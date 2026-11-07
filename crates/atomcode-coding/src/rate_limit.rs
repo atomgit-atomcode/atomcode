@@ -128,6 +128,12 @@ pub struct Entitlement {
 #[async_trait]
 pub trait RateLimitWindowSource: Send + Sync + std::fmt::Debug {
     fn applies_to(&self, base_url: &str) -> bool;
+    /// Opaque, non-secret identity of the account currently metered. Automatic
+    /// goal quota recovery requires this binding; unknown identity fails closed.
+    /// Never return credentials. The runtime neither persists nor logs this value.
+    fn account_id(&self) -> Option<String> {
+        None
+    }
     async fn fetch_windows(&self) -> Result<Vec<RateLimitWindow>, String>;
 
     /// What the account has spent, when the service reports it.

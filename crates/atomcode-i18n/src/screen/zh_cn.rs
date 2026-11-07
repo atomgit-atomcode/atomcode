@@ -1317,6 +1317,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── signing in, from the screen (`atomcode-cli`) ──
         Msg::CmdAboutTuiLogin => "登录并配好 provider；已登录则刷新 codingplan 配置".into(),
         Msg::SetupThreadDied => "codingplan setup 线程崩了".into(),
+        Msg::QuotaAvailableContinueManually => "当前额度可用。若任务仍处于暂停状态，可发送“继续”继续当前对话；已结束的 loop 需要手动重新启动。".into(),
         Msg::ConfigWrittenReloadFailedCli { error } => format!("配置已写入，但重新加载失败：{error}").into(),
         Msg::SignedInSettingUpProvider => "登录成了，正在配 provider…".into(),
         Msg::AlreadySignedInRefreshing => "已登录，正在刷新 codingplan 配置…".into(),

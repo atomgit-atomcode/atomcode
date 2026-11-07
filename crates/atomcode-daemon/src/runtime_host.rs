@@ -62,6 +62,12 @@ impl RateLimitWindowSource for CodingPlanRateLimitSource {
         atomcode_capabilities::provider::is_atomgit_gateway(base_url)
     }
 
+    fn account_id(&self) -> Option<String> {
+        atomcode_auth::get_stored_auth(atomcode_coding::config::product_dirs_from_env().user())
+            .map(|auth| auth.user.id)
+            .filter(|id| !id.is_empty())
+    }
+
     async fn fetch_windows(&self) -> Result<Vec<RateLimitWindow>, String> {
         tokio::task::spawn_blocking(|| {
             let client = atomcode_codingplan::Client::from_stored_auth(

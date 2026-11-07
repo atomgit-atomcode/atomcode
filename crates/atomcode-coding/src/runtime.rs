@@ -4639,7 +4639,7 @@ fn spawn_runtime_owner_with_optional_agent(
     let (_closed_wakeup_tx, closed_wakeup_rx) = mpsc::unbounded_channel();
     let mut wakeup_rx = wakeup_rx.unwrap_or(closed_wakeup_rx);
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
-    let (goal_retry_tx, mut goal_retry_rx) = mpsc::unbounded_channel::<(u64, u64, u64)>();
+    let (goal_retry_tx, mut goal_retry_rx) = mpsc::unbounded_channel::<GoalRetryOutcome>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
     let (next_prompt_tx, mut next_prompt_rx) =
         mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
@@ -4705,6 +4705,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut cancel_pending = false;
         let mut main_failure_retryable = None;
         let mut main_retry_after_secs = None;
+        let mut main_quota_reset_secs = None;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
         let mut pending_steer_acknowledgements = VecDeque::new();
@@ -5473,7 +5474,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                 }
                 retry = goal_retry_rx.recv(), if native_protocol => {
-                    let Some((retry_generation, controller_id, epoch)) = retry else { continue };
+                    let Some(GoalRetryOutcome { generation: retry_generation, controller_id, epoch, quota }) = retry else { continue };
                     let Some(state) = goal.as_mut().filter(|state| state.active && state.id == controller_id && state.async_epoch == epoch && state.recovery.is_some()) else { continue };
                     if retry_generation != generation || held_turn.is_none() { continue; }
                     if !agent_available || persistence_failure.is_some() || pending_policy_intervention.is_some() {
@@ -5502,6 +5503,39 @@ fn spawn_runtime_owner_with_optional_agent(
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                         continue;
+                    }
+                    if let Some(quota) = quota {
+                        let source = resources.as_ref().and_then(|runtime| runtime.parts.rate_limit_source(&runtime.config.base_url)).cloned();
+                        let (account_changed, quota) = match quota {
+                            GoalQuotaCheck::Windows { account, windows } => (
+                                source.as_ref().and_then(|source| source.account_id()).as_deref() != Some(account.as_str()),
+                                windows,
+                            ),
+                            GoalQuotaCheck::AccountChanged => (true, Err("quota account changed".into())),
+                        };
+                        let available = !account_changed && source.is_some() && quota.as_ref().is_ok_and(|windows| !windows.is_empty() && windows.iter().all(|window| !window.quota_exhausted));
+                        if !available {
+                            let reset = quota.as_ref().ok().and_then(|windows| windows.iter().filter(|window| window.quota_exhausted).map(|window| window.seconds_until_reset.max(0) as u64).max());
+                            if let Some((source, delay)) = source.filter(|_| !account_changed).and_then(|source| state.schedule_recovery(GoalRecoveryKind::Provider, reset).map(|delay| (source, delay))) {
+                                state.last_reason = Some("waiting for quota recovery; allowance will be checked before continuing".into());
+                                arm_goal_quota_retry(&goal_retry_tx, generation, state, delay, source);
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                continue;
+                            }
+                            state.pause_for_recovery(if account_changed {
+                                "quota account changed or signed out; automatic recovery paused; goal retained"
+                            } else {
+                                "quota still unavailable or unknown; recovery budget exhausted; goal retained"
+                            });
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                                active_turn = None;
+                                terminal_reason = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                            }
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                            continue;
+                        }
                     }
                     state.begin_retry_attempt();
                     state.last_reason = Some("automatic goal recovery in progress".into());
@@ -10158,9 +10192,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 | StopReason::MaxContinuations
                                                 | StopReason::MaxRounds
                                         );
+                                        let quota_source = (reason == StopReason::RateLimited)
+                                            .then_some(main_quota_reset_secs).flatten()
+                                            .and_then(|secs| resources.as_ref().and_then(|runtime| runtime.parts.rate_limit_source(&runtime.config.base_url)).cloned().filter(|source| source.account_id().is_some_and(|id| !id.is_empty())).map(|source| (secs, source)));
                                         let recoverable = match reason {
                                             StopReason::Timeout => main_failure_retryable != Some(false),
-                                            StopReason::ProviderError | StopReason::RateLimited => main_failure_retryable == Some(true),
+                                            StopReason::ProviderError => main_failure_retryable == Some(true),
+                                            StopReason::RateLimited => main_failure_retryable == Some(true) && main_quota_reset_secs.is_none(),
                                             _ => false,
                                         };
                                         let mut keep_goal_registered = false;
@@ -10189,18 +10227,33 @@ fn spawn_runtime_owner_with_optional_agent(
                                             held_turn = Some((turn_id, reason, snapshot.clone(), stats));
                                             launch_goal_evaluation(generation, state, &snapshot, resources.as_ref(), &goal_eval_tx);
                                             continue;
-                                        } else if recoverable {
-                                            if let Some(delay) = state.schedule_recovery(GoalRecoveryKind::Provider, main_retry_after_secs) {
+                                        } else if recoverable || quota_source.is_some() {
+                                            let checking_quota = quota_source.is_some();
+                                            let retry_after = quota_source.as_ref().map(|(secs, _)| *secs).into_iter().chain(main_retry_after_secs).max();
+                                            if let Some(delay) = state.schedule_recovery(GoalRecoveryKind::Provider, retry_after) {
                                                 held_turn = Some((turn_id, reason, snapshot.clone(), stats));
-                                                arm_goal_retry(&goal_retry_tx, generation, state, delay);
+                                                if let Some((_, source)) = quota_source {
+                                                    state.last_reason = Some("waiting for quota recovery; allowance will be checked before continuing".into());
+                                                    arm_goal_quota_retry(&goal_retry_tx, generation, state, delay, source);
+                                                } else {
+                                                    arm_goal_retry(&goal_retry_tx, generation, state, delay);
+                                                }
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                                 tracing::info!(generation, goal_id=state.id, delay_secs=delay.as_secs(), "goal provider recovery scheduled");
                                                 continue;
                                             }
-                                            state.pause_for_recovery("provider recovery budget exhausted; goal retained; check provider/network and send a message to continue");
+                                            state.pause_for_recovery(if checking_quota {
+                                                "quota reset exceeds the recovery budget; goal retained"
+                                            } else {
+                                                "provider recovery budget exhausted; goal retained; check provider/network and send a message to continue"
+                                            });
                                             keep_goal_registered = true;
                                             held_turn = None;
-                                            completion_reason = StopReason::ProviderError;
+                                            completion_reason = if checking_quota { StopReason::RateLimited } else { StopReason::ProviderError };
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                        } else if reason == StopReason::RateLimited && main_quota_reset_secs.is_some() {
+                                            state.pause_for_recovery("quota account unavailable; automatic recovery paused; goal retained");
+                                            keep_goal_registered = true;
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                         } else {
                                             state.finish(
@@ -10347,6 +10400,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                             }
+                            event @ AgentEvent::RateLimited { .. } => {
+                                if let AgentEvent::RateLimited { ref reset_at_display, ref reset_label, secs_until_reset, auto_resuming: false, .. } = event {
+                                    // Only a host's quota-window pause authorizes quota
+                                    // recovery; generic/terminal 429s carry no window.
+                                    main_quota_reset_secs = secs_until_reset.filter(|_| !reset_at_display.is_empty() || !reset_label.is_empty());
+                                }
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
+                            }
                             event @ AgentEvent::Error { .. } => {
                                 if let AgentEvent::Error { retryable, http_status, ref code, retry_after_secs, ends_turn: true, .. } = event {
                                     main_failure_retryable = Some(transient_provider_failure(retryable, http_status, code.as_deref(), retry_after_secs));
@@ -10357,6 +10418,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             AgentEvent::TurnStarted { .. } => {
                                 main_failure_retryable = None;
                                 main_retry_after_secs = None;
+                                main_quota_reset_secs = None;
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {
@@ -11273,8 +11335,61 @@ fn runtime_prepare_error(error: io::Error) -> RuntimeError {
     }
 }
 
+enum GoalQuotaCheck {
+    Windows {
+        account: String,
+        windows: Result<Vec<crate::rate_limit::RateLimitWindow>, String>,
+    },
+    AccountChanged,
+}
+
+struct GoalRetryOutcome {
+    generation: u64,
+    controller_id: u64,
+    epoch: u64,
+    quota: Option<GoalQuotaCheck>,
+}
+
+fn arm_goal_quota_retry(
+    tx: &mpsc::UnboundedSender<GoalRetryOutcome>,
+    generation: u64,
+    state: &GoalState,
+    delay: std::time::Duration,
+    source: Arc<dyn crate::rate_limit::RateLimitWindowSource>,
+) {
+    let tx = tx.clone();
+    let controller_id = state.id;
+    let epoch = state.async_epoch;
+    let cancel = state.work_cancel.clone();
+    let account = source.account_id().filter(|id| !id.is_empty());
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            quota = async {
+                tokio::time::sleep(delay).await;
+                if account.is_none() || source.account_id() != account {
+                    return GoalQuotaCheck::AccountChanged;
+                }
+                let windows = tokio::time::timeout(std::time::Duration::from_secs(3), source.fetch_windows())
+                    .await.unwrap_or_else(|_| Err("quota check timed out".into()))
+                    .map(|windows| windows.into_iter().filter(|window| {
+                        // Match rate_limit::decide_from_windows: retired monthly
+                        // windows must not keep an available rolling quota blocked.
+                        window.window_size_seconds > 0 && window.window_size_seconds <= 18_000
+                    }).collect());
+                if source.account_id() != account {
+                    GoalQuotaCheck::AccountChanged
+                } else {
+                    GoalQuotaCheck::Windows { account: account.expect("account checked"), windows }
+                }
+            } => { let _ = tx.send(GoalRetryOutcome { generation, controller_id, epoch, quota: Some(quota) }); }
+        }
+    });
+}
+
 fn arm_goal_retry(
-    tx: &mpsc::UnboundedSender<(u64, u64, u64)>,
+    tx: &mpsc::UnboundedSender<GoalRetryOutcome>,
     generation: u64,
     state: &GoalState,
     delay: std::time::Duration,
@@ -11287,7 +11402,7 @@ fn arm_goal_retry(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {},
-            _ = tokio::time::sleep(delay) => { let _ = tx.send((generation, id, epoch)); }
+            _ = tokio::time::sleep(delay) => { let _ = tx.send(GoalRetryOutcome { generation, controller_id: id, epoch, quota: None }); }
         }
     });
 }
@@ -15115,15 +15230,32 @@ mod tests {
         Arc<std::sync::atomic::AtomicBool>,
         KernelRuntimeAdapter,
     ) {
+        controller_test_runtime_with_quota(provider_factory, config, None).await
+    }
+
+    pub(super) async fn controller_test_runtime_with_quota(
+        provider_factory: Arc<dyn CodingProviderFactory>,
+        config: CodingAgentConfig,
+        source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
+    ) -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        mpsc::UnboundedSender<WakeupRequest>,
+        Arc<std::sync::atomic::AtomicBool>,
+        KernelRuntimeAdapter,
+    ) {
         let (agent, kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let CodingRuntimeStart {
-            prepare,
+            mut prepare,
             plugin_hooks,
             ..
         } = native_start(false);
+        prepare.rate_limit_source = source;
         let parts =
             prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
                 .await

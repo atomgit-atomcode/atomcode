@@ -177,6 +177,55 @@ struct World {
     reload: Arc<dyn Fn(&dyn Say) + Send + Sync>,
 }
 
+// This is a presentation eligibility check, not a pending-task owner. Any
+// newer fact, active turn, or navigation invalidates the hint across reload.
+fn rate_limited_turn(client: &atomcode_tui::plugin::AgentClient) -> Option<u64> {
+    if client.session() != client.root() || !client.root_settled() {
+        return None;
+    }
+    is_rate_limited(&client.events()).then(|| client.root_high())
+}
+
+fn is_rate_limited(events: &[atomcode_kernel::session::LoggedEvent]) -> bool {
+    use atomcode_kernel::{event::StopReason, session::SessionEvent};
+    let boundary = events.iter().rev().find(|logged| {
+        matches!(
+            logged.event,
+            SessionEvent::TurnStart { .. }
+                | SessionEvent::UserMessage { .. }
+                | SessionEvent::TurnEnd { .. }
+                | SessionEvent::Rewound { .. }
+                | SessionEvent::Stopped { .. }
+        )
+    });
+    boundary.is_some_and(|logged| {
+        matches!(
+            logged.event,
+            SessionEvent::TurnEnd {
+                stop: StopReason::RateLimited,
+                ..
+            }
+        )
+    })
+}
+
+fn quota_available(reply: &atomcode_host_api::HostReply) -> bool {
+    let atomcode_host_api::HostReply::Usage {
+        windows,
+        unavailable: None,
+        ..
+    } = reply
+    else {
+        return false;
+    };
+    // Match the runtime's active rolling windows, excluding retired monthly meters.
+    let mut windows = windows
+        .iter()
+        .filter(|window| window.window_seconds > 0 && window.window_seconds <= 18_000)
+        .peekable();
+    windows.peek().is_some() && windows.all(|window| !window.exhausted)
+}
+
 /// Where the flow's lines go.
 ///
 /// A trait rather than the `UserInterface` itself so a criterion can read them:
@@ -269,6 +318,8 @@ impl World {
                 return;
             };
             let root = client.root();
+            let paused_at = rate_limited_turn(&client);
+            let client = client.clone();
             let repaint = repaint.clone();
             // The screen is where the words go, so the failure is reported
             // through it — the same road the successful lines take. Nothing
@@ -277,16 +328,36 @@ impl World {
             let _ = say;
             let screen = ui.clone();
             runtime_handle.spawn(async move {
-                if let Err(error) = control
-                    .call(atomcode_host_api::HostCommand::SignIn { session: root })
+                match control
+                    .call(atomcode_host_api::HostCommand::SignIn {
+                        session: root.clone(),
+                    })
                     .await
                 {
-                    screen.say(&tr(SMsg::ConfigWrittenReloadFailedCli {
+                    Err(error) => screen.say(&tr(SMsg::ConfigWrittenReloadFailedCli {
                         error: &format!("{error:?}"),
-                    }));
-                    if let Some(repaint) = repaint.as_ref() {
-                        repaint.now();
+                    })),
+                    Ok(_) => {
+                        // A successful sign-in says nothing about remaining quota.
+                        // Ask the newly configured provider, without submitting work.
+                        if let Some(paused_at) = paused_at {
+                            let usage = control
+                                .call(atomcode_host_api::HostCommand::Usage {
+                                    session: root.clone(),
+                                    windows_only: true,
+                                })
+                                .await;
+                            if client.root() == root
+                                && rate_limited_turn(&client) == Some(paused_at)
+                                && usage.as_ref().is_ok_and(quota_available)
+                            {
+                                screen.say(&tr(SMsg::QuotaAvailableContinueManually));
+                            }
+                        }
                     }
+                }
+                if let Some(repaint) = repaint.as_ref() {
+                    repaint.now();
                 }
             });
         });
@@ -471,6 +542,95 @@ fn show_login_chrome(say: &dyn Say, url: &str) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_the_latest_turn_can_qualify_for_the_quota_hint() {
+        use atomcode_kernel::{
+            event::StopReason,
+            session::{LoggedEvent, SessionEvent},
+        };
+        let mut events = vec![];
+        assert!(!is_rate_limited(&events));
+        events.push(LoggedEvent {
+            seq: 1,
+            at: 0,
+            event: SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::RateLimited,
+                error: None,
+            },
+        });
+        assert!(is_rate_limited(&events));
+        events.push(LoggedEvent {
+            seq: 2,
+            at: 0,
+            event: SessionEvent::TurnStart { turn: 2 },
+        });
+        assert!(!is_rate_limited(&events));
+        for stop in [
+            StopReason::Stopped,
+            StopReason::MaxRounds,
+            StopReason::ProviderError,
+        ] {
+            events.push(LoggedEvent {
+                seq: 3,
+                at: 0,
+                event: SessionEvent::TurnEnd {
+                    turn: 2,
+                    stop,
+                    error: None,
+                },
+            });
+            assert!(!is_rate_limited(&events));
+        }
+    }
+
+    #[test]
+    fn quota_hint_requires_known_non_exhausted_windows() {
+        fn reply(
+            windows: serde_json::Value,
+            unavailable: serde_json::Value,
+        ) -> atomcode_host_api::HostReply {
+            serde_json::from_value(serde_json::json!({
+                "Usage": { "windows": windows, "unavailable": unavailable,
+                "plan": null, "stats": null, "stats_unavailable": null }
+            }))
+            .expect("usage reply")
+        }
+        let window = serde_json::json!({
+            "label": "5h", "exhausted": false, "resets_at": "",
+            "resets_in_seconds": 0, "window_seconds": 18000
+        });
+        assert!(!quota_available(&reply(
+            serde_json::json!([]),
+            serde_json::Value::Null
+        )));
+        assert!(quota_available(&reply(
+            serde_json::json!([window.clone()]),
+            serde_json::Value::Null
+        )));
+        assert!(!quota_available(&reply(
+            serde_json::json!([window.clone()]),
+            serde_json::json!("offline")
+        )));
+        let mut retired = window.clone();
+        retired["window_seconds"] = serde_json::json!(30 * 86400);
+        retired["exhausted"] = serde_json::json!(true);
+        assert!(quota_available(&reply(
+            serde_json::json!([window.clone(), retired.clone()]),
+            serde_json::Value::Null
+        )));
+        assert!(!quota_available(&reply(
+            serde_json::json!([retired]),
+            serde_json::Value::Null
+        )));
+        let mut exhausted = window.clone();
+        exhausted["exhausted"] = serde_json::json!(true);
+        assert!(!quota_available(&reply(
+            serde_json::json!([window, exhausted]),
+            serde_json::Value::Null
+        )));
+    }
 
     /// A front end that only keeps what it was told.
     ///

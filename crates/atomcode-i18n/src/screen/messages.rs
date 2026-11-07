@@ -2131,6 +2131,7 @@ pub enum Msg<'a> {
     ConfigWrittenReloadFailedCli {
         error: &'a str,
     },
+    QuotaAvailableContinueManually,
     SignedInSettingUpProvider,
     AlreadySignedInRefreshing,
     TokenRejectedSigningInAgain,
