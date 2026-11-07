@@ -2554,3 +2554,174 @@ async fn a_stop_timeout_keeps_the_member_owned_and_does_not_commit_stopped() {
     let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
     assert!(!stopped.is_error, "{}", stopped.content);
 }
+
+/// Real guard failures reach the lead even if the member calls tell_parent to
+/// claim completion. Notifications disclose no attempted paths or payloads.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn refused_team_writes_notify_the_lead_once_per_turn_without_leaking_arguments() {
+    let dir = scratch("refusal-report");
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\n---\nWrite notes.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "acknowledged" }"#,
+        r#"{ calls = [
+            { name = "write_file", args = { file_path = "private-target-one.txt", content = "secret-payload-one" } },
+            { name = "write_file", args = { file_path = "private-target-two.txt", content = "secret-payload-two" } },
+            { name = "tell_parent", args = { text = "claimed complete" } },
+            { name = "todowrite", args = { todos = [ { content = "not in member catalog", status = "pending" } ] } }
+        ] }, { text = "done" },
+        { calls = [ { name = "write_file", args = { file_path = "private-target-three.txt", content = "secret-payload-three" } } ] },
+        { text = "done again" }"#,
+    )).await;
+    assert!(app
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .get("todowrite")
+        .is_some());
+    let lead = create_agent(&app).await.unwrap();
+    let result = as_lead(&app, &lead,
+        r#"{"action":"delegate","name":"scribe","role":"scribe","task":"write notes","scope":["notes/**"]}"#
+    ).await;
+    assert!(!result.is_error, "{}", result.content);
+    let member = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&format!("{}/scribe", lead.session_id()))
+        .unwrap();
+    until_idle(&member).await;
+    let reports = heard_by(&app, &lead).await;
+    let blocked: Vec<_> = reports
+        .iter()
+        .filter(|(_, text)| text.contains(": write boundary blocked work"))
+        .collect();
+    assert_eq!(blocked.len(), 1, "{reports:?}");
+    assert!(
+        reports
+            .iter()
+            .any(|(_, text)| text.contains("claimed complete")),
+        "reports={reports:?}"
+    );
+    assert!(blocked[0].1.contains("not a completion report"));
+    assert!(!blocked[0].1.contains("private-target"));
+    assert!(!blocked[0].1.contains("secret-payload"));
+    assert!(
+        member.session().events().iter().any(|e| matches!(
+            &e.event, SessionEvent::ToolResultLogged { is_error: true, content, .. }
+            if content.contains("unknown tool `todowrite`")
+        )),
+        "a multi-call round must not gain tools from the lead catalog"
+    );
+    assert!(!dir.join("private-target-one.txt").exists());
+    assert!(!dir.join("private-target-two.txt").exists());
+    assert_eq!(member.session().events().iter().filter(|e| matches!(
+        &e.event, SessionEvent::ToolResultLogged { is_error: true, content, .. } if content.starts_with("Refused:")
+    )).count(), 2);
+    let result = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"tell","name":"scribe","text":"handle the remaining work"}"#,
+    )
+    .await;
+    assert!(!result.is_error);
+    until_idle(&member).await;
+    let reports = heard_by(&app, &lead).await;
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|(_, text)| text.contains(": write boundary blocked work"))
+            .count(),
+        2,
+        "{reports:?}"
+    );
+    assert!(!dir.join("private-target-three.txt").exists());
+    assert!(
+        reports.iter().any(|(_, text)| text.contains("done again")),
+        "automatic alerts must not suppress normal completion reports"
+    );
+    as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn allowed_writes_and_sensitive_path_denials_do_not_emit_scope_alerts() {
+    for (tag, path, allowed) in [
+        ("allowed", "notes/ok.txt", true),
+        ("sensitive", ".env", false),
+    ] {
+        let dir = scratch(tag);
+        write_role(
+            &dir,
+            "scribe",
+            "---\npermission: worker\ndifficulty: simple\n---\nWrite notes.\n",
+        );
+        let script = format!(
+            r#"{{ calls = [ {{ name = "write_file", args = {{ file_path = "{path}", content = "private-content" }} }} ] }}, {{ text = "finished" }}"#
+        );
+        let app = start(tree(&dir, r#"{ text = "acknowledged" }"#, &script)).await;
+        let lead = create_agent(&app).await.unwrap();
+        let delegated = as_lead(&app, &lead, r#"{"action":"delegate","name":"scribe","role":"scribe","task":"write notes","scope":["notes/**"]}"#).await;
+        assert!(!delegated.is_error, "{}", delegated.content);
+        let member = app
+            .context()
+            .service::<AgentsSvc>()
+            .unwrap()
+            .by_session(&format!("{}/scribe", lead.session_id()))
+            .unwrap();
+        until_idle(&member).await;
+        let reports = heard_by(&app, &lead).await;
+        assert!(
+            !reports
+                .iter()
+                .any(|(_, text)| text.contains(": write boundary blocked work")),
+            "{reports:?}"
+        );
+        assert_eq!(dir.join(path).exists(), allowed);
+        if !allowed {
+            assert!(member.session().events().iter().any(|e| matches!(
+                &e.event, SessionEvent::ToolResultLogged { is_error: true, content, .. } if content.contains("sensitive paths")
+            )));
+        }
+        as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn scope_refusals_on_person_started_member_turns_are_notes_not_lead_wakeups() {
+    let dir = scratch("person-refusal");
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\n---\nWrite notes.\n",
+    );
+    let app = start(tree(&dir, r#"{ text = "acknowledged" }"#,
+        r#"{ text = "ready" }, { calls = [ { name = "write_file", args = { file_path = "outside.txt", content = "private-content" } } ] }, { text = "blocked" }"#
+    )).await;
+    let lead = create_agent(&app).await.unwrap();
+    assert!(!as_lead(&app, &lead, r#"{"action":"delegate","name":"scribe","role":"scribe","task":"stand by","scope":["notes/**"]}"#).await.is_error);
+    let member = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&format!("{}/scribe", lead.session_id()))
+        .unwrap();
+    until_idle(&member).await;
+    heard_by(&app, &lead).await;
+    assert!(!lead.inbox().has_waking_input());
+    member.send("write the file");
+    until_idle(&member).await;
+    assert!(
+        !lead.inbox().has_waking_input(),
+        "a person-started member turn must not automatically wake the lead"
+    );
+    assert!(lead.session().events().iter().any(|e| matches!(
+        &e.event, SessionEvent::Injected { text, origin: InjectionOrigin::TeamNote { member }, .. }
+        if member == "scribe" && text.contains(": write boundary blocked work")
+    )));
+    assert!(!dir.join("outside.txt").exists());
+    as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
+}

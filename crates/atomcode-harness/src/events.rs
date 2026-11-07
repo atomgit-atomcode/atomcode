@@ -359,6 +359,20 @@ plexus_event!(AssistantChunk, "assistant/chunk", Emit, Chunk);
 plexus_event!(AssistantMessage, "assistant/message", Emit, Message);
 plexus_event!(ToolResultEvent, "tool/result", Emit, ToolResult);
 
+/// Ephemeral signal from the delegated-write guard, not a persisted fact.
+/// Deliberately carries no paths, tool arguments or raw refusal text.
+#[derive(Clone, Debug)]
+pub struct DelegatedWriteRefusal {
+    pub session: String,
+    pub turn: u64,
+}
+plexus_event!(
+    DelegatedWriteRefused,
+    "delegation/write-refused",
+    Emit,
+    DelegatedWriteRefusal
+);
+
 plexus_event!(
     /// Around the model call. Delegating runs the provider; returning without
     /// delegating replaces the response entirely (a cache hit, a canned reply, a

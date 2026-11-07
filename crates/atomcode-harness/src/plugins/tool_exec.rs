@@ -72,7 +72,10 @@ impl Waterfall<ToolsExecuteBatch> for Parallel {
         // `FuturesOrdered` yields in push order, so results come back in
         // emission order whatever finished first, and the transcript stays
         // reproducible.
-        let toolbox = self.ctx.service::<ToolsSvc>();
+        // A member's tool catalog is local to its realm (including tell_parent).
+        // Scheduling a batch must not switch execution back to the lead's catalog.
+        let agent_ctx = crate::agent::scoped(&self.ctx);
+        let toolbox = agent_ctx.service::<ToolsSvc>();
         let gate = Arc::new(tokio::sync::RwLock::new(()));
         let permits = Arc::new(tokio::sync::Semaphore::new(
             self.max_parallel.clamp(1, CEILING),
@@ -91,7 +94,7 @@ impl Waterfall<ToolsExecuteBatch> for Parallel {
             let permits = permits.clone();
             let cancel = batch.cancel.clone();
             let working_dir = batch.working_dir.clone();
-            let ctx = self.ctx.clone();
+            let ctx = agent_ctx.clone();
             let id = call.id.clone();
             let exec = ToolExec {
                 call,

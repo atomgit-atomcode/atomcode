@@ -491,6 +491,14 @@ impl Waterfall<ToolsExecute> for DelegationBounds {
             name,
             &exec.call.arguments,
         ) {
+            if let Some(log) = scoped.service::<crate::seams::SessionSvc>() {
+                scoped.emit::<crate::events::DelegatedWriteRefused>(
+                    &crate::events::DelegatedWriteRefusal {
+                        session: log.id().to_string(),
+                        turn: exec.turn,
+                    },
+                );
+            }
             return refuse(why);
         }
         next.run(exec).await
