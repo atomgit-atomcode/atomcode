@@ -1,0 +1,76 @@
+name: android
+
+# `check.yml` compiles for the host, so every `#[cfg(target_os = "android")]`
+# path in this workspace is invisible to it: the SAF JNI bridge
+# (`crates/atomcode-android/src/saf_jni.rs`), the JNI entry points
+# (`crates/atomcode-android/src/jni_api.rs`) and the in-process scheduler
+# (`crates/atomcode-daemon/src/schedule_runner.rs`) have never been compiled by
+# CI. A broken Android-only path therefore ships until someone builds an APK.
+#
+# This job compiles exactly those paths for the device triple. It is not a
+# substitute for building the APK (Gradle needs the embedded webui bundle), but
+# it is the cheap gate that would have caught the class of break that only shows
+# up when someone finally builds for the phone.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "release/**"
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # minSdk in android/app/build.gradle.kts; the NDK wrapper name must match.
+  API: "26"
+
+jobs:
+  target:
+    name: cargo check (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      # `cargo check` never links, but it DOES run build scripts, and some of
+      # them compile C for the TARGET (ring, zstd-sys, tree-sitter grammars).
+      # Those need a cross C compiler, which is what the NDK wrapper is — the
+      # same wiring `scripts/build-android.sh` does locally.
+      #
+      # Report-only until it has run green here once, on the same contract as
+      # the `nextest` steps in check.yml. PROMOTE THIS: delete the
+      # `continue-on-error` line below once a run is green — a gate that cannot
+      # fail a PR is not a gate.
+      - name: cargo check (android cfg paths)
+        continue-on-error: true
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          toolchain="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android${API}-clang"
+          export CC_aarch64_linux_android="$toolchain/aarch64-linux-android${API}-clang"
+          export AR_aarch64_linux_android="$toolchain/llvm-ar"
+          cargo check --target aarch64-linux-android \
+            -p atomcode-android -p atomcode-daemon
