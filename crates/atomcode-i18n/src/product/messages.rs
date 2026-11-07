@@ -2385,6 +2385,13 @@ pub enum Msg<'a> {
     CmdSkillUnknownExplicit {
         name: &'a str,
     },
+    CmdSkillSpellingSuggestion {
+        candidates: &'a str,
+    },
+    CmdSkillTaskSpelling {
+        word: &'a str,
+        candidates: &'a str,
+    },
     CmdCatalogSkillsEmpty,
     CmdCatalogSkillDirs,
     CmdCatalogSkillDiagnostics,

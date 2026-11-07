@@ -1822,3 +1822,91 @@ async fn optional_and_legacy_templates_keep_empty_input_and_model_loading_is_unc
         result.content
     );
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skill_spelling_hints_preserve_atomic_rejection_and_original_task_text() {
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+    let dir = scratch("skill-spelling");
+    for (name, hidden) in [("plan", false), ("review", false), ("secret-review", true)] {
+        let at = dir.join(format!(".claude/skills/{name}"));
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("SKILL.md"), format!("---\nname: {name}\ndescription: {name} test\nuser-invocable: {}\n---\n{name} body\n", !hidden)).unwrap();
+    }
+    let app = start(tree(&dir, STOP, &[])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let command = catalog.find("skills", &agent).unwrap();
+    for args in [
+        "plan $reveiw task",
+        "plan ¥reveiw task",
+        "$reveiw task",
+        "reveiw task",
+    ] {
+        let error = command.run(agent.clone(), args).await.unwrap_err();
+        assert!(error.contains("Did you mean `review`?"), "{error}");
+        assert!(!agent
+            .inbox()
+            .waiting_from(atomcode_harness::agent::MessageOrigin::User));
+        assert!(agent.inbox().claim().injections.is_empty());
+    }
+    let hidden = command
+        .run(agent.clone(), "$secret-reveiw task")
+        .await
+        .unwrap_err();
+    assert!(!hidden.contains("Did you mean"), "{hidden}");
+    let prepared = command
+        .prepare_input(&agent, "plan reveiw  fix   the bug")
+        .unwrap()
+        .unwrap();
+    assert!(prepared
+        .output
+        .contains("`reveiw` was not recognized as a skill"));
+    assert!(prepared.output.contains("Did you mean `review`?"));
+    assert_eq!(prepared.text, "/skills plan reveiw  fix   the bug");
+    assert!(matches!(&prepared.context.1, InjectionOrigin::Skill { name } if name == "plan"));
+    assert!(!prepared.context.0.contains("review body"));
+    assert!(
+        !prepared.context.0.contains("Did you mean"),
+        "advisory must not enter the skill body"
+    );
+    for args in [
+        "plan fix reveiw later",
+        "plan fix $reveiw later",
+        "plan ./reveiw task",
+        "plan review task",
+    ] {
+        let prepared = command.prepare_input(&agent, args).unwrap().unwrap();
+        assert!(
+            !prepared.output.contains("Did you mean"),
+            "{args}: {}",
+            prepared.output
+        );
+    }
+    let prepared = command
+        .prepare_input(&agent, "plan REVIEW task")
+        .unwrap()
+        .unwrap();
+    assert!(prepared.output.contains("Did you mean `review`?"));
+    let prepared = command
+        .prepare_input(&agent, "plan reveiw  fix   the bug")
+        .unwrap()
+        .unwrap();
+    let output = prepared.send(
+        &agent,
+        vec![atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        }],
+    );
+    assert!(output.contains("Did you mean `review`?"));
+    let claimed = agent.inbox().claim();
+    assert_eq!(
+        claimed.message.as_deref(),
+        Some("/skills plan reveiw  fix   the bug")
+    );
+    assert_eq!(claimed.images.len(), 1);
+}

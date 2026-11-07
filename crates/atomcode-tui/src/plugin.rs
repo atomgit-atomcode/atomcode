@@ -7028,6 +7028,13 @@ impl Tui {
                 if let Some(line) = invocation {
                     self.host.stop_recognizing();
                     if failed == Some(false) {
+                        let notice = self.client.described().and_then(|description| {
+                            crate::commands::skill_spelling_notice(&description.commands, &line)
+                        });
+                        if let Some(notice) = notice {
+                            self.say(&notice);
+                            return true;
+                        }
                         return false;
                     }
                     self.host.echo_command(&line);
@@ -16210,6 +16217,53 @@ mod skills_menu_tests {
         assert_eq!(m.caret, m.input.len());
         drop(m);
         assert!(!host.menu_open(), "the next words are the skill's task");
+    }
+
+    #[test]
+    fn successful_skill_gateway_shows_spelling_hints_without_echoing_acknowledgements() {
+        let (host, tui) = screen();
+        let description = tui.client.described().unwrap();
+        for (line, expects_notice) in [
+            ("/skills code brainstormnig task", true),
+            ("/skills code BRAINSTORMING task", true),
+            ("/skills code fix brainstormnig later", false),
+            ("/skills code $brainstormnig task", false),
+            ("/skills code brainstorming task", false),
+            ("/code brainstormnig task", false),
+        ] {
+            let before = host.stream.read().unwrap().slots().len();
+            tui.client
+                .view
+                .lock()
+                .unwrap()
+                .turn_invocations
+                .insert("spelling".into(), line.into());
+            tui.on_event(AgentEvent::Invoked {
+                id: "spelling".into(),
+                output: "ordinary acknowledgement".into(),
+                queued: false,
+                failed: Some(false),
+            });
+            let stream = host.stream.read().unwrap();
+            assert_eq!(
+                stream.slots().len(),
+                before + usize::from(expects_notice),
+                "{line}"
+            );
+            if expects_notice {
+                let expected =
+                    crate::commands::skill_spelling_notice(&description.commands, line).unwrap();
+                assert!(expected.contains("brainstorming"));
+                let said = crate::content::CommandSaid {
+                    text: expected,
+                    refused: false,
+                };
+                assert_eq!(
+                    stream.slots().last().unwrap().block().content_hash(),
+                    crate::block::Content::content_hash(&said)
+                );
+            }
+        }
     }
 
     #[test]

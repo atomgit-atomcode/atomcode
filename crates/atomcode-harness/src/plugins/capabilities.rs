@@ -752,6 +752,14 @@ fn skill_repeat_notice(events: &[LoggedEvent], names: &[String]) -> String {
         .join("\n")
 }
 
+fn quoted_skill_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn with_skill_notice(output: String, events: &[LoggedEvent], names: &[String]) -> String {
     let notice = skill_repeat_notice(events, names);
     if notice.is_empty() {
@@ -944,17 +952,51 @@ impl ListSkills {
         agent: &crate::agent::Agent,
         args: &str,
     ) -> Result<crate::commands::PreparedCommandInput, String> {
+        let boundary =
+            atomcode_capabilities::skills::spelling::invocation_boundary(args, |token| {
+                self.0.get(token).is_some_and(|skill| skill.user_invocable)
+            });
+        let available: Vec<_> = self
+            .0
+            .all()
+            .into_iter()
+            .filter(|skill| skill.user_invocable)
+            .collect();
+        let candidates = |word: &str| {
+            atomcode_capabilities::skills::spelling::suggestions(
+                word,
+                available.iter().map(|skill| skill.name.as_str()),
+            )
+        };
+        let append_suggestion = |error: String| {
+            let suggested = boundary
+                .as_ref()
+                .map(|b| candidates(b.word))
+                .unwrap_or_default();
+            if suggested.is_empty() {
+                error
+            } else {
+                let candidates = quoted_skill_names(&suggested);
+                format!(
+                    "{error}\n{}",
+                    t(Msg::CmdSkillSpellingSuggestion {
+                        candidates: &candidates
+                    })
+                )
+            }
+        };
         let (names, task) = skills_and_task(args, |token| {
             self.0
                 .get(token)
                 .filter(|skill| skill.user_invocable)
                 .map(|skill| skill.name.clone())
-        })?;
+        })
+        .map_err(&append_suggestion)?;
         let Some(first) = args.split_whitespace().next() else {
             return Err("没说要用哪个 skill".into());
         };
         if names.is_empty() {
-            return Err(format!("没有叫 `{first}` 的 skill"));
+            return Err(append_suggestion(format!("没有叫 `{first}` 的 skill")));
         }
         // Each gets the same task: they are several ways of looking at one
         // thing, not a pipeline.
@@ -974,6 +1016,23 @@ impl ListSkills {
         if blocks.is_empty() {
             return Err("展开之后是空的".into());
         }
+        let spelling_notice = boundary.as_ref().and_then(|boundary| {
+            let suggested = atomcode_capabilities::skills::spelling::task_candidates(
+                boundary,
+                available.iter().map(|skill| skill.name.as_str()),
+            );
+            if suggested.is_empty() {
+                return None;
+            }
+            let candidates = quoted_skill_names(&suggested);
+            Some(
+                t(Msg::CmdSkillTaskSpelling {
+                    word: boundary.word,
+                    candidates: &candidates,
+                })
+                .into_owned(),
+            )
+        });
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
         Ok(crate::commands::PreparedCommandInput {
@@ -992,18 +1051,24 @@ impl ListSkills {
                         .join(" · "),
                 },
             ),
-            output: with_skill_notice(
-                format!(
-                    "按 {} 开始",
-                    names
-                        .iter()
-                        .map(|name| bare_name(name))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                ),
-                &agent.session().events(),
-                &names,
-            ),
+            output: {
+                let output = with_skill_notice(
+                    format!(
+                        "按 {} 开始",
+                        names
+                            .iter()
+                            .map(|name| bare_name(name))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    ),
+                    &agent.session().events(),
+                    &names,
+                );
+                match spelling_notice {
+                    Some(notice) => format!("{output}\n{notice}"),
+                    None => output,
+                }
+            },
         })
     }
 }

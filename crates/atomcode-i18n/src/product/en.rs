@@ -1490,6 +1490,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 .into(),
         Msg::CmdCatalogSkills =>
             "Which skills are installed; give names and they are used together".into(),
+        Msg::CmdSkillSpellingSuggestion { candidates } => format!("Did you mean {candidates}? Nothing was corrected or loaded automatically.").into(),
+        Msg::CmdSkillTaskSpelling { word, candidates } => format!("`{word}` was not recognized as a skill and remains task text. Did you mean {candidates}? No automatic correction or additional skill loading was performed.").into(),
         Msg::CmdCatalogSkillsEmpty => "No skills installed".into(),
         Msg::CmdCatalogSkillDirs => "Skill scan directories".into(),
         Msg::CmdCatalogSkillDiagnostics => "Skill loading diagnostics".into(),

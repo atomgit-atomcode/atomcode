@@ -3484,6 +3484,53 @@ pub(crate) fn described_command_is_skill(
         })
 }
 
+pub(crate) fn skill_spelling_notice(
+    commands: &[atomcode_kernel::agent::CommandDescription],
+    line: &str,
+) -> Option<String> {
+    let (command, args) = line.trim_start().split_once(char::is_whitespace)?;
+    if !command.eq_ignore_ascii_case("/skills") {
+        return None;
+    }
+    let names: Vec<_> = commands
+        .iter()
+        .filter(|command| described_command_is_skill(command))
+        .map(|command| command.name.as_str())
+        .collect();
+    // Match registry resolution, rather than the menu's case-insensitive search.
+    let boundary = atomcode_capabilities::skills::spelling::invocation_boundary(args, |name| {
+        names.contains(&name)
+            || name
+                .strip_prefix("skills:")
+                .is_some_and(|bare| names.contains(&bare))
+            || (!name.contains(':')
+                && names
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.ends_with(&format!(":{}", name.to_ascii_lowercase()))
+                    })
+                    .count()
+                    == 1)
+    })?;
+    let suggestions =
+        atomcode_capabilities::skills::spelling::task_candidates(&boundary, names.iter().copied());
+    if suggestions.is_empty() {
+        return None;
+    }
+    let candidates = suggestions
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(
+        crate::i18n::product::t(crate::i18n::product::Msg::CmdSkillTaskSpelling {
+            word: boundary.word,
+            candidates: &candidates,
+        })
+        .into_owned(),
+    )
+}
+
 pub(crate) fn catalog_command_starts_turn(
     commands: &[atomcode_kernel::agent::CommandDescription],
     name: &str,

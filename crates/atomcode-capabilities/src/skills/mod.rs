@@ -17,6 +17,7 @@ pub mod catalog_hook;
 pub mod registry;
 pub mod render;
 pub mod skill;
+pub mod spelling;
 pub mod use_skill;
 
 pub use catalog_hook::SkillCatalogHook;
