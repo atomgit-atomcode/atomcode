@@ -1016,11 +1016,13 @@ fn push_single_line(into: &mut String, text: &str) -> bool {
 /// Escape `[` and `]` so a call field can neither close the call line's `]`
 /// nor open another tag on that line.
 ///
-/// A backslash run ending at a bracket is doubled first, so the bracket is
-/// left with an odd number of backslashes before it whatever the field
-/// contained. Escaping only the bracket would let a field's own `\` pair with
-/// the added one (`\]` → `\\]`), which under the same backslash convention
-/// reads as a literal backslash followed by an unescaped bracket.
+/// A backslash run ending at a bracket, or at the field's end, is doubled
+/// first: a bracket keeps an odd number before it, and the call line's own
+/// closing `]` — which follows the last field — keeps an even one. Escaping
+/// only the bracket would let a field's own `\` pair with the added one (`\]`
+/// → `\\]`), which under the same backslash convention reads as a literal
+/// backslash followed by an unescaped bracket; a trailing run would likewise
+/// make the line's closing bracket read as escaped.
 fn escape_brackets(text: &str) -> Cow<'_, str> {
     let mut extra = 0;
     let mut run = 0;
@@ -1034,6 +1036,10 @@ fn escape_brackets(text: &str) -> Cow<'_, str> {
             _ => run = 0,
         }
     }
+    // The last non-empty field ends right before the call line's own `]` (or
+    // before the separator of a field that follows): double its trailing run
+    // too, so the structural bracket is never left behind an odd count.
+    extra += run;
     if extra == 0 {
         return Cow::Borrowed(text);
     }
@@ -1062,6 +1068,7 @@ fn escape_brackets(text: &str) -> Cow<'_, str> {
     }
     for _ in 0..run {
         out.push('\\');
+        out.push('\\');
     }
     Cow::Owned(out)
 }
@@ -1070,8 +1077,8 @@ fn escape_brackets(text: &str) -> Cow<'_, str> {
 /// the field folds away, so the line never ends with a dangling space. Brackets
 /// are escaped after the per-item bound, so a cut marker is escaped with the
 /// field and a cut cannot split an escape pair; the escape doubles a backslash
-/// run ending at a bracket and adds one per bracket, so a bracket-heavy field
-/// renders at up to twice its bound.
+/// run ending at a bracket or at the field's end and adds one per bracket, so
+/// a field carrying them renders at up to twice its bound.
 fn push_call_field(into: &mut String, text: &str) {
     let text = escape_brackets(text.trim());
     let start = into.len();
@@ -3873,6 +3880,57 @@ mod tests {
                     "{bracket} at {index} has {run} backslashes in {field:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_call_field_trailing_backslash_does_not_escape_the_closing_bracket() {
+        // The field ends right before the call line's own `]`. A trailing
+        // backslash run left as-is would put an odd count before that bracket,
+        // which under the same convention reads as an escaped `]` — the line
+        // loses its structural close and can merge with the next one.
+        for count in 0..=4 {
+            let call = ToolCall {
+                id: "c1".into(),
+                name: "n".into(),
+                arguments: format!("path{}", "\\".repeat(count)),
+            };
+            let out = render_transcript(&[Message::assistant("", vec![call])]);
+            let line = out
+                .lines()
+                .find(|line| line.starts_with("[tool call:"))
+                .expect("the call line");
+            let closing = line.rfind(']').expect("the call line closes");
+            let run = line[..closing]
+                .chars()
+                .rev()
+                .take_while(|c| *c == '\\')
+                .count();
+            assert_eq!(run, count * 2, "the trailing run is doubled: {line:?}");
+        }
+        // With no arguments the name is the field next to the closing bracket.
+        for count in 0..=4 {
+            let call = ToolCall {
+                id: "c1".into(),
+                name: format!("n{}", "\\".repeat(count)),
+                arguments: " ".into(),
+            };
+            let out = render_transcript(&[Message::assistant("", vec![call])]);
+            let line = out
+                .lines()
+                .find(|line| line.starts_with("[tool call:"))
+                .expect("the call line");
+            let closing = line.rfind(']').expect("the call line closes");
+            let run = line[..closing]
+                .chars()
+                .rev()
+                .take_while(|c| *c == '\\')
+                .count();
+            assert_eq!(
+                run,
+                count * 2,
+                "the name's trailing run is doubled: {line:?}"
+            );
         }
     }
 
