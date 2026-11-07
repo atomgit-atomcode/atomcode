@@ -695,9 +695,12 @@ impl SessionManager {
             // matches (a converted session whose plan was never in this log),
             // fall back to a content match against the sidecar's **last** item
             // only: the narrower guess that still keeps the one reflected add
-            // from being written twice. The fallback is consumed by its first
-            // match, so a later add of the same content is applied instead of
-            // matching the same unchanged item again.
+            // from being written twice. That item is captured before the replay
+            // because the calls below extend the list: a repeat of a task this
+            // rebuild just added is a new fact, not the reflected one. And only
+            // the first add after the alignment is eligible — once a different
+            // add is applied the sidecar's tail is behind it, so a later repeat
+            // of the old tail is new too.
             fn same_items(left: &[TodoItem], right: &[TodoItem]) -> bool {
                 left.len() == right.len()
                     && left
@@ -705,21 +708,15 @@ impl SessionManager {
                         .zip(right)
                         .all(|(a, b)| a.content.trim() == b.content.trim() && a.status == b.status)
             }
-            fn adds_the_lists_tail(items: &[TodoItem], arguments: &str) -> bool {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-                    return false;
-                };
+            /// The content of an `add` action, when the call is one.
+            fn added_content(arguments: &str) -> Option<String> {
+                let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
                 if value.get("action").and_then(|action| action.as_str()) != Some("add") {
-                    return false;
+                    return None;
                 }
-                let Some(content) = value.get("content").and_then(|content| content.as_str())
-                else {
-                    return false;
-                };
+                let content = value.get("content").and_then(|content| content.as_str())?;
                 let content = content.trim();
-                items
-                    .last()
-                    .is_some_and(|item| !content.is_empty() && item.content.trim() == content)
+                (!content.is_empty()).then(|| content.to_string())
             }
             let mut start = 0;
             if legacy_baseline {
@@ -744,7 +741,11 @@ impl SessionManager {
                 }
             }
             let tail_only = start == 0 && legacy_baseline;
-            let mut tail_reflected = false;
+            let mut fallback_tail = if tail_only {
+                items.last().map(|item| item.content.trim().to_string())
+            } else {
+                None
+            };
             for (turn, round, index, _, arguments) in &calls[start..] {
                 let position = super::manager::TodoCallPosition {
                     turn: *turn,
@@ -754,14 +755,18 @@ impl SessionManager {
                 if through.is_some_and(|current| position <= current) {
                     continue;
                 }
-                if tail_only && !tail_reflected && adds_the_lists_tail(&items, arguments) {
-                    // The sidecar's last item already reflects one add. Consume
-                    // the fallback: a second add of the same content is a new
-                    // fact, and letting it match the same unchanged item again
-                    // would swallow it (and every later one).
-                    tail_reflected = true;
-                    through = Some(position);
-                    continue;
+                if fallback_tail.is_some() {
+                    if let Some(content) = added_content(arguments) {
+                        // The one add the sidecar already reflects, or a new
+                        // one: either way the fallback is spent now. Skipping
+                        // only a match keeps every later repeat a new fact.
+                        let reflected = fallback_tail.as_deref() == Some(content.as_str());
+                        fallback_tail = None;
+                        if reflected {
+                            through = Some(position);
+                            continue;
+                        }
+                    }
                 }
                 apply_todo_action(&mut items, arguments);
                 through = Some(position);
@@ -5859,6 +5864,196 @@ mod tests {
                 index: 0,
             })
         );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_keeps_a_repeat_of_a_new_add() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-new-add-repeat";
+        let lease = created(&manager, id);
+        let add = |call: &str| ToolCall {
+            id: call.into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"other"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a1")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 2,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a2")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                ],
+            )
+            .unwrap();
+        // The sidecar ends with a task neither add repeats. The first add grows
+        // the list to "other"; the second repeats it and is still a new fact —
+        // the tail it repeats is one this rebuild just made, not the sidecar's.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[crate::session::manager::TodoSidecarItem {
+                    content: "task".into(),
+                    status: "pending".into(),
+                }],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    5,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        let shown: Vec<&str> = sidecar
+            .todos
+            .iter()
+            .map(|todo| todo.content.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["task", "other", "other"],
+            "a repeat of a new add is a new task"
+        );
+        assert_eq!(
+            sidecar.through,
+            Some(crate::session::manager::TodoCallPosition {
+                turn: 1,
+                round: 2,
+                index: 0,
+            })
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_keeps_a_new_add_that_repeats_its_old_tail_after_another() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-old-tail-after-new-add";
+        let lease = created(&manager, id);
+        let add = |call: &str, content: &str| ToolCall {
+            id: call.into(),
+            name: "todowrite".into(),
+            arguments: format!(r#"{{"action":"add","content":"{content}"}}"#),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a1", "other")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 2,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a2", "task")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                ],
+            )
+            .unwrap();
+        // "other" is a new add and takes the new-fact decision with it: the
+        // later "task" repeats the sidecar's *old* tail, but the reflected add
+        // (if any) was the first one, so this one is new too.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    crate::session::manager::TodoSidecarItem {
+                        content: "plan".into(),
+                        status: "pending".into(),
+                    },
+                    crate::session::manager::TodoSidecarItem {
+                        content: "task".into(),
+                        status: "pending".into(),
+                    },
+                ],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    5,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        let shown: Vec<&str> = sidecar
+            .todos
+            .iter()
+            .map(|todo| todo.content.as_str())
+            .collect();
+        assert_eq!(shown, vec!["plan", "task", "other", "task"]);
     }
 
     #[cfg(feature = "tools")]

@@ -6748,8 +6748,12 @@ mod tests {
     fn a_sidecar_keeps_its_full_budget_alongside_a_baseline() {
         use crate::session::manager::TodoSidecarItem;
 
+        // Three quarters of one state's ceiling each: either list fits the
+        // budget on its own, and the two together are over a single one — so a
+        // shared budget would have to drop one of them.
+        let item = crate::session::manager::MAX_TODO_SIDECAR_BYTES * 3 / 4;
         let big = |status: &str| TodoSidecarItem {
-            content: "x".repeat(200 * 1024),
+            content: "x".repeat(item),
             status: status.into(),
         };
         let dir = tempfile::tempdir().unwrap();
@@ -6757,9 +6761,10 @@ mod tests {
         manager
             .write_todo_sidecar("big", &[big("pending")], 4, None)
             .unwrap();
-        // The second write carries the first list as a baseline: ~400 KiB of
-        // JSON. The baseline is stored beside the list under its own budget,
-        // so neither state halves the other's — both survive the write.
+        // The second write carries the first list as a baseline: together they
+        // are over one state's budget of JSON. The baseline is stored beside
+        // the list under its own budget, so neither state halves the other's —
+        // both survive the write.
         manager
             .write_todo_sidecar("big", &[big("completed")], 6, None)
             .unwrap();
