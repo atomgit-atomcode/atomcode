@@ -498,15 +498,18 @@ impl SessionManager {
             })
             .next_back();
 
-        // A failed result excludes the call it answered — the latest earlier
-        // call with that id, the same association the transcript fold makes by
-        // message order. Keyed by id alone, one turn's failure would drop a
-        // later turn that reused the id; keyed by turn and round it could miss
-        // a result filed under another round.
+        // A result answers the nearest earlier call with its id that no earlier
+        // result has settled — the same association the transcript fold makes by
+        // message order. A result never reaches back past the last call its id
+        // settled, so a duplicated or late failure cannot take back a call a
+        // success already answered. Every call is a candidate (a non-todo call
+        // can be the one a result answers); only todo calls join the fold.
         let mut calls: Vec<(u64, u32, u32, &str, &str)> = Vec::new();
-        let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut latest: std::collections::HashMap<&str, Option<usize>> =
+        let mut candidates: Vec<(&str, Option<usize>)> = Vec::new();
+        let mut settled: Vec<bool> = Vec::new();
+        let mut last_settled: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
+        let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (index, logged) in events.iter().enumerate() {
             if undone.contains(&logged.event.turn()) {
                 continue;
@@ -521,19 +524,19 @@ impl SessionManager {
                     tool_calls,
                     ..
                 } => {
-                    for (index, call) in tool_calls.iter().enumerate() {
-                        if is_todo_call(&call.name) {
-                            latest.insert(call.id.as_str(), Some(calls.len()));
+                    for (call_index, call) in tool_calls.iter().enumerate() {
+                        let todo = is_todo_call(&call.name).then(|| {
                             calls.push((
                                 *turn,
                                 *round,
-                                u32::try_from(index).unwrap_or(u32::MAX),
+                                u32::try_from(call_index).unwrap_or(u32::MAX),
                                 call.name.as_str(),
                                 call.arguments.as_str(),
                             ));
-                        } else {
-                            latest.insert(call.id.as_str(), None);
-                        }
+                            calls.len() - 1
+                        });
+                        candidates.push((call.id.as_str(), todo));
+                        settled.push(false);
                     }
                 }
                 SessionEvent::ToolResultLogged {
@@ -663,25 +666,57 @@ impl SessionManager {
                 sources = sidecar.source_seqs.clone();
             }
             // A sidecar written before positions existed cannot say which calls
-            // it already reflects. Same content means the task it adds is
-            // already in the list: advance past the call instead of writing it
-            // twice — and without dropping the list to avoid the duplicate.
-            let already_listed = |items: &[TodoItem], arguments: &str| -> bool {
+            // it already reflects. Align it once: replay the calls and keep the
+            // longest prefix whose fold equals the sidecar's own list. Calls
+            // after that prefix are facts it has not seen — including an `add`
+            // whose content merely repeats an older task, which the old
+            // anywhere-in-the-list match used to swallow. When no prefix
+            // matches (a converted session whose plan was never in this log),
+            // fall back to a content match against the sidecar's **last** item
+            // only: the narrower guess that still keeps a reflected add from
+            // being written twice.
+            fn same_items(left: &[TodoItem], right: &[TodoItem]) -> bool {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(a, b)| a.content.trim() == b.content.trim() && a.status == b.status)
+            }
+            fn adds_the_lists_tail(items: &[TodoItem], arguments: &str) -> bool {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
                     return false;
                 };
                 if value.get("action").and_then(|action| action.as_str()) != Some("add") {
                     return false;
                 }
-                value
-                    .get("content")
-                    .and_then(|content| content.as_str())
-                    .map(str::trim)
-                    .is_some_and(|content| {
-                        !content.is_empty() && items.iter().any(|item| item.content == content)
-                    })
-            };
-            for (turn, round, index, _, arguments) in &calls {
+                let Some(content) = value.get("content").and_then(|content| content.as_str())
+                else {
+                    return false;
+                };
+                let content = content.trim();
+                items
+                    .last()
+                    .is_some_and(|item| !content.is_empty() && item.content.trim() == content)
+            }
+            let mut start = 0;
+            if legacy_baseline {
+                for count in 0..=calls.len() {
+                    let folded = reduce_todos(
+                        calls[..count]
+                            .iter()
+                            .map(|(_, _, _, name, arguments)| (*name, *arguments)),
+                    );
+                    if same_items(&folded, &items) {
+                        start = count;
+                    }
+                }
+                if start > 0 {
+                    let (turn, round, index, _, _) = calls[start - 1];
+                    through = Some(super::manager::TodoCallPosition { turn, round, index });
+                }
+            }
+            let tail_only = start == 0 && legacy_baseline;
+            for (turn, round, index, _, arguments) in &calls[start..] {
                 let position = super::manager::TodoCallPosition {
                     turn: *turn,
                     round: *round,
@@ -690,7 +725,7 @@ impl SessionManager {
                 if through.is_some_and(|current| position <= current) {
                     continue;
                 }
-                if legacy_baseline && already_listed(&items, arguments) {
+                if tail_only && adds_the_lists_tail(&items, arguments) {
                     through = Some(position);
                     continue;
                 }
@@ -1165,9 +1200,10 @@ impl SessionManager {
             .len())
     }
 
-    /// Whether the bytes a rollback would cut (everything after `mark`) carry an
-    /// undo or cancel fact. Only then can the todo sidecar differ from its
-    /// pre-append state.
+    /// Whether the bytes a rollback would cut (everything after `mark`) can
+    /// move the todo fold: an undo or cancel fact, a todo call, or a tool
+    /// result whose settlement can change which call stands. Only then can the
+    /// sidecar differ from its pre-append state.
     #[cfg(feature = "tools")]
     fn truncated_tail_moves_todo_boundary(&self, id: &str, mark: u64) -> bool {
         let Ok(path) = self.events_path(id) else {
@@ -1199,6 +1235,13 @@ impl SessionManager {
             // is treated as "may have moved the boundary".
             #[serde(default)]
             scope: Option<atomcode_kernel::session::RewindScope>,
+            #[serde(default)]
+            tool_calls: Vec<TailCall>,
+        }
+        #[derive(serde::Deserialize)]
+        struct TailCall {
+            #[serde(default)]
+            name: String,
         }
         #[derive(serde::Deserialize)]
         struct TailRecord {
@@ -1231,6 +1274,17 @@ impl SessionManager {
                     }
                 }
                 Some("interrupted") => return true,
+                // A cut todo call leaves the sidecar describing work the log no
+                // longer has; a cut result can change which todo call stands.
+                Some("assistant_message")
+                    if event
+                        .tool_calls
+                        .iter()
+                        .any(|call| crate::tools::todo::is_todo_call(&call.name)) =>
+                {
+                    return true;
+                }
+                Some("tool_result_logged") => return true,
                 _ => {}
             }
         }
@@ -5105,6 +5159,296 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
+    fn a_legacy_sidecar_keeps_a_new_add_that_repeats_a_task() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-new-same-add";
+        let lease = created(&manager, id);
+        let add = |call: &str| ToolCall {
+            id: call.into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"task"}"#.into(),
+        };
+        let call = |turn: u64, call: ToolCall| {
+            logged(
+                2 * turn,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn,
+                    round: 1,
+                    text: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: vec![call],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            )
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    call(1, add("a1")),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "a1".into(),
+                            content: "#1 [ ] task".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                    call(2, add("a2")),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "a2".into(),
+                            content: "#2 [ ] task".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "later".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // The legacy sidecar already reflects the first add; the second one is
+        // a new fact even though its content repeats the first task.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[crate::session::manager::TodoSidecarItem {
+                    content: "task".into(),
+                    status: "pending".into(),
+                }],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 3,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(
+            sidecar.todos.len(),
+            2,
+            "the repeat is a new task, not a duplicate to swallow"
+        );
+        assert!(sidecar.through.is_some());
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_still_skips_the_add_it_ends_with() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-tail-add";
+        let lease = created(&manager, id);
+        let add = ToolCall {
+            id: "a".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"task"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(3, 0, SessionEvent::TurnStart { turn: 2 }),
+                ],
+            )
+            .unwrap();
+        // A converted session's list may hold a plan the log never had; the
+        // add it ends with is the one the trailing call reflects.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    crate::session::manager::TodoSidecarItem {
+                        content: "plan".into(),
+                        status: "pending".into(),
+                    },
+                    crate::session::manager::TodoSidecarItem {
+                        content: "task".into(),
+                        status: "pending".into(),
+                    },
+                ],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    4,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 3,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(
+            sidecar.todos.len(),
+            2,
+            "the reflected add is not written twice"
+        );
+        assert!(sidecar.through.is_some());
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_duplicate_error_does_not_fail_a_settled_plan_in_the_rebuild() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "duplicate-error-settled-plan";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: "p".into(),
+                                name: "todowrite".into(),
+                                arguments:
+                                    r#"{"todos":[{"content":"task","status":"in_progress"}]}"#
+                                        .into(),
+                            }],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "#1 [~] task".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    // A duplicated, late failure for the same call id.
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "late failure".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "later".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the settled plan survives the duplicate failure");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].status, "in_progress");
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
     fn a_rewind_rebuilds_the_todo_sidecar() {
         let (_dir, manager) = store();
         let lease = todo_session(&manager, "rewind-todos");
@@ -7077,6 +7421,61 @@ mod tests {
             )
             .unwrap();
         assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
+
+        // A cut tail carrying a todo call moves the fold even without an undo:
+        // the sidecar may already reflect a call the log would no longer have.
+        let id = "truncate-tail-todo-call";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::AssistantMessage {
+                        turn: 1,
+                        round: 2,
+                        text: String::new(),
+                        reasoning: String::new(),
+                        tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                            id: "t".into(),
+                            name: "todowrite".into(),
+                            arguments: r#"{"action":"add","content":"x"}"#.into(),
+                        }],
+                        reasoning_blocks: vec![],
+                        meta: None,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
+
+        // A cut assistant message with no todo call leaves the fold alone.
+        let id = "truncate-tail-plain-message";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::AssistantMessage {
+                        turn: 1,
+                        round: 2,
+                        text: "just prose".into(),
+                        reasoning: String::new(),
+                        tool_calls: vec![],
+                        reasoning_blocks: vec![],
+                        meta: None,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(!manager.truncated_tail_moves_todo_boundary(id, mark));
     }
 
     #[cfg(feature = "tools")]
