@@ -108,6 +108,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── the moment ──
+        Msg::MomentHistoryClear => "History recalled · Ctrl+C clears input · Esc stops the task".into(),
         Msg::MomentQuitAgain => "press Ctrl+C again to quit".into(),
         Msg::MomentEofAgain => "press Ctrl+D again to quit".into(),
 
@@ -555,12 +556,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+R                          search what you have typed in this project before; type to narrow, ctrl-r again for older, enter takes it, esc gives your draft back
 
   ── During a turn ──
-    Esc / Ctrl+C                    stop the turn and hand what was queued back to the composer
+    Esc                             stop the turn and return queued messages
+    Ctrl+C                          clear input; stop the turn only when input is empty
     Ctrl+X                          stop the turn and send what was queued right away
 
   ── Idle ──
     Esc Esc                         clear the composer; twice more on an empty one opens rewind
-    Ctrl+C                          clear the composer, again to quit
+    Ctrl+C                          clear input; on an empty composer, press twice to quit
 
   ── Reading & display ──
     PgUp / PgDn                     page through the conversation

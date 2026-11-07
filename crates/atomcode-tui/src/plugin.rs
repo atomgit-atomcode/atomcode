@@ -7663,6 +7663,14 @@ impl Tui {
         if m.eof_armed {
             m.disarm_quit();
         }
+        // Editing wins over process control: clearing a draft must neither
+        // stop an active turn nor arm exit, including attachment-only drafts.
+        let action =
+            if action == Action::Cancel && (!m.input.is_empty() || !m.attachments.is_empty()) {
+                Action::Clear
+            } else {
+                action
+            };
         // Any action other than a repeat Ctrl+C disarms the "press again to quit"
         // latch, and takes the exit hint below the box down with it: an accidental
         // first press followed by real work must never leave the terminal one
@@ -8113,15 +8121,7 @@ impl Tui {
                 }
             }
             Action::Clear => {
-                m.input.clear();
-                // The `[Pasted …]` markers went with the text, so the bodies they
-                // stood for go too.
-                m.clear_pastes();
-                // The markers went with the text, so the images they stood for
-                // go too. Leaving them held would make the composer's state
-                // disagree with the only place a person can see it.
-                m.attachments.clear();
-                m.caret = 0;
+                m.clear_composer();
             }
             Action::CaretLeft => {
                 // Nothing typed: left opens the background sessions, where there
@@ -10883,9 +10883,13 @@ fn recall_back(m: &mut crate::moment::Moment) {
         Some(0) => return, // already at the oldest; going further is nowhere
         Some(i) => i - 1,
     };
+    let entering = m.history_at.is_none();
     m.history_at = Some(at);
     m.input = m.history[at].clone();
     m.caret = 0;
+    if entering {
+        m.hint_history_clear();
+    }
 }
 
 /// Forward one entry, and out the far side to the draft that was set aside.
@@ -15839,6 +15843,69 @@ mod skills_menu_tests {
         let mut m = host.moment.write().expect("moment poisoned");
         m.input = line.into();
         m.caret = line.len();
+    }
+
+    #[test]
+    fn ctrl_c_discards_a_draft_without_stopping_or_arming_exit() {
+        for running in [false, true] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = "history text".into();
+                m.caret = m.input.len();
+                m.draft = "old draft".into();
+                m.history = Arc::new(vec!["history text".into()]);
+                m.history_at = Some(0);
+                m.pastes = Arc::new(vec!["paste body".into()]);
+                m.turn_open = running;
+                m.activity = if running {
+                    crate::moment::Activity::Working
+                } else {
+                    crate::moment::Activity::Idle
+                };
+                m.quit_armed = true;
+                m.attachments.add(atomcode_kernel::message::ImageContent {
+                    media_type: "image/png".into(),
+                    data: "test".into(),
+                });
+            }
+            assert!(!tui.act(Action::Cancel, &tui.client));
+            let m = host.moment.read().unwrap();
+            assert!(
+                m.input.is_empty()
+                    && m.draft.is_empty()
+                    && m.pastes.is_empty()
+                    && m.attachments.is_empty()
+            );
+            assert_eq!(m.caret, 0);
+            assert!(m.history_at.is_none() && m.search.is_none());
+            assert!(!m.quit_armed && !m.eof_armed && !m.stopping);
+            assert_eq!(m.turn_open, running);
+            assert_eq!(m.history.len(), 1, "history records are retained");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_clears_attachment_only_drafts_and_requires_fresh_exit_presses() {
+        let (host, tui) = screen();
+        host.moment
+            .write()
+            .unwrap()
+            .attachments
+            .add(atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "test".into(),
+            });
+        assert!(!tui.act(Action::Cancel, &tui.client));
+        assert!(!host.moment.read().unwrap().quit_armed);
+        assert!(
+            !tui.act(Action::Cancel, &tui.client),
+            "empty line first press only arms"
+        );
+        assert!(
+            tui.act(Action::Cancel, &tui.client),
+            "empty line second press exits"
+        );
     }
 
     #[test]

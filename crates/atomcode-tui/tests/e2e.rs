@@ -1531,10 +1531,10 @@ async fn esc_puts_what_was_queued_back_in_the_composer() {
     let _ = task.await;
 }
 
-/// `ctrl-c` is the same stop, and hands the queue back the same way — ahead of
-/// whatever is being typed, which is where it stood in time.
+/// With a draft, Ctrl+C clears only that draft. Esc still stops the turn
+/// and returns queued messages without resurrecting the discarded text.
 #[tokio::test]
-async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
+async fn ctrl_c_clears_the_draft_and_escape_returns_the_queued_messages() {
     let dir = scratch("ctrl-c-queued-back");
     let script = replay(
         r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
@@ -1546,6 +1546,22 @@ async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
     s.term.type_text("DRAFT-e5");
 
     s.term.press(KeyPress::ctrl('c'));
+    for _ in 0..100 {
+        if !composer_text(&s).contains("DRAFT-e5") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let cleared = composer_text(&s);
+    assert!(
+        !cleared.contains("DRAFT-e5") && !cleared.contains("QUEUED"),
+        "Ctrl+C only discards the draft: {cleared}"
+    );
+    assert!(
+        !a_turn_was_interrupted(&s),
+        "clearing must not stop the turn"
+    );
+    s.term.press(KeyPress::plain(Key::Esc));
     for _ in 0..300 {
         if composer_text(&s).contains("QUEUED-d4") {
             break;
@@ -1558,9 +1574,9 @@ async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
     assert!(
         matches!(
             (at("QUEUED-c3"), at("QUEUED-d4"), at("DRAFT-e5")),
-            (Some(c), Some(d), Some(e)) if c < d && d < e
+            (Some(c), Some(d), None) if c < d
         ),
-        "the queue comes back ahead of the draft, which is kept:\n{field}"
+        "Esc returns the queue, without the draft discarded by Ctrl+C:\n{field}"
     );
     assert!(
         !user_messages(&s).iter().any(|m| m.contains("QUEUED")),

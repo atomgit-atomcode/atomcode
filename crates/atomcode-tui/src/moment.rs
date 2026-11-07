@@ -1469,6 +1469,24 @@ impl Moment {
         self.recent_folded_paste = None;
     }
 
+    /// Discard only the composer state; never change turn or stop state.
+    pub fn clear_composer(&mut self) {
+        self.disarm_quit();
+        self.input.clear();
+        self.caret = 0;
+        self.clear_pastes();
+        self.attachments.clear();
+        self.history_at = None;
+        self.search = None;
+        self.draft.clear();
+    }
+
+    pub fn hint_history_clear(&mut self) {
+        self.disarm_quit();
+        self.notice =
+            Some(Notice::for_ms(t(Msg::MomentHistoryClear), false, self.now, NOTICE_MS).below());
+    }
+
     /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
     /// that quits, `false` when it is the first that arms.
     ///

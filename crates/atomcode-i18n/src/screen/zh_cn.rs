@@ -94,6 +94,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── 当下 ──
+        Msg::MomentHistoryClear => "已填入历史消息 · Ctrl+C 清空输入 · Esc 停止任务".into(),
         Msg::MomentQuitAgain => "再按 Ctrl+C 退出".into(),
         Msg::MomentEofAgain => "再按 Ctrl+D 退出".into(),
 
@@ -518,12 +519,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+R                          搜索这个项目里以前打过的东西；继续打字缩小范围，再按往更老翻，Enter 接受，Esc 还回草稿
 
   ── 回合进行中 ──
-    Esc / Ctrl+C                    停止当轮；排队的话退回输入框
+    Esc                             停止当轮；排队的话退回输入框
+    Ctrl+C                          有输入时只清空；输入为空时停止当轮
     Ctrl+X                          停止当轮；排队的话立刻发出
 
   ── 空闲时 ──
     Esc Esc                         清空输入；输入已空再连按两下打开回退
-    Ctrl+C                          清空输入；再按一次退出
+    Ctrl+C                          有输入时只清空；输入为空时双击退出
 
   ── 翻看与显示 ──
     PgUp / PgDn                     按屏翻页（保留一行重叠）

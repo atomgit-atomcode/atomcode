@@ -191,7 +191,7 @@ pub enum Action {
     HistoryBack,
     /// Forward through it, and out to the draft. `ctrl-n`.
     HistoryForward,
-    /// Stop the running turn. Cooperative.
+    /// Clear a nonempty composer; otherwise cooperatively stop or arm exit.
     Cancel,
     Quit,
     Scroll(i32),
@@ -216,9 +216,8 @@ pub enum Action {
     /// A line break inside what is being typed, rather than sending it.
     Newline,
     /// Back out of the innermost thing: the selection, then what is typed, then
-    /// the turn. Distinct from [`Action::Cancel`], which always stops the turn —
-    /// pressing ctrl-c to stop a model that is running must not turn into
-    /// "cleared your draft" just because there was one.
+    /// the turn. While a turn runs this remains the direct stop gesture;
+    /// [`Action::Cancel`] gives clearing a nonempty composer priority.
     Escape,
     /// 停掉这一轮,然后把排在它后面的话立刻发出去。
     ///

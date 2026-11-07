@@ -209,6 +209,7 @@ pub fn key(m: &mut Moment, press: KeyPress) -> Step {
 fn accept(m: &mut Moment, s: &Search) {
     if let Some(i) = s.at() {
         m.input = m.history[i].clone();
+        m.hint_history_clear();
     }
     m.caret = m.input.len();
 }
