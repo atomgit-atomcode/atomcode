@@ -91,27 +91,16 @@ async fn registry_connect_discover_and_call_echo() {
 
 /// Regression-style reproduction: a stdio server whose `args` contain spaces and
 /// non-ASCII characters (a script path under a directory with a CJK name). The
-/// arg is written as `${UNICODE_ARG}` in `.mcp.json`, so the value only reaches
-/// argv through `load_mcp_config` → `expand_env_vars` — a regression of the
+/// arg is written as `${UNICODE_ARG:-<cjk path>}` in `.mcp.json` — the variable
+/// is deliberately never set, so the value reaches argv through the default
+/// branch of `load_mcp_config` → `expand_env_vars` — a regression of the
 /// byte-wise expansion fails the byte-for-byte assertion below, before any
-/// connection is attempted. Connect and reconnect then also exercise such args
-/// in argv (the fixture ignores extra args, so they are not the guard).
+/// connection is attempted. No process env is mutated, so the test cannot race
+/// other tests' environ reads. Connect and reconnect then also exercise such
+/// args in argv (the fixture ignores extra args, so they are not the guard).
 #[tokio::test]
-#[serial_test::serial(unicode_arg_env)]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
-    // serial(unicode_arg_env) only serializes against other tests that join
-    // the same group — today this test is its only member. The attribute marks
-    // the group any future test that also mutates UNICODE_ARG must join; the
-    // guard removes the variable again even on assertion failure.
-    struct RemoveEnvOnDrop;
-    impl Drop for RemoveEnvOnDrop {
-        fn drop(&mut self) {
-            std::env::remove_var("UNICODE_ARG");
-        }
-    }
-    std::env::set_var("UNICODE_ARG", UNICODE_ARG);
-    let _env_guard = RemoveEnvOnDrop;
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join(".mcp.json"),
@@ -119,7 +108,9 @@ async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
             "mcpServers": {
                 "spacey-args": {
                     "command": env!("CARGO_BIN_EXE_mcp-test-server"),
-                    "args": ["${UNICODE_ARG}"]
+                    // Never set UNICODE_ARG anywhere: the default branch of
+                    // ${VAR:-default} carries the CJK value through expansion.
+                    "args": ["${UNICODE_ARG:-/tmp/中文 目录/with space/server.py}"]
                 }
             }
         })
