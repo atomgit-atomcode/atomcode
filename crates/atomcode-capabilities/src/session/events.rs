@@ -505,11 +505,15 @@ impl SessionManager {
         // success already answered. Every call is a candidate (a non-todo call
         // can be the one a result answers); only todo calls join the fold.
         let mut calls: Vec<(u64, u32, u32, &str, &str)> = Vec::new();
-        let mut candidates: Vec<(&str, Option<usize>)> = Vec::new();
-        let mut settled: Vec<bool> = Vec::new();
         let mut last_settled: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
+        // Per id, the calls a result has not settled yet, newest last. A result
+        // pops the nearest one in constant time; rescanning the prefix made a
+        // long session's association quadratic.
+        let mut pending: std::collections::HashMap<&str, Vec<(usize, Option<usize>)>> =
+            std::collections::HashMap::new();
         let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut candidate = 0usize;
         for (index, logged) in events.iter().enumerate() {
             if undone.contains(&logged.event.turn()) {
                 continue;
@@ -535,18 +539,35 @@ impl SessionManager {
                             ));
                             calls.len() - 1
                         });
-                        candidates.push((call.id.as_str(), todo));
-                        settled.push(false);
+                        pending
+                            .entry(call.id.as_str())
+                            .or_default()
+                            .push((candidate, todo));
+                        candidate += 1;
                     }
                 }
                 SessionEvent::ToolResultLogged {
                     call_id, is_error, ..
                 } => {
-                    // Success also settles the call: a duplicate failure must
-                    // not invalidate it or reach an older occurrence of its id.
-                    if let Some(Some(position)) = latest.remove(call_id.as_str()) {
-                        if *is_error {
-                            failed.insert(position);
+                    let Some(open) = pending.get_mut(call_id.as_str()) else {
+                        continue;
+                    };
+                    let Some((position, todo)) = open.last().copied() else {
+                        continue;
+                    };
+                    if last_settled
+                        .get(call_id.as_str())
+                        .is_some_and(|last| position < *last)
+                    {
+                        // The nearest unsettled call is older than the last one
+                        // this id settled: a late duplicate, not its answer.
+                        continue;
+                    }
+                    open.pop();
+                    last_settled.insert(call_id.as_str(), position);
+                    if *is_error {
+                        if let Some(todo) = todo {
+                            failed.insert(todo);
                         }
                     }
                 }
@@ -700,14 +721,19 @@ impl SessionManager {
             }
             let mut start = 0;
             if legacy_baseline {
-                for count in 0..=calls.len() {
-                    let folded = reduce_todos(
-                        calls[..count]
-                            .iter()
-                            .map(|(_, _, _, name, arguments)| (*name, *arguments)),
-                    );
+                // One pass over the calls, folding as `reduce_todos` would:
+                // a valid full list resets the fold, an action applies to it.
+                // Re-folding every prefix made this alignment quadratic in the
+                // calls of a long session.
+                let mut folded: Vec<TodoItem> = Vec::new();
+                for (count, (_, _, _, _, arguments)) in calls.iter().enumerate() {
+                    if let Ok(planned) = crate::tools::todo::parse_todos(arguments) {
+                        folded = planned;
+                    } else {
+                        apply_todo_action(&mut folded, arguments);
+                    }
                     if same_items(&folded, &items) {
-                        start = count;
+                        start = count + 1;
                     }
                 }
                 if start > 0 {
@@ -4609,6 +4635,231 @@ mod tests {
             sidecar.baseline.is_some(),
             "the recoverable state stays reachable for a later undo"
         );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn an_undo_replays_the_standing_turns_over_the_earliest_baseline() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-increments-undone-in-order";
+        let lease = created(&manager, id);
+        let planned_at = TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        };
+        let updated_at = TodoCallPosition {
+            turn: 2,
+            round: 1,
+            index: 0,
+        };
+        let item = |content: &str, status: &str| TodoSidecarItem {
+            content: content.into(),
+            status: status.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 10, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        11,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "plan".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        12,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // The plan exists only in the sidecar (a converted session).
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[item("finish it", "pending")],
+                3,
+                Some(planned_at),
+                &[2],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(4, 20, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        21,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "done".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        6,
+                        22,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: "u".into(),
+                                name: "todowrite".into(),
+                                arguments: r#"{"action":"update","id":1,"status":"completed"}"#
+                                    .into(),
+                            }],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        7,
+                        23,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#1 [x] finish it".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[item("finish it", "completed")],
+                7,
+                Some(updated_at),
+                &[2],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(8, 30, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        9,
+                        31,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "more".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        10,
+                        32,
+                        SessionEvent::AssistantMessage {
+                            turn: 3,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: "a".into(),
+                                name: "todowrite".into(),
+                                arguments: r#"{"action":"add","content":"second"}"#.into(),
+                            }],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        11,
+                        33,
+                        SessionEvent::ToolResultLogged {
+                            turn: 3,
+                            round: 1,
+                            call_id: "a".into(),
+                            content: "#2 [ ] second".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[item("finish it", "completed"), item("second", "pending")],
+                11,
+                Some(TodoCallPosition {
+                    turn: 3,
+                    round: 1,
+                    index: 0,
+                }),
+                &[2],
+            )
+            .unwrap();
+
+        // Undo turn 3. The baseline is the state after turn 1, but the
+        // standing turn-2 update must be replayed on top of it: stopping at
+        // the baseline itself would be the too-early list.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    12,
+                    40,
+                    SessionEvent::Rewound {
+                        turn: 3,
+                        to: 8,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(
+            sidecar.todos[0].status, "completed",
+            "the standing update is applied over the baseline"
+        );
+        assert_eq!(sidecar.through, Some(updated_at));
+        assert!(
+            sidecar.baseline.is_some(),
+            "the earliest recovery point stays reachable for the next undo"
+        );
+
+        // Undo turn 2 as well: back to the plan, not to an empty list.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    13,
+                    41,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].status, "pending");
+        assert_eq!(sidecar.through, Some(planned_at));
     }
 
     #[cfg(feature = "tools")]

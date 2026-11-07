@@ -1557,8 +1557,12 @@ impl SessionManager {
         // Keep the state before this write's calls so an undo that takes one
         // back can rebuild the list even when the plan itself is no longer in
         // the log. An older baseline is already the furthest recoverable point.
-        // A previous sidecar written against a longer conversation describes a
-        // state an undo has taken back, so it is not frozen as the baseline.
+        // A previous sidecar written against a longer conversation is not a
+        // state to fall back to: either an undo or a compaction shrank the
+        // projection. Its older baseline still is, and dropping that too would
+        // lose the only recovery point the next undo has. (The rebuild clears
+        // a baseline whose plan the undo took back; it runs before the next
+        // hook write, so a stale list is never kept as a fallback.)
         let baseline = match self.read_todo_sidecar(id) {
             Ok(Some(previous)) if previous.message_count <= message_count => {
                 previous.baseline.or(Some(TodoSidecarBaseline {
@@ -1566,6 +1570,7 @@ impl SessionManager {
                     through: previous.through,
                 }))
             }
+            Ok(Some(previous)) => previous.baseline,
             _ => None,
         };
         self.write_todo_sidecar_full(id, todos, message_count, through, source_seqs, baseline)
@@ -1589,6 +1594,8 @@ impl SessionManager {
                 message: "invalid source references".into(),
             });
         }
+        // Adding recovery data must not halve the accepted size of a current
+        // plan, nor allow either state to grow beyond its original budget.
         let mut sidecar = TodoSidecar {
             source_seqs: source_seqs.to_vec(),
             todos: todos.to_vec(),
@@ -1605,20 +1612,6 @@ impl SessionManager {
             serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_FILE_BYTES)?
         } else {
             current
-        };
-        let bytes = match serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES) {
-            Ok(bytes) => bytes,
-            // The baseline is a recovery aid, not the list itself. A sidecar
-            // that only fits without it keeps the list (and the write) instead
-            // of failing as a whole.
-            Err(SessionStoreError::TooLarge { .. }) if sidecar.baseline.is_some() => {
-                let trimmed = TodoSidecar {
-                    baseline: None,
-                    ..sidecar
-                };
-                serialize_bounded(&trimmed, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?
-            }
-            Err(error) => return Err(error),
         };
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)
     }
@@ -6707,22 +6700,28 @@ mod tests {
             "the state before this write is recoverable"
         );
 
-        // The conversation shrank since the last write (an undo): that list is
-        // not frozen as the state to fall back to.
+        // The conversation shrank since the last write (an undo or a
+        // compaction): the list being replaced is not frozen as the state to
+        // fall back to, but the older baseline still is — dropping it would
+        // throw away the only recovery point a later undo has.
         manager
             .write_todo_sidecar("s", &[item("pending")], 4, None)
             .unwrap();
         let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
         assert_eq!(sidecar.todos[0].status, "pending");
-        assert!(
-            sidecar.baseline.is_none(),
-            "a pre-undo list must not become the recoverable baseline"
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the stale completed list is not kept, the older baseline is"
         );
     }
 
     #[cfg(feature = "tools")]
     #[test]
-    fn a_sidecar_too_large_with_its_baseline_keeps_the_list() {
+    fn a_sidecar_keeps_its_full_budget_alongside_a_baseline() {
         use crate::session::manager::TodoSidecarItem;
 
         let big = |status: &str| TodoSidecarItem {
@@ -6734,18 +6733,27 @@ mod tests {
         manager
             .write_todo_sidecar("big", &[big("pending")], 4, None)
             .unwrap();
-        // The second write would carry the first list as a baseline: ~400 KiB
-        // of JSON, over the sidecar's 256 KiB ceiling. The list survives; the
-        // recovery aid is dropped rather than failing the write as a whole.
+        // The second write carries the first list as a baseline: ~400 KiB of
+        // JSON. The baseline is stored beside the list under its own budget,
+        // so neither state halves the other's — both survive the write.
         manager
             .write_todo_sidecar("big", &[big("completed")], 6, None)
             .unwrap();
         let sidecar = manager.read_todo_sidecar("big").unwrap().expect("written");
         assert_eq!(sidecar.todos[0].status, "completed");
-        assert!(
-            sidecar.baseline.is_none(),
-            "the oversized baseline is dropped"
-        );
+        let baseline = sidecar.baseline.expect("the baseline is stored beside the list");
+        assert_eq!(baseline.todos[0].status, "pending");
+
+        // A list over its own budget is rejected as a whole; the previously
+        // written state stays intact.
+        let huge = [TodoSidecarItem {
+            content: "x".repeat(crate::session::manager::MAX_TODO_SIDECAR_BYTES),
+            status: "pending".into(),
+        }];
+        assert!(manager.write_todo_sidecar("big", &huge, 9, None).is_err());
+        let sidecar = manager.read_todo_sidecar("big").unwrap().expect("written");
+        assert_eq!(sidecar.todos[0].status, "completed");
+        assert_eq!(sidecar.baseline.unwrap().todos[0].status, "pending");
     }
 
     #[test]

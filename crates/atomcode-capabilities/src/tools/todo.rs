@@ -1080,6 +1080,9 @@ mod tests {
             Message::tool_result("dup", "read failed", true),
         ];
         assert_eq!(active_todo_calls(&messages).len(), 1);
+    }
+
+    #[test]
     fn a_late_duplicate_result_does_not_reach_back_to_an_older_call() {
         // An earlier call with the same id never got a result; a duplicated
         // error after the later call's success must not be read as its answer.
