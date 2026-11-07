@@ -929,8 +929,11 @@ fn expand_env_vars(s: &str) -> String {
             Some(sep) => (&inner[..sep], Some(&inner[sep + 2..])),
             None => (inner, None),
         };
-        let value =
-            std::env::var(var_name).unwrap_or_else(|_| default.unwrap_or_default().to_string());
+        let value = match std::env::var(var_name) {
+            Ok(value) => value,
+            // 无 default 时以 `String::new()` 收尾，不为空串多分配一次。
+            Err(_) => default.map(str::to_string).unwrap_or_default(),
+        };
         result.push_str(&value);
         rest = &after_brace[end + 1..];
     }
