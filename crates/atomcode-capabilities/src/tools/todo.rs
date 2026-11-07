@@ -382,32 +382,21 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
         .iter()
         .rposition(Message::is_user_interruption)
         .map_or(messages, |index| &messages[index + 1..]);
-    // Each result answers the nearest earlier call with its id that no earlier
-    // result has already settled — not every call sharing the id. A provider
-    // that reuses ids across turns must not let one turn's failure drop a later
-    // turn's call, and a duplicated result must not re-answer (and fail) a call
-    // a successful result already settled.
+    // A result settles only the latest call with this id, once. Keep even
+    // non-todo calls in the map so a reused id cannot reach an older todo.
+    // Removing the entry on settlement ignores duplicate results without
+    // searching backwards into an older, unanswered occurrence of the id.
+    let mut pending = std::collections::HashMap::new();
     let mut failed = std::collections::HashSet::new();
-    let mut settled = std::collections::HashSet::new();
-    for (index, message) in active_messages.iter().enumerate() {
-        let Some(id) = message.tool_call_id.as_deref() else {
-            continue;
-        };
-        let answered = active_messages[..index].iter().enumerate().rev().find_map(
-            |(message_index, earlier)| {
-                earlier
-                    .tool_calls
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(call_index, call)| {
-                        (call.id == id && !settled.contains(&(message_index, call_index)))
-                            .then_some((message_index, call_index))
-                    })
-            },
-        );
-        if let Some(call) = answered {
-            settled.insert(call);
+    for (message_index, message) in active_messages.iter().enumerate() {
+        for (call_index, call) in message.tool_calls.iter().enumerate() {
+            pending.insert(call.id.as_str(), (message_index, call_index));
+        }
+        if let Some(call) = message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| pending.remove(id))
+        {
             if message.is_error {
                 failed.insert(call);
             }
@@ -1063,6 +1052,34 @@ mod tests {
         let calls = active_todo_calls(&messages);
         assert_eq!(calls.len(), 1, "the settled plan stays active");
         assert_eq!(calls[0].call.id, "dup");
+    }
+
+    #[test]
+    fn a_duplicate_result_does_not_reach_an_older_unanswered_call() {
+        let messages = vec![
+            write_call("dup", PLAN3),
+            write_call("dup", r#"{"action":"add","content":"later"}"#),
+            Message::tool_result("dup", "added", false),
+            Message::tool_result("dup", "duplicate failure", true),
+        ];
+        assert_eq!(active_todo_calls(&messages).len(), 2);
+    }
+
+    #[test]
+    fn a_non_todo_call_shadows_an_older_todo_with_the_same_id() {
+        let messages = vec![
+            write_call("dup", PLAN3),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "dup".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("dup", "read failed", true),
+        ];
+        assert_eq!(active_todo_calls(&messages).len(), 1);
     }
 
     #[test]

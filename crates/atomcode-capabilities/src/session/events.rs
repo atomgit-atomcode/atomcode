@@ -537,12 +537,14 @@ impl SessionManager {
                     }
                 }
                 SessionEvent::ToolResultLogged {
-                    call_id,
-                    is_error: true,
-                    ..
+                    call_id, is_error, ..
                 } => {
-                    if let Some(Some(position)) = latest.get(call_id.as_str()) {
-                        failed.insert(*position);
+                    // Success also settles the call: a duplicate failure must
+                    // not invalidate it or reach an older occurrence of its id.
+                    if let Some(Some(position)) = latest.remove(call_id.as_str()) {
+                        if *is_error {
+                            failed.insert(position);
+                        }
                     }
                 }
                 _ => {}
@@ -6677,6 +6679,143 @@ mod tests {
                 .as_ref()
                 .is_none_or(|sidecar| sidecar.todos.is_empty()),
             "the call the failed result answered is not part of the list: {sidecar:?}"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_baseline_does_not_halve_the_current_todo_size_budget() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        let (_dir, manager) = store();
+        let id = "large-sidecar-baseline";
+        let _lease = created(&manager, id);
+        let mut items = vec![TodoSidecarItem {
+            content: "x".repeat(140_000),
+            status: "pending".into(),
+        }];
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager.write_todo_sidecar(id, &items, 3, through).unwrap();
+        items[0].status = "completed".into();
+        manager
+            .write_todo_sidecar(id, &items, 3, through)
+            .expect("same valid plan must remain writable when baseline is retained");
+        let saved = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(saved.todos[0].status, "completed");
+        assert_eq!(saved.baseline.unwrap().todos[0].status, "pending");
+
+        // The larger file budget is for recovery data, not larger individual
+        // plans. A rejected write must leave both saved states intact.
+        items[0].content = "x".repeat(super::super::manager::MAX_TODO_SIDECAR_BYTES);
+        assert!(manager.write_todo_sidecar(id, &items, 3, through).is_err());
+        let saved = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(saved.todos[0].content.len(), 140_000);
+        assert_eq!(saved.todos[0].status, "completed");
+        assert_eq!(saved.baseline.unwrap().todos[0].status, "pending");
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_duplicate_failure_does_not_erase_a_successful_plan_during_rebuild() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "duplicate-result-rebuild";
+        let lease = created(&manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"keep me","status":"pending"}]}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "success".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    // A duplicate error filed under another round must not
+                    // settle the already successful call a second time.
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 2,
+                            call_id: "p".into(),
+                            content: "denied".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "undo".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap();
+        assert_eq!(
+            sidecar.as_ref().map(|s| s.todos.len()),
+            Some(1),
+            "successful plan must survive duplicate failure: {sidecar:?}"
         );
     }
 

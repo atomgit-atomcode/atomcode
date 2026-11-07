@@ -36,19 +36,20 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
-/// Bounded size for the todo-list sidecar: a todo list is small (a few dozen
-/// items), so a generous-but-bounded cap prevents a corrupt file from ballooning
-/// memory on read.
+/// Size budget for one todo state, preserving the pre-baseline limit.
 pub const MAX_TODO_SIDECAR_BYTES: usize = 256 * 1024;
+/// The cache can hold both the current state and a recovery baseline. Each
+/// state is bounded separately; reads must allow both without unbounded input.
+const MAX_TODO_SIDECAR_FILE_BYTES: usize = 2 * MAX_TODO_SIDECAR_BYTES + 64;
 const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
 const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
 
 /// Serializable todo-list sidecar. Independent of the transcript so a compaction
 /// that drains old turns (including the early todowrite plan call) does not erase
 /// the todo state the model (`TodoHook` pre-request anchor) and the vscode panel
-/// rely on (issue #1503). `message_count` is a stale marker: readers discard the
-/// sidecar when the CURRENT conversation message count is smaller (a rollback /
-/// undo truncated history).
+/// rely on (issue #1503). Rewinds rebuild this cache from standing log facts and
+/// its recovery baseline; message count alone cannot detect staleness because
+/// compaction also reduces the conversation size.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TodoSidecar {
     /// Batch source pointers only; raw guidance remains in the event log.
@@ -56,7 +57,7 @@ pub struct TodoSidecar {
     pub source_seqs: Vec<u64>,
     #[serde(default)]
     pub todos: Vec<TodoSidecarItem>,
-    /// Conversation message count at write time (stale-detection marker).
+    /// Conversation message count at write time (informational, not a validity check).
     #[serde(default)]
     pub message_count: usize,
     /// Where the last todo call `todos` already reflects was made. A transcript
@@ -1521,14 +1522,23 @@ impl SessionManager {
                 message: "invalid source references".into(),
             });
         }
-        let sidecar = TodoSidecar {
+        let mut sidecar = TodoSidecar {
             source_seqs: source_seqs.to_vec(),
             todos: todos.to_vec(),
             message_count,
             through,
-            baseline,
+            baseline: None,
         };
-        let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        // Adding recovery data must not halve the accepted size of a current
+        // plan, nor allow either state to grow beyond its original budget.
+        let current = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        let bytes = if let Some(baseline) = baseline {
+            serialize_bounded(&baseline, "todo baseline", MAX_TODO_SIDECAR_BYTES)?;
+            sidecar.baseline = Some(baseline);
+            serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_FILE_BYTES)?
+        } else {
+            current
+        };
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)
     }
     /// Read the todo-list sidecar. The sidecar is written at `turn_complete` and,
@@ -1543,7 +1553,7 @@ impl SessionManager {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = read_regular_file_bounded(&path, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        let bytes = read_regular_file_bounded(&path, "todo sidecar", MAX_TODO_SIDECAR_FILE_BYTES)?;
         let sidecar: TodoSidecar = deserialize(&bytes, "todo sidecar")?;
         Ok(Some(sidecar))
     }
