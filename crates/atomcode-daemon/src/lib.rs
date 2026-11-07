@@ -33,6 +33,7 @@ mod api_provider_accounts;
 mod api_schedule;
 pub mod approval_mode;
 mod commands;
+mod git_branch;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
 pub mod live_hub;
@@ -7750,6 +7751,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/sessions/resolve/:id", get(resolve_session))
         // Current project state (working directory)
         .route("/project", get(get_project_state))
+        .route("/project/git-branch", get(git_branch::get))
         .route("/cd", post(change_dir))
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))
@@ -9104,6 +9106,36 @@ mod tests {
             },
             "test".into(),
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn git_branch_endpoint_reads_display_metadata_without_changing_the_project() {
+        use axum::response::IntoResponse;
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let checkout = home._dir.path().join("checkout");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(
+            checkout.join(".git/HEAD"),
+            "ref: refs/heads/feature/web-branch\n",
+        )
+        .unwrap();
+        let query = serde_json::from_value(serde_json::json!({ "dir": checkout })).unwrap();
+        let response = git_branch::get(State(state.clone()), Query(query))
+            .await
+            .unwrap()
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(data["branch"], "feature/web-branch");
+        assert_eq!(state.project.read().await.working_dir, home._dir.path());
+        let relative = serde_json::from_value(serde_json::json!({ "dir": "relative" })).unwrap();
+        assert!(matches!(
+            git_branch::get(State(state), Query(relative)).await,
+            Err(StatusCode::BAD_REQUEST)
+        ));
     }
 
     fn chat_test_state(home: &ScopedChatHome) -> AppState {

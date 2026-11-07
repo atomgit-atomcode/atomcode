@@ -1,3 +1,4 @@
+import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
 import { importPatchFile, taskSpecs } from '../api';
@@ -4070,6 +4071,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         ) : (
           <span class="input-cwd-path muted">{t('header.noCwd')}</span>
         )}
+        <GitBranch cwd={cwd || ''} />
         <span class="input-cwd-chevron">▾</span>
       </button>
       <span class="input-hint">

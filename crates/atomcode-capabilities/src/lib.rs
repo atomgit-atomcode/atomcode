@@ -74,6 +74,9 @@ pub use product_dirs::ProductDirs;
 /// `is_running_as_admin` mirror core's copies until core is retired (see module doc).
 pub mod process_utils;
 
+/// Bounded symbolic Git HEAD lookup for frontend display.
+pub mod git_branch;
+
 /// ONE home for Windows path normalization (native-canonical internally,
 /// forward-slash at the LLM/UI boundary). `pub` so native drivers and L2 crates
 /// (`review`, `clix`, `coding`) can reuse it. Local copy of

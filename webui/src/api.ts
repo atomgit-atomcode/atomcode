@@ -663,6 +663,16 @@ export async function getProject(): Promise<ProjectState> {
 }
 
 
+export interface GitBranchState { working_dir: string; branch: string | null }
+
+export async function getGitBranch(dir: string, signal?: AbortSignal): Promise<GitBranchState> {
+  const response = await apiFetch(`/project/git-branch?dir=${encodeURIComponent(dir)}`, {
+    headers: authHeaders(), signal,
+  });
+  return readJson(response);
+}
+
+
 // --- MCP server status ---
 
 export interface McpServerInfo {

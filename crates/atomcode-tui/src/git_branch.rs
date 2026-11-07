@@ -18,46 +18,5 @@ pub(crate) fn current(cwd: &str) -> Option<String> {
 }
 
 fn read(cwd: &Path) -> Option<String> {
-    for dir in cwd.ancestors() {
-        let dot = dir.join(".git");
-        let git = if dot.is_dir() {
-            dot
-        } else if dot.is_file() {
-            let link = std::fs::read_to_string(&dot).ok()?;
-            let target = link.trim().strip_prefix("gitdir: ")?;
-            dir.join(target)
-        } else {
-            continue;
-        };
-        let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
-        let branch = head.trim().strip_prefix("ref: refs/heads/")?;
-        return (!branch.is_empty() && !branch.chars().any(char::is_control))
-            .then(|| branch.to_string());
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn branches_follow_nested_directories_worktrees_and_detached_heads() {
-        let root = tempfile::tempdir().unwrap();
-        let git = root.path().join(".git");
-        std::fs::create_dir(&git).unwrap();
-        std::fs::write(git.join("HEAD"), "ref: refs/heads/release/v5.2.7\n").unwrap();
-        let child = root.path().join("src");
-        std::fs::create_dir(&child).unwrap();
-        assert_eq!(read(&child).as_deref(), Some("release/v5.2.7"));
-        std::fs::write(git.join("HEAD"), "0123456789abcdef\n").unwrap();
-        assert_eq!(read(&child), None);
-        std::fs::remove_dir_all(&git).unwrap();
-        assert_eq!(read(root.path()), None);
-        let metadata = root.path().join("metadata");
-        std::fs::create_dir(&metadata).unwrap();
-        std::fs::write(metadata.join("HEAD"), "ref: refs/heads/feature/test\n").unwrap();
-        std::fs::write(&git, "gitdir: metadata\n").unwrap();
-        assert_eq!(read(&child).as_deref(), Some("feature/test"));
-    }
+    atomcode_capabilities::git_branch::read(cwd)
 }

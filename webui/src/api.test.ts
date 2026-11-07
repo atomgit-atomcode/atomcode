@@ -805,3 +805,21 @@ test('mode switches preserve independent selection context and explicit API-defa
     assert.deepEqual(submitted,{mode:'plan',independent:true,previous_mode:'build',current_model:{model:'fast',reasoning_effort:null},running:false});
   }finally{globalThis.fetch=originalFetch;}
 });
+
+
+test('git branch lookup encodes the checkout path and forwards auth and cancellation', async () => {
+  const original = globalThis.fetch;
+  const controller = new AbortController();
+  let captured: { url: string; init?: RequestInit } | null = null;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    captured = { url: String(url), init };
+    return new Response(JSON.stringify({ working_dir: '/work/a b&c', branch: 'feature/example' }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { getGitBranch } = await import('./api.ts');
+    assert.equal((await getGitBranch('/work/a b&c', controller.signal)).branch, 'feature/example');
+    assert.equal(captured!.url, '/project/git-branch?dir=%2Fwork%2Fa%20b%26c');
+    assert.equal((captured!.init!.headers as Record<string, string>).Authorization, 'Bearer test-token');
+    assert.ok(captured!.init!.signal);
+  } finally { globalThis.fetch = original; }
+});

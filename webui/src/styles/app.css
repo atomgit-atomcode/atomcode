@@ -4251,3 +4251,17 @@ body {
 
 /* Reserve the current turn’s reading area using the actual scroller height. */
 .turn-reply-space { flex: 0 0 auto; pointer-events: none; overflow-anchor: none; }
+
+/* The branch is display metadata, sharing the directory picker's target. */
+.input-cwd-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 22ch;
+  color: var(--app-secondary-foreground);
+  flex-shrink: 1;
+}
+.input-cwd-branch svg { flex-shrink: 0; }
+.input-cwd-branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 480px) { .input-cwd-branch { max-width: 12ch; } }
