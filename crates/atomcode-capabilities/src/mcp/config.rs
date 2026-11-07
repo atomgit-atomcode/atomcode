@@ -1209,10 +1209,20 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_default_value_keeps_utf8() {
-        // 默认值本身含非 ASCII 时也必须逐字节保留（不查环境变量，不依赖状态）。
+        // `${VAR:-default}` 会先查 VAR：用专用变量并先删除，保证无论外部
+        // 环境如何都走默认值；默认值本身含非 ASCII 时必须逐字节保留。
+        struct RemoveEnvOnDrop;
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var("EXPAND_UTF8_MISSING_VAR");
+            }
+        }
+        std::env::remove_var("EXPAND_UTF8_MISSING_VAR");
+        let _env_guard = RemoveEnvOnDrop;
         assert_eq!(
-            expand_env_vars("${MISSING_VAR:-/tmp/中文 目录/server.py}"),
+            expand_env_vars("${EXPAND_UTF8_MISSING_VAR:-/tmp/中文 目录/server.py}"),
             "/tmp/中文 目录/server.py"
         );
     }
@@ -1220,16 +1230,21 @@ mod tests {
     #[test]
     #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_expansion_before_unclosed_brace() {
+        // 专用变量名：不与未序列化的既有单测（test_expand_env_vars_simple
+        // 也用 TEST_VAR）共享键，串行组与 Drop 清理只兜住本测试自己的修改。
         struct RemoveEnvOnDrop;
         impl Drop for RemoveEnvOnDrop {
             fn drop(&mut self) {
-                std::env::remove_var("TEST_VAR");
+                std::env::remove_var("EXPAND_UNCLOSED_VAR");
             }
         }
-        std::env::set_var("TEST_VAR", "test_value");
+        std::env::set_var("EXPAND_UNCLOSED_VAR", "test_value");
         let _env_guard = RemoveEnvOnDrop;
         // 前段正常展开，后段未闭合的 `${` 按 break 路径由兜底拼接保留。
-        assert_eq!(expand_env_vars("${TEST_VAR}tail${D"), "test_valuetail${D");
+        assert_eq!(
+            expand_env_vars("${EXPAND_UNCLOSED_VAR}tail${D"),
+            "test_valuetail${D"
+        );
     }
 
     #[test]

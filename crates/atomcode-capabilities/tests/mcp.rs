@@ -100,8 +100,10 @@ async fn registry_connect_discover_and_call_echo() {
 #[serial_test::serial(unicode_arg_env)]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
-    // serial(unicode_arg_env) keeps this process-wide mutation away from the
-    // other tests; the guard removes it again even on assertion failure.
+    // serial(unicode_arg_env) only serializes against other tests that join
+    // the same group — today this test is its only member. The attribute marks
+    // the group any future test that also mutates UNICODE_ARG must join; the
+    // guard removes the variable again even on assertion failure.
     struct RemoveEnvOnDrop;
     impl Drop for RemoveEnvOnDrop {
         fn drop(&mut self) {
@@ -163,7 +165,9 @@ async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
 /// (`type`, `timeout`, `description`) plus an args path containing spaces and
 /// CJK characters. Loads it through the real config parser — where `${VAR}`
 /// expansion must not corrupt non-ASCII bytes — and connects through the real
-/// registry, the full path the daemon takes.
+/// registry. Scope note: this bypasses the daemon's project-trust gating (the
+/// registry admits the server directly), so it covers load + connect, not the
+/// trust flow.
 #[tokio::test]
 async fn config_with_unknown_fields_and_unicode_path_loads_and_connects() {
     let unicode_arg = "/tmp/中文 目录/with space/server.py";
