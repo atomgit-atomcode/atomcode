@@ -1557,20 +1557,17 @@ impl SessionManager {
         // Keep the state before this write's calls so an undo that takes one
         // back can rebuild the list even when the plan itself is no longer in
         // the log. An older baseline is already the furthest recoverable point.
-        // A previous sidecar written against a longer conversation is not a
-        // state to fall back to: either an undo or a compaction shrank the
-        // projection. Its older baseline still is, and dropping that too would
-        // lose the only recovery point the next undo has. (The rebuild clears
-        // a baseline whose plan the undo took back; it runs before the next
-        // hook write, so a stale list is never kept as a fallback.)
+        // A smaller message_count is not evidence that the conversation was
+        // taken back: compaction shrinks the projection too, and the list it
+        // shrank around is still the state before this write. When an undo
+        // does shrink it, the rebuild has already rewritten this sidecar (and
+        // cleared any baseline whose plan the undo took back) before the next
+        // hook write, so what this read sees is the standing list either way.
         let baseline = match self.read_todo_sidecar(id) {
-            Ok(Some(previous)) if previous.message_count <= message_count => {
-                previous.baseline.or(Some(TodoSidecarBaseline {
-                    todos: previous.todos,
-                    through: previous.through,
-                }))
-            }
-            Ok(Some(previous)) => previous.baseline,
+            Ok(Some(previous)) => previous.baseline.or(Some(TodoSidecarBaseline {
+                todos: previous.todos,
+                through: previous.through,
+            })),
             _ => None,
         };
         self.write_todo_sidecar_full(id, todos, message_count, through, source_seqs, baseline)
@@ -6701,9 +6698,8 @@ mod tests {
         );
 
         // The conversation shrank since the last write (an undo or a
-        // compaction): the list being replaced is not frozen as the state to
-        // fall back to, but the older baseline still is — dropping it would
-        // throw away the only recovery point a later undo has.
+        // compaction). An older baseline is still the furthest recoverable
+        // point; the stale completed list does not displace it.
         manager
             .write_todo_sidecar("s", &[item("pending")], 4, None)
             .unwrap();
@@ -6716,6 +6712,39 @@ mod tests {
                 .map(|b| b.todos[0].status.as_str()),
             Some("pending"),
             "the stale completed list is not kept, the older baseline is"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_shrunk_conversation_without_a_baseline_keeps_the_state_before_the_write() {
+        use crate::session::manager::TodoSidecarItem;
+
+        let item = |status: &str| TodoSidecarItem {
+            content: "task".into(),
+            status: status.into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        // The first write has no older baseline. A compaction then shrinks the
+        // projection before the next write; that shrink is not evidence the
+        // list was taken back, so the state before the write is still the only
+        // state an undo can fall back to and must be kept.
+        manager
+            .write_todo_sidecar("s", &[item("pending")], 8, None)
+            .unwrap();
+        manager
+            .write_todo_sidecar("s", &[item("completed")], 3, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(sidecar.todos[0].status, "completed");
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the state before the shrunk write is the recoverable floor"
         );
     }
 

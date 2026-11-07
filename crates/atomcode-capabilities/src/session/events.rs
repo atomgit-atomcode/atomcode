@@ -694,8 +694,10 @@ impl SessionManager {
             // anywhere-in-the-list match used to swallow. When no prefix
             // matches (a converted session whose plan was never in this log),
             // fall back to a content match against the sidecar's **last** item
-            // only: the narrower guess that still keeps a reflected add from
-            // being written twice.
+            // only: the narrower guess that still keeps the one reflected add
+            // from being written twice. The fallback is consumed by its first
+            // match, so a later add of the same content is applied instead of
+            // matching the same unchanged item again.
             fn same_items(left: &[TodoItem], right: &[TodoItem]) -> bool {
                 left.len() == right.len()
                     && left
@@ -742,6 +744,7 @@ impl SessionManager {
                 }
             }
             let tail_only = start == 0 && legacy_baseline;
+            let mut tail_reflected = false;
             for (turn, round, index, _, arguments) in &calls[start..] {
                 let position = super::manager::TodoCallPosition {
                     turn: *turn,
@@ -751,7 +754,12 @@ impl SessionManager {
                 if through.is_some_and(|current| position <= current) {
                     continue;
                 }
-                if tail_only && adds_the_lists_tail(&items, arguments) {
+                if tail_only && !tail_reflected && adds_the_lists_tail(&items, arguments) {
+                    // The sidecar's last item already reflects one add. Consume
+                    // the fallback: a second add of the same content is a new
+                    // fact, and letting it match the same unchanged item again
+                    // would swallow it (and every later one).
+                    tail_reflected = true;
                     through = Some(position);
                     continue;
                 }
@@ -4639,6 +4647,160 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
+    fn an_undo_after_a_shrunk_projection_still_takes_back_the_increment() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "sidecar-increment-after-shrink";
+        let lease = created(&manager, id);
+        let planned_at = TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        };
+        let added_at = TodoCallPosition {
+            turn: 2,
+            round: 1,
+            index: 0,
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 10, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        11,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "plan".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        12,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // The plan lives only in the sidecar (a converted session); this first
+        // write has no older baseline.
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[TodoSidecarItem {
+                    content: "finish it".into(),
+                    status: "pending".into(),
+                }],
+                10,
+                Some(planned_at),
+                &[2],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(4, 20, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        21,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "more".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        6,
+                        22,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: "a".into(),
+                                name: "todowrite".into(),
+                                arguments: r#"{"action":"add","content":"second"}"#.into(),
+                            }],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        7,
+                        23,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "a".into(),
+                            content: "#2 [ ] second".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // A compaction shrank the projection before this write (10 -> 5).
+        // That is not an undo: the state before the write is still the only
+        // fallback a later undo has, so it is kept as the baseline.
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[
+                    TodoSidecarItem {
+                        content: "finish it".into(),
+                        status: "pending".into(),
+                    },
+                    TodoSidecarItem {
+                        content: "second".into(),
+                        status: "pending".into(),
+                    },
+                ],
+                5,
+                Some(added_at),
+                &[2],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    40,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the plan survives");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "finish it");
+        assert_eq!(
+            sidecar.through,
+            Some(planned_at),
+            "the increment written after the shrink is taken back"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
     fn an_undo_replays_the_standing_turns_over_the_earliest_baseline() {
         use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
         use atomcode_kernel::tool::ToolCall;
@@ -5594,6 +5756,109 @@ mod tests {
             "the reflected add is not written twice"
         );
         assert!(sidecar.through.is_some());
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_swallows_only_the_add_it_ends_with() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-two-tail-adds";
+        let lease = created(&manager, id);
+        let add = |call: &str| ToolCall {
+            id: call.into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"task"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a1")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 2,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a2")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                ],
+            )
+            .unwrap();
+        // The sidecar ends with the first add; the second, with the same
+        // content, is a new fact. The tail fallback may skip only one.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    crate::session::manager::TodoSidecarItem {
+                        content: "plan".into(),
+                        status: "pending".into(),
+                    },
+                    crate::session::manager::TodoSidecarItem {
+                        content: "task".into(),
+                        status: "pending".into(),
+                    },
+                ],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    5,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        let shown: Vec<&str> = sidecar
+            .todos
+            .iter()
+            .map(|todo| todo.content.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["plan", "task", "task"],
+            "the first repeat is the reflected add, the second is a new task"
+        );
+        assert_eq!(
+            sidecar.through,
+            Some(crate::session::manager::TodoCallPosition {
+                turn: 1,
+                round: 2,
+                index: 0,
+            })
+        );
     }
 
     #[cfg(feature = "tools")]
@@ -7697,6 +7962,32 @@ mod tests {
                         }],
                         reasoning_blocks: vec![],
                         meta: None,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
+
+        // A cut tool result can change which call stands even when the result
+        // is not itself a todo result: it settles (or fails) the call it
+        // answers, and the sidecar may already reflect that.
+        let id = "truncate-tail-result";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::ToolResultLogged {
+                        turn: 1,
+                        round: 2,
+                        call_id: "t".into(),
+                        content: "failed".into(),
+                        is_error: true,
+                        images: vec![],
                     },
                 )],
             )
