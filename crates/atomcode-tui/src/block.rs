@@ -458,14 +458,16 @@ impl Slot {
     }
 }
 
-/// The append-only sequence a person reads.
+/// The sequence a person reads. Live blocks append; settled historical pages
+/// may be prepended without changing existing block identities.
 ///
-/// Positions are assigned on `open` and never move. Several slots may be `Live`
+/// Block identities are assigned on `open` and never change. Several slots may be `Live`
 /// at once (parallel tool calls) and they may settle in any order.
 #[derive(Debug, Default)]
 pub struct Stream {
     slots: Vec<Slot>,
     next_id: AtomicU64,
+    positions: Option<std::collections::HashMap<BlockId, usize>>,
 }
 
 impl Stream {
@@ -473,7 +475,48 @@ impl Stream {
         Self::default()
     }
 
-    /// Everything, in emission order.
+    /// An isolated historical renderer allocates above existing IDs, so live
+    /// producers can keep amending their original blocks after a prepend.
+    pub(crate) fn history_buffer(&self) -> Self {
+        Self {
+            slots: Vec::new(),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::SeqCst)),
+            positions: Some(Default::default()),
+        }
+    }
+
+    /// Prepend read-only history without replacing live slots or reusing IDs.
+    pub(crate) fn prepend_history(&mut self, mut older: Self) {
+        assert!(older.slots.iter().all(Slot::is_settled));
+        self.next_id
+            .fetch_max(older.next_id.load(Ordering::SeqCst), Ordering::SeqCst);
+        older.slots.append(&mut self.slots);
+        self.slots = older.slots;
+        self.positions = Some(
+            self.slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.block().id, i))
+                .collect(),
+        );
+    }
+
+    pub(crate) fn discard_seed_blocks(&mut self) {
+        self.discard_after(0);
+    }
+
+    pub(crate) fn discard_after(&mut self, count: usize) {
+        self.slots.truncate(count);
+        self.positions = Some(
+            self.slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.block().id, i))
+                .collect(),
+        );
+    }
+
+    /// Everything, in display order (including any historical prefix).
     pub fn slots(&self) -> &[Slot] {
         &self.slots
     }
@@ -490,19 +533,24 @@ impl Stream {
     ///
     /// **The lookup is O(1), and that is the point.** Ids are handed out one
     /// per [`StreamWriter::open`] from a counter that starts at 1 and never
-    /// reuses a number, and nothing removes a slot — so a block's position *is*
+    /// reuses a number, and ordinary live appends keep every slot — so a block's position *is*
     /// its id minus one. Scanning for it instead turned every `settle` into a
     /// pass over the whole conversation, which is quadratic over a replay: the
     /// transcript settles a block per `emit`, so a session with a few thousand
     /// facts paid a few million slot visits. That was most of the cost of
     /// switching to another session (`plugin.rs::look_at` replays the log).
     ///
+    /// Historical prepends and discarded seed blocks use an ID-to-position
+    /// map instead, preserving O(1) lookup when display order changes.
     /// Kept as one checked accessor rather than `id.0 - 1` at each call site:
     /// a stream that ever gained a hole, a reused id or a second source of
     /// slots would answer `None` here rather than read the wrong block, and the
     /// position is what the counter and the vec have to agree about.
     fn position_of(&self, id: BlockId) -> Option<usize> {
-        let at = usize::try_from(id.0.checked_sub(1)?).ok()?;
+        let at = match &self.positions {
+            Some(positions) => *positions.get(&id)?,
+            None => usize::try_from(id.0.checked_sub(1)?).ok()?,
+        };
         self.slots
             .get(at)
             .is_some_and(|slot| slot.block().id == id)
@@ -591,6 +639,9 @@ impl StreamWriter<'_> {
     /// Append a new block, `Live`.
     pub fn open(&mut self, at: Coord, content: Arc<dyn Content>) -> BlockId {
         let id = BlockId(self.stream.next_id.fetch_add(1, Ordering::SeqCst) + 1);
+        if let Some(positions) = &mut self.stream.positions {
+            positions.insert(id, self.stream.slots.len());
+        }
         self.stream.slots.push(Slot::Live(
             Block {
                 id,
@@ -701,6 +752,30 @@ mod tests {
 
     fn text(s: &'static str) -> Arc<dyn Content> {
         Arc::new(Text(s))
+    }
+
+    #[test]
+    fn history_prepend_keeps_live_ids_amendable_and_new_ids_unique() {
+        let mut stream = Stream::new();
+        let live = stream.writer("live").open(Coord::default(), text("live"));
+        let mut older = stream.history_buffer();
+        let old = older.writer("history").emit(Coord::default(), text("old"));
+        older.writer("history").settle_all();
+        stream.prepend_history(older);
+        assert_eq!(stream.slots()[0].block().id, old);
+        assert_eq!(stream.slots()[1].block().id, live);
+        stream.writer("live").amend(live, text("continued"));
+        stream.writer("live").settle(live);
+        let new = stream.writer("live").emit(Coord::default(), text("new"));
+        assert_ne!(new, old);
+        assert_ne!(new, live);
+        assert!(stream.get(old).unwrap().is_settled());
+        assert!(stream.get(live).unwrap().is_settled());
+        assert_eq!(
+            stream.get(live).unwrap().block().content.content_hash(),
+            text("continued").content_hash()
+        );
+        assert_eq!(stream.get(new).unwrap().block().id, new);
     }
 
     /// A block that draws two rows on a terminal that does Unicode, one otherwise.

@@ -4265,3 +4265,15 @@ body {
 .input-cwd-branch svg { flex-shrink: 0; }
 .input-cwd-branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 480px) { .input-cwd-branch { max-width: 12ch; } }
+
+.history-load-more {
+  display: block;
+  margin: 8px auto 16px;
+  padding: 6px 12px;
+  color: var(--app-secondary-foreground);
+  background: transparent;
+  border: 1px solid var(--app-input-border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.history-load-more:disabled { opacity: .6; cursor: default; }

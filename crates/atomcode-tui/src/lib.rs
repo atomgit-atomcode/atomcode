@@ -51,6 +51,7 @@ pub mod content;
 pub mod diff;
 pub mod el;
 pub mod frame;
+pub mod history;
 pub mod host;
 pub mod image_cache;
 mod tmux_mouse;

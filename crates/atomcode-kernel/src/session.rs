@@ -16,6 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "session_history.rs"]
+pub mod history;
 #[path = "session_retention.rs"]
 pub mod retention;
 

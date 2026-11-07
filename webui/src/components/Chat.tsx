@@ -1,3 +1,4 @@
+import { preservedHistoryPrefix } from '../lib/historyPaging';
 import { GoalRecoveryStatus } from './GoalRecoveryStatus';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
@@ -45,7 +46,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -490,6 +491,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const { messages, setMessages, read: readTimelineMessage, hold: holdTimelineMessages } = useTimelineMessages<Message>(limits.resident, (message, key) => ({
     ...archivedMessage(message, key), archiveArtifacts: artifactsByAssistantIndex([message]).get(0),
   }), limits.residentBytes);
+  type ServerHistory = { session: string; cursor?: DisplayHistoryCursor; baseline?: DisplayHistoryCursor };
+  const [serverHistory, setServerHistoryState] = useState<ServerHistory>({ session: '' });
+  const serverHistoryRef = useRef<ServerHistory>(serverHistory);
+  function setServerHistory(value: ServerHistory) {
+    serverHistoryRef.current = value;
+    setServerHistoryState(value);
+  }
+  const [serverHistoryLoading, setServerHistoryLoading] = useState(false);
+  const serverHistoryRequest = useRef<AbortController | null>(null);
   const [timelineStart, setTimelineStart] = useState<number | null>(null);
   useEffect(() => {
     const media = window.matchMedia('(max-width: 767px)');
@@ -770,6 +780,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // An accepted first-turn `done` pre-binds activeIdRef to its new id, so that
     // normal null -> canonical-id prop update does not invalidate its own tail.
     if (activeIdRef.current !== sessionId) sessionGenerationRef.current += 1;
+    serverHistoryRequest.current?.abort();
     renderedSessionIdRef.current = sessionId;
   }
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
@@ -777,7 +788,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const loadedForRef = useRef<string | null>(null);
   const switchReadyRef = useRef<{ id: string; generation: number; ready: Promise<boolean> } | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
-  useEffect(() => () => { historyAbortRef.current?.abort(); }, []);
+  useEffect(() => () => { historyAbortRef.current?.abort(); serverHistoryRequest.current?.abort(); }, []);
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
   const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
   const messageCacheCountRef = useRef<Map<string, number>>(new Map());
@@ -1136,7 +1147,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     loadAfterSessionSwitch(accepted,
       () => !historyController.signal.aborted && activeIdRef.current === loadId
         && sessionGenerationRef.current === loadGeneration,
-      () => Promise.allSettled([getSession(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
+      () => Promise.allSettled([getSessionPage(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
       .then((results) => {
         if (!results || historyController.signal.aborted) return;
         const [sessionResult, activeResult] = results;
@@ -1148,18 +1159,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
         let nextHint: string | null = null;
         if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
+          setServerHistory({ session: loadId, cursor: sessionResult.value.history_older, baseline: sessionResult.value.history_older });
           updateSummaryCount(sessionResult.value.summary_count);
           const currentCached = messageCacheRef.current.get(loadId);
           const cachedTodos = todoCacheRef.current.get(loadId);
           const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
           // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
-          const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
+          const loaded = sessionMessagesToDisplay(sessionResult.value.messages, !sessionResult.value.history_seed);
+          if (sessionResult.value.history_seed) sessionMessagesToDisplay(sessionResult.value.history_seed);
 
           if (currentCached && currentCached.length > 0) {
             // If the loaded messages from the backend are shorter than the cached messages,
             // it means the backend task is still running or hasn't saved yet.
             // Keep the cached messages and do not overwrite them with stale backend history.
-            if (loaded.length >= (messageCacheCountRef.current.get(loadId) ?? currentCached.length)) {
+            if (sessionResult.value.history_seed || sessionResult.value.history_older || loaded.length >= (messageCacheCountRef.current.get(loadId) ?? currentCached.length)) {
               setMessages(loaded);
               messageCacheRef.current.delete(loadId);
               messageCacheCountRef.current.delete(loadId);
@@ -1626,7 +1639,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }, [sync]);
 
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
-  function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
+  function sessionMessagesToDisplay(msgs: SessionMessage[], projectState = true): Message[] {
     const loaded: Message[] = [];
     const todoTitles: TodoTitles = new Map();
     const pendingTodoCalls = new Map<string, { name: string; args: string }>();
@@ -1700,6 +1713,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       }
       // system messages: skip
     }
+    if (!projectState) return loaded;
     const restoredProjection = projectTodoCalls([], orderedTodoCalls);
     const restoredTodoItems = restoredProjection.committed;
     const priorTodoCalls = orderedTodoCalls.filter(
@@ -1770,6 +1784,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      historyAbortRef.current?.abort();
+      serverHistoryRequest.current?.abort();
+      serverHistoryRequest.current = null;
+      setServerHistoryLoading(false);
+
       setCurrentTurnModel(null);
       currentTurnModelRef.current = null;
       if (activeIdRef.current !== e.session_id) resetSummaryCount();
@@ -1785,7 +1804,21 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
-      const loaded = segmentMessages(sessionMessagesToDisplay(e.messages));
+      let loaded = segmentMessages(sessionMessagesToDisplay(e.messages, !e.history_seed));
+      const previousHistory = serverHistoryRef.current;
+      const prefix = previousHistory.session === e.session_id
+        ? preservedHistoryPrefix(messagesRef.current, loaded, previousHistory.baseline, e.history_older) : [];
+      if (prefix.length > 0) {
+        loaded = [...prefix, ...loaded];
+        setServerHistory({ session: e.session_id, cursor: previousHistory.cursor, baseline: e.history_older });
+      } else {
+        setServerHistory({ session: e.session_id, cursor: e.history_older, baseline: e.history_older });
+        if (e.history_older || previousHistory.baseline) {
+          setTimelineStart(null);
+          timelineAnchorRef.current = null;
+        }
+      }
+      if (e.history_seed) sessionMessagesToDisplay(e.history_seed);
       // A new session starts at the bottom. Reconnection to the same session
       // must preserve whether the reader was following or inspecting history.
       if (e.session_id && activeIdRef.current !== e.session_id) {
@@ -2235,10 +2268,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const projectHash = activeSession?.project_hash;
     if (!projectHash) return;
     try {
-      const detail = await getSession(projectHash, id);
+      const detail = await getSessionPage(projectHash, id);
       if (activeIdRef.current === id) {
+        setServerHistory({ session: id, cursor: detail.history_older, baseline: detail.history_older });
         updateSummaryCount(detail.summary_count);
-        setMessages(sessionMessagesToDisplay(detail.messages));
+        setMessages(sessionMessagesToDisplay(detail.messages, !detail.history_seed));
+        if (detail.history_seed) sessionMessagesToDisplay(detail.history_seed);
       }
     } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
   }
@@ -2349,14 +2384,19 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   useEffect(()=>{
     if(!sync||busy||!sessionId||!activeSession?.project_hash)return;
     const controller=new AbortController();
-    void getSession(activeSession.project_hash,sessionId,controller.signal).then(detail=>{
+    void getSessionPage(activeSession.project_hash,sessionId,controller.signal).then(detail=>{
       if(controller.signal.aborted)return;
       const originals=detail.messages.filter(message=>message.role==='user'&&!message.synthetic&&!isInternalHistoryUserMessage(message.content??'',message.synthetic));
       setMessages(current=>{
         const users=current.filter(message=>message.role==='user');
-        if(users.length!==originals.length||users.some((message,index)=>message.sourceSeq!=null?message.sourceSeq!==originals[index].source_seq:messageText(message)!==stripVisionAnnotation(originals[index].content??'')))return current;
+        const offset=users.length-originals.length;
+        if(!originals.length||offset<0||users.slice(offset).some((message,index)=>message.sourceSeq!=null?message.sourceSeq!==originals[index].source_seq:messageText(message)!==stripVisionAnnotation(originals[index].content??'')))return current;
         let index=0;
-        return current.map(message=>message.role==='user'?{...message,sourceSeq:originals[index].source_seq,specPinned:originals[index++].task_spec_pinned}:message);
+        return current.map(message=>{
+          if(message.role!=='user')return message;
+          const original=originals[index++-offset];
+          return original?{...message,sourceSeq:original.source_seq,specPinned:original.task_spec_pinned}:message;
+        });
       });
     }).catch(()=>{});
     return ()=>controller.abort();
@@ -3611,12 +3651,46 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     timelineIgnoreScrollRef.current = performance.now() + 500;
     timelineAnchorRef.current = null;
   }, [range.start, page.loading]);
+  async function loadServerHistory() {
+    const id = activeIdRef.current;
+    const cursor = serverHistory.cursor;
+    const project = activeSession?.project_hash;
+    if (!id || id !== serverHistory.session || !cursor || !project || serverHistoryRequest.current) return;
+    const generation = sessionGenerationRef.current;
+    const controller = new AbortController();
+    serverHistoryRequest.current = controller;
+    setServerHistoryLoading(true);
+    try {
+      const detail = await getSessionPage(project, id, controller.signal, cursor);
+      if (controller.signal.aborted || generation !== sessionGenerationRef.current || activeIdRef.current !== id) return;
+      const older = segmentMessages(sessionMessagesToDisplay(detail.messages, false));
+      const viewport = scrollRef.current;
+      const node = matchRefs.current[range.start];
+      if (viewport && node?.isConnected) timelineAnchorRef.current = {
+        index: range.start + older.length, top: node.getBoundingClientRect().top,
+        start: older.length + range.start, before: true,
+      };
+      atBottomRef.current = false;
+      setTimelineStart(older.length + range.start);
+      setMessages(current => [...older, ...current]);
+      setServerHistory({ session: id, cursor: detail.history_older, baseline: serverHistoryRef.current.baseline });
+    } catch (error) {
+      if (!controller.signal.aborted && generation === sessionGenerationRef.current) pushCommandNotice(String(error));
+    } finally {
+      if (serverHistoryRequest.current === controller) {
+        serverHistoryRequest.current = null;
+        setServerHistoryLoading(false);
+      }
+    }
+  }
   function pageTimeline(direction: number) {
     if (page.loading || (historyDisplay.active && !historyDisplay.showLive) || performance.now() < timelineIgnoreScrollRef.current) return;
     const viewport = scrollRef.current;
     if (!viewport) return;
     if (direction < 0 && viewport.scrollTop <= 80 && range.start > liveFrom) {
       showTimelinePage(adjacentTimelineStart(messages, range, -1, limits.mounted, limits.pageBytes, liveFrom), true);
+    } else if (direction < 0 && viewport.scrollTop <= 80 && range.start === 0) {
+      void loadServerHistory();
     } else if (direction > 0 && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 80 && range.end < messages.length) {
       showTimelinePage(adjacentTimelineStart(messages, range, 1, limits.mounted, limits.pageBytes), true);
     }
@@ -4301,10 +4375,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         onPointerDown={interactWithTimeline}
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
+        {serverHistory.session === sessionId && serverHistory.cursor && range.start === 0 &&
+          <button type="button" class="history-load-more" disabled={serverHistoryLoading} onClick={() => void loadServerHistory()}>
+            {serverHistoryLoading ? '…' : t('chat.loadEarlierHistory')}
+          </button>}
+
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
           projectHash={activeSession.project_hash} sessionId={sessionId} messages={messages} reset={historyReset}
-          canLoadBefore={historyDisplay.active || range.start <= liveFrom} compact={compactTimeline}
+          canLoadBefore={!serverHistory.cursor && (historyDisplay.active || range.start <= liveFrom)} compact={compactTimeline}
           focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null}
           viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onNavigate={navigateNode}
           onWindow={(active, showLive, liveStart) => {

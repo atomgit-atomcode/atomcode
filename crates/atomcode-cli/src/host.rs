@@ -2210,6 +2210,58 @@ impl HostControl for RuntimeControl {
                 self.delete_stored(&session)?;
                 Ok(HostReply::Done)
             }
+            HostCommand::DisplayHistory {
+                session,
+                cursor,
+                turns,
+            } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                // Disk reads see committed native facts under the runtime's lease;
+                // the runtime remains the only writer and lifecycle owner.
+                let id = session.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let dirs = atomcode_coding::config::product_dirs_from_env();
+                    let manager =
+                        atomcode_capabilities::session::SessionManager::for_project(&here, &dirs);
+                    let events = if manager.is_event_session(&id) {
+                        manager.load_events(&id).map_err(|e| e.to_string())?
+                    } else if manager.list().iter().any(|m| m.id == id) {
+                        return Err("Display paging requires a native event session".into());
+                    } else {
+                        Vec::new()
+                    };
+                    let source = if cursor.is_none() {
+                        atomcode_kernel::session::history::bootstrap_events(&events)
+                    } else {
+                        &events
+                    };
+                    let (range, page) = atomcode_kernel::session::history::range(
+                        &id,
+                        source,
+                        cursor.as_ref(),
+                        turns,
+                    )
+                    .map_err(|e| format!("History cursor refused: {e:?}"))?;
+                    let seed = atomcode_tui::history::state_seed(&id, &events[..range.start]);
+                    Ok::<_, String>((page, seed))
+                })
+                .await
+                .map_err(|e| HostError::Failed {
+                    message: e.to_string(),
+                })?
+                .map_err(|message| HostError::Failed { message })?;
+                self.addressed(&session)?;
+                Ok(HostReply::DisplayHistory {
+                    page: result.0,
+                    seed: result.1,
+                })
+            }
             HostCommand::PreviewSession { session } => Ok(HostReply::SessionPreview {
                 lines: preview_of(&session)?,
             }),

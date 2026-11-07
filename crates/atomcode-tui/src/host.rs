@@ -2278,6 +2278,62 @@ impl Host {
         false
     }
 
+    /// Seed sidebars/producer indexes without presenting old transcript bodies.
+    pub(crate) fn seed_history(&self, seed: &[atomcode_kernel::session::Committed]) {
+        let before = self.stream.read().expect("stream poisoned").len();
+        for event in seed {
+            self.absorb_logged(&event.logged());
+        }
+        self.stream
+            .write()
+            .expect("stream poisoned")
+            .discard_after(before);
+        self.forget_row_index();
+    }
+
+    /// Old pages use an isolated transcript fold. Live producers, questions,
+    /// editor state and sidebar counters are untouched.
+    pub(crate) fn prepend_history(
+        &self,
+        seed: &[atomcode_kernel::session::Committed],
+        events: &[atomcode_kernel::session::Committed],
+    ) {
+        let renderer = crate::modules::transcript::Transcript::default();
+        let mut stream = self.stream.write().expect("stream poisoned");
+        let mut older = stream.history_buffer();
+        let dir = self.session_dir.read().expect("dir poisoned").clone();
+        for event in seed {
+            crate::module::Producer::absorb(
+                &renderer,
+                &event.logged(),
+                &mut older.writer("transcript").in_dir(dir.clone()),
+            );
+        }
+        older.discard_seed_blocks();
+        for event in events {
+            crate::module::Producer::absorb(
+                &renderer,
+                &event.logged(),
+                &mut older.writer("transcript").in_dir(dir.clone()),
+            );
+        }
+        older.writer("transcript").settle_all();
+        let calls: Vec<_> = older
+            .slots()
+            .iter()
+            .filter(|s| s.block().content.as_tool_call().is_some())
+            .map(|s| s.block().id)
+            .collect();
+        stream.prepend_history(older);
+        drop(stream);
+        let mut presentation = self.presentation.write().expect("presentation poisoned");
+        for id in calls {
+            presentation.fold_by_default(id);
+        }
+        drop(presentation);
+        self.forget_row_index();
+    }
+
     /// Deliver one committed fact to every module, as the log carries it.
     ///
     /// Producers first, then views: a view that reacts to the same fact should

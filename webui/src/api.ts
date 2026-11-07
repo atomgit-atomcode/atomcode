@@ -340,7 +340,11 @@ export async function getTodoSources(project: string, session: string, signal: A
   return readJson<TodoSourceView>(response);
 }
 
+export interface DisplayHistoryCursor { session: string; before: number; digest: string }
+
 export interface SessionDetail {
+  history_seed?: SessionMessage[];
+  history_older?: DisplayHistoryCursor;
   summary_count?: number;
   id: string;
   name: string;
@@ -973,12 +977,20 @@ export async function getSession(
   projectHash: string,
   sessionId: string,
   signal?: AbortSignal,
+  before?: DisplayHistoryCursor,
+  recent = false,
 ): Promise<SessionDetail> {
-  const resp = await apiFetch(`/projects/${projectHash}/sessions/${sessionId}`, {
+  const query = before ? `?before=${encodeURIComponent(JSON.stringify(before))}` : recent ? '?recent=true' : '';
+  const resp = await apiFetch(`/projects/${projectHash}/sessions/${sessionId}${query}`, {
     headers: authHeaders(),
     signal,
   });
   return readJson(resp);
+}
+
+/** Bounded display read; export/search callers keep getSession's full contract. */
+export function getSessionPage(projectHash: string, sessionId: string, signal?: AbortSignal, before?: DisplayHistoryCursor) {
+  return getSession(projectHash, sessionId, signal, before, true);
 }
 
 export interface TranscriptStep {
@@ -1071,7 +1083,7 @@ export interface LiveLoopProgress {
 export type LiveWireEvent =
   | { type: 'context_compacting'; active: boolean; diagnostic?: string }
   | { type: 'context_summary'; count: number; record: boolean }
-  | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null }
+  | { type: 'snapshot'; history_seed?: SessionMessage[]; history_older?: DisplayHistoryCursor; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
   | ({ type: 'loop_changed' } & LiveLoopProgress)
   | { type: 'provider'; provider: string; model?: string | null }
@@ -1112,7 +1124,7 @@ export async function streamLive(
   // caller can run a staleness watchdog that reconnects a silently-dead stream.
   onActivity?: () => void,
 ): Promise<void> {
-  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+  const params = sessionId ? `?recent=true&session_id=${encodeURIComponent(sessionId)}` : '?recent=true';
   const resp = await apiFetch(`/live${params}`, { headers: authHeaders(), signal });
   await readEventStream(resp, onEvent, { onActivity });
 }

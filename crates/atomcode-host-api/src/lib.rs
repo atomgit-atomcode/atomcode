@@ -51,6 +51,12 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// Read committed display history only; does not restore or mutate the agent.
+    DisplayHistory {
+        session: String,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        turns: usize,
+    },
     /// The last few exchanges of a stored session, for someone deciding whether
     /// to come back to it. Answered from the log the session already keeps —
     /// nothing is opened or resumed by asking.
@@ -356,7 +362,8 @@ impl HostCommand {
     /// The live session this command acts on, if it acts on one.
     pub fn addressed(&self) -> Option<&str> {
         match self {
-            Self::NewSession { session }
+            Self::DisplayHistory { session, .. }
+            | Self::NewSession { session }
             | Self::Resume { session, .. }
             | Self::TaskSpecs { session, .. }
             | Self::FollowUp { session, .. }
@@ -434,6 +441,12 @@ pub struct PersonaInfo {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    /// `seed` is render-free, disposable display state, not authoritative facts.
+    /// Never send it to the model or append it to the session log.
+    DisplayHistory {
+        page: atomcode_kernel::session::history::Page,
+        seed: Vec<atomcode_kernel::session::Committed>,
+    },
     Hooks {
         value: serde_json::Value,
     },
@@ -1598,6 +1611,16 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::DisplayHistory {
+                session: "a".into(),
+                turns: 8,
+                cursor: Some(atomcode_kernel::session::history::Cursor {
+                    session: "a".into(),
+                    through: 100,
+                    before: 70,
+                    revision: 0,
+                }),
+            },
             HostCommand::Hooks {
                 session: "a".into(),
                 args: "list".into(),
@@ -1783,7 +1806,8 @@ mod tests {
         ];
         for c in &all {
             match c {
-                HostCommand::NewSession { .. }
+                HostCommand::DisplayHistory { .. }
+                | HostCommand::NewSession { .. }
                 | HostCommand::Resume { .. }
                 | HostCommand::SetReasoningEffort { .. }
                 | HostCommand::ListSessions { .. }
@@ -1844,6 +1868,21 @@ mod tests {
 
     fn replies() -> Vec<HostReply> {
         let all = vec![
+            HostReply::DisplayHistory {
+                page: atomcode_kernel::session::history::Page {
+                    session: "a".into(),
+                    through: 100,
+                    revision: 0,
+                    events: vec![],
+                    older: Some(atomcode_kernel::session::history::Cursor {
+                        session: "a".into(),
+                        through: 100,
+                        before: 70,
+                        revision: 0,
+                    }),
+                },
+                seed: vec![],
+            },
             HostReply::Done,
             HostReply::Hooks {
                 value: serde_json::json!({"items":[]}),
@@ -2128,7 +2167,8 @@ mod tests {
             .collect();
         for r in &all {
             match r {
-                HostReply::Done
+                HostReply::DisplayHistory { .. }
+                | HostReply::Done
                 | HostReply::TaskSpecs { .. }
                 | HostReply::FollowUp { .. }
                 | HostReply::Hooks { .. }

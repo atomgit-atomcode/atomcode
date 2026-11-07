@@ -716,6 +716,10 @@ pub(crate) enum LiveWireEvent {
     ContextSummary { count: u64, record: bool },
     #[serde(rename = "snapshot")]
     Snapshot {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        history_seed: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history_older: Option<crate::display_history::Cursor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary_count: Option<u64>,
         messages: Vec<crate::MessageInfo>,
@@ -1510,6 +1514,8 @@ pub(crate) async fn sync_live_provider_config(
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct LiveStreamQuery {
     #[serde(default)]
+    pub recent: bool,
+    #[serde(default)]
     pub session_id: Option<String>,
 }
 
@@ -1651,9 +1657,26 @@ pub(crate) async fn live_stream(
         &join.binding.session_id,
     );
     let summary_count = crate::context_summary_count(&snapshot_wd, &join.binding.session_id);
+    let history_seed = if q.recent {
+        crate::display_history::state_seed(&snapshot_messages)
+    } else {
+        Vec::new()
+    };
+    let history_older = if q.recent {
+        crate::display_history::window(
+            &format!("{project_hash}/{}", join.binding.session_id),
+            &mut snapshot_messages,
+            None,
+        )
+        .unwrap_or(None)
+    } else {
+        None
+    };
     let _ = tx.send((
         join.binding.session_id.clone(),
         LiveWireEvent::Snapshot {
+            history_seed,
+            history_older,
             summary_count,
             messages: snapshot_messages,
             session_id: join.binding.session_id.clone(),

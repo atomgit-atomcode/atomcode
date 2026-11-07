@@ -14,6 +14,7 @@
     "test:permission": "node scripts/permission-e2e.mjs",
     "test:todo-sources": "node scripts/todo-sources-e2e.mjs",
     "test:session-browse": "node scripts/session-browse-e2e.mjs",
+    "test:history-pagination": "node scripts/history-pagination-e2e.mjs",
     "test:context": "node scripts/context-summary-e2e.mjs",
     "test:workbench": "node scripts/workbench-e2e.mjs",
     "test:workbench-refresh": "node scripts/workbench-refresh-e2e.mjs",

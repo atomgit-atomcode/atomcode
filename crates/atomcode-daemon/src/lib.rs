@@ -33,6 +33,7 @@ mod api_provider_accounts;
 mod api_schedule;
 pub mod approval_mode;
 mod commands;
+mod display_history;
 mod git_branch;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
@@ -452,6 +453,10 @@ pub struct AppendSessionMessagesResponse {
 /// Session detail response
 #[derive(Debug, Serialize)]
 pub struct SessionDetail {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) history_seed: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) history_older: Option<display_history::Cursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_count: Option<u64>,
     pub id: String,
@@ -2402,11 +2407,21 @@ async fn get_todo_sources(
 }
 
 /// GET /projects/:hash/sessions/:id - Get session detail
-async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+#[derive(Default, serde::Deserialize)]
+struct DisplayHistoryQuery {
+    #[serde(default)]
+    recent: bool,
+    before: Option<String>,
+}
+
+async fn get_session_detail(
+    Path((hash, id)): Path<(String, String)>,
+    Query(query): Query<DisplayHistoryQuery>,
+) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
             let turn_timestamps = load_turn_timestamps(&hash, &id).await;
-            let messages =
+            let mut messages =
                 match merge_catalog_session_messages_for_display(&session, &turn_timestamps) {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -2414,11 +2429,43 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                         return (StatusCode::NOT_FOUND, Json(msg)).into_response();
                     }
                 };
+            let message_count = messages.len();
+            let cursor = match query
+                .before
+                .as_deref()
+                .map(serde_json::from_str::<display_history::Cursor>)
+                .transpose()
+            {
+                Ok(c) => c,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, Json("Invalid history cursor"))
+                        .into_response()
+                }
+            };
+            let history_seed = if query.recent && cursor.is_none() {
+                display_history::state_seed(&messages)
+            } else {
+                Vec::new()
+            };
+            let history_older = if query.recent || cursor.is_some() {
+                match display_history::window(
+                    &format!("{hash}/{id}"),
+                    &mut messages,
+                    cursor.as_ref(),
+                ) {
+                    Ok(older) => older,
+                    Err(error) => return (StatusCode::CONFLICT, Json(error)).into_response(),
+                }
+            } else {
+                None
+            };
             // Read the todo sidecar BEFORE moving fields out of `session` below.
             // (Survives compaction that drained the transcript's todowrite calls;
             // the stale marker check happens inside `read_todo_sidecar`.)
             let todos = read_todo_sidecar_for_detail(&session);
             let detail = SessionDetail {
+                history_seed,
+                history_older,
                 summary_count: context_summary_count(
                     std::path::Path::new(&session.meta.working_dir),
                     &session.meta.id,
@@ -2428,7 +2475,7 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                 working_dir: PathBuf::from(session.meta.working_dir),
                 created_at: u64::try_from(session.meta.created_at.max(0)).unwrap_or(0),
                 updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
-                message_count: messages.len(),
+                message_count,
                 messages,
                 todos,
             };

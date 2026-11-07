@@ -202,6 +202,8 @@ pub struct AgentClient {
     link: Mutex<Option<Link>>,
     view: Mutex<Views>,
     receipts: AtomicU64,
+    history_sink: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
+    history_enabled: AtomicBool,
 }
 
 struct Link {
@@ -240,6 +242,9 @@ struct SessionView {
     /// The last fact folded.
     high: Option<SeqNo>,
     events: Vec<LoggedEvent>,
+    history: Option<atomcode_kernel::session::history::Cursor>,
+    history_request: Option<u64>,
+    history_seed: Vec<Committed>,
     described: Option<AgentDescription>,
     /// The **selection id** the session is on — `AtomGit/deepseek-flash`, which
     /// an alias differs from — as of the last `/model` this screen saw land.
@@ -654,9 +659,21 @@ impl AgentClient {
         for old in previous.into_iter().filter(|old| old != session) {
             self.command(AgentCommand::Unsubscribe { session: old });
         }
+        if !self.request_history(session, None, true) {
+            self.subscribe_history(session, 0);
+        }
+    }
+
+    fn subscribe_history(&self, session: &str, from: SeqNo) {
+        let receipt = self
+            .view
+            .lock()
+            .expect("client poisoned")
+            .replay_receipt
+            .clone();
         let subscribe = AgentCommand::Subscribe {
-            session: session.to_string(),
-            from: 0,
+            session: session.into(),
+            from,
         };
         self.command(match receipt {
             Some(id) => AgentCommand::Tagged {
@@ -665,6 +682,71 @@ impl AgentClient {
             },
             None => subscribe,
         });
+    }
+
+    fn request_history(
+        &self,
+        session: &str,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        initial: bool,
+    ) -> bool {
+        if !self.history_enabled.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(sink) = self.history_sink.lock().expect("client poisoned").clone() else {
+            return false;
+        };
+        let Some(control) = self.control() else {
+            return false;
+        };
+        let request = self.receipts.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut views = self.view.lock().expect("client poisoned");
+            let Some(view) = views.sessions.get_mut(session) else {
+                return false;
+            };
+            if view.history_request.is_some() {
+                return false;
+            }
+            view.history_request = Some(request);
+        }
+        let session = session.to_string();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                control.call(HostCommand::DisplayHistory {
+                    session: session.clone(),
+                    cursor: cursor.clone(),
+                    turns: atomcode_kernel::session::history::DEFAULT_TURNS,
+                }),
+            )
+            .await
+            .unwrap_or(Err(atomcode_host_api::HostError::Unavailable));
+            let _ = sink.send(Wake::History {
+                session,
+                request,
+                initial,
+                cursor,
+                result,
+            });
+        });
+        true
+    }
+
+    fn request_older(&self) {
+        let (session, cursor) = {
+            let views = self.view.lock().expect("client poisoned");
+            let Some(view) = views.screen() else {
+                return;
+            };
+            if view.history_request.is_some() {
+                return;
+            }
+            (views.on_screen.clone(), view.history.clone())
+        };
+        if let Some(cursor) = cursor {
+            self.request_history(&session, Some(cursor), false);
+        }
     }
 
     /// Let a member go once it has left the team — unless it is on screen,
@@ -747,6 +829,23 @@ impl AgentClient {
         };
         if view.high.is_some_and(|h| committed.seq <= h) {
             return false;
+        }
+        if matches!(
+            committed.event,
+            atomcode_kernel::session::SessionEvent::Rewound { .. }
+                | atomcode_kernel::session::SessionEvent::Interrupted { undone: true, .. }
+                | atomcode_kernel::session::SessionEvent::Compacted { .. }
+                | atomcode_kernel::session::SessionEvent::MessagesRewritten { .. }
+                | atomcode_kernel::session::SessionEvent::ToolResultsStubbed { .. }
+        ) {
+            // The log is append-only. Rebase the omitted range only after this
+            // view observed the mutation; a response based on the earlier
+            // revision is discarded. Current undo markers are applied after
+            // prepending original historical events.
+            if let Some(cursor) = &mut view.history {
+                cursor.revision = committed.seq;
+            }
+            view.history_request = None;
         }
         view.high = Some(committed.seq);
         view.events.push(LoggedEvent {
@@ -1095,6 +1194,13 @@ async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
 }
 
 enum Wake {
+    History {
+        session: String,
+        request: u64,
+        initial: bool,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        result: Result<HostReply, atomcode_host_api::HostError>,
+    },
     Copied {
         session: String,
         message: String,
@@ -1579,6 +1685,7 @@ impl UserInterface for Tui {
         client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
+        *client.history_sink.lock().expect("client poisoned") = Some(wake_tx.clone());
         // Started before anything can commit a fact, so the first turn's
         // opening reading is measured on the same clock as every later one.
         let clock = Clock::start();
@@ -2250,6 +2357,15 @@ impl UserInterface for Tui {
                         }
                         stale = true;
                     }
+                }
+                Wake::History {
+                    session,
+                    request,
+                    initial,
+                    cursor,
+                    result,
+                } => {
+                    stale |= self.accept_history(&session, request, initial, cursor, result);
                 }
                 Wake::Fact => {
                     stale = true;
@@ -3852,6 +3968,96 @@ impl Tui {
     /// the only way to learn the rows — the screen has no other road to the
     /// configuration, which is what keeps it an App apart (`docs/adr/0022` §3).
     ///
+    fn accept_history(
+        &self,
+        session: &str,
+        request: u64,
+        initial: bool,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        result: Result<HostReply, atomcode_host_api::HostError>,
+    ) -> bool {
+        let on_screen = {
+            let mut views = self.client.view.lock().expect("client poisoned");
+            let on_screen = views.on_screen == session;
+            let Some(view) = views.sessions.get_mut(session) else {
+                return false;
+            };
+            if view.history_request != Some(request) {
+                return false;
+            }
+            view.history_request = None;
+            if !initial && view.history != cursor {
+                return false;
+            }
+            on_screen
+        };
+        let (page, seed) = match result {
+            Ok(HostReply::DisplayHistory { page, seed }) if page.session == session => (page, seed),
+            other => {
+                // A host without this optional display read still speaks the
+                // existing full subscription protocol; never strand the screen.
+                if initial {
+                    self.client.subscribe_history(session, 0);
+                }
+                if let Err(error) = other {
+                    let error = format!("{error:?}");
+                    self.host.say(
+                        pt(PMsg::SessionLoadFailed { error: &error }).into_owned(),
+                        true,
+                    );
+                }
+                return true;
+            }
+        };
+        if initial {
+            if on_screen {
+                self.host.seed_history(&seed);
+            }
+            // Retain the lightweight seed for projections rebuilt when looking
+            // at a team member and then returning to the lead.
+            {
+                let mut views = self.client.view.lock().expect("client poisoned");
+                let view = views.sessions.get_mut(session).expect("checked session");
+                view.history_seed = seed;
+                view.events = view.history_seed.iter().map(Committed::logged).collect();
+            }
+            for event in page.events {
+                self.on_event(AgentEvent::Fact(Box::new(event)));
+            }
+            {
+                let mut views = self.client.view.lock().expect("client poisoned");
+                let view = views.sessions.get_mut(session).expect("checked session");
+                view.high = Some(page.through);
+                view.history = page.older;
+            }
+            // Reading before subscribing closes the read/live gap: appends
+            // during the read are replayed from the frozen high-water mark.
+            self.client
+                .subscribe_history(session, page.through.saturating_add(1));
+        } else {
+            if on_screen {
+                self.host.prepend_history(&seed, &page.events);
+            }
+            let mut views = self.client.view.lock().expect("client poisoned");
+            let view = views.sessions.get_mut(session).expect("checked session");
+            let before = cursor.as_ref().expect("older page has a cursor").before;
+            view.events.retain(|e| e.seq >= before);
+            view.events.splice(
+                0..0,
+                seed.iter()
+                    .map(Committed::logged)
+                    .chain(page.events.iter().map(Committed::logged)),
+            );
+            view.history_seed = seed;
+            view.history = page.older;
+            drop(views);
+            if on_screen {
+                self.mark_undone();
+            }
+        }
+        true
+    }
+
     /// **True when the rows changed**, so a caller can tell "read them again"
     /// from "and they were different".
     fn refresh_settings(&self) -> bool {
@@ -3866,6 +4072,9 @@ impl Tui {
         };
         self.host
             .set_history_layout_rows(port.history_replay_rows());
+        self.client
+            .history_enabled
+            .store(port.history_replay_rows().is_some(), Ordering::SeqCst);
         let view = port.rows();
         let value = view
             .rows()
@@ -6183,7 +6392,18 @@ impl Tui {
         let stopped = self.host.take_stopped();
         self.host.switch_view();
         self.hand_back(stopped);
-        for logged in &known {
+        let seed = self
+            .client
+            .view
+            .lock()
+            .expect("client poisoned")
+            .sessions
+            .get(session)
+            .map(|view| view.history_seed.clone())
+            .unwrap_or_default();
+        self.host.seed_history(&seed);
+        let through = seed.last().map_or(0, |e| e.seq);
+        for logged in known.iter().filter(|e| e.seq > through) {
             self.host.absorb_logged(logged);
         }
         self.mark_undone();
@@ -8526,6 +8746,9 @@ impl Tui {
                 let max = self.host.scroll_limit(self.surface.size(), &m);
                 let next = m.scroll.0 as i64 - by as i64;
                 m.scroll = crate::moment::ScrollPos(next.clamp(0, max as i64) as usize);
+                if by < 0 && m.scroll.0.saturating_add(40) >= max {
+                    client.request_older();
+                }
             }
             Action::ScrollToBottom => {
                 m.edge_scroll = None;
@@ -17055,6 +17278,242 @@ mod allowance_switch_tests {
         assert!(
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_history_tests {
+    use super::*;
+    use atomcode_kernel::session::{history, SessionEvent};
+
+    struct Noop;
+    #[async_trait]
+    impl HostControl for Noop {
+        async fn call(&self, _: HostCommand) -> Result<HostReply, atomcode_host_api::HostError> {
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+    fn events() -> Vec<LoggedEvent> {
+        (1..=25)
+            .flat_map(|turn| {
+                [
+                    SessionEvent::TurnStart { turn },
+                    SessionEvent::UserMessage {
+                        turn,
+                        text: format!("prompt {turn}"),
+                        images: vec![],
+                    },
+                    SessionEvent::AssistantMessage {
+                        turn,
+                        round: 1,
+                        text: format!("answer {turn}"),
+                        reasoning: String::new(),
+                        tool_calls: vec![],
+                        reasoning_blocks: vec![],
+                        meta: None,
+                    },
+                    SessionEvent::TurnEnd {
+                        turn,
+                        stop: atomcode_kernel::event::StopReason::Stopped,
+                        error: None,
+                    },
+                ]
+            })
+            .enumerate()
+            .map(|(i, event)| LoggedEvent {
+                seq: i as u64 + 1,
+                at: i as u64,
+                event,
+            })
+            .collect()
+    }
+    fn reply(events: &[LoggedEvent], cursor: Option<&history::Cursor>) -> HostReply {
+        let (range, page) = history::range("lead", events, cursor, 8).unwrap();
+        HostReply::DisplayHistory {
+            page,
+            seed: crate::history::state_seed("lead", &events[..range.start]),
+        }
+    }
+    #[test]
+    fn bounded_bootstrap_subscribes_after_watermark_and_old_pages_preserve_live_state() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        let (send, mut commands) = mpsc::unbounded_channel();
+        tui.client.connect(send, Arc::new(Noop));
+        tui.client.follow("lead");
+        commands.try_recv().unwrap();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(1);
+        assert!(tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None))));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            AgentCommand::Subscribe { from: 101, .. }
+        ));
+        assert_eq!(tui.client.root_high(), 100);
+        assert_eq!(
+            tui.client
+                .events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+                .count(),
+            8
+        );
+        host.moment.write().unwrap().input = "unsent draft".into();
+        let live = host.stream.write().unwrap().writer("test-live").open(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::NoticeBlock {
+                detail: "live".into(),
+            }),
+        );
+        let cursor = tui.client.view.lock().unwrap().sessions["lead"]
+            .history
+            .clone()
+            .unwrap();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(2);
+        assert!(tui.accept_history(
+            "lead",
+            2,
+            false,
+            Some(cursor.clone()),
+            Ok(reply(&events(), Some(&cursor)))
+        ));
+        assert_eq!(host.moment.read().unwrap().input, "unsent draft");
+        assert_eq!(tui.client.root_high(), 100);
+        assert!(host.stream.write().unwrap().writer("test-live").amend(
+            live,
+            Arc::new(crate::content::NoticeBlock {
+                detail: "continued".into()
+            })
+        ));
+        assert_eq!(
+            tui.client
+                .events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+                .count(),
+            16
+        );
+        assert_eq!(
+            tui.client
+                .events()
+                .iter()
+                .map(|e| e.seq)
+                .collect::<HashSet<_>>()
+                .len(),
+            tui.client.events().len()
+        );
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(3);
+        tui.client.keep(&Committed {
+            session: "lead".into(),
+            seq: 101,
+            at: 101,
+            event: SessionEvent::Interrupted {
+                turn: 25,
+                undone: true,
+            },
+        });
+        let views = tui.client.view.lock().unwrap();
+        assert_eq!(
+            views.sessions["lead"].history.as_ref().unwrap().revision,
+            101
+        );
+        assert_eq!(views.sessions["lead"].history_request, None);
+    }
+    #[test]
+    fn a_leads_old_page_does_not_prepend_into_a_member_now_on_screen() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow("lead");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(1);
+        tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None)));
+        let cursor = tui.client.view.lock().unwrap().sessions["lead"]
+            .history
+            .clone()
+            .unwrap();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(2);
+        tui.look_at("member");
+        let before = host.stream.read().unwrap().len();
+        tui.accept_history(
+            "lead",
+            2,
+            false,
+            Some(cursor.clone()),
+            Ok(reply(&events(), Some(&cursor))),
+        );
+        assert_eq!(tui.client.session(), "member");
+        assert_eq!(host.stream.read().unwrap().len(), before);
+        assert_eq!(
+            tui.client.view.lock().unwrap().sessions["lead"]
+                .events
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+                .count(),
+            16
+        );
+    }
+    #[test]
+    fn a_late_page_from_an_earlier_view_of_the_same_session_is_ignored() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow("lead");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(1);
+        tui.client.follow("other");
+        tui.client.follow("lead");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(2);
+        assert!(!tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None))));
+        assert!(tui.client.events().is_empty());
+        assert_eq!(
+            tui.client.view.lock().unwrap().sessions["lead"].history_request,
+            Some(2)
         );
     }
 }
