@@ -5,7 +5,10 @@
 //! In a builder-assembled agent they are five branches in one function. Here each
 //! is a row, and the loop's own code says only "ask, then obey".
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -864,6 +867,18 @@ fn truncate(text: &str, max: usize) -> String {
         + "…"
 }
 
+/// Per-session stage attempts and their lock-free hints. Kept separate from the
+/// request row so the cross-session contract can be tested without a Context.
+struct CompactionGate {
+    /// Attempts in each session’s current turn and context-pressure cycle.
+    tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
+    /// Per-session, lock-free gate hints (one direct-mapped slot per session
+    /// hash). A miss only costs the gate's lock or one projection; the map under
+    /// the lock remains authoritative. A slot collision evicts another session's
+    /// hint, which costs an optimization, never a decision.
+    hint: GateHint,
+}
+
 /// Runs before the request goes out: if the last round's usage crossed the
 /// threshold, ask the compaction provider for a decision and log it. The
 /// resulting prompt is smaller *and* still fully derived from the log.
@@ -871,11 +886,61 @@ struct CompactBeforeRequest {
     ctx: Context,
     threshold: f32,
     token_limit: Option<u32>,
-    /// Attempts in each session’s current turn and context-pressure cycle.
-    tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
+    /// Stage attempts and their per-session hints.
+    gate: CompactionGate,
 }
 
-impl CompactBeforeRequest {
+/// Hint key for a session: hash in the high bits, low bit reserved for the
+/// both-slots state.
+fn session_key(session: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    session.hash(&mut hasher);
+    hasher.finish() & !1
+}
+
+const GATE_HINT_SLOTS: usize = 16;
+
+/// One direct-mapped atomic hint per session slot: the session key with the
+/// both-slots bit. Different sessions keep their hints unless their hashes land
+/// in the same slot; even then the map under the lock decides the gate.
+struct GateHint([AtomicU64; GATE_HINT_SLOTS]);
+
+impl GateHint {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+    fn slot(key: u64) -> usize {
+        (key >> 1) as usize % GATE_HINT_SLOTS
+    }
+    fn set(&self, session: &str, both: bool) {
+        let key = session_key(session);
+        self.0[Self::slot(key)].store(key | if both { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    fn hit(&self, session: &str) -> bool {
+        let key = session_key(session);
+        self.0[Self::slot(key)].load(Ordering::Relaxed) == (key | 1)
+    }
+}
+
+impl CompactionGate {
+    fn new() -> Self {
+        Self {
+            tried: Mutex::new(HashMap::new()),
+            hint: GateHint::new(),
+        }
+    }
+
+    /// Lower pressure rearms the session by dropping its entry. The hint is left
+    /// as-is: a stale both bit only makes the next request take the lock and
+    /// re-read the map, and `first_try` refreshes it. Clearing it here would pay
+    /// a hash + atomic store on every low-pressure request.
+    fn rearm(&self, session: &str) {
+        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+        tried.remove(session);
+    }
+}
+
+impl CompactionGate {
     /// At most one attempt per stage per turn or pressure cycle. A no-op or
     /// failed summary must not bill again on every request while pressure stays
     /// high. A later provider report below the trigger rearms both stages.
@@ -887,7 +952,49 @@ impl CompactBeforeRequest {
         if entry.0 != turn {
             *entry = (turn, [false; 2]);
         }
-        !std::mem::replace(&mut entry.1[usize::from(slow)], true)
+        let first = !std::mem::replace(&mut entry.1[usize::from(slow)], true);
+        let both = entry.1.iter().all(|tried| *tried);
+        self.hint.set(session, both);
+        first
+    }
+
+    /// Whether both stages were already attempted for this turn/cycle. Checked
+    /// before `calls_model`, which projects the whole log: a long turn that stays
+    /// above the threshold must not pay that projection on every request after
+    /// both attempts are spent.
+    ///
+    /// `first_try` marks slot 0 for the fast stage (`slow == false`) and slot 1
+    /// for the slow one; only an ask whose `calls_model` returns true takes the
+    /// slow slot. The built-in tail strategy always answers false, and a
+    /// model-backed summarizer only when the ask is not an overflow stub and it
+    /// has a settled span to summarize.
+    ///
+    /// Both slots are therefore spent only after the verdict flips inside the
+    /// turn: an always-true verdict spends only the slow stage, so every later
+    /// request still asks and `first_try` refuses the spent slot; an
+    /// always-false verdict only spends the fast one. Neither stable verdict
+    /// trips this gate — both are still asked on every request — and the
+    /// optimization pays off once the verdict flips and both slots are spent.
+    ///
+    /// Read-only: the turn reset belongs to `first_try`, which every request
+    /// that gets past this check still reaches. A request that cannot hit the
+    /// gate pays one session hash + one atomic load; otherwise one map lookup
+    /// and no allocation.
+    ///
+    /// This deliberately does not cache `calls_model`'s last verdict: a verdict
+    /// that flips — overflow starts needing the stub, or enough turns settle —
+    /// is the signal to spend the other stage, and skipping it could send a
+    /// request the stub was about to shrink. A verdict that never flips is
+    /// therefore still asked for on every request; the projection is skipped
+    /// only after both stages have been spent.
+    fn both_tried(&self, session: &str, turn: u64) -> bool {
+        if !self.hint.hit(session) {
+            return false;
+        }
+        let tried = self.tried.lock().expect("compaction attempts poisoned");
+        tried
+            .get(session)
+            .is_some_and(|entry| entry.0 == turn && entry.1.iter().all(|tried| *tried))
     }
 }
 
@@ -913,7 +1020,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
-        let used = last_prompt_tokens(&session);
+        let used = session.last_prompt_tokens();
         let trigger_tokens = self
             .token_limit
             .map_or(window as f32 * self.threshold, |limit| {
@@ -923,10 +1030,13 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             return next.run(req).await;
         }
         if (used as f32) < trigger_tokens {
-            self.tried
-                .lock()
-                .expect("compaction attempts poisoned")
-                .remove(session.id());
+            // This must stay ahead of both_tried: a low request is the one that
+            // rearms, and the gate would otherwise skip it with the table still
+            // spent, silencing the trigger until the next turn.
+            self.gate.rearm(session.id());
+            return next.run(req).await;
+        }
+        if self.gate.both_tried(session.id(), session.current_turn()) {
             return next.run(req).await;
         }
 
@@ -938,7 +1048,10 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             used_tokens: used,
         };
         let slow = compaction.calls_model(&session, &ask);
-        if !self.first_try(session.id(), session.current_turn(), slow) {
+        if !self
+            .gate
+            .first_try(session.id(), session.current_turn(), slow)
+        {
             return next.run(req).await;
         }
         if slow {
@@ -969,24 +1082,6 @@ pub(crate) fn reproject(req: &mut ModelRequest, session: &crate::session::Sessio
         .collect();
     messages.extend(session.derive_messages());
     req.messages = messages;
-}
-
-/// Prompt tokens of the last request: what the provider reported for it, or —
-/// for a session seeded from a stored conversation, which carries no usage
-/// facts — what the stored answer recorded.
-pub(crate) fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
-    session
-        .events()
-        .iter()
-        .rev()
-        .find_map(|e| match &e.event {
-            SessionEvent::Usage { usage, .. } => Some(usage.prompt),
-            SessionEvent::AssistantMessage {
-                meta: Some(meta), ..
-            } if meta.used_tokens > 0 => Some(meta.used_tokens),
-            _ => None,
-        })
-        .unwrap_or(0)
 }
 
 pub struct CompactionPlugin;
@@ -1042,7 +1137,7 @@ pub fn mount_compaction_trigger_with_limit(
             ctx: ctx.clone(),
             threshold,
             token_limit,
-            tried: Mutex::new(HashMap::new()),
+            gate: CompactionGate::new(),
         }),
         false,
     );
@@ -1731,5 +1826,105 @@ mod round_budget_tests {
             Some(StopReason::StoppedByPolicy),
             "an unlimited round budget must not disable the deadline"
         );
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::{session_key, GateHint};
+
+    #[test]
+    fn the_gate_hint_is_per_session() {
+        let hint = GateHint::new();
+        let a = "session-a";
+        let b = (0..1_000)
+            .map(|i| format!("session-b{i}"))
+            .find(|b| GateHint::slot(session_key(a)) != GateHint::slot(session_key(b)))
+            .expect("a session with a distinct hint slot");
+
+        hint.set(a, true);
+        assert!(hint.hit(a));
+        assert!(!hint.hit(&b));
+
+        hint.set(&b, true);
+        assert!(
+            hint.hit(a),
+            "another session must not evict this one's hint"
+        );
+        assert!(hint.hit(&b));
+
+        hint.set(a, false);
+        assert!(!hint.hit(a));
+        assert!(hint.hit(&b));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::{session_key, CompactionGate, GateHint};
+
+    #[test]
+    fn a_slot_collision_only_loses_the_hint() {
+        let a = "session-a";
+        let b = (0..1_000)
+            .map(|i| format!("session-collide{i}"))
+            .find(|b| GateHint::slot(session_key(a)) == GateHint::slot(session_key(b)))
+            .expect("a colliding session key");
+        let gate = CompactionGate::new();
+
+        assert!(gate.first_try(a, 7, true));
+        assert!(gate.first_try(a, 7, false));
+        assert!(gate.both_tried(a, 7));
+
+        // B's first_try writes the same hint slot and evicts A's hint.
+        assert!(gate.first_try(&b, 7, true));
+        assert!(!gate.both_tried(a, 7));
+
+        // The map under the lock is still authoritative: A's slots stay spent.
+        assert!(!gate.first_try(a, 7, true));
+        assert!(!gate.first_try(a, 7, false));
+    }
+
+    #[test]
+    fn a_rearm_behind_a_stale_hint_still_reopens_the_gate() {
+        let gate = CompactionGate::new();
+
+        assert!(gate.first_try("s", 3, false));
+        assert!(gate.first_try("s", 3, true));
+        assert!(gate.both_tried("s", 3));
+
+        // rearm keeps the hint set on purpose; the map under the lock must
+        // still answer false so the next request can compact again.
+        gate.rearm("s");
+        assert!(!gate.both_tried("s", 3));
+        assert!(gate.first_try("s", 3, false));
+        assert!(gate.first_try("s", 3, true));
+        assert!(gate.both_tried("s", 3));
+    }
+
+    #[test]
+    fn sessions_do_not_silence_each_other() {
+        let gate = CompactionGate::new();
+
+        assert!(gate.first_try("a", 7, true));
+        assert!(gate.first_try("a", 7, false));
+        assert!(gate.both_tried("a", 7));
+
+        assert!(!gate.both_tried("b", 7));
+        assert!(gate.first_try("b", 7, true));
+        assert!(gate.first_try("b", 7, false));
+        assert!(gate.both_tried("b", 7));
+
+        // B spending both does not reset A's spent slots.
+        assert!(!gate.first_try("a", 7, true));
+        assert!(!gate.first_try("a", 7, false));
+
+        // A new turn rearms A; B's own turn stays spent.
+        assert!(gate.first_try("a", 8, true));
+        assert!(!gate.first_try("b", 7, true));
+
+        gate.rearm("a");
+        assert!(!gate.both_tried("a", 8));
+        assert!(gate.first_try("a", 8, true));
     }
 }

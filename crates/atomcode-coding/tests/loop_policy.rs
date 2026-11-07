@@ -520,7 +520,7 @@ async fn a_later_compaction_keeps_what_the_earlier_summary_said() {
 }
 
 /// A compaction strategy that says it would call a model and never finds
-/// anything to commit — and counts how often it was asked.
+/// anything to commit — and counts how often `compact` was attempted.
 struct Reluctant(Arc<AtomicU32>);
 
 #[async_trait]
@@ -589,15 +589,19 @@ async fn a_slow_compaction_is_tried_once_a_turn_and_its_start_is_always_closed()
     let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
                 [[insert]]\nid = \"compaction-reluctant\"\nname = \"compaction-reluctant\"\n\n\
                 [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
-    let asked = Arc::new(AtomicU32::new(0));
+    let compacts = Arc::new(AtomicU32::new(0));
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(ReluctantRow(asked.clone(), 0.0000001)));
+    registry.register(Arc::new(ReluctantRow(compacts.clone(), 0.0000001)));
     let mut app = App::new(registry, tree(&dir, &script, &[swap]));
     app.start().await.expect("must mount");
 
     run_turn(&app, "first").await.unwrap();
     // The first request has no usage to measure; the four after it all do.
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once in the turn");
+    assert_eq!(
+        compacts.load(Ordering::SeqCst),
+        1,
+        "one compact attempt in the turn"
+    );
 
     let events: Vec<SessionEvent> = app
         .context()
@@ -1143,6 +1147,33 @@ impl Waterfall<AgentRequest> for PressureCycle {
     }
 }
 
+/// Reports a scheduled prompt size for each response, so one turn can cross the
+/// trigger, spend both stages, fall below it and rise again. The schedule must
+/// cover every response; a missing entry fails the test instead of silently
+/// falling back to high pressure.
+struct ScheduledPressure(AtomicU32, &'static [u32]);
+#[async_trait]
+impl Waterfall<AgentRequest> for ScheduledPressure {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let mut response = next.run(req).await?;
+        let index = self.0.fetch_add(1, Ordering::SeqCst) as usize;
+        response.usage = Some(atomcode_kernel::stream::TokenUsage {
+            prompt: self
+                .1
+                .get(index)
+                .copied()
+                .expect("ScheduledPressure needs an entry for every response"),
+            completion: 1,
+            cached: 0,
+        });
+        Ok(response)
+    }
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn automatic_compaction_rearms_after_pressure_falls_and_grows_in_one_turn() {
     let dir = scratch("pressure-cycles");
@@ -1166,9 +1197,9 @@ id = "repeat-fuse"
 [[remove]]
 id = "tool-loop-guard"
 "#;
-    let asked = Arc::new(AtomicU32::new(0));
+    let compacts = Arc::new(AtomicU32::new(0));
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(ReluctantRow(asked.clone(), 0.0005)));
+    registry.register(Arc::new(ReluctantRow(compacts.clone(), 0.0005)));
     let mut app = App::new(registry, tree(&dir, &script, &[swap]));
     app.start().await.unwrap();
     let _guard = app
@@ -1176,8 +1207,312 @@ id = "tool-loop-guard"
         .on_waterfall::<AgentRequest>(Arc::new(PressureCycle(AtomicU32::new(0))), false);
     run_turn(&app, "one long task").await.unwrap();
     assert_eq!(
-        asked.load(Ordering::SeqCst),
+        compacts.load(Ordering::SeqCst),
         2,
         "falling below the trigger must permit the next pressure cycle in the same turn"
     );
+}
+
+/// A strategy that counts what the trigger asks and can stop claiming a model
+/// after `true_for` asks: `1` flips the verdict inside one turn, `u32::MAX`
+/// keeps it stable.
+struct CountingVerdict {
+    asked: Arc<AtomicU32>,
+    attempts: Arc<AtomicU32>,
+    true_for: u32,
+}
+
+#[async_trait]
+impl atomcode_harness::seams::Compaction for CountingVerdict {
+    fn describe(&self) -> String {
+        format!("claims a model for its first {} ask(s)", self.true_for)
+    }
+    fn calls_model(
+        &self,
+        _: &atomcode_harness::session::SessionLog,
+        _: &atomcode_harness::seams::CompactionAsk,
+    ) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst) < self.true_for
+    }
+    async fn compact(
+        &self,
+        _: &atomcode_harness::session::SessionLog,
+        _: &atomcode_harness::seams::CompactionAsk,
+    ) -> Option<atomcode_harness::seams::CompactionDecision> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+struct VerdictRow {
+    asked: Arc<AtomicU32>,
+    attempts: Arc<AtomicU32>,
+    true_for: u32,
+    threshold: f32,
+}
+
+#[async_trait]
+impl atomcode_plexus::Plugin for VerdictRow {
+    fn name(&self) -> &'static str {
+        "compaction-verdict"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["compaction"]
+    }
+    fn description(&self) -> &'static str {
+        "a counted model verdict"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<CompactionSvc>(Arc::new(CountingVerdict {
+                asked: self.asked.clone(),
+                attempts: self.attempts.clone(),
+                true_for: self.true_for,
+            }))
+            .map_err(|e| e.to_string())?;
+        plugins::loop_policy::mount_compaction_trigger(ctx, self.threshold);
+        Ok(())
+    }
+}
+
+/// Four tool rounds, a closing answer and one more turn's answer: the first
+/// request has no usage, the four after it do.
+async fn verdict_app(
+    dir: &std::path::Path,
+    asked: &Arc<AtomicU32>,
+    attempts: &Arc<AtomicU32>,
+    true_for: u32,
+) -> App {
+    verdict_app_with_rounds(dir, asked, attempts, true_for, 4, 0.0000001).await
+}
+
+/// A turn of `rounds` tool rounds plus the closing answer, followed by one more
+/// turn's answer. The first request has no usage; the responses after it drive
+/// the trigger. `threshold` is the fraction of the context window that counts as
+/// pressure (the trigger is `window * threshold`), not a raw prompt-token count.
+async fn verdict_app_with_rounds(
+    dir: &std::path::Path,
+    asked: &Arc<AtomicU32>,
+    attempts: &Arc<AtomicU32>,
+    true_for: u32,
+    rounds: usize,
+    threshold: f32,
+) -> App {
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let mut steps = vec![call; rounds];
+    steps.push(r#"{ text = "done" }"#);
+    steps.push(r#"{ text = "next" }"#);
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ context_window = 128000, script = [\n  \
+         {}\n] }}\n",
+        steps.join(",\n  ")
+    );
+    let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
+                [[insert]]\nid = \"compaction-verdict\"\nname = \"compaction-verdict\"\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(VerdictRow {
+        asked: asked.clone(),
+        attempts: attempts.clone(),
+        true_for,
+        threshold,
+    }));
+    let mut app = App::new(registry, tree(dir, &script, &[swap]));
+    app.start().await.expect("must mount");
+    app
+}
+
+async fn verdict_app_with_script(
+    dir: &std::path::Path,
+    asked: &Arc<AtomicU32>,
+    attempts: &Arc<AtomicU32>,
+    true_for: u32,
+    threshold: f32,
+    script: &str,
+) -> App {
+    let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
+                [[insert]]\nid = \"compaction-verdict\"\nname = \"compaction-verdict\"\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(VerdictRow {
+        asked: asked.clone(),
+        attempts: attempts.clone(),
+        true_for,
+        threshold,
+    }));
+    let mut app = App::new(registry, tree(dir, script, &[swap]));
+    app.start().await.expect("must mount");
+    app
+}
+
+/// Pressure does not fall between the rounds of a turn. Once both stages have
+/// been spent, the trigger must stop asking the strategy — `calls_model`
+/// projects the whole log — and only a new turn (or a pressure drop) may rearm
+/// it. The verdict flips after the first ask so both stage slots get marked
+/// inside one turn; the stable-verdict case is pinned separately below.
+#[tokio::test]
+async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
+    let dir = scratch("fast-path");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let app = verdict_app(&dir, &asked, &attempts, 1).await;
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the two stages spend one ask each inside the turn"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "and each attempt reaches the strategy once"
+    );
+
+    run_turn(&app, "second").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "a new turn rearms the trigger instead of leaving it silent"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+/// A verdict that never flips is still asked for on every request: the trigger
+/// cannot know it changed without asking, and caching the last answer would
+/// skip a flip that may be the stub a shrinking request depends on. The fast
+/// path only stops asking once both stages are spent, which a stable verdict
+/// never reaches — this pins that cost so a future "optimization" cannot make
+/// the trigger deaf to the stub.
+///
+/// Not the same case as `a_spent_turn_stops_asking_the_strategy_until_the_next_turn`:
+/// that verdict flips after one ask (2 asks / 2 attempts); this one never flips,
+/// so every request still asks (`asked` grows) while only the slow stage is
+/// attempted (`attempts == 1`). `asked` counts `calls_model`; `attempts` counts
+/// `compact` — different counters for different stages.
+#[tokio::test]
+async fn a_stable_verdict_is_still_asked_each_request() {
+    let dir = scratch("stable-verdict");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let app = verdict_app(&dir, &asked, &attempts, u32::MAX).await;
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        4,
+        "one ask per request after the first, whether or not the stage is spent"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the slow stage is still attempted only once"
+    );
+}
+
+/// The fast path and the pressure rearm meet: after both stages are spent, a
+/// high request is skipped without asking; a drop below the trigger then removes
+/// the entry, so the next high request asks the strategy again in the same turn.
+/// Without the gate that skipped ask would run (4 asks); without the rearm the
+/// last ask would stay silent (2 asks). The 3/3 pinned here is the only count
+/// that needs both paths.
+#[tokio::test]
+async fn a_pressure_drop_rearms_the_fast_path_inside_one_turn() {
+    let dir = scratch("fast-path-rearm");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    // Five tool rounds and the closing answer. The first request has no usage;
+    // each response then sets the pressure the next request sees: high, high,
+    // high (gate skips), low (entry removed), high (asks again).
+    let app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 5, 0.0005).await;
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(ScheduledPressure(
+            AtomicU32::new(0),
+            &[100, 100, 100, 10, 100, 100],
+        )),
+        false,
+    );
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "the gate skipped one high request, the drop rearmed, and the rise asked again"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn a_zero_round_turn_builds_a_valid_script() {
+    let dir = scratch("zero-rounds");
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 0, 0.0005).await;
+
+    let outcome = run_turn(&app, "first").await.unwrap();
+    assert_eq!(outcome.steps, 1, "the closing answer is one model step");
+    assert!(outcome.text.contains("done"), "{:?}", outcome.text);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+    // The script's next answer carries the first response's usage: a
+    // usage-bearing request must still reach the trigger, so the zero counters
+    // above are not a dead-test artifact.
+    let second = run_turn(&app, "second").await.unwrap();
+    assert_eq!(second.steps, 1, "the second turn is one model step");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "a usage-bearing request asks the strategy"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+/// Two root sessions share one trigger row. A spends both stages; B's own first
+/// turn must still be asked and attempted instead of inheriting A's gate.
+#[tokio::test]
+async fn a_second_session_still_gets_its_own_attempt() {
+    let dir = scratch("two-sessions");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    // A: four tool rounds + closing; B: one tool round + closing.
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ context_window = 128000, script = [\n  \
+         {call},\n  {call},\n  {call},\n  {call},\n  {{ text = \"a done\" }},\n  {call},\n  {{ text = \"b done\" }}\n] }}\n"
+    );
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let app = verdict_app_with_script(&dir, &asked, &attempts, 1, 0.0000001, &script).await;
+
+    let a = atomcode_harness::create_agent(&app).await.unwrap();
+    let b = atomcode_harness::create_agent(&app).await.unwrap();
+    assert_ne!(a.session_id(), b.session_id());
+    // Both agents reach their first turn's gate; a gate keyed only by turn
+    // would see A's spent slots and skip B.
+
+    a.send("first");
+    atomcode_harness::drive(&app, &a).await.unwrap();
+    assert_eq!(a.session().current_turn(), 1);
+    assert_eq!(b.session().current_turn(), 0);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    b.send("second");
+    atomcode_harness::drive(&app, &b).await.unwrap();
+    assert_eq!(b.session().current_turn(), 1);
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "the second session must still be asked instead of inheriting A's gate"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }

@@ -289,7 +289,7 @@ impl OverflowLadder {
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
-        let used_tokens = super::loop_policy::last_prompt_tokens(&session);
+        let used_tokens = session.last_prompt_tokens();
         while *attempt < self.max_attempts {
             let ask = CompactionAsk {
                 trigger: CompactTrigger::Overflow {

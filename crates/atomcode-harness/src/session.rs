@@ -142,6 +142,30 @@ impl SessionLog {
             })
     }
 
+    /// Prompt tokens of the last request, without copying the log: what the
+    /// provider reported for it (`Usage`), or — for a session seeded from a
+    /// stored conversation, which carries no usage facts — what the stored
+    /// answer recorded on its message (`used_tokens`, skipped when zero). The
+    /// newest of those sources wins.
+    ///
+    /// The compaction trigger reads this before every request; cloning the whole
+    /// event log for one number is the wrong trade on a long session.
+    pub fn last_prompt_tokens(&self) -> u32 {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .find_map(|logged| match &logged.event {
+                SessionEvent::Usage { usage, .. } => Some(usage.prompt),
+                SessionEvent::AssistantMessage {
+                    meta: Some(meta), ..
+                } if meta.used_tokens > 0 => Some(meta.used_tokens),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     pub fn events(&self) -> Vec<LoggedEvent> {
         self.events.read().expect("session log poisoned").clone()
     }

@@ -1922,7 +1922,7 @@ async fn compact(
             .service::<LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0),
-        used_tokens: super::loop_policy::last_prompt_tokens(&log),
+        used_tokens: log.last_prompt_tokens(),
     };
     // A summary is a model call, and it is the one piece of work between turns
     // that a person can be left waiting on: stopping has to reach it, or a
