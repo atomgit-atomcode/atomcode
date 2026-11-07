@@ -6,16 +6,13 @@
 <meta http-equiv="refresh" content="0; url=./zh/index.html">
 <script>
 (function(){
+  var lang = 'zh';
   try {
-    var lang = localStorage.getItem('atomcode_lang');
-    if (lang !== 'en') lang = 'zh'; // default to zh
-    // also honour ?lang=en|zh
-    var qs = location.search.match(/[?&]lang=(en|zh)/);
-    if (qs) lang = qs[1];
-    location.replace('./' + lang + '/index.html');
-  } catch (e) {
-    location.replace('./zh/index.html');
-  }
+    if (localStorage.getItem('atomcode_lang') === 'en') lang = 'en';
+  } catch (e) {}
+  var requested = new URLSearchParams(location.search).get('lang');
+  if (requested === 'en' || requested === 'zh') lang = requested;
+  location.replace('./' + lang + '/index.html' + location.hash);
 })();
 </script>
 </head>
