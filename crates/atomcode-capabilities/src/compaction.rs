@@ -1015,17 +1015,53 @@ fn push_single_line(into: &mut String, text: &str) -> bool {
 
 /// Escape `[` and `]` so a call field can neither close the call line's `]`
 /// nor open another tag on that line.
+///
+/// A backslash run ending at a bracket is doubled first, so the bracket is
+/// left with an odd number of backslashes before it whatever the field
+/// contained. Escaping only the bracket would let a field's own `\` pair with
+/// the added one (`\]` → `\\]`), which under the same backslash convention
+/// reads as a literal backslash followed by an unescaped bracket.
 fn escape_brackets(text: &str) -> Cow<'_, str> {
-    let extra = text.matches(['[', ']']).count();
+    let mut extra = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        match c {
+            '\\' => run += 1,
+            '[' | ']' => {
+                extra += run + 1;
+                run = 0;
+            }
+            _ => run = 0,
+        }
+    }
     if extra == 0 {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len() + extra);
+    let mut run = 0;
     for c in text.chars() {
-        if c == '[' || c == ']' {
-            out.push('\\');
+        match c {
+            '\\' => run += 1,
+            '[' | ']' => {
+                for _ in 0..run {
+                    out.push('\\');
+                    out.push('\\');
+                }
+                run = 0;
+                out.push('\\');
+                out.push(c);
+            }
+            _ => {
+                for _ in 0..run {
+                    out.push('\\');
+                }
+                run = 0;
+                out.push(c);
+            }
         }
-        out.push(c);
+    }
+    for _ in 0..run {
+        out.push('\\');
     }
     Cow::Owned(out)
 }
@@ -1033,8 +1069,9 @@ fn escape_brackets(text: &str) -> Cow<'_, str> {
 /// Append a call field after a single separating space, or nothing at all when
 /// the field folds away, so the line never ends with a dangling space. Brackets
 /// are escaped after the per-item bound, so a cut marker is escaped with the
-/// field and a cut cannot split an escape pair; the escape adds one backslash
-/// per bracket, so a bracket-heavy field renders at up to twice its bound.
+/// field and a cut cannot split an escape pair; the escape doubles a backslash
+/// run ending at a bracket and adds one per bracket, so a bracket-heavy field
+/// renders at up to twice its bound.
 fn push_call_field(into: &mut String, text: &str) {
     let text = escape_brackets(text.trim());
     let start = into.len();
@@ -3794,6 +3831,49 @@ mod tests {
             !out.contains("] [tool call:"),
             "a field cannot close the call and open another: {out:?}"
         );
+    }
+
+    #[test]
+    fn a_call_field_backslash_cannot_cancel_a_bracket_escape() {
+        // Escaping only the bracket leaves a field's own `\` to pair with the
+        // added one (`\]` → `\\]`), which under the same convention reads as a
+        // literal backslash and an unescaped bracket. Whatever the field's
+        // backslash count, the rendered bracket must keep an odd one.
+        for count in 0..=4 {
+            let slashes = "\\".repeat(count);
+            let call = ToolCall {
+                id: "c1".into(),
+                name: "n".into(),
+                arguments: format!("a{slashes}]b{slashes}[c"),
+            };
+            let out = render_transcript(&[Message::assistant("", vec![call])]);
+            let line = out
+                .lines()
+                .find(|line| line.starts_with("[tool call:"))
+                .expect("the call line");
+            let field = line
+                .strip_prefix("[tool call: n ")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .expect("the renderer puts the name and field here");
+            let brackets: Vec<(usize, &str)> = field.match_indices(['[', ']']).collect();
+            assert_eq!(
+                brackets.len(),
+                2,
+                "both field brackets are rendered: {field:?}"
+            );
+            for (index, bracket) in brackets {
+                let run = field[..index]
+                    .chars()
+                    .rev()
+                    .take_while(|c| *c == '\\')
+                    .count();
+                assert_eq!(
+                    run % 2,
+                    1,
+                    "{bracket} at {index} has {run} backslashes in {field:?}"
+                );
+            }
+        }
     }
 
     #[test]
