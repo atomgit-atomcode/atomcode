@@ -101,6 +101,15 @@ async fn registry_connect_discover_and_call_echo() {
 #[tokio::test]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
+    // The assertion below expects the default branch of ${UNICODE_ARG:-…} to
+    // be taken. This is a read-only check (no setenv, no race); a host that
+    // defines this test-namespaced variable would invalidate the expectation,
+    // so refuse loudly instead of failing obscurely mid-test.
+    assert!(
+        std::env::var("UNICODE_ARG").is_err(),
+        "the host must not define UNICODE_ARG — it would override the \
+         ${{UNICODE_ARG:-…}} default this test asserts on"
+    );
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join(".mcp.json"),

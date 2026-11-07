@@ -929,12 +929,15 @@ fn expand_env_vars(s: &str) -> String {
             Some(sep) => (&inner[..sep], Some(&inner[sep + 2..])),
             None => (inner, None),
         };
-        let value = match std::env::var(var_name) {
-            Ok(value) => value,
-            // 无 default 时以 `String::new()` 收尾，不为空串多分配一次。
-            Err(_) => default.map(str::to_string).unwrap_or_default(),
-        };
-        result.push_str(&value);
+        match std::env::var(var_name) {
+            Ok(value) => result.push_str(&value),
+            // 未命中：默认值直接 push 切片，不再为它 clone 一次 String。
+            Err(_) => {
+                if let Some(d) = default {
+                    result.push_str(d);
+                }
+            }
+        }
         rest = &after_brace[end + 1..];
     }
 
@@ -1159,6 +1162,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_simple() {
         std::env::set_var("TEST_VAR", "test_value");
         let result = expand_env_vars("${TEST_VAR}");
@@ -1166,6 +1170,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_with_default() {
         std::env::remove_var("NONEXISTENT_VAR");
         let result = expand_env_vars("${NONEXISTENT_VAR:-default_value}");
@@ -1173,6 +1178,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_existing_with_default() {
         std::env::set_var("EXISTING_VAR", "actual");
         let result = expand_env_vars("${EXISTING_VAR:-unused}");
@@ -1180,6 +1186,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_no_var() {
         std::env::remove_var("MISSING_VAR");
         let result = expand_env_vars("${MISSING_VAR}");
@@ -1187,6 +1194,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_mixed() {
         std::env::set_var("VAR1", "a");
         std::env::set_var("VAR2", "b");
