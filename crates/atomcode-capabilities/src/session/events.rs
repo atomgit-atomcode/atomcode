@@ -694,14 +694,13 @@ impl SessionManager {
             // whose content repeats an older task, which the old
             // anywhere-in-the-list match used to swallow. When no prefix
             // matches (a converted session whose plan was never in this log),
-            // fall back to a content match against the sidecar's **last** item
-            // only: the narrower guess that still keeps the one reflected add
-            // from being written twice. That item is captured before the replay
-            // because the calls below extend the list: a repeat of a task this
-            // rebuild just added is a new fact, not the reflected one. And only
-            // the first add after the alignment is eligible — once a different
-            // add is applied the sidecar's tail is behind it, so a later repeat
-            // of the old tail is new too.
+            // fall back to the longest suffix of the sidecar's own list that is
+            // also a run of leading `add` calls: those are the adds it already
+            // reflects. The run is captured before the replay because the calls
+            // below extend the list: a repeat of a task this rebuild just added
+            // is a new fact, not the reflected one. And only that leading run
+            // is eligible — once a different add is applied the sidecar's tail
+            // is behind it, so a later repeat of the old tail is new too.
             fn same_items(left: &[TodoItem], right: &[TodoItem]) -> bool {
                 left.len() == right.len()
                     && left
@@ -747,11 +746,55 @@ impl SessionManager {
                 }
             }
             let tail_only = start == 0 && legacy_baseline;
-            let mut fallback_tail = if tail_only {
-                items.last().map(|item| item.content.trim().to_string())
+            // The adds the sidecar's tail already reflects: the longest prefix
+            // of the add calls that is also a suffix of its list. The suffix
+            // is read before the replay below extends the list, so a repeat of
+            // a task this rebuild adds later stays a new fact.
+            let reflected_adds: Vec<String> = if tail_only {
+                fn longest_prefix_that_suffixes(pattern: &[&str], text: &[&str]) -> usize {
+                    if pattern.is_empty() {
+                        return 0;
+                    }
+                    let mut pi = vec![0usize; pattern.len()];
+                    for i in 1..pattern.len() {
+                        let mut j = pi[i - 1];
+                        while j > 0 && pattern[i] != pattern[j] {
+                            j = pi[j - 1];
+                        }
+                        if pattern[i] == pattern[j] {
+                            j += 1;
+                        }
+                        pi[i] = j;
+                    }
+                    let mut state = 0;
+                    for (index, &word) in text.iter().enumerate() {
+                        while state > 0 && word != pattern[state] {
+                            state = pi[state - 1];
+                        }
+                        if word == pattern[state] {
+                            state += 1;
+                        }
+                        if state == pattern.len() {
+                            if index + 1 == text.len() {
+                                return pattern.len();
+                            }
+                            state = pi[state - 1];
+                        }
+                    }
+                    state
+                }
+                let added: Vec<String> = calls
+                    .iter()
+                    .filter_map(|(_, _, _, _, arguments)| added_content(arguments))
+                    .collect();
+                let pattern: Vec<&str> = added.iter().map(String::as_str).collect();
+                let text: Vec<&str> = items.iter().map(|item| item.content.trim()).collect();
+                let matched = longest_prefix_that_suffixes(&pattern, &text);
+                added[..matched].to_vec()
             } else {
-                None
+                Vec::new()
             };
+            let mut reflected_next = 0;
             for (turn, round, index, _, arguments) in &calls[start..] {
                 let position = super::manager::TodoCallPosition {
                     turn: *turn,
@@ -761,17 +804,16 @@ impl SessionManager {
                 if through.is_some_and(|current| position <= current) {
                     continue;
                 }
-                if fallback_tail.is_some() {
+                if let Some(expected) = reflected_adds.get(reflected_next) {
                     if let Some(content) = added_content(arguments) {
-                        // The one add the sidecar already reflects, or a new
-                        // one: either way the fallback is spent now. Skipping
-                        // only a match keeps every later repeat a new fact.
-                        let reflected = fallback_tail.as_deref() == Some(content.as_str());
-                        fallback_tail = None;
-                        if reflected {
+                        if expected == &content {
+                            reflected_next += 1;
                             through = Some(position);
                             continue;
                         }
+                        // The reflected run ended before this add; it and every
+                        // later one are new facts.
+                        reflected_next = reflected_adds.len();
                     }
                 }
                 apply_todo_action(&mut items, arguments);
@@ -5867,6 +5909,126 @@ mod tests {
             Some(crate::session::manager::TodoCallPosition {
                 turn: 1,
                 round: 2,
+                index: 0,
+            })
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_skips_every_add_it_ends_with() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-multi-tail-adds";
+        let lease = created(&manager, id);
+        let add = |call: &str, content: &str| ToolCall {
+            id: call.into(),
+            name: "todowrite".into(),
+            arguments: format!(r#"{{"action":"add","content":"{content}"}}"#),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a1", "first")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 2,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a2", "second")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 3,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add("a3", "third")],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                ],
+            )
+            .unwrap();
+        // The converted plan is not in the log, so no prefix fold matches.
+        // The sidecar ends with two adds the log holds; the third is new.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    crate::session::manager::TodoSidecarItem {
+                        content: "plan".into(),
+                        status: "pending".into(),
+                    },
+                    crate::session::manager::TodoSidecarItem {
+                        content: "first".into(),
+                        status: "pending".into(),
+                    },
+                    crate::session::manager::TodoSidecarItem {
+                        content: "second".into(),
+                        status: "pending".into(),
+                    },
+                ],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        let shown: Vec<&str> = sidecar
+            .todos
+            .iter()
+            .map(|todo| todo.content.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["plan", "first", "second", "third"],
+            "both reflected adds are skipped; only the new add is applied"
+        );
+        assert_eq!(
+            sidecar.through,
+            Some(crate::session::manager::TodoCallPosition {
+                turn: 1,
+                round: 3,
                 index: 0,
             })
         );

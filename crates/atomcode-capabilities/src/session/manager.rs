@@ -6669,8 +6669,6 @@ mod tests {
 
     #[test]
     fn a_shrunk_projection_keeps_the_older_baseline_over_the_stale_list() {
-        use crate::session::manager::TodoSidecarItem;
-
         let item = |status: &str| TodoSidecarItem {
             content: "task".into(),
             status: status.into(),
