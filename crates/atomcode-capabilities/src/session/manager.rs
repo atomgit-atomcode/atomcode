@@ -6668,7 +6668,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_does_not_freeze_a_state_the_conversation_has_taken_back() {
+    fn a_shrunk_projection_keeps_the_older_baseline_over_the_stale_list() {
         use crate::session::manager::TodoSidecarItem;
 
         let item = |status: &str| TodoSidecarItem {
@@ -6694,9 +6694,9 @@ mod tests {
             "the state before this write is recoverable"
         );
 
-        // The conversation shrank since the last write (an undo or a
-        // compaction). An older baseline is still the furthest recoverable
-        // point; the stale completed list does not displace it.
+        // The projection shrank since the last write (as a compaction or an
+        // undo would shrink it). The older baseline is still the furthest
+        // recoverable point; the stale completed list does not displace it.
         manager
             .write_todo_sidecar("s", &[item("pending")], 4, None)
             .unwrap();
@@ -6742,49 +6742,6 @@ mod tests {
             Some("pending"),
             "the state before the shrunk write is the recoverable floor"
         );
-    }
-
-    #[test]
-    fn a_sidecar_keeps_its_full_budget_alongside_a_baseline() {
-        use crate::session::manager::TodoSidecarItem;
-
-        // Three quarters of one state's ceiling each: either list fits the
-        // budget on its own, and the two together are over a single one — so a
-        // shared budget would have to drop one of them.
-        let item = crate::session::manager::MAX_TODO_SIDECAR_BYTES * 3 / 4;
-        let big = |status: &str| TodoSidecarItem {
-            content: "x".repeat(item),
-            status: status.into(),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let manager = SessionManager::with_root(dir.path());
-        manager
-            .write_todo_sidecar("big", &[big("pending")], 4, None)
-            .unwrap();
-        // The second write carries the first list as a baseline: together they
-        // are over one state's budget of JSON. The baseline is stored beside
-        // the list under its own budget, so neither state halves the other's —
-        // both survive the write.
-        manager
-            .write_todo_sidecar("big", &[big("completed")], 6, None)
-            .unwrap();
-        let sidecar = manager.read_todo_sidecar("big").unwrap().expect("written");
-        assert_eq!(sidecar.todos[0].status, "completed");
-        let baseline = sidecar
-            .baseline
-            .expect("the baseline is stored beside the list");
-        assert_eq!(baseline.todos[0].status, "pending");
-
-        // A list over its own budget is rejected as a whole; the previously
-        // written state stays intact.
-        let huge = [TodoSidecarItem {
-            content: "x".repeat(crate::session::manager::MAX_TODO_SIDECAR_BYTES),
-            status: "pending".into(),
-        }];
-        assert!(manager.write_todo_sidecar("big", &huge, 9, None).is_err());
-        let sidecar = manager.read_todo_sidecar("big").unwrap().expect("written");
-        assert_eq!(sidecar.todos[0].status, "completed");
-        assert_eq!(sidecar.baseline.unwrap().todos[0].status, "pending");
     }
 
     #[test]

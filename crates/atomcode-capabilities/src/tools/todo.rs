@@ -1083,22 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn a_late_duplicate_result_does_not_reach_back_to_an_older_call() {
-        // An earlier call with the same id never got a result; a duplicated
-        // error after the later call's success must not be read as its answer.
-        let messages = vec![
-            write_call("dup", r#"{"action":"add","content":"old"}"#),
-            write_call("dup", PLAN3),
-            Message::tool_result("dup", "3 tasks", false),
-            Message::tool_result("dup", "late failure", true),
-        ];
-        let calls = active_todo_calls(&messages);
-        assert_eq!(calls.len(), 2, "both calls stay active");
-        assert!(calls[0].call.arguments.contains("old"));
-        assert_eq!(calls[1].call.arguments, PLAN3);
-    }
-
-    #[test]
     fn a_same_reply_duplicate_id_result_answers_the_nearest_call() {
         // Two todo calls in one reply share a provider-minted id; the result is
         // the nearest (last) call's, so the plan before it stays the active

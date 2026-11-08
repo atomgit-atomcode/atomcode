@@ -688,9 +688,10 @@ impl SessionManager {
             }
             // A sidecar written before positions existed cannot say which calls
             // it already reflects. Align it once: replay the calls and keep the
-            // longest prefix whose fold equals the sidecar's own list. Calls
-            // after that prefix are facts it has not seen — including an `add`
-            // whose content merely repeats an older task, which the old
+            // first prefix whose fold equals the sidecar's own list. Calls
+            // after that prefix are facts it has not seen — including a call
+            // that merely folds to the same list (a no-op update) and an `add`
+            // whose content repeats an older task, which the old
             // anywhere-in-the-list match used to swallow. When no prefix
             // matches (a converted session whose plan was never in this log),
             // fall back to a content match against the sidecar's **last** item
@@ -732,7 +733,12 @@ impl SessionManager {
                         apply_todo_action(&mut folded, arguments);
                     }
                     if same_items(&folded, &items) {
+                        // The sidecar first reached this state here. Anything
+                        // after it is replayed below, including calls that fold
+                        // back to the same list; they are facts the sidecar had
+                        // not seen.
                         start = count + 1;
+                        break;
                     }
                 }
                 if start > 0 {
@@ -6160,6 +6166,114 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
+    fn a_late_duplicate_result_does_not_fail_an_older_unanswered_todo_call() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "late-duplicate-older-todo";
+        let lease = created(&manager, id);
+        let call = |round: u32, id: &str, arguments: &str| {
+            logged(
+                1 + round as u64,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round,
+                    text: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: id.into(),
+                        name: "todowrite".into(),
+                        arguments: arguments.into(),
+                    }],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            )
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    call(
+                        1,
+                        "p",
+                        r#"{"todos":[{"content":"plan","status":"pending"}]}"#,
+                    ),
+                    call(2, "p", r#"{"action":"add","content":"task"}"#),
+                    // The success answers the nearest (add) call; the late
+                    // duplicate error must not reach back to the plan.
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 2,
+                            call_id: "p".into(),
+                            content: "#2 [ ] task".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 2,
+                            call_id: "p".into(),
+                            content: "late failure".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "later".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the plan survives the late duplicate");
+        let shown: Vec<&str> = sidecar
+            .todos
+            .iter()
+            .map(|todo| todo.content.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["plan", "task"],
+            "the late error did not fail the older plan"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
     fn a_rewind_rebuilds_the_todo_sidecar() {
         let (_dir, manager) = store();
         let lease = todo_session(&manager, "rewind-todos");
@@ -7769,8 +7883,12 @@ mod tests {
         let (_dir, manager) = store();
         let id = "large-sidecar-baseline";
         let _lease = created(&manager, id);
+        // Three quarters of one state's ceiling: each list fits the per-state
+        // budget, and the two together are over a single one — so a shared
+        // budget would have to drop one of them.
+        let item = super::super::manager::MAX_TODO_SIDECAR_BYTES * 3 / 4;
         let mut items = vec![TodoSidecarItem {
-            content: "x".repeat(140_000),
+            content: "x".repeat(item),
             status: "pending".into(),
         }];
         let through = Some(TodoCallPosition {
@@ -7792,7 +7910,7 @@ mod tests {
         items[0].content = "x".repeat(super::super::manager::MAX_TODO_SIDECAR_BYTES);
         assert!(manager.write_todo_sidecar(id, &items, 3, through).is_err());
         let saved = manager.read_todo_sidecar(id).unwrap().unwrap();
-        assert_eq!(saved.todos[0].content.len(), 140_000);
+        assert_eq!(saved.todos[0].content.len(), item);
         assert_eq!(saved.todos[0].status, "completed");
         assert_eq!(saved.baseline.unwrap().todos[0].status, "pending");
     }
