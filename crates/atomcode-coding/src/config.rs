@@ -189,9 +189,10 @@ pub struct CodingAgentConfig {
     /// None preserves window-relative behavior. Read from `[compaction].token_limit`
     /// in config.toml; the mounted `compaction-coding` row carries the same value.
     pub compact_token_limit: Option<u32>,
-    /// Optional fixed budget for the recent turns kept full before old tool
-    /// results are stubbed. Read from `[compaction].stub_recent_budget`; lower
-    /// values stub older output sooner. None keeps the window-relative budget.
+    /// Optional budget for the recent turns kept full before old tool results
+    /// are stubbed. Read from `[compaction].stub_recent_budget`; lower values
+    /// stub older output sooner, and values above the window-relative budget
+    /// are clamped to it. None keeps the window-relative budget.
     pub compact_stub_recent_budget: Option<u32>,
     /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
     /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
@@ -550,8 +551,10 @@ pub fn describe_config_file_for(
          automatic history summarization; omit to keep the window-relative policy. \
          `stub_recent_budget`: optional positive budget for the recent turns kept full before \
          old tool results are stubbed; lower values stub older output sooner (a cheap tail-only \
-         cache break) and are useful on large-context models. Omit to keep the window-relative \
-         default. Both apply when the agent is rebuilt; the model's physical context window is unchanged.\n\
+         cache break) and are useful on large-context models. Values above the window-relative \
+         budget are clamped to it, so this can only make stubbing earlier. Omit to keep the \
+         window-relative default. Both apply when the agent is rebuilt; the model's physical \
+         context window is unchanged.\n\
          - `[modes.plan]` and `[modes.build]` optionally bind a `model` selection id and `reasoning_effort` (unset inherits the model profile; `default` uses the API default). Cross-mode transitions apply them for this session without writing `default_model`; `/model` temporarily overrides until the next mode transition. Configure via `/config` or WebUI mode settings.\n\
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\

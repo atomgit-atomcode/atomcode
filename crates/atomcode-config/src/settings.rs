@@ -985,12 +985,22 @@ mod tests {
         setting.patch(&mut document, "100000").unwrap();
         let config: Config = toml::from_str(&document.to_string()).unwrap();
         assert_eq!(config.compaction.stub_recent_budget.unwrap().get(), 100_000);
+        assert_eq!(setting.value(&config), "100000");
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("stub_recent_budget"));
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.compaction, config.compaction);
         for invalid in ["0", "-1", "4294967296"] {
             assert!(setting.patch(&mut document, invalid).is_err());
+            assert!(toml::from_str::<Config>(&format!(
+                "[compaction]\nstub_recent_budget={invalid}"
+            ))
+            .is_err());
         }
         setting.patch(&mut document, "").unwrap();
         let config: Config = toml::from_str(&document.to_string()).unwrap();
         assert!(config.compaction.stub_recent_budget.is_none());
+        assert!(!toml::to_string(&config).unwrap().contains("[compaction]"));
         assert!(document.to_string().contains("# preserve"));
     }
 
