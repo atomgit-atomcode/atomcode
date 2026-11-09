@@ -11,7 +11,7 @@
 architecture_topology = true
 ```
 
-默认是 `false`。修改后重启会话所在 runtime（TUI 重启程序；WebUI 重启 daemon）。CLI、TUI、WebUI 等使用共同 coding runtime 的入口都读取这一设置。开启只挂载 `repo_architecture` 工具及简短规划指导，不会启动后台索引或自动扫描仓库。
+默认是 `false`。TUI 可通过 `/config` 搜索 `ATI`、`架构` 或 `topology`，切换“ATI 只读架构分析”；保存后沿用现有配置重载流程重新装配能力，无需重启程序。手动修改文件后需重载配置或重启对应 runtime（WebUI 可重启 daemon）。CLI、TUI、WebUI 等使用共同 coding runtime 的入口都读取这一设置。开启只挂载 `repo_architecture` 工具及简短规划指导，不会启动后台索引或自动扫描仓库。
 
 可以直接向模型提出：
 

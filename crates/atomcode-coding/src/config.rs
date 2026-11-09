@@ -547,7 +547,7 @@ pub fn describe_config_file_for(
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[dap]` `enabled` (default true): local DAP debugging with automatic Python/debugpy and LLDB discovery on launch. Optional `[dap.adapters.<id>]` `command` / `args` override built-ins; adapters are installed separately. Reload configuration after editing; never put credentials in adapter arguments. Debugging uses execution approval and is not restored with a session.\n\
-         - `[coding]` `architecture_topology` (default false): opt in to read-only repository architecture evidence; restart the runtime after editing. No scan until the tool is called.\n\
+         - `[coding]` `architecture_topology` (default false): opt in to read-only repository architecture evidence; use `/config` to toggle and reload capabilities, or reload/restart after editing the file. No scan until the tool is called.\n\
          - `[coding]` `auto_review` (default true; false removes automatic pre-handoff review guidance while retaining explicit reviews; `ATOMCODE_AUTO_REVIEW` overrides), \
          `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \

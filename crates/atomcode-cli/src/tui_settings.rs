@@ -340,6 +340,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ati_switch_is_visible_and_persists_with_capability_reload_policy() {
+        let path = scratch("ati-switch");
+        std::fs::write(&path, "# preserve\n[coding]\nauto_review = false\n").unwrap();
+        let port = ConfigSettings::new(path.clone());
+        let id = "coding.architecture_topology";
+        let initial = port.rows();
+        let row = initial.rows().iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.value, "false");
+        assert_eq!(row.applies, Applies::Reprepare);
+        for enabled in [true, false] {
+            let view = port.set(id, &enabled.to_string()).unwrap();
+            assert_eq!(
+                view.rows().iter().find(|r| r.id == id).unwrap().value,
+                enabled.to_string()
+            );
+            let saved = atomcode_config::Config::load(&path).unwrap();
+            assert_eq!(saved.coding.architecture_topology, enabled);
+            assert!(!saved.coding.auto_review);
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("# preserve"));
+        }
+        port.reset(id).unwrap();
+        assert!(
+            !atomcode_config::Config::load(&path)
+                .unwrap()
+                .coding
+                .architecture_topology
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn question_edit_shortcut_roundtrips_and_rejects_reserved_keys_before_writing() {
         let path = scratch("question-edit-shortcut");
         std::fs::write(&path, "# keep me\n").unwrap();

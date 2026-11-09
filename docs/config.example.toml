@@ -269,7 +269,8 @@ mode = "follow_system"
 auto_review = true
 max_rounds = 0
 # ATI 只读架构证据工具，默认关闭；启用后仅在调用时扫描，不自动修改代码或写记忆。
-# 修改后重启会话/runtime。使用与限制见 docs/architectural-topology.md。
+# /config 搜索 ATI/架构 可切换并重载；手改文件后需重载或重启 runtime。
+# 使用与限制见 docs/architectural-topology.md。
 architecture_topology = false
 
 # ---- Plan / Build 模式模型绑定（可选）----

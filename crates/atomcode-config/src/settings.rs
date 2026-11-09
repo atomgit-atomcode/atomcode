@@ -238,6 +238,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Choice(TODO_EAGERNESS),
         apply: ApplyPolicy::AgentReassemble,
     },
+    bool_setting(
+        "coding.architecture_topology",
+        &["coding", "architecture_topology"],
+        "ATI read-only architecture analysis",
+        "ATI 只读架构分析",
+        &["ATI", "architecture", "topology", "架构", "文件放置"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
     SettingSpec {
         id: "coding.auto_review",
         path: &["coding", "auto_review"],
@@ -589,6 +597,7 @@ impl SettingSpec {
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
             "coding.auto_review" => config.coding.auto_review.to_string(),
+            "coding.architecture_topology" => config.coding.architecture_topology.to_string(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
             "coding.shell_guard_policy" => {
                 format!("{:?}", config.coding.shell_guard_policy).to_lowercase()
@@ -1159,6 +1168,39 @@ mod tests {
     }
 
     #[test]
+    fn ati_is_discoverable_default_off_and_patches_without_changing_other_settings() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "coding.architecture_topology")
+            .unwrap();
+        assert_eq!(setting.value(&Config::default()), "false");
+        assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
+        for query in ["ATI", "architecture", "topology", "架构", "文件放置"] {
+            assert!(setting.matches(query), "{query}");
+        }
+        let mut document: DocumentMut =
+            "# preserve\n[coding]\nauto_review = false\nmax_rounds = 42\n"
+                .parse()
+                .unwrap();
+        for enabled in [true, false] {
+            setting.patch(&mut document, &enabled.to_string()).unwrap();
+            let config: Config = toml::from_str(&document.to_string()).unwrap();
+            assert_eq!(config.coding.architecture_topology, enabled);
+            assert_eq!(setting.value(&config), enabled.to_string());
+            assert!(!config.coding.auto_review);
+            assert_eq!(config.coding.max_rounds, 42);
+            assert!(document.to_string().contains("# preserve"));
+        }
+        let before = document.to_string();
+        assert!(setting.patch(&mut document, "maybe").is_err());
+        assert_eq!(document.to_string(), before);
+        setting.reset(&mut document);
+        let reset: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!reset.coding.architecture_topology);
+        assert!(!document.to_string().contains("architecture_topology"));
+    }
+
+    #[test]
     fn auto_review_is_a_separate_default_on_config_switch() {
         let setting = SETTINGS
             .iter()
@@ -1446,6 +1488,7 @@ model = "model-a"
             "tools.atomgit.enabled",
             "tools.todo.eager",
             "coding.max_rounds",
+            "coding.architecture_topology",
             "coding.shell_guard_policy",
             "subagent.max_concurrent",
             "subagent.max_rounds",
@@ -1458,6 +1501,7 @@ model = "model-a"
             let setting = SETTINGS.iter().find(|setting| setting.id == id).unwrap();
             let expected = match id {
                 "tools.todo.enabled"
+                | "coding.architecture_topology"
                 | "tools.atomgit.enabled"
                 | "subagent.max_concurrent"
                 | "subagent.max_rounds"
