@@ -79,6 +79,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(capabilities::SkillsAdvertPlugin))
         .register(Arc::new(capabilities::CodeIntelPlugin))
         .register(Arc::new(capabilities::CodeGraphPlugin))
+        .register(Arc::new(capabilities::ArchitectureTopologyPlugin))
         .register(Arc::new(capabilities::WebPlugin::new()))
         .register(Arc::new(subagent::ModelCatalogPlugin))
         .register(Arc::new(llm::LlmUtilitySelectedPlugin))

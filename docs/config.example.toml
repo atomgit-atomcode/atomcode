@@ -268,6 +268,9 @@ mode = "follow_system"
 # 这是模型行为指导，并非禁止模型调用工具的执行权限开关。
 auto_review = true
 max_rounds = 0
+# ATI 只读架构证据工具，默认关闭；启用后仅在调用时扫描，不自动修改代码或写记忆。
+# 修改后重启会话/runtime。使用与限制见 docs/architectural-topology.md。
+architecture_topology = false
 
 # ---- Plan / Build 模式模型绑定（可选）----
 # 让 /plan 与 /build 各自使用不同的模型与思考强度；整段留空表示不绑定，行为与以前一致。

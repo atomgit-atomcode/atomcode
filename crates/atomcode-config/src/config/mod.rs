@@ -92,6 +92,8 @@ pub struct DapAdapterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodingConfig {
+    /// Opt-in read-only repository architecture evidence; scans only on tool use.
+    pub architecture_topology: bool,
     /// Default pre-handoff code review guidance; explicit reviews remain available.
     pub auto_review: bool,
     pub max_rounds: u32,
@@ -416,6 +418,7 @@ impl PermissionsConfig {
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
+            architecture_topology: false,
             auto_review: true,
             max_rounds: 0,
             shell_guard_policy: ShellGuardPolicy::Prompt,

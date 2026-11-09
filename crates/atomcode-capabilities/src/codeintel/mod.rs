@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod architecture;
 pub mod blast_radius;
 pub mod file_deps;
 pub mod find_references;

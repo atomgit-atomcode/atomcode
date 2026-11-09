@@ -367,6 +367,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.max_rounds,
             std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
         ),
+        architecture_topology: config.coding.architecture_topology,
         auto_review: atomcode_coding::config::resolve_auto_review(
             config.coding.auto_review,
             std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref(),
@@ -3679,6 +3680,7 @@ mod tests {
         );
         let mut config = atomcode_config::Config::default();
         config.coding.auto_review = false;
+        config.coding.architecture_topology = true;
         config.permissions.default_mode = Some(atomcode_config::config::DefaultExecutionMode::Plan);
         let runtime = live_runtime_config(
             &config,
@@ -3687,6 +3689,7 @@ mod tests {
             telemetry,
         );
         assert!(runtime.interactive);
+        assert!(runtime.agent_config().architecture_topology);
         assert_eq!(
             runtime.agent_config().auto_review,
             atomcode_coding::config::resolve_auto_review(

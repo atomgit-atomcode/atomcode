@@ -110,6 +110,8 @@ pub struct CodingAgentConfig {
     pub max_rounds: u32,
     /// Encourage code_review before handoff; false keeps explicit reviews available.
     pub auto_review: bool,
+    /// Mount the read-only repo_architecture tool. Default off.
+    pub architecture_topology: bool,
     /// When the coarse repetition fuse (`repeat-fuse`) stops a turn: after this
     /// many rounds of the very same tool calls. `None` keeps the row's own (6);
     /// `Some(0)` removes the fuse. Rounds that waited a minute or more are not
@@ -348,6 +350,8 @@ pub struct CodingRuntimeConfig {
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub auto_review: bool,
+    /// Mount the read-only repo_architecture tool. Default off.
+    pub architecture_topology: bool,
     /// `[coding] repeat_stop_rounds`; see [`CodingAgentConfig::repeat_stop_rounds`].
     pub repeat_stop_rounds: Option<u32>,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -543,6 +547,7 @@ pub fn describe_config_file_for(
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[dap]` `enabled` (default true): local DAP debugging with automatic Python/debugpy and LLDB discovery on launch. Optional `[dap.adapters.<id>]` `command` / `args` override built-ins; adapters are installed separately. Reload configuration after editing; never put credentials in adapter arguments. Debugging uses execution approval and is not restored with a session.\n\
+         - `[coding]` `architecture_topology` (default false): opt in to read-only repository architecture evidence; restart the runtime after editing. No scan until the tool is called.\n\
          - `[coding]` `auto_review` (default true; false removes automatic pre-handoff review guidance while retaining explicit reviews; `ATOMCODE_AUTO_REVIEW` overrides), \
          `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
@@ -727,6 +732,7 @@ impl CodingRuntimeConfig {
                 config.coding.max_rounds,
                 std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
             ),
+            architecture_topology: config.coding.architecture_topology,
             auto_review: resolve_auto_review(
                 config.coding.auto_review,
                 std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref(),
@@ -804,6 +810,7 @@ impl CodingRuntimeConfig {
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.auto_review = self.auto_review;
+        config.architecture_topology = self.architecture_topology;
         config.repeat_stop_rounds = self.repeat_stop_rounds;
         config.subagent_config = self.subagent_config.clone();
         config.interactive = self.interactive;
@@ -1290,6 +1297,7 @@ impl CodingAgentConfig {
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
             auto_review: true,
+            architecture_topology: false,
             repeat_stop_rounds: None,
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,

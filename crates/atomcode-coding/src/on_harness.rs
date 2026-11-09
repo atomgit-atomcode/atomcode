@@ -177,6 +177,12 @@ name = "skills"
 [[insert]]
 name = "skills-advert"
 
+# Experimental architecture evidence is absent until explicitly enabled.
+# Enabling only mounts a tool; it never starts a repository scan.
+[[insert]]
+name = "architecture-topology"
+disabled = true
+
 [[insert]]
 name = "codeintel"
 
@@ -896,6 +902,9 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
             serde_json::json!({"tool_search": cfg.mcp_tool_search}),
         )
         .map_err(|e| e.to_string())?;
+    if cfg.architecture_topology {
+        out = out.enable("architecture-topology");
+    }
     // `[ui] ai_session_naming`(或 `ATOMCODE_AI_SESSION_NAMING`)选的是**哪一个
     // 命名器**填 `session-title` 这条缝:默认那个读第一句话、不问模型;开了之后
     // 换成问工具模型的那个。两者都把答案作为一条 `Titled` 事实提交,所以会话

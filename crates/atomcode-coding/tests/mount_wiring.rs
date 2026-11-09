@@ -1143,3 +1143,60 @@ async fn loaded_skill_resources_are_readable_in_a_fenced_mount_and_revoked_on_re
     assert!(fs.read_text(&resource).await.is_err());
     next.shutdown().await;
 }
+
+#[tokio::test]
+async fn architecture_topology_follows_standard_config_and_host_can_disable_it() {
+    use atomcode_harness::seams::{SystemPromptSvc, ToolsSvc};
+    let project = tempfile::tempdir().unwrap();
+    for enabled in [false, true] {
+        let file: atomcode_config::Config =
+            toml::from_str(&format!("[coding]\narchitecture_topology = {enabled}\n")).unwrap();
+        let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+            &file,
+            project.path(),
+            atomcode_coding::config::product_dirs_from_env(),
+            None,
+            None,
+            false,
+            false,
+        );
+        let cfg = runtime.agent_config();
+        assert_eq!(cfg.architecture_topology, enabled);
+        let app = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+        assert_eq!(
+            app.context()
+                .service::<ToolsSvc>()
+                .unwrap()
+                .names()
+                .contains(&"repo_architecture".into()),
+            enabled
+        );
+        assert_eq!(
+            app.context()
+                .service::<SystemPromptSvc>()
+                .unwrap()
+                .render()
+                .contains("`repo_architecture`"),
+            enabled
+        );
+        app.shutdown().await;
+        if enabled {
+            let mut opts = quiet_options();
+            opts.host_plugins = atomcode_coding::HostPlugins::new()
+                .with_layer(atomcode_coding::host::Layer::new().disable("architecture-topology"));
+            let app = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+            assert!(!app
+                .context()
+                .service::<ToolsSvc>()
+                .unwrap()
+                .names()
+                .contains(&"repo_architecture".into()));
+            app.shutdown().await;
+        }
+    }
+    assert!(
+        !atomcode_config::Config::default()
+            .coding
+            .architecture_topology
+    );
+}

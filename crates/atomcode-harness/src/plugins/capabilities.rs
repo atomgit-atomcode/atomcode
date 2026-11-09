@@ -291,6 +291,41 @@ impl Plugin for CodeGraphPlugin {
     }
 }
 
+// ---- read-only architectural evidence (explicit opt-in) --------------------
+
+pub struct ArchitectureTopologyPlugin;
+#[async_trait]
+impl Plugin for ArchitectureTopologyPlugin {
+    fn name(&self) -> &'static str {
+        "architecture-topology"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["product-dirs", "tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["code-index"]
+    }
+    fn description(&self) -> &'static str {
+        "opt-in read-only architectural evidence and placement candidate retrieval"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        // No traversal at mount: only an explicit tool call reads the repo.
+        let dirs = (*crate::product_dirs(ctx)?).clone();
+        let index = ctx.service::<CodeIndexSvc>();
+        mount(
+            ctx,
+            vec![Arc::new(
+                atomcode_capabilities::codeintel::architecture::RepositoryArchitectureTool::new(
+                    dirs, index,
+                ),
+            )],
+        )?;
+        contribute_prompt(ctx,"architecture-topology",57,
+            "For architectural planning or choosing a new file location, use `repo_architecture` for bounded evidence. Treat candidate rankings as retrieval hints, check applicable instructions and cited files, and report uncertainty rather than inventing module ownership.");
+        Ok(())
+    }
+}
+
 // ---- web ----------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]

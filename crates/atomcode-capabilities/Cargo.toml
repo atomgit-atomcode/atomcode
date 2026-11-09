@@ -168,6 +168,7 @@ atomgit = ["tools", "dep:reqwest", "dep:atomcode-auth"]
 # Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
 # Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
 codeintel = [
+    "dep:toml",
     "dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python",
     "dep:tree-sitter-javascript", "dep:tree-sitter-typescript", "dep:tree-sitter-go",
     "dep:tree-sitter-java", "dep:tree-sitter-c", "dep:tree-sitter-cpp",

@@ -1910,3 +1910,80 @@ async fn skill_spelling_hints_preserve_atomic_rejection_and_original_task_text()
     );
     assert_eq!(claimed.images.len(), 1);
 }
+
+#[tokio::test]
+async fn architecture_topology_is_absent_by_default_and_opt_in_does_not_require_a_graph() {
+    let dir = scratch("ati-default");
+    let base = start(tree(&dir, STOP, &[])).await;
+    assert!(!base
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .names()
+        .contains(&"repo_architecture".into()));
+    assert!(!base
+        .context()
+        .service::<SystemPromptSvc>()
+        .unwrap()
+        .render()
+        .contains("repo_architecture"));
+    drop(base);
+    let enabled = start(tree(
+        &dir,
+        STOP,
+        &["[[patch]]\nid = \"architecture-topology\"\ndisabled = false\n"],
+    ))
+    .await;
+    assert!(enabled
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .names()
+        .contains(&"repo_architecture".into()));
+    assert!(enabled
+        .context()
+        .service::<SystemPromptSvc>()
+        .unwrap()
+        .render()
+        .contains("repo_architecture"));
+    assert!(enabled
+        .context()
+        .service::<atomcode_harness::seams::CodeIndexSvc>()
+        .is_none());
+}
+
+#[tokio::test]
+async fn architecture_topology_executes_through_the_normal_tool_loop_and_can_be_disabled() {
+    let dir = scratch("ati-tool");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname='ati_fixture'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let enabled = "[[patch]]\nid = \"architecture-topology\"\ndisabled = false\n";
+    let app = start(tree(
+        &dir,
+        &script_one("repo_architecture", r#"{ action = "overview" }"#),
+        &[enabled],
+    ))
+    .await;
+    run_turn(&app, "inspect architecture").await.unwrap();
+    let log = transcript(&app);
+    assert!(log.contains("ati_fixture"), "{log}");
+    drop(app);
+    let disabled = start(tree(
+        &dir,
+        STOP,
+        &[
+            enabled,
+            "[[patch]]\nid = \"architecture-topology\"\ndisabled = true\n",
+        ],
+    ))
+    .await;
+    assert!(!disabled
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .names()
+        .contains(&"repo_architecture".into()));
+}

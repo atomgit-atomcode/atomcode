@@ -732,6 +732,16 @@ async fn the_published_rows_are_what_the_product_mounts() {
         .map(|e| (e.id.clone(), e.config.clone()))
         .collect();
     for published in host::PUBLISHED_ROWS {
+        if *published == "architecture-topology" {
+            // An opt-in row is addressable by a host while dormant by default.
+            assert!(mounted
+                .app
+                .tree()
+                .entries
+                .iter()
+                .any(|e| e.id == *published && e.disabled));
+            continue;
+        }
         assert!(
             rows.iter().any(|(id, _)| id == published),
             "`{published}` is published and must be mounted: {:?}",
