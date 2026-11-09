@@ -810,6 +810,11 @@ impl SessionManager {
                         // The reflected run ended before this add; it and every
                         // later one are new facts.
                         reflected_next = reflected_adds.len();
+                    } else {
+                        // A non-add fact this rebuild applies ends the run:
+                        // the sidecar's tail no longer names the next
+                        // reflected add, so a later add is a new fact too.
+                        reflected_next = reflected_adds.len();
                     }
                 }
                 apply_todo_action(&mut items, arguments);
@@ -6027,6 +6032,108 @@ mod tests {
                 round: 3,
                 index: 0,
             })
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_does_not_skip_an_add_after_an_applied_fact() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-run-ended-by-update";
+        let lease = created(&manager, id);
+        let call = |seq: u64, round: u32, call: ToolCall| {
+            logged(
+                seq,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round,
+                    text: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: vec![call],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            )
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    call(
+                        2,
+                        1,
+                        ToolCall {
+                            id: "u1".into(),
+                            name: "todowrite".into(),
+                            arguments: r#"{"action":"update","id":2,"status":"completed"}"#.into(),
+                        },
+                    ),
+                    call(
+                        3,
+                        2,
+                        ToolCall {
+                            id: "a1".into(),
+                            name: "todowrite".into(),
+                            arguments: r#"{"action":"add","content":"task"}"#.into(),
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                ],
+            )
+            .unwrap();
+        // The sidecar's plan is not in the log; its tail names the add. The
+        // update is a fact the sidecar does not carry, so once it is applied
+        // the tail run is over: the add after it is new, not reflected.
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    crate::session::manager::TodoSidecarItem {
+                        content: "plan".into(),
+                        status: "pending".into(),
+                    },
+                    crate::session::manager::TodoSidecarItem {
+                        content: "task".into(),
+                        status: "pending".into(),
+                    },
+                ],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    5,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        let shown: Vec<(&str, &str)> = sidecar
+            .todos
+            .iter()
+            .map(|todo| (todo.content.as_str(), todo.status.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("plan", "pending"),
+                ("task", "completed"),
+                ("task", "pending"),
+            ],
+            "an applied fact ends the run; the later add is a new fact"
         );
     }
 

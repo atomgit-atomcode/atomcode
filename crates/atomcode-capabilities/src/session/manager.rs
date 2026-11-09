@@ -6695,11 +6695,13 @@ mod tests {
         // The projection shrank since the last write (as a compaction or an
         // undo would shrink it). The older baseline is still the furthest
         // recoverable point; the stale completed list does not displace it.
+        // The new list is deliberately distinct from the older baseline, so a
+        // baseline taken from this write cannot pass.
         manager
-            .write_todo_sidecar("s", &[item("pending")], 4, None)
+            .write_todo_sidecar("s", &[item("in_progress")], 4, None)
             .unwrap();
         let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
-        assert_eq!(sidecar.todos[0].status, "pending");
+        assert_eq!(sidecar.todos[0].status, "in_progress");
         assert_eq!(
             sidecar
                 .baseline
