@@ -1099,7 +1099,7 @@ export function Sidebar({
             {!skillsLoading &&
               (skills ?? []).map((s) => (
                 <button key={s.name} class="skills-menu-row" onClick={() => chooseSkill(s.name)} title={s.description || ''}>
-                  <span class="skills-menu-name">/{s.name}</span>
+                  <span class="skills-menu-name">{s.display_name ? `${s.display_name} · /${s.name}` : `/${s.name}`}</span>
                   {s.description && <span class="skills-menu-desc">{s.description}</span>}
                 </button>
               ))}

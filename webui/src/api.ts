@@ -676,13 +676,14 @@ export async function postLiveMcpTrust(): Promise<{ ok: boolean; error?: string 
 
 export interface SkillInfo {
   name: string;
+  display_name?: string;
   description: string;
 }
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await apiFetch('/skills', { headers: authHeaders() });
   const value: unknown = await readJson(resp);
-  if (!Array.isArray(value) || value.some(item => !item || typeof item.name !== 'string' || typeof item.description !== 'string')) {
+  if (!Array.isArray(value) || value.some(item => !item || typeof item.name !== 'string' || typeof item.description !== 'string' || (item.display_name !== undefined && typeof item.display_name !== 'string'))) {
     throw new Error('Invalid skill list response / 技能列表响应格式异常');
   }
   return value as SkillInfo[];

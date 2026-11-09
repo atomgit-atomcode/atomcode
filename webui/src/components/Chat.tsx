@@ -4018,7 +4018,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               type="button"
               title={item.description || ''}
             >
-              <span class="slash-name">/{item.name}</span>
+              <span class="slash-name">{item.display_name ? `${item.display_name} · /${item.name}` : `/${item.name}`}</span>
               {item.description && <span class="slash-desc">{item.description}</span>}
             </button>
           ))}

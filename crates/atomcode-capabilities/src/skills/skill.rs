@@ -21,6 +21,8 @@ pub enum AutoLoad {
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub name: String,
+    /// Optional human-readable title; never used for resolution or invocation.
+    pub display_name: Option<String>,
     pub description: String,
     /// The template body (everything after the frontmatter block).
     pub template: String,
@@ -43,6 +45,15 @@ pub struct Skill {
 }
 
 impl Skill {
+    /// Human-facing discovery text, retaining the canonical name separately.
+    pub fn summary(&self) -> String {
+        match self.display_name.as_deref() {
+            Some(title) if self.description.is_empty() => title.to_string(),
+            Some(title) => format!("{title} · {}", self.description),
+            None => self.description.clone(),
+        }
+    }
+
     /// Substitute arguments + variables into the template:
     /// `$ARGUMENTS[N]` / `$N` (positional), `$ARGUMENTS` (all; appended if absent),
     /// `${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}`, and `` !`cmd` `` (shell pre-exec).
@@ -269,6 +280,7 @@ fn run_shell_command(cmd: &str) -> String {
 
 struct Frontmatter {
     name: Option<String>,
+    display_name: Option<String>,
     description: String,
     allowed_tools: Vec<String>,
     tools_error: Option<String>,
@@ -290,6 +302,7 @@ impl Default for Frontmatter {
     fn default() -> Self {
         Self {
             name: None,
+            display_name: None,
             description: String::new(),
             allowed_tools: Vec::new(),
             tools_error: None,
@@ -454,6 +467,8 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
         tools_block = false;
         if let Some(v) = line.strip_prefix("name:") {
             fm.name = Some(fm_value(v));
+        } else if let Some(v) = line.strip_prefix("display-name:") {
+            fm.display_name = Some(fm_value(v));
         } else if let Some(v) = line.strip_prefix("description:") {
             fm.description = fm_value(v);
         } else if let Some(v) = line
@@ -563,12 +578,14 @@ fn first_paragraph(template: &str) -> String {
 }
 
 fn validate_skill_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.len() > 64 {
+    // Count Unicode scalar values, not UTF-8 bytes: Chinese names have the
+    // same 64-character budget as ASCII names. Keep separators unchanged.
+    if name.is_empty() || name.chars().count() > 64 {
         return Err("skill name must be 1-64 characters".into());
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '/')
     {
         return Err("skill name has invalid characters".into());
     }
@@ -703,8 +720,33 @@ fn build_skill(
     } else {
         fm.description
     };
+    let display_name = fm.display_name.and_then(|title| {
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+        if title.chars().count() > 128
+            || title.chars().any(|c| {
+                c.is_control()
+                    || (c.is_whitespace() && c != ' ')
+                    || matches!(c,
+                    '<' | '>' | '\u{00ad}' | '\u{061c}' | '\u{180e}'
+                    | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}' | '\u{feff}')
+            })
+        {
+            warnings.push(
+                "invalid display-name: expected at most 128 visible characters; using skill name"
+                    .into(),
+            );
+            None
+        } else {
+            Some(title.to_string())
+        }
+    });
     let skill = Skill {
         name,
+        display_name,
         description,
         template,
         allowed_tools: fm.allowed_tools,
@@ -827,6 +869,7 @@ mod tests {
     fn skill(template: &str) -> Skill {
         Skill {
             name: "t".into(),
+            display_name: None,
             description: String::new(),
             template: template.into(),
             allowed_tools: vec![],
@@ -1111,8 +1154,59 @@ mod tests {
     }
 
     #[test]
+    fn display_title_is_optional_and_does_not_replace_the_identifier() {
+        let parse = |extra: &str| {
+            build_skill(
+            &format!("---\nname: linyaps-packager\ndescription: Build packages\n{extra}\n---\npackage $ARGUMENTS"),
+            "install-dir", Path::new("."), Path::new("SKILL.md"), None, true,
+        ).unwrap()
+        };
+        let titled = parse("display-name: '玲珑打包技能'");
+        assert_eq!(titled.skill.name, "linyaps-packager");
+        assert_eq!(titled.skill.display_name.as_deref(), Some("玲珑打包技能"));
+        assert_eq!(titled.skill.summary(), "玲珑打包技能 · Build packages");
+        assert_eq!(titled.skill.expand("app", ""), "package app");
+        assert!(titled.warnings.is_empty());
+        for extra in ["", "display-name:", "display-name: '   '"] {
+            let plain = parse(extra);
+            assert_eq!(plain.skill.display_name, None);
+            assert_eq!(plain.skill.summary(), "Build packages");
+            assert!(plain.warnings.is_empty());
+        }
+        for title in [
+            "x\u{200b}y".to_string(),
+            "x\u{202e}y".to_string(),
+            "x\u{061c}y".to_string(),
+            "x\u{2028}y".to_string(),
+            "<fake>".to_string(),
+            "x".repeat(129),
+        ] {
+            let invalid = parse(&format!("display-name: {title}"));
+            assert_eq!(invalid.skill.display_name, None);
+            assert_eq!(invalid.skill.name, "linyaps-packager");
+            assert_eq!(invalid.warnings.len(), 1);
+        }
+        let long = parse(&format!("display-name: {}", "玲".repeat(128)));
+        assert!(long.skill.display_name.is_some());
+    }
+
+    #[test]
     fn name_validation() {
         assert!(validate_skill_name("good-name_1").is_ok());
+        assert!(validate_skill_name("玲珑打包技能").is_ok());
+        assert!(validate_skill_name("玲珑-Packager_1").is_ok());
+        assert!(validate_skill_name(&"玲".repeat(64)).is_ok());
+        assert!(validate_skill_name(&"玲".repeat(65)).is_err());
+        for name in [
+            "玲珑\u{200b}打包",
+            "玲珑\u{202e}打包",
+            "玲珑\n打包",
+            "玲珑:打包",
+            "玲珑\\打包",
+            "<玲珑>",
+        ] {
+            assert!(validate_skill_name(name).is_err(), "{name:?}");
+        }
         assert!(validate_skill_name("").is_err());
         assert!(validate_skill_name("-bad").is_err());
         assert!(validate_skill_name("a--b").is_err());

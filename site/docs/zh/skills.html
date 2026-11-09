@@ -122,6 +122,15 @@ description: 发布一个新的 release tag,更新 changelog,并打包
 - 不允许绕过测试,任何失败都必须先修复
 - 发布失败时,回滚所有本地 tag 和 changelog 改动</code></pre>
 
+      <h2 id="skill-names">技能名称与展示名</h2>
+      <p><code>name</code> 是稳定的调用标识，支持中文，长度为 1–64 个字符。目录技能未填写时使用目录名，独立 Markdown 技能使用文件名。可选的 <code>display-name</code> 只用于展示，未填写时继续展示调用标识。</p>
+      <pre><code>---
+name: linyaps-packager
+display-name: 玲珑打包技能
+description: 生成玲珑应用打包配置
+---</code></pre>
+      <p>菜单展示中文标题和 <code>/linyaps-packager</code>，按标题或标识均可搜索。选择后填入调用标识，也可以使用 <code>$linyaps-packager</code> 或 <code>/skills linyaps-packager</code>。修改展示名不会改变调用方式；展示名不作为别名。<code>display-name</code> 最多 128 个字符，不接受控制字符、零宽字符或双向控制符；无效时给出警告并回退。</p>
+
       <h2 id="bundled-resources">技能自带资源</h2>
       <p>已加载的目录技能可以用 <code>read_file</code> 读取其 <code>SKILL.md</code> 同目录及子目录中的文件，包括工作区外已安装插件的技能。资源相对路径应以技能目录为基准。独立 Markdown 技能只授权读取该文件。</p>
       <p>这只增加读取范围：工作区写入限制与敏感文件审批仍然有效。链接不能把读取范围扩展到无关位置。禁用或删除技能后，重新加载技能以更新执行环境的资源访问范围。</p>

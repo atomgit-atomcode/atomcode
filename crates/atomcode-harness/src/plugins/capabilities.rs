@@ -634,7 +634,7 @@ impl crate::commands::CatalogCommand for RunSkill {
                 })
                 .into_owned(),
             ),
-            summary: self.skill.description.clone(),
+            summary: self.skill.summary(),
             target: atomcode_kernel::agent::CommandTarget::Session,
             args_requirement: self.skill.args_requirement,
             accepts_images: true,
@@ -884,7 +884,7 @@ impl ListSkills {
                         format!(
                             "{} · {}\n  {}{}",
                             skill.name,
-                            skill.description,
+                            skill.summary(),
                             skill.source_path.display(),
                             history
                                 .get(&skill.name)
@@ -1575,11 +1575,22 @@ mod tests {
     /// only duty: the front end reads `args_requirement` off the catalog
     /// description to route its Enter key, and this row is the only one that
     /// knows a skill's own declaration.
+    #[test]
+    fn skill_display_title_stays_out_of_the_command_identifier() {
+        let mut command =
+            runskill_with_requirement(atomcode_kernel::agent::ArgsRequirement::Unspecified);
+        std::sync::Arc::make_mut(&mut command.skill).display_name = Some("玲珑打包技能".into());
+        let described = command.describe();
+        assert_eq!(described.name, "cmd");
+        assert_eq!(described.summary, "玲珑打包技能 · a command");
+    }
+
     fn runskill_with_requirement(requirement: atomcode_kernel::agent::ArgsRequirement) -> RunSkill {
         use atomcode_capabilities::skills::{Skill, SkillRegistry};
         use std::path::PathBuf;
         let skill = std::sync::Arc::new(Skill {
             name: "cmd".into(),
+            display_name: None,
             description: "a command".into(),
             template: "body".into(),
             allowed_tools: vec![],

@@ -191,6 +191,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_display_title_is_searchable_but_invocation_uses_the_id() {
+        let registry = registry_with(&[("packager", "---\nname: packager\ndisplay-name: 玲珑打包技能\ndescription: Build packages\n---\npackage $ARGUMENTS")]);
+        let listed = ListSkillsTool::new(registry.clone())
+            .execute(r#"{"query":"玲珑"}"#, &ctx())
+            .await;
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("packager"));
+        assert!(listed.content.contains("玲珑打包技能"));
+        let tool = UseSkillTool::new(registry);
+        let invoked = tool
+            .execute(r#"{"name":"packager","arguments":"app"}"#, &ctx())
+            .await;
+        assert!(!invoked.is_error);
+        assert!(invoked.content.contains("package app"));
+        assert!(
+            tool.execute(r#"{"name":"玲珑打包技能"}"#, &ctx())
+                .await
+                .is_error
+        );
+    }
+
+    #[tokio::test]
     async fn use_skill_expands() {
         let tool = UseSkillTool::new(registry_with(&[("greet", "Hello $ARGUMENTS!")]));
         let r = tool

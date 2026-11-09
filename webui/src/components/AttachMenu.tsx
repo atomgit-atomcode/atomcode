@@ -157,7 +157,7 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
                   onClick={() => pickSkill(s.name)}
                   title={s.description}
                 >
-                  <span class="attach-skill-name">/{s.name}</span>
+                  <span class="attach-skill-name">{s.display_name ? `${s.display_name} · /${s.name}` : `/${s.name}`}</span>
                   {s.description && (
                     <span class="attach-skill-desc">{s.description}</span>
                   )}

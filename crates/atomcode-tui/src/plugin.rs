@@ -16336,6 +16336,26 @@ mod skills_menu_tests {
     }
 
     #[test]
+    fn display_titles_filter_both_skill_menus_but_complete_the_identifier() {
+        let (host, tui) = screen();
+        let mut description = tui.client.described().unwrap();
+        description
+            .commands
+            .iter_mut()
+            .find(|c| c.name == "code")
+            .unwrap()
+            .summary = "玲珑打包技能 · 实现代码".into();
+        tui.client.describe(&description);
+        for (typed, selected) in [("$玲珑", "$code"), ("/skills 玲珑", "skills code")] {
+            type_line(&host, typed);
+            tui.refresh_menu();
+            assert_eq!(host.menu_selected().as_deref(), Some(selected));
+        }
+        tui.complete_skill("code");
+        assert_eq!(host.moment.read().unwrap().input, "$code ");
+    }
+
+    #[test]
     fn skills_filters_in_a_second_level_menu() {
         let (host, tui) = screen();
         type_line(&host, "/skills ");
@@ -16396,6 +16416,12 @@ mod skills_menu_tests {
 
     #[test]
     fn a_committed_skill_prefix_uses_the_skills_gateway() {
+        assert_eq!(skill_prefix("$玲珑打包技能"), Some("玲珑打包技能"));
+        assert_eq!(
+            skill_command("$玲珑打包技能 打包应用", |name| name
+                == "玲珑打包技能"),
+            Some("/skills 玲珑打包技能 打包应用".into())
+        );
         let known = |name: &str| name == "code";
         assert_eq!(skill_command("$code", known), Some("/skills code".into()));
         assert_eq!(

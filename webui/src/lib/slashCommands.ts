@@ -3,9 +3,9 @@ export interface ParsedCommand {
   arg: string;
 }
 
-// 命令名字符集与 TUI parse_slash_line 对齐：首字符字母，后续字母/数字/_-: 。
+// 命令名支持 Unicode 字母和数字（包括中文技能名），保留 _-: 。
 // 因为遇到空白即停，"/Users/me" 的 name 会含 '/' → 不匹配 → 判为非命令（路径回退聊天）。
-const NAME_RE = /^[A-Za-z][A-Za-z0-9_:-]*$/;
+const NAME_RE = /^[\p{L}\p{N}_:-]+$/u;
 
 /** 解析一行输入为斜杠命令；非命令返回 null（调用方应作为普通聊天发送）。 */
 export function parseSlashCommand(line: string): ParsedCommand | null {
@@ -166,11 +166,12 @@ export interface SlashMenuItem {
   name: string;
   description: string;
   kind: 'command' | 'skill';
+  display_name?: string;
 }
 
 export function buildSlashMenuItems(
   commands: SlashCommandDef[],
-  skills: { name: string; description?: string }[],
+  skills: { name: string; display_name?: string; description?: string }[],
   query: string,
   t: (key: string) => string,
   // `skillsOnly` renders a pure skills browser (the /skills command): commands are
@@ -185,8 +186,8 @@ export function buildSlashMenuItems(
         .filter((c) => c.name.toLowerCase().includes(q))
         .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
   const skillItems: SlashMenuItem[] = skills
-    .filter((s) => s.name.toLowerCase().includes(q))
-    .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }))
+    .filter((s) => s.name.toLowerCase().includes(q) || s.display_name?.toLowerCase().includes(q))
+    .map((s) => ({ name: s.name, ...(s.display_name ? { display_name: s.display_name } : {}), description: s.description ?? '', kind: 'skill' as const }))
     .sort((a, b) => a.name.localeCompare(b.name));
   return [...cmdItems, ...skillItems];
 }

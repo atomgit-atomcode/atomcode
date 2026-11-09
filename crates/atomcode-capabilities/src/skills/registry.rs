@@ -235,7 +235,8 @@ impl SkillRegistry {
                     TemplateKind::Command => index.commands.get(&name),
                 }
                 .is_some_and(|previous| {
-                    previous.description == skill.description
+                    previous.display_name == skill.display_name
+                        && previous.description == skill.description
                         && previous.template == skill.template
                         && previous.allowed_tools == skill.allowed_tools
                         && previous.user_invocable == skill.user_invocable
@@ -431,7 +432,7 @@ impl SkillRegistry {
     pub fn list(&self) -> Vec<(String, String)> {
         self.read()
             .values()
-            .map(|s| (s.name.clone(), s.description.clone()))
+            .map(|s| (s.name.clone(), s.summary()))
             .collect()
     }
 
@@ -499,7 +500,7 @@ impl SkillRegistry {
             .map(|s| super::render::CatalogEntry {
                 name: s.name.clone(),
                 hint: None, // capabilities skills carry no argument hint
-                description: s.description.clone(),
+                description: s.summary(),
                 source_rank: super::render::source_rank(&s.source_path, &native_roots),
             })
             .collect();
@@ -520,7 +521,7 @@ fn text_mentions_exact_name(text: &str, name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     text.match_indices(&name).any(|(start, _)| {
         let end = start + name.len();
-        let is_name_char = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':');
+        let is_name_char = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '-' | ':');
         let before_ok = text[..start]
             .chars()
             .next_back()
@@ -967,6 +968,7 @@ mod tests {
         let reg = SkillRegistry::new();
         reg.register(Skill {
             name: "skills:dup".into(),
+            display_name: None,
             description: "a".into(),
             template: "A".into(),
             allowed_tools: Vec::new(),
@@ -978,6 +980,7 @@ mod tests {
         });
         reg.register(Skill {
             name: "plugin:dup".into(),
+            display_name: None,
             description: "b".into(),
             template: "B".into(),
             allowed_tools: Vec::new(),
@@ -1002,6 +1005,7 @@ mod tests {
         let reg = SkillRegistry::new();
         reg.register(Skill {
             name: "skills:review".into(),
+            display_name: None,
             description: "visible".into(),
             template: "V".into(),
             allowed_tools: Vec::new(),
@@ -1013,6 +1017,7 @@ mod tests {
         });
         reg.register(Skill {
             name: "plugin:review".into(),
+            display_name: None,
             description: "hidden".into(),
             template: "H".into(),
             allowed_tools: Vec::new(),
@@ -1239,6 +1244,69 @@ mod tests {
             reg.get("resource").is_none(),
             "a skill's own resource .md is not a command"
         );
+    }
+
+    #[test]
+    fn display_titles_are_discoverable_but_never_resolve_as_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["packager", "other"] {
+            std::fs::create_dir(root.path().join(id)).unwrap();
+            std::fs::write(root.path().join(id).join("SKILL.md"),
+                format!("---\nname: {id}\ndisplay-name: 玲珑打包技能\ndescription: Build packages\n---\nbody")).unwrap();
+        }
+        let reg = SkillRegistry::load(&[root.path().to_path_buf()]);
+        assert_eq!(reg.list().len(), 2);
+        assert!(reg.get("packager").is_some());
+        assert!(reg.get("other").is_some());
+        assert!(reg.get("玲珑打包技能").is_none());
+        assert!(reg
+            .list()
+            .iter()
+            .all(|(_, summary)| summary.contains("玲珑打包技能")));
+        let catalog = reg.render_catalog().unwrap();
+        assert!(catalog.contains("packager"));
+        assert!(catalog.contains("玲珑打包技能"));
+    }
+
+    #[test]
+    fn chinese_names_load_from_frontmatter_directories_and_flat_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (dir, content) in [
+            (
+                "linyaps-packager-skill",
+                "---\nname: 玲珑打包技能\ndescription: 打包\n---\n打包 $ARGUMENTS",
+            ),
+            ("中文目录-1.0.0", "目录技能"),
+        ] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("SKILL.md"), content).unwrap();
+        }
+        std::fs::write(tmp.path().join("中文指令.md"), "平铺技能").unwrap();
+        let reg = super::SkillRegistry::load(&[tmp.path().to_path_buf()]);
+        assert!(reg.diagnostics().is_empty());
+        assert_eq!(
+            reg.get("玲珑打包技能").unwrap().expand("应用", ""),
+            "打包 应用"
+        );
+        assert!(reg.get("中文目录").is_some());
+        assert!(reg.get("中文指令").is_some());
+        assert!(reg.get("skills:玲珑打包技能").is_some());
+        let namespaced = super::SkillRegistry::new();
+        namespaced.load_dir(tmp.path(), Some("plugin"));
+        assert!(namespaced.get("plugin:玲珑打包技能").is_some());
+        assert!(namespaced.get("玲珑打包技能").is_some());
+        assert!(text_mentions_exact_name(
+            "使用 `玲珑打包技能`",
+            "玲珑打包技能"
+        ));
+        assert!(!text_mentions_exact_name(
+            "其他玲珑打包技能",
+            "玲珑打包技能"
+        ));
+        assert!(!text_mentions_exact_name(
+            "玲珑打包技能扩展",
+            "玲珑打包技能"
+        ));
     }
 
     #[test]

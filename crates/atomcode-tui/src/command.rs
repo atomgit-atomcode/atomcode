@@ -701,7 +701,7 @@ pub fn looks_like_command(line: &str) -> bool {
         return false;
     };
     let name_end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'))
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == ':'))
         .unwrap_or(rest.len());
     if name_end == 0 {
         return false; // "/" alone, or "//…" — no command name
@@ -736,6 +736,10 @@ mod tests {
         assert!(looks_like_command("/help"));
         assert!(looks_like_command("/cd ~/projects")); // path lives in the args
         assert!(looks_like_command("/model glm5.3"));
+        assert!(looks_like_command("/玲珑打包技能 应用"));
+        assert!(looks_like_command("/插件:玲珑打包技能"));
+        assert!(!looks_like_command("/中文目录/文件"));
+        assert!(!looks_like_command("/玲珑\u{200b}打包"));
         assert!(looks_like_command("/skills:brainstorming")); // namespaced skill
         assert!(looks_like_command("  /clear")); // leading spaces are fine
         assert!(looks_like_command("/reset")); // unknown-but-command-shaped still dispatches (→ "did you mean")

@@ -269,6 +269,7 @@ mod tests {
     fn skill(name: &str, policy: AutoLoad) -> Skill {
         Skill {
             name: name.into(),
+            display_name: None,
             description: "Investigate bugs and failed tests".into(),
             template: "DEBUG_WORKFLOW_BODY: establish evidence before changing code.".into(),
             allowed_tools: vec!["bash".into()],

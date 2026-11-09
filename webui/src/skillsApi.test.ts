@@ -12,5 +12,10 @@ test('skill requests preserve HTTP errors and reject a successful non-list paylo
     await assert.rejects(getSkills(), /Invalid skill list response/);
     globalThis.fetch = async () => Response.json([{ name: 'plugin:skill', description: 'usable skill' }]);
     assert.deepEqual(await getSkills(), [{ name: 'plugin:skill', description: 'usable skill' }]);
+    const titled = [{ name: 'packager', display_name: '玲珑打包技能', description: 'Build packages' }];
+    globalThis.fetch = async () => Response.json(titled);
+    assert.deepEqual(await getSkills(), titled);
+    globalThis.fetch = async () => Response.json([{ name: 'packager', display_name: 123, description: 'Build packages' }]);
+    await assert.rejects(getSkills(), /Invalid skill list response/);
   } finally { globalThis.fetch = original; }
 });

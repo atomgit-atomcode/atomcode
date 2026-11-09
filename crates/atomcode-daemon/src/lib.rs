@@ -7293,6 +7293,8 @@ async fn get_tunnel_status(
 #[derive(serde::Serialize)]
 pub struct SkillInfo {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub description: String,
 }
 
@@ -7354,6 +7356,7 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
         .into_iter()
         .map(|s| SkillInfo {
             name: s.name.clone(),
+            display_name: s.display_name.clone(),
             description: s.description.clone(),
         })
         .collect();
