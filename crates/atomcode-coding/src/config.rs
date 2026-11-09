@@ -189,6 +189,10 @@ pub struct CodingAgentConfig {
     /// None preserves window-relative behavior. Read from `[compaction].token_limit`
     /// in config.toml; the mounted `compaction-coding` row carries the same value.
     pub compact_token_limit: Option<u32>,
+    /// Optional fixed budget for the recent turns kept full before old tool
+    /// results are stubbed. Read from `[compaction].stub_recent_budget`; lower
+    /// values stub older output sooner. None keeps the window-relative budget.
+    pub compact_stub_recent_budget: Option<u32>,
     /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
     /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
@@ -287,6 +291,8 @@ pub struct CodingRuntimeConfig {
     pub startup_warnings: Vec<String>,
     /// Optional absolute prompt budget from `[compaction].token_limit`.
     pub compact_token_limit: Option<u32>,
+    /// Optional fixed stub keep budget from `[compaction].stub_recent_budget`.
+    pub compact_stub_recent_budget: Option<u32>,
     /// Explicit trusted skill roots from `[skills].extra_dirs`.
     pub extra_skill_dirs: Vec<String>,
     /// See [`CodingAgentConfig::dirs`].
@@ -542,7 +548,10 @@ pub fn describe_config_file_for(
          native persistent sessions restore unfinished goals paused for review.\n\
          - `[compaction]` `token_limit`: optional positive prompt-token budget for earlier \
          automatic history summarization; omit to keep the window-relative policy. \
-         Applied when the agent is rebuilt; the model's physical context window is unchanged.\n\
+         `stub_recent_budget`: optional positive budget for the recent turns kept full before \
+         old tool results are stubbed; lower values stub older output sooner (a cheap tail-only \
+         cache break) and are useful on large-context models. Omit to keep the window-relative \
+         default. Both apply when the agent is rebuilt; the model's physical context window is unchanged.\n\
          - `[modes.plan]` and `[modes.build]` optionally bind a `model` selection id and `reasoning_effort` (unset inherits the model profile; `default` uses the API default). Cross-mode transitions apply them for this session without writing `default_model`; `/model` temporarily overrides until the next mode transition. Configure via `/config` or WebUI mode settings.\n\
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
@@ -665,6 +674,10 @@ impl CodingRuntimeConfig {
         Self {
             startup_warnings,
             compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
+            compact_stub_recent_budget: config
+                .compaction
+                .stub_recent_budget
+                .map(|limit| limit.get()),
             extra_skill_dirs: config.skills.extra_dirs.clone(),
             dirs: dirs.clone(),
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
@@ -770,6 +783,7 @@ impl CodingRuntimeConfig {
         config.startup_warnings = self.startup_warnings.clone();
         config.extra_skill_dirs = self.extra_skill_dirs.clone();
         config.compact_token_limit = self.compact_token_limit;
+        config.compact_stub_recent_budget = self.compact_stub_recent_budget;
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
         config.supports_reasoning_effort =
@@ -1316,6 +1330,7 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             compact_token_limit: None,
+            compact_stub_recent_budget: None,
             web_search_provider: None,
             web_search_api_key: None,
             lsp: Default::default(),

@@ -1283,6 +1283,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_larger_pinned_budget_keeps_a_completed_turn_the_small_one_stubs() {
+        // Three real turns: the floor protects turn 1, while turns 2 and 3 can
+        // be kept or stubbed by the budget. Both results are big enough to stub.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("first"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", big("bash out"), false),
+            Message::user("second"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", big("grep out"), false),
+            Message::user("third"),
+            asst_call("v1", "grep"),
+            Message::tool_result("v1", big("third out"), false),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+
+        let small = StubCompaction::new(1, true)
+            .plan(&view(&conv.messages, floor))
+            .await;
+        let small_indices: Vec<usize> = small.rewrites.iter().map(|(i, _)| *i).collect();
+        assert!(
+            small_indices.contains(&6),
+            "the small budget stubs the second turn: {small_indices:?}"
+        );
+
+        let large = StubCompaction::new(1_000_000, true)
+            .plan(&view(&conv.messages, floor))
+            .await;
+        let large_indices: Vec<usize> = large.rewrites.iter().map(|(i, _)| *i).collect();
+        assert!(
+            !large_indices.contains(&6),
+            "the large budget keeps the second turn full: {large_indices:?}"
+        );
+        assert!(
+            large_indices.contains(&3),
+            "the sacred floor still keeps turn 1 out of reach: {large_indices:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn idempotent_second_run_is_noop() {
         let msgs = vec![
             Message::system("persona"),

@@ -135,6 +135,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         },
         apply: ApplyPolicy::AgentReassemble,
     },
+    SettingSpec {
+        id: "compaction.stub_recent_budget",
+        path: &["compaction", "stub_recent_budget"],
+        label_en: "Recent tool output kept before stubbing",
+        label_zh: "打桩前保留的近期工具输出预算",
+        aliases: &["stub", "compact", "打桩", "上下文"],
+        kind: SettingKind::Integer {
+            min: 1,
+            max: 4_294_967_295,
+        },
+        apply: ApplyPolicy::AgentReassemble,
+    },
     bool_setting(
         "auto_update",
         &["auto_update"],
@@ -584,6 +596,11 @@ impl SettingSpec {
                 .token_limit
                 .map(|limit| limit.to_string())
                 .unwrap_or_default(),
+            "compaction.stub_recent_budget" => config
+                .compaction
+                .stub_recent_budget
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
             "tools.search.respect_gitignore" => config.tools.search.respect_gitignore.to_string(),
@@ -953,6 +970,27 @@ mod tests {
         setting.patch(&mut document, "").unwrap();
         let config: Config = toml::from_str(&document.to_string()).unwrap();
         assert!(config.compaction.token_limit.is_none());
+        assert!(document.to_string().contains("# preserve"));
+    }
+
+    #[test]
+    fn stub_recent_budget_is_optional_positive_and_resettable() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "compaction.stub_recent_budget")
+            .unwrap();
+        let mut document = "# preserve\n".parse::<DocumentMut>().unwrap();
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(setting.value(&config), "");
+        setting.patch(&mut document, "100000").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(config.compaction.stub_recent_budget.unwrap().get(), 100_000);
+        for invalid in ["0", "-1", "4294967296"] {
+            assert!(setting.patch(&mut document, invalid).is_err());
+        }
+        setting.patch(&mut document, "").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(config.compaction.stub_recent_budget.is_none());
         assert!(document.to_string().contains("# preserve"));
     }
 

@@ -2335,6 +2335,8 @@ pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedRevie
 struct CompactionCodingRow {
     #[serde(default)]
     token_limit: Option<u32>,
+    #[serde(default)]
+    stub_recent_budget: Option<u32>,
     #[serde(default = "default_compaction_threshold")]
     threshold: f32,
 }
@@ -2345,6 +2347,7 @@ fn default_compaction_threshold() -> f32 {
 
 struct CodingCompaction {
     token_limit: Option<u32>,
+    stub_recent_budget: Option<u32>,
     provider: atomcode_review::SharedReviewProvider,
 }
 
@@ -2353,12 +2356,15 @@ impl CodingCompaction {
     fn strategy(&self) -> (atomcode_capabilities::compaction::OverflowCompaction, bool) {
         let provider = self.provider.read().ok().and_then(|slot| slot.clone());
         let writes = provider.is_some();
+        let stub = match self.stub_recent_budget {
+            Some(limit) => {
+                atomcode_capabilities::compaction::StubCompaction::new(limit as usize, true)
+            }
+            None => atomcode_capabilities::compaction::StubCompaction::default(),
+        };
         (
-            atomcode_capabilities::compaction::OverflowCompaction::new(
-                atomcode_capabilities::compaction::StubCompaction::default(),
-                provider,
-            )
-            .with_auto_token_limit(self.token_limit),
+            atomcode_capabilities::compaction::OverflowCompaction::new(stub, provider)
+                .with_auto_token_limit(self.token_limit),
             writes,
         )
     }
@@ -2371,7 +2377,11 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
             .token_limit
             .map(|limit| format!(" or {limit} prompt tokens"))
             .unwrap_or_default();
-        format!("fold old tool output under pressure; past 0.78 of the window{budget}, or on request, have the conversation's model summarize older turns; on an overflow, stub, truncate, then summarize")
+        let stub = self
+            .stub_recent_budget
+            .map(|limit| format!("; keep {limit} recent tokens before stubbing"))
+            .unwrap_or_default();
+        format!("fold old tool output under pressure{stub}; past 0.78 of the window{budget}, or on request, have the conversation's model summarize older turns; on an overflow, stub, truncate, then summarize")
     }
 
     fn calls_model(
@@ -2423,9 +2433,13 @@ impl Plugin for CompactionCodingPlugin {
         if row.token_limit == Some(0) {
             return Err("compaction token_limit must be positive or omitted".into());
         }
+        if row.stub_recent_budget == Some(0) {
+            return Err("compaction stub_recent_budget must be positive or omitted".into());
+        }
         let _ = ctx
             .provide::<atomcode_harness::seams::CompactionSvc>(Arc::new(CodingCompaction {
                 token_limit: row.token_limit,
+                stub_recent_budget: row.stub_recent_budget,
                 provider: self.0.clone(),
             }))
             .map_err(|e| e.to_string())?;
@@ -3566,6 +3580,81 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_coding_row_uses_the_configured_stub_budget() {
+        use atomcode_kernel::message::{
+            CompactTrigger, CompactionStrategy, CompactionView, Conversation, Message,
+        };
+        use atomcode_kernel::tool::ToolCall;
+
+        fn big(text: &str) -> String {
+            format!("{text}\n{}", "x".repeat(600))
+        }
+        fn call(id: &str) -> Message {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+            )
+        }
+
+        // Three turns: the sacred floor protects turn 1; turn 2 is the one a
+        // smaller keep budget must be able to stub.
+        let mut conv = Conversation::new();
+        conv.messages = vec![
+            Message::system("persona"),
+            Message::user("first"),
+            call("b1"),
+            Message::tool_result("b1", big("first out"), false),
+            Message::user("second"),
+            call("b2"),
+            Message::tool_result("b2", big("second out"), false),
+            Message::user("third"),
+            call("b3"),
+            Message::tool_result("b3", big("third out"), false),
+        ];
+        let floor = conv.sacred_floor();
+        let view = CompactionView {
+            messages: &conv.messages,
+            trigger: CompactTrigger::Auto { utilization: 0.5 },
+            ctx_window: 1_000_000,
+            used_tokens: 500,
+            utilization: 0.5,
+            sacred_floor: floor,
+        };
+        let provider: atomcode_review::SharedReviewProvider =
+            std::sync::Arc::new(std::sync::RwLock::new(None));
+
+        let small = super::CodingCompaction {
+            token_limit: None,
+            stub_recent_budget: Some(1),
+            provider: provider.clone(),
+        }
+        .strategy()
+        .0;
+        let plan = small.plan(&view).await;
+        assert!(
+            plan.rewrites.iter().any(|(index, _)| *index == 6),
+            "the pinned small budget must stub the completed second turn"
+        );
+
+        let default = super::CodingCompaction {
+            token_limit: None,
+            stub_recent_budget: None,
+            provider,
+        }
+        .strategy()
+        .0;
+        let plan = default.plan(&view).await;
+        assert!(
+            !plan.rewrites.iter().any(|(index, _)| *index == 6),
+            "without the pin, the window-relative budget keeps the second turn"
+        );
+    }
+
     #[test]
     fn historical_framing_keeps_logged_stats_aligned_without_accepting_changed_text() {
         use atomcode_kernel::message::{
