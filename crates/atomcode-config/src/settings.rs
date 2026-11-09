@@ -138,8 +138,8 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         id: "compaction.stub_recent_budget",
         path: &["compaction", "stub_recent_budget"],
-        label_en: "Recent tool output kept before stubbing",
-        label_zh: "打桩前保留的近期工具输出预算",
+        label_en: "Recent tool-output budget (tokens)",
+        label_zh: "近期工具输出保留预算（token）",
         aliases: &["stub", "compact", "打桩", "上下文"],
         kind: SettingKind::Integer {
             min: 1,
@@ -1083,8 +1083,10 @@ mod tests {
         const CONCEPT_WORDS: &[&str] = &["provider", "model", "credential"];
 
         for setting in SETTINGS {
-            let public_budget = setting.id == "compaction.token_limit"
+            let public_budget = (setting.id == "compaction.token_limit"
                 && setting.path == ["compaction", "token_limit"]
+                || setting.id == "compaction.stub_recent_budget"
+                    && setting.path == ["compaction", "stub_recent_budget"])
                 && matches!(
                     setting.kind,
                     SettingKind::Integer {

@@ -2379,7 +2379,11 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
             .unwrap_or_default();
         let stub = self
             .stub_recent_budget
-            .map(|limit| format!("; keep {limit} recent tokens before stubbing"))
+            .map(|limit| {
+                format!(
+                    "; a configured {limit}-token recent budget is clamped to the window-relative budget before stubbing"
+                )
+            })
             .unwrap_or_default();
         format!("fold old tool output under pressure{stub}; past 0.78 of the window{budget}, or on request, have the conversation's model summarize older turns; on an overflow, stub, truncate, then summarize")
     }
@@ -3580,6 +3584,19 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_stub_budget_is_described_as_clamped() {
+        let row = super::CodingCompaction {
+            token_limit: None,
+            stub_recent_budget: Some(100_000),
+            provider: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        };
+        let described =
+            <super::CodingCompaction as atomcode_harness::seams::Compaction>::describe(&row);
+        assert!(described.contains("100000"));
+        assert!(described.contains("clamped"));
+    }
+
     #[tokio::test]
     async fn the_coding_row_uses_the_configured_stub_budget() {
         use atomcode_kernel::message::{
@@ -3601,8 +3618,9 @@ mod tests {
             )
         }
 
-        // Three turns: the sacred floor protects turn 1; turn 2 is the one a
-        // smaller keep budget must be able to stub.
+        // Three turns. The floor protects only the system line and the first
+        // user line; turn 1's tool result is old and is stubbed either way.
+        // Turn 2 is the one a smaller keep budget must be able to stub.
         let mut conv = Conversation::new();
         conv.messages = vec![
             Message::system("persona"),
