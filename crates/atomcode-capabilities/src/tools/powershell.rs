@@ -417,4 +417,96 @@ mod tests {
             assert!(script.contains("exit 7 # comment\n"));
         }
     }
+
+    #[test]
+    fn encoded_command_preserves_the_reported_workspace_path() {
+        let shell = PowerShell {
+            path: "powershell.exe".into(),
+            version: "5.1".into(),
+        };
+        let path = r"D:\2026增肌\工作区_wb06\_atomcode_archive";
+        let command = shell.command(&format!("[IO.Directory]::CreateDirectory('{path}')"));
+        use base64::Engine;
+        let encoded = command
+            .as_std()
+            .get_args()
+            .last()
+            .unwrap()
+            .to_string_lossy();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap();
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let decoded = String::from_utf16(&units).unwrap();
+        assert!(decoded.contains(path));
+        assert!(!decoded.contains("澧炶倢"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_powershell_versions_create_the_exact_chinese_archive_directory() {
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+        let programs = PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles"));
+        let mut shells = vec![(
+            system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+            "5.1",
+        )];
+        let seven = programs.join("PowerShell/7/pwsh.exe");
+        if seven.is_file() {
+            shells.push((seven, "7"));
+        }
+        for (path, version) in shells {
+            assert!(
+                path.is_file(),
+                "required Windows PowerShell is missing: {}",
+                path.display()
+            );
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().join("2026增肌").join("工作区 wb06");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let target = cwd.join("_atomcode_archive");
+            let escaped = target.to_string_lossy().replace('\'', "''");
+            let script = format!("$target = '{escaped}'; [IO.Directory]::CreateDirectory($target) | Out-Null; [IO.File]::WriteAllText([IO.Path]::Combine($target, 'probe.txt'), 'ok')");
+            let shell = PowerShell {
+                path,
+                version: version.into(),
+            };
+            let process = shell
+                .spawn(
+                    &script,
+                    &SpawnOptions {
+                        cwd: Some(cwd.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut output = Vec::new();
+            while let Some(chunk) = process.next_chunk().await {
+                output.extend_from_slice(chunk.bytes());
+            }
+            assert!(
+                process.wait().await.unwrap().success(),
+                "{}",
+                shell.decode(&output)
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.join("probe.txt")).unwrap(),
+                "ok"
+            );
+            let top: Vec<_> = std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(top, vec![std::ffi::OsString::from("2026增肌")]);
+            let dirs: Vec<_> = std::fs::read_dir(root.path().join("2026增肌"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(dirs, vec![std::ffi::OsString::from("工作区 wb06")]);
+        }
+    }
 }

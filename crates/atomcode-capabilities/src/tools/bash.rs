@@ -25,6 +25,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
 mod exit_diagnostic;
+#[cfg(any(windows, test))]
+mod windows_diagnostics;
+#[cfg(all(windows, test))]
+mod windows_encoding_tests;
 
 /// How long a process can be silent (no new stdout/stderr) AFTER having emitted
 /// something, before we kill it. Bumped from 30→90 to tolerate legitimate silent
@@ -1202,11 +1206,16 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     // HEAD fix): std's `.arg()` applies `CommandLineToArgvW` quoting that cmd.exe does NOT
     // follow, mangling embedded quotes (`node -e "..."`), `%VAR%`, `^`. Mirrors
     // atomcode-core's process_utils::shell_command / tool/bash.rs.
+    Ok(build_cmd_command(command))
+}
+
+#[cfg(windows)]
+fn build_cmd_command(command: &str) -> tokio::process::Command {
     use std::os::windows::process::CommandExt;
     let mut cmd = tokio::process::Command::new("cmd.exe");
     cmd.arg("/C");
     cmd.as_std_mut().raw_arg(command);
-    Ok(cmd)
+    cmd
 }
 
 /// Decode subprocess output to text. UTF-8 is the fast path; if that fails we first
@@ -3262,6 +3271,9 @@ pub(crate) async fn spawn_local_command(
         }
     }
 
+    #[cfg(windows)]
+    windows_diagnostics::log_spawn(cmd.as_std());
+
     // `mut` is consumed on Windows, where the child is not rebound below.
     #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut child = cmd
@@ -5311,6 +5323,34 @@ mod tests {
     #[test]
     fn unparseable_args_are_conservatively_risky() {
         assert_eq!(BashTool::default().risk("not json"), RiskLevel::Risky);
+    }
+
+    #[test]
+    fn chinese_workspace_paths_survive_output_decoding_without_guessed_repairs() {
+        let path = r"D:\2026增肌\工作区_wb06\_atomcode_archive";
+        assert_eq!(decode_output(path.as_bytes()), path);
+        let (gbk, _, had_errors) = encoding_rs::GBK.encode(path);
+        assert!(!had_errors);
+        assert_eq!(decode_oem(&gbk, 936), path);
+        let utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_output(&utf16), path);
+        let mut pending = Vec::new();
+        let mut decoded = String::new();
+        for byte in path.as_bytes() {
+            if let Some(chunk) = decode_stream_chunk(&mut pending, &[*byte], false) {
+                decoded.push_str(&chunk);
+            }
+        }
+        if let Some(chunk) = decode_stream_chunk(&mut pending, &[], true) {
+            decoded.push_str(&chunk);
+        }
+        assert_eq!(decoded, path);
+        let (mojibake, _, errors) = encoding_rs::GBK.decode("增肌".as_bytes());
+        assert!(!errors);
+        assert_eq!(mojibake, "澧炶倢");
+        // This string is already valid Unicode. Output decoding cannot know
+        // that it came from a previous, incorrect decode or repair it safely.
+        assert_eq!(decode_output(mojibake.as_bytes()), mojibake);
     }
 
     #[test]

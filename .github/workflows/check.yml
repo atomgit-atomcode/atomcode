@@ -128,3 +128,36 @@ jobs:
       - name: cargo clippy
         continue-on-error: true
         run: cargo clippy --workspace --all-targets
+
+  windows-path-encoding:
+    name: Windows Unicode path roundtrip
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-path-encoding
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      # One crate's library target only: exercise actual Windows APIs/cmd/PS,
+      # including when Git Bash would otherwise hide the cmd fallback.
+      - name: Run Windows path regressions
+        run: >-
+          cargo nextest run -p atomcode-capabilities --lib
+          -E 'test(windows_encoding_tests) | test(windows_powershell_versions) | test(chinese_workspace_paths) | test(encoded_command_preserves) | test(windows_diagnostics)'
+
+      # The source is ASCII so Windows PowerShell 5.1 can read the probe itself.
+      # Deliberately BOM-less script cases are diagnostic contrasts, not proof
+      # of a historical AtomCode failure. All writes stay under system temp.
+      - name: Compare native arguments and script-file encodings
+        shell: powershell
+        run: .\scripts\probe-windows-path-encoding.ps1
