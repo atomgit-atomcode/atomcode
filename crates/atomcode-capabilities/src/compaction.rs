@@ -807,7 +807,8 @@ fn is_line_break(c: char) -> bool {
 
 /// The first segment of `text` (empty when it starts with a break).
 fn first_line(text: &str) -> &str {
-    text.split(is_line_break).next().unwrap_or("")
+    // `split` always yields at least one segment.
+    text.split(is_line_break).next().unwrap()
 }
 
 /// Call `f` on every segment between line breaks: CRLF is one break, and lone
