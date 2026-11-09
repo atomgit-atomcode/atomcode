@@ -108,6 +108,7 @@
           <tr><td><code>/paste</code></td><td>Attach an image from the clipboard (Windows fallback for when <code>Ctrl+V</code> is captured by the terminal)</td></tr>
           <tr><td><code>/cost</code></td><td>Prompt, completion, and cached tokens accumulated per model in the current session. Distinct from <code>/usage</code>, which queries the CodingPlan gateway for your plan quota</td></tr>
           <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
+          <tr><td><code>/context prompt</code> · <code>/context persona</code></td><td>TUI: inspect the currently assembled system prompt, or just the persona and append settings; see <a href="#context-inspection">context and prompt inspection</a></td></tr>
           <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
           <tr><td><code>/rewind</code></td><td>Choose an earlier prompt and roll back the conversation, code, or both; see <a href="./sessions.html">Sessions &amp; Undo</a></td></tr>
           <tr><td><code>/clear</code></td><td>Clear the current session's messages (working directory and model are kept)</td></tr>
@@ -129,6 +130,10 @@
         <strong>Read-only reports run mid-turn</strong>
         <p>You don't have to wait for a turn to finish to check on things: <code>/status</code>, <code>/diff</code>, <code>/cost</code>, <code>/usage</code>, and <code>/rename</code> run even while the agent is streaming. They render as a transient panel below the input box (press <kbd>Esc</kbd> to dismiss) without interrupting the running turn. <code>/usage</code> mid-turn is also tab-switchable across its Current / Overview / Models views.</p>
       </div>
+
+      <h2 id="context-inspection">Context and prompt inspection</h2>
+      <p><code>/context</code> reports context-budget and usage statistics. In the TUI, <code>/context prompt</code> displays the system prompt assembled by the currently loaded components, while <code>/context persona</code> shows only the persona and its append settings.</p>
+      <p>The system prompt is not the complete model request: tool definitions and conversation history are separate. These prompt-text inspection commands apply to the TUI; the WebUI's <code>/context</code> provides budget statistics only. For compaction protection and why prompts can change after resuming, see <a href="./sessions.html#prompt-retention">session prompt retention</a>.</p>
 
       <h2 id="conversation-modes-thinking">Conversation modes &amp; thinking</h2>
       <table>

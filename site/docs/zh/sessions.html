@@ -89,6 +89,28 @@
       </ul>
       <p>会话数据落盘在 <code>~/.atomcode/sessions/</code> 下,按项目(工作目录 hash)分组存储。</p>
 
+      <h2 id="prompt-retention">系统提示与初始任务会保留吗？</h2>
+      <p>这里需要区分<strong>系统提示</strong>和<strong>你发送的第一条任务消息</strong>：前者是 AtomCode 组装的角色、项目指令及能力说明，后者是你的实际输入。</p>
+      <table>
+        <thead><tr><th>内容</th><th>正常对话与压缩时的处理</th></tr></thead>
+        <tbody>
+          <tr><td>当前生效的系统提示</td><td>后续模型请求仍会使用，不会因常规历史摘要而丢弃。</td></tr>
+          <tr><td>首条真实用户消息的文本</td><td>属于压缩保护范围，正常压缩不会删除或用摘要替换这条原始任务。</td></tr>
+          <tr><td>后续历史消息与工具结果</td><td>可能被摘要或精简。会话记录已保存在磁盘，不代表每次请求都发送全部原文。</td></tr>
+        </tbody>
+      </table>
+      <p>这描述的是正常上下文压缩；主动执行 <code>/clear</code>、<code>/session</code>，或通过 <code>/undo</code> / <code>/rewind</code> 回退对话，会改变当前有效历史。图片等附件也可能单独转换或折叠，不能把文本保护理解为附件始终原样发送。</p>
+
+      <h3 id="prompt-resume">恢复会话后，系统提示完全一样吗？</h3>
+      <p><code>/resume</code> 或 <code>--continue</code> 会从持久化会话记录恢复有效历史，包括仍在历史中的初始任务。保存的会话上下文也会参与恢复。系统提示由当前加载的组件组装；版本、配置或项目指令变化后，恢复时的提示不保证与会话最初逐字一致。恢复会话不是原始模型请求的逐字重放。</p>
+
+      <h3 id="inspect-system-prompt">在哪里查看当前系统提示？</h3>
+      <p>在 <strong>TUI</strong> 中使用：</p>
+      <pre><code>/context prompt    # 查看当前组装的系统提示
+/context persona   # 查看角色提示及其追加设置
+/context           # 查看上下文预算与占用统计</code></pre>
+      <p><code>/context prompt</code> 显示当前应用组装的系统提示，不是包含工具定义和全部对话历史的完整模型请求。以上提示正文查看入口指 TUI；不要把 WebUI 的 <code>/context</code> 预算统计当作完整提示查看器。详见 <a href="./slash-commands.html#context-inspection">命令说明</a>。</p>
+
       <h2 id="恢复会话">恢复会话</h2>
       <h3 id="命令行继续上次">命令行继续上次</h3>
       <pre><code>atomcode -c        # 或 atomcode --continue</code></pre>

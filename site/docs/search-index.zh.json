@@ -498,7 +498,12 @@
       {
         "id": "工具与实用操作",
         "heading": "工具与实用操作",
-        "body": "命令 作用 /view · /view <文件路径> 打开只读文件查看器。 不带参数 时打开一个模糊「仅文件」选择器(输入即筛选;像 ~/… 或 ./… 这类路径式查询还能打开项目 之外 的文件)。带路径则直接打开该文件。方向键 / PageUp-Down / Home-End(或 g / G 跳到首/末行)滚动; Esc 退回, Ctrl+C 退出 /undo · /undo N 把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件 /diff 显示当前工作目录未提交改动的 git diff(文件列表一次最多显示 5 行,并带「更多文件」滚动提示) /review 对当前改动做代码审查: /review 审查未提交改动, /review staged 审查暂存区, /review <base> 对比某个基准 ref /paste 从剪贴板粘贴图片(Windows 下 Ctrl+V 被终端拦截时的备用入口) /cost 按模型显示当前会话累计的提示、补全和缓存 Token。与 /usage 不同,后者查询的是 CodingPlan 网关的套餐额度 /context 显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用 /compact 压缩历史消息,把早期对话压缩成摘要以腾出上下文预算 /rewind 选择历史提示，并回退对话、代码或两者；详见 会话与撤销 /clear 清空当前会话的消息(保留工作目录和模型) /init 扫描当前工作目录，按优先级创建或完善当前生效的项目指令文件（ .atomcode.md 、 AGENTS.md 或 CLAUDE.md ）。生成内容跟随当前语言，并可在 /config 中配置自定义提示词文件。 /background <任务> 把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于\"顺手让它去查一下 X\"这类轻探索。详见 后台会话 /worktree <子命令> Git worktree 隔离: create 在新分支上拉一份独立 worktree、 list 查看现有 worktree、 done 仅切回主检出（不提交、不 squash、不合并）、 cleanup 删除 worktree（不验证是否已合并；请先提交并合并需保留的成果， --force 会丢弃未提交内容） /todo · /todo add <任务> · /todo clear 重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 todowrite 工具调用并重渲染),带「进行中 / 已完成」状态标记。 /todo add <任务> 确定性地追加一条任务(不走模型); /todo clear 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度 /copy 把上一条回复复制到剪贴板: /copy 复制整条回复的 markdown 原文(整个回合,不含工具输出); /copy code 复制最后一个代码块、 /copy code N 复制第 N 个、 /copy code all 复制全部代码块(旧写法 /copy N 、 /copy all 、 /copy msg 仍可用) /save 把当前会话导出成 markdown 文件: /save 用自动生成的文件名, /save <文件名> 指定文件名 AtomGit Issue 现在由内置工具处理 /issue 已移除。执行 /login 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”。AtomCode 会选择内置的 atomgit_issue 工具，写操作仍需权限确认。详见 内置工具 。 只读报告可在回合中运行 不必等回合结束就能查看状态: /status 、 /diff 、 /cost 、 /usage 、 /rename 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 Esc 关闭),不打断进行中的回合。 /usage 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。"
+        "body": "命令 作用 /view · /view <文件路径> 打开只读文件查看器。 不带参数 时打开一个模糊「仅文件」选择器(输入即筛选;像 ~/… 或 ./… 这类路径式查询还能打开项目 之外 的文件)。带路径则直接打开该文件。方向键 / PageUp-Down / Home-End(或 g / G 跳到首/末行)滚动; Esc 退回, Ctrl+C 退出 /undo · /undo N 把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件 /diff 显示当前工作目录未提交改动的 git diff(文件列表一次最多显示 5 行,并带「更多文件」滚动提示) /review 对当前改动做代码审查: /review 审查未提交改动, /review staged 审查暂存区, /review <base> 对比某个基准 ref /paste 从剪贴板粘贴图片(Windows 下 Ctrl+V 被终端拦截时的备用入口) /cost 按模型显示当前会话累计的提示、补全和缓存 Token。与 /usage 不同,后者查询的是 CodingPlan 网关的套餐额度 /context 显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用 /context prompt · /context persona TUI：查看当前组装的系统提示，或仅查看角色提示及追加设置；详见 上下文与提示查看 /compact 压缩历史消息,把早期对话压缩成摘要以腾出上下文预算 /rewind 选择历史提示，并回退对话、代码或两者；详见 会话与撤销 /clear 清空当前会话的消息(保留工作目录和模型) /init 扫描当前工作目录，按优先级创建或完善当前生效的项目指令文件（ .atomcode.md 、 AGENTS.md 或 CLAUDE.md ）。生成内容跟随当前语言，并可在 /config 中配置自定义提示词文件。 /background <任务> 把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于\"顺手让它去查一下 X\"这类轻探索。详见 后台会话 /worktree <子命令> Git worktree 隔离: create 在新分支上拉一份独立 worktree、 list 查看现有 worktree、 done 仅切回主检出（不提交、不 squash、不合并）、 cleanup 删除 worktree（不验证是否已合并；请先提交并合并需保留的成果， --force 会丢弃未提交内容） /todo · /todo add <任务> · /todo clear 重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 todowrite 工具调用并重渲染),带「进行中 / 已完成」状态标记。 /todo add <任务> 确定性地追加一条任务(不走模型); /todo clear 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度 /copy 把上一条回复复制到剪贴板: /copy 复制整条回复的 markdown 原文(整个回合,不含工具输出); /copy code 复制最后一个代码块、 /copy code N 复制第 N 个、 /copy code all 复制全部代码块(旧写法 /copy N 、 /copy all 、 /copy msg 仍可用) /save 把当前会话导出成 markdown 文件: /save 用自动生成的文件名, /save <文件名> 指定文件名 AtomGit Issue 现在由内置工具处理 /issue 已移除。执行 /login 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”。AtomCode 会选择内置的 atomgit_issue 工具，写操作仍需权限确认。详见 内置工具 。 只读报告可在回合中运行 不必等回合结束就能查看状态: /status 、 /diff 、 /cost 、 /usage 、 /rename 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 Esc 关闭),不打断进行中的回合。 /usage 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。"
+      },
+      {
+        "id": "context-inspection",
+        "heading": "上下文与提示查看",
+        "body": "/context 显示上下文预算与占用统计。在 TUI 中， /context prompt 显示当前加载组件组装出的系统提示正文， /context persona 只显示角色提示及其追加设置。 系统提示正文不等于完整模型请求：工具定义和对话历史另算。提示正文查看入口以上述 TUI 命令为准，WebUI 的 /context 只提供预算统计。关于正常压缩时的保护范围，以及恢复后提示为何可能变化，见 会话提示保留策略 。"
       },
       {
         "id": "对话模式与思考",
@@ -640,6 +645,21 @@
         "id": "会话的生命周期",
         "heading": "会话的生命周期",
         "body": "每次启动 atomcode 都会自动创建一个会话,会话包含: 完整消息历史(用户 prompt、AI 回复、工具调用) 关联的工作目录 关联的 provider / 模型 Token 消耗统计 该会话中所有文件编辑的 file-history 快照 会话数据落盘在 ~/.atomcode/sessions/ 下,按项目(工作目录 hash)分组存储。"
+      },
+      {
+        "id": "prompt-retention",
+        "heading": "系统提示与初始任务会保留吗？",
+        "body": "这里需要区分 系统提示 和 你发送的第一条任务消息 ：前者是 AtomCode 组装的角色、项目指令及能力说明，后者是你的实际输入。 内容 正常对话与压缩时的处理 当前生效的系统提示 后续模型请求仍会使用，不会因常规历史摘要而丢弃。 首条真实用户消息的文本 属于压缩保护范围，正常压缩不会删除或用摘要替换这条原始任务。 后续历史消息与工具结果 可能被摘要或精简。会话记录已保存在磁盘，不代表每次请求都发送全部原文。 这描述的是正常上下文压缩；主动执行 /clear 、 /session ，或通过 /undo / /rewind 回退对话，会改变当前有效历史。图片等附件也可能单独转换或折叠，不能把文本保护理解为附件始终原样发送。"
+      },
+      {
+        "id": "prompt-resume",
+        "heading": "恢复会话后，系统提示完全一样吗？",
+        "body": "/resume 或 --continue 会从持久化会话记录恢复有效历史，包括仍在历史中的初始任务。保存的会话上下文也会参与恢复。系统提示由当前加载的组件组装；版本、配置或项目指令变化后，恢复时的提示不保证与会话最初逐字一致。恢复会话不是原始模型请求的逐字重放。"
+      },
+      {
+        "id": "inspect-system-prompt",
+        "heading": "在哪里查看当前系统提示？",
+        "body": "在 TUI 中使用： /context prompt # 查看当前组装的系统提示 /context persona # 查看角色提示及其追加设置 /context # 查看上下文预算与占用统计 /context prompt 显示当前应用组装的系统提示，不是包含工具定义和全部对话历史的完整模型请求。以上提示正文查看入口指 TUI；不要把 WebUI 的 /context 预算统计当作完整提示查看器。详见 命令说明 。"
       },
       {
         "id": "恢复会话",
@@ -1491,6 +1511,16 @@
         "id": "上一次的会话还能继续吗",
         "heading": "上一次的会话还能继续吗？",
         "body": "能。启动时加 --continue （或 -c ）继续上一次会话，或在新会话里运行 /resume ，从历史列表里挑一个继续。"
+      },
+      {
+        "id": "prompt-retention",
+        "heading": "会话开始时发给模型的 prompt 会保留吗？",
+        "body": "正常对话与压缩过程中，当前生效的系统提示会继续使用，首条真实用户消息的文本也受压缩保护。后续历史和工具结果可能被摘要或精简；保存在磁盘上的历史，不等于每次请求都把全部原文发给模型。主动清空、新建或回退会话会改变有效历史。 恢复会话会恢复已保存的有效历史，但系统提示还会结合当前版本、配置和项目指令重新装配，不保证与最初逐字相同。详见 系统提示与初始任务的保留策略 。"
+      },
+      {
+        "id": "inspect-system-prompt",
+        "heading": "在哪里查看当前系统提示？",
+        "body": "在 TUI 中输入 /context prompt 查看当前组装的系统提示； /context persona 查看角色提示及追加设置。单独的 /context 查看上下文预算统计，不是提示正文。详见 命令说明 。"
       },
       {
         "id": "skills-与项目指令",

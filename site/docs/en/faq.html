@@ -147,6 +147,13 @@
       <h3 id="can-i-resume-the-previous-session">Can I resume the previous session?</h3>
       <p>Yes. Launch with <code>--continue</code> (or <code>-c</code>) to pick up the last session, or run <code>/resume</code> from inside a new session and pick one from the history list.</p>
 
+      <h3 id="prompt-retention">Is the prompt sent at the start of a session retained?</h3>
+      <p>During normal conversation and compaction, the currently active system prompt continues to be used, and the first real user message's text is protected from compaction. Later history and tool results may be summarized or shortened; persisted history is not necessarily sent in full with every request. Explicitly clearing, starting a new session or rolling back changes the effective history.</p>
+      <p>Resuming restores saved effective history, but the system prompt is assembled using the current version, configuration and project instructions. It is not guaranteed to match the original prompt word for word. See <a href="./sessions.html#prompt-retention">system-prompt and original-task retention</a>.</p>
+
+      <h3 id="inspect-system-prompt">Where can I inspect the current system prompt?</h3>
+      <p>In the TUI, use <code>/context prompt</code> for the currently assembled system prompt, or <code>/context persona</code> for the persona and append settings. Plain <code>/context</code> reports the context budget, not the prompt text. See the <a href="./slash-commands.html#context-inspection">command reference</a>.</p>
+
       <h2 id="skills-project-instructions">Skills &amp; project instructions</h2>
 
       <h3 id="my-skill-doesnt-show-up-in-the-menu">My skill doesn't show up in the menu</h3>

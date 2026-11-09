@@ -89,6 +89,28 @@
       </ul>
       <p>Session data is persisted under <code>~/.atomcode/sessions/</code>, grouped by project (working-directory hash).</p>
 
+      <h2 id="prompt-retention">Are the system prompt and original task retained?</h2>
+      <p>Distinguish the <strong>system prompt</strong>, assembled by AtomCode from its persona, project instructions and capability guidance, from <strong>your first task message</strong>, which is your own input.</p>
+      <table>
+        <thead><tr><th>Content</th><th>During normal conversation and compaction</th></tr></thead>
+        <tbody>
+          <tr><td>The currently active system prompt</td><td>Continues to be used in subsequent model requests. Ordinary history summarization does not discard it.</td></tr>
+          <tr><td>The text of the first real user message</td><td>Is protected from compaction. Normal compaction does not delete the original task or replace it with a summary.</td></tr>
+          <tr><td>Later messages and tool results</td><td>May be summarized or shortened. Saving session records to disk does not mean every request sends their entire original text.</td></tr>
+        </tbody>
+      </table>
+      <p>This describes normal context compaction. Explicitly running <code>/clear</code>, starting a new session with <code>/session</code>, or rolling back the conversation with <code>/undo</code> / <code>/rewind</code> changes the effective history. Images and other attachments may also be converted or folded separately; protecting message text does not mean attachments are always sent unchanged.</p>
+
+      <h3 id="prompt-resume">Is the system prompt identical after resuming?</h3>
+      <p><code>/resume</code> and <code>--continue</code> restore effective history from persisted session records, including the original task when it is still part of that history. Saved session context also participates in restoration. The system prompt is assembled from the currently loaded components; version, configuration or project-instruction changes can make it differ from the prompt at session creation. Resuming is not a byte-for-byte replay of the original model request.</p>
+
+      <h3 id="inspect-system-prompt">Where can I inspect the current system prompt?</h3>
+      <p>In the <strong>TUI</strong>, use:</p>
+      <pre><code>/context prompt    # Inspect the currently assembled system prompt
+/context persona   # Inspect the persona and its append settings
+/context           # Inspect context-budget and usage statistics</code></pre>
+      <p><code>/context prompt</code> shows the application-assembled system prompt, not a complete model request containing tool definitions and all conversation history. These prompt-text inspection commands refer to the TUI; the WebUI's <code>/context</code> budget statistics are not a full prompt viewer. See the <a href="./slash-commands.html#context-inspection">command reference</a>.</p>
+
       <h2 id="resuming-sessions">Resuming sessions</h2>
       <h3 id="continue-the-last-one-from-the-cli">Continue the last one from the CLI</h3>
       <pre><code>atomcode -c        # or atomcode --continue</code></pre>

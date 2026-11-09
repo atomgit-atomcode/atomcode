@@ -147,6 +147,13 @@
       <h3 id="上一次的会话还能继续吗">上一次的会话还能继续吗？</h3>
       <p>能。启动时加 <code>--continue</code>（或 <code>-c</code>）继续上一次会话，或在新会话里运行 <code>/resume</code>，从历史列表里挑一个继续。</p>
 
+      <h3 id="prompt-retention">会话开始时发给模型的 prompt 会保留吗？</h3>
+      <p>正常对话与压缩过程中，当前生效的系统提示会继续使用，首条真实用户消息的文本也受压缩保护。后续历史和工具结果可能被摘要或精简；保存在磁盘上的历史，不等于每次请求都把全部原文发给模型。主动清空、新建或回退会话会改变有效历史。</p>
+      <p>恢复会话会恢复已保存的有效历史，但系统提示还会结合当前版本、配置和项目指令重新装配，不保证与最初逐字相同。详见 <a href="./sessions.html#prompt-retention">系统提示与初始任务的保留策略</a>。</p>
+
+      <h3 id="inspect-system-prompt">在哪里查看当前系统提示？</h3>
+      <p>在 TUI 中输入 <code>/context prompt</code> 查看当前组装的系统提示；<code>/context persona</code> 查看角色提示及追加设置。单独的 <code>/context</code> 查看上下文预算统计，不是提示正文。详见 <a href="./slash-commands.html#context-inspection">命令说明</a>。</p>
+
       <h2 id="skills-与项目指令">Skills 与项目指令</h2>
 
       <h3 id="我的-skill-没出现在菜单里">我的 skill 没出现在菜单里</h3>
