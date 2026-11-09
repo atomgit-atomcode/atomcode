@@ -6712,8 +6712,6 @@ mod tests {
 
     #[test]
     fn a_shrunk_conversation_without_a_baseline_keeps_the_state_before_the_write() {
-        use crate::session::manager::TodoSidecarItem;
-
         let item = |status: &str| TodoSidecarItem {
             content: "task".into(),
             status: status.into(),

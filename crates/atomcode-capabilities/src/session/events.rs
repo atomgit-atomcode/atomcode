@@ -720,17 +720,13 @@ impl SessionManager {
             }
             let mut start = 0;
             if legacy_baseline {
-                // One pass over the calls, folding as `reduce_todos` would:
-                // a valid full list resets the fold, an action applies to it.
-                // Re-folding every prefix made this alignment quadratic in the
-                // calls of a long session.
+                // This path only runs when the log holds no full plan at all
+                // (`has_plan` is false), so every call is an action: fold them
+                // in one pass. Re-folding every prefix made this alignment
+                // quadratic in the calls of a long session.
                 let mut folded: Vec<TodoItem> = Vec::new();
                 for (count, (_, _, _, _, arguments)) in calls.iter().enumerate() {
-                    if let Ok(planned) = crate::tools::todo::parse_todos(arguments) {
-                        folded = planned;
-                    } else {
-                        apply_todo_action(&mut folded, arguments);
-                    }
+                    apply_todo_action(&mut folded, arguments);
                     if same_items(&folded, &items) {
                         // The sidecar first reached this state here. Anything
                         // after it is replayed below, including calls that fold
