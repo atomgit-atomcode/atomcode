@@ -72,8 +72,9 @@ impl Default for StubCompaction {
 impl StubCompaction {
     /// Pin a protect-window budget (mostly for tests / callers that want a
     /// window-independent boundary). At plan time it is clamped to the
-    /// window-relative budget, so a pinned value can only lower the keep
-    /// window. Production uses [`StubCompaction::default`] unless
+    /// window-relative budget (or to [`MAX_RECENT_KEEP_TOKENS`] when the
+    /// window is unknown), so a pinned value can only lower the keep window.
+    /// Production uses [`StubCompaction::default`] unless
     /// `[compaction].stub_recent_budget` pins a lower budget.
     pub fn new(protect_tokens: usize, exempt_read_file: bool) -> Self {
         Self {
@@ -94,9 +95,10 @@ impl CompactionStrategy for StubCompaction {
         let window_budget = recent_keep_budget(view.ctx_window);
         let budget = match self.protect_tokens {
             // A known window caps a pinned budget as well: `stub_recent_budget`
-            // is an opt-in to stub EARLIER, not a way to disable stubbing.
+            // is an opt-in to stub EARLIER, not a way to disable stubbing. An
+            // unknown window still has a finite ceiling.
             Some(pinned) if view.ctx_window > 0 => pinned.min(window_budget),
-            Some(pinned) => pinned,
+            Some(pinned) => pinned.min(MAX_RECENT_KEEP_TOKENS),
             None => window_budget,
         };
         let boundary = recent_keep_boundary(msgs, budget, view.sacred_floor);
@@ -1334,8 +1336,7 @@ mod tests {
 
         // A pinned budget larger than the window-relative one cannot silently
         // disable the gentle stub: it behaves exactly like the default.
-        let mut small_window = view(&conv.messages, floor);
-        small_window.ctx_window = 1000;
+        let small_window = view(&conv.messages, floor);
         let default_plan = StubCompaction::default().plan(&small_window).await;
         let oversized = StubCompaction::new(usize::MAX, true)
             .plan(&small_window)
@@ -1343,6 +1344,20 @@ mod tests {
         assert_eq!(
             oversized.rewrites, default_plan.rewrites,
             "an oversized pinned budget is clamped to the window-relative budget"
+        );
+
+        // With no known window, the pinned budget still has a finite ceiling.
+        let mut unknown_window = view(&conv.messages, floor);
+        unknown_window.ctx_window = 0;
+        let capped = StubCompaction::new(MAX_RECENT_KEEP_TOKENS, true)
+            .plan(&unknown_window)
+            .await;
+        let oversized = StubCompaction::new(usize::MAX, true)
+            .plan(&unknown_window)
+            .await;
+        assert_eq!(
+            oversized.rewrites, capped.rewrites,
+            "an oversized pinned budget is capped when the window is unknown"
         );
     }
 

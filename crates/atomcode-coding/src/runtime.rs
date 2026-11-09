@@ -1936,6 +1936,7 @@ pub async fn compact_snapshot(
     messages: Vec<Message>,
     provider: Arc<dyn LlmProvider>,
     focus: Option<String>,
+    stub_recent_budget: Option<usize>,
 ) -> SnapshotCompaction {
     let mut conversation = Conversation {
         messages,
@@ -1955,10 +1956,11 @@ pub async fn compact_snapshot(
         0.0
     };
     let trigger = CompactTrigger::Manual { focus };
-    let strategy = atomcode_capabilities::compaction::OverflowCompaction::new(
-        atomcode_capabilities::compaction::StubCompaction::default(),
-        Some(provider),
-    );
+    let stub = match stub_recent_budget {
+        Some(limit) => atomcode_capabilities::compaction::StubCompaction::new(limit, true),
+        None => atomcode_capabilities::compaction::StubCompaction::default(),
+    };
+    let strategy = atomcode_capabilities::compaction::OverflowCompaction::new(stub, Some(provider));
     let plan = strategy
         .plan(&CompactionView {
             messages: &conversation.messages,
@@ -24246,7 +24248,7 @@ type = "openai"
             .with_ctx_window(128_000),
         );
 
-        let result = compact_snapshot(messages, provider, None).await;
+        let result = compact_snapshot(messages, provider, None, None).await;
 
         assert!(result.outcome.committed);
         assert!(matches!(

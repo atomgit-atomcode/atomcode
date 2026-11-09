@@ -3658,6 +3658,10 @@ mod tests {
             plan.rewrites.iter().any(|(index, _)| *index == 6),
             "the pinned small budget must stub the completed second turn"
         );
+        assert!(
+            plan.rewrites.iter().any(|(index, _)| *index == 3),
+            "turn 1's tool result is old and stubbed under the small budget"
+        );
 
         let default = super::CodingCompaction {
             token_limit: None,
@@ -3670,6 +3674,10 @@ mod tests {
         assert!(
             !plan.rewrites.iter().any(|(index, _)| *index == 6),
             "without the pin, the window-relative budget keeps the second turn"
+        );
+        assert!(
+            plan.rewrites.iter().any(|(index, _)| *index == 3),
+            "turn 1's tool result is old and stubbed under the default budget"
         );
     }
 
