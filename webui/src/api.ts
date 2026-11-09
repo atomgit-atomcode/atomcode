@@ -596,6 +596,8 @@ export async function postConfigReload(): Promise<ConfigReloadResult> {
 // --- Projects types ---
 
 export interface ProjectInfo {
+  pinned?: boolean;
+  hidden?: boolean;
   hash: string;
   name: string;
   working_dir: string;
@@ -963,15 +965,28 @@ export async function changeDir(path: string, setDefault = false): Promise<CdRes
   return readJson(resp);
 }
 
-/** Delete a historical project and its sessions catalog. */
+/** Hide a workspace group, preserving its directory and all sessions. */
 export async function deleteProject(hash: string): Promise<void> {
-  const resp = await apiFetch(`/projects/${hash}`, {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(hash)}`, {
     method: 'DELETE',
     headers: authHeaders(),
   });
   if (!resp.ok) throw await failure(resp);
+  notifyProjectsChanged(hash, { hidden: true });
 }
 
+export function notifyProjectsChanged(hash: string, patch: { pinned?: boolean; hidden?: boolean }): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('atomcode:projects-changed', { detail: { hash, patch } }));
+}
+
+export async function updateProject(hash: string, patch: { pinned?: boolean; hidden?: boolean }): Promise<void> {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(hash)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  });
+  if (!resp.ok) throw await failure(resp);
+  notifyProjectsChanged(hash, patch);
+}
 
 // --- Session detail (messages endpoint exists) ---
 

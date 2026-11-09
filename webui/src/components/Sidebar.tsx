@@ -1,4 +1,6 @@
 import { ModalOverlay } from './ModalOverlay';
+import { WorkspaceActionDialog } from './WorkspaceActions';
+import { visibleWorkspaces, applyWorkspacePreference } from '../lib/workspaceActions';
 import { ScheduleIcon } from './Automation';
 // Session sidebar (Claude-Code-inspired: brand + collapse at top, CC-style
 // new-conversation row, live-filtered session list, settings at the bottom;
@@ -7,7 +9,7 @@ import { ScheduleIcon } from './Automation';
 import { useSkills, refreshSkills } from '../skills';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getMcpStatus, postLiveMcpTrust, getSession, getProjects, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getMcpStatus, postLiveMcpTrust, getSession, getProjects, updateProject, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -359,6 +361,12 @@ export function Sidebar({
   const pendingCenterSessionIdRef = useRef<string | null>(activeSessionId);
   const previousActiveSessionIdRef = useRef<string | null>(activeSessionId);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [workspaceMenu, setWorkspaceMenu] = useState<{ project: ProjectInfo; top?: number; bottom?: number; right: number } | null>(null);
+  const workspaceMenuRef = useRef<HTMLDivElement | null>(null);
+  const [workspaceAction, setWorkspaceAction] = useState<{ project: ProjectInfo; action: 'remove' | 'clear' } | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [pinning, setPinning] = useState(false);
+  const [projectCatalogFailed, setProjectCatalogFailed] = useState(false);
   const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
     loadSidebarViewMode(sidebarStorage()),
   );
@@ -523,6 +531,7 @@ export function Sidebar({
           }
           if (epoch !== loadEpochRef.current) return null;
           setProjects(nextProjects);
+          setProjectCatalogFailed(false);
           // 清理已不存在的项目 bucket，但不整表清空 —— 可见列表保持原样就地
           // 更新，避免重载/删除时整表刷新闪动。
           const hashes = new Set(nextProjects.map((project) => project.hash));
@@ -566,7 +575,9 @@ export function Sidebar({
         if (epoch !== loadEpochRef.current) return;
         setSessions([]);
         if (viewMode === 'workspace') {
-          setProjects([]);
+          // Catalog presentation facts outlive a failed refresh. In particular,
+          // do not resurrect a hidden current workspace via its fallback row.
+          setProjectCatalogFailed(true);
           setLoadedProjects(new Set());
         }
       })
@@ -611,6 +622,63 @@ export function Sidebar({
   }, [projectHash]);
 
   useEffect(() => {
+    const reload = (event: Event) => {
+      const { hash, patch } = (event as CustomEvent<{ hash: string; patch: { pinned?: boolean; hidden?: boolean } }>).detail;
+      const fallback = hash === projectHash ? {
+        hash, name: dirName(cwd || ''), working_dir: cwd || '', session_count: 0, created_at: 0, last_updated: 0,
+      } : undefined;
+      setProjects(current => applyWorkspacePreference(current, hash, patch, fallback));
+      loadSessions();
+    };
+    window.addEventListener('atomcode:projects-changed', reload);
+    return () => window.removeEventListener('atomcode:projects-changed', reload);
+  }, [cwd, projectHash, viewMode, expandedProjects]);
+
+  useEffect(() => {
+    if (!workspaceMenu) return;
+    const close = () => setWorkspaceMenu(null);
+    const outside = (event: MouseEvent) => {
+      const el = event.target as HTMLElement;
+      if (!workspaceMenuRef.current?.contains(el) && !el.closest?.('.sidebar-project-more')) close();
+    };
+    const key = (event: KeyboardEvent) => { if (event.key === 'Escape') close(); };
+    document.addEventListener('mousedown', outside);
+    document.addEventListener('keydown', key);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      document.removeEventListener('mousedown', outside);
+      document.removeEventListener('keydown', key);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [workspaceMenu]);
+
+  function openWorkspaceMenu(event: MouseEvent, project: ProjectInfo) {
+    event.stopPropagation();
+    setMenuFor(null);
+    setWorkspaceError(null);
+    if (workspaceMenu?.project.hash === project.hash) { setWorkspaceMenu(null); return; }
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const right = Math.max(8, window.innerWidth - rect.right);
+    setWorkspaceMenu(window.innerHeight - rect.bottom < 160
+      ? { project, bottom: window.innerHeight - rect.top + 4, right }
+      : { project, top: rect.bottom + 4, right });
+  }
+
+  async function toggleWorkspacePin(project: ProjectInfo) {
+    if (pinning) return;
+    setPinning(true);
+    setWorkspaceError(null);
+    try {
+      await updateProject(project.hash, { pinned: !project.pinned });
+      setWorkspaceMenu(null);
+    } catch (error) {
+      setWorkspaceError(t('workspace.failed', { error: error instanceof Error ? error.message : String(error) }));
+    } finally { setPinning(false); }
+  }
+
+  useEffect(() => {
     if (activeSessionId !== previousActiveSessionIdRef.current) {
       pendingCenterSessionIdRef.current = activeSessionId;
       previousActiveSessionIdRef.current = activeSessionId;
@@ -642,8 +710,8 @@ export function Sidebar({
   useEffect(() => {
     if (viewMode === 'workspace') return;
     getProjects()
-      .then(setProjects)
-      .catch(() => setProjects([]));
+      .then(next => { setProjects(next); setProjectCatalogFailed(false); })
+      .catch(() => setProjectCatalogFailed(true));
   }, [reloadKey, viewMode]);
 
   useEffect(() => {
@@ -689,6 +757,7 @@ export function Sidebar({
   }, [menuFor]);
 
   function openItemMenu(e: MouseEvent, id: string) {
+    setWorkspaceMenu(null);
     e.preventDefault();
     e.stopPropagation();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -1205,10 +1274,7 @@ export function Sidebar({
     : projects;
   const activeProjectHash = filtered.find(s => s.id === activeSessionId);
   const selectedProjectHash = activeProjectHash ? sessionProjectHash(activeProjectHash) : projectHash;
-  const selectedProject = availableProjects.find(p => p.hash === selectedProjectHash);
-  const workspaceProjects = selectedProject
-    ? [selectedProject, ...availableProjects.filter(p => p !== selectedProject)]
-    : availableProjects;
+  const workspaceProjects = visibleWorkspaces(availableProjects, selectedProjectHash);
   const currentWorkspaceHash = projectHash || projects.find(
     (project) => normDir(project.working_dir) === cwdNorm,
   )?.hash || '';
@@ -1448,7 +1514,9 @@ export function Sidebar({
         {!loading && merged.length === 0 && (viewMode === 'flat' || workspaceProjects.length === 0) && (
           <div class="session-empty">{t(viewMode === 'flat' ? 'sidebar.empty' : 'sidebar.emptyInCwd')}</div>
         )}
+        {projectCatalogFailed && viewMode === 'workspace' && <button class="sidebar-project-retry" onClick={() => loadSessions()}>{t('sidebar.loadFailedRetry')}</button>}
         {viewMode === 'flat' && filtered.map(renderItem)}
+        {!loading && viewMode === 'workspace' && workspaceProjects.length === 0 && merged.length > 0 && <div class="session-empty">{t('workspace.noneVisible')}</div>}
         {viewMode === 'workspace' && workspaceProjects.map((project) => {
           const projectSessions = sessionsByProject.get(project.hash) ?? [];
           const expanded = expandedProjects.has(project.hash);
@@ -1478,6 +1546,15 @@ export function Sidebar({
                   <span class="sidebar-project-name">{project.name || dirName(project.working_dir)}</span>
                   <span class="sidebar-project-count">({project.session_count})</span>
                 </button>
+                {project.pinned && <span class="sidebar-project-pinned" title={t('workspace.pinned')} aria-label={t('workspace.pinned')}>📌</span>}
+                <button
+                  class="sidebar-project-new sidebar-project-more"
+                  onClick={(event) => openWorkspaceMenu(event, project)}
+                  title={t('workspace.actions')}
+                  aria-label={t('workspace.actions')}
+                  aria-haspopup="menu"
+                  aria-expanded={workspaceMenu?.project.hash === project.hash}
+                ><KebabIcon /></button>
                 <button
                   class="sidebar-project-new"
                   onClick={(e) => {
@@ -1701,6 +1778,27 @@ export function Sidebar({
         </ModalOverlay>, document.body,
       )}
 
+      {workspaceAction && createPortal(<WorkspaceActionDialog
+        key={`${workspaceAction.project.hash}:${workspaceAction.action}`}
+        project={workspaceAction.project} action={workspaceAction.action}
+        runningSessionId={runningSessionId} runningProjectHash={projectHash} onDeleted={handleDeleted}
+        onDone={() => { if (workspaceAction.action === 'clear') loadSessions(); }} onClose={() => setWorkspaceAction(null)}
+      />, document.body)}
+      {workspaceMenu && createPortal(
+        <div class="item-menu" ref={workspaceMenuRef} role="menu" aria-label={t('workspace.actions')}
+          style={{ top: workspaceMenu.top, bottom: workspaceMenu.bottom, right: workspaceMenu.right }}>
+          <button class="item-menu-row" role="menuitem" disabled={pinning} onClick={() => void toggleWorkspacePin(workspaceMenu.project)}>
+            {t(workspaceMenu.project.pinned ? 'workspace.unpin' : 'workspace.pin')}
+          </button>
+          <button class="item-menu-row danger" role="menuitem" disabled={pinning} onClick={() => {
+            setWorkspaceAction({ project: workspaceMenu.project, action: 'clear' }); setWorkspaceMenu(null);
+          }}>{t('workspace.clear')}</button>
+          <button class="item-menu-row danger" role="menuitem" disabled={pinning} onClick={() => {
+            setWorkspaceAction({ project: workspaceMenu.project, action: 'remove' }); setWorkspaceMenu(null);
+          }}>{t('workspace.remove')}</button>
+          {workspaceError && <div class="modal-error" role="alert">{workspaceError}</div>}
+        </div>, document.body,
+      )}
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the
           scroll container nor the mobile drawer's transform/overflow clips it. */}
       {menuSession && menuPos && createPortal(

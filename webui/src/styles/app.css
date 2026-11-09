@@ -4277,3 +4277,10 @@ body {
   cursor: pointer;
 }
 .history-load-more:disabled { opacity: .6; cursor: default; }
+
+/* Workspace actions remain reachable by keyboard and on touch screens. */
+.sidebar-project-row:focus-within .sidebar-project-new { opacity: 1; visibility: visible; }
+.sidebar-project-pinned { flex: 0 0 auto; font-size: 0.7rem; }
+@media (hover: none) {
+  .sidebar-project-new { opacity: 1; visibility: visible; }
+}

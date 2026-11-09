@@ -43,6 +43,7 @@ mod login_state;
 mod login_state_tests;
 mod mention_search;
 pub mod native_live;
+mod project_preferences;
 mod runtime_host;
 mod transcript_view;
 mod workbench;
@@ -2207,13 +2208,75 @@ async fn change_dir(
 
 /// GET /projects - List all projects (historical, from sessions directory)
 async fn get_projects() -> impl IntoResponse {
-    match run_session_catalog_io(list_projects).await {
+    match run_session_catalog_io(|| {
+        project_preferences::decorate(
+            atomcode_coding::config::product_dirs_from_env().user(),
+            list_projects()?,
+        )
+    })
+    .await
+    {
         Ok(projects) => Json(projects).into_response(),
         Err(e) => {
             let msg = format!("Failed to list projects: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
         }
     }
+}
+
+/// Update catalog presentation only. No session or filesystem deletion occurs.
+async fn patch_project(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    Json(patch): Json<project_preferences::Patch>,
+) -> axum::response::Response {
+    if !valid_project_bucket(&hash) {
+        return (StatusCode::BAD_REQUEST, "Invalid workspace identifier").into_response();
+    }
+    let current = state.project.read().await.working_dir.clone();
+    match run_session_catalog_io(move || {
+        let dir = list_projects()?
+            .into_iter()
+            .find(|p| p.hash == hash)
+            .map(|p| p.working_dir)
+            .or_else(|| (hash_path(&current) == hash).then_some(current));
+        let root = atomcode_coding::config::product_dirs_from_env();
+        if dir.is_none() && !project_preferences::read(root.user())?.contains_key(&hash) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workspace not found",
+            ));
+        }
+        project_preferences::update(root.user(), &hash, patch, dir)
+    })
+    .await
+    {
+        Ok(pref) => Json(pref).into_response(),
+        Err(error) => (
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            format!("Failed to update workspace: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn hide_project(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> axum::response::Response {
+    patch_project(
+        State(state),
+        Path(hash),
+        Json(project_preferences::Patch {
+            hidden: Some(true),
+            pinned: None,
+        }),
+    )
+    .await
 }
 
 /// GET /projects/:hash/sessions - List sessions for a project
@@ -7906,6 +7969,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/cd", post(change_dir))
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))
+        .route("/projects/:hash", patch(patch_project).delete(hide_project))
         .route("/projects/:hash/sessions", get(get_project_sessions))
         .route("/sessions/:id/messages", post(append_session_messages))
         .route(
@@ -9291,6 +9355,98 @@ mod tests {
             git_branch::get(State(state), Query(relative)).await,
             Err(StatusCode::BAD_REQUEST)
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_http_hides_groups_without_deleting_directories_and_can_restore_them() {
+        use axum::routing::patch;
+        use tower::ServiceExt;
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let dir = state.project.read().await.working_dir.clone();
+        std::fs::write(dir.join("keep-source.txt"), "keep").unwrap();
+        let hash = hash_path(&dir);
+        let app = axum::Router::new()
+            .route("/projects", get(get_projects))
+            .route("/projects/:hash", patch(patch_project).delete(hide_project))
+            .with_state(state.clone());
+        let request = |method: &str, path: &str, body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let route = format!("/projects/{hash}");
+        let pinned = app
+            .clone()
+            .oneshot(request("PATCH", &route, serde_json::json!({"pinned":true})))
+            .await
+            .unwrap();
+        assert_eq!(pinned.status(), StatusCode::OK);
+        let hidden = app
+            .clone()
+            .oneshot(request("DELETE", &route, serde_json::Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::OK);
+        let listed = app
+            .clone()
+            .oneshot(request("GET", "/projects", serde_json::Value::Null))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(listed.into_body(), 65536)
+            .await
+            .unwrap();
+        let projects: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let group = projects
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["hash"] == hash)
+            .unwrap();
+        assert_eq!(group["hidden"], true);
+        assert_eq!(group["pinned"], true);
+        assert_eq!(group["session_count"], 0);
+        let restored = app
+            .clone()
+            .oneshot(request(
+                "PATCH",
+                &route,
+                serde_json::json!({"hidden":false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        let pref =
+            &project_preferences::read(atomcode_coding::config::product_dirs_from_env().user())
+                .unwrap()[&hash];
+        assert!(!pref.hidden && pref.pinned);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep-source.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(state.project.read().await.working_dir, dir);
+        let invalid = app
+            .clone()
+            .oneshot(request(
+                "DELETE",
+                "/projects/invalid",
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let unknown = app
+            .oneshot(request(
+                "PATCH",
+                "/projects/ffffffffffffffff",
+                serde_json::json!({"hidden":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     fn chat_test_state(home: &ScopedChatHome) -> AppState {

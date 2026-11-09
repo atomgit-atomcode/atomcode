@@ -137,6 +137,11 @@ atomcode webui --port 13457 --host 127.0.0.1</code></pre>
         </tbody>
       </table>
 
+      <h2 id="workspace-actions">Manage the workspace list</h2>
+      <p>The menu before the <code>+</code> button on each workspace offers Pin / Unpin workspace, Clear sessions and Remove workspace. Pinning and visibility are saved by the local server and survive refreshes and restarts.</p>
+      <p>Remove workspace only hides its group. Project directories, code and session records are kept. History remains accessible through the Sessions view or search. Add the directory again to restore its group.</p>
+      <p>Clear sessions requires confirmation and permanently deletes the workspace's listed session records, keeping the empty workspace and project files. Running sessions and sessions owned by another process are not forcibly deleted. If a deletion fails, the operation stops and shows the number already deleted; retry to clear the remaining sessions.</p>
+
       <h2 id="live-sync">Live sync across devices</h2>
       <p>Behind the webui is a <strong>LiveSession</strong>: one session can be open in the terminal and multiple browser tabs at once, and every input, streamed AI reply, and tool result is <strong>broadcast live</strong> to all connected views — a viewer that joins late first receives a snapshot replay.</p>
       <ul>
