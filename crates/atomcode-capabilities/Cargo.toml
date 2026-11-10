@@ -201,6 +201,11 @@ cc-hooks = ["tools", "plugin", "dep:dirs", "tokio/process", "tokio/io-util"]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
+# The report-only benchmark harness (`benches/core.rs`, `scripts/bench.sh`). Not part
+# of any test or default build: the bench target below is skipped unless this feature
+# is on, so `cargo check --workspace --all-targets` and normal test runs do not build
+# it. It turns on the three capabilities the fixture exercises.
+bench = ["provider", "tools", "session"]
 # MCP client: connect external MCP servers (stdio/HTTP/OAuth) + surface their tools as
 # kernel Tools. Opt-in (NOT default). `reqwest/blocking` powers the one-shot OAuth
 # login/refresh flow; transport_http uses the async reqwest client. OAuth's callback
@@ -295,3 +300,14 @@ serial_test = "3"
 name = "mcp-test-server"
 path = "src/bin/mcp-test-server.rs"
 required-features = ["mcp"]
+
+# Report-only benchmark harness. `required-features` keeps it out of the default
+# `--all-targets` compile gate; run it with
+#   cargo bench -p atomcode-capabilities --features bench --bench core
+# or through scripts/bench.sh. No benchmark framework dependency: the harness
+# measures medians itself and writes JSON + Markdown.
+[[bench]]
+name = "core"
+path = "benches/core.rs"
+harness = false
+required-features = ["bench"]
