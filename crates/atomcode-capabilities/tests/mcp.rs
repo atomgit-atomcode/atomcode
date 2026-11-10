@@ -89,6 +89,131 @@ async fn registry_connect_discover_and_call_echo() {
     assert_eq!(result.content, "echo:hi");
 }
 
+/// Regression-style reproduction: a stdio server whose `args` contain spaces and
+/// non-ASCII characters (a script path under a directory with a CJK name). The
+/// arg is written as `${UNICODE_ARG:-<cjk path>}` in `.mcp.json` — the variable
+/// is deliberately never set, so the value reaches argv through the default
+/// branch of `load_mcp_config` → `expand_env_vars` — a regression of the
+/// byte-wise expansion fails the byte-for-byte assertion below, before any
+/// connection is attempted. No process env is mutated, so the test cannot race
+/// other tests' environ reads. Connect and reconnect then also exercise such
+/// args in argv (the fixture ignores extra args, so they are not the guard).
+#[tokio::test]
+async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
+    const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
+    // The assertion below expects the default branch of ${UNICODE_ARG:-…} to
+    // be taken. This is a read-only check (no setenv, no race); a host that
+    // defines this test-namespaced variable would invalidate the expectation,
+    // so refuse loudly instead of failing obscurely mid-test.
+    assert!(
+        std::env::var("UNICODE_ARG").is_err(),
+        "the host must not define UNICODE_ARG — it would override the \
+         ${{UNICODE_ARG:-…}} default this test asserts on"
+    );
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "spacey-args": {
+                    "command": env!("CARGO_BIN_EXE_mcp-test-server"),
+                    // Never set UNICODE_ARG anywhere: the default branch of
+                    // ${VAR:-default} carries the CJK value through expansion.
+                    "args": ["${UNICODE_ARG:-/tmp/中文 目录/with space/server.py}"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let servers = atomcode_capabilities::mcp::config::load_mcp_config(
+        project.path(),
+        std::path::Path::new("/nonexistent/user"),
+    )
+    .expect("the config must parse");
+    assert_eq!(servers.len(), 1, "the server must be admitted: {servers:?}");
+    // The fixture server ignores extra args, so connect alone cannot catch a
+    // corrupted expansion — assert the expanded bytes before connecting.
+    let McpTransportConfig::Stdio { args, .. } = &servers[0].config else {
+        panic!(
+            "a `command` entry must load as Stdio: {:?}",
+            servers[0].config
+        );
+    };
+    assert_eq!(
+        args.as_slice(),
+        [UNICODE_ARG],
+        "expansion must preserve non-ASCII bytes byte for byte"
+    );
+
+    let registry = McpRegistry::new(NO_TREE);
+    registry
+        .add_server(servers[0].clone())
+        .await
+        .expect("connect with expanded spaces/unicode args should succeed");
+    registry
+        .reconnect_server(servers[0].clone())
+        .await
+        .expect("reconnect with expanded spaces/unicode args should succeed");
+    assert_eq!(
+        registry.server_statuses().await,
+        vec![("spacey-args".to_string(), ServerStatus::Connected)]
+    );
+}
+
+/// Regression for a config copied from tools like Claude/Cursor: unknown fields
+/// (`type`, `timeout`, `description`) plus an args path containing spaces and
+/// CJK characters. Loads it through the real config parser — where `${VAR}`
+/// expansion must not corrupt non-ASCII bytes — and connects through the real
+/// registry. Scope note: this bypasses the daemon's project-trust gating (the
+/// registry admits the server directly), so it covers load + connect, not the
+/// trust flow.
+#[tokio::test]
+async fn config_with_unknown_fields_and_unicode_path_loads_and_connects() {
+    let unicode_arg = "/tmp/中文 目录/with space/server.py";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "unicode-cfg": {
+                    "type": "stdio",
+                    "command": env!("CARGO_BIN_EXE_mcp-test-server"),
+                    "args": [unicode_arg],
+                    "timeout": 1200000,
+                    "description": "copied from another tool"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let servers = atomcode_capabilities::mcp::config::load_mcp_config(
+        project.path(),
+        std::path::Path::new("/nonexistent/user"),
+    )
+    .expect("config with unknown fields must parse");
+    assert_eq!(servers.len(), 1, "the server must be admitted: {servers:?}");
+    let McpTransportConfig::Stdio { args, .. } = &servers[0].config else {
+        panic!(
+            "a `command` entry must load as Stdio: {:?}",
+            servers[0].config
+        );
+    };
+    assert_eq!(
+        args.as_slice(),
+        [unicode_arg],
+        "expansion must preserve non-ASCII bytes byte for byte"
+    );
+
+    let registry = McpRegistry::new(NO_TREE);
+    registry
+        .add_server(servers.into_iter().next().unwrap())
+        .await
+        .expect("a unicode-path config should connect through the real load path");
+}
+
 #[tokio::test]
 async fn stdio_reconnects_once_after_server_exit_for_concurrent_calls() {
     let temp = tempfile::tempdir().unwrap();

@@ -948,48 +948,36 @@ fn with_http_oauth_server(
 /// Supports `${VAR}` and `${VAR:-default}` syntax.
 fn expand_env_vars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
+    let mut rest = s;
 
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            i += 2; // skip ${
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_brace = &rest[start + 2..];
+        let Some(end) = after_brace.find('}') else {
+            // No closing brace: keep the literal text and stop scanning.
+            result.push_str("${");
+            rest = after_brace;
+            break;
+        };
 
-            let mut var_name = String::new();
-            let mut default = String::new();
-            let mut has_default = false;
-
-            while i < bytes.len() && bytes[i] != b'}' {
-                if bytes[i] == b':' && !has_default && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    i += 2; // skip :-
-                    has_default = true;
-                    continue;
+        let inner = &after_brace[..end];
+        let (var_name, default) = match inner.find(":-") {
+            Some(sep) => (&inner[..sep], Some(&inner[sep + 2..])),
+            None => (inner, None),
+        };
+        match std::env::var(var_name) {
+            Ok(value) => result.push_str(&value),
+            // 未命中：默认值直接 push 切片，不再为它 clone 一次 String。
+            Err(_) => {
+                if let Some(d) = default {
+                    result.push_str(d);
                 }
-                if has_default {
-                    default.push(bytes[i] as char);
-                } else {
-                    var_name.push(bytes[i] as char);
-                }
-                i += 1;
             }
-            if i < bytes.len() {
-                i += 1; // skip }
-            }
-
-            let value = std::env::var(&var_name).unwrap_or_else(|_| {
-                if has_default {
-                    default
-                } else {
-                    String::new()
-                }
-            });
-            result.push_str(&value);
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
         }
+        rest = &after_brace[end + 1..];
     }
 
+    result.push_str(rest);
     result
 }
 
@@ -1210,6 +1198,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_simple() {
         std::env::set_var("TEST_VAR", "test_value");
         let result = expand_env_vars("${TEST_VAR}");
@@ -1217,6 +1206,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_with_default() {
         std::env::remove_var("NONEXISTENT_VAR");
         let result = expand_env_vars("${NONEXISTENT_VAR:-default_value}");
@@ -1224,6 +1214,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_existing_with_default() {
         std::env::set_var("EXISTING_VAR", "actual");
         let result = expand_env_vars("${EXISTING_VAR:-unused}");
@@ -1231,6 +1222,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_no_var() {
         std::env::remove_var("MISSING_VAR");
         let result = expand_env_vars("${MISSING_VAR}");
@@ -1238,11 +1230,65 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_mixed() {
         std::env::set_var("VAR1", "a");
         std::env::set_var("VAR2", "b");
         let result = expand_env_vars("prefix_${VAR1}_middle_${VAR2}_suffix");
         assert_eq!(result, "prefix_a_middle_b_suffix");
+    }
+
+    #[test]
+    fn test_expand_env_vars_unclosed_brace_is_kept_verbatim() {
+        // 无 `}` 的 `${` 不得把后面的文本当变量名展开成空串，必须按字面保留。
+        assert_eq!(expand_env_vars("${UNCLOSED"), "${UNCLOSED");
+    }
+
+    #[test]
+    fn test_expand_env_vars_preserves_utf8_outside_braces() {
+        // 旧实现逐字节 `bytes[i] as char`，把非 ASCII 路径改写成 Latin-1 乱码。
+        // 这条断言钉住「${} 之外的内容逐字节原样保留」。
+        let cjk_path = "/tmp/中文 目录/with space/server.py";
+        assert_eq!(expand_env_vars(cjk_path), cjk_path);
+    }
+
+    #[test]
+    #[serial_test::serial(expand_test_var)]
+    fn test_expand_env_vars_default_value_keeps_utf8() {
+        // `${VAR:-default}` 会先查 VAR：用专用变量并先删除，保证无论外部
+        // 环境如何都走默认值；默认值本身含非 ASCII 时必须逐字节保留。
+        struct RemoveEnvOnDrop;
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var("EXPAND_UTF8_MISSING_VAR");
+            }
+        }
+        std::env::remove_var("EXPAND_UTF8_MISSING_VAR");
+        let _env_guard = RemoveEnvOnDrop;
+        assert_eq!(
+            expand_env_vars("${EXPAND_UTF8_MISSING_VAR:-/tmp/中文 目录/server.py}"),
+            "/tmp/中文 目录/server.py"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(expand_test_var)]
+    fn test_expand_env_vars_expansion_before_unclosed_brace() {
+        // 专用变量名：不与未序列化的既有单测（test_expand_env_vars_simple
+        // 也用 TEST_VAR）共享键，串行组与 Drop 清理只兜住本测试自己的修改。
+        struct RemoveEnvOnDrop;
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var("EXPAND_UNCLOSED_VAR");
+            }
+        }
+        std::env::set_var("EXPAND_UNCLOSED_VAR", "test_value");
+        let _env_guard = RemoveEnvOnDrop;
+        // 前段正常展开，后段未闭合的 `${` 按 break 路径由兜底拼接保留。
+        assert_eq!(
+            expand_env_vars("${EXPAND_UNCLOSED_VAR}tail${D"),
+            "test_valuetail${D"
+        );
     }
 
     #[test]
