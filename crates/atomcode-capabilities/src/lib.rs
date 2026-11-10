@@ -91,6 +91,7 @@ pub mod pathnorm;
     feature = "provider",
     feature = "web",
     feature = "atomgit",
+    feature = "grape",
     feature = "mcp"
 ))]
 pub(crate) mod proxy;

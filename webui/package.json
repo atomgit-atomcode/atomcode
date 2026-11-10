@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
+    "test:assets": "node scripts/asset-size-e2e.mjs",
     "test:timeline": "node scripts/timeline-e2e.mjs",
     "test:user-input": "node scripts/user-input-e2e.mjs",
     "test:permission": "node scripts/permission-e2e.mjs",

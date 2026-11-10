@@ -8,6 +8,7 @@ description = "L2 coding specialization: assembles the neutral kernel + capabili
 # Forward the AtomGit REST tool feature to the capabilities layer so the
 # CLI can enable it on the coding dep without reaching into capabilities directly.
 atomgit = ["atomcode-capabilities/atomgit"]
+grape = ["atomcode-capabilities/grape"]
 
 [dependencies]
 # Project permission settings use an advisory writer lock and atomic replacement.

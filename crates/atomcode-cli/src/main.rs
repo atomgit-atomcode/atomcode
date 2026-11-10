@@ -15,6 +15,7 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 mod cloud_cmd;
+mod grape_cmd;
 mod headless_json;
 mod lsp_cmd;
 mod review;
@@ -770,6 +771,9 @@ enum Commands {
     /// Enable, disable or diagnose the bundled Huawei Cloud sandbox integration.
     #[command(subcommand)]
     Cloud(cloud_cmd::CloudCli),
+    /// Connect Grape once, then query and hand off tasks through native tools.
+    #[command(subcommand)]
+    Grape(grape_cmd::GrapeCli),
     /// Sign in with AtomGit OAuth and claim CodingPlan models in one
     /// flow: OAuth (if needed) → claim → fetch models → register
     /// providers → fetch status. Reports each step and exits.
@@ -4105,6 +4109,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
         Commands::Cloud(sub) => cloud_cmd::handle(sub),
+        Commands::Grape(sub) => tokio::task::spawn_blocking(move || grape_cmd::handle(sub)).await?,
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
             name,

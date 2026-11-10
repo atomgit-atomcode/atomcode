@@ -48,6 +48,8 @@ pub mod debug;
 pub mod edit;
 pub mod encoding;
 pub mod glob;
+#[cfg(feature = "grape")]
+pub mod grape;
 pub mod grep;
 pub mod list;
 /// Model-facing memory tool (remember / forget / list). Opt-in `memory` feature.

@@ -28,11 +28,13 @@ fn _tests_assert_in_chinese() {
 #[cfg(unix)]
 pub mod askpass;
 pub mod desktop;
+pub mod grape_connect;
 pub mod project_setup;
 pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
 pub mod tui_command_meter;
+pub mod tui_grape;
 pub mod tui_login;
 pub mod tui_mcp;
 pub mod tui_onboarding;
@@ -288,6 +290,8 @@ pub mod tui_front {
             crate::tui_bg::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
+            // Grape consent is not deployed on the public cloud yet. Keep its
+            // TUI command unmounted until the service is ready.
             crate::tui_welcome_words::row_layer(),
             crate::tui_opening::row_layer(),
             crate::tui_shell::row_layer(),
