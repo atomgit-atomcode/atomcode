@@ -315,6 +315,20 @@ pub struct ArtifactMiddleware {
 }
 
 impl ArtifactMiddleware {
+    /// Save a full capture, preferring the configured store and falling back to the
+    /// shared temp store. `Err` means neither could write and carries BOTH reasons:
+    /// the caller inlines the range away, but the reader learns why instead of seeing
+    /// a bare "(could not be saved)".
+    fn save_capture(&self, bytes: &[u8]) -> Result<(String, Option<std::io::Error>), String> {
+        match self.store.put(bytes) {
+            Ok(id) => Ok((id, None)),
+            Err(primary) => match ArtifactStore::new(fallback_dir()).put(bytes) {
+                Ok(id) => Ok((id, Some(primary))),
+                Err(fallback) => Err(both_failed_message(&primary, &fallback)),
+            },
+        }
+    }
+
     /// A caller-requested shell preview. Only presentation changes; the caller
     /// supplies the status from its process result, never from output text.
     pub(crate) fn shell_tail(
@@ -343,20 +357,12 @@ impl ArtifactMiddleware {
             let capture = if result.content.len() > MAX_ARTIFACT_BYTES {
                 format!("Full captured result unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).")
             } else {
-                match self.store.put(result.content.as_bytes()) {
-                    Ok(id) => format!("Full captured result saved as artifact {id}; read with fetch_output(artifact_id=\"{id}\", offset=0, limit={FETCH_MAX_LIMIT})."),
-                    Err(primary) => {
-                        // The configured directory can be unwritable (read-only volume,
-                        // permissions, full disk). Falling back keeps fetch_output usable for
-                        // this session instead of silently dropping the middle of the output.
-                        let fallback = ArtifactStore::new(fallback_dir());
-                        match fallback.put(result.content.as_bytes()) {
-                            Ok(id) => format!(
-                                "Full captured result saved as a TEMPORARY artifact {id} (primary store failed: {primary}); read it with fetch_output(artifact_id=\"{id}\") in this session."
-                            ),
-                            Err(fallback_err) => both_failed_message(&primary, &fallback_err),
-                        }
-                    }
+                match self.save_capture(result.content.as_bytes()) {
+                    Ok((id, None)) => format!("Full captured result saved as artifact {id}; read with fetch_output(artifact_id=\"{id}\", offset=0, limit={FETCH_MAX_LIMIT})."),
+                    Ok((id, Some(primary))) => format!(
+                        "Full captured result saved as a TEMPORARY artifact {id} (primary store failed: {primary}); read it with fetch_output(artifact_id=\"{id}\") in this session."
+                    ),
+                    Err(reason) => reason,
                 }
             };
             result.content = format!(
@@ -431,15 +437,18 @@ re-run the tool call with narrower output to see that range.]\n\n"
             return;
         }
 
-        let marker = match self.store.put(result.content.as_bytes()) {
-            Ok(id) => format!(
+        let marker = match self.save_capture(result.content.as_bytes()) {
+            Ok((id, None)) => format!(
                 "\n\n{missing} Full output saved as artifact {id}; the missing range is {} part(s) of up to \
 {FETCH_MAX_LIMIT} bytes. Read part 1: fetch_output(artifact_id=\"{id}\", offset={head_end}, limit={FETCH_MAX_LIMIT}).]\n\n",
                 (tail_begin - head_end).div_ceil(FETCH_MAX_LIMIT).max(1),
             ),
-            Err(_) => format!(
-                "\n\n{missing} Full output unavailable (could not be saved); re-run the tool call with narrower \
-output to see that range.]\n\n"
+            Ok((id, Some(primary))) => format!(
+                "\n\n{missing} Full output saved as a TEMPORARY artifact {id} (primary store failed: {primary}); \
+read part 1: fetch_output(artifact_id=\"{id}\", offset={head_end}, limit={FETCH_MAX_LIMIT}).]\n\n"
+            ),
+            Err(reason) => format!(
+                "\n\n{missing} {reason} Re-run the tool call with narrower output to see that range.]\n\n"
             ),
         };
         result.content = format!("{head}{marker}{tail}");
@@ -463,6 +472,38 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
 #[cfg(test)]
 mod tests {
+    /// The same defect lived in `spill`: a failed store write inlined the missing
+    /// range away with "(could not be saved)" — no id, no reason, no fallback.
+    #[tokio::test]
+    async fn spill_falls_back_to_a_readable_temp_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: format!("{}\nlast\n", "x".repeat(super::THRESHOLD_BYTES + 10_000)),
+            ..Default::default()
+        };
+        preview.spill(&mut result, false).await;
+        assert!(
+            result.content.contains("TEMPORARY artifact"),
+            "must fall back instead of dropping the range: {}",
+            &result.content[..400.min(result.content.len())]
+        );
+        let id = result
+            .content
+            .split("TEMPORARY artifact ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '(']).next())
+            .expect("the marker must carry an id")
+            .to_string();
+        assert!(
+            store.get(&id, 0, 16).unwrap().is_some(),
+            "an id we print must be readable"
+        );
+    }
+
     /// The smoke run saw `(could not be saved.)` for three different sizes with no
     /// id and no reason. A spill that cannot reach its configured directory must
     /// still hand the model a readable artifact, and must name the failure.
