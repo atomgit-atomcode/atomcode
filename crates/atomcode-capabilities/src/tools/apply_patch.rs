@@ -55,8 +55,32 @@ impl ApplyPatchTool {
 fn store(provider: &ArtifactStoreProvider) -> Result<Arc<ArtifactStore>, String> {
     provider().ok_or_else(|| "input artifacts are unavailable for this session".into())
 }
+/// ENOTSUP (`os error 45` on macOS, `EOPNOTSUPP` on Linux) means the workspace volume
+/// cannot do what the patch needs. Say so, and say what to do instead — the bare errno
+/// told the reader nothing.
+fn with_mount_hint(msg: String) -> String {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("os error 45") || lower.contains("operation not supported") {
+        format!(
+            "{msg} (the workspace volume does not support the file operation this patch \
+needs — retry from a local volume, or edit the file with edit_file)"
+        )
+    } else {
+        msg
+    }
+}
+
+/// Name the stage and the path an error came from: a bare `os error 45` did not say
+/// which call failed.
+fn stage_err(stage: &str, rel: &str, e: impl std::fmt::Display) -> String {
+    with_mount_hint(format!("{rel}: {stage} failed: {e}"))
+}
+
 async fn root(world: &dyn FileSystem, cwd: &Path) -> Result<PathBuf, String> {
-    world.canonicalize(cwd).await.map_err(|e| e.to_string())
+    world
+        .canonicalize(cwd)
+        .await
+        .map_err(|e| stage_err("canonicalize working directory", &cwd.display().to_string(), e))
 }
 async fn target_path(
     world: &dyn FileSystem,
@@ -67,7 +91,7 @@ async fn target_path(
     let canonical = world
         .canonicalize(&path)
         .await
-        .map_err(|e| format!("{relative}: {e}"))?;
+        .map_err(|e| stage_err("canonicalize target", relative, e))?;
     if canonical != path || !canonical.starts_with(root) {
         return Err(format!("{relative}: symlink or path escape refused"));
     }
@@ -158,7 +182,11 @@ impl ImportPatchTool {
             {
                 return Err(format!("{}: sensitive targets cannot be captured in patch artifacts; use explicitly approved per-file edits", file.path));
             }
-            let info = self.world.info(&path).await.map_err(|e| e.to_string())?;
+            let info = self
+                .world
+                .info(&path)
+                .await
+                .map_err(|e| stage_err("stat", &file.path, e))?;
             if info.len > 8 * 1024 * 1024 {
                 return Err(format!("{}: file exceeds 8 MiB limit", file.path));
             }
@@ -166,7 +194,7 @@ impl ImportPatchTool {
                 .world
                 .read_bytes(&path)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| stage_err("read", &file.path, e))?;
             if before.contains(&0) {
                 return Err(format!("{}: binary targets are unsupported", file.path));
             }
@@ -419,6 +447,17 @@ mod tests {
     use super::*;
     use crate::world::LocalFs;
     use atomcode_kernel::tool::ProgressSink;
+    /// A workspace on an SMB/NFS mount fails `canonicalize`/`stat` with ENOTSUP and the
+    /// bare errno told the reader nothing. The hint must name the volume problem and a
+    /// way forward; unrelated errors must pass through untouched.
+    #[test]
+    fn mount_unsupported_error_gets_an_actionable_hint() {
+        let msg = with_mount_hint("Operation not supported (os error 45)".into());
+        assert!(msg.contains("local volume"), "{msg}");
+        assert!(msg.contains("edit_file"), "{msg}");
+        assert_eq!(with_mount_hint("No such file".into()), "No such file");
+    }
+
     fn context(dir: &Path) -> ToolContext {
         ToolContext {
             working_dir: dir.to_path_buf(),
