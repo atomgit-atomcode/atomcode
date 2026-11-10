@@ -290,7 +290,8 @@ pub mod tui_front {
             crate::tui_bg::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
-            crate::tui_grape::row_layer(),
+            // Grape consent is not deployed on the public cloud yet. Keep its
+            // TUI command unmounted until the service is ready.
             crate::tui_welcome_words::row_layer(),
             crate::tui_opening::row_layer(),
             crate::tui_shell::row_layer(),
@@ -311,9 +312,6 @@ pub mod tui_front {
         .unwrap_or(None);
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
-            Arc::new(crate::tui_grape::GrapeRow {
-                user_dir: dirs.user().to_path_buf(),
-            }),
             Arc::new(crate::tui_providers::ProvidersRow),
             Arc::new(crate::tui_plugins::PluginsRow {
                 config_path: config_path.clone(),

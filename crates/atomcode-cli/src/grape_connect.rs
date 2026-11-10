@@ -14,8 +14,8 @@ pub fn online() -> Result<()> {
 
 pub fn status(user_dir: &Path) -> Result<String> {
     Ok(match atomcode_auth::grape::load(user_dir)? {
-        Some(c) => format!("Grape 已连接：{}\n服务：{}\n此为本地连接状态，未检查远端健康。\n/grape disconnect 断开连接", c.username, c.server),
-        None => format!("Grape 尚未连接。使用 /grape connect 连接官方云端。\n内测阶段：请先在 {} 使用 GitCode 登录并申请内测资格。", atomcode_auth::grape::CLOUD_APP),
+        Some(c) => format!("Grape 已连接：{}\n服务：{}\n此为本地连接状态，未检查远端健康。\natomcode grape disconnect 断开连接", c.username, c.server),
+        None => format!("Grape 尚未连接。使用 atomcode grape connect 连接支持授权的服务。\n内测阶段：请先在 {} 使用 GitCode 登录并申请内测资格。", atomcode_auth::grape::CLOUD_APP),
     })
 }
 
@@ -38,7 +38,7 @@ pub fn connect(
         bail!("Grape authorization cancelled; previous connection unchanged");
     }
     let pending = atomcode_auth::grape::start(server)?;
-    say(&format!("Grape 授权码：{}\n{}\n请使用 GitCode 登录并核对授权码。连接不会自动派发任务。\n云端处于内测阶段；若需申请资格，请先取消此次等待，获批后重新连接。TUI：/grape cancel；终端：Ctrl+C。", pending.user_code, pending.verification_url));
+    say(&format!("Grape 授权码：{}\n{}\n请使用 GitCode 登录并核对授权码。连接不会自动派发任务。\n云端处于内测阶段；若需申请资格，请先取消此次等待，获批后重新连接。在终端按 Ctrl+C 取消等待。", pending.user_code, pending.verification_url));
     if cancelled() {
         bail!("Grape authorization cancelled; previous connection unchanged");
     }

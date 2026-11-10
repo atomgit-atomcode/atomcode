@@ -6,7 +6,7 @@ Both the Grape device-authorization endpoints and this AtomCode build are requir
 
 ## Connect
 
-In the TUI, type `/grape`. It connects to the official cloud (`https://www.grapedev.cn/`) when disconnected, or shows the saved identity when connected. Use `/grape connect` to authorize again, `/grape status` for local status, `/grape disconnect` to revoke, and `/grape cancel` to stop an authorization wait. The UI remains responsive during authorization. `/grape help` lists these commands.
+The TUI `/grape` entry is temporarily disabled until cloud device authorization is deployed. Its implementation is retained but is not mounted in the TUI command menu or dispatcher. The CLI remains available for services that already support the protocol.
 
 The official cloud is in private beta. Sign in with GitCode at https://www.grapedev.cn/app/. If access is unavailable, use the existing “申请内测” entry; cancel the current AtomCode wait and reconnect after approval. Submitting an application does not grant access or complete authorization. An older cloud deployment without device authorization fails immediately with deployment guidance.
 
@@ -18,7 +18,7 @@ atomcode grape connect
 
 AtomCode opens the service's authorization page. If already signed in to Grape, compare the displayed code and approve. Otherwise sign in through Grape's existing login, then approve. The CLI waits for completion and securely saves a dedicated, revocable credential. No key is copied into chat or configuration.
 
-For private deployments, use `/grape connect https://your-grape.example/` or `atomcode grape connect --server https://your-grape.example/`. The `/app/` URL is the browser application, not the API base; the official API base is the site root.
+For private deployments, use `atomcode grape connect --server https://your-grape.example/`. The `/app/` URL is the browser application, not the API base; the official API base is the site root.
 
 For SSH/headless machines:
 
@@ -28,7 +28,7 @@ atomcode grape connect --server https://your-grape.example --no-browser
 
 Open the printed URL on another device. Run this command on the machine, OS account and product directory that own the AtomCode runtime. Logging in on a laptop does not connect a daemon running under another account or host. HTTP is accepted only for literal loopback development services; deployed services require HTTPS.
 
-The stored connection is read at request time, so the new CLI/TUI/WebUI runtimes share it without a session restart after authorization. There is no separate MCP server to install. Connection startup is a human CLI or TUI command; this version does not add a WebUI connection button. A daemon under another OS account must be authorized on its own host.
+The stored connection is read at request time, so the new CLI/TUI/WebUI runtimes share it without a session restart after authorization. There is no separate MCP server to install. Connection startup currently uses the human CLI command; this version does not add a WebUI connection button. A daemon under another OS account must be authorized on its own host.
 
 ```sh
 atomcode grape status       # local saved identity; does not verify remote health
