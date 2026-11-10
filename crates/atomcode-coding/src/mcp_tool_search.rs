@@ -54,6 +54,21 @@ fn schema_budget(window: u32) -> usize {
     (window.max(1_024) / 10) as usize * 4
 }
 
+/// Words that carry no retrieval signal. They still match a tool NAME (a tool may
+/// legitimately be called `noop`), but a DESCRIPTION hit on them proved worthless:
+/// `no` occurs inside "not"/"none", so a nonsense query matched 40 tools.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "for", "from", "has", "have", "in",
+    "is", "it", "its", "no", "not", "of", "on", "or", "such", "that", "the", "this", "to", "with",
+];
+
+/// Shortest term allowed to score through a description hit.
+const MIN_DESCRIPTION_TERM: usize = 3;
+
+fn is_content_term(term: &str) -> bool {
+    term.chars().count() >= MIN_DESCRIPTION_TERM && !STOPWORDS.contains(&term)
+}
+
 fn schema_bytes(tool: &ToolDef) -> usize {
     // ToolDef contains only JSON values and strings: serialization cannot fail.
     serde_json::to_vec(tool)
@@ -119,7 +134,7 @@ fn search_in(tools: &[ToolDef], args: SearchArgs, budget: usize, catalog: Catalo
                         100
                     } else if name.contains(term) {
                         10
-                    } else if description.contains(term) {
+                    } else if is_content_term(term) && description.contains(term) {
                         1
                     } else {
                         0
@@ -132,6 +147,9 @@ fn search_in(tools: &[ToolDef], args: SearchArgs, budget: usize, catalog: Catalo
     ranked.sort_by(|(a_score, a), (b_score, b)| {
         b_score.cmp(a_score).then_with(|| a.name.cmp(&b.name))
     });
+    // The top score lets a caller (and the smoke test) tell "nothing matched" from
+    // "fuzzy fallback matched by accident" without eyeballing the hit list.
+    let best_score = ranked.first().map(|(score, _)| *score).unwrap_or(0);
     let total = ranked.len();
     let limit = args.limit.unwrap_or(DEFAULT_MATCHES).clamp(1, MAX_MATCHES);
     let mut remaining = budget;
@@ -162,6 +180,7 @@ fn search_in(tools: &[ToolDef], args: SearchArgs, budget: usize, catalog: Catalo
         "loaded_tools": selection.loaded_tools,
         "matches": matches,
         "total_matches": total,
+        "best_score": best_score,
         "next_offset": (next < total).then_some(next),
         "schema_budget_bytes": budget,
         "instruction": "Only loaded_tools will have full schemas in the next model request. Call those tools by their original names with their declared arguments. Each successful search replaces the previous selection."
@@ -483,6 +502,53 @@ mod tests {
     use super::*;
     use atomcode_kernel::provider::ChatOptions;
     use atomcode_kernel::tool::ToolCall;
+
+    /// `no`/`such` are stopwords that occur inside ordinary English descriptions
+    /// ("not", "none"), so a description hit on them made a meaningless query look
+    /// like it matched 40 tools. Only name hits may count for such terms.
+    #[test]
+    fn stopword_and_short_terms_do_not_match_by_description() {
+        let tools = vec![ToolDef {
+            name: "mcp__x__alpha".into(),
+            description: "does not support none of such things".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        }];
+        let out = search(
+            &tools,
+            SearchArgs {
+                query: "no such".into(),
+                limit: None,
+                offset: 0,
+            },
+            200_000,
+        );
+        assert_eq!(out["total_matches"], 0, "{}", out);
+        assert_eq!(out["best_score"], 0, "{}", out);
+    }
+
+    #[test]
+    fn content_term_still_matches_by_description() {
+        let tools = vec![ToolDef {
+            name: "mcp__x__wiki".into(),
+            description: "read and write confluence pages".into(),
+            parameters: json!({"type":"object","properties":{}}),
+        }];
+        let out = search(
+            &tools,
+            SearchArgs {
+                query: "confluence".into(),
+                limit: None,
+                offset: 0,
+            },
+            200_000,
+        );
+        assert_eq!(out["total_matches"], 1, "{}", out);
+        assert!(
+            out["best_score"].as_u64().unwrap() > 0,
+            "a real content term must still score: {}",
+            out
+        );
+    }
 
     fn tool(name: &str, padding: usize) -> ToolDef {
         ToolDef {
