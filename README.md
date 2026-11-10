@@ -158,7 +158,7 @@ See [Permission Model](./docs/security/permission-model.md) for the full design 
 
 ### Privacy
 
-- 📊 Anonymous telemetry (opt-out) — see [docs/telemetry.md](docs/telemetry.md)
+- 📊 Anonymous telemetry (on by default, opt-out available) — see [docs/telemetry.md](docs/telemetry.md)
 
 ## Installation
 
