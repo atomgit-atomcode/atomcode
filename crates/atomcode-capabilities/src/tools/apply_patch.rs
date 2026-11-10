@@ -136,14 +136,21 @@ impl ImportPatchTool {
         let args: Args = serde_json::from_str(args).map_err(|e| e.to_string())?;
         cancelled(ctx)?;
         let path = resolve_path(&args.file_path, &ctx.working_dir);
-        if self.world.info(&path).await.map_err(|e| e.to_string())?.len > 8 * 1024 * 1024 {
+        if self
+            .world
+            .info(&path)
+            .await
+            .map_err(|e| stage_err("stat patch file", &args.file_path, e))?
+            .len
+            > 8 * 1024 * 1024
+        {
             return Err("patch exceeds 8 MiB import limit".into());
         }
         let bytes = self
             .world
             .read_bytes(&path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| stage_err("read patch file", &args.file_path, e))?;
         self.import_bytes(bytes, ctx).await
     }
 
@@ -579,6 +586,8 @@ mod failure_tests {
     struct Fails {
         inner: LocalFs,
         partial: bool,
+        /// When set, `info` fails the way an SMB/NFS mount does (ENOTSUP).
+        no_stat: bool,
     }
     #[async_trait]
     impl FileSystem for Fails {
@@ -607,6 +616,9 @@ mod failure_tests {
             self.inner.list(p).await
         }
         async fn info(&self, p: &Path) -> Result<FileInfo, FsError> {
+            if self.no_stat {
+                return Err(FsError::denied("Operation not supported (os error 45)"));
+            }
             self.inner.info(p).await
         }
         async fn canonicalize(&self, p: &Path) -> Result<PathBuf, FsError> {
@@ -623,6 +635,7 @@ mod failure_tests {
             let world = Arc::new(Fails {
                 inner: LocalFs::new(dir.path()),
                 partial,
+                no_stat: false,
             });
             for name in ["a", "b"] {
                 std::fs::write(dir.path().join(name), "old\n").unwrap();
@@ -698,6 +711,48 @@ mod failure_tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".env")).unwrap(),
             "secret\n"
+        );
+    }
+
+    /// The smoke run got a bare `import_patch: Operation not supported (os error 45)`:
+    /// no stage, no hint. Import must say which step failed and why the volume refuses.
+    #[tokio::test]
+    async fn import_names_the_failing_stage_and_hints_on_an_unsupported_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p"),
+            "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let store = Arc::new(ArtifactStore::new(storage.path()));
+        let provider: ArtifactStoreProvider = Arc::new(move || Some(store.clone()));
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: Default::default(),
+            requester: None,
+        };
+        let tool = ImportPatchTool::new(
+            Arc::new(Fails {
+                inner: LocalFs::new(dir.path()),
+                partial: false,
+                no_stat: true,
+            }),
+            provider,
+            super::super::sensitive_path::test_guard(),
+        );
+        let result = tool.execute(r#"{"file_path":"p"}"#, &ctx).await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("stat patch file"),
+            "must name the failing stage: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("local volume"),
+            "must hint at the unsupported volume: {}",
+            result.content
         );
     }
 }

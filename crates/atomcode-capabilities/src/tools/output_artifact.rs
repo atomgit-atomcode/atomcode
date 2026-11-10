@@ -68,6 +68,13 @@ pub struct ArtifactStore {
 /// Resolve a host-owned optional store when a call/schema is built, not at mount.
 pub type ArtifactStoreProvider = Arc<dyn Fn() -> Option<Arc<ArtifactStore>> + Send + Sync>;
 
+/// Where a capture goes when the configured store cannot be written. Content-addressed
+/// and process-independent, so an id printed in one turn still resolves in the next —
+/// and `get` consults it on a miss.
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join("atomcode-artifacts")
+}
+
 impl ArtifactStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -96,11 +103,15 @@ impl ArtifactStore {
         if !is_valid_id(id) {
             return Ok(None);
         }
-        let path = self.dir.join(id);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match std::fs::read(self.dir.join(id)) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+            // A configured store that is unwritable (or not even a directory) spilled
+            // this capture to `fallback_dir`; an id we handed out must still resolve.
+            Err(primary) => match std::fs::read(fallback_dir().join(id)) {
+                Ok(b) => b,
+                Err(_) if primary.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(primary),
+            },
         };
         let start = offset.min(bytes.len());
         let end = start.saturating_add(limit).min(bytes.len());
@@ -338,10 +349,7 @@ impl ArtifactMiddleware {
                         // The configured directory can be unwritable (read-only volume,
                         // permissions, full disk). Falling back keeps fetch_output usable for
                         // this session instead of silently dropping the middle of the output.
-                        let fallback = ArtifactStore::new(
-                            std::env::temp_dir()
-                                .join(format!("atomcode-artifacts-{}", std::process::id())),
-                        );
+                        let fallback = ArtifactStore::new(fallback_dir());
                         match fallback.put(result.content.as_bytes()) {
                             Ok(id) => format!(
                                 "Full captured result saved as a TEMPORARY artifact {id} (primary store failed: {primary}); read it with fetch_output(artifact_id=\"{id}\") in this session."
@@ -481,6 +489,34 @@ mod tests {
             "must name the primary failure: {}",
             result.content
         );
+    }
+
+    /// The fallback id was unusable in practice: `get` only read the configured
+    /// directory, so `fetch_output` answered "no longer available" for an id we had
+    /// just handed out. An id we print must be readable.
+    #[test]
+    fn a_fallback_artifact_is_readable_through_the_primary_store() {
+        let d = tempfile::tempdir().unwrap();
+        let blocked = d.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: "first\nsecond\nthird\n[exit code 0]".into(),
+            ..Default::default()
+        };
+        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "[atomcode: output truncated");
+        assert!(result.content.contains("TEMPORARY artifact"), "{}", result.content);
+        let id = result
+            .content
+            .split("TEMPORARY artifact ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '(']).next())
+            .expect("the message must carry an id")
+            .to_string();
+        let got = store.get(&id, 0, usize::MAX).unwrap();
+        let got = got.unwrap_or_else(|| panic!("artifact {id} must be readable, got None"));
+        assert!(String::from_utf8_lossy(&got).contains("second"), "wrong bytes");
     }
 
     #[test]
