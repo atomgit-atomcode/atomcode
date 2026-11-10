@@ -64,7 +64,10 @@ impl Tool for TraceChainTool {
 }
 
 /// Keep only the symbols whose path ends with `file`. A blank/absent filter keeps all.
-fn narrow<'a>(nodes: Vec<&'a super::graph::SymbolNode>, file: Option<&str>) -> Vec<&'a super::graph::SymbolNode> {
+fn narrow<'a>(
+    nodes: Vec<&'a super::graph::SymbolNode>,
+    file: Option<&str>,
+) -> Vec<&'a super::graph::SymbolNode> {
     let Some(suffix) = file.map(str::trim).filter(|f| !f.is_empty()) else {
         return nodes;
     };
@@ -220,7 +223,11 @@ mod tests {
         let r = tool
             .execute(r#"{"from":"main","to":"add"}"#, &ctx(d.path()))
             .await;
-        assert!(r.is_error, "ambiguous names must be refused, got: {}", r.content);
+        assert!(
+            r.is_error,
+            "ambiguous names must be refused, got: {}",
+            r.content
+        );
         assert!(
             r.content.contains("a.rs") && r.content.contains("b.rs"),
             "the error must list every candidate: {}",
@@ -239,7 +246,10 @@ mod tests {
         ambiguous_fixture(d.path());
         let tool = TraceChainTool::new(Arc::new(CodeIndex::new(&crate::product_dirs::test_dirs())));
         let r = tool
-            .execute(r#"{"from":"main","to":"add","file":"b.rs"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"from":"main","to":"add","file":"b.rs"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(
