@@ -2122,6 +2122,13 @@ const MAX_TOOL_CALL_DELTAS: usize = 20000;
 /// never rejected, while keeping the buffer trivially small.
 const MAX_TOOL_CALLS: usize = 256;
 
+/// Upper bound on one SSE line, and on the unterminated tail the decoder keeps
+/// between chunks. A legitimate line carries one model delta; even the largest
+/// legal tool-call argument payload is bounded by the provider's output-token
+/// limit, well under this. Without a cap, an endpoint that never sends `\n`
+/// could grow [`SseDecoder::buf`] until the process is OOM-killed.
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
 /// inline in the network loop) makes the wire→event mapping deterministic and
@@ -2138,6 +2145,9 @@ struct SseDecoder {
     /// kept short, to show in that error.
     stray: String,
     buf: Vec<u8>,
+    /// Largest one line (or its unterminated tail) may grow before the decoder
+    /// refuses the stream. See [`MAX_SSE_LINE_BYTES`].
+    max_line_bytes: usize,
     /// Per-index `(id, name, accumulated_args)` for in-flight tool calls.
     tool_calls: Vec<(String, String, String)>,
     last_usage: Option<TokenUsage>,
@@ -2169,6 +2179,7 @@ impl SseDecoder {
             saw_data: false,
             stray: String::new(),
             buf: Vec::new(),
+            max_line_bytes: MAX_SSE_LINE_BYTES,
             tool_calls: Vec::new(),
             last_usage: None,
             truncated: false,
@@ -2245,19 +2256,67 @@ impl SseDecoder {
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
     /// across arbitrary chunk boundaries (UTF-8 is only decoded on whole lines).
+    ///
+    /// Complete lines are walked once and the consumed prefix is dropped in one
+    /// step at the end. Draining each line as it was found moved the whole
+    /// remaining buffer (`Vec::drain` from the front), so one chunk carrying
+    /// many small events cost O(chunk²); this costs O(chunk).
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&line);
-            let text = text.trim_end_matches('\n').trim_end_matches('\r');
-            self.process_line(text, &mut out);
+        if self.buf.is_empty() {
+            return out;
+        }
+        // Take the buffer so a line can be borrowed while `process_line` mutates
+        // the decoder. The unterminated tail is put back below.
+        let buf = std::mem::take(&mut self.buf);
+        let mut start = 0usize;
+        while let Some(offset) = buf[start..].iter().position(|&b| b == b'\n') {
+            let end = start + offset;
+            if end - start > self.max_line_bytes {
+                out.extend(self.line_too_large());
+                return out;
+            }
+            let text = String::from_utf8_lossy(&buf[start..end]);
+            self.process_line(text.trim_end_matches('\r'), &mut out);
+            start = end + 1;
             if self.done {
-                break;
+                // The stream is terminal; bytes after the line that ended it are
+                // not part of this response.
+                return out;
             }
         }
+        let rest = &buf[start..];
+        if rest.len() > self.max_line_bytes {
+            out.extend(self.line_too_large());
+            return out;
+        }
+        if !rest.is_empty() {
+            self.buf.extend_from_slice(rest);
+        }
         out
+    }
+
+    /// Refuse a line the provider never terminated (or sent longer than the
+    /// cap) instead of growing `buf` without bound. The stream is terminal:
+    /// there is no safe point to resume a line whose start was dropped.
+    fn line_too_large(&mut self) -> Vec<StreamEvent> {
+        let limit = self.max_line_bytes;
+        self.fail_incomplete(
+            "sse_line_too_large",
+            &format!(
+                "provider stream line exceeded the {limit}-byte limit; the response was \
+                 refused instead of buffering it without bound"
+            ),
+        )
+    }
+
+    /// Test-only override for the line cap, so the boundary can be exercised
+    /// without allocating a production-sized (16 MiB) line.
+    #[cfg(test)]
+    fn with_line_cap(mut self, cap: usize) -> Self {
+        self.max_line_bytes = cap;
+        self
     }
 
     /// True once a NON-EMPTY `finish_reason` has been seen — the model's own
@@ -2299,6 +2358,9 @@ impl SseDecoder {
         // Some gateways omit the final newline as well as [DONE]. Parse the
         // last line before deciding whether its finish_reason completed us.
         if !self.buf.is_empty() {
+            if self.buf.len() > self.max_line_bytes {
+                return self.line_too_large();
+            }
             let pending = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
             self.process_line(pending.trim_end_matches('\r'), &mut out);
         }
@@ -5118,6 +5180,77 @@ mod tests {
             !noise.iter().any(|e| matches!(e, StreamEvent::Malformed)),
             "comments / blank / empty-data lines must NOT be malformed; got {:?}",
             kinds(&noise)
+        );
+    }
+
+    /// A provider that never sends `\n` must not grow the decoder without
+    /// bound. The tail is refused once it passes the cap, and the stream is
+    /// terminal (a later chunk cannot resume a line whose start was dropped).
+    #[test]
+    fn sse_unterminated_line_past_the_cap_fails_instead_of_buffering() {
+        let mut d = SseDecoder::new().with_line_cap(64);
+        let ev = d.feed(&[b'x'; 65]);
+        assert_eq!(kinds(&ev), vec!["error"], "{ev:?}");
+        let StreamEvent::Error(err) = &ev[0] else {
+            unreachable!()
+        };
+        assert_eq!(err.code.as_deref(), Some("sse_line_too_large"));
+        assert!(!err.retryable);
+        assert!(d.feed(b"data: [DONE]\n").is_empty());
+        assert!(d.finish().is_empty());
+    }
+
+    /// A complete line longer than the cap is refused before it is parsed.
+    #[test]
+    fn sse_complete_line_past_the_cap_fails() {
+        let mut d = SseDecoder::new().with_line_cap(8);
+        let ev = d.feed(b"xxxxxxxxx\n");
+        assert_eq!(kinds(&ev), vec!["error"], "{ev:?}");
+        assert!(matches!(
+            &ev[0],
+            StreamEvent::Error(e) if e.code.as_deref() == Some("sse_line_too_large")
+        ));
+    }
+
+    /// The cap applies to the line, not to one transport chunk: a line split
+    /// below the cap is still reassembled.
+    #[test]
+    fn sse_a_line_split_across_chunks_is_reassembled_under_the_cap() {
+        let mut d = SseDecoder::new().with_line_cap(128);
+        let line = line(json!({"choices":[{"delta":{"content":"ok"}}]}));
+        assert!(line.len() <= 128, "fixture must fit the cap");
+        let (head, tail) = line.split_at(line.len() / 2);
+        assert!(d.feed(head.as_bytes()).is_empty());
+        let ev = d.feed(tail.as_bytes());
+        assert_eq!(kinds(&ev), vec!["text"]);
+    }
+
+    /// Many events in one transport chunk are decoded in order. This is the
+    /// shape that made a per-line front-drain quadratic; it stays linear.
+    #[test]
+    fn sse_many_lines_in_one_chunk_decode_in_order() {
+        let mut d = SseDecoder::new();
+        let mut sse = String::new();
+        for i in 0..1000 {
+            sse.push_str(&line(
+                json!({"choices":[{"delta":{"content":format!("{i},")}}]}),
+            ));
+        }
+        let ev = d.feed(sse.as_bytes());
+        let text: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected: String = (0..1000).map(|i| format!("{i},")).collect();
+        assert_eq!(text, expected);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::TextDelta(_)))
+                .count(),
+            1000
         );
     }
 

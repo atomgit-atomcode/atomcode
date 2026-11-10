@@ -48,3 +48,7 @@
 - On/off are policy controls and do not need historical audit files. Corrupt old evidence must not block these switches. A resumed-session regression verifies both switches remain usable.
 - Inspecting an active attempt must not run crash recovery against its live evidence file. Restore only while idle, and never restore over an existing in-memory attempt; the cancellation scenario also asserts inspection leaves the on-disk status verifying.
 - Remote release gained ATI commits `5730add1b` and `297ffe090` during implementation. Preserve these commits and revalidate integration before pushing; never force-push over them.
+
+## Integrated release verification
+
+Rebased onto `297ffe090` with both ATI commits preserved. The only conflict was adjacent configuration documentation; both descriptions are retained. Integrated coding regression: 1307 passed, 16 skipped (including the five baseline failures listed above). Compile gate, formatting, documentation/search checks and Cargo.lock audit passed on the integrated source. The final review has no remaining feature-blocking findings.
