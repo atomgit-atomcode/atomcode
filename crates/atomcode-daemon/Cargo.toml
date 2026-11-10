@@ -49,10 +49,10 @@ serde_json = "1"
 # `webui/dist/` off disk at runtime in debug, using the absolute path recorded
 # at compile time — so a debug binary is bound to the machine and checkout it
 # was built in, serves 404 the moment the tree moves, and cannot be handed to
-# anyone. Embedding always costs ~700 KB in the debug binary and means a
-# frontend change needs a Rust rebuild; `ATOMCODE_WEBUI_DEV=http://localhost:5173`
+# anyone. Embedded frontend changes need a Rust rebuild; `ATOMCODE_WEBUI_DEV=http://localhost:5173`
 # (see `webui.rs`) is the intended fast loop for frontend work and is unaffected.
-rust-embed = { version = "8", features = ["mime-guess", "debug-embed"] }
+# Compress embedded assets; rust-embed transparently decompresses each asset on first use.
+rust-embed = { version = "8", features = ["mime-guess", "debug-embed", "compression"] }
 mime_guess = "2"
 
 # Async trait support

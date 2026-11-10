@@ -1,8 +1,21 @@
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
+import { woff2FontSources } from './src/lib/fontAssets';
 
 export default defineConfig({
-  plugins: [preact()],
+  plugins: [
+    {
+      name: 'woff2-only-fonts',
+      enforce: 'pre',
+      transform(source, id) {
+        const path = id.replaceAll('\\', '/');
+        if (!/\/katex\/dist\/katex(?:\.min)?\.css(?:\?|$)/.test(path)
+          && !/\/@fontsource\/source-serif-4\/[^/]+\.css(?:\?|$)/.test(path)) return;
+        return { code: woff2FontSources(source), map: null };
+      },
+    },
+    preact(),
+  ],
   base: './',
   build: {
     outDir: 'dist',

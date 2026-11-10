@@ -219,6 +219,8 @@ if [ "$BUILD_ARM64" = "1" ]; then
 fi
 
 echo ""
+python3 "$ROOT/scripts/report-package-size.py" --artifacts "$DIST" \
+    --baseline "$ROOT/latest.json" --output "$DIST/package-size.json"
 echo "=== SHA256 ==="
 cd "$DIST"
 shasum -a 256 atomcode-*linux-* 2>/dev/null | tee checksums-linux.txt

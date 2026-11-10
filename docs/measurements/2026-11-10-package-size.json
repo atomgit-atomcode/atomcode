@@ -1,0 +1,21 @@
+{
+  "baseline_commit": "c042a8226432b29ec44b7e11eec4c7b4acc3cae9",
+  "target": "aarch64-apple-darwin",
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "profile": "release",
+  "features": "default, unsigned (no private crypto overlay)",
+  "before": {
+    "binary_bytes": 42766608,
+    "web_bytes": 2942167,
+    "web_files": 94,
+    "sha256": "1f0d001a6385f1ab15ebb3bb50667f8717c32f988fdf0529ed2288eee9582298"
+  },
+  "after": {
+    "binary_bytes": 40883856,
+    "web_bytes": 1945075,
+    "web_files": 42,
+    "sha256": "e929e645a6c587762103f2a440429d30464945c6a301a6d331b3c2e118794f47"
+  },
+  "saved_bytes": 1882752,
+  "saved_percent": 4.402387956510369
+}
