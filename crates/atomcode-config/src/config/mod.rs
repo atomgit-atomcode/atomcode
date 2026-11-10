@@ -605,10 +605,17 @@ pub struct SkillsConfig {
 pub struct CompactionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<std::num::NonZeroU32>,
+    /// Token budget for the recent turns kept full before old tool results are
+    /// stubbed. Lower values stub older output sooner; a value above the
+    /// window-relative budget (a quarter of the context window, clamped) is
+    /// clamped to it, so this can only make stubbing earlier. Omission keeps
+    /// the window-relative default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stub_recent_budget: Option<std::num::NonZeroU32>,
 }
 impl CompactionConfig {
     fn is_default(&self) -> bool {
-        self.token_limit.is_none()
+        self.token_limit.is_none() && self.stub_recent_budget.is_none()
     }
 }
 

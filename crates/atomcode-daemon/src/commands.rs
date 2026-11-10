@@ -329,6 +329,9 @@ async fn exec_native_compact(
     let coding_cfg = crate::kernel_runtime::coding_config_from_runtime(
         &crate::live_api::chat_runtime_config(&config, &resolved, working_dir, telemetry),
     );
+    let stub_recent_budget = coding_cfg
+        .compact_stub_recent_budget
+        .map(|limit| limit as usize);
     let factory = crate::runtime_host::coding_provider_factory();
     let provider = tokio::task::spawn_blocking(move || factory.build(&coding_cfg, None))
         .await
@@ -339,6 +342,7 @@ async fn exec_native_compact(
         session.loaded.snapshot.messages.clone(),
         provider,
         (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
+        stub_recent_budget,
     )
     .await;
     if compacted.outcome.committed {

@@ -45,8 +45,9 @@ pub struct StubCompaction {
     /// `None` (the default) scales the budget with the context window at plan time
     /// ([`recent_keep_budget`]) — the SAME budget the proactive drain uses, so gentle-stub
     /// and drain agree on "recent", and a small-window model still stubs proactively rather
-    /// than never reaching a fixed budget. `Some(n)` pins a fixed budget; the mechanism
-    /// tests pin `Some(1)` (= keep only the active turn).
+    /// than never reaching a fixed budget. `Some(n)` pins a budget, clamped to that
+    /// window-relative budget at plan time: it can make stubbing earlier, never disable it.
+    /// The mechanism tests pin `Some(1)` (= keep only the active turn).
     protect_tokens: Option<usize>,
     /// Never stub `read_file` results — compacting them makes the model "falsely
     /// confident" and re-edit the same file (core's 5–7 atomgr finding); keeping them
@@ -69,9 +70,12 @@ impl Default for StubCompaction {
 }
 
 impl StubCompaction {
-    /// Pin a FIXED protect-window budget (mostly for tests / callers that want a
-    /// window-independent boundary). Production uses [`StubCompaction::default`], which
-    /// scales the budget with the context window.
+    /// Pin a protect-window budget (mostly for tests / callers that want a
+    /// window-independent boundary). At plan time it is clamped to the
+    /// window-relative budget (or to [`MAX_RECENT_KEEP_TOKENS`] when the
+    /// window is unknown), so a pinned value can only lower the keep window.
+    /// Production uses [`StubCompaction::default`] unless
+    /// `[compaction].stub_recent_budget` pins a lower budget.
     pub fn new(protect_tokens: usize, exempt_read_file: bool) -> Self {
         Self {
             protect_tokens: Some(protect_tokens),
@@ -88,9 +92,15 @@ impl CompactionStrategy for StubCompaction {
         // sacred floor). The budget scales with the context window by default — the SAME
         // `recent_keep_budget` the proactive drain uses, so gentle-stub and drain agree on
         // what "recent" means and a small-window model still stubs proactively.
-        let budget = self
-            .protect_tokens
-            .unwrap_or_else(|| recent_keep_budget(view.ctx_window));
+        let window_budget = recent_keep_budget(view.ctx_window);
+        let budget = match self.protect_tokens {
+            // A known window caps a pinned budget as well: `stub_recent_budget`
+            // is an opt-in to stub EARLIER, not a way to disable stubbing. An
+            // unknown window still has a finite ceiling.
+            Some(pinned) if view.ctx_window > 0 => pinned.min(window_budget),
+            Some(pinned) => pinned.min(MAX_RECENT_KEEP_TOKENS),
+            None => window_budget,
+        };
         let boundary = recent_keep_boundary(msgs, budget, view.sacred_floor);
         if boundary <= view.sacred_floor {
             return CompactionPlan::noop(); // nothing older than the kept window
@@ -1279,6 +1289,75 @@ mod tests {
         assert!(
             conv.messages[7].text.len() > MIN_COLLAPSE_SIZE,
             "active-turn grep → still full"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_larger_pinned_budget_keeps_a_completed_turn_the_small_one_stubs() {
+        // Three real turns. The floor protects only the system line and the
+        // first user line; turn 1's tool result is old and stays stubbed under
+        // either budget. Turns 2 and 3 show what the budget itself controls.
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("first"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", big("bash out"), false),
+            Message::user("second"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", big("grep out"), false),
+            Message::user("third"),
+            asst_call("v1", "grep"),
+            Message::tool_result("v1", big("third out"), false),
+        ];
+        let mut conv = Conversation::new();
+        conv.messages = msgs;
+        let floor = conv.sacred_floor();
+
+        let mut large_view = view(&conv.messages, floor);
+        large_view.ctx_window = 1_000_000; // the window-relative budget is 250K
+
+        let small = StubCompaction::new(1, true).plan(&large_view).await;
+        let small_indices: Vec<usize> = small.rewrites.iter().map(|(i, _)| *i).collect();
+        assert!(
+            small_indices.contains(&6),
+            "the small budget stubs the second turn: {small_indices:?}"
+        );
+
+        let large = StubCompaction::new(1_000_000, true).plan(&large_view).await;
+        let large_indices: Vec<usize> = large.rewrites.iter().map(|(i, _)| *i).collect();
+        assert!(
+            !large_indices.contains(&6),
+            "the large budget keeps the second turn full: {large_indices:?}"
+        );
+        assert!(
+            large_indices.contains(&3),
+            "turn 1's tool result is stubbed even under the larger budget (the floor protects only its user line): {large_indices:?}"
+        );
+
+        // A pinned budget larger than the window-relative one cannot silently
+        // disable the gentle stub: it behaves exactly like the default.
+        let small_window = view(&conv.messages, floor);
+        let default_plan = StubCompaction::default().plan(&small_window).await;
+        let oversized = StubCompaction::new(usize::MAX, true)
+            .plan(&small_window)
+            .await;
+        assert_eq!(
+            oversized.rewrites, default_plan.rewrites,
+            "an oversized pinned budget is clamped to the window-relative budget"
+        );
+
+        // With no known window, the pinned budget still has a finite ceiling.
+        let mut unknown_window = view(&conv.messages, floor);
+        unknown_window.ctx_window = 0;
+        let capped = StubCompaction::new(MAX_RECENT_KEEP_TOKENS, true)
+            .plan(&unknown_window)
+            .await;
+        let oversized = StubCompaction::new(usize::MAX, true)
+            .plan(&unknown_window)
+            .await;
+        assert_eq!(
+            oversized.rewrites, capped.rewrites,
+            "an oversized pinned budget is capped when the window is unknown"
         );
     }
 
