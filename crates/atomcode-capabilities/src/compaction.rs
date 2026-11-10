@@ -594,12 +594,9 @@ pub async fn summarize_span(
         // Split: the prior anchor (if any) is the UPDATE base; everything else is the new
         // transcript to fold in. The anchor is NEVER re-rendered as transcript (erosion fix).
         let previous_anchor = find_prior_anchor(span);
-        let new_events: Vec<Message> = span
-            .iter()
-            .filter(|m| !is_anchor_message(m))
-            .cloned()
-            .collect();
-        let transcript = render_transcript(&new_events);
+        // Render borrowed messages: cloning this span would duplicate large
+        // bodies, arguments, and image data before the input caps are applied.
+        let transcript = render_transcript(span);
         let prompt = vec![
             Message::system(SUMMARY_SYSTEM_PROMPT),
             Message::user(build_summary_prompt(previous_anchor, &transcript, focus)),
@@ -1215,9 +1212,10 @@ fn render_tool_body(text: &str) -> Cow<'_, str> {
 }
 
 /// Render a message span as a compact role-tagged transcript for the summarizer.
+/// Prior anchors are passed separately as the update base, never transcribed.
 fn render_transcript(span: &[Message]) -> String {
     let mut s = String::new();
-    for m in span {
+    for m in span.iter().filter(|m| !is_anchor_message(m)) {
         let role = match m.role {
             Role::System => "SYSTEM",
             Role::User => "USER",
@@ -4471,6 +4469,25 @@ mod tests {
             !out.contains("][1 image(s) attached]"),
             "the marker must not glue to the call line"
         );
+    }
+
+    #[test]
+    fn render_transcript_skips_only_synthetic_anchor_notes() {
+        let prior_user = Message::synthetic_user(format!("{ANCHOR_SENTINEL}\nold-user-summary"));
+        let mut prior_system = Message::system(format!("{ANCHOR_SENTINEL}\nold-system-summary"));
+        prior_system.synthetic = true;
+        let quoted = Message::user(format!("{ANCHOR_SENTINEL}\nuser-quoted-marker"));
+        let out = render_transcript(&[
+            prior_user,
+            prior_system,
+            quoted,
+            Message::assistant("current answer", vec![]),
+        ]);
+        assert!(!out.contains("old-user-summary"));
+        assert!(!out.contains("old-system-summary"));
+        assert!(out.contains(&format!("USER: {ANCHOR_SENTINEL}")));
+        assert!(out.contains("user-quoted-marker"));
+        assert!(out.contains("ASSISTANT: current answer"));
     }
 
     /// Records the prompt it was asked, answers with a stock summary.
