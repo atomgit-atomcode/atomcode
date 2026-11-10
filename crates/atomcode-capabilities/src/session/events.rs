@@ -22,8 +22,6 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::session::{
     derive_messages_with_meta, InjectionOrigin, LoggedEvent, NoticeKind, RewindScope, SeqNo,
@@ -894,7 +892,7 @@ impl SessionManager {
                 header = Some(found);
                 return Ok(());
             }
-            let (Some(seq), Some(mut value)) = (line.seq, line.event) else {
+            let (Some(seq), Some(value)) = (line.seq, line.event) else {
                 return Err(SessionStoreError::Corrupt {
                     kind: "session events",
                     message: "not an event record".into(),
@@ -910,8 +908,14 @@ impl SessionManager {
                     message: "missing header or non-increasing sequence".into(),
                 });
             }
-            // Validate the original event before dropping any non-reference payload.
-            event_of(&value, &path, index - 1, header.as_ref())?;
+            // Validate before trimming, and count the canonical event representation:
+            // ignored fields and omitted serde defaults must not change the budget.
+            let event = event_of(value, &path, index - 1, header.as_ref())?;
+            let mut value =
+                serde_json::to_value(event).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: error.to_string(),
+                })?;
             trim_reference_payload(&mut value, &mut clipped, query);
             retained = retained
                 .saturating_add(serialized_len(&value)?)
@@ -923,7 +927,7 @@ impl SessionManager {
                     actual: retained,
                 });
             }
-            let event = event_of(&value, &path, index - 1, header.as_ref())?;
+            let event = event_of(value, &path, index - 1, header.as_ref())?;
             events.push(LoggedEvent {
                 seq,
                 at: line.at,
@@ -1022,7 +1026,7 @@ impl SessionManager {
                 (Some(seq), Some(event)) => events.push(LoggedEvent {
                     seq,
                     at: line.at,
-                    event: event_of(&event, &path, index, header.as_ref())?,
+                    event: event_of(event, &path, index, header.as_ref())?,
                 }),
                 _ => {
                     return Err(SessionStoreError::Corrupt {
@@ -2145,11 +2149,10 @@ fn serialized_len(value: &serde_json::Value) -> SessionResult<usize> {
 /// header's version alone cannot say — and the file is refused as newer, not
 /// read as corrupt.
 ///
-/// Borrows the value: reference projection validates the original, trims it,
-/// then parses it again, and a round trip through `serde_json::to_value` only
-/// copied data the caller already had.
+/// Consume the value so ordinary event-log reads can move large strings into
+/// the event instead of cloning the body from a borrowed JSON tree.
 fn event_of(
-    value: &serde_json::Value,
+    value: serde_json::Value,
     path: &std::path::Path,
     index: usize,
     header: Option<&SessionHeader>,
@@ -2158,7 +2161,7 @@ fn event_of(
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    SessionEvent::deserialize(value).map_err(|error| {
+    serde_json::from_value(value).map_err(|error| {
         if error.to_string().starts_with("unknown variant") {
             SessionStoreError::FutureSchema {
                 kind: "session events",
@@ -7281,6 +7284,52 @@ mod tests {
         assert!(!text.contains("bad prefix"));
         assert!(!text.contains("reasoning_discarded"));
         assert_eq!(text.lines().count(), 1, "only the header remains");
+    }
+
+    #[test]
+    fn reference_retained_budget_uses_canonical_events_at_the_exact_boundary() {
+        for (index, raw) in [
+            serde_json::json!({"kind":"user_message","turn":1,"text":"hello","images":[]}),
+            serde_json::json!({"kind":"user_message","turn":1,"text":"hello","extra":"x".repeat(65536)}),
+            serde_json::json!({"kind":"titled","turn":1,"title":"old title without user_set"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_dir, manager) = store();
+            let id = format!("budget-{index}");
+            let _lease = created(&manager, &id);
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(manager.events_path(&id).unwrap())
+                .unwrap();
+            writeln!(file, "{}", serde_json::json!({"seq":1,"at":0,"event":raw})).unwrap();
+            drop(file);
+            let event: SessionEvent = serde_json::from_value(raw).unwrap();
+            let mut canonical = serde_json::to_value(event).unwrap();
+            trim_reference_payload(&mut canonical, &mut false, "");
+            let limit = serde_json::to_vec(&canonical).unwrap().len() + 64;
+            manager
+                .reference_projection(&id, limit)
+                .expect("canonical event fits at the old exact boundary");
+            assert!(matches!(manager.reference_projection(&id, limit - 1),
+                Err(SessionStoreError::TooLarge { actual, .. }) if actual == limit));
+        }
+    }
+
+    #[test]
+    fn ordinary_event_decode_reuses_the_owned_text_allocation() {
+        let raw = serde_json::json!({"kind":"user_message","turn":1,"text":"x".repeat(1024*1024)});
+        let original = raw["text"].as_str().unwrap().as_ptr();
+        let event = event_of(raw, Path::new("fixture.events"), 0, None).unwrap();
+        let SessionEvent::UserMessage { text, .. } = event else {
+            panic!("expected a user message")
+        };
+        assert_eq!(
+            text.as_ptr(),
+            original,
+            "ordinary reads must move rather than copy the body"
+        );
     }
 
     /// `serialized_len` must measure exactly what the allocating form did, so
