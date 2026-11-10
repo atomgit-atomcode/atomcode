@@ -185,3 +185,139 @@ impl Plugin for ReviewPersonaPlugin {
         Ok(())
     }
 }
+
+/// A background review is a single tool assignment, not a second development
+/// conversation. The host decides whether a person has taken this session over.
+/// Completion comes from the session's actual tool result, never a model claim.
+pub(crate) struct ReviewHandoffPlugin(pub Arc<dyn atomcode_review::ReviewDelegate>);
+
+struct ReviewHandoffRow {
+    delegate: Arc<dyn atomcode_review::ReviewDelegate>,
+    ctx: Context,
+}
+
+impl ReviewHandoffRow {
+    fn events(&self) -> Option<Vec<atomcode_kernel::session::LoggedEvent>> {
+        if !self.delegate.report_only()
+            || atomcode_harness::agent::current_member_name(&self.ctx).is_some()
+        {
+            return None;
+        }
+        let log = atomcode_harness::agent::scoped(&self.ctx)
+            .service::<atomcode_harness::seams::SessionSvc>()?;
+        if log.header().member.is_some() {
+            return None;
+        }
+        Some(log.events())
+    }
+}
+
+fn completed_review(
+    events: &[atomcode_kernel::session::LoggedEvent],
+    turn: u64,
+) -> Option<(String, bool)> {
+    use atomcode_kernel::session::SessionEvent;
+    let call = first_review_call(events, turn)?;
+    events.iter().find_map(|e| match &e.event {
+        SessionEvent::ToolResultLogged {
+            turn: t,
+            call_id,
+            content,
+            is_error,
+            ..
+        } if *t == turn && call_id == call => Some((content.clone(), *is_error)),
+        _ => None,
+    })
+}
+
+fn first_review_call(events: &[atomcode_kernel::session::LoggedEvent], turn: u64) -> Option<&str> {
+    use atomcode_kernel::session::SessionEvent;
+    events.iter().find_map(|e| match &e.event {
+        SessionEvent::AssistantMessage {
+            turn: t,
+            tool_calls,
+            ..
+        } if *t == turn => tool_calls
+            .iter()
+            .find(|call| call.name == "code_review")
+            .map(|call| call.id.as_str()),
+        _ => None,
+    })
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for ReviewHandoffRow {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        use atomcode_harness::events::{ModelResponse, RequestError};
+        if let Some(events) = self.events() {
+            req.tools.retain(|tool| tool.name == "code_review");
+            if let Some(result) = completed_review(&events, req.turn) {
+                return if result.1 {
+                    Err(RequestError {
+                        policy_denied: true,
+                        ..RequestError::message(result.0)
+                    })
+                } else {
+                    Ok(ModelResponse {
+                        text: result.0,
+                        ..Default::default()
+                    })
+                };
+            }
+        }
+        next.run(req).await
+    }
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecute> for ReviewHandoffRow {
+    async fn handle(
+        &self,
+        exec: &mut atomcode_harness::events::ToolExec,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::ToolsExecute>,
+    ) -> atomcode_kernel::tool::ToolResult {
+        use atomcode_kernel::session::SessionEvent;
+        if let Some(events) = self.events() {
+            // The requested batch is committed before parallel execution. Using
+            // that fact, rather than racing ToolStarted events, admits exactly
+            // its first review even if the model asks twice in one response.
+            let turn = events.iter().rev().find_map(|e| match &e.event {
+                SessionEvent::TurnStart { turn } => Some(*turn),
+                _ => None,
+            });
+            let prior = turn
+                .and_then(|turn| first_review_call(&events, turn))
+                .is_some_and(|first| first != exec.call.id);
+            if exec.call.name != "code_review" || prior {
+                return atomcode_kernel::tool::ToolResult {
+                    call_id: exec.call.id.clone(),
+                    content: "This host-owned background assignment runs code_review once and returns its result. Follow-up work belongs to the originating conversation.".into(),
+                    is_error: true,
+                    images: vec![],
+                };
+            }
+        }
+        next.run(exec).await
+    }
+}
+
+#[async_trait]
+impl Plugin for ReviewHandoffPlugin {
+    fn name(&self) -> &'static str {
+        "review-handoff"
+    }
+    async fn apply(&self, ctx: &Context, _: &Value) -> Result<(), String> {
+        let row = Arc::new(ReviewHandoffRow {
+            delegate: self.0.clone(),
+            ctx: ctx.clone(),
+        });
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(row.clone(), true);
+        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(row, true);
+        Ok(())
+    }
+}

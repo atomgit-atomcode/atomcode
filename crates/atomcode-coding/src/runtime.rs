@@ -12169,7 +12169,15 @@ fn harness_host_state(
         quality: Some(parts.quality.clone()),
         // What a host outside this workspace brought. Registered only: the
         // rows that mount them come in its layers, last (see `mount`).
-        plugins: prepare.host_plugins.plugins.clone(),
+        plugins: {
+            let mut plugins = prepare.host_plugins.plugins.clone();
+            if let Some(delegate) = &prepare.review_delegate {
+                plugins.push(Arc::new(crate::review_rows::ReviewHandoffPlugin(
+                    delegate.clone(),
+                )));
+            }
+            plugins
+        },
         identity: prepare.identity.clone(),
         session_context: Some(crate::on_harness::HostContext {
             hook: Arc::clone(&parts.session_context_hook),
@@ -12353,6 +12361,11 @@ fn tree_inputs(
     // patch is the last word on any row — except the explicit model-only catalog
     // closure below, which no layer may reopen.
     let mut extra = vec![crate::on_harness::config_rows(config)?];
+    if prepare.review_delegate.is_some() {
+        extra.push(
+            atomcode_plexus::Layer::new().insert(atomcode_plexus::Entry::named("review-handoff")),
+        );
+    }
     extra.push(
         atomcode_plexus::Layer::new()
             .patch(

@@ -72,6 +72,15 @@ impl LlmProvider for Model {
             .map(|m| m.text.as_str())
             .collect();
         let slow = !tools.is_empty() && said.last().is_some_and(|text| text.contains("slow"));
+        if !tools.is_empty() && said.last() == Some(&"background failure") {
+            return Err(ProviderError {
+                retryable: false,
+                message: "scripted background failure".into(),
+                http_status: Some(400),
+                code: None,
+                retry_after_secs: None,
+            });
+        }
         // `ask me`: a question for the person, through the tool that asks one.
         let last = messages.iter().rev().find(|m| !m.synthetic);
         if !tools.is_empty()
@@ -3196,5 +3205,42 @@ async fn answering_one_background_question_brings_up_the_next_one() {
         list.len() == 2 && list.iter().all(|s| s.state != BackgroundState::Waiting)
     })
     .await;
+    rig.quit().await;
+}
+
+/// Failure must arrive even without an assistant closing message. This rig uses
+/// real UI threads and subprocess-backed runtime setup, so it uses real time.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn a_background_failure_reaches_its_parent_without_a_conclusion() {
+    let rig = Rig::new().await;
+    let parent = rig.client.root();
+    rig.control()
+        .call(HostCommand::StartBackground {
+            text: "background failure".into(),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    rig.until_background("the background task failed", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Failed)
+    })
+    .await;
+    rig.until_screen("结果回来了").await;
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let events = store.load_events(&parent).unwrap();
+    assert!(
+        events.iter().any(|logged| matches!(&logged.event,
+            atomcode_kernel::session::SessionEvent::Injected {
+                text, origin: atomcode_kernel::session::InjectionOrigin::Peer { .. }, ..
+            } if text.contains("scripted background failure") && text.contains("不是成功结论")
+        )),
+        "the failed task's actual outcome must be logged as a peer note"
+    );
+    assert_eq!(rig.client.root(), parent);
     rig.quit().await;
 }

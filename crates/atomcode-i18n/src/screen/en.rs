@@ -697,6 +697,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // Content only, no instruction: the sentence that used to follow was a
         // decision made on the conversation's behalf, spoken in the person's own
         // voice. Whether to go through it now is that conversation's to make.
+        Msg::BackgroundIncomplete { reason, partial } => format!("Background task incomplete ({reason}). Partial output below is not a successful conclusion:\n\n{partial}").into(),
+        Msg::BackgroundNoConclusion => "The background task ended without a conclusion.".into(),
         Msg::BackgroundResult { title, answer } =>
             format!("“{title}” is back from the background. Its result:\n\n{answer}").into(),
 

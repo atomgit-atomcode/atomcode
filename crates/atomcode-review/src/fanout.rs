@@ -154,7 +154,25 @@ pub fn finalize_deep_review(
 ) -> (bool, String) {
     let (merged, deduped) = merge_deep_findings(outcomes, changed_paths);
     let (completed, failed) = dimension_coverage(outcomes);
-    render_deep_result(&merged, changed_files, &completed, &failed, deduped, None)
+    let (error, mut text) =
+        render_deep_result(&merged, changed_files, &completed, &failed, deduped, None);
+    text.push_str(&failure_details(outcomes));
+    (error, text)
+}
+
+/// Bounded per-dimension diagnostics; timeout/error reasons must survive fan-out.
+pub(crate) fn failure_details(outcomes: &[DimensionOutcome]) -> String {
+    let mut text = String::new();
+    for outcome in outcomes.iter().filter(|o| !o.completed) {
+        if let Some(reason) = outcome.error.as_deref().filter(|s| !s.trim().is_empty()) {
+            text.push_str(&format!(
+                "\n{}: {}\n",
+                outcome.dimension,
+                reason.chars().take(1000).collect::<String>()
+            ));
+        }
+    }
+    text
 }
 
 /// Merge → scope-filter → sort the fan-out outcomes into the deduped survivor
@@ -638,8 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn finalize_output_is_unchanged_after_the_split() {
-        // The no-verify path must be byte-identical to Phase 1's behavior.
+    fn finalize_matches_the_decomposed_result_with_failure_details() {
+        // Both entry points must retain the same findings, coverage and diagnostics.
         let outcomes = vec![
             DimensionOutcome {
                 dimension: "correctness",
@@ -669,7 +687,9 @@ mod tests {
         let (err_a, out_a) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
         let (merged, deduped) = merge_deep_findings(&outcomes, &["a.rs".to_string()]);
         let (completed, failed) = dimension_coverage(&outcomes);
-        let (err_b, out_b) = render_deep_result(&merged, 1, &completed, &failed, deduped, None);
+        let (err_b, mut out_b) = render_deep_result(&merged, 1, &completed, &failed, deduped, None);
+        out_b.push_str(&failure_details(&outcomes));
+        assert!(out_b.contains("performance: boom"));
         assert_eq!(
             (err_a, out_a),
             (err_b, out_b),

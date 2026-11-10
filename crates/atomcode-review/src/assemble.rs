@@ -158,13 +158,16 @@ pub fn build_review_agent_with_cancel(
     if let Some(policy) = cfg.tool_loop_policy {
         builder = builder.tool_loop_policy(policy);
     }
-    // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
-    // CLI run unbounded; engineering callers pass `--max-rounds`). When bounded, also mount
-    // the round-budget pressure hook so the reviewer LANDS findings before the fuse trips
-    // instead of dying empty in a read-exploration loop (see `round_budget`).
+    // Keep a bare CLI run unbounded. A bounded caller gets landing pressure for
+    // time as well as rounds: slow requests may exhaust time long before rounds.
+    // The existing cancellation seam still enforces the deadline.
     if let Some(n) = cfg.max_rounds {
-        builder = builder.max_rounds(n).hook(Arc::new(
+        builder = builder.max_rounds(n);
+    }
+    if cfg.max_rounds.is_some() || cfg.max_turn_duration.is_some() {
+        builder = builder.hook(Arc::new(
             crate::round_budget::RoundBudgetHook::new()
+                .with_duration(cfg.max_turn_duration)
                 .tracing_to_stderr(cfg.trace_budget_to_stderr),
         ));
     }

@@ -94,6 +94,21 @@ struct ReviewElsewhere {
 
 #[async_trait]
 impl atomcode_review::ReviewDelegate for ReviewElsewhere {
+    fn report_only(&self) -> bool {
+        let Some(background) = self.home.0.lock().expect("review home poisoned").upgrade() else {
+            return false;
+        };
+        let Some(front_end) = self.front_end.upgrade() else {
+            return false;
+        };
+        let state = background.state.lock().expect("background poisoned");
+        state.slots.iter().any(|live| {
+            live.review_only
+                && Arc::ptr_eq(live.control.front_end(), &front_end)
+                && !matches!(*live.mark.lock().expect("mark poisoned"), Mark::TakenUp)
+        })
+    }
+
     async fn delegate(
         &self,
         working_dir: &std::path::Path,
@@ -130,6 +145,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
 /// 一个接上了的 runtime。
 struct Live {
     id: u64,
+    review_only: bool,
     control: Arc<RuntimeControl>,
     commands: mpsc::UnboundedSender<AgentCommand>,
     track: Arc<Mutex<Track>>,
@@ -264,6 +280,35 @@ fn last_turn_answer(log: &[LoggedEvent]) -> Option<String> {
             }
             _ => None,
         })
+}
+
+/// A terminal outcome must reach its parent even when the model produced no
+/// closing text. Never pass an earlier turn's answer off as this turn's result.
+fn completion_report(log: &[LoggedEvent], reason: &StopReason) -> String {
+    use atomcode_i18n::screen::{t, Msg};
+    if *reason == StopReason::Stopped {
+        return last_turn_answer(log)
+            .unwrap_or_else(|| t(Msg::BackgroundNoConclusion).into_owned());
+    }
+    let start = log
+        .iter()
+        .rposition(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
+        .unwrap_or(0);
+    let error = log[start..].iter().rev().find_map(|e| match &e.event {
+        SessionEvent::TurnEnd {
+            error: Some(error), ..
+        } => Some(error.as_str()),
+        _ => None,
+    });
+    let reason = error
+        .map(|e| format!("{reason:?}: {e}"))
+        .unwrap_or_else(|| format!("{reason:?}"));
+    let partial = last_turn_answer(log).unwrap_or_default();
+    t(Msg::BackgroundIncomplete {
+        reason: &reason,
+        partial: &partial,
+    })
+    .into_owned()
 }
 
 impl Track {
@@ -459,6 +504,7 @@ fn attach(
     Ok((
         Live {
             id,
+            review_only: false,
             control,
             commands,
             track: track.clone(),
@@ -892,9 +938,7 @@ impl Background {
         // 这是"结果回来了"在那段对话里的形状。**只投内容**:要不要接着逐条核实,是那段
         // 对话看了上下文自己决定的事,不由这里替它下令。
         if let AgentEvent::TurnComplete { reason, .. } = &event {
-            if ended_state(reason) == BackgroundState::Done {
-                self.deliver_home(id);
-            }
+            self.deliver_home(id, reason);
         }
         let front = {
             let state = self.state.lock().expect("background poisoned");
@@ -920,7 +964,7 @@ impl Background {
     /// 投的是**内容**而不是一句通知。发起时说的是"结果回来后我会逐条核实",而那次
     /// 核实要真发生,就得让那段对话拿到结果 —— "去 /bg 读"是把这件事留给了一个人。
     /// 指令不跟着投:核实与否由那段对话自己定(`Msg::BackgroundResult`)。
-    fn deliver_home(&self, id: u64) {
+    fn deliver_home(&self, id: u64, reason: &StopReason) {
         use atomcode_i18n::screen::{t as tr, Msg as SMsg};
         let (origin, sender, frame, mark) = {
             let state = self.state.lock().expect("background poisoned");
@@ -931,9 +975,7 @@ impl Background {
                 return;
             }
             let log = log_of(live);
-            let Some(answer) = last_turn_answer(&log) else {
-                return;
-            };
+            let answer = completion_report(&log, reason);
             let title = name_of(&log);
             let frame = tr(SMsg::BackgroundResult {
                 title: &title,
@@ -1675,6 +1717,7 @@ impl Background {
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
+        live.review_only = scope.is_some() || name.as_deref() == Some("code-review");
         live.name = name;
         live.task = one_line(&text);
         let session = live.control.session_id();
@@ -2029,7 +2072,7 @@ mod tests {
         assert_eq!(track.ended, Some(BackgroundState::Failed));
         track.saw(&ended(StopReason::Stopped));
         assert_eq!(track.ended, Some(BackgroundState::Done));
-        // 被熔断、轮数用尽的不是一次结论 —— 不算干完,也就不会被投回去。
+        // 被熔断、轮数用尽的按失败回传，不冒充成功结论。
         for reason in [
             StopReason::RepeatLoop,
             StopReason::ToolLoopDetected,
@@ -2133,12 +2176,26 @@ mod tests {
         second.push(logged(SessionEvent::TurnStart { turn: 2 }));
         second.push(said(2, ""));
         assert_eq!(last_turn_answer(&second), None);
+        let failed = completion_report(&second, &StopReason::ProviderError);
+        assert!(failed.contains("ProviderError"));
+        assert!(!failed.contains("结论:两处要改"));
+        let cancelled = completion_report(&second, &StopReason::Cancelled);
+        assert!(cancelled.contains("Cancelled"));
 
         second.push(said(2, "补充:第三处也要改"));
         assert_eq!(
             last_turn_answer(&second).as_deref(),
             Some("补充:第三处也要改")
         );
+        second.push(logged(SessionEvent::TurnEnd {
+            turn: 2,
+            stop: StopReason::PolicyDenied,
+            error: Some("review budget exhausted; partial findings retained".into()),
+        }));
+        let failed = completion_report(&second, &StopReason::PolicyDenied);
+        assert!(failed.contains("review budget exhausted"));
+        assert!(failed.contains("补充:第三处也要改"));
+        assert!(failed.contains("不是成功结论") || failed.contains("not a successful conclusion"));
     }
 
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。

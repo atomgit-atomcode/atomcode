@@ -33,6 +33,8 @@ use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
+#[cfg(test)]
+use crate::build_review_agent_with;
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
@@ -42,7 +44,7 @@ use crate::fanout::{
 };
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
-use crate::{build_review_agent_with, Finding};
+use crate::{build_review_agent_with_cancel, Finding};
 
 /// Prefix for ephemeral review activity. It deliberately matches the existing sub-agent
 /// activity convention so terminal drivers can update one latest-wins line instead of adding
@@ -207,6 +209,12 @@ impl Default for ReviewToolConfig {
 /// conversation that is itself out of view — run it inline, as before.
 #[async_trait]
 pub trait ReviewDelegate: Send + Sync + std::fmt::Debug {
+    /// Whether this runtime is currently a host-owned, one-review reporting task.
+    /// False after a person takes it over, and for ordinary conversations.
+    fn report_only(&self) -> bool {
+        false
+    }
+
     /// Start `task` elsewhere, in `working_dir` — where this conversation is
     /// now, which is where the changes are. `scope` is the host's word for the
     /// changes (`working_tree`, `staged`, or a base ref), so it can say how many
@@ -631,7 +639,10 @@ impl Tool for ReviewTool {
             None => return err("code_review: review provider is not wired (internal error)"),
         };
 
-        // Shared per-agent config seed (both paths).
+        // One existing cancellation deadline covers dimensions AND verification;
+        // verification must not restart a fresh full-length time allowance.
+        let started = tokio::time::Instant::now();
+        let deadline = crate::shared_review_deadline(self.max_turn_duration);
         let make_cfg = || {
             let mut cfg = ReviewAgentConfig::new(
                 "",
@@ -645,7 +656,9 @@ impl Tool for ReviewTool {
             cfg.first_token_timeout = self.cfg.first_token_timeout;
             cfg.request_timeout = self.cfg.request_timeout;
             cfg.max_rounds = self.max_rounds;
-            cfg.max_turn_duration = self.max_turn_duration;
+            cfg.max_turn_duration = self
+                .max_turn_duration
+                .map(|d| d.saturating_sub(started.elapsed()));
             cfg.tool_loop_policy = self.tool_loop_policy;
             cfg.progress = Some(ctx.progress.clone());
             cfg.review_paths = files.clone();
@@ -653,14 +666,17 @@ impl Tool for ReviewTool {
         };
 
         if !a.is_deep() {
-            // --- single-agent path (unchanged behavior) ---
-            let (agent, report) = build_review_agent_with(&make_cfg(), provider);
+            // --- single-agent path ---
+            let (agent, report) =
+                build_review_agent_with_cancel(&make_cfg(), provider, deadline.clone());
             let (stop, run_error) = tokio::select! {
                 _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
                 outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
                     (outcome.stop, outcome.error)
                 }
             };
+            let run_error =
+                review_failure_reason(&stop, run_error, &deadline, self.max_turn_duration);
             let mut findings = report.findings();
             findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
             sort_findings(&mut findings);
@@ -683,10 +699,12 @@ impl Tool for ReviewTool {
             let task = task.clone();
             let mut cfg = make_cfg();
             let cancel = ctx.cancel.clone();
+            let deadline = deadline.clone();
+            let duration = self.max_turn_duration;
             async move {
                 cfg.progress_label = Some(dim.id.to_string());
                 cfg = cfg.with_persona_append(dim.lens);
-                let (agent, report) = build_review_agent_with(&cfg, provider);
+                let (agent, report) = build_review_agent_with_cancel(&cfg, provider, deadline.clone());
                 let (stop, run_error) = tokio::select! {
                     _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
                     outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
@@ -697,7 +715,7 @@ impl Tool for ReviewTool {
                     dimension: dim.id,
                     findings: report.findings(),
                     completed: stop == StopReason::Stopped && run_error.is_none(),
-                    error: run_error,
+                    error: review_failure_reason(&stop, run_error, &deadline, duration),
                 }
             }
         })
@@ -708,6 +726,7 @@ impl Tool for ReviewTool {
         let (mut merged, deduped) = merge_deep_findings(&outcomes, &files);
         let (completed, failed) = dimension_coverage(&outcomes);
         let mut verify_dropped = None;
+        let mut verify_incomplete = 0;
         if a.wants_verify() && !merged.is_empty() {
             // One verify agent per finding, capped. Keep a finding when its verify
             // agent re-reports a corresponding finding (or fails open on error/cancel).
@@ -715,7 +734,9 @@ impl Tool for ReviewTool {
             // which embeds the whole diff — is rendered lazily inside each closure, so
             // at most `VERIFY_CONCURRENCY` copies of the diff are live at once.
             let candidates: Vec<Finding> = merged.iter().map(|m| m.finding.clone()).collect();
+            let verified = Arc::new(AtomicU32::new(0));
             let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
+                let verified = verified.clone();
                 let provider = provider.clone();
                 let candidate = candidates[i].clone();
                 let vtask = format!(
@@ -724,10 +745,16 @@ impl Tool for ReviewTool {
                 );
                 let mut cfg = make_cfg();
                 let cancel = ctx.cancel.clone();
+                let deadline = deadline.clone();
                 async move {
+                    // Do not instantiate another reviewer after the common deadline.
+                    // Unverified findings remain present and are explicitly labeled below.
+                    if cancel.is_cancelled() || deadline.as_ref().is_some_and(|t| t.is_cancelled()) {
+                        return (i, true);
+                    }
                     cfg.progress_label = Some("verify".to_string());
                     cfg = cfg.with_persona_append(VERIFY_LENS);
-                    let (agent, report) = build_review_agent_with(&cfg, provider);
+                    let (agent, report) = build_review_agent_with_cancel(&cfg, provider, deadline);
                     let (stop, run_error) = tokio::select! {
                         _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
                         outcome = agent.run_to_completion(vtask, AutoRespond::AllowAll) => {
@@ -737,6 +764,7 @@ impl Tool for ReviewTool {
                     // Fail-open: keep on error/cancel; else keep iff the verifier
                     // re-reported a finding corresponding to THIS candidate.
                     let clean = stop == StopReason::Stopped && run_error.is_none();
+                    if clean { verified.fetch_add(1, Ordering::Relaxed); }
                     let kept = if clean {
                         verify_reconfirms(&candidate, &report.findings())
                     } else {
@@ -746,12 +774,15 @@ impl Tool for ReviewTool {
                 }
             })
             .await;
+            verify_incomplete = merged
+                .len()
+                .saturating_sub(verified.load(Ordering::Relaxed) as usize);
             let before = merged.len();
             let mut mask = keep.into_iter();
             merged.retain(|_| mask.next().unwrap_or(true));
             verify_dropped = Some(before - merged.len());
         }
-        let (is_error, content) = render_deep_result(
+        let (is_error, mut content) = render_deep_result(
             &merged,
             files.len(),
             &completed,
@@ -759,6 +790,10 @@ impl Tool for ReviewTool {
             deduped,
             verify_dropped,
         );
+        content.push_str(&crate::fanout::failure_details(&outcomes));
+        if verify_incomplete > 0 {
+            content.push_str(&format!("\nVerification incomplete for {verify_incomplete} candidate(s); unverified findings were retained, not reconfirmed.\n"));
+        }
         if is_error {
             err(content)
         } else {
@@ -771,10 +806,31 @@ impl Tool for ReviewTool {
 // Helpers (pure where possible, testable)
 // ---------------------------------------------------------------------------
 
+fn review_failure_reason(
+    stop: &StopReason,
+    error: Option<String>,
+    deadline: &Option<tokio_util::sync::CancellationToken>,
+    duration: Option<Duration>,
+) -> Option<String> {
+    if *stop == StopReason::Stopped && error.is_none() {
+        return None;
+    }
+    error.or_else(|| {
+        Some(if deadline.as_ref().is_some_and(|t| t.is_cancelled()) {
+            format!(
+                "review wall-clock budget exhausted ({}s); coverage is incomplete",
+                duration.unwrap_or_default().as_secs()
+            )
+        } else {
+            format!("review stopped with {stop:?}; coverage is incomplete")
+        })
+    })
+}
+
 /// Keep user constraints visible to both the delegate and the read-only reviewer.
 fn review_instructions(instructions: Option<&str>) -> String {
     match instructions.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(text) => format!("=== USER REVIEW INSTRUCTIONS ===\n{text}\n\nThe code_review reviewer remains read-only and reports findings. The calling agent follows the user's authorized task."),
+        Some(text) => format!("=== USER REVIEW INSTRUCTIONS ===\n{text}\n\nThe code_review reviewer remains read-only and reports findings. The originating conversation handles any authorized follow-up work."),
         None => String::new(),
     }
 }
@@ -796,9 +852,12 @@ fn delegated_task(args: &str, instructions: Option<&str>) -> String {
     format!(
         "代码审查 · {scope} · {depth}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
          concise summary of its findings. Preserve the user's instructions in the tool call and \
-         in your summary. If they requested conclusions only or no edits, stop after reporting; \
-         do not apply fixes. Otherwise, follow their authorized task. Findings themselves are \
-         not new authorization to modify files.\n\n{instructions}"
+         in your summary. Call code_review exactly once for this delegated task. If it fails, \
+         times out, or reports partial coverage, return that outcome and any collected findings \
+         immediately; do not retry with another depth or start another review. This background \
+         session only reviews and reports: do not apply fixes, create commits, push, or open a PR. \
+         Leave authorized follow-up work to the calling conversation. Findings themselves are \
+         not new authorization to modify files.\n\n{instructions}\n\nYour assignment here remains review and report only. Return after the one tool outcome, including failure; the originating conversation owns fixes and PR creation."
     )
 }
 
@@ -1510,6 +1569,27 @@ mod tests {
         }
     }
 
+    struct SlowReviewAndVerify;
+    #[async_trait]
+    impl LlmProvider for SlowReviewAndVerify {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            if !messages.iter().any(|m| m.role == Role::Tool) {
+                tokio::time::sleep(Duration::from_secs(200)).await;
+            }
+            ScriptedReviewProvider
+                .chat_stream(messages, tools, options)
+                .await
+        }
+    }
+
     struct FinishesAfterTenMinutes;
 
     #[async_trait]
@@ -1861,15 +1941,93 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn interactive_review_can_complete_after_more_than_ten_minutes() {
+    #[test]
+    fn delegated_review_is_one_report_task_not_a_second_coding_task() {
+        let task = delegated_task(r#"{"depth":"deep"}"#, Some("Audit, fix, and open a PR"));
+        assert!(task.contains("exactly once"));
+        assert!(task.contains("do not retry with another depth"));
+        assert!(task.contains("calling conversation"));
+        assert!(task.contains("Audit, fix, and open a PR"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deep_deadline_surfaces_all_failed_dimensions_and_the_reason() {
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(FinishesAfterTenMinutes))));
+        let mut tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                stream_timeout: Duration::from_secs(700),
+                ..Default::default()
+            },
+            test_dirs(),
+        );
+        tool.max_turn_duration = Some(Duration::from_secs(300));
+        let start = tokio::time::Instant::now();
+        let result = tool
+            .execute(r#"{"depth":"deep"}"#, &ctx_in(dir.path()))
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("0/4"), "{}", result.content);
+        for dimension in ["correctness", "security", "performance", "tests_contracts"] {
+            assert!(
+                result.content.contains(&format!(
+                    "{dimension}: review wall-clock budget exhausted (300s)"
+                )),
+                "{}",
+                result.content
+            );
+        }
+        assert!(start.elapsed() <= Duration::from_secs(301));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn verify_uses_the_remaining_deadline_and_keeps_unverified_findings() {
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(SlowReviewAndVerify))));
+        let mut tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                first_token_timeout: Duration::from_secs(700),
+                ..Default::default()
+            },
+            test_dirs(),
+        );
+        tool.max_turn_duration = Some(Duration::from_secs(300));
+        let start = tokio::time::Instant::now();
+        let result = tool
+            .execute(r#"{"depth":"deep+verify"}"#, &ctx_in(dir.path()))
+            .await;
+        assert!(
+            result.content.contains("unchecked unwrap"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Verification incomplete"),
+            "{}",
+            result.content
+        );
+        assert!(
+            start.elapsed() <= Duration::from_secs(301),
+            "elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn explicitly_extended_review_can_complete_after_more_than_ten_minutes() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
         }
         let dir = repo_with_working_tree_change();
         let provider: SharedReviewProvider =
             Arc::new(RwLock::new(Some(Arc::new(FinishesAfterTenMinutes))));
-        let tool = ReviewTool::new(
+        let mut tool = ReviewTool::new(
             provider,
             ReviewToolConfig {
                 model: "mock-model".into(),
@@ -1879,6 +2037,7 @@ mod tests {
             },
             test_dirs(),
         );
+        tool.max_turn_duration = Some(Duration::from_secs(900));
         let ctx = ToolContext {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),

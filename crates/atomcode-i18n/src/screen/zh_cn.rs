@@ -652,6 +652,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // 只交内容,不交指令:那句"逐条核实一遍…"是替那段对话里的人做的决定,而且是以
         // 人的口吻说出来的。要不要接着核实,由那段对话自己看上下文决定。
+        Msg::BackgroundIncomplete { reason, partial } => format!("后台任务未完成（{reason}）。以下仅为中断前的部分输出，不是成功结论：\n\n{partial}").into(),
+        Msg::BackgroundNoConclusion => "后台任务已结束，但没有返回结论。".into(),
         Msg::BackgroundResult { title, answer } =>
             format!("后台「{title}」的结果回来了:\n\n{answer}").into(),
 

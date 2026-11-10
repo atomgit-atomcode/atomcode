@@ -259,6 +259,7 @@ mode = "follow_system"
 # 内嵌 code_review 在父回合等待期间有自己的默认保险（200 轮/900 秒），均可覆盖，0 为关闭：
 #   ATOMCODE_REVIEW_MAX_ROUNDS=200
 #   ATOMCODE_REVIEW_MAX_DURATION_SECS=900
+# 约 5 分钟开始软提醒收尾，不会因此终止；deep 与 verify 共用同一时间预算。
 # 工具返回的截断阈值见下方 [tools.output]；环境变量优先于配置文件：
 #   ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES=204800
 [coding]
