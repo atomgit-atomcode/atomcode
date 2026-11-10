@@ -529,12 +529,15 @@ pub fn provision_with_listed(
     for (at, (selection, model)) in wanted.iter().zip(models).enumerate() {
         let rank = Some(u32::try_from(at + 1).unwrap_or(u32::MAX));
         if let Some(existing) = config.models.get_mut(selection) {
-            // Ours: refreshed. The person's own entry under the same id: theirs,
-            // untouched.
+            // Ranking is presentation metadata, also refreshed for entries a
+            // person edited (editing clears origin and rank). Do not reclaim
+            // ownership or overwrite their model settings.
+            if existing.account == OPENROUTER_ACCOUNT_ID && existing.model == model.id {
+                existing.rank = rank;
+            }
             if managed(existing) {
                 existing.display_name = model.name.clone();
                 existing.context_window = window(model);
-                existing.rank = rank;
             }
             continue;
         }
@@ -1271,6 +1274,28 @@ mod tests {
             assert_eq!(rank(&c, "openrouter/z/top:free"), Some(2));
         }
 
+        #[test]
+        fn a_rerun_restores_edited_models_ranking_without_reclaiming_them() {
+            let mut c = Config::default();
+            provision(&mut c, "k", &[free("z/top:free"), free("a/next:free")]);
+            let edited = c.models.get_mut("openrouter/z/top:free").unwrap();
+            edited.origin = None;
+            edited.rank = None;
+            edited.context_window = 12345;
+            edited.display_name = Some("My model".into());
+            provision(&mut c, "k", &[free("z/top:free"), free("a/next:free")]);
+            let edited = &c.models["openrouter/z/top:free"];
+            assert_eq!(edited.rank, Some(1));
+            assert_eq!(edited.origin, None);
+            assert_eq!(edited.context_window, 12345);
+            assert_eq!(edited.display_name.as_deref(), Some("My model"));
+            let serialized = toml::to_string(&c).unwrap();
+            let loaded: Config = toml::from_str(&serialized).unwrap();
+            let mut models: Vec<_> = loaded.models.values().collect();
+            models.sort_by_key(|m| atomcode_config::config::provider::model_list_order(m));
+            assert_eq!(models[0].model, "z/top:free");
+        }
+
         /// **Run again, the set is swapped.** What it added before and is no
         /// longer current goes; what is still current stays, refreshed; what is
         /// new comes in. The key is replaced, and nothing is doubled.
@@ -1297,9 +1322,8 @@ mod tests {
             );
         }
 
-        /// **The person's own models are never touched** — one they added by
-        /// hand under the same id, one on the same account, one an older build
-        /// added without the mark, one on another account.
+        /// The person's model settings and ownership are preserved, even when
+        /// a current catalog entry receives display ranking metadata.
         #[test]
         fn the_persons_own_models_are_never_changed_or_removed() {
             let mut c = Config::default();
