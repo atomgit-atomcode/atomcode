@@ -2887,6 +2887,31 @@ struct PromptTokensDetails {
     cached_tokens: Option<u32>,
 }
 
+/// Feed `lines` synthetic SSE deltas in chunks of `per_chunk` lines.
+///
+/// Benchmark-only: `benches/core.rs` is a separate crate and cannot name the
+/// private decoder. The return value is the number of decoded events, so the
+/// harness has a real result to keep the work from being optimized away.
+#[cfg(feature = "bench")]
+pub(crate) fn bench_sse_feed(lines: usize, per_chunk: usize) -> usize {
+    const DELTA: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+    let per_chunk = per_chunk.max(1);
+    let mut decoder = SseDecoder::new();
+    let mut decoded = 0usize;
+    let mut chunk = String::new();
+    for index in 0..lines {
+        chunk.push_str(DELTA);
+        if (index + 1) % per_chunk == 0 {
+            decoded += decoder.feed(chunk.as_bytes()).len();
+            chunk.clear();
+        }
+    }
+    if !chunk.is_empty() {
+        decoded += decoder.feed(chunk.as_bytes()).len();
+    }
+    decoded + decoder.finish().len()
+}
+
 // ---------------------------------------------------------------------------
 // Tests (deterministic, no network)
 // ---------------------------------------------------------------------------

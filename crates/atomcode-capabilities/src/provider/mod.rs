@@ -18,6 +18,10 @@
 mod anthropic;
 mod atomgit_sign;
 mod auto_proxy;
+/// Thin benchmark-only entry points for `benches/core.rs`. Compiled only with
+/// the `bench` feature, which is not part of any default or test build.
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod discovery;
 mod input_profile;
 mod latency;
