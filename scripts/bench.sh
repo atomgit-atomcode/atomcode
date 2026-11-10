@@ -18,6 +18,13 @@ cd "$REPO"
 ITERATIONS="${BENCH_ITERATIONS:-5}"
 SHA="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 BASE="${BENCH_OUT:-target/bench/core-${SHA}}"
+# `cargo bench` runs the target with its cwd set to the package root
+# (`crates/atomcode-capabilities`), so a relative --out would land in the
+# package's target/ tree, not the repository's. Resolve it here.
+case "$BASE" in
+  /*|[A-Za-z]:/*) ;;
+  *) BASE="$REPO/$BASE" ;;
+esac
 
 ARGS=(--iterations "$ITERATIONS" --out "$BASE")
 
@@ -29,7 +36,7 @@ if [ "${BENCH_E2E:-0}" = "1" ]; then
   fi
   if [ -x "$BIN" ]; then
     case "$BIN" in
-      /*) export BENCH_ATOMCODE_BIN="$BIN" ;;
+      /*|[A-Za-z]:/*) export BENCH_ATOMCODE_BIN="$BIN" ;;
       *) export BENCH_ATOMCODE_BIN="$REPO/$BIN" ;;
     esac
     ARGS+=(--e2e)

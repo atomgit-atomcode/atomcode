@@ -18,6 +18,9 @@ BENCH_ITERATIONS=10 ./scripts/bench.sh
 BENCH_OUT=target/bench/my-change ./scripts/bench.sh
 ```
 
+`BENCH_OUT` is resolved from the repository root, even when `cargo bench` runs
+the target from the package directory.
+
 The harness needs no network, no model and no real terminal.
 
 ## Metrics
@@ -46,6 +49,10 @@ BENCH_E2E=1 ./scripts/bench.sh
 These numbers include process startup. They depend on the terminal, the OS page
 cache, the CPU governor and the machine load. Compare them only on the same
 machine, and only as a trend. Do not use them as a pass/fail threshold.
+
+A non-zero exit, a spawn failure or empty stdout drops the whole process-level
+metric. The harness prints the exit code and stderr. It never reports a failed
+run as a fast sample.
 
 The script builds `target/release/atomcode` if it is missing. Set
 `BENCH_ATOMCODE_BIN` to time an existing binary.

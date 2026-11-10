@@ -146,8 +146,19 @@ impl Options {
 fn bench_sse(iterations: usize) -> Vec<Sample> {
     const LINES: usize = 20_000;
     const PER_CHUNK: usize = 512;
-    let _ = provider_bench::sse_feed(LINES, PER_CHUNK);
-    let samples = measure(iterations, || provider_bench::sse_feed(LINES, PER_CHUNK));
+    let warm = provider_bench::sse_feed(LINES, PER_CHUNK);
+    assert!(
+        warm >= LINES,
+        "SSE decoder produced {warm} events, expected at least {LINES}"
+    );
+    let samples = measure(iterations, || {
+        let decoded = provider_bench::sse_feed(LINES, PER_CHUNK);
+        assert!(
+            decoded >= LINES,
+            "SSE decoder produced {decoded} events, expected at least {LINES}"
+        );
+        decoded
+    });
     vec![Sample::new(
         "sse_feed",
         samples,
@@ -161,7 +172,9 @@ fn bench_file_index(iterations: usize) -> Vec<Sample> {
 
     let samples = measure(iterations, || {
         let index = FileIndex::new(fixture.root.clone(), ".atomcode");
-        index.filter_blocking("", "")
+        let entries = index.filter_blocking("", "");
+        assert!(!entries.is_empty(), "file index returned no entries");
+        entries
     });
     vec![Sample::new(
         "file_index_first_walk",
@@ -182,14 +195,16 @@ fn bench_grep(iterations: usize) -> Vec<Sample> {
     let cold = vec![runtime.block_on(async {
         let start = Instant::now();
         let result = tool.execute(args, &ctx).await;
-        black_box((result.content.len(), result.is_error));
+        assert!(!result.is_error, "grep failed: {}", result.content);
+        black_box(result.content.len());
         start.elapsed().as_secs_f64() * 1000.0
     })];
 
     let warm = measure(iterations, || {
         runtime.block_on(async {
             let result = tool.execute(args, &ctx).await;
-            black_box((result.content.len(), result.is_error));
+            assert!(!result.is_error, "grep failed: {}", result.content);
+            black_box(result.content.len());
         })
     });
 
@@ -205,21 +220,34 @@ fn bench_read(iterations: usize) -> Vec<Sample> {
     make_big_file(&path, BIG_FILE_MIB).expect("write big file");
     let tool = ReadFileTool::new(false);
     let ctx = context(&fixture.root);
-    let args = format!(
-        r#"{{"file_path":"{}","offset":{READ_WINDOW_OFFSET},"limit":{READ_WINDOW_LIMIT}}}"#,
-        path.to_string_lossy()
-    );
+    // Build the arguments with `serde_json`. A `format!` template broke on
+    // Windows paths: `\U`, `\A` and `\w` are not valid JSON escapes, so the
+    // tool only measured its argument-parse failure path.
+    let args = serde_json::json!({
+        "file_path": path.to_string_lossy(),
+        "offset": READ_WINDOW_OFFSET,
+        "limit": READ_WINDOW_LIMIT,
+    })
+    .to_string();
+    serde_json::from_str::<serde_json::Value>(&args)
+        .expect("read_file arguments must be valid JSON");
 
     let runtime = runtime();
     // Warm the page cache once; the metric is the decode/scan cost, not the
     // first cold disk read.
     runtime.block_on(async {
-        let _ = tool.execute(&args, &ctx).await;
+        let result = tool.execute(&args, &ctx).await;
+        assert!(
+            !result.is_error,
+            "read_file warm-up failed: {}",
+            result.content
+        );
     });
     let samples = measure(iterations, || {
         runtime.block_on(async {
             let result = tool.execute(&args, &ctx).await;
-            black_box((result.content.len(), result.is_error));
+            assert!(!result.is_error, "read_file failed: {}", result.content);
+            black_box(result.content.len());
         })
     });
 
@@ -239,8 +267,18 @@ fn bench_session_list(iterations: usize) -> Vec<Sample> {
         create_session(&manager, &fixture.root, &format!("list-{index:06}"), 0);
     }
 
-    let _ = manager.list();
-    let samples = measure(iterations, || manager.list());
+    let listed = manager.list();
+    assert_eq!(
+        listed.len(),
+        SESSIONS,
+        "session list saw {} sessions, expected {SESSIONS}",
+        listed.len()
+    );
+    let samples = measure(iterations, || {
+        let listed = manager.list();
+        assert_eq!(listed.len(), SESSIONS, "session list lost sessions");
+        listed
+    });
     vec![Sample::new(
         "session_list",
         samples,
@@ -256,8 +294,14 @@ fn bench_session_resume(iterations: usize) -> Vec<Sample> {
 
     // Warm the log once, then reopen it. Each reopen re-reads and re-projects
     // the whole log; that is the path P3 is meant to improve.
-    let _ = manager.open_for_resume(&lease);
-    let samples = measure(iterations, || manager.open_for_resume(&lease));
+    manager
+        .open_for_resume(&lease)
+        .expect("resume warm-up failed");
+    let samples = measure(iterations, || {
+        manager
+            .open_for_resume(&lease)
+            .expect("resume benchmark failed")
+    });
 
     vec![Sample::new(
         "session_resume",
@@ -294,24 +338,28 @@ fn bench_e2e(iterations: usize) -> Vec<Sample> {
             "process wall time; full screen composition; no tty",
         ),
     ] {
-        // Warm the binary and page cache once. A cold first run measured 6.9 s
-        // for a debug binary whose pages were not resident; that is not a useful
-        // signal for a code change.
-        let _ = Command::new(&bin)
-            .args(&args)
-            .env("ATOMCODE_HOME", home.path())
-            .output()
-            .expect("warm atomcode");
-        let runs = measure(iterations, || {
-            let start = Instant::now();
-            let output = Command::new(&bin)
-                .args(&args)
-                .env("ATOMCODE_HOME", home.path())
-                .output()
-                .expect("spawn atomcode");
-            black_box((output.status.success(), output.stdout.len()));
-            start.elapsed().as_secs_f64() * 1000.0
-        });
+        // A non-zero exit is not a fast sample. `--tui` fails immediately
+        // without a tty, on a missing config, or after an argument rename. Drop
+        // the whole metric instead of reporting a misleading median.
+        if let Err(error) = run_timed(&bin, &args, home.path()) {
+            eprintln!("skipping {name}: warm-up {error}");
+            continue;
+        }
+        let mut runs = Vec::with_capacity(iterations);
+        let mut failed = None;
+        for _ in 0..iterations {
+            match run_timed(&bin, &args, home.path()) {
+                Ok(elapsed) => runs.push(elapsed),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failed {
+            eprintln!("skipping {name}: {error}");
+            continue;
+        }
         samples.push(Sample::new(
             name,
             runs,
@@ -319,6 +367,33 @@ fn bench_e2e(iterations: usize) -> Vec<Sample> {
         ));
     }
     samples
+}
+
+/// Run one process-level sample. A non-zero exit, a spawn failure or empty
+/// stdout is an error, not a timing.
+fn run_timed(bin: &Path, args: &[&str], home: &Path) -> Result<f64, String> {
+    let start = Instant::now();
+    let output = Command::new(bin)
+        .args(args)
+        .env("ATOMCODE_HOME", home)
+        .output()
+        .map_err(|error| format!("spawn failed: {error}"))?;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    if !output.status.success() {
+        let stderr: String = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(400)
+            .collect();
+        return Err(format!(
+            "exited with {:?}: {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        return Err("exited 0 but produced no stdout".into());
+    }
+    Ok(elapsed)
 }
 
 // ---------------------------------------------------------------------------
