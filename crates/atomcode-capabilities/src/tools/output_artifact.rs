@@ -286,6 +286,17 @@ any value from that range until you have read it.",
     )
 }
 
+/// The message for a capture that could not be saved anywhere. Both errors are
+/// named: the bare "(could not be saved.)" it replaces left the reader unable to
+/// tell a full disk from a permission problem, which is why the smoke run could
+/// not explain why `fetch_output` had no id to read.
+fn both_failed_message(primary: &std::io::Error, fallback: &std::io::Error) -> String {
+    format!(
+        "Full captured result unavailable — could not be saved: primary store error: {primary}; \
+fallback store error: {fallback}."
+    )
+}
+
 pub struct ArtifactMiddleware {
     store: Arc<ArtifactStore>,
     /// `[tools.output] threshold_bytes`, when the deployment set one.
@@ -323,7 +334,21 @@ impl ArtifactMiddleware {
             } else {
                 match self.store.put(result.content.as_bytes()) {
                     Ok(id) => format!("Full captured result saved as artifact {id}; read with fetch_output(artifact_id=\"{id}\", offset=0, limit={FETCH_MAX_LIMIT})."),
-                    Err(_) => "Full captured result unavailable (could not be saved).".into(),
+                    Err(primary) => {
+                        // The configured directory can be unwritable (read-only volume,
+                        // permissions, full disk). Falling back keeps fetch_output usable for
+                        // this session instead of silently dropping the middle of the output.
+                        let fallback = ArtifactStore::new(
+                            std::env::temp_dir()
+                                .join(format!("atomcode-artifacts-{}", std::process::id())),
+                        );
+                        match fallback.put(result.content.as_bytes()) {
+                            Ok(id) => format!(
+                                "Full captured result saved as a TEMPORARY artifact {id} (primary store failed: {primary}); read it with fetch_output(artifact_id=\"{id}\") in this session."
+                            ),
+                            Err(fallback_err) => both_failed_message(&primary, &fallback_err),
+                        }
+                    }
                 }
             };
             result.content = format!(
@@ -430,6 +455,44 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
 #[cfg(test)]
 mod tests {
+    /// The smoke run saw `(could not be saved.)` for three different sizes with no
+    /// id and no reason. A spill that cannot reach its configured directory must
+    /// still hand the model a readable artifact, and must name the failure.
+    #[test]
+    fn primary_store_failure_falls_back_to_a_temp_artifact() {
+        let d = tempfile::tempdir().unwrap();
+        // A regular FILE where the store's parent directory must be → create_dir_all fails.
+        let blocked = d.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store);
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: "first\nsecond\nthird\n[exit code 0]".into(),
+            ..Default::default()
+        };
+        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "[atomcode: output truncated");
+        assert!(
+            result.content.contains("TEMPORARY artifact"),
+            "must fall back instead of giving up: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("primary store failed"),
+            "must name the primary failure: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn both_failed_message_names_both_errors() {
+        let primary = std::io::Error::other("primary denied");
+        let fallback = std::io::Error::other("fallback denied");
+        let msg = super::both_failed_message(&primary, &fallback);
+        assert!(msg.contains("primary denied"), "{msg}");
+        assert!(msg.contains("fallback denied"), "{msg}");
+        assert!(!msg.contains("could not be saved.)"), "no bare message: {msg}");
+    }
+
     #[test]
     fn requested_shell_tail_keeps_status_and_saves_utf8_capture() {
         let dir = tempfile::tempdir().unwrap();
@@ -458,7 +521,9 @@ mod tests {
         let blocker = dir.path().join("file");
         std::fs::write(&blocker, "not a directory").unwrap();
         for (path, full, reason) in [
-            (blocker, "first\nlast".to_string(), "could not be saved"),
+            // An unwritable primary store now falls back to a per-process temp store,
+            // so the honest message names the TEMPORARY artifact and the primary error.
+            (blocker, "first\nlast".to_string(), "TEMPORARY artifact"),
             (
                 dir.path().join("ceiling"),
                 format!("{}\nlast", "x".repeat(super::MAX_ARTIFACT_BYTES)),
