@@ -779,9 +779,12 @@ impl SessionManager {
                     }
                     state
                 }
+                // Only consecutive leading adds can be reflected by the old
+                // tail. Looking past an update can falsely match a longer suffix
+                // and discard a new add before replay reaches that update.
                 let added: Vec<String> = calls
                     .iter()
-                    .filter_map(|(_, _, _, _, arguments)| added_content(arguments))
+                    .map_while(|(_, _, _, _, arguments)| added_content(arguments))
                     .collect();
                 let pattern: Vec<&str> = added.iter().map(String::as_str).collect();
                 let text: Vec<&str> = items.iter().map(|item| item.content.trim()).collect();
@@ -6052,6 +6055,99 @@ mod tests {
                 index: 0,
             })
         );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_does_not_match_adds_across_an_update() {
+        use crate::session::manager::TodoSidecarItem;
+        use atomcode_kernel::tool::ToolCall;
+        let (_dir, manager) = store();
+        let id = "legacy-leading-run-cross-update";
+        let lease = created(&manager, id);
+        let actions = [
+            r#"{"action":"add","content":"A"}"#,
+            r#"{"action":"update","id":1,"status":"completed"}"#,
+            r#"{"action":"add","content":"B"}"#,
+        ];
+        manager
+            .append_events(&lease, &[logged(1, 0, SessionEvent::TurnStart { turn: 1 })])
+            .unwrap();
+        for (i, args) in actions.iter().enumerate() {
+            manager
+                .append_events(
+                    &lease,
+                    &[logged(
+                        i as u64 + 2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: i as u32 + 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: format!("c{i}"),
+                                name: "todowrite".into(),
+                                arguments: (*args).into(),
+                            }],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    )],
+                )
+                .unwrap();
+        }
+        let original: Vec<_> = ["plan", "A", "B"]
+            .into_iter()
+            .map(|content| TodoSidecarItem {
+                content: content.into(),
+                status: "pending".into(),
+            })
+            .collect();
+        manager
+            .append_events(&lease, &[logged(5, 0, SessionEvent::TurnStart { turn: 2 })])
+            .unwrap();
+        manager.write_todo_sidecar(id, &original, 2, None).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        let actual = manager.read_todo_sidecar(id).unwrap().unwrap();
+        let contents: Vec<_> = actual
+            .todos
+            .iter()
+            .map(|item| item.content.as_str())
+            .collect();
+        // The only leading add is A, but the old sidecar ends in B: no
+        // reflected leading run matches. Both new adds must be retained.
+        assert_eq!(contents, vec!["plan", "A", "B", "A", "B"]);
+        assert_eq!(actual.todos[0].status, "completed");
+        manager.rebuild_todo_sidecar_after_undo(id).unwrap();
+        let repeated = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(
+            repeated
+                .todos
+                .iter()
+                .map(|item| (&item.content, &item.status))
+                .collect::<Vec<_>>(),
+            actual
+                .todos
+                .iter()
+                .map(|item| (&item.content, &item.status))
+                .collect::<Vec<_>>(),
+            "rebuilding again must not replay the adds"
+        );
+        assert_eq!(repeated.through, actual.through);
     }
 
     #[cfg(feature = "tools")]
