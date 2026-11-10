@@ -650,6 +650,62 @@ async fn bg_drop_cancels_a_running_one() {
     rig.quit().await;
 }
 
+/// New tasks use the parent's live mode, not the spawn factory's defaults.
+/// A later change on the parent never silently raises a child's permissions.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn background_tasks_snapshot_live_permissions_and_reviews_stay_read_only() {
+    use atomcode_host_api::Mode;
+    for (mode, scope, expected) in [
+        (Mode::Auto, None, Mode::Auto),
+        (Mode::AcceptEdits, None, Mode::AcceptEdits),
+        (Mode::Plan, None, Mode::Plan),
+        (Mode::Ask, None, Mode::Ask),
+        (Mode::Auto, Some("working_tree".to_string()), Mode::Plan),
+    ] {
+        let rig = Rig::new().await;
+        let parent = rig.client.root();
+        let control = rig.control();
+        control
+            .call(HostCommand::SetMode {
+                session: parent.clone(),
+                mode,
+            })
+            .await
+            .unwrap();
+        let reply = control
+            .call(HostCommand::StartBackground {
+                text: "slow job".into(),
+                scope,
+            })
+            .await
+            .unwrap();
+        let HostReply::Backgrounded { session: child, .. } = reply else {
+            panic!("{reply:?}");
+        };
+        // Keep the child running while the parent changes its own mode.
+        control
+            .call(HostCommand::SetMode {
+                session: parent.clone(),
+                mode: Mode::Auto,
+            })
+            .await
+            .unwrap();
+        control
+            .call(HostCommand::Foreground {
+                session: parent,
+                target: child.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            control.call(HostCommand::Mode { session: child }).await.unwrap(),
+            HostReply::Mode { mode: Some(actual) } if actual == expected
+        ));
+        rig.quit().await;
+    }
+}
+
 /// **`/background <task>` runs a task without changing the foreground.** The
 /// screen stays on the session it was on; the task runs in a session of its
 /// own; `/bg 1` then brings that one forward with its answer.

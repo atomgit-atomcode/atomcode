@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use atomcode_capabilities::session::manager::SessionOrigin;
 use atomcode_coding::front_end::FrontEnd;
-use atomcode_coding::runtime::{RuntimePhase, UserInput};
+use atomcode_coding::runtime::{RuntimeMode, RuntimePhase, UserInput};
 use atomcode_coding::{CodingAgentConfig, CodingRuntime};
 use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
@@ -602,6 +602,17 @@ fn log_of_control(control: &RuntimeControl) -> Vec<LoggedEvent> {
         .and_then(|app| Feed::find(&app, &session))
         .map(|agent| agent.session().events())
         .unwrap_or_default()
+}
+
+fn review_task(request: Option<&str>, task: &str) -> String {
+    let context = request
+        .map(|request| format!("=== ORIGINATING REQUEST (CONTEXT ONLY) === {request}\n\n"))
+        .unwrap_or_default();
+    format!(
+        "{context}=== ASSIGNED READ-ONLY REVIEW ===\n{task}\n\n\
+         Review and report findings only. Do not edit files, commit, push, or create pull requests. \
+         The originating conversation owns all follow-up work, including work requested above."
+    )
 }
 
 fn current_request(log: &[LoggedEvent]) -> Option<String> {
@@ -1680,14 +1691,9 @@ impl Background {
             let log = log_of(&state.front);
             current_request(&log)
         };
-        let text = match request {
-            Some(request) => format!(
-                "{request}\n\n{}",
-                text.split_once('\n')
-                    .map_or(text.as_str(), |(_, instructions)| instructions)
-            ),
-            None => text,
-        };
+        // The parent's request is context, not another assignment. In
+        // particular, its authorized edits/commit/PR remain the parent's job.
+        let text = review_task(request.as_deref(), &text);
         self.start_locked(working_dir, text, scope, name)
             .await
             .map(Some)
@@ -1708,16 +1714,34 @@ impl Background {
             }
             state.front.control.clone()
         };
+        // Read the live owner's mode, not the launch-time configuration. Take
+        // one snapshot for this new task; later changes do not alter it.
+        let review_only = scope.is_some() || name.as_deref() == Some("code-review");
+        let mode = if review_only {
+            RuntimeMode::Plan
+        } else {
+            control
+                .runtime()
+                .mode()
+                .await
+                .map_err(crate::host::refused)?
+        };
         // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
         let files = scope
             .as_deref()
             .and_then(|scope| changed_files(&working_dir, scope));
         let mut live = self.spawn_at(working_dir.clone()).await?;
+        // Configure before publishing the slot or submitting any work. Failure
+        // retires the candidate and never runs it with a fallback permission.
+        if let Err(error) = live.control.runtime().set_mode(mode).await {
+            stop(live).await;
+            return Err(crate::host::refused(error));
+        }
         // 它是替**前台那个**干的:干完把结果投回去,而不是留在这里等人来读。
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
-        live.review_only = scope.is_some() || name.as_deref() == Some("code-review");
+        live.review_only = review_only;
         live.name = name;
         live.task = one_line(&text);
         let session = live.control.session_id();
@@ -1985,6 +2009,16 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_review_keeps_context_without_assigning_follow_up_work() {
+        let text = review_task(Some("审查后修复、提交并创建 PR"), "Review staged changes");
+        assert!(text.contains("ORIGINATING REQUEST (CONTEXT ONLY)"));
+        assert!(text.contains("审查后修复、提交并创建 PR"));
+        assert!(text.contains("ASSIGNED READ-ONLY REVIEW ===\nReview staged changes"));
+        assert!(text.contains("Do not edit files, commit, push, or create pull requests"));
+        assert!(review_task(None, "review task").contains("review task"));
+    }
 
     #[test]
     fn embedded_navigation_preserves_busy_refusals() {
