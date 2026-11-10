@@ -35,6 +35,8 @@ function shortSessionId(id: string): string {
 const SIDEBAR_WIDTH_KEY = 'atomcode-sidebar-width';
 const SIDEBAR_MIN = 180;
 const SIDEBAR_MAX = 500;
+const SIDEBAR_MAX_RATIO = 0.35;
+const SIDEBAR_COLLAPSE_AT = 140;
 
 function readSidebarWidth(): number | null {
   try {
@@ -119,7 +121,7 @@ export function App() {
   // Keep the responsive CSS width until a stored or dragged width exists.
   const [sidebarWidth, setSidebarWidth] = useState<number | null>(readSidebarWidth);
   const resizingRef = useRef<{
-    x: number; width: number; cursor: string; userSelect: string;
+    x: number; width: number; preferred: number | null; cursor: string; userSelect: string;
   } | null>(null);
   const widthRef = useRef(sidebarWidth);
 
@@ -127,7 +129,18 @@ export function App() {
     function onMouseMove(e: MouseEvent) {
       const drag = resizingRef.current;
       if (!drag) return;
-      const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, drag.width + e.clientX - drag.x));
+      const requested = drag.width + e.clientX - drag.x;
+      if (requested < SIDEBAR_COLLAPSE_AT) {
+        // A collapse gesture must not replace the last expanded preference
+        // with the temporary narrow widths crossed during the drag.
+        widthRef.current = drag.preferred;
+        setSidebarWidth(drag.preferred);
+        finishResize();
+        setSidebarCollapsed(true);
+        return;
+      }
+      const max = Math.min(SIDEBAR_MAX, window.innerWidth * SIDEBAR_MAX_RATIO);
+      const w = Math.min(max, Math.max(SIDEBAR_MIN, requested));
       widthRef.current = w;
       setSidebarWidth(w);
     }
@@ -510,6 +523,7 @@ export function App() {
             e.preventDefault();
             resizingRef.current = {
               x: e.clientX,
+              preferred: widthRef.current,
               width: e.currentTarget.previousElementSibling?.getBoundingClientRect().width ?? 280,
               cursor: document.body.style.cursor,
               userSelect: document.body.style.userSelect,

@@ -1,3 +1,4 @@
+import { SessionHoverCard } from './SessionHoverCard';
 import { ModalOverlay } from './ModalOverlay';
 import { WorkspaceActionDialog } from './WorkspaceActions';
 import { visibleWorkspaces, applyWorkspacePreference } from '../lib/workspaceActions';
@@ -1348,7 +1349,6 @@ export function Sidebar({
   const renderItem = (s: SessionMetaWithProject) => {
     const active = s.id === activeSessionId;
     const label = s.name || s.id.slice(0, 8);
-    const dir = shortDir(s.working_dir);
     return (
       <div
         key={s.id}
@@ -1359,13 +1359,13 @@ export function Sidebar({
           (menuFor === s.id ? ' menu-open' : '')
         }
       >
-        <button class="session-item-main" onClick={() => onSelect(s)} title={`${label}\n${dir}${runningSessionId && s.id !== runningSessionId ? `\n${t('browse.sidebarHint')}` : ''}`}>
+        <SessionHoverCard title={label} directory={s.working_dir} onSelect={() => onSelect(s)}>
           <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
           {s.id === runningSessionId && <span class="session-running-mark">{t('browse.running')}</span>}
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>
-        </button>
+        </SessionHoverCard>
         <button
           class="session-item-kebab"
           onClick={(e) => openItemMenu(e as unknown as MouseEvent, s.id)}
@@ -1553,8 +1553,6 @@ export function Sidebar({
           </button>
         )}
       </div>
-
-      {runningSessionId && <p class="session-browse-sidebar-hint">{t('browse.sidebarHint')}</p>}
 
       <div
         class="session-list-body"
