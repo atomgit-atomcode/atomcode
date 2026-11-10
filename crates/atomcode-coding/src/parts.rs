@@ -910,6 +910,19 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         host_only_tools.extend(names[before..].iter().cloned());
     }
 
+    #[cfg(feature = "grape")]
+    if opts.tools && !atomcode_config::config::offline::is_offline_active() {
+        atomcode_capabilities::tools::grape::register_grape_tools(&mut registry, cfg.dirs.user())
+            .map_err(|error| io::Error::other(format!("Grape tool setup failed: {error}")))?;
+        let grape_names = atomcode_capabilities::tools::grape::GRAPE_TOOLS
+            .iter()
+            .map(|name| (*name).to_string());
+        for name in grape_names {
+            host_only_tools.push(name.clone());
+            names.push(name);
+        }
+    }
+
     if opts.tools && opts.web && !atomcode_config::config::offline::is_offline_active() {
         registry.register(Arc::new(WebFetchTool));
         // web_search backend: explicit config wins; else the `ATOMCODE_WEB_SEARCH_PROVIDER`

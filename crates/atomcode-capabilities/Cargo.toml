@@ -165,6 +165,7 @@ web = ["tools", "dep:reqwest", "dep:url", "tokio/net"]
 # `tools`; pulls the async HTTP stack (reqwest). NOT in default — an embedder that
 # wants no AtomGit egress skips it.
 atomgit = ["tools", "dep:reqwest", "dep:atomcode-auth"]
+grape = ["tools", "dep:reqwest", "dep:atomcode-auth"]
 # Code-intelligence tools (tree-sitter symbol extraction): list_symbols / read_symbol.
 # Opt-in (NOT default) — pulls 12 tree-sitter grammar crates (heavy C compilation).
 codeintel = [

@@ -86,6 +86,10 @@ Automation:
 - `auto_fix` — automatic lint/typecheck fix loop
 - `use_skill` — invoke a user-defined skill
 
+### Grape Remote Workflows
+
+Authorize once with `/grape` in the TUI or `atomcode grape connect` (official cloud; GitCode login and beta eligibility required), then use native Grape tools to query projects, retrieve repository knowledge, hand off existing Issues and inspect remote results. No copied API key or separate MCP server is required. Grape service-side support must be deployed first. See [authorization and usage](docs/grape.md).
+
 ### Multi-Provider Support
 
 Connect to any LLM that supports OpenAI's function-calling API:
