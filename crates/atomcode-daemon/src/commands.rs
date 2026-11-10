@@ -39,6 +39,9 @@ pub(crate) struct CommandReq {
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum CommandResult {
+    Quality {
+        text: String,
+    },
     Undo {
         undone: usize,
     },
@@ -861,6 +864,15 @@ pub(crate) async fn run_command(
         }
     };
     let result = match req.command.as_str() {
+        "quality" => match req.session_id {
+            Some(session) => crate::native_live::quality(session, req.arg)
+                .await
+                .map(|text| CommandResult::Quality { text })
+                .map_err(|error| {
+                    anyhow::anyhow!("Quality command requires the current live session: {error:?}")
+                }),
+            None => Err(anyhow::anyhow!("session_id required for quality")),
+        },
         "undo" => exec_undo(
             &working_dir,
             req.session_id.as_deref(),

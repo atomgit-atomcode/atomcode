@@ -279,3 +279,10 @@ test('display titles filter skills while completion and dispatch keep canonical 
   assert.deepEqual(calls, ['exec:linyaps-packager:app']);
   assert.deepEqual(await dispatchSlashCommand('/玲珑打包技能', map, h), { handled: false, unknown: true });
 });
+
+test('/quality dispatches to the server without changing approval mode', async () => {
+  const { h, calls } = fakeHandlers();
+  const result = await dispatchSlashCommand('/quality status', buildCommandMap(FRONTEND_COMMANDS), h);
+  assert.deepEqual(result, { handled: true });
+  assert.deepEqual(calls, ['exec:quality:status']);
+});

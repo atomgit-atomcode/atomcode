@@ -2490,6 +2490,7 @@ impl Plugin for CapabilityCommandsPlugin {
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,
             Arc::new(LoopCommand(self.0.clone())),
+            Arc::new(QualityCommand(self.0.clone())),
             Arc::new(QueueCommand(self.0.clone())),
             Arc::new(PolicyCommand(self.0.clone())),
             Arc::new(WorktreeCommand(self.0.clone(), self.1.clone())),
@@ -4742,5 +4743,29 @@ mod goal_rate_limit_classification_tests {
                 began.elapsed()
             );
         }
+    }
+}
+
+struct QualityCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for QualityCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "quality",
+            Some("on|off|status|evidence|waive <reason>"),
+            "Configure quality checks and inspect verification evidence",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        self.0
+            .quality_for_session(agent.session_id().into(), args.into())
+            .await
     }
 }

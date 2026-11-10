@@ -1601,6 +1601,7 @@ pub async fn mount_swappable(
 /// See [`crate::host_rows`] for how each becomes a row.
 #[derive(Default)]
 pub struct HostState {
+    pub(crate) quality: Option<Arc<crate::quality::QualityControl>>,
     pub session: crate::host_rows::SessionSeed,
     pub hooks: Option<Arc<crate::host_rows::HostHooks>>,
     /// The person's live switches, and the session grants plan mode keeps for
@@ -2112,6 +2113,9 @@ fn compose_hosted(
     if let Some(middleware) = host.middleware.as_ref() {
         hosted = hosted.then(middleware.rows());
     }
+    if host.quality.is_some() {
+        hosted = hosted.insert(atomcode_plexus::Entry::named("quality-host"));
+    }
     layers.push(hosted.then(host.rows.clone()));
     for layer in extra_layers {
         layers.push(layer.clone());
@@ -2127,6 +2131,13 @@ fn compose_hosted(
     // What IS registered here is what this crate owns: the coding discipline.
     let mut registry = catalog();
     registry.register(Arc::new(InjectProvider(providers.clone())));
+    if let Some(control) = host.quality.clone() {
+        registry.register(Arc::new(crate::quality::QualityPlugin {
+            control,
+            cwd: working_dir.to_path_buf(),
+            evidence_root: dirs.user().join("quality-evidence"),
+        }));
+    }
     if let Some(stored) = host.session.stored.clone() {
         registry.register(Arc::new(crate::session_store::SessionStorePlugin(stored)));
     }
@@ -2305,6 +2316,13 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Veri
     ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
     {
         let response = next.run(req).await?;
+        if self
+            .ctx
+            .service::<crate::quality::QualitySvc>()
+            .is_some_and(|quality| quality.enabled())
+        {
+            return Ok(response);
+        }
         // A round that asked for tools is not finished, and the loop will carry
         // on by itself. The cadence is about the round where the model says it
         // is done.

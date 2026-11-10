@@ -1028,6 +1028,11 @@ impl PluginAgentLoop {
                     break;
                 }
                 Err(error) => {
+                    if error.policy_denied {
+                        outcome.stop = StopReason::PolicyDenied;
+                        outcome.error = Some(error.message);
+                        break;
+                    }
                     if let Some(pause) = error.rate_limit_pause.clone() {
                         outcome.provider_error = Some(error.clone());
                         // Not a failure: the turn stops cleanly and says when to

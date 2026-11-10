@@ -232,7 +232,9 @@ impl Plugin for BashToolPlugin {
             )
             .await,
         )?;
-        let bash = BashTool::new(sensitive.clone()).with_output_preview_provider(provider.clone());
+        let bash = BashTool::new(sensitive.clone())
+            .with_output_preview_provider(provider.clone())
+            .with_execution_observer(shell_execution_observer(ctx));
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
                 provider.clone(),
@@ -335,4 +337,28 @@ impl Plugin for SearchToolsPlugin {
         );
         Ok(())
     }
+}
+
+/// Read the live optional observer so host rows can mount after the tool row.
+pub(super) fn shell_execution_observer(
+    ctx: &Context,
+) -> Arc<dyn atomcode_capabilities::tools::bash::ShellExecutionObserver> {
+    struct Observer(Context);
+    impl atomcode_capabilities::tools::bash::ShellExecutionObserver for Observer {
+        fn interested(&self, ctx: &atomcode_kernel::tool::ToolContext) -> bool {
+            self.0
+                .service::<crate::seams::ShellExecutionSvc>()
+                .is_some_and(|observer| observer.interested(ctx))
+        }
+        fn completed(
+            &self,
+            ctx: &atomcode_kernel::tool::ToolContext,
+            receipt: &atomcode_capabilities::tools::bash::ShellExecutionReceipt,
+        ) {
+            if let Some(observer) = self.0.service::<crate::seams::ShellExecutionSvc>() {
+                observer.completed(ctx, receipt);
+            }
+        }
+    }
+    Arc::new(Observer(ctx.clone()))
 }

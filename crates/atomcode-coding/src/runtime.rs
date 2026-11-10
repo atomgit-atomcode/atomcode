@@ -975,6 +975,12 @@ impl From<&str> for UserInput {
 /// runs from a front end — never a tool the model can reach.
 #[async_trait::async_trait]
 pub trait RuntimeCommands: Send + Sync {
+    async fn quality_for_session(&self, _session: String, args: String) -> Result<String, String> {
+        self.quality(args).await
+    }
+    async fn quality(&self, _args: String) -> Result<String, String> {
+        Err("Quality is unavailable in this host.".into())
+    }
     /// Work towards `condition` on its own until it holds.
     async fn start_goal(&self, condition: String) -> Result<(), String>;
     /// Stop the goal that is running.
@@ -2635,6 +2641,23 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn quality_for_session(
+        &self,
+        session: Option<String>,
+        args: String,
+    ) -> Result<String, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Quality {
+                generation: self.status().generation,
+                session,
+                args,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn set_mode(&self, mode: RuntimeMode) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
@@ -4062,6 +4085,12 @@ pub enum CodingRuntimeControl {
     PauseGoal {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    Quality {
+        generation: u64,
+        session: Option<String>,
+        args: String,
+        done: oneshot::Sender<Result<String, RuntimeError>>,
     },
     SetMode {
         generation: u64,
@@ -6009,6 +6038,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 goal.as_ref().map(|state| state.phase),
                                 Some(GoalPhase::Paused | GoalPhase::PausedAtCap)
                             );
+                        if reengage && resources.as_ref().is_some_and(|runtime| runtime.parts.quality.enabled()) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("Stop the paused goal before using quality for ordinary tasks.".into()))); continue;
+                        }
                         if reengage {
                             if let Some(state) = goal.as_mut() {
                                 let was_user_paused = state.phase == GoalPhase::Paused;
@@ -7237,6 +7269,35 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = done.send(Err(RuntimeError::DeliveryFailed));
                             }
                         }
+                    }
+                    Some(CodingRuntimeControl::Quality { generation: request_generation, session, args, done }) => {
+                        let Some(runtime) = resources.as_ref() else { let _ = done.send(Err(RuntimeError::Unavailable)); continue; };
+                        if request_generation != generation || compaction_suspended { let _ = done.send(Err(RuntimeError::Busy)); continue; }
+                        if session.as_ref().is_some_and(|id| runtime.parts.session.as_ref().is_none_or(|binding| &binding.id != id)) {
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
+                        }
+                        let mutation = matches!(args.trim(), "on" | "off") || args.trim().starts_with("waive ");
+                        if args.trim() == "on" && (background_jobs.pending() || background_jobs.uncollected()) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("Collect or stop background jobs before enabling quality.".into()))); continue;
+                        }
+                        if mutation && (active_turn.is_some() || held_turn.is_some() || goal.as_ref().is_some_and(|g| g.active) || loop_state.as_ref().is_some_and(|l| l.active)) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("Change quality policy only while idle, with goal/loop stopped.".into()))); continue;
+                        }
+                        // Policy switches must remain usable even if an older audit file is corrupt.
+                        let needs_evidence = matches!(args.trim(), "" | "status" | "evidence") || args.trim().starts_with("waive ");
+                        if needs_evidence && active_turn.is_none() {
+                            if let Some(session) = runtime.parts.session.as_ref() {
+                                if let Err(error) = runtime.parts.quality.restore_evidence(&session.id, &runtime.config.dirs.user().join("quality-evidence")) {
+                                    let _ = done.send(Err(RuntimeError::CommandRefused(error))); continue;
+                                }
+                            }
+                        }
+                        let result = runtime.parts.quality.command(&args, &runtime.config.working_dir).await.map_err(RuntimeError::CommandRefused);
+                        if mutation && result.is_ok() {
+                            let said = args.trim().strip_prefix("waive ").map(crate::told::quality_waived).unwrap_or_else(|| crate::told::quality_changed(runtime.parts.quality.enabled()));
+                            tell(runtime, Some(said));
+                        }
+                        let _ = done.send(result);
                     }
                     Some(CodingRuntimeControl::SetMode {
                         generation: request_generation, mode, done,
@@ -9608,6 +9669,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, images, done, recovery_tx }) => {
+                        if resources.as_ref().is_some_and(|r| r.parts.quality.enabled()) { let _ = done.send(Err(RuntimeError::CommandRefused("Quality currently supports ordinary tasks only; disable it before starting goal/loop.".into()))); continue; }
                         if follow_up.is_some() { let _ = done.send(Err(RuntimeError::CommandRefused("clear the pending follow-up before starting goal/loop".into()))); continue; }
                         if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
@@ -9777,6 +9839,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                     }
                     Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done, recovery_tx }) => {
+                        if resources.as_ref().is_some_and(|r| r.parts.quality.enabled()) { let _ = done.send(Err(RuntimeError::CommandRefused("Quality currently supports ordinary tasks only; disable it before starting goal/loop.".into()))); continue; }
                         if follow_up.is_some() { let _ = done.send(Err(RuntimeError::CommandRefused("clear the pending follow-up before starting goal/loop".into()))); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
@@ -11011,6 +11074,9 @@ fn reject_runtime_control_with_error(
         CodingRuntimeControl::Snapshot { done, .. } => {
             let _ = done.send(Err(error));
         }
+        CodingRuntimeControl::Quality { done, .. } => {
+            let _ = done.send(Err(error));
+        }
         CodingRuntimeControl::ContextStats { done, .. } => {
             let _ = done.send(Err(error));
         }
@@ -11994,6 +12060,7 @@ fn harness_host_state(
         )),
     );
     Ok(crate::on_harness::HostState {
+        quality: Some(parts.quality.clone()),
         // What a host outside this workspace brought. Registered only: the
         // rows that mount them come in its layers, last (see `mount`).
         plugins: prepare.host_plugins.plugins.clone(),
@@ -12641,6 +12708,16 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
 
 #[async_trait::async_trait]
 impl RuntimeCommands for CodingRuntimeHandle {
+    async fn quality_for_session(&self, session: String, args: String) -> Result<String, String> {
+        CodingRuntimeHandle::quality_for_session(self, Some(session), args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn quality(&self, args: String) -> Result<String, String> {
+        CodingRuntimeHandle::quality_for_session(self, None, args)
+            .await
+            .map_err(|e| e.to_string())
+    }
     async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, String> {
         CodingRuntimeHandle::goal_questions(self)
             .await

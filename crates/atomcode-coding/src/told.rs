@@ -219,6 +219,7 @@ mod tests {
     pub(super) fn heard(control: &CodingRuntimeControl) -> Heard {
         use CodingRuntimeControl as C;
         match control {
+            C::Quality { args, .. } => if matches!(args.trim(), "on" | "off") || args.trim().starts_with("waive ") { Heard::Told } else { Heard::Nothing },
             C::ReassembleProvider { .. }
             | C::SetMode { .. }
             | C::McpAct { .. }
@@ -336,4 +337,17 @@ mod tests {
         );
         assert!(said.contains("and 5 more"), "{said}");
     }
+}
+
+/// An independent human quality policy changed; no authority is granted here.
+pub(crate) fn quality_changed(enabled: bool) -> String {
+    reminder(if enabled {
+        "The person enabled quality checks. The host will run configured checks before ordinary changed-task handoff, through normal approvals. Do not claim quality passed before the host's result."
+    } else {
+        "The person disabled quality checks. This is not evidence that checks passed; report verification limits accurately."
+    })
+}
+
+pub(crate) fn quality_waived(reason: &str) -> String {
+    reminder(&format!("The person explicitly waived the previous quality result: {reason}. This is a waiver, not passing verification. Future tasks still follow the configured quality policy."))
 }

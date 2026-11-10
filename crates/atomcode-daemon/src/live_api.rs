@@ -326,6 +326,7 @@ pub(crate) fn chat_runtime_config(
         mcp: true,
         telemetry: Some(telemetry),
         datalog: config.datalog.clone(),
+        quality: config.quality.clone(),
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
         reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
         reasoning_effort_levels: p.and_then(|p| p.reasoning_effort_levels.clone()),

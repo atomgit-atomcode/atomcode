@@ -903,6 +903,19 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
+    pub async fn quality(&self, session: String, args: String) -> Result<String, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::RuntimeRejected(
+                "Quality command targets a different session.".into(),
+            ));
+        }
+        handle
+            .quality_for_session(Some(session), args)
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))
+    }
+
     pub async fn set_mode(&self, mode: atomcode_coding::RuntimeMode) -> Result<(), HubError> {
         self.bound_handle()?
             .1
@@ -2202,6 +2215,31 @@ mod tests {
         let after = hub.binding().unwrap();
         assert_eq!(before.id, after.id);
         assert_eq!(before.session_id, after.session_id);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn quality_changes_reject_another_session_without_rebinding() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        hub.bind(
+            "session-a",
+            project.path().to_path_buf(),
+            snapshot("one"),
+            Arc::new(RealControl {
+                handle: runtime.handle.clone(),
+            }),
+        )
+        .unwrap();
+        let before = hub.binding().unwrap();
+        let result = hub.quality("session-b".into(), "off".into()).await;
+        assert!(
+            matches!(result, Err(HubError::RuntimeRejected(message)) if message.contains("different session"))
+        );
+        assert_eq!(hub.binding().unwrap().id, before.id);
         runtime.handle.shutdown().await.unwrap();
     }
 

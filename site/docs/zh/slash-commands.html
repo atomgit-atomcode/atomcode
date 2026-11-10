@@ -131,6 +131,26 @@
         <p>不必等回合结束就能查看状态:<code>/status</code>、<code>/diff</code>、<code>/cost</code>、<code>/usage</code>、<code>/rename</code> 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 <kbd>Esc</kbd> 关闭),不打断进行中的回合。<code>/usage</code> 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。</p>
       </div>
 
+      <h2 id="quality">质量检查策略</h2>
+      <p><code>/quality on</code> 开启、<code>/quality off</code> 关闭；<code>/quality status</code> 查看当前状态，<code>/quality evidence</code> 查看最近一次证据。策略与 Build / Auto 等审批模式独立，检查命令仍遵守原有权限。修改策略时需处于空闲状态。</p>
+      <p>先在用户配置中明确指定检查命令（以下仅为示例，请换成项目实际命令）：</p>
+      <pre><code>[quality]
+# 默认关闭；也可用 /quality on 在当前会话开启
+enabled = false
+
+[[quality.gates]]
+name = "tests"
+command = "npm test -- --run"
+timeout_secs = 120
+
+[[quality.gates]]
+name = "types"
+command = "npx tsc --noEmit"
+timeout_secs = 60</code></pre>
+      <p>配置加载后，普通任务产生改动时，交付前按顺序运行所有检查。全部检查成功且检查期间文件未再变化，才显示 Quality Passed。失败、拒绝、超时、取消或证据保存失败不会通过；文件保留，不自动回滚或提交。后续修改文件后，<code>/quality status</code> 会将旧结果标为 Stale。没有改动的任务标为 NotRequired，不宣称已经测试。</p>
+      <p>确需接受未通过的结果时，可在任务停止后运行 <code>/quality waive &lt;原因&gt;</code>。它新增一份人工豁免记录，保留原始失败证据，显示 Waived 而非 Passed，也不会关闭后续任务的质量检查。检查结果只证明配置命令对记录的文件版本执行成功，不保证没有 Bug。</p>
+      <p>第一版仅支持有初始提交的本地 Git 工作区和普通前台任务，开启时不能启动 goal / loop、团队委派或后台命令。快照覆盖版本控制中的文件和未被忽略的新文件，不覆盖忽略的构建产物或外部服务；子模块不在支持范围内。单项检查限时 1–300 秒；快照最多 256 MiB 文件内容，单文件最多 64 MiB，diff 最多 32 MiB，超过限制会拒绝验证。证据保存在用户数据目录的 <code>quality-evidence/</code>，包含文件指纹、diff、命令、真实退出码、耗时和输出，可能含私有代码或敏感日志，请谨慎分享。重启后开关以配置为准，已保存证据仍可查看。</p>
+
       <h2 id="context-inspection">上下文与提示查看</h2>
       <p><code>/context</code> 显示上下文预算与占用统计。在 TUI 中，<code>/context prompt</code> 显示当前加载组件组装出的系统提示正文，<code>/context persona</code> 只显示角色提示及其追加设置。</p>
       <p>系统提示正文不等于完整模型请求：工具定义和对话历史另算。提示正文查看入口以上述 TUI 命令为准，WebUI 的 <code>/context</code> 只提供预算统计。关于正常压缩时的保护范围，以及恢复后提示为何可能变化，见 <a href="./sessions.html#prompt-retention">会话提示保留策略</a>。</p>

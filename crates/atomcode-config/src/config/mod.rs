@@ -665,6 +665,9 @@ pub struct Config {
     /// having to know the field names in advance.
     #[serde(default, skip_serializing)]
     pub datalog: DatalogConfig,
+    /// Explicit opt-in coding quality checks, independent of approval mode.
+    #[serde(default, skip_serializing_if = "QualityConfig::is_default")]
+    pub quality: QualityConfig,
     /// Task-finished notifications. Saved manually with help comments so users
     /// can discover the terminal-first strategy and platform fallbacks.
     #[serde(default, skip_serializing)]
@@ -1186,6 +1189,7 @@ impl Default for Config {
             models: HashMap::new(),
             default_model: None,
             modes: Default::default(),
+            quality: Default::default(),
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
@@ -4036,6 +4040,7 @@ model = "missing-type"
             models: HashMap::new(),
             default_model: None,
             modes: Default::default(),
+            quality: Default::default(),
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),
@@ -5587,5 +5592,108 @@ mod goal_recovery_policy_tests {
         );
         let roundtrip: Config = toml::from_str(&toml::to_string(&overnight).unwrap()).unwrap();
         assert_eq!(roundtrip.goal, overnight.goal);
+    }
+}
+
+/// Trusted, explicitly configured foreground checks. Never inferred from repository text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gates: Vec<QualityGate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityGate {
+    pub name: String,
+    pub command: String,
+    #[serde(default = "quality_timeout")]
+    pub timeout_secs: u64,
+}
+fn quality_timeout() -> u64 {
+    60
+}
+impl QualityConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.gates.is_empty() {
+            return Err(
+                "Quality has no configured gates. Configure [[quality.gates]] first.".into(),
+            );
+        }
+        if self.gates.len() > 16 {
+            return Err("Quality supports at most 16 gates.".into());
+        }
+        let mut names = std::collections::HashSet::new();
+        for gate in &self.gates {
+            if gate.name.trim().is_empty()
+                || gate.command.trim().is_empty()
+                || !names.insert(&gate.name)
+            {
+                return Err(
+                    "Quality gates need unique nonempty names and nonempty commands.".into(),
+                );
+            }
+            if !(1..=300).contains(&gate.timeout_secs) {
+                return Err("Quality timeout_secs must be between 1 and 300.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod quality_config_tests {
+    use super::*;
+    #[test]
+    fn quality_configuration_survives_save_and_load() {
+        let mut config = Config::default();
+        config.quality = QualityConfig {
+            enabled: true,
+            gates: vec![QualityGate {
+                name: "types".into(),
+                command: "tsc --noEmit".into(),
+                timeout_secs: 120,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().quality, config.quality);
+    }
+    #[test]
+    fn quality_requires_explicit_bounded_unique_checks() {
+        assert!(QualityConfig::default().validate().is_err());
+        let gate = QualityGate {
+            name: "test".into(),
+            command: "true".into(),
+            timeout_secs: 60,
+        };
+        assert!(QualityConfig {
+            enabled: true,
+            gates: vec![gate.clone()]
+        }
+        .validate()
+        .is_ok());
+        assert!(QualityConfig {
+            enabled: true,
+            gates: vec![gate.clone(), gate.clone()]
+        }
+        .validate()
+        .is_err());
+        assert!(QualityConfig {
+            enabled: true,
+            gates: vec![QualityGate {
+                timeout_secs: 301,
+                ..gate
+            }]
+        }
+        .validate()
+        .is_err());
     }
 }

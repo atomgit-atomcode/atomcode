@@ -59,6 +59,8 @@ pub struct ModelRequest {
 /// 400 for a 429.
 #[derive(Clone, Debug)]
 pub struct RequestError {
+    /// A host policy refused completion; no provider failure occurred.
+    pub policy_denied: bool,
     pub message: String,
     /// The provider's own verdict on whether trying again could help.
     pub retryable: bool,
@@ -101,6 +103,7 @@ impl RequestError {
             rate_limit_pause: None,
             partial: None,
             unexecuted_tool_output: false,
+            policy_denied: false,
         }
     }
 
@@ -117,6 +120,7 @@ impl RequestError {
             rate_limit_pause: None,
             partial: None,
             unexecuted_tool_output: false,
+            policy_denied: false,
         }
     }
 

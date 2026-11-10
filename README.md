@@ -51,7 +51,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 ### Agent Loop
 
 - **Autonomous multi-step execution** — reads files, edits code, runs tests, fixes errors, all in a loop
-- **Verification loop** — automatically verifies edits via syntax checks before declaring success
+- **Verification guidance** — reminds the agent to check unverified code edits; opt-in quality gates provide configured command checks
 - **Dynamic step budget** — scales with the number of edited files, capped per turn to bound cost
 - **Loop detection** — detects and breaks out of repetitive tool-call patterns
 - **3-layer JSON repair** — recovers malformed tool-call arguments
@@ -60,6 +60,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 ### Modes & Autonomy
 
 - **Plan / Build modes** — `/plan` switches to read-only exploration (the agent investigates without touching files); `/build` switches back to full execution
+- **Quality policy** — `/quality on` runs explicitly configured checks before ordinary changed-task handoff, retaining logs and file fingerprints. Independent of approvals; failures preserve files. See [configuration and limits](site/docs/en/slash-commands.html#quality).
 - **Goal mode** — `/goal <text>` sets a completion condition and the agent loops autonomously, turn after turn, until the goal is met
 - **Recurring work** — `/loop 5m <task>` repeats work at the chosen interval; `/loop stop` ends the loop.
 - **Subagents and teams** — drivers with subagents enabled support delegating work through `task` / `team`.
@@ -522,6 +523,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | -------------- | --------------------------------------------------------------------------------- |
 | `/plan`        | Switch to Plan mode (read-only exploration)                                       |
 | `/build`       | Switch to Build mode (full execution)                                             |
+| `/quality` | Enable/disable configured checks, inspect status/evidence, or record a human waiver |
 | `/goal <text>` | Set a completion goal — the agent loops autonomously until it's met               |
 | `/review`      | Code review the current changes (`/review` · `/review staged` · `/review <base>`) |
 | `/think`       | Control extended thinking (on / off / budget N)                                   |

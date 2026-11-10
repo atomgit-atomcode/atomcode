@@ -131,6 +131,26 @@
         <p>You don't have to wait for a turn to finish to check on things: <code>/status</code>, <code>/diff</code>, <code>/cost</code>, <code>/usage</code>, and <code>/rename</code> run even while the agent is streaming. They render as a transient panel below the input box (press <kbd>Esc</kbd> to dismiss) without interrupting the running turn. <code>/usage</code> mid-turn is also tab-switchable across its Current / Overview / Models views.</p>
       </div>
 
+      <h2 id="quality">Quality checks</h2>
+      <p><code>/quality on</code> enables checks, <code>/quality off</code> disables them, <code>/quality status</code> reports the current state, and <code>/quality evidence</code> shows the latest evidence. Quality is independent of Build / Auto approval modes; commands still obey existing permissions. Change the policy only while idle.</p>
+      <p>Explicitly configure checks in your user configuration first. Replace these examples with the project's actual commands:</p>
+      <pre><code>[quality]
+# Disabled by default; /quality on enables it for the current session
+enabled = false
+
+[[quality.gates]]
+name = "tests"
+command = "npm test -- --run"
+timeout_secs = 120
+
+[[quality.gates]]
+name = "types"
+command = "npx tsc --noEmit"
+timeout_secs = 60</code></pre>
+      <p>After loading the configuration, ordinary tasks that change files run all checks sequentially before handoff. Quality Passed requires successful checks with no further file changes during verification. Failure, denial, timeout, cancellation, or evidence persistence failure cannot pass. Files are retained; no automatic rollback or commit occurs. After later edits, <code>/quality status</code> marks old results Stale. Unchanged tasks are NotRequired, which does not claim tests ran.</p>
+      <p>To explicitly accept an unverified result after the task stops, run <code>/quality waive &lt;reason&gt;</code>. This adds an audited human waiver, retains the original failure evidence, and displays Waived rather than Passed. Future tasks remain gated. Passing only establishes that configured commands succeeded for the recorded file version, not that the code is bug-free.</p>
+      <p>The first version supports ordinary foreground tasks in local Git worktrees with an initial commit; goal / loop, team delegation, and background commands are unavailable while it is enabled. Snapshots cover tracked files and nonignored new files, not ignored build artifacts or external services; submodules are unsupported. Each check allows 1–300 seconds. Snapshots allow up to 256 MiB of file contents, 64 MiB per file, and 32 MiB of diff; exceeding a limit refuses verification. Evidence under <code>quality-evidence/</code> in the user data directory includes file fingerprints, diffs, commands, actual exit codes, durations, and output. It may contain private code or sensitive logs; review before sharing. After restart, the configuration determines the enabled state, and saved evidence remains readable.</p>
+
       <h2 id="context-inspection">Context and prompt inspection</h2>
       <p><code>/context</code> reports context-budget and usage statistics. In the TUI, <code>/context prompt</code> displays the system prompt assembled by the currently loaded components, while <code>/context persona</code> shows only the persona and its append settings.</p>
       <p>The system prompt is not the complete model request: tool definitions and conversation history are separate. These prompt-text inspection commands apply to the TUI; the WebUI's <code>/context</code> provides budget statistics only. For compaction protection and why prompts can change after resuming, see <a href="./sessions.html#prompt-retention">session prompt retention</a>.</p>

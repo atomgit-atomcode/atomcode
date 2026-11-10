@@ -150,3 +150,6 @@ pub use atomcode_plexus as plexus;
 mod session_reference;
 
 mod mode_models;
+
+/// Opt-in, runtime-owned quality verification and evidence.
+pub mod quality;

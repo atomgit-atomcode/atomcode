@@ -1279,6 +1279,7 @@ export async function postLiveProvider(
 // --- /command endpoint ---
 
 export type CommandResult =
+  | { kind: 'quality'; text: string }
   | { kind: 'undo'; undone: number }
   | { kind: 'remember'; scope: 'global' | 'project' | 'local'; text?: string }
   | { kind: 'memory_action'; text: string }

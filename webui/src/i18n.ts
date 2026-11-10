@@ -673,6 +673,7 @@ const zh = {
   'cmd.cost.desc': '显示本会话累计 token 用量',
   'cmd.cost.body': '本会话累计 {tokens} tokens（{turns} 轮）',
   'cmd.todo.desc': '显示当前待办清单',
+  'cmd.quality.desc': '配置质量检查，查看验证状态与证据',
   'cmd.todo.header': '当前待办：',
   'cmd.todo.empty': '暂无待办',
 
@@ -1473,6 +1474,7 @@ const en: Record<MsgKey, string> = {
   'cmd.cost.desc': 'Show cumulative token usage for this session',
   'cmd.cost.body': '{tokens} tokens used this session ({turns} turns)',
   'cmd.todo.desc': 'Show the current todo list',
+  'cmd.quality.desc': 'Configure quality checks and inspect verification evidence',
   'cmd.todo.header': 'Current todos:',
   'cmd.todo.empty': 'No todos',
 

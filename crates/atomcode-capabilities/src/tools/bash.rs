@@ -124,7 +124,24 @@ pub use background::{
 /// container, a remote sandbox. Everything this tool keeps is the part that is
 /// the same wherever it runs: what counts as destructive, how long to wait, and
 /// how to present the result.
+/// A completed foreground shell process, observed before textual rendering or truncation.
+/// Absence of this receipt (denial, timeout, cancellation, spawn failure) is not success.
+#[derive(Clone, Debug)]
+pub struct ShellExecutionReceipt {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Host-provided read-only execution observation; never authorizes an operation.
+pub trait ShellExecutionObserver: Send + Sync {
+    fn interested(&self, ctx: &ToolContext) -> bool;
+    fn completed(&self, ctx: &ToolContext, receipt: &ShellExecutionReceipt);
+}
+
 pub struct BashTool {
+    observer: Option<Arc<dyn ShellExecutionObserver>>,
     label: &'static str,
     world: Arc<dyn crate::world::Shell>,
     output_preview: Option<super::output_artifact::ArtifactStoreProvider>,
@@ -152,7 +169,13 @@ impl BashTool {
             label: "bash",
             sensitive,
             output_preview: None,
+            observer: None,
         }
+    }
+
+    pub fn with_execution_observer(mut self, observer: Arc<dyn ShellExecutionObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub(crate) fn with_label(mut self, label: &'static str) -> Self {
@@ -363,6 +386,13 @@ impl Tool for BashTool {
             // command had just started and call a finished command a timeout.
             res = process.collect_within(Some(dur)) => match res {
                 Ok(Some(collected)) => {
+                    if let Some(observer) = self.observer.as_ref().filter(|observer| observer.interested(ctx)) {
+                        observer.completed(ctx, &ShellExecutionReceipt {
+                            command: a.command.clone(), exit_code: collected.exit.code,
+                            stdout: self.world.decode(&collected.stdout),
+                            stderr: self.world.decode(&collected.stderr),
+                        });
+                    }
                     let mut result = format_output(
                         &self.world.decode(&collected.stdout),
                         &self.world.decode(&collected.stderr),

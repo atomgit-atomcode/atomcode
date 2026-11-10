@@ -966,3 +966,7 @@ pub async fn follow_up(
 ) -> Result<serde_json::Value, crate::live_hub::HubError> {
     hub().follow_up(session, args).await
 }
+
+pub async fn quality(session: String, args: String) -> Result<String, HubError> {
+    hub().quality(session, args).await
+}

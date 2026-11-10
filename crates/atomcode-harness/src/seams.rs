@@ -1350,3 +1350,5 @@ mod prompt_fragment_tests {
         assert_eq!(prompts.render(), "unrelated persona");
     }
 }
+
+plexus_service!(ShellExecutionSvc => dyn atomcode_capabilities::tools::bash::ShellExecutionObserver, "shell-execution-observer", Seam, "Read-only foreground process completion receipts");

@@ -158,6 +158,7 @@ pub struct CodingAgentConfig {
     pub telemetry: Option<std::sync::Arc<atomcode_telemetry::Telemetry>>,
     /// Best-effort per-turn Markdown + per-round JSONL logging.
     pub datalog: atomcode_config::config::DatalogConfig,
+    pub quality: atomcode_config::config::QualityConfig,
     /// Provider `reasoning_history` override (`"include"` | `"exclude"`), passed
     /// through verbatim to the provider builder. `None`/empty (default) ⇒ the
     /// adapter's per-model auto-detect ([`ReasoningPolicy::derive`]). This is the
@@ -317,6 +318,7 @@ pub struct CodingRuntimeConfig {
     pub mcp: bool,
     pub telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
     pub datalog: atomcode_config::config::DatalogConfig,
+    pub quality: atomcode_config::config::QualityConfig,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
     /// The effort levels this endpoint exposes (server-advertised or folded builtin).
@@ -548,6 +550,7 @@ pub fn describe_config_file_for(
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[dap]` `enabled` (default true): local DAP debugging with automatic Python/debugpy and LLDB discovery on launch. Optional `[dap.adapters.<id>]` `command` / `args` override built-ins; adapters are installed separately. Reload configuration after editing; never put credentials in adapter arguments. Debugging uses execution approval and is not restored with a session.\n\
          - `[coding]` `architecture_topology` (default false): opt in to read-only repository architecture evidence; use `/config` to toggle and reload capabilities, or reload/restart after editing the file. No scan until the tool is called.\n\
+         - `[quality]` `enabled` (default false), `[[quality.gates]]` with unique `name`, explicit shell `command`, and `timeout_secs` (1–300, default 60). Independent of approval mode; `/quality on|off|status|evidence|waive <reason>` controls ordinary-task checks. No automatic rollback or commit. Commands still obey tool approvals.\n\
          - `[coding]` `auto_review` (default true; false removes automatic pre-handoff review guidance while retaining explicit reviews; `ATOMCODE_AUTO_REVIEW` overrides), \
          `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
@@ -693,6 +696,7 @@ impl CodingRuntimeConfig {
             mcp: true,
             telemetry,
             datalog: config.datalog.clone(),
+            quality: config.quality.clone(),
             reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
             reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
             reasoning_effort_levels: r.and_then(|r| r.reasoning_effort_levels.clone()),
@@ -793,6 +797,7 @@ impl CodingRuntimeConfig {
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
         config.datalog = self.datalog.clone();
+        config.quality = self.quality.clone();
         config.reasoning_history = self.reasoning_history.clone();
         config.chat_options.reasoning_effort =
             atomcode_kernel::provider::ReasoningEffort::from_config(
@@ -1309,6 +1314,7 @@ impl CodingAgentConfig {
             chat_options: Default::default(),
             telemetry: None,
             datalog: atomcode_config::config::DatalogConfig::default(),
+            quality: Default::default(),
             reasoning_history: None,
             provider_type: "openai".into(),
             thinking_enabled: None,

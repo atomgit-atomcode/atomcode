@@ -2553,6 +2553,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             return;
           }
           if (res.kind === 'remember') { pushCommandNotice(res.text ?? t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'quality') { pushCommandNotice(res.text); return; }
           if (res.kind === 'memory_action') { pushCommandNotice(res.text); return; }
           if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
           if (res.kind === 'memory') {

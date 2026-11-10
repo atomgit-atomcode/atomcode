@@ -183,6 +183,7 @@ impl Plugin for BashWorldToolPlugin {
             .await,
         )?;
         let bash = BashTool::with_world(shell.clone(), sensitive.clone())
+            .with_execution_observer(super::tools::shell_execution_observer(ctx))
             .with_output_preview_provider(provider.clone());
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(

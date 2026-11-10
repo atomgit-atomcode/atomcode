@@ -616,6 +616,7 @@ fn resolve_skill_dirs_at(
 /// Everything `assemble` composes — and everything a respawn must REUSE so state
 /// survives (approval grants, hook state, session identity).
 pub struct CodingParts {
+    pub(crate) quality: Arc<crate::quality::QualityControl>,
     /// What preparing left out or changed that the person should be told —
     /// [`CodingAgentConfig::startup_warnings`] plus what `prepare` found (an
     /// external agent whose binary is missing, an in-flight prompt a resume
@@ -1335,6 +1336,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         credential_shell_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
+        quality: Arc::new(crate::quality::QualityControl::new(cfg.quality.clone())),
         registry,
         tool_names: names,
         todo_enabled,
@@ -1632,6 +1634,7 @@ impl CodingParts {
     /// Carry session-scoped runtime decisions across a capability-graph rebuild.
     /// Fresh/resume/project switches deliberately keep their newly prepared stores.
     pub(crate) fn inherit_runtime_continuity(&mut self, previous: &CodingParts) {
+        self.quality.inherit(&previous.quality);
         self.plan_mode = Arc::clone(&previous.plan_mode);
         self.bypass_mode = Arc::clone(&previous.bypass_mode);
         self.accept_edits = Arc::clone(&previous.accept_edits);
