@@ -66,7 +66,9 @@ impl Tool for SearchReplaceTool {
         "Find and replace text across MANY files at once — replaces every occurrence in \
          every matching file. Use for project-wide renames (a CSS class, an import, a \
          config key, a string literal). For a single file, prefer `edit_file`. \
-         `regex:true` enables regex (with `$1`/`$2` capture groups in `replace`); the \
+         `regex:true` enables regex (with `$1`/`$2` capture groups in `replace`; write \
+         `${1}` when the number is followed by name characters, e.g. `${1}_DONE` — \
+         `$1_DONE` is read as the group name `1_DONE` and is now rejected); the \
          default is literal matching. `glob` limits scope (e.g. \"*.rs\", \"src/**/*.ts\"); \
          `path` sets the search root (default: working directory)."
     }
@@ -75,7 +77,7 @@ impl Tool for SearchReplaceTool {
             "type": "object",
             "properties": {
                 "search": { "type": "string", "description": "Text or regex pattern to find" },
-                "replace": { "type": "string", "description": "Replacement text (use $1, $2 for regex captures)" },
+                "replace": { "type": "string", "description": "Replacement text (use $1, $2 for regex captures; use ${1} when a digit is followed by name characters — $${1}_DONE, not $1_DONE)" },
                 "glob": { "type": "string", "description": "File pattern to limit scope, e.g. \"*.rs\", \"src/**/*.ts\" (default: all files)" },
                 "path": { "type": "string", "description": "Directory to search in (default: working directory)" },
                 "regex": { "type": "boolean", "description": "Use regex matching (default: false = literal)" }
@@ -129,6 +131,13 @@ impl Tool for SearchReplaceTool {
         } else {
             None
         };
+        // Refuse an unexpandable `$ref` BEFORE the walk touches anything: the
+        // regex crate would otherwise expand it to the empty string.
+        if let Some(re) = re.as_ref() {
+            if let Err(e) = validate_replacement(re, &a.replace) {
+                return err(e);
+            }
+        }
         let glob_filter = match a.glob.as_deref() {
             Some(p) => match FileGlob::new(p) {
                 Ok(g) => Some(g),
@@ -222,6 +231,74 @@ async fn sr_scan(
         }
     }
     Ok((modified, scanned))
+}
+
+/// Capture-group references a replacement string makes, following the `regex`
+/// crate's expansion rules: `$$` is a literal `$`, `${name}` is a braced
+/// reference, and `$name` takes the longest run of `[0-9A-Za-z_]`.
+///
+/// Why this exists: `replace_all` treats `$1_DONE` as the group name `1_DONE`,
+/// which does not exist, and expands the whole match to the EMPTY string —
+/// silently emptying the file. Naming an unknown group is a caller mistake we
+/// can detect before touching the disk.
+fn dollar_refs(rep: &str) -> Vec<String> {
+    let chars: Vec<char> = rep.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        // `$$` → a literal dollar sign, not a reference.
+        if i + 1 < chars.len() && chars[i + 1] == '$' {
+            i += 2;
+            continue;
+        }
+        // `${name}` — everything up to the closing brace.
+        if i + 1 < chars.len() && chars[i + 1] == '{' {
+            match chars[i + 2..].iter().position(|c| *c == '}') {
+                Some(off) => {
+                    out.push(chars[i + 2..i + 2 + off].iter().collect());
+                    i = i + 3 + off;
+                }
+                None => i += 1,
+            }
+            continue;
+        }
+        // `$name` — longest run of name characters.
+        let start = i + 1;
+        let mut end = start;
+        while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+        if end > start {
+            out.push(chars[start..end].iter().collect());
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Reject a replacement that references a capture group the pattern does not
+/// have. Called once, before any file is read or written.
+fn validate_replacement(re: &regex::Regex, replace: &str) -> Result<(), String> {
+    let names: Vec<&str> = re.capture_names().flatten().collect();
+    for group in dollar_refs(replace) {
+        let known = match group.parse::<usize>() {
+            Ok(idx) => idx < re.captures_len(),
+            Err(_) => names.iter().any(|n| *n == group),
+        };
+        if !known {
+            return Err(format!(
+                "search_replace: replace refers to capture group '${group}', which this pattern does not have. \
+                 Use ${{N}} when a digit is followed by name characters (e.g. ${{1}}_DONE, not $1_DONE)."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The replacement for one file's content, or `None` when nothing changes. Pure, so
@@ -353,6 +430,63 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(d.path().join("outside.txt")).unwrap(),
             "foo"
+        );
+    }
+
+    /// `$1_DONE` is read by the `regex` crate as the group name "1_DONE", which does
+    /// not exist → the whole match expands to the empty string and the file is silently
+    /// emptied. The tool must refuse instead of writing that.
+    #[tokio::test]
+    async fn regex_replacement_rejects_unknown_group_from_trailing_identifier() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("sr.txt");
+        std::fs::write(&file, "SMOKE_OK\n").unwrap();
+        let tool = SearchReplaceTool::with_world(
+            Arc::new(LocalFs::new(d.path())),
+            crate::product_dirs::test_dirs(),
+        );
+        let r = tool
+            .execute(
+                r#"{"search":"(SMOKE)_OK","replace":"$1_DONE","path":".","glob":"sr.txt","regex":true}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "unknown group must be rejected, got: {}", r.content);
+        assert!(
+            r.content.contains("1_DONE"),
+            "the error must name the bad reference, got: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "SMOKE_OK\n",
+            "the file must be untouched when the replacement is refused"
+        );
+    }
+
+    /// The validator must ACCEPT the braced form — it is the documented way to put a
+    /// group next to name characters, and a bug in the reference scanner would
+    /// otherwise reject it.
+    #[tokio::test]
+    async fn regex_replacement_accepts_braced_group() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("sr.txt");
+        std::fs::write(&file, "SMOKE_OK\n").unwrap();
+        let tool = SearchReplaceTool::with_world(
+            Arc::new(LocalFs::new(d.path())),
+            crate::product_dirs::test_dirs(),
+        );
+        let r = tool
+            .execute(
+                r#"{"search":"(SMOKE)_OK","replace":"${1}_DONE","path":".","glob":"sr.txt","regex":true}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "SMOKE_DONE\n",
+            "braced group expands to the captured text"
         );
     }
 
