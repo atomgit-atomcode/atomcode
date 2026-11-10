@@ -1174,8 +1174,8 @@ fn warn_console_encoding() {
         let (input, output) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
         if input != CP_UTF8 || output != CP_UTF8 {
             eprintln!(
-                "Console code pages: input {input}, output {output} (expected UTF-8 / 65001).\n\
-                 CJK input/output may be garbled. Use Windows Terminal, or launch with:\n\
+                "Console code pages before TUI setup: input {input}, output {output} (UTF-8 is 65001).\n\
+                 The TUI will request UTF-8 and verify it before accepting input. Legacy console paths may alter pasted Unicode, including emoji, not just its display. If setup fails, use Windows Terminal or launch with:\n\
                  cmd.exe /c \"chcp 65001 >nul & atomcode\""
             );
         }
