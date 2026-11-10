@@ -1346,7 +1346,10 @@ mod tests {
             "an oversized pinned budget is clamped to the window-relative budget"
         );
 
-        // With no known window, the pinned budget still has a finite ceiling.
+        // Cross the ceiling: a small fixture would produce the same plan even
+        // if the unknown-window clamp were accidentally removed.
+        conv.messages[6].text = "x".repeat(MAX_RECENT_KEEP_TOKENS * 4 + 4096);
+        assert!(conv.messages[6].estimate_tokens() as usize > MAX_RECENT_KEEP_TOKENS);
         let mut unknown_window = view(&conv.messages, floor);
         unknown_window.ctx_window = 0;
         let capped = StubCompaction::new(MAX_RECENT_KEEP_TOKENS, true)
@@ -1355,6 +1358,11 @@ mod tests {
         let oversized = StubCompaction::new(usize::MAX, true)
             .plan(&unknown_window)
             .await;
+        assert!(capped.rewrites.iter().any(|(index, _)| *index == 6));
+        assert!(
+            oversized.rewrites.iter().all(|(index, _)| *index < 7),
+            "the active turn stays full"
+        );
         assert_eq!(
             oversized.rewrites, capped.rewrites,
             "an oversized pinned budget is capped when the window is unknown"
