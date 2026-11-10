@@ -485,3 +485,18 @@ theme = "auto"
 # model = "your-fast-model"
 # context_window = 64000
 # capable_model = 0
+
+# =============================================================================
+# Context compaction (optional)
+# =============================================================================
+# [compaction]
+# token_limit = 200000       # Optional positive prompt-token threshold for earlier summarization.
+# stub_recent_budget = 100000 # Optional positive recent-history keep budget for tool-output stubs.
+# Both are omitted by default and apply after the agent is rebuilt.
+# stub_recent_budget only adjusts the retained span when compaction is triggered;
+# it does not trigger compaction earlier or cap total prompt tokens. The gentle
+# stub policy keeps the active user turn and exempts read_file results.
+# With a known window it cannot raise the window-relative keep budget; when
+# the window is unknown, a configured value is capped at 256000 tokens. Summary/overflow policies remain unchanged.
+# Rewriting old output may invalidate provider prompt-cache entries; savings
+# depend on the model, cache behavior, and workload.

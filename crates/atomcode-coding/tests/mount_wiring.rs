@@ -75,6 +75,31 @@ async fn the_configured_absolute_compaction_budget_reaches_the_existing_strategy
     assert!(runtime.agent_config().compact_token_limit.is_none());
 }
 
+#[tokio::test]
+async fn the_configured_stub_keep_budget_reaches_the_existing_strategy_row() {
+    let project = tempfile::tempdir().unwrap();
+    let file: atomcode_config::config::Config =
+        toml::from_str("[compaction]\nstub_recent_budget=100000").unwrap();
+    let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    );
+    let cfg = runtime.agent_config();
+    assert_eq!(cfg.compact_stub_recent_budget, Some(100_000));
+    let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+    assert!(
+        mounted.dump().contains("\"stub_recent_budget\": 100000"),
+        "{}",
+        mounted.dump()
+    );
+    mounted.shutdown().await;
+}
+
 /// Answers with a little text and a usage report — enough for a metering
 /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
 struct CannedProvider;

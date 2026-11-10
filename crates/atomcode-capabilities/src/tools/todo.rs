@@ -467,7 +467,8 @@ the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new p
 set it `in_progress`; the MOMENT it is actually done (verified) set it `completed`.\n\
 Each task is ONE specific, verifiable action with a concrete outcome a later turn can execute without re-planning — write `add error handling to load_config`, not `handle errors`, `task 1`, or `处理功能`. Keep \
 EXACTLY ONE task `in_progress` at a time (enforced automatically). Mark a task `completed` ONLY after the work is \
-actually done, never on intent. When planning from detailed user guidance, use todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch into a task title or guess the most recent message as its source. Incremental updates preserve these batch references.";
+actually done, never on intent. When planning from detailed user guidance, use todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch into a task title or guess the most recent message as its source. Incremental updates preserve these batch references. \
+Batch this update with the next substantive tool call in the SAME response whenever you are about to use one; do not spend a whole model round on a todo update by itself.";
 
 #[async_trait]
 impl Tool for TodoTool {
@@ -643,6 +644,14 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[test]
+    fn description_asks_to_batch_the_update_with_the_next_call() {
+        let tool = TodoTool::new();
+        let description = tool.description();
+        assert!(description.contains("SAME response"));
+        assert!(description.contains("do not spend a whole model round"));
     }
 
     #[tokio::test]

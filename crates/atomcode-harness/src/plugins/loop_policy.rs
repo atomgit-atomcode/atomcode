@@ -945,15 +945,32 @@ impl CompactionGate {
     /// failed summary must not bill again on every request while pressure stays
     /// high. A later provider report below the trigger rearms both stages.
     fn first_try(&self, session: &str, turn: u64, slow: bool) -> bool {
-        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
-        let entry = tried
-            .entry(session.to_string())
-            .or_insert((turn, [false; 2]));
-        if entry.0 != turn {
-            *entry = (turn, [false; 2]);
-        }
-        let first = !std::mem::replace(&mut entry.1[usize::from(slow)], true);
-        let both = entry.1.iter().all(|tried| *tried);
+        let (first, both) = {
+            let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+            let entry = if let Some(entry) = tried.get_mut(session) {
+                entry
+            } else {
+                // The key is allocated only for a session this gate has not
+                // seen (or one `rearm` removed); a turn keeps its entry, so
+                // the common request path does not allocate.
+                tried
+                    .entry(session.to_string())
+                    .or_insert((turn, [false; 2]))
+            };
+            if entry.0 != turn {
+                *entry = (turn, [false; 2]);
+            }
+            let first = !std::mem::replace(&mut entry.1[usize::from(slow)], true);
+            (first, entry.1.iter().all(|tried| *tried))
+        };
+        // The hint is advisory: publishing it after the unlock can race a
+        // concurrent update. A stale true makes `both_tried` take the lock and
+        // re-read the authoritative map, which then decides; a stale false
+        // skips that fast-path read, so the request pays one `calls_model`
+        // projection, but `first_try` below still makes the authoritative map
+        // read under the lock before deciding. Neither state changes a gate
+        // decision. Keeping the hash and atomic store outside the critical
+        // section shortens the only serialized part of the request path.
         self.hint.set(session, both);
         first
     }
