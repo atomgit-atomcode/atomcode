@@ -982,11 +982,28 @@ fn require_console_io(supported: bool) -> std::io::Result<()> {
     }
 }
 
+#[cfg(any(windows, test))]
+fn require_utf8_code_pages(input: u32, output: u32) -> std::io::Result<()> {
+    if input == 65001 && output == 65001 {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "Could not set Windows console UTF-8 code pages (input {input}, output {output}). \
+         Legacy console paths may alter pasted Unicode characters, including emoji. \
+         Launch with cmd.exe /c \"chcp 65001 >nul & atomcode\" or use Windows Terminal."
+    )))
+}
+
 /// Check the input/output transport before launching either Windows screen.
 /// Headless callers do not need console records and should skip this check.
 pub fn validate_interactive_io() -> std::io::Result<()> {
     #[cfg(windows)]
-    require_console_io(win_console::has_console_io())?;
+    {
+        require_console_io(win_console::has_console_io())?;
+        win_console::ensure_utf8();
+        let (input, output) = win_console::code_pages();
+        require_utf8_code_pages(input, output)?;
+    }
     Ok(())
 }
 
@@ -1017,9 +1034,15 @@ mod win_console {
         fn GetLastError() -> u32;
     }
 
+    pub(super) fn code_pages() -> (u32, u32) {
+        // SAFETY: these functions take no pointers and retain nothing.
+        unsafe { (GetConsoleCP(), GetConsoleOutputCP()) }
+    }
+
     pub(super) fn ensure_utf8() -> bool {
         const UTF8: u32 = 65001;
-        // SAFETY: these APIs read/set only this process's console code pages.
+        // SAFETY: these APIs read/set the attached console's code pages,
+        // which are shared with other processes attached to that console.
         // Zero means no attached console, so there is no code page to change.
         unsafe {
             let input = GetConsoleCP();
@@ -3071,6 +3094,18 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[test]
+    fn console_utf8_setup_requires_both_code_pages_to_succeed() {
+        assert!(require_utf8_code_pages(65001, 65001).is_ok());
+        for (input, output) in [(936, 65001), (65001, 936), (936, 936), (0, 0)] {
+            let error = require_utf8_code_pages(input, output)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("pasted Unicode") && error.contains("emoji"));
+            assert!(error.contains(&format!("input {input}, output {output}")));
         }
     }
 

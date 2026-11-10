@@ -13821,6 +13821,32 @@ mod paste_burst_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn windows_paste_keeps_committed_unicode_symbols_and_spaces_exactly() {
+        use crossterm::event::KeyEventKind;
+        let text = "【验证】✅一致 px 53:16 |  推断:Int64  |  悬停:Int64\n❌❓⚠️⏭😀";
+        // The Windows parser normalizes an Alt-release text commit to Press.
+        // Genuine key-up events must still be ignored, without duplicating text.
+        let script = text
+            .chars()
+            .flat_map(|c| {
+                let Event::Key(key) = (if c == '\n' { enter() } else { press(c) }) else {
+                    unreachable!()
+                };
+                let mut release = key;
+                release.kind = KeyEventKind::Release;
+                [(0, Event::Key(key)), (0, Event::Key(release))]
+            })
+            .collect();
+        let seen = pumped(script).await;
+        assert_eq!(seen, vec![Input::Paste(text.into())]);
+        let (host, tui) = assemble(Headless::new(80, 24));
+        tui.act(Action::Paste(text.into()), &tui.client);
+        let m = host.moment.read().unwrap();
+        assert_eq!(m.input, text);
+        assert!(!m.turn_open);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn windows_paste_releases_do_not_split_lines_into_submits() {
         use crossterm::event::KeyEventKind;
         let text =

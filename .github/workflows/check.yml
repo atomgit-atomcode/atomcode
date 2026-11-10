@@ -130,7 +130,7 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
   windows-path-encoding:
-    name: Windows Unicode path roundtrip
+    name: Windows Unicode input and path roundtrip
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -154,6 +154,18 @@ jobs:
         run: >-
           cargo nextest run -p atomcode-capabilities --lib
           -E 'test(windows_encoding_tests) | test(windows_powershell_versions) | test(chinese_workspace_paths) | test(encoded_command_preserves) | test(windows_diagnostics)'
+
+      # The vendored dependency is outside the workspace, so use its manifest
+      # to include its own test dependencies and exercise the native parser.
+      - name: Preserve Windows Alt-release Unicode text commits
+        run: >-
+          cargo nextest run --manifest-path vendor/crossterm/Cargo.toml --lib
+          -E 'test(windows_alt_unicode)'
+
+      - name: Preserve Unicode paste through the TUI input buffer
+        run: >-
+          cargo nextest run -p atomcode-tui --lib
+          -E 'test(windows_paste) | test(console_utf8_setup)'
 
       # The source is ASCII so Windows PowerShell 5.1 can read the probe itself.
       # Deliberately BOM-less script cases are diagnostic contrasts, not proof

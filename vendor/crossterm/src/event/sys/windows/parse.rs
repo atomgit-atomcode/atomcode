@@ -220,12 +220,11 @@ fn parse_key_event_record(key_event: &KeyEventRecord) -> Option<WindowsKeyEvent>
                 // values.
                 let ch = std::char::from_u32(unicode_scalar_value as u32).unwrap();
                 let key_code = KeyCode::Char(ch);
-                let kind = if key_event.key_down {
-                    KeyEventKind::Press
-                } else {
-                    KeyEventKind::Release
-                };
-                let key_event = KeyEvent::new_with_kind(key_code, modifiers, kind);
+                // This release commits text (Alt+Numpad, also synthesized by
+                // Windows paste), rather than releasing a previously typed
+                // character. Report it once as input so consumers that correctly
+                // ignore ordinary key-up events do not silently lose the text.
+                let key_event = KeyEvent::new(key_code, modifiers);
                 return Some(WindowsKeyEvent::KeyEvent(key_event));
             }
         }
@@ -375,4 +374,77 @@ fn parse_mouse_event_record(
         row: ypos,
         modifiers,
     }))
+}
+
+#[cfg(test)]
+mod windows_alt_unicode_tests {
+    use super::*;
+    use crossterm_winapi::InputRecord;
+    use winapi::um::wincon::{INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD};
+
+    fn record(vk: u16, down: bool, unit: u16) -> KeyEventRecord {
+        let mut native = INPUT_RECORD::default();
+        native.EventType = KEY_EVENT;
+        let mut key = KEY_EVENT_RECORD::default();
+        key.bKeyDown = i32::from(down);
+        key.wRepeatCount = 1;
+        key.wVirtualKeyCode = vk;
+        // SAFETY: select the Unicode key variant, as ReadConsoleInputW does.
+        unsafe {
+            *key.uChar.UnicodeChar_mut() = unit;
+            *native.Event.KeyEvent_mut() = key;
+        }
+        match InputRecord::from(native) {
+            InputRecord::KeyEvent(key) => key,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn windows_alt_unicode_commits_bmp_symbols_as_presses() {
+        for ch in "✅❌❓⚠\u{fe0f}⏭".chars() {
+            let event = handle_key_event(record(VK_MENU as u16, false, ch as u16), &mut None);
+            assert_eq!(
+                event,
+                Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn windows_alt_unicode_commits_surrogate_pair_once() {
+        let mut buffer = None;
+        let units: Vec<u16> = "😀".encode_utf16().collect();
+        assert_eq!(
+            handle_key_event(record(VK_MENU as u16, false, units[0]), &mut buffer),
+            None
+        );
+        assert_eq!(
+            handle_key_event(record(VK_MENU as u16, false, units[1]), &mut buffer),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('😀'),
+                KeyModifiers::NONE
+            )))
+        );
+        assert!(buffer.is_none());
+    }
+
+    #[test]
+    fn windows_alt_unicode_does_not_turn_ordinary_releases_into_presses() {
+        let event = handle_key_event(record(b'A' as u16, false, b'a' as u16), &mut None);
+        assert!(matches!(
+            event,
+            Some(Event::Key(KeyEvent {
+                kind: KeyEventKind::Release,
+                ..
+            }))
+        ));
+        assert_eq!(
+            handle_key_event(record(VK_MENU as u16, false, 0), &mut None),
+            None
+        );
+    }
 }
