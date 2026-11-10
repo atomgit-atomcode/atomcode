@@ -2123,10 +2123,10 @@ const MAX_TOOL_CALL_DELTAS: usize = 20000;
 const MAX_TOOL_CALLS: usize = 256;
 
 /// Upper bound on one SSE line, and on the unterminated tail the decoder keeps
-/// between chunks. A legitimate line carries one model delta; even the largest
-/// legal tool-call argument payload is bounded by the provider's output-token
-/// limit, well under this. Without a cap, an endpoint that never sends `\n`
-/// could grow [`SseDecoder::buf`] until the process is OOM-killed.
+/// between chunks. This is a defensive client limit, not an SSE protocol limit:
+/// gateways may batch payloads, so even syntactically valid larger lines are
+/// refused. Without a cap, an endpoint that never sends `\n` could grow
+/// [`SseDecoder::buf`] until the process is OOM-killed.
 const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
@@ -2254,46 +2254,52 @@ impl SseDecoder {
         self.stray.extend(line.chars().take(KEEP));
     }
 
-    /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
-    /// across arbitrary chunk boundaries (UTF-8 is only decoded on whole lines).
-    ///
-    /// Complete lines are walked once and the consumed prefix is dropped in one
-    /// step at the end. Draining each line as it was found moved the whole
-    /// remaining buffer (`Vec::drain` from the front), so one chunk carrying
-    /// many small events cost O(chunk²); this costs O(chunk).
+    /// Feed a chunk of raw bytes; decode UTF-8 only when a whole line is ready.
+    /// Scan only new bytes: an incomplete line is appended in place, never
+    /// rescanned or copied wholesale on the next chunk. Complete lines already
+    /// in a chunk are borrowed directly. Framing and amortized buffering are
+    /// linear in received bytes, including lines fragmented across chunks.
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        if self.buf.is_empty() {
+        if self.done {
             return out;
         }
-        // Take the buffer so a line can be borrowed while `process_line` mutates
-        // the decoder. The unterminated tail is put back below.
-        let buf = std::mem::take(&mut self.buf);
-        let mut start = 0usize;
-        while let Some(offset) = buf[start..].iter().position(|&b| b == b'\n') {
+        let mut start = 0;
+        while let Some(offset) = chunk[start..].iter().position(|&b| b == b'\n') {
             let end = start + offset;
-            if end - start > self.max_line_bytes {
+            let part = &chunk[start..end];
+            // Check before appending, so an oversized chunk is never copied
+            // into the line buffer just to be rejected afterwards.
+            if part.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
                 out.extend(self.line_too_large());
                 return out;
             }
-            let text = String::from_utf8_lossy(&buf[start..end]);
-            self.process_line(text.trim_end_matches('\r'), &mut out);
-            start = end + 1;
+            if self.buf.is_empty() {
+                let text = String::from_utf8_lossy(part);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+            } else {
+                self.buf.extend_from_slice(part);
+                let mut line = std::mem::take(&mut self.buf);
+                let text = String::from_utf8_lossy(&line);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+                line.clear();
+                if !self.done {
+                    // Reuse storage for the next fragmented line.
+                    self.buf = line;
+                }
+            }
             if self.done {
-                // The stream is terminal; bytes after the line that ended it are
-                // not part of this response.
+                self.buf = Vec::new();
                 return out;
             }
+            start = end + 1;
         }
-        let rest = &buf[start..];
-        if rest.len() > self.max_line_bytes {
+        let rest = &chunk[start..];
+        if rest.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
             out.extend(self.line_too_large());
             return out;
         }
-        if !rest.is_empty() {
-            self.buf.extend_from_slice(rest);
-        }
+        self.buf.extend_from_slice(rest);
         out
     }
 
@@ -2330,6 +2336,7 @@ impl SseDecoder {
 
     fn fail_incomplete(&mut self, code: &str, message: &str) -> Vec<StreamEvent> {
         self.done = true;
+        self.buf = Vec::new();
         self.tool_calls.clear();
         tracing::warn!(error_origin = code, "provider stream diagnostic");
         let mut out = Vec::new();
@@ -2361,8 +2368,9 @@ impl SseDecoder {
             if self.buf.len() > self.max_line_bytes {
                 return self.line_too_large();
             }
-            let pending = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
-            self.process_line(pending.trim_end_matches('\r'), &mut out);
+            let pending = std::mem::take(&mut self.buf);
+            let text = String::from_utf8_lossy(&pending);
+            self.process_line(text.trim_end_matches('\r'), &mut out);
         }
         if self.done {
             return out;
@@ -5181,6 +5189,78 @@ mod tests {
             "comments / blank / empty-data lines must NOT be malformed; got {:?}",
             kinds(&noise)
         );
+    }
+
+    #[test]
+    fn sse_terminal_decoder_ignores_all_later_chunks() {
+        for failed in [false, true] {
+            let mut d = SseDecoder::new().with_line_cap(64);
+            let terminal = if failed {
+                d.feed(&[b'x'; 65])
+            } else {
+                d.feed(b"data: [DONE]\n")
+            };
+            assert!(terminal
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { .. } | StreamEvent::Error(_))));
+            for chunk in [
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n".as_slice(),
+                &[b'x'; 65],
+                b"unfinished",
+            ] {
+                assert!(d.feed(chunk).is_empty(), "terminal decoder emitted again");
+                assert!(d.buf.is_empty(), "terminal decoder retained bytes");
+            }
+            assert!(d.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn sse_fragmented_line_reuses_reserved_storage() {
+        let mut d = SseDecoder::new().with_line_cap(2048);
+        d.buf.reserve_exact(2048);
+        let storage = d.buf.as_ptr();
+        for _ in 0..1024 {
+            assert!(d.feed(b"x").is_empty());
+            assert_eq!(
+                d.buf.as_ptr(),
+                storage,
+                "existing tail was reallocated despite reserved space"
+            );
+        }
+        assert_eq!(d.buf.len(), 1024);
+    }
+
+    #[test]
+    fn sse_line_cap_boundary_and_split_crlf_are_chunk_independent() {
+        let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n";
+        for split in 0..=bytes.len() {
+            let mut d = SseDecoder::new().with_line_cap(bytes.len() - 1);
+            let mut events = d.feed(&bytes[..split]);
+            events.extend(d.feed(&bytes[split..]));
+            assert_eq!(kinds(&events), ["text"], "split at {split}");
+            let mut d = SseDecoder::new().with_line_cap(bytes.len() - 2);
+            let mut events = d.feed(&bytes[..split]);
+            events.extend(d.feed(&bytes[split..]));
+            assert_eq!(kinds(&events), ["error"], "split at {split}");
+            assert!(d.buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn sse_every_byte_fragment_preserves_utf8_and_eof_completion() {
+        let payload = format!(
+            "{}data: [DONE]",
+            line(json!({"choices":[{"delta":{"content":"你好🦀"}}]}))
+        );
+        let mut d = SseDecoder::new();
+        let mut events = Vec::new();
+        for byte in payload.as_bytes() {
+            events.extend(d.feed(std::slice::from_ref(byte)));
+        }
+        events.extend(d.finish());
+        assert_eq!(kinds(&events), ["text", "done"]);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "你好🦀"));
     }
 
     /// A provider that never sends `\n` must not grow the decoder without
