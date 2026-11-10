@@ -418,11 +418,19 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
     active
 }
 
+/// Host-provided view of the CURRENT plan length. `TodoTool` is stateless — the list
+/// lives in the transcript — so without this it cannot tell a valid id from a stale
+/// one, and would echo an update the reducer silently drops.
+pub trait TodoListAccess: Send + Sync {
+    fn len(&self) -> Result<usize, String>;
+}
+
 /// Stateless full-list-replace todo tool. No interior state — current list is derived
 /// from the transcript (see `derive_current_todos`).
 #[derive(Clone, Default)]
 pub struct TodoTool {
     sources: Option<std::sync::Arc<dyn super::todo_sources::TodoSourceAccess>>,
+    list: Option<std::sync::Arc<dyn TodoListAccess>>,
 }
 
 impl TodoTool {
@@ -434,7 +442,15 @@ impl TodoTool {
     ) -> Self {
         Self {
             sources: Some(sources),
+            list: None,
         }
+    }
+
+    /// Host hook for the current list length so `update` can refuse a stale id.
+    /// Embeds that do not wire it keep the historical echo behaviour.
+    pub fn with_list(mut self, list: std::sync::Arc<dyn TodoListAccess>) -> Self {
+        self.list = Some(list);
+        self
     }
 }
 
@@ -565,7 +581,22 @@ impl Tool for TodoTool {
                     match (id, status.and_then(TodoStatus::parse_lenient)) {
                         // `#<id> → <status>` is the base the TUI `enrich_todo_detail` splices a
                         // title into; keep this exact shape.
-                        (Some(id), Some(_)) if id >= 1 => ok(format!("#{} \u{2192} {}", id, status.unwrap())),
+                        (Some(id), Some(_)) if id >= 1 => {
+                            // The reducer ignores an out-of-range id, so echoing one back as
+                            // applied is a lie the model cannot detect. Refuse it — but only
+                            // when the host wired a list, and never when `len()` itself fails
+                            // (no session yet): planning must not be blocked by that.
+                            if let Some(list) = &self.list {
+                                if let Ok(len) = list.len() {
+                                    if id as usize > len {
+                                        return err(format!(
+                                            "todowrite: id {id} is out of range — the current plan has {len} item(s); ids are 1..={len}. Re-read the list and retry."
+                                        ));
+                                    }
+                                }
+                            }
+                            ok(format!("#{} \u{2192} {}", id, status.unwrap()))
+                        }
                         (None, _) => err("todowrite: `update` needs an `id` (the task number).".to_string()),
                         (Some(_), _) => {
                             err("todowrite: `update` needs a `status` of pending|in_progress|completed.".to_string())
@@ -585,6 +616,25 @@ mod tests {
     use atomcode_kernel::message::Message;
     use atomcode_kernel::tool::ToolCall;
     use tokio_util::sync::CancellationToken;
+
+    struct FixedLen(usize);
+    impl super::TodoListAccess for FixedLen {
+        fn len(&self) -> Result<usize, String> {
+            Ok(self.0)
+        }
+    }
+
+    /// The reducer ignores an out-of-range id, so echoing it as applied is a lie the
+    /// model cannot detect. With a list accessor wired, the tool must refuse instead.
+    #[tokio::test]
+    async fn update_rejects_id_beyond_current_list() {
+        let t = TodoTool::new().with_list(std::sync::Arc::new(FixedLen(6)));
+        let r = t
+            .execute(r#"{"action":"update","id":999,"status":"completed"}"#, &ctx())
+            .await;
+        assert!(r.is_error, "out-of-range id must fail, got: {}", r.content);
+        assert!(r.content.contains("999"), "the error must name the id: {}", r.content);
+    }
 
     fn ctx() -> ToolContext {
         ToolContext {

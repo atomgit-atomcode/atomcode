@@ -44,6 +44,20 @@ impl atomcode_capabilities::tools::todo_sources::TodoSourceAccess for ScopedTodo
     }
 }
 
+impl atomcode_capabilities::tools::todo::TodoListAccess for ScopedTodoSources {
+    fn len(&self) -> Result<usize, String> {
+        let ctx = crate::agent::scoped(&self.0);
+        let log = ctx
+            .service::<SessionSvc>()
+            .ok_or("this agent has no session log")?;
+        Ok(
+            atomcode_capabilities::tools::todo_sources::source_plan(&log.events())
+                .todos
+                .len(),
+        )
+    }
+}
+
 pub struct TodoPlugin;
 
 #[async_trait]
@@ -60,10 +74,13 @@ impl Plugin for TodoPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let sources: Arc<dyn atomcode_capabilities::tools::todo_sources::TodoSourceAccess> =
             Arc::new(ScopedTodoSources(ctx.clone()));
+        let list: Arc<dyn atomcode_capabilities::tools::todo::TodoListAccess> =
+            Arc::new(ScopedTodoSources(ctx.clone()));
         mount(
             ctx,
             vec![
-                Arc::new(TodoTool::with_sources(sources.clone())) as Arc<dyn Tool>,
+                Arc::new(TodoTool::with_sources(sources.clone()).with_list(list))
+                    as Arc<dyn Tool>,
                 Arc::new(atomcode_capabilities::tools::todo_sources::TodoSourcesTool(
                     sources,
                 )) as Arc<dyn Tool>,
