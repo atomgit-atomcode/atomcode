@@ -95,6 +95,57 @@ try {
   await page.locator('.message-input').waitFor();
   await page.waitForTimeout(1000);
   assert(clients.size > 0);
+  if (width === 1200) {
+    const sidebar = page.locator('.session-list');
+    const handle = page.locator('.sidebar-resize-handle');
+    const sidebarWidth = async () => Math.round((await sidebar.boundingBox()).width);
+    const drag = async delta => {
+      const box = await handle.boundingBox();
+      await page.mouse.move(box.x + box.width / 2, box.y + 100);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width / 2 + delta, box.y + 100);
+      await page.mouse.up();
+    };
+    assert.equal(await sidebarWidth(), 280, 'untouched desktop keeps responsive CSS');
+    await page.setViewportSize({width:2000,height:900});
+    assert.equal(await sidebarWidth(), 320, 'default follows viewport changes');
+    await page.setViewportSize({width:1200,height:900});
+    const tooltip = await page.locator('.session-item-main').filter({hasText:third.name}).getAttribute('title');
+    assert(tooltip.startsWith(third.name + '\n'), 'tooltip starts with the complete title');
+    assert(tooltip.includes('/fixture'), 'tooltip retains working directory');
+    await drag(100);
+    await page.waitForFunction(() => localStorage.getItem('atomcode-sidebar-width') === '380');
+    assert.equal(await sidebarWidth(), 380, 'drag starts at the current edge without jumping');
+    await page.reload();
+    await page.locator('.message-input').waitFor();
+    assert.equal(await sidebarWidth(), 380, 'saved width survives reload');
+    await drag(1000);
+    assert.equal(await sidebarWidth(), 500);
+    await drag(-1000);
+    assert.equal(await sidebarWidth(), 180);
+    await page.evaluate(() => { document.body.style.cursor='help'; document.body.style.userSelect='text'; });
+    let box = await handle.boundingBox();
+    await page.mouse.move(box.x + 3, box.y + 100);
+    await page.mouse.down();
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    assert.deepEqual(await page.evaluate(() => [document.body.style.cursor,document.body.style.userSelect]), ['help','text']);
+    await page.mouse.up();
+    await page.evaluate(() => { document.body.style.cursor=''; document.body.style.userSelect=''; });
+    box = await handle.boundingBox();
+    await page.mouse.move(box.x + 3, box.y + 100);
+    await page.mouse.down();
+    await page.locator('.sidebar-collapse-btn').evaluate(button => button.click());
+    await page.waitForFunction(() => document.body.style.userSelect !== 'none');
+    assert.equal(await handle.count(), 0, 'collapsed rail has no drag handle');
+    await page.mouse.up();
+    await page.locator('.sidebar-rail .rail-btn').first().click();
+    await page.evaluate(() => localStorage.removeItem('atomcode-sidebar-width'));
+    await page.reload();
+    await page.locator('.message-input').waitFor();
+    await page.waitForTimeout(200);
+  } else {
+    assert.equal(await page.locator('.sidebar-resize-handle').isVisible(), false, 'mobile drawer has no resize handle');
+  }
   emit({type:'state', running:true});
   try { await page.getByText('Running', {exact:false}).first().waitFor({timeout:5000}); } catch (e) { console.log(await page.locator('body').innerText()); throw e; }
   const before = switches;

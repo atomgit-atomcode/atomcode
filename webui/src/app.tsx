@@ -31,6 +31,22 @@ function shortSessionId(id: string): string {
   return id.slice(0, 8);
 }
 
+// Persistent sidebar width (localStorage-backed).
+const SIDEBAR_WIDTH_KEY = 'atomcode-sidebar-width';
+const SIDEBAR_MIN = 180;
+const SIDEBAR_MAX = 500;
+
+function readSidebarWidth(): number | null {
+  try {
+    const v = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    if (v) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= SIDEBAR_MIN && n <= SIDEBAR_MAX) return n;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
 export function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   useEffect(()=>{
@@ -99,6 +115,44 @@ export function App() {
   // 刷新时若 URL 带 session id，先进入「恢复中」态：在按短 id 还原出会话前，
   // 抑制 Chat 的新建落地页，避免「先闪一下新建页再跳到历史」的体验。
   const [restoring, setRestoring] = useState<boolean>(() => readSessionIdFromUrl() != null);
+
+  // Keep the responsive CSS width until a stored or dragged width exists.
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(readSidebarWidth);
+  const resizingRef = useRef<{
+    x: number; width: number; cursor: string; userSelect: string;
+  } | null>(null);
+  const widthRef = useRef(sidebarWidth);
+
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      const drag = resizingRef.current;
+      if (!drag) return;
+      const w = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, drag.width + e.clientX - drag.x));
+      widthRef.current = w;
+      setSidebarWidth(w);
+    }
+    function finishResize() {
+      const drag = resizingRef.current;
+      if (!drag) return;
+      resizingRef.current = null;
+      document.body.style.cursor = drag.cursor;
+      document.body.style.userSelect = drag.userSelect;
+      if (widthRef.current !== null) {
+        try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(widthRef.current)); } catch { /* optional storage */ }
+      }
+    }
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', finishResize);
+    window.addEventListener('blur', finishResize);
+    window.addEventListener('resize', finishResize);
+    return () => {
+      finishResize();
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', finishResize);
+      window.removeEventListener('blur', finishResize);
+      window.removeEventListener('resize', finishResize);
+    };
+  }, [sidebarCollapsed]);
 
   // 关闭表头会话菜单：外部点击 / 滚动 / 缩放（fixed 菜单不跟随锚点，故一并关闭）。
   useEffect(() => {
@@ -422,7 +476,7 @@ export function App() {
   }
 
   return (
-    <div class="app">
+    <div class="app" style={sidebarWidth === null ? undefined : { '--sidebar-width': `${sidebarWidth}px` }}>
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
       <Sidebar
         activeSessionId={browseSession?.id ?? sessionId}
@@ -446,6 +500,25 @@ export function App() {
         onOpenRemote={() => setSettingsSection('remote')}
         onOpenCwd={() => setShowCwd(true)}
       />
+      {/* Resize handle: invisible drag strip on the sidebar's right edge.
+          Hidden on mobile (sidebar is a drawer) and when collapsed (icon rail). */}
+      {!sidebarCollapsed && (
+        <div
+          class="sidebar-resize-handle"
+          onMouseDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            resizingRef.current = {
+              x: e.clientX,
+              width: e.currentTarget.previousElementSibling?.getBoundingClientRect().width ?? 280,
+              cursor: document.body.style.cursor,
+              userSelect: document.body.style.userSelect,
+            };
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+          }}
+        />
+      )}
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
         onClick={() => setSidebarOpen(false)}

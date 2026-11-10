@@ -1282,9 +1282,8 @@ body {
 
 /* === Sidebar / session list === */
 .session-list {
-  /* Desktop ratio follows DeepSeek Harness: roughly 18% of the viewport,
-     bounded so ordinary laptops and ultrawide displays both stay balanced. */
-  width: clamp(280px, 18vw, 320px);
+  /* Keep the responsive default until a person explicitly resizes the sidebar. */
+  width: var(--sidebar-width, clamp(280px, 18vw, 320px));
   /* 暖色二级背景（比主区略深），与主区形成柔和分层（对齐设计）。 */
   background: var(--app-secondary-background);
   border-right: 1px solid var(--app-primary-border-color);
@@ -1292,6 +1291,38 @@ body {
   flex-direction: column;
   overflow: hidden;
   flex-shrink: 0;
+}
+
+/* --- Sidebar resize handle (drag strip between sidebar and main column) --- */
+.sidebar-resize-handle {
+  width: 6px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+  /* Expand the hit area beyond the visible strip for easier grabbing. */
+  margin-left: -3px;
+  margin-right: -3px;
+}
+.sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 32px;
+  border-radius: 2px;
+  background: var(--app-secondary-foreground);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.sidebar-resize-handle:hover::after {
+  opacity: 0.4;
+}
+.sidebar-resize-handle:active::after {
+  opacity: 0.6;
+  height: 48px;
 }
 
 /* --- Brand row: diamond logo + "AtomCode" + collapse button --- */
@@ -3409,6 +3440,8 @@ body {
   .session-list.collapsed { display: flex; width: 80vw; max-width: 300px; }
   .session-list.collapsed .sidebar-rail { display: none; }
   .sidebar-backdrop.show { display: block; }
+  /* Resize handle is desktop-only; sidebar is a drawer on mobile. */
+  .sidebar-resize-handle { display: none; }
 
   /* Reduce timeline / input insets */
   .messages-container {
