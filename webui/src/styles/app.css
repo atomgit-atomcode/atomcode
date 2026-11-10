@@ -4253,7 +4253,6 @@ body {
 @media (max-width: 768px) {
   .session-browse-notice { padding: 60px 16px 16px; gap: 12px; }
 }
-.session-browse-sidebar-hint { margin: 0; padding: 0 16px 10px; color: var(--app-secondary-foreground); font-size: 12px; line-height: 1.5; }
 .session-running-mark { flex-shrink: 0; padding: 1px 5px; border-radius: 4px; background: var(--app-secondary-background); color: var(--app-secondary-foreground); font-size: 11px; }
 
 .task-specifications { width: min(760px, calc(100vw - 24px)); max-height: 85vh; overflow: auto; padding: 20px; border-radius: 12px; }
@@ -4326,3 +4325,39 @@ body {
 @media (hover: none) {
   .sidebar-project-new { opacity: 1; visibility: visible; }
 }
+
+/* Full session identity: quiet card, shared light/dark menu tokens. */
+.session-hover-card {
+  position: fixed;
+  z-index: 1100;
+  box-sizing: border-box;
+  width: 360px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 12px 14px;
+  border: 1px solid var(--app-menu-border);
+  border-radius: 12px;
+  background: var(--app-menu-background);
+  color: var(--app-primary-foreground);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 12%);
+  user-select: text;
+}
+.session-hover-card-title {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+.session-hover-card-directory {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 8px;
+  color: var(--app-secondary-foreground);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.session-hover-card-directory svg { flex-shrink: 0; margin-top: 3px; }
+.session-hover-card-directory span { overflow-wrap: anywhere; min-width: 0; }

@@ -110,9 +110,6 @@ try {
     await page.setViewportSize({width:2000,height:900});
     assert.equal(await sidebarWidth(), 320, 'default follows viewport changes');
     await page.setViewportSize({width:1200,height:900});
-    const tooltip = await page.locator('.session-item-main').filter({hasText:third.name}).getAttribute('title');
-    assert(tooltip.startsWith(third.name + '\n'), 'tooltip starts with the complete title');
-    assert(tooltip.includes('/fixture'), 'tooltip retains working directory');
     await drag(100);
     await page.waitForFunction(() => localStorage.getItem('atomcode-sidebar-width') === '380');
     assert.equal(await sidebarWidth(), 380, 'drag starts at the current edge without jumping');
@@ -173,6 +170,39 @@ try {
   try { await page.getByText('Running', {exact:false}).first().waitFor({timeout:5000}); } catch (e) { console.log(await page.locator('body').innerText()); throw e; }
   const before = switches;
   if (width < 600) await page.locator('.mobile-menu-btn').click();
+  assert.equal(await page.locator('.session-browse-sidebar-hint').count(), 0);
+  const hoverRow = page.locator('.session-item-main').filter({hasText:third.name});
+  assert.equal(await hoverRow.getAttribute('title'), null, 'no competing native tooltip');
+  await hoverRow.hover();
+  const hoverCard = page.locator('.session-hover-card');
+  await hoverCard.waitFor();
+  assert.equal(await hoverCard.locator('.session-hover-card-title').textContent(), third.name);
+  assert.equal(await hoverCard.locator('.session-hover-card-directory').textContent(), third.working_dir);
+  const box = await hoverCard.boundingBox();
+  assert(box.x >= 0 && box.x + box.width <= width && box.y >= 0 && box.y + box.height <= 900);
+  await hoverCard.hover();
+  await page.waitForTimeout(450);
+  assert(await hoverCard.isVisible(), 'pointer can move onto the card');
+  if (width === 1200) {
+    await page.screenshot({path:'/tmp/atomcode-sidebar-session-hover.png'});
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'));
+    await page.screenshot({path:'/tmp/atomcode-sidebar-session-hover-dark.png'});
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'light'));
+  }
+  await page.keyboard.press('Escape');
+  await hoverCard.waitFor({state:'hidden'});
+  await hoverRow.focus();
+  await hoverCard.waitFor();
+  assert.equal(await hoverRow.getAttribute('aria-describedby'), await hoverCard.getAttribute('id'));
+  await page.mouse.move(width - 10, 20);
+  await page.waitForTimeout(180);
+  assert(await hoverCard.isVisible(), 'keyboard focus keeps the description visible');
+  await hoverCard.hover();
+  await hoverCard.locator('.session-hover-card-title').click();
+  await page.waitForTimeout(180);
+  assert(await hoverCard.isVisible(), 'selecting card text does not dismiss it');
+  await page.locator('.session-list-body').dispatchEvent('scroll');
+  await hoverCard.waitFor({state:'hidden'});
   await page.locator('.session-item-main').filter({hasText:'Other conversation'}).click();
   await page.getByText('Historical answer', {exact:true}).waitFor();
   assert.equal(switches, before);
@@ -181,7 +211,7 @@ try {
   await page.getByText('The task is still running', {exact:false}).waitFor();
   const openSidebar = async () => { if (width < 600) await page.locator('.mobile-menu-btn').click(); };
   await openSidebar();
-  await page.getByText('Task running · other sessions open read-only', {exact:true}).waitFor();
+  assert.equal(await page.locator('.session-browse-sidebar-hint').count(), 0);
   await page.locator('.session-item-main').filter({hasText:third.name}).click();
   await page.waitForFunction(name => document.querySelector('.session-browse-title')?.textContent === name, third.name);
   for(let attempt=0;!releaseSlowHistory&&attempt<50;attempt++)await page.waitForTimeout(20);
