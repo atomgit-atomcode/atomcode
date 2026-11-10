@@ -22,6 +22,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use serde::Deserialize;
+
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::session::{
     derive_messages_with_meta, InjectionOrigin, LoggedEvent, RewindScope, SeqNo, SessionEvent,
@@ -380,7 +382,7 @@ impl SessionManager {
                 header = Some(found);
                 return Ok(());
             }
-            let (Some(seq), Some(value)) = (line.seq, line.event) else {
+            let (Some(seq), Some(mut value)) = (line.seq, line.event) else {
                 return Err(SessionStoreError::Corrupt {
                     kind: "session events",
                     message: "not an event record".into(),
@@ -397,22 +399,10 @@ impl SessionManager {
                 });
             }
             // Validate the original event before dropping any non-reference payload.
-            let event = event_of(value, &path, index - 1, header.as_ref())?;
-            let mut value =
-                serde_json::to_value(event).map_err(|e| SessionStoreError::Corrupt {
-                    kind: "session events",
-                    message: e.to_string(),
-                })?;
+            event_of(&value, &path, index - 1, header.as_ref())?;
             trim_reference_payload(&mut value, &mut clipped, query);
             retained = retained
-                .saturating_add(
-                    serde_json::to_vec(&value)
-                        .map_err(|e| SessionStoreError::Corrupt {
-                            kind: "session events",
-                            message: e.to_string(),
-                        })?
-                        .len(),
-                )
+                .saturating_add(serialized_len(&value)?)
                 .saturating_add(64);
             if retained > retained_limit {
                 return Err(SessionStoreError::TooLarge {
@@ -421,7 +411,7 @@ impl SessionManager {
                     actual: retained,
                 });
             }
-            let event = event_of(value, &path, index - 1, header.as_ref())?;
+            let event = event_of(&value, &path, index - 1, header.as_ref())?;
             events.push(LoggedEvent {
                 seq,
                 at: line.at,
@@ -507,7 +497,7 @@ impl SessionManager {
                 (Some(seq), Some(event)) => events.push(LoggedEvent {
                     seq,
                     at: line.at,
-                    event: event_of(event, &path, index, header.as_ref())?,
+                    event: event_of(&event, &path, index, header.as_ref())?,
                 }),
                 _ => {
                     return Err(SessionStoreError::Corrupt {
@@ -1272,12 +1262,38 @@ fn turn_of_each_prompt(messages: &[Message]) -> Vec<u64> {
     turns
 }
 
+/// Length of `value` as compact JSON, without allocating a throwaway buffer.
+/// The reference projection only needs the size to enforce its retained bound;
+/// `serde_json::to_vec(..).len()` allocated the whole encoding to measure it.
+fn serialized_len(value: &serde_json::Value) -> SessionResult<usize> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(|error| SessionStoreError::Corrupt {
+        kind: "session events",
+        message: error.to_string(),
+    })?;
+    Ok(count.0)
+}
+
 /// A record's fact. A kind this build does not know was added by a newer one
 /// — a later build appends kinds to a file an earlier one created, so the
 /// header's version alone cannot say — and the file is refused as newer, not
 /// read as corrupt.
+///
+/// Borrows the value: reference projection validates the original, trims it,
+/// then parses it again, and a round trip through `serde_json::to_value` only
+/// copied data the caller already had.
 fn event_of(
-    value: serde_json::Value,
+    value: &serde_json::Value,
     path: &std::path::Path,
     index: usize,
     header: Option<&SessionHeader>,
@@ -1286,7 +1302,7 @@ fn event_of(
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    serde_json::from_value(value).map_err(|error| {
+    SessionEvent::deserialize(value).map_err(|error| {
         if error.to_string().starts_with("unknown variant") {
             SessionStoreError::FutureSchema {
                 kind: "session events",
@@ -2690,5 +2706,21 @@ mod tests {
         assert!(!text.contains("bad prefix"));
         assert!(!text.contains("reasoning_discarded"));
         assert_eq!(text.lines().count(), 1, "only the header remains");
+    }
+
+    /// `serialized_len` must measure exactly what the allocating form did, so
+    /// the retained bound does not change when the measurement changes shape.
+    #[test]
+    fn serialized_len_matches_the_allocating_encoding() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!({"kind":"AssistantMessage","text":"你好","n":[1,2,3]}),
+            serde_json::json!([true, false, 0, -1.5, "x"]),
+        ] {
+            assert_eq!(
+                serialized_len(&value).unwrap(),
+                serde_json::to_vec(&value).unwrap().len()
+            );
+        }
     }
 }
