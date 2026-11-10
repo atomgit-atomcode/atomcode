@@ -534,6 +534,10 @@ pub async fn approve_mcp_tool(
     hub().approve_mcp_tool(alias).await
 }
 
+pub async fn mcp_session(session: String, paused: Option<bool>) -> Result<bool, HubError> {
+    hub().mcp_session(session, paused).await
+}
+
 pub async fn mcp_servers() -> Result<(PathBuf, Vec<crate::live_hub::LiveMcpServer>), HubError> {
     hub().mcp_servers().await
 }

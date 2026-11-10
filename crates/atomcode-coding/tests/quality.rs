@@ -128,6 +128,7 @@ async fn start_with_plugins(
     let prepare = PrepareOptions {
         memory: false,
         mcp: false,
+        mcp_paused: false,
         web: false,
         review: false,
         skill_dirs: Some(vec![]),

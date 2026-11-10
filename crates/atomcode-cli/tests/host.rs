@@ -318,6 +318,7 @@ async fn started_with_vision(
             skill_dirs: Some(skill_dirs),
             plugin_skill_dirs: Vec::new(),
             mcp,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -575,6 +576,7 @@ async fn a_finished_turn_offers_what_might_be_said_next() {
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -2709,7 +2711,7 @@ async fn mcp_manage_lists_servers_with_source_and_tool_count() {
     // has it — so this waits for the connection rather than sleeping past it.
     let tools = tools_on_the_model(&connection, &session, "fs").await;
 
-    let Ok(HostReply::McpRows { rows }) = connection
+    let Ok(HostReply::McpRows { rows, .. }) = connection
         .control
         .call(HostCommand::McpManage {
             session: session.clone(),
@@ -2833,7 +2835,7 @@ async fn mcp_act_disable_writes_config_and_withdraws() {
         serde_json::from_str(&std::fs::read_to_string(&defined_in).unwrap()).unwrap();
     assert_eq!(before["mcpServers"]["fs"]["disabled"].as_bool(), None);
 
-    let Ok(HostReply::McpRows { rows }) = connection
+    let Ok(HostReply::McpRows { rows, .. }) = connection
         .control
         .call(HostCommand::McpAct {
             session: session.clone(),
@@ -3459,6 +3461,7 @@ async fn started_without_a_provider_on(
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,

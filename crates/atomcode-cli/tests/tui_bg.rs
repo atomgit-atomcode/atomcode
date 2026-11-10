@@ -221,6 +221,7 @@ fn start(
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
+                mcp_paused: false,
                 extra_mcp_servers: Vec::new(),
                 mcp_user_config: None,
                 mcp_tokens: None,

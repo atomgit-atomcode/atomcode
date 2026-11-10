@@ -39,6 +39,7 @@ async fn plan_mode_blocks_a_write_tool_through_the_assembly() {
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        mcp_paused: false,
         extra_mcp_servers: Vec::new(),
         mcp_user_config: None,
         mcp_tokens: None,

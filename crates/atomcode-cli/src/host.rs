@@ -1166,6 +1166,8 @@ fn to_mcp_action(
     use atomcode_coding::parts::McpAction as Runtime;
     use atomcode_host_api::McpAction;
     match action {
+        McpAction::PauseAll => Some(Runtime::PauseAll),
+        McpAction::ResumeAll => Some(Runtime::ResumeAll),
         McpAction::Reconnect => Some(Runtime::Reconnect),
         McpAction::CancelReconnect => Some(Runtime::CancelReconnect),
         McpAction::Trust => Some(Runtime::Trust),
@@ -2468,6 +2470,7 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 let rows = self.handle.mcp_rows().await.map_err(refused)?;
                 Ok(HostReply::McpRows {
+                    paused: rows.paused,
                     rows: rows.rows.into_iter().map(to_mcp_row).collect(),
                 })
             }
@@ -2500,9 +2503,24 @@ impl HostControl for RuntimeControl {
                 let action = to_mcp_action(action).ok_or_else(|| HostError::Failed {
                     message: "this build does not know that MCP action".into(),
                 })?;
-                self.handle.mcp_act(server, action).await.map_err(refused)?;
+                if matches!(
+                    action,
+                    atomcode_coding::parts::McpAction::PauseAll
+                        | atomcode_coding::parts::McpAction::ResumeAll
+                ) {
+                    self.handle
+                        .set_mcp_paused(
+                            session,
+                            action == atomcode_coding::parts::McpAction::PauseAll,
+                        )
+                        .await
+                        .map_err(refused)?;
+                } else {
+                    self.handle.mcp_act(server, action).await.map_err(refused)?;
+                }
                 let rows = self.handle.mcp_rows().await.map_err(refused)?;
                 Ok(HostReply::McpRows {
+                    paused: rows.paused,
                     rows: rows.rows.into_iter().map(to_mcp_row).collect(),
                 })
             }

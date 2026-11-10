@@ -519,6 +519,7 @@ fn start(
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -2876,6 +2877,134 @@ async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
             "`{gone}` 这条命令不存在,照着敲只会得到「不认识」:\n{said}"
         );
     }
+}
+
+// Uses real shell subprocess I/O; a paused Tokio clock would race MCP handshakes.
+#[cfg(unix)]
+async fn pausing_all_mcp_is_session_local_and_preserves_individual_switches() {
+    use atomcode_coding::parts::McpAction;
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let pid_file = scratch.path().join("pid");
+    let body = std::fs::read_to_string(&script).unwrap();
+    std::fs::write(
+        &script,
+        body.replacen(
+            "#!/bin/sh",
+            &format!("#!/bin/sh\necho $$ > '{}'", pid_file.display()),
+            1,
+        ),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut disabled = input.prepare.extra_mcp_servers[0].clone();
+    disabled.name = "off".into();
+    disabled.disabled = true;
+    input.prepare.extra_mcp_servers.push(disabled);
+    let config = env.project.path().join(".mcp.json");
+    let contents = r#"{"mcpServers":{"disabled":{"command":"do-not-start","disabled":true}}}"#;
+    std::fs::write(&config, contents).unwrap();
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let id = runtime.session.as_ref().unwrap().id.clone();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+    assert!(!runtime.handle.mcp_rows().await.unwrap().paused);
+    assert!(runtime
+        .handle
+        .set_mcp_paused("another-session".into(), true)
+        .await
+        .is_err());
+    runtime
+        .handle
+        .set_mcp_paused(id.clone(), true)
+        .await
+        .unwrap();
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    // Real subprocess teardown is asynchronous; wait for the observable OS process exit.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("paused MCP server process must be released");
+    assert!(runtime.handle.mcp_rows().await.unwrap().paused);
+    assert!(runtime
+        .handle
+        .mcp_status()
+        .await
+        .unwrap()
+        .servers
+        .is_empty());
+    assert!(runtime
+        .handle
+        .mcp_rows()
+        .await
+        .unwrap()
+        .rows
+        .iter()
+        .any(|r| r.name == "disabled" && r.disabled));
+    assert!(runtime
+        .handle
+        .mcp_act("t".into(), McpAction::Reconnect)
+        .await
+        .is_err());
+    assert!(runtime
+        .handle
+        .mcp_act("disabled".into(), McpAction::Enable)
+        .await
+        .is_err());
+    turn(&mut runtime, "plain task while MCP paused").await;
+    assert!(!last_offered(&recorder)
+        .iter()
+        .any(|n| n.starts_with("mcp__")));
+    runtime.handle.reload_capabilities().await.unwrap();
+    assert!(runtime.handle.mcp_rows().await.unwrap().paused);
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+    recorder.build_fails.store(true, Ordering::SeqCst);
+    assert!(runtime
+        .handle
+        .set_mcp_paused(id.clone(), false)
+        .await
+        .is_err());
+    assert!(runtime.handle.mcp_rows().await.unwrap().paused);
+    recorder.build_fails.store(false, Ordering::SeqCst);
+    runtime
+        .handle
+        .set_mcp_paused(id.clone(), false)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    turn(&mut runtime, "plain task after resume").await;
+    assert!(last_offered(&recorder).iter().any(|n| n == "mcp__t__echo"));
+    assert!(!last_offered(&recorder)
+        .iter()
+        .any(|n| n.starts_with("mcp__off__")));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), contents);
+    runtime.handle.set_mcp_paused(id, true).await.unwrap();
+    runtime.handle.fresh_session().await.unwrap();
+    assert!(!runtime.handle.mcp_rows().await.unwrap().paused);
+    runtime.handle.shutdown().await.unwrap();
 }
 
 async fn an_mcp_servers_tools_are_offered_and_run() {
@@ -6857,6 +6986,8 @@ mod criteria {
         a_round_budget_ends_the_turn,
         #[cfg(unix)]
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
+        #[cfg(unix)]
+        pausing_all_mcp_is_session_local_and_preserves_individual_switches,
         an_mcp_servers_tools_are_offered_and_run,
         reconnecting_one_mcp_keeps_its_neighbor_and_session,
         a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries,

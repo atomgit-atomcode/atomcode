@@ -660,6 +660,17 @@ export interface McpStatusInfo {
   blocked?: string[];
 }
 
+/** Current-session pause overlay; does not change per-server configuration. */
+export async function getMcpSession(session: string): Promise<{ paused: boolean }> {
+  return readJson(await apiFetch(`/live/mcp/session?session=${encodeURIComponent(session)}`, { headers: authHeaders() }));
+}
+export async function setMcpSession(session: string, paused: boolean): Promise<{ paused: boolean }> {
+  return readJson(await apiFetch('/live/mcp/session', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session, paused }),
+  }));
+}
+
 export async function getMcpStatus(): Promise<McpStatusInfo> {
   const resp = await apiFetch('/mcp/status', { headers: authHeaders() });
   return readJson(resp);

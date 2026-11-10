@@ -281,6 +281,7 @@ impl Env {
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: true,
+                mcp_paused: false,
                 extra_mcp_servers: Vec::new(),
                 mcp_user_config: Some(user_config.clone()),
                 mcp_tokens: Some(tokens.clone()),

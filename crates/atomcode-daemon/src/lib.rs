@@ -8028,6 +8028,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/compact", post(live_api::live_compact))
         .route("/live/command", post(live_api::live_command))
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
+        .route(
+            "/live/mcp/session",
+            get(live_api::live_mcp_session_get).post(live_api::live_mcp_session_post),
+        )
         .route("/command", post(commands::run_command))
         .route(
             "/live/followup",

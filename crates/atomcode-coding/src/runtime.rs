@@ -277,6 +277,8 @@ pub struct McpToolsSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpRowsSnapshot {
+    pub paused: bool,
+    pub session_id: Option<String>,
     pub generation: RuntimeGeneration,
     pub rows: Vec<crate::parts::McpRowFacts>,
 }
@@ -1487,6 +1489,15 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
             )
             .await
         }
+        None if runtime.prepare.mcp_paused => {
+            let registry = atomcode_capabilities::mcp::McpRegistry::new(runtime.config.dirs.user());
+            crate::parts::mcp_row_facts_in(
+                &crate::parts::mcp_storage(&runtime.config, &runtime.prepare),
+                &registry,
+                &[],
+            )
+            .await
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -1665,6 +1676,9 @@ async fn apply_mcp_action(
 ) -> Result<McpActionApplied, String> {
     use crate::parts::McpAction;
     match action {
+        crate::parts::McpAction::PauseAll | crate::parts::McpAction::ResumeAll => {
+            Err("session MCP actions require the reprepare path".into())
+        }
         McpAction::Reconnect | McpAction::CancelReconnect => {
             Err("reconnect must run as an owned cancellable task".into())
         }
@@ -2868,6 +2882,18 @@ impl CodingRuntimeHandle {
         server: String,
         action: crate::parts::McpAction,
     ) -> Result<(), RuntimeError> {
+        if matches!(
+            action,
+            crate::parts::McpAction::PauseAll | crate::parts::McpAction::ResumeAll
+        ) {
+            return self
+                .reprepare_target(ReprepareTarget::McpSessionPaused {
+                    paused: action == crate::parts::McpAction::PauseAll,
+                    session: None,
+                })
+                .await
+                .map(|_| ());
+        }
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
@@ -2890,6 +2916,19 @@ impl CodingRuntimeHandle {
             ))),
             Err(error) => Err(error),
         }
+    }
+
+    /// Change only the addressed session's ephemeral MCP overlay.
+    pub async fn set_mcp_paused(
+        &self,
+        session: String,
+        paused: bool,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::McpSessionPaused {
+            paused,
+            session: Some(session),
+        })
+        .await
     }
 
     /// One or two sentences on where the conversation stands and what is
@@ -4380,6 +4419,10 @@ pub enum RewindFinalization {
 #[doc(hidden)]
 #[derive(Clone)]
 pub enum ReprepareTarget {
+    McpSessionPaused {
+        paused: bool,
+        session: Option<String>,
+    },
     Reload {
         plugin_skill_dirs: Option<Vec<atomcode_capabilities::skills::TemplateDirectory>>,
     },
@@ -7639,6 +7682,8 @@ fn spawn_runtime_owner_with_optional_agent(
                         };
                         let _ = done.send(match mcp_rows_of(runtime).await {
                             Ok(rows) => Ok(McpRowsSnapshot {
+                                paused: runtime.prepare.mcp_paused,
+                                session_id: runtime.parts.session.as_ref().map(|s| s.id.clone()),
                                 generation: RuntimeGeneration(generation),
                                 rows,
                             }),
@@ -7691,6 +7736,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if runtime.prepare.mcp_paused && action != crate::parts::McpAction::Disable {
+                            let _ = done.send(Err(RuntimeError::ReconfigureFailed("MCP is paused for this session; resume MCP first".into())));
+                            continue;
+                        }
                         if action == crate::parts::McpAction::CancelReconnect {
                             if pending_mcp_reconnect.as_ref().is_some_and(|pending| pending.server == server) {
                                 let phase = pending_mcp_reconnect.take().expect("matching reconnect").cancel().await;
@@ -8607,7 +8656,8 @@ fn spawn_runtime_owner_with_optional_agent(
                         target,
                         done,
                     }) => {
-                        if request_generation != generation || compaction_suspended {
+                        if request_generation != generation || compaction_suspended
+                            || (matches!(&target, ReprepareTarget::McpSessionPaused { .. }) && (active_turn.is_some() || pending_mcp_reconnect.is_some() || held_turn.is_some() || background_jobs.pending() || background_jobs.uncollected() || goal.as_ref().is_some_and(|g| g.active) || loop_state.as_ref().is_some_and(|l| l.active))) {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
@@ -8686,9 +8736,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 continue;
                             }
                         }
+                        let mcp_session_note = match &target {
+                            ReprepareTarget::McpSessionPaused { paused, .. } => Some(crate::told::mcp_acted("", if *paused { crate::parts::McpAction::PauseAll } else { crate::parts::McpAction::ResumeAll })),
+                            _ => None,
+                        };
                         let withdraws_mcp = matches!(
                             &target,
-                            ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_)
+                            ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_) | ReprepareTarget::McpSessionPaused { .. }
                         );
                         let resolved = match resolve_reprepare_input(&runtime, target) {
                             Ok(input) => input,
@@ -9012,6 +9066,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             None => {}
                         }
+                        tell(&runtime, mcp_session_note);
                         // A resumed session may carry a prompt its previous
                         // process accepted but never answered. This binding is
                         // the switch's only chance to hand it back; no other
@@ -11424,6 +11479,53 @@ fn resolve_reprepare_input(
     RuntimeError,
 > {
     match target {
+        ReprepareTarget::McpSessionPaused { paused, session } => {
+            if session.as_ref().is_some_and(|id| {
+                runtime
+                    .parts
+                    .session
+                    .as_ref()
+                    .is_none_or(|binding| &binding.id != id)
+            }) {
+                return Err(RuntimeError::Busy);
+            }
+            if runtime
+                .harness_app
+                .as_ref()
+                .and_then(|app| {
+                    app.context()
+                        .service::<atomcode_harness::seams::AgentsSvc>()
+                })
+                .is_some_and(|agents| agents.list().iter().any(|a| a.parent().is_some()))
+            {
+                return Err(RuntimeError::CommandRefused(
+                    "Stop delegated agents before pausing or resuming all MCP servers".into(),
+                ));
+            }
+            if !runtime.prepare.mcp || !runtime.prepare.tools {
+                return Err(RuntimeError::ReconfigureFailed(
+                    "MCP is unavailable in this runtime".into(),
+                ));
+            }
+            if runtime.prepare.mcp_paused == paused {
+                return Ok(None);
+            }
+            let mut prepare = runtime.prepare.clone();
+            prepare.mcp_paused = paused;
+            prepare.session = match runtime.parts.session.as_ref() {
+                Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
+                None => crate::SessionMode::Disabled,
+            };
+            Ok(Some((
+                ReprepareInput {
+                    config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::Reprepare,
+                },
+                None,
+                None,
+            )))
+        }
         ReprepareTarget::Reload { plugin_skill_dirs } => {
             let mut prepare = runtime.prepare.clone();
             if let Some(plugin_skill_dirs) = plugin_skill_dirs {
@@ -11468,6 +11570,7 @@ fn resolve_reprepare_input(
         }
         ReprepareTarget::Fresh => {
             let mut prepare = runtime.prepare.clone();
+            prepare.mcp_paused = false;
             prepare.session = crate::SessionMode::Fresh;
             Ok(Some((
                 ReprepareInput {
@@ -11481,6 +11584,7 @@ fn resolve_reprepare_input(
         }
         ReprepareTarget::Resume(id) => {
             let mut prepare = runtime.prepare.clone();
+            prepare.mcp_paused = false;
             prepare.session = crate::SessionMode::Resume(id);
             Ok(Some((
                 ReprepareInput {
@@ -11523,6 +11627,7 @@ fn resolve_reprepare_input(
             // and the transferred lease below is the authority that validates it.
             config.working_dir = working_dir;
             let mut prepare = runtime.prepare.clone();
+            prepare.mcp_paused = false;
             prepare.session = crate::SessionMode::Resume(id);
             Ok(Some((
                 ReprepareInput {
@@ -11564,6 +11669,7 @@ fn resolve_reprepare_input(
             let mut config = runtime.config.clone();
             config.working_dir = canonical;
             let mut prepare = runtime.prepare.clone();
+            prepare.mcp_paused = false;
             prepare.session = crate::SessionMode::Fresh;
             Ok(Some((
                 ReprepareInput {
@@ -14111,6 +14217,7 @@ pub mod testkit {
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -15318,6 +15425,7 @@ mod tests {
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
+                mcp_paused: false,
                 extra_mcp_servers: Vec::new(),
                 mcp_user_config: None,
                 mcp_tokens: None,
@@ -20868,6 +20976,12 @@ mod tests {
         assert_eq!(handle.status().phase, RuntimePhase::InTurn);
         assert!(runtime_events.try_recv().is_err());
 
+        assert_eq!(
+            handle
+                .mcp_act(String::new(), crate::parts::McpAction::PauseAll)
+                .await,
+            Err(RuntimeError::Busy)
+        );
         handle.shutdown().await.unwrap();
     }
 

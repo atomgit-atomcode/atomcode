@@ -1879,6 +1879,8 @@ impl Plugin for McpHostPlugin {
                  the project, without which its own `.mcp.json` servers never connect, \
                  and signing in to an OAuth server. The server's detail page also offers \
                  Reconnect, which replaces only that server while the session is idle. \
+                 The top of `/mcp` offers Pause all / Resume (Ctrl+S), for this session only. \
+                 Pause requires an idle session and leaves per-server configuration unchanged. \
                  After a file changes, `/reload` reads \
                  the servers again and reconnects. Each server's tools join the catalog \
                  as `mcp__<server>__<tool>` and go through the same approval as \

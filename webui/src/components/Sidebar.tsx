@@ -9,7 +9,7 @@ import { ScheduleIcon } from './Automation';
 import { useSkills, refreshSkills } from '../skills';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getMcpStatus, postLiveMcpTrust, getSession, getProjects, updateProject, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getMcpStatus, getMcpSession, setMcpSession, postLiveMcpTrust, getSession, getProjects, updateProject, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -387,11 +387,55 @@ export function Sidebar({
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
   // MCP menu: server list fetched lazily; the count badge shows once loaded.
+  const [mcpSession, setMcpSessionState] = useState<{ session: string; paused: boolean } | null>(null);
+  const [mcpSwitchBusy, setMcpSwitchBusy] = useState(false);
+  const [mcpSwitchError, setMcpSwitchError] = useState('');
+  const mcpReadRevision = useRef(0);
+  const mcpSessionRef = useRef(activeSessionId);
+  mcpSessionRef.current = activeSessionId;
+  async function toggleMcpSession() {
+    const current = mcpSession;
+    if (!current || current.session !== activeSessionId || mcpSwitchBusy) return;
+    const revision = ++mcpReadRevision.current;
+    setMcpSwitchBusy(true);
+    setMcpSwitchError('');
+    try {
+      const { paused } = await setMcpSession(current.session, !current.paused);
+      if (mcpSessionRef.current === current.session && revision === mcpReadRevision.current) {
+        setMcpSessionState({ session: current.session, paused });
+        refreshMcpStatus();
+      }
+    } catch (error) {
+      if (mcpSessionRef.current === current.session && revision === mcpReadRevision.current) setMcpSwitchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMcpSwitchBusy(false);
+      // Reopening the menu may have read state before this mutation committed.
+      // Fetch again rather than applying its now-stale response to the current view.
+      if (mcpSessionRef.current === current.session && revision !== mcpReadRevision.current) {
+        const refresh = ++mcpReadRevision.current;
+        void getMcpSession(current.session).then(({ paused }) => {
+          if (mcpSessionRef.current === current.session && refresh === mcpReadRevision.current) {
+            setMcpSessionState({ session: current.session, paused });
+          }
+        }).catch(() => {});
+      }
+    }
+  }
   const [mcpStatus, setMcpStatus] = useState<McpStatusInfo | null>(null);
   const [mcpLoading, setMcpLoading] = useState(false);
   // Bounds the connecting-state poll loop (see the poll effect below).
   const mcpPollAttemptsRef = useRef(0);
   const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const revision = ++mcpReadRevision.current;
+    setMcpSessionState(null);
+    setMcpSwitchError('');
+    if (activeSessionId) getMcpSession(activeSessionId).then(({ paused }) => {
+      if (!cancelled && revision === mcpReadRevision.current) setMcpSessionState({ session: activeSessionId, paused });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeSessionId, mcpMenuOpen]);
   const [mcpMenuPos, setMcpMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const mcpMenuRef = useRef<HTMLDivElement | null>(null);
   const mcpBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -1192,6 +1236,15 @@ export function Sidebar({
               minWidth: `${Math.max(mcpMenuPos.width, 220)}px`,
             }}
           >
+            {mcpSession?.session === activeSessionId && (
+              <div class="mcp-session-control">
+                <span>{t(mcpSession.paused ? 'mcp.sessionPaused' : 'mcp.sessionEnabled')}</span>
+                <button class="btn" disabled={mcpSwitchBusy} onClick={() => void toggleMcpSession()}>
+                  {mcpSwitchBusy ? '…' : t(mcpSession.paused ? 'mcp.resumeAll' : 'mcp.pauseAll')}
+                </button>
+              </div>
+            )}
+            {mcpSwitchError && <div role="alert" class="mcp-blocked-error">{mcpSwitchError}</div>}
             {mcpLoading && <div class="group-by-menu-title">{t('sidebar.mcpLoading')}</div>}
             {!mcpLoading && (mcpStatus?.servers?.length ?? 0) === 0 && !(mcpStatus?.blocked?.length) && (
               <div class="group-by-menu-title">{t('sidebar.mcpEmpty')}</div>

@@ -2994,6 +2994,37 @@ pub(crate) async fn live_compact(State(_state): State<AppState>) -> impl IntoRes
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct McpSessionQuery {
+    session: String,
+}
+#[derive(serde::Deserialize)]
+pub(crate) struct McpSessionChange {
+    session: String,
+    paused: bool,
+}
+
+pub(crate) async fn live_mcp_session_get(
+    axum::extract::Query(q): axum::extract::Query<McpSessionQuery>,
+) -> axum::response::Response {
+    mcp_session_reply(crate::native_live::mcp_session(q.session, None).await)
+}
+pub(crate) async fn live_mcp_session_post(
+    Json(q): Json<McpSessionChange>,
+) -> axum::response::Response {
+    mcp_session_reply(crate::native_live::mcp_session(q.session, Some(q.paused)).await)
+}
+fn mcp_session_reply(result: Result<bool, crate::live_hub::HubError>) -> axum::response::Response {
+    match result {
+        Ok(paused) => Json(serde_json::json!({"paused": paused})).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
 /// are allowed to connect on the next turn. Rebuilds the serving MCP registry
 /// so newly-allowed servers start connecting immediately.

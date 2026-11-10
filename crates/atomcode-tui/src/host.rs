@@ -4221,6 +4221,23 @@ impl Host {
         }
     }
 
+    /// Whether the pointer is over the current-session MCP switch.
+    pub fn mcp_switch_at(&self, x: u16, y: u16) -> bool {
+        let rect = *self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .mcp
+            .as_ref()
+            .unwrap_or(&crate::frame::Rect::sized(0, 0));
+        if !rect.contains(x, y) {
+            return false;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::mcp::geometry(&m, &vp).is_session_switch((y - rect.y) as usize)
+    }
+
     /// Which row of the MCP panel is under the pointer.
     ///
     /// 列表层是**服务器**的第几行,详情层是**动作**的第几行——正是 `Panel::cursor`

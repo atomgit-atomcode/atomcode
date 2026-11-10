@@ -1237,6 +1237,10 @@ pub enum Msg<'a> {
     McpActionReconnect,
     McpActionEnable,
     McpActionDisable,
+    McpPauseAll,
+    McpResumeAll,
+    McpSessionPaused,
+    McpSessionEnabled,
     /// The key legend: on the list, on the detail page, and while a round trip
     /// is out.
     McpRefreshTimeout,

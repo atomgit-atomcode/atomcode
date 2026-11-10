@@ -2932,6 +2932,14 @@ impl UserInterface for Tui {
                             // the second half of a double click land on an
                             // action that was not on screen for the first half.
                             if self.host.mcp_open() {
+                                if self.host.mcp_switch_at(x, y) {
+                                    self.run_mcp_key(crate::surface::KeyPress {
+                                        key: crate::surface::Key::Char('s'),
+                                        mods: crate::surface::Mods::CTRL,
+                                    });
+                                    stale = true;
+                                    continue;
+                                }
                                 if let Some(row) = self.host.mcp_row_at(x, y) {
                                     if self.host.mcp_click(row) {
                                         self.run_mcp_key(crate::surface::KeyPress::plain(

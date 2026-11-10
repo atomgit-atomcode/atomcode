@@ -2069,6 +2069,14 @@ body {
   white-space: nowrap;
 }
 /* Blocked-untrusted-project notice inside the MCP popover. */
+.mcp-session-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
 .mcp-blocked-notice {
   display: flex;
   flex-direction: column;

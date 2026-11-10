@@ -119,6 +119,8 @@ pub(crate) fn mode_changed(from: RuntimeMode, to: RuntimeMode) -> Option<String>
 
 pub(crate) fn mcp_acted(server: &str, action: McpAction) -> String {
     reminder(&match action {
+        McpAction::PauseAll => "The person paused all MCP servers for this session.".into(),
+        McpAction::ResumeAll => "The person resumed this session MCP servers according to their individual configuration.".into(),
         // Trust is the project's, not one server's: `/mcp trust` names none, and
         // a trust given from one server's page lets in all of the project's.
         McpAction::Trust => "The person trusted this project's MCP servers; their tools are \
@@ -228,7 +230,7 @@ mod tests {
             | C::ApplyUndo { .. }
             | C::FinishRewind { .. } => Heard::Told,
             C::Reprepare { target, .. } => match target {
-                ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_) => Heard::Told,
+                ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_) | ReprepareTarget::McpSessionPaused { .. } => Heard::Told,
                 // A new session: its prompt says where it is, and there is no
                 // conversation above it to be told about.
                 ReprepareTarget::Fresh

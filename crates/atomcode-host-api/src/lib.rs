@@ -513,6 +513,8 @@ pub enum HostReply {
         tools: Vec<String>,
     },
     McpRows {
+        #[serde(default)]
+        paused: bool,
         rows: Vec<McpRow>,
     },
     McpDetail {
@@ -1283,6 +1285,9 @@ pub struct McpServerDetail {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpAction {
+    /// Pause all MCP servers in the addressed session only.
+    PauseAll,
+    ResumeAll,
     /// Reconnect only this server, keeping the current session.
     Reconnect,
     /// Cancel the current reconnect of this server, without cancelling a turn.
@@ -1968,6 +1973,7 @@ mod tests {
                 tools: vec!["fs__read".into(), "fs__write".into()],
             },
             HostReply::McpRows {
+                paused: false,
                 rows: vec![McpRow {
                     name: "fs".into(),
                     state: McpServerState::Connected,

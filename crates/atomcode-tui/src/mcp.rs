@@ -103,6 +103,8 @@ pub struct McpDetail {
 /// 一次动作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    PauseAll,
+    ResumeAll,
     Reconnect,
     Trust,
     Untrust,
@@ -115,6 +117,8 @@ pub enum Action {
 impl Action {
     pub fn about(self) -> String {
         match self {
+            Self::PauseAll => t(Msg::McpPauseAll),
+            Self::ResumeAll => t(Msg::McpResumeAll),
             Self::Reconnect => t(Msg::McpActionReconnect),
             Self::Trust => t(Msg::McpActionTrust),
             Self::Untrust => t(Msg::McpActionUntrust),
@@ -139,6 +143,7 @@ pub enum Level {
 /// 目录,以及打开着的那一份详情。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct McpView {
+    pub paused: bool,
     rows: Vec<McpRow>,
     detail: Option<McpDetail>,
 }
@@ -149,7 +154,16 @@ impl McpView {
         rows.sort_by(|a, b| {
             (a.source.as_str(), a.name.as_str()).cmp(&(b.source.as_str(), b.name.as_str()))
         });
-        Self { rows, detail: None }
+        Self {
+            rows,
+            detail: None,
+            paused: false,
+        }
+    }
+
+    pub fn with_paused(mut self, paused: bool) -> Self {
+        self.paused = paused;
+        self
     }
 
     pub fn with_detail(mut self, detail: McpDetail) -> Self {
@@ -400,6 +414,16 @@ pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
         };
     }
 
+    if panel.level == Level::List && press.key == Key::Char('s') && press.mods == Mods::CTRL {
+        return Step::Act {
+            server: String::new(),
+            action: if view.paused {
+                Action::ResumeAll
+            } else {
+                Action::PauseAll
+            },
+        };
+    }
     if press.key == Key::Char('r') && press.mods == Mods::CTRL {
         return Step::Refresh;
     }
@@ -560,6 +584,56 @@ mod tests {
 
     fn press(key: Key) -> KeyPress {
         KeyPress::plain(key)
+    }
+
+    #[test]
+    fn session_switch_uses_authoritative_state_and_ignores_detail_and_busy() {
+        let mut view = McpView::default();
+        let mut panel = Panel::default();
+        let shortcut = KeyPress {
+            key: Key::Char('s'),
+            mods: Mods::CTRL,
+        };
+        assert_eq!(
+            key(&view, &mut panel, shortcut),
+            Step::Act {
+                server: String::new(),
+                action: Action::PauseAll
+            }
+        );
+        view.paused = true;
+        assert_eq!(
+            key(&view, &mut panel, shortcut),
+            Step::Act {
+                server: String::new(),
+                action: Action::ResumeAll
+            }
+        );
+        panel.level = Level::Detail;
+        assert!(!matches!(
+            key(&view, &mut panel, shortcut),
+            Step::Act { .. }
+        ));
+    }
+
+    #[test]
+    fn session_switch_does_not_start_a_second_action_while_busy() {
+        let view = McpView::default();
+        let mut panel = Panel {
+            busy: Some(Busy::of(Action::PauseAll)),
+            ..Panel::default()
+        };
+        assert_eq!(
+            key(
+                &view,
+                &mut panel,
+                KeyPress {
+                    key: Key::Char('s'),
+                    mods: Mods::CTRL
+                }
+            ),
+            Step::Stay
+        );
     }
 
     #[test]

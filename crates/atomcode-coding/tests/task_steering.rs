@@ -136,6 +136,7 @@ async fn run(scenario: Scenario) -> (Arc<Script>, Vec<CodingRuntimeEvent>, Vec<M
         prepare: PrepareOptions {
             skill_dirs: Some(Vec::new()),
             mcp: false,
+            mcp_paused: false,
             memory: false,
             web: false,
             review: false,

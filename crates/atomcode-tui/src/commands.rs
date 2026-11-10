@@ -2981,7 +2981,7 @@ async fn unknown_server(
     server: &str,
 ) -> Option<Outcome> {
     let rows = match control.call(HostCommand::McpManage { session: root }).await {
-        Ok(HostReply::McpRows { rows }) => rows,
+        Ok(HostReply::McpRows { rows, .. }) => rows,
         _ => return None,
     };
     if rows.iter().any(|row| row.name == server) {
@@ -5184,6 +5184,7 @@ mod tests {
 
     fn rows(names: &[&str]) -> HostReply {
         HostReply::McpRows {
+            paused: false,
             rows: names
                 .iter()
                 .map(|name| atomcode_host_api::McpRow {

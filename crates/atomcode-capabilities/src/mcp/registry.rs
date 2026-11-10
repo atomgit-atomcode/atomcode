@@ -578,7 +578,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
         let configs = match storage.load() {
             Ok(mut c) => {
-                c.extend(extra_servers);
+                c.extend(extra_servers.into_iter().filter(|server| !server.disabled));
                 c
             }
             Err(e) => {

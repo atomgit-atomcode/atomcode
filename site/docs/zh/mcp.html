@@ -78,6 +78,9 @@
 <h1 id="mcp-集成">MCP 集成</h1>
       <p class="lede">MCP（Model Context Protocol）是一个开放协议,把外部程序或 HTTP 服务的「工具」接到 AtomCode,让模型像调用内置工具一样使用它们。从 v4.20.4 起 AtomCode 内置 MCP 客户端,直接复用 Cursor 等同样使用 <code>mcpServers</code> 配置块的生态。</p>
 
+      <h2 id="session-pause">暂停本会话全部 MCP</h2>
+      <p>在 <code>/mcp</code> 面板顶部点击“暂停全部”，或在列表页按 <code>Ctrl+S</code>；WebUI 的 MCP 菜单顶部也提供同样入口。暂停后工具不再提供给模型，连接会释放。“恢复”按各服务器原有配置重新连接，不会启用原本禁用的服务器，也不修改配置文件。</p>
+      <p>请先结束当前任务、goal/loop，收取后台任务并停止子 agent。暂停状态在同一会话内的模型切换和配置重载后保留；新建、重新打开会话或切换工作目录后重置，不作为持久化配置保存。</p>
       <h2 id="它能做什么">它能做什么</h2>
       <ul>
         <li>通过官方 MCP server 操作 GitHub、GitLab、Jira 等外部服务</li>

@@ -78,6 +78,9 @@
 <h1 id="mcp-integration">MCP Integration</h1>
       <p class="lede">MCP (Model Context Protocol) is an open protocol that plugs the "tools" exposed by external programs or HTTP services into AtomCode, so the model can call them like built-in tools. Since v4.20.4, AtomCode ships a built-in MCP client and re-uses the same <code>mcpServers</code> configuration block as Cursor and others.</p>
 
+      <h2 id="session-pause">Pause all MCP servers for this session</h2>
+      <p>Choose “Pause all” at the top of <code>/mcp</code>, or press <code>Ctrl+S</code> in its list view. The WebUI MCP menu offers the same control. Pausing removes MCP tools from the model and releases connections. Resume reconnects according to each server’s existing configuration, leaving individually disabled servers off and configuration files unchanged.</p>
+      <p>Finish the current task and goal/loop, collect background jobs, and stop delegated agents first. The pause survives model changes and configuration reloads in the same session. Starting or reopening a session, or changing directory, resets it; it is not a persistent setting.</p>
       <h2 id="what-it-enables">What it enables</h2>
       <ul>
         <li>Operate GitHub, GitLab, Jira, and other external services via official MCP servers</li>

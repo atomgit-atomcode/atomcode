@@ -903,6 +903,33 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
+    pub async fn mcp_session(
+        &self,
+        session: String,
+        paused: Option<bool>,
+    ) -> Result<bool, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::StaleBinding);
+        }
+        if let Some(paused) = paused {
+            let changed = handle
+                .set_mcp_paused(session.clone(), paused)
+                .await
+                .map_err(|e| HubError::RuntimeRejected(e.to_string()))?;
+            self.commit_changed_snapshot(&binding, &handle, &changed)
+                .await?;
+        }
+        let snapshot = handle
+            .mcp_rows()
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))?;
+        if snapshot.session_id.as_deref() != Some(session.as_str()) {
+            return Err(HubError::StaleBinding);
+        }
+        Ok(snapshot.paused)
+    }
+
     pub async fn quality(&self, session: String, args: String) -> Result<String, HubError> {
         let (binding, handle) = self.bound_handle()?;
         if binding.session_id != session {
@@ -2240,6 +2267,33 @@ mod tests {
             matches!(result, Err(HubError::RuntimeRejected(message)) if message.contains("different session"))
         );
         assert_eq!(hub.binding().unwrap().id, before.id);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mcp_session_pause_rejects_another_session_without_rebinding() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        hub.bind(
+            "session-a",
+            project.path().to_path_buf(),
+            snapshot("one"),
+            Arc::new(RealControl {
+                handle: runtime.handle.clone(),
+            }),
+        )
+        .unwrap();
+        let before = hub.binding().unwrap();
+        for paused in [None, Some(true), Some(false)] {
+            assert_eq!(
+                hub.mcp_session("session-b".into(), paused).await,
+                Err(HubError::StaleBinding)
+            );
+            assert_eq!(hub.binding().unwrap().id, before.id);
+        }
         runtime.handle.shutdown().await.unwrap();
     }
 

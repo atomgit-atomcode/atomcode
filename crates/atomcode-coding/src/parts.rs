@@ -113,6 +113,8 @@ pub struct PrepareOptions {
     pub plugin_skill_dirs: Vec<atomcode_capabilities::skills::TemplateDirectory>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,
+    /// Ephemeral current-session overlay; never writes per-server disabled flags.
+    pub mcp_paused: bool,
     /// Driver-supplied MCP servers connected alongside config servers — e.g.
     /// ACP client-injected `mcpServers` from `session/new`. Entries must use
     /// `McpConfigSource::Driver`: they bypass the project trust gate because
@@ -267,6 +269,7 @@ impl Default for PrepareOptions {
             skill_dirs: None,
             plugin_skill_dirs: Vec::new(),
             mcp: true,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -1065,47 +1068,48 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // the session candidate path. `mount()` publishes each connected server's tools
     // atomically for the next turn, then publishes once more when the initial pass
     // reaches its bounded terminal state.
-    let (mcp_registry, mcp_connect_rx, mcp_telemetry_rx) = if opts.tools && opts.mcp {
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-        // A second listener, only when something is metering. The registry
-        // publishes to one sender, so the fan-out is here rather than in
-        // `atomcode-capabilities` — one consumer is still the common case, and
-        // a telemetry-free embedder pays nothing for this.
-        //
-        // Chaining instead of teeing would make the meter load-bearing for the
-        // tool catalog: turn telemetry off and the tools stop being published.
-        let (event_rx, telemetry_rx) = match cfg.telemetry.is_some() {
-            false => (event_rx, None),
-            true => {
-                let (rows_tx, rows_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (meter_tx, meter_rx) = tokio::sync::mpsc::unbounded_channel();
-                let mut source = event_rx;
-                // Ends when the registry drops its sender, which happens when
-                // these parts do — no handle to abort, and nothing to leak.
-                tokio::spawn(async move {
-                    while let Some(event) = source.recv().await {
-                        let to_rows = rows_tx.send(event.clone()).is_ok();
-                        let to_meter = meter_tx.send(event).is_ok();
-                        if !to_rows && !to_meter {
-                            break;
+    let (mcp_registry, mcp_connect_rx, mcp_telemetry_rx) =
+        if opts.tools && opts.mcp && !opts.mcp_paused {
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+            // A second listener, only when something is metering. The registry
+            // publishes to one sender, so the fan-out is here rather than in
+            // `atomcode-capabilities` — one consumer is still the common case, and
+            // a telemetry-free embedder pays nothing for this.
+            //
+            // Chaining instead of teeing would make the meter load-bearing for the
+            // tool catalog: turn telemetry off and the tools stop being published.
+            let (event_rx, telemetry_rx) = match cfg.telemetry.is_some() {
+                false => (event_rx, None),
+                true => {
+                    let (rows_tx, rows_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (meter_tx, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let mut source = event_rx;
+                    // Ends when the registry drops its sender, which happens when
+                    // these parts do — no handle to abort, and nothing to leak.
+                    tokio::spawn(async move {
+                        while let Some(event) = source.recv().await {
+                            let to_rows = rows_tx.send(event.clone()).is_ok();
+                            let to_meter = meter_tx.send(event).is_ok();
+                            if !to_rows && !to_meter {
+                                break;
+                            }
                         }
-                    }
-                });
-                (rows_rx, Some(meter_rx))
-            }
+                    });
+                    (rows_rx, Some(meter_rx))
+                }
+            };
+            (
+                Some(Arc::new(McpRegistry::from_storage_background(
+                    &mcp_storage(cfg, &opts),
+                    Some(event_tx),
+                    opts.extra_mcp_servers.clone(),
+                ))),
+                Some(event_rx),
+                telemetry_rx,
+            )
+        } else {
+            (None, None, None)
         };
-        (
-            Some(Arc::new(McpRegistry::from_storage_background(
-                &mcp_storage(cfg, &opts),
-                Some(event_tx),
-                opts.extra_mcp_servers.clone(),
-            ))),
-            Some(event_rx),
-            telemetry_rx,
-        )
-    } else {
-        (None, None, None)
-    };
     let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
     // Session binding: the id's single owner.
@@ -1959,6 +1963,10 @@ pub async fn mcp_row_facts_in(
 /// waits on a browser and writes only a token (`cli/tui_mcp.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpAction {
+    /// Pause all MCP connections for this session without changing configuration.
+    PauseAll,
+    /// Restore the configured servers for this session.
+    ResumeAll,
     /// Reconnect only this server, keeping the current session.
     Reconnect,
     /// Cancel the current reconnect of this server, without cancelling a turn.
@@ -2730,6 +2738,7 @@ mod tests {
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: true,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -3079,6 +3088,7 @@ mod tests {
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
