@@ -1456,6 +1456,14 @@ async fn a_zero_round_turn_builds_a_valid_script() {
     let asked = Arc::new(AtomicU32::new(0));
     let attempts = Arc::new(AtomicU32::new(0));
     let app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 0, 0.0005).await;
+    // The second turn must see a usage-bearing request, and the trigger is
+    // 0.0005 * 128_000 = 64 tokens. Report 100 explicitly instead of relying
+    // on the replay provider's own hardcoded prompt count, so this test is
+    // about the zero-round script and not about that fixture.
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(ScheduledPressure(AtomicU32::new(0), &[100, 100])),
+        false,
+    );
 
     let outcome = run_turn(&app, "first").await.unwrap();
     assert_eq!(outcome.steps, 1, "the closing answer is one model step");
@@ -1463,9 +1471,9 @@ async fn a_zero_round_turn_builds_a_valid_script() {
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
 
-    // The script's next answer carries the first response's usage: a
-    // usage-bearing request must still reach the trigger, so the zero counters
-    // above are not a dead-test artifact.
+    // The second turn's request carries the first response's scheduled usage:
+    // a usage-bearing request must still reach the trigger, so the zero
+    // counters above are not a dead-test artifact.
     let second = run_turn(&app, "second").await.unwrap();
     assert_eq!(second.steps, 1, "the second turn is one model step");
     assert_eq!(
