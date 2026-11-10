@@ -91,7 +91,7 @@ async fn registry_connect_discover_and_call_echo() {
 
 /// Regression-style reproduction: a stdio server whose `args` contain spaces and
 /// non-ASCII characters (a script path under a directory with a CJK name). The
-/// arg is written as `${UNICODE_ARG:-<cjk path>}` in `.mcp.json` — the variable
+/// arg is written as `${ATOMCODE_TEST_MCP_UNICODE_DEFAULT:-<cjk path>}` in `.mcp.json` — the variable
 /// is deliberately never set, so the value reaches argv through the default
 /// branch of `load_mcp_config` → `expand_env_vars` — a regression of the
 /// byte-wise expansion fails the byte-for-byte assertion below, before any
@@ -100,15 +100,15 @@ async fn registry_connect_discover_and_call_echo() {
 /// args in argv (the fixture ignores extra args, so they are not the guard).
 #[tokio::test]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
-    const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
-    // The assertion below expects the default branch of ${UNICODE_ARG:-…} to
+    const UNICODE_PATH: &str = "/tmp/中文 目录/with space/server.py";
+    // The assertion below expects the default branch of ${ATOMCODE_TEST_MCP_UNICODE_DEFAULT:-…} to
     // be taken. This is a read-only check (no setenv, no race); a host that
     // defines this test-namespaced variable would invalidate the expectation,
     // so refuse loudly instead of failing obscurely mid-test.
     assert!(
-        std::env::var("UNICODE_ARG").is_err(),
-        "the host must not define UNICODE_ARG — it would override the \
-         ${{UNICODE_ARG:-…}} default this test asserts on"
+        std::env::var("ATOMCODE_TEST_MCP_UNICODE_DEFAULT").is_err(),
+        "the host must not define ATOMCODE_TEST_MCP_UNICODE_DEFAULT — it would override the \
+         ${{ATOMCODE_TEST_MCP_UNICODE_DEFAULT:-…}} default this test asserts on"
     );
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -117,9 +117,9 @@ async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
             "mcpServers": {
                 "spacey-args": {
                     "command": env!("CARGO_BIN_EXE_mcp-test-server"),
-                    // Never set UNICODE_ARG anywhere: the default branch of
+                    // Never set ATOMCODE_TEST_MCP_UNICODE_DEFAULT anywhere: the default branch of
                     // ${VAR:-default} carries the CJK value through expansion.
-                    "args": ["${UNICODE_ARG:-/tmp/中文 目录/with space/server.py}"]
+                    "args": ["${ATOMCODE_TEST_MCP_UNICODE_DEFAULT:-/tmp/中文 目录/with space/server.py}"]
                 }
             }
         })
@@ -142,7 +142,7 @@ async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     };
     assert_eq!(
         args.as_slice(),
-        [UNICODE_ARG],
+        [UNICODE_PATH],
         "expansion must preserve non-ASCII bytes byte for byte"
     );
 

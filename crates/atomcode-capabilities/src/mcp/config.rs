@@ -1274,8 +1274,8 @@ mod tests {
     #[test]
     #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_expansion_before_unclosed_brace() {
-        // 专用变量名：不与未序列化的既有单测（test_expand_env_vars_simple
-        // 也用 TEST_VAR）共享键，串行组与 Drop 清理只兜住本测试自己的修改。
+        // 使用专用变量名，并与其他环境变量展开测试共享串行组；
+        // Drop 清理保证断言失败后也不遗留本测试设置的值。
         struct RemoveEnvOnDrop;
         impl Drop for RemoveEnvOnDrop {
             fn drop(&mut self) {
