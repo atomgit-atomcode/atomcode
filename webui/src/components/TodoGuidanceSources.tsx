@@ -3,7 +3,7 @@ import { getTodoSources, type TodoSourceView, type TodoSourcePage } from '../api
 import { useT } from '../settings';
 import type { TodoItem } from '../lib/todoState';
 
-/** Read-only original guidance, loaded only on explicit expansion. */
+/** Discover linked sources up front; read original text only on explicit selection. */
 export function TodoGuidanceSources(props: { projectHash: string; sessionId: string; items: TodoItem[]; revision: number }) {
   const t = useT();
   const [open, setOpen] = useState(false);
@@ -18,6 +18,7 @@ export function TodoGuidanceSources(props: { projectHash: string; sessionId: str
   function cancel() { epoch.current += 1; pending.current?.abort(); pending.current = null; }
   useLayoutEffect(() => {
     cancel(); setOpen(false); setView(null); setPage(null); setError(''); setBusy(false);
+    void load();
     return cancel;
   }, [props.projectHash, props.sessionId, signature, props.revision]);
 
@@ -45,15 +46,18 @@ export function TodoGuidanceSources(props: { projectHash: string; sessionId: str
   }
   function toggle() {
     if (open) { cancel(); setOpen(false); setBusy(false); }
-    else { setOpen(true); void load(); }
+    else { setOpen(true); }
   }
+  // Unknown/loading is distinct from a successful empty result. Failed discovery
+  // remains retryable instead of masquerading as "no sources".
+  if (!view) return error ? <div class="todo-guidance-sources"><p role="alert">{error} <button type="button" class="btn" onClick={() => void load()}>{t('todo.source.retry')}</button></p></div> : null;
+  if (!view.sources.length) return null;
   return <div class="todo-guidance-sources">
-    <button type="button" class="btn btn-ghost" aria-expanded={open} onClick={toggle}>{t('todo.source.open')}</button>
+    <button type="button" class="btn btn-ghost" aria-expanded={open} onClick={toggle}>{t('todo.source.open', { count: view.sources.length })}</button>
     {open && <div>
       <p class="todo-source-hint">{t('todo.source.reference')}</p>
       {busy && <p role="status">{t('todo.source.loading')}</p>}
       {error && <p role="alert">{error} <button type="button" class="btn" onClick={() => void load()}>{t('todo.source.retry')}</button></p>}
-      {view && !view.sources.length && <p>{t('todo.source.empty')}</p>}
       {view?.sources.map(source => <button key={source.seq} type="button" class="btn btn-ghost" disabled={busy} onClick={() => void load(source.seq)}>{t('todo.source.message', { seq: source.seq })} · {source.chars.toLocaleString()} {t('todo.source.characters')}</button>)}
       {page && <div class="todo-source-page">
         <div>{t('todo.source.message', { seq: page.seq })} · {page.offset.toLocaleString()}–{(page.offset + Array.from(page.text).length).toLocaleString()} / {page.total_chars.toLocaleString()}</div>
