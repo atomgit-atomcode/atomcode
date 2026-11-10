@@ -303,6 +303,18 @@ pub trait FileSystem: Send + Sync {
 
     async fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, FsError>;
 
+    /// Best-effort line count for display, reading at most `max_bytes + 1` bytes.
+    /// Return None when too large or unsupported. Never fall back to read_bytes:
+    /// worlds without a bounded reader must skip this optional inspection.
+    /// Counts LF-delimited lines plus a final unterminated line, like str::lines.
+    async fn count_lines_bounded(
+        &self,
+        _path: &Path,
+        _max_bytes: u64,
+    ) -> Result<Option<usize>, FsError> {
+        Ok(None)
+    }
+
     async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError>;
 
     /// Create `path` and every missing ancestor.
@@ -1035,6 +1047,35 @@ impl LocalFs {
     }
 }
 
+// Fixed storage even for a single giant line; the read cap also covers growth
+// after metadata inspection. A partial/error count is never reported as exact.
+async fn count_reader_lines(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    max_bytes: u64,
+) -> Result<Option<usize>, FsError> {
+    use tokio::io::AsyncReadExt;
+    let mut reader = reader.take(max_bytes.saturating_add(1));
+    let mut buffer = [0u8; 16 * 1024];
+    let mut total = 0u64;
+    let mut lines = 0usize;
+    let mut last = None;
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(FsError::io)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > max_bytes {
+            return Ok(None);
+        }
+        lines += buffer[..read].iter().filter(|&&byte| byte == b'\n').count();
+        last = Some(buffer[read - 1]);
+    }
+    Ok(Some(
+        lines + usize::from(last.is_some_and(|byte| byte != b'\n')),
+    ))
+}
+
 #[async_trait]
 impl FileSystem for LocalFs {
     fn describe(&self) -> String {
@@ -1068,6 +1109,20 @@ impl FileSystem for LocalFs {
             Err(_) => return Err(FsError::not_found(&path)),
         }
         tokio::fs::read(&path).await.map_err(FsError::io)
+    }
+
+    async fn count_lines_bounded(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<usize>, FsError> {
+        let path = self.resolve(path)?;
+        let meta = tokio::fs::metadata(&path).await.map_err(FsError::io)?;
+        if !meta.is_file() || meta.len() > max_bytes {
+            return Ok(None);
+        }
+        let file = tokio::fs::File::open(path).await.map_err(FsError::io)?;
+        count_reader_lines(file, max_bytes).await
     }
 
     async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
@@ -2240,5 +2295,82 @@ mod tests {
         let fs = LocalFs::new(&dir);
         let info = fs.info(Path::new("nope.txt")).await.unwrap();
         assert!(!info.exists);
+    }
+}
+
+#[cfg(test)]
+mod bounded_line_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_lines_match_text_lines_and_reject_an_over_budget_reader() {
+        for text in ["", "a", "a\n", "\n", "a\r\nb\r\n", "a\nb", "中文\n下一行"] {
+            assert_eq!(
+                count_reader_lines(text.as_bytes(), text.len() as u64)
+                    .await
+                    .unwrap(),
+                Some(text.lines().count())
+            );
+        }
+        // Models a file that grew after the metadata check, including no newline.
+        let bytes = vec![b'x'; 100_000];
+        assert_eq!(
+            count_reader_lines(bytes.as_slice(), 10).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            count_reader_lines(bytes.as_slice(), 100_000).await.unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_local_inspection_respects_the_world_and_size_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a"), "a\nb\n").unwrap();
+        std::fs::write(outside.path().join("secret"), "secret").unwrap();
+        let world = LocalFs::new(root.path());
+        assert_eq!(
+            world.count_lines_bounded(Path::new("a"), 4).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            world.count_lines_bounded(Path::new("a"), 3).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            world
+                .count_lines_bounded(&outside.path().join("secret"), 100)
+                .await
+                .unwrap_err()
+                .kind,
+            FsErrorKind::Denied
+        );
+        assert_eq!(
+            world
+                .count_lines_bounded(Path::new("."), 100)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_failure_never_returns_a_partial_line_count() {
+        struct Fails;
+        impl tokio::io::AsyncRead for Fails {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("read failed")))
+            }
+        }
+        use tokio::io::AsyncReadExt;
+        assert!(count_reader_lines(b"first\n".as_slice().chain(Fails), 100)
+            .await
+            .is_err());
     }
 }

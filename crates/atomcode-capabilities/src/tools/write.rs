@@ -80,13 +80,14 @@ impl Tool for WriteFileTool {
         };
         let path = resolve_path(&a.file_path, &ctx.working_dir);
 
-        // Capture pre-existing line count for an overwrite diff message.
+        // Display-only inspection must never read the entire old file.
+        let existed = self.world.info(&path).await.ok().map(|info| info.exists);
         let old_lines = self
             .world
-            .read_text(&path)
+            .count_lines_bounded(&path, 10 * 1024 * 1024)
             .await
             .ok()
-            .map(|s| s.lines().count());
+            .flatten();
 
         if let Some(parent) = path.parent() {
             if let Err(e) = self.world.create_dir_all(parent).await {
@@ -127,7 +128,11 @@ impl Tool for WriteFileTool {
                 }
                 m
             }
-            None => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
+            None => match existed {
+                Some(false) => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
+                Some(true) => format!("Overwrote {disp} ({bytes} bytes, {new_lines} lines; previous line count unavailable)"),
+                None => format!("Wrote {disp} ({bytes} bytes, {new_lines} lines; previous line count unavailable)"),
+            },
         };
         if let Some(warning) = windows_script_encoding_warning(&path, &a.content) {
             msg.push_str(warning);
@@ -247,6 +252,30 @@ mod tests {
             "{}",
             r.content
         );
+    }
+
+    #[tokio::test]
+    async fn large_overwrite_skips_count_and_still_reports_overwrite() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("large.log");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(100 * 1024 * 1024)
+            .unwrap();
+        let result = WriteFileTool::default()
+            .execute(
+                r#"{"file_path":"large.log","content":"small\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.starts_with("Overwrote"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("previous line count unavailable"));
+        assert_eq!(std::fs::read(path).unwrap(), b"small\n");
     }
 
     #[tokio::test]
