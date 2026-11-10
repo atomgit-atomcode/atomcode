@@ -1,4 +1,4 @@
-# AtomCode uninstaller — PowerShell
+# AtomCode uninstaller - PowerShell
 #
 #   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
 #
@@ -49,10 +49,10 @@ foreach ($f in @("atomcode.exe.bak",".atomcode.rolling",".atomcode.download",".a
 
 if (-not $KeepData) {
     Write-Host ""
-    Write-Host "Will consider (Group 2 — credentials):"
+    Write-Host "Will consider (Group 2 - credentials):"
     foreach ($f in $Group2Files) { $p = Join-Path $DataDir $f; if (Test-Path $p) { Write-Host "  $p" } }
     Write-Host ""
-    Write-Host "Will remove (Group 3 — state):"
+    Write-Host "Will remove (Group 3 - state):"
     foreach ($f in $Group3Files) { $p = Join-Path $DataDir $f; if (Test-Path $p) { Write-Host "  $p" } }
     foreach ($d in $Group3Dirs)  { $p = Join-Path $DataDir $d; if (Test-Path $p) { Write-Host "  $p" } }
     foreach ($pre in $Group3Prefixes) {
@@ -82,7 +82,7 @@ elseif (-not $Yes) {
     if (-not ($a -match '^(y|yes)$')) { Write-Host "aborted"; exit 1 }
 }
 
-# execute (state → credentials → rc → binary)
+# execute (state -> credentials -> rc -> binary)
 if ($DoG3) {
     foreach ($f in $Group3Files) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $DataDir $f) }
     foreach ($d in $Group3Dirs)  { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $DataDir $d) }
@@ -114,7 +114,7 @@ if (Test-Path $Binary) {
         Remove-Item -Force $Binary
         Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
     } catch {
-        Write-Error "could not remove $Binary — close any running atomcode.exe and re-run."
+        Write-Error "could not remove $Binary - close any running atomcode.exe and re-run."
         exit 4
     }
 }

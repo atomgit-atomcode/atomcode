@@ -512,6 +512,7 @@ fn shell_tool_description(
     macro_rules! cmd_suffix {
         () => {
             "\n\
+             Windows script encoding: avoid non-ASCII UTF-8 .cmd/.bat files under legacy code pages. Prefer the independent pwsh tool for commands containing literal Chinese paths. Windows PowerShell 5.1 -File requires UTF-8 with BOM for non-ASCII .ps1 scripts; console output encoding does not fix script decoding.\n\
              Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
              bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
              printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
@@ -530,6 +531,7 @@ fn shell_tool_description(
     macro_rules! bash_suffix {
         () => {
             "\n\
+             Windows script encoding: invoking powershell.exe -File or cmd.exe batch files still uses those interpreters decoding rules. For non-ASCII .ps1 scripts under Windows PowerShell 5.1, use UTF-8 with BOM or execute directly with the independent pwsh tool. Avoid non-ASCII UTF-8 .cmd/.bat files under legacy code pages.\n\
              Windows: a POSIX bash (Git Bash / MSYS2) is installed and this tool runs \
              commands via `bash -c` — use bash syntax, NOT cmd.exe. `$(...)`, `&&`, `|`, \
              quoting, heredocs and `printf` all work as on Linux.\n\

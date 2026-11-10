@@ -111,7 +111,7 @@ impl Tool for WriteFileTool {
             return err(format!("write_file: failed to write {disp}: {e}"));
         }
 
-        let msg = match old_lines {
+        let mut msg = match old_lines {
             Some(old) => {
                 let diff = new_lines as i64 - old as i64;
                 let sign = if diff >= 0 { "+" } else { "" };
@@ -129,12 +129,51 @@ impl Tool for WriteFileTool {
             }
             None => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
         };
+        if let Some(warning) = windows_script_encoding_warning(&path, &a.content) {
+            msg.push_str(warning);
+        }
         ok(msg)
+    }
+}
+
+// Inspect content, not the host OS: scripts may be authored for Windows remotely.
+fn windows_script_encoding_warning(path: &std::path::Path, content: &str) -> Option<&'static str> {
+    if content.is_ascii() {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("ps1") {
+        if content.starts_with('\u{feff}') {
+            return None;
+        }
+        Some("\nWARNING: This PowerShell script contains non-ASCII text without a BOM. Windows PowerShell 5.1 -File reads it using the legacy ANSI code page and may create wrongly named paths. Use the pwsh tool to execute the command directly, PowerShell 7 if available, or explicitly save this .ps1 as UTF-8 with BOM before running it in 5.1. Changing console output encoding does not fix script decoding.")
+    } else if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+        Some("\nWARNING: This batch script contains non-ASCII UTF-8 text. cmd.exe may read it using a different active code page and create wrongly named paths. Prefer the pwsh tool with literal paths instead of a batch file; do not assume adding a BOM makes cmd.exe read UTF-8 correctly.")
+    } else {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_script_encoding_warning_targets_unsafe_script_content() {
+        use std::path::Path;
+        for extension in ["ps1", "PS1", "cmd", "BAT"] {
+            let path = format!("script.{extension}");
+            assert!(
+                super::windows_script_encoding_warning(Path::new(&path), "mkdir '工作区'")
+                    .is_some()
+            );
+            assert!(super::windows_script_encoding_warning(Path::new(&path), "echo ok").is_none());
+        }
+        assert!(super::windows_script_encoding_warning(
+            Path::new("script.ps1"),
+            "\u{feff}mkdir '工作区'"
+        )
+        .is_none());
+        assert!(super::windows_script_encoding_warning(Path::new("notes.md"), "工作区").is_none());
+    }
     use super::*;
     use atomcode_kernel::tool::ToolContext;
     use tokio_util::sync::CancellationToken;
@@ -145,6 +184,35 @@ mod tests {
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn script_encoding_warning_reaches_the_model_without_changing_file_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        for (file, content, warning) in [
+            ("task.ps1", "New-Item '工作区'", true),
+            ("task.ps1", "\u{feff}New-Item '工作区'", false),
+            ("task.CMD", "mkdir 工作区", true),
+            ("task.bat", "\u{feff}mkdir 工作区", true),
+            ("notes.md", "工作区", false),
+        ] {
+            let result = WriteFileTool::default()
+                .execute(
+                    &serde_json::json!({"file_path": file, "content": content}).to_string(),
+                    &ctx(d.path()),
+                )
+                .await;
+            assert_eq!(
+                result.content.contains("WARNING:"),
+                warning,
+                "{}",
+                result.content
+            );
+            assert_eq!(
+                std::fs::read(d.path().join(file)).unwrap(),
+                content.as_bytes()
+            );
         }
     }
 
