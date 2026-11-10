@@ -232,7 +232,9 @@ impl ImportPatchTool {
         if record.len() > 64 * 1024 * 1024 {
             return Err("encoded input record exceeds 64 MiB limit".into());
         }
-        let id = store.put_input(&record).map_err(|e| e.to_string())?;
+        let id = store
+            .put_input(&record)
+            .map_err(|e| stage_err("store input record", "artifact store", e))?;
         Ok(json!({"artifact_id":id,"patch_sha256":digest,"file_paths":manifest,"files":manifest.len(),"hunks":parsed.iter().map(|f| f.hunks.len()).sum::<usize>(),"status":"imported_and_preflighted","next":"apply_patch with this artifact_id and exact file_paths; never output the patch body"}).to_string())
     }
 }
@@ -273,7 +275,7 @@ impl ApplyPatchTool {
         let record: Record = serde_json::from_slice(
             &store
                 .get_input(&args.artifact_id)
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| stage_err("read input record", &args.artifact_id, e))?,
         )
         .map_err(|e| e.to_string())?;
         let root = root(&*self.world, &ctx.working_dir).await?;
@@ -711,6 +713,42 @@ mod failure_tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".env")).unwrap(),
             "secret\n"
+        );
+    }
+
+    /// The live ENOTSUP came from HERE, not from stat/read: writing the input record to
+    /// the artifact store. It was a bare `.to_string()`, so the reader saw only the errno.
+    #[tokio::test]
+    async fn import_names_the_stage_when_the_artifact_store_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "old\n").unwrap();
+        std::fs::write(
+            dir.path().join("p"),
+            "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        // A regular file where the store's directory must be → every write fails.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = Arc::new(ArtifactStore::new(blocked.join("inputs")));
+        let provider: ArtifactStoreProvider = Arc::new(move || Some(store.clone()));
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: Default::default(),
+            requester: None,
+        };
+        let tool = ImportPatchTool::new(
+            Arc::new(LocalFs::new(dir.path())),
+            provider,
+            super::super::sensitive_path::test_guard(),
+        );
+        let result = tool.execute(r#"{"file_path":"p"}"#, &ctx).await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("store input record"),
+            "must name the failing stage: {}",
+            result.content
         );
     }
 
