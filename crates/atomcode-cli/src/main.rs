@@ -3481,7 +3481,7 @@ pub(crate) async fn run_native_headless_detailed(
         handle,
         mut events,
         task,
-        ..
+        session,
     } = runtime;
     let jsonl = output_format == HeadlessOutputFormat::Jsonl;
     let captured = capture.then(String::new);
@@ -3489,6 +3489,7 @@ pub(crate) async fn run_native_headless_detailed(
     if jsonl {
         write_headless_json_event(&headless_json::HeadlessEvent::RunStarted {
             schema_version: 1,
+            session_id: session.map(|binding| binding.id),
             provider: provider_name,
             model: model_name,
         })?;
