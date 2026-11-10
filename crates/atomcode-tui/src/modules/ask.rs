@@ -470,7 +470,7 @@ fn tabs_line(sheet: &Sheet, caps: Caps, w: usize) -> Line {
         theme::fg(Role::Muted),
     )];
     for (i, asked) in sheet.asked.iter().enumerate() {
-        let answered = sheet.drafts.get(i).is_some_and(|d| d.answer.is_some());
+        let answered = sheet.answer(i).is_some();
         let mark = caps.g(match answered {
             true => Glyph::Checked,
             false => Glyph::Unchecked,

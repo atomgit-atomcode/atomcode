@@ -954,9 +954,9 @@ pub struct Draft {
     /// character boundary — the same caret every single-line field on this
     /// screen keeps ([`crate::text::step_caret`] and its siblings move it).
     pub caret: usize,
-    /// The answer this page was given, in a batch — what its tab is marked
-    /// for and what the review page lists. A lone question is delivered the
-    /// moment it is answered and never keeps one.
+    /// An explicitly confirmed answer in a batch. The review and final submit
+    /// also accept valid selections and text drafts through `Sheet::answer`.
+    /// A lone question is delivered immediately and never keeps one.
     pub answer: Option<Reply>,
 }
 
@@ -1416,26 +1416,11 @@ impl Sheet {
             },
             Slot::Chat => Step::Deliver(vec![Some(Reply::typed(CHAT_INSTEAD)); self.asked.len()]),
             Slot::Send => {
-                if let Some(tab) = self.drafts.iter().position(|d| {
-                    d.option_edit.is_some()
-                        || (d.answer.is_none()
-                            && (d.checked.iter().any(|checked| *checked)
-                                || !d.typed.trim().is_empty()))
-                }) {
+                if let Some(tab) = self.drafts.iter().position(|d| d.option_edit.is_some()) {
                     self.tab = tab;
-                    if self.option_edit().is_none() {
-                        let confirm = match self.page().map(Asked::form) {
-                            Some(Form::Multiple) => Slot::Submit,
-                            Some(Form::Text) => Slot::Input,
-                            _ => Slot::Other,
-                        };
-                        if let Some(row) = self.slots().iter().position(|slot| *slot == confirm) {
-                            self.point_at(row);
-                        }
-                    }
                     Step::Stay
                 } else {
-                    Step::Deliver(self.drafts.iter().map(|d| d.answer.clone()).collect())
+                    Step::Deliver((0..self.asked.len()).map(|i| self.answer(i)).collect())
                 }
             }
             Slot::Cancel => self.decline(),
@@ -1464,8 +1449,12 @@ impl Sheet {
     /// and the words, if there are any. `None` when there is neither — a send
     /// with nothing in it is not an answer, and esc is there for "none".
     pub fn ticked(&self) -> Option<Reply> {
-        let asked = self.page()?;
-        let draft = self.draft()?;
+        self.ticked_at(self.tab)
+    }
+
+    fn ticked_at(&self, i: usize) -> Option<Reply> {
+        let asked = self.asked.get(i)?;
+        let draft = self.drafts.get(i)?;
         let mut selected = Vec::new();
         let mut custom = Vec::new();
         for (i, answer) in asked.question.options.iter().enumerate() {
@@ -1488,6 +1477,27 @@ impl Sheet {
         Some(Reply { selected, text })
     }
 
+    /// The latest answer the final submission will send. Merely focusing a
+    /// default option is not a selection; unfinished option edits need an
+    /// explicit save or cancellation before they can be submitted.
+    pub fn answer(&self, i: usize) -> Option<Reply> {
+        let asked = self.asked.get(i)?;
+        let draft = self.drafts.get(i)?;
+        if draft.option_edit.is_some() {
+            return None;
+        }
+        if let Some(answer) = &draft.answer {
+            return Some(answer.clone());
+        }
+        match asked.form() {
+            Form::Multiple => self.ticked_at(i),
+            Form::Single | Form::Text if !draft.typed.trim().is_empty() => {
+                Some(Reply::typed(draft.typed.trim().to_string()))
+            }
+            _ => None,
+        }
+    }
+
     /// A question answered: sent at once when it is the only one, and in a
     /// batch kept on its page while the next unanswered one after it comes up —
     /// the review page when there is none.
@@ -1507,7 +1517,7 @@ impl Sheet {
     /// How question `i`'s answer reads on the review page: the offered
     /// answers' own words, then what was typed. `None` when it has none.
     pub fn recap(&self, i: usize) -> Option<String> {
-        let reply = self.drafts.get(i)?.answer.as_ref()?;
+        let reply = self.answer(i)?;
         let asked = self.asked.get(i)?;
         let mut said: Vec<String> = reply
             .selected
@@ -2276,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_multiple_edit_cannot_be_silently_skipped_from_the_batch_review() {
+    fn final_submission_confirms_saved_multiple_edits_without_another_page_confirmation() {
         let mut sheet = Sheet::new(1, vec![multiple(), single()]);
         sheet.edit_option();
         sheet.type_text(" first");
@@ -2284,14 +2294,7 @@ mod tests {
         sheet.turn(1);
         sheet.enter();
         assert!(sheet.reviewing());
-        assert_eq!(
-            sheet.enter(),
-            Step::Stay,
-            "saved edits need their page's confirmation"
-        );
-        assert_eq!(sheet.tab, 0);
-        assert_eq!(sheet.pointed(), Some(Slot::Submit));
-        sheet.enter();
+        assert_eq!(sheet.recap(0).as_deref(), Some("Python first"));
         let sent = wire(sheet.enter());
         assert!(!sent[0].declined);
         assert_eq!(sent[0].text.as_deref(), Some("Python first"));
@@ -2299,7 +2302,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_a_confirmed_free_text_draft_requires_its_latest_words_to_be_confirmed() {
+    fn review_and_submission_use_the_latest_free_text_draft() {
         use crate::surface::{Key, KeyPress};
         let mut sheet = Sheet::new(1, vec![multiple(), single()]);
         sheet.edit_option();
@@ -2321,9 +2324,7 @@ mod tests {
             changed.point_at(3);
             keys(&mut changed, &edit);
             changed.turn(2);
-            assert_eq!(changed.enter(), Step::Stay);
-            assert_eq!(changed.pointed(), Some(Slot::Submit));
-            changed.enter();
+            assert_eq!(changed.recap(0), Some(format!("Python first\n{expected}")));
             let sent = wire(changed.enter());
             assert_eq!(sent[0].text, Some(format!("Python first\n{expected}")));
         }
@@ -2340,6 +2341,51 @@ mod tests {
             wire(sheet.enter())[0].text.as_deref(),
             Some("Python first\nextra")
         );
+    }
+
+    #[test]
+    fn final_submission_accepts_drafts_but_never_the_untouched_default() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::new(1, vec![multiple(), text(), single()]);
+        sheet.toggle(0);
+        sheet.point_at(3);
+        sheet.type_text("  other answer  ");
+        keys(&mut sheet, &[Key::Tab]);
+        sheet.type_text("  free text  ");
+        keys(&mut sheet, &[Key::Tab, Key::Right]);
+        assert!(sheet.reviewing());
+        assert!(sheet.recap(0).unwrap().contains("other answer"));
+        assert_eq!(sheet.recap(1).as_deref(), Some("free text"));
+        assert_eq!(sheet.recap(2), None);
+        let sent = wire(sheet.enter());
+        assert_eq!(sent[0].selected, ["Python"]);
+        assert_eq!(sent[0].text.as_deref(), Some("other answer"));
+        assert_eq!(sent[1].text.as_deref(), Some("free text"));
+        assert!(sent[2].declined);
+    }
+
+    #[test]
+    fn single_other_text_is_ready_and_erased_multiple_answers_are_not_sent() {
+        let mut sheet = Sheet::new(1, vec![single(), multiple()]);
+        let other = sheet
+            .slots()
+            .iter()
+            .position(|s| *s == Slot::Other)
+            .unwrap();
+        sheet.point_at(other);
+        sheet.type_text(" custom ");
+        sheet.turn(1);
+        sheet.toggle(0);
+        sheet.point_at(4);
+        sheet.enter();
+        sheet.turn(-1);
+        sheet.toggle(0);
+        sheet.turn(1);
+        assert_eq!(sheet.recap(0).as_deref(), Some("custom"));
+        assert_eq!(sheet.recap(1), None);
+        let sent = wire(sheet.enter());
+        assert_eq!(sent[0].text.as_deref(), Some("custom"));
+        assert!(sent[1].declined);
     }
 
     #[test]
