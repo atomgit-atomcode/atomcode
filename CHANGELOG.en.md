@@ -24,6 +24,25 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
+## v5.2.7
+
+### Overview
+
+This release improves long-running tasks and everyday controls: pause and resume all MCP servers for a session, load long conversation histories on demand, and recover more reliably from interruptions. It also expands skill invocation, debugging and project setup, with improvements to the WebUI workspace, terminal input and tool diagnostics.
+
+### Changes
+
+- **Pause and resume all MCP servers**: Use Ctrl+S at the top of the `/mcp` list to pause all MCP servers and press it again to resume. Controls are available in both TUI and WebUI, apply only to the current session, and preserve individual server configuration. Fix non-ASCII paths during environment variable expansion and improve MCP tool search relevance.
+- **Long histories and context compaction**: TUI and WebUI load display history in pages on demand. Bound summary inputs and old tool records, reduce copying and repeated computation, and distinguish a failed summary from a compaction that needs no changes.
+- **Recovery and task progress**: Improve recovery of accepted prompts after interruptions and keep todo records aligned across undo, rewind, forks and cancellation. Verify quota availability before resuming paused loops, with bounded retries and jitter for automatic recovery.
+- **Skill names and invocation**: Support Chinese skill names, separate display titles and multiple `$skill` references in one input. Add usage history and conservative spelling suggestions.
+- **Debugging and project setup**: Add DAP debugging and local adapter discovery. Project setup checks existing capabilities and offers optional tool installation with confirmation. An optional read-only architecture evidence capability can be enabled in shared settings.
+- **Task checks and automatic review**: Add configurable, audited checks for task handoffs and automatic review guidance. Improve background review permission inheritance, execution limits and failure reporting, including blocked writes by team members.
+- **WebUI workspace and navigation**: Pin, clear and remove workspaces, resize the sidebar, and view the current Git branch and session identity. Improve cross-client image retention, file refresh, narrow layouts and scroll positioning for newly submitted turns.
+- **Terminal input and upgrade feedback**: Show download progress, speed and remaining time during upgrades. Ctrl+C clears nonempty input first. Improve Windows and HarmonyOS scrolling, Unicode input and script encoding warnings, and clarify when the lead agent is waiting for members.
+- **Tool results and diagnostics**: Reject undefined replacement capture groups that could erase text. Report invalid todo IDs, invalid structural search patterns and ambiguous symbols explicitly. Patch import errors identify the failing stage and path; artifact storage can fall back to a temporary directory.
+- **Model transport and efficiency**: Improve streamed tool arguments, missing call IDs and SSE buffering. Reduce repeated context estimation and tool execution work, compress embedded WebUI assets, and expose native session identity in headless JSONL startup events.
+
 ## v5.2.6 (2026-11-05)
 
 ### Overview

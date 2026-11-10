@@ -22,6 +22,63 @@
   英文界面读它，某个版本没有英文节时显示这里的中文节。Issues 只写在这份里，英文界面也显示这里的。
 -->
 
+## v5.2.7
+
+### 概览
+
+这一版重点改善长任务的稳定性与日常操作效率：MCP 新增会话级整体暂停与恢复，长会话历史按需加载，上下文压缩与中断恢复更加可靠。同步增强技能调用、调试与项目能力配置，并完善 WebUI 工作区、终端输入和工具错误提示。
+
+### 更新内容
+
+- **MCP 一键暂停与恢复**：在 `/mcp` 列表顶部通过 Ctrl+S 暂停全部 MCP，再次操作即可恢复；TUI 与 WebUI 均提供入口，仅对当前会话生效，不改写各服务器的启用配置。修复环境变量展开破坏中文等非 ASCII 路径的问题，并改善 MCP 工具搜索的相关性。
+- **长会话加载与上下文压缩**：TUI 与 WebUI 按需分页加载显示历史，减少长会话打开与浏览的负担；限制压缩摘要输入和旧工具记录的预算，减少不必要的复制与重复计算，并明确区分摘要失败和无需压缩。
+- **中断恢复与任务进度**：改善异常中断后已接受提示的恢复，修复待办记录在撤销、回退、分叉和取消后的同步；额度重置后先确认可用状态，再恢复暂停的循环任务，并为自动恢复增加有界重试与抖动。
+- **技能命名与调用**：支持中文技能名和独立展示标题，一次输入可引用多个 `$技能`；增加使用历史与保守的拼写纠正建议，方便查找和调用已有技能。
+- **调试与项目能力配置**：新增 DAP 调试能力与本地调试适配器发现；项目配置引导可检查现有能力，并在确认后安装可选工具。新增可选的只读架构证据能力，可通过共享设置启用。
+- **任务检查与自动审查**：支持为任务交接配置可审计检查，并提供可配置的自动审查指导；改善后台审查的权限继承、执行边界和失败反馈，团队成员的写入受阻也会明确报告。
+- **WebUI 工作区与会话导航**：支持工作区固定、清空和移除，侧栏可拖动调整宽度；展示当前 Git 分支与会话身份，改善跨端图片保留、文件刷新、窄屏布局及新提交回合的滚动定位。
+- **终端输入与升级反馈**：升级下载展示进度、速度和预计剩余时间；Ctrl+C 优先清空非空输入，改善 Windows 与鸿蒙终端滚动、Unicode 输入和脚本编码提示，并明确展示主 agent 等待成员工作的状态。
+- **工具结果与错误提示**：修复文本替换中未定义捕获组可能导致内容被清空的问题；无效待办编号、无效结构搜索模式和同名符号歧义返回明确反馈。补丁导入错误补充失败阶段与路径提示，工具产物保存失败时可回退临时目录。
+- **模型传输与运行效率**：改善流式工具参数、缺失调用编号及 SSE 缓冲处理，减少上下文估算和工具执行中的重复工作；压缩内嵌 WebUI 资源，并在非交互 JSONL 启动事件中提供原生会话标识。
+
+### Issues
+
+本节收录 [v5.2.7 里程碑](https://atomgit.com/atomgit_atomcode/atomcode/milestones/1067621?iid=50)下的全部 issue，不区分状态与标签。此列表用于关联跟踪，不表示所有条目均已实现或完成发布验收。
+
+- [#873 [共创大赛] write_file覆盖时read_to_string全量读取导致大文件OOM](https://atomgit.com/atomgit_atomcode/atomcode/issues/873)
+- [#1000 [共创大赛]webui界面左侧鼠标移入标题显示的是工作目录而不是标题完整内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/1000)
+- [#1486 Context window not adapted for auto model when using openrouter or openai-compatible provider](https://atomgit.com/atomgit_atomcode/atomcode/issues/1486)
+- [#1662 [Feature] 希望在Agent内核里添加DAP技术](https://atomgit.com/atomgit_atomcode/atomcode/issues/1662)
+- [#1735 [共创大赛][Bug] Agent 文本输出声称任务全已完成，但底层 Todo 列表仍显示 18 个待办项（状态不同步）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1735)
+- [#1737 [Feature] 按项目语言推荐 MCP / 工具：检测到 Rust 项目时主动提示装 rust-mcp、ast-grep 等](https://atomgit.com/atomgit_atomcode/atomcode/issues/1737)
+- [#1738 [Performance] 消除热路径冗余分配：Vec 中转 join / Arc 上多余 to_vec / 每帧 HashMap 查找分配 String / sgr 的 format! 链](https://atomgit.com/atomgit_atomcode/atomcode/issues/1738)
+- [#1739 [Bug][LSP] 真实仓颉服务端下 document_symbols 取不到大纲：.cj 的 languageId 兜底成 "cj"（须为 "Cangjie"），且工具层仍判 IDE-only](https://atomgit.com/atomgit_atomcode/atomcode/issues/1739)
+- [#1741 [Feature] 让会话内 code_review（任务完成前的自动评审）可单独关闭](https://atomgit.com/atomgit_atomcode/atomcode/issues/1741)
+- [#1742 [Bug]输入/app不能生成二维码](https://atomgit.com/atomgit_atomcode/atomcode/issues/1742)
+- [#1743 [Bug] team/子 agent 工作时 main agent 等待期间误显示 ✻ Done，让用户以为任务已完成](https://atomgit.com/atomgit_atomcode/atomcode/issues/1743)
+- [#1744 [Feature] 输入框被 history 填充后缺少安全清空机制，用户不敢按 Ctrl+C](https://atomgit.com/atomgit_atomcode/atomcode/issues/1744)
+- [#1745 鸿蒙 PC 登录自动打开浏览器仍报 Exec format error：5.2.6 发布二进制早于 #1161 的 sh 兜底修复](https://atomgit.com/atomgit_atomcode/atomcode/issues/1745)
+- [#1746 [Bug] team 成员 agent 之间不互通，"not my file → skip" 无任何处理机制，导致协作遗漏](https://atomgit.com/atomgit_atomcode/atomcode/issues/1746)
+- [#1747 [Feature] coding plan 刷新后，因碰上限停止的任务应自动恢复](https://atomgit.com/atomgit_atomcode/atomcode/issues/1747)
+- [#1748 [Feature] 需要机制告诉模型：任务前已是脏工作区时，不要简单 git checkout/reset，容易炸仓库](https://atomgit.com/atomgit_atomcode/atomcode/issues/1748)
+- [#1749 [Feature] 状态栏与工作台显示当前 git 分支，避免在错误分支上跑一整轮](https://atomgit.com/atomgit_atomcode/atomcode/issues/1749)
+- [#1750 [Feature] skill 多加载可发现性：/skills 用法提示、$a $b 一致化、已加载状态可见](https://atomgit.com/atomgit_atomcode/atomcode/issues/1750)
+- [#1751 [Docs] 大+小模型混合使用：能力已存在但配置文档缺失（capable_model 示例、跨账号陷阱、路由前提）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1751)
+- [#1752 [Feature] /upgrade 下载进度展示太粗糙，应换成进度条，可加网络吞吐曲线](https://atomgit.com/atomgit_atomcode/atomcode/issues/1752)
+- [#1753 优化重试策略：基于历史成功率动态调整重试间隔](https://atomgit.com/atomgit_atomcode/atomcode/issues/1753)
+- [#1757 Refactor webui api.ts: deduplicate SSE parsing and unify error handling](https://atomgit.com/atomgit_atomcode/atomcode/issues/1757)
+- [#1759 [Feature] UltraCode 模式：面向质量保障的专业运行模式](https://atomgit.com/atomgit_atomcode/atomcode/issues/1759)
+- [#1761 文档改进：系统 prompt 保留策略应在文档中明确说明，而非需要阅读代码](https://atomgit.com/atomgit_atomcode/atomcode/issues/1761)
+- [#1763 文档改进：用户会话初始提示词的保留策略应在文档中明确说明](https://atomgit.com/atomgit_atomcode/atomcode/issues/1763)
+- [#1765 [Windows] 中文路径 codepage 串码：归档时把 UTF-8 中文工作区路径按 GBK 写坏，落盘成乱码幽灵目录树](https://atomgit.com/atomgit_atomcode/atomcode/issues/1765)
+- [#1766 官网docs中似乎有错误信息](https://atomgit.com/atomgit_atomcode/atomcode/issues/1766)
+- [#1768 Feature Request: Architectural Topology Intelligence (ATI)  Motivation](https://atomgit.com/atomgit_atomcode/atomcode/issues/1768)
+- [#1770 [共创大赛]-[Feature] 希望能增加工作目录删除按钮](https://atomgit.com/atomgit_atomcode/atomcode/issues/1770)
+- [#1771 [共创大赛]-[Feature] 希望能增加对 skill name 的中文支持](https://atomgit.com/atomgit_atomcode/atomcode/issues/1771)
+- [#1773 建议为 MCP 加个开关功能](https://atomgit.com/atomgit_atomcode/atomcode/issues/1773)
+- [#1774 provider: SSE 解码器行缓冲无上限，逐行 drain 为 O(n²)](https://atomgit.com/atomgit_atomcode/atomcode/issues/1774)
+- [#1776 Windows 控制台代码页 936 时，TUI 输入框粘贴 emoji（✅❌❓⚠️⏭）被静默丢弃](https://atomgit.com/atomgit_atomcode/atomcode/issues/1776)
+
 ## v5.2.6 (2026-11-05)
 
 ### 概览
