@@ -24,6 +24,7 @@
 //!   including process startup. Noisy; compare only on the same machine.
 
 use std::hint::black_box;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,7 @@ use atomcode_capabilities::ProductDirs;
 use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader, SESSION_FORMAT_VERSION};
 use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 const FILES: usize = 2_000;
@@ -79,6 +81,12 @@ impl Sample {
 
 fn main() {
     let options = Options::parse();
+    let binary = options.e2e.then(|| {
+        let bin = std::env::var_os("BENCH_ATOMCODE_BIN").expect(
+            "--e2e needs BENCH_ATOMCODE_BIN; use scripts/bench.sh to build the current binary",
+        );
+        binary_identity(Path::new(&bin)).expect("identify requested benchmark binary")
+    });
     let mut samples = Vec::new();
 
     samples.extend(bench_sse(options.iterations));
@@ -91,10 +99,10 @@ fn main() {
         samples.extend(bench_e2e(options.iterations));
     }
 
-    let markdown = render_markdown(&samples);
+    let markdown = render_markdown(&samples, binary.as_ref());
     print!("{markdown}");
     if let Some(base) = &options.out {
-        if let Err(error) = write_reports(base, &samples, &markdown) {
+        if let Err(error) = write_reports(base, &samples, &markdown, binary.as_ref()) {
             eprintln!("failed to write reports to {}: {error}", base.display());
             std::process::exit(1);
         }
@@ -369,6 +377,27 @@ fn bench_e2e(iterations: usize) -> Vec<Sample> {
     samples
 }
 
+/// Identify the actual executable outside the timed region. Git SHA describes
+/// the harness checkout; an external binary can come from a different build.
+fn binary_identity(bin: &Path) -> Result<serde_json::Value, String> {
+    let path = bin.canonicalize().map_err(|e| e.to_string())?;
+    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(json!({
+        "path": path,
+        "sha256": format!("{:x}", digest.finalize()),
+        "source": std::env::var("BENCH_BINARY_SOURCE").unwrap_or_else(|_| "external".into()),
+    }))
+}
+
 /// Run one process-level sample. A non-zero exit, a spawn failure or empty
 /// stdout is an error, not a timing.
 fn run_timed(bin: &Path, args: &[&str], home: &Path) -> Result<f64, String> {
@@ -561,7 +590,7 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
-fn render_markdown(samples: &[Sample]) -> String {
+fn render_markdown(samples: &[Sample], binary: Option<&serde_json::Value>) -> String {
     let mut out = String::new();
     out.push_str("# AtomCode benchmark\n\n");
     out.push_str(&format!("- git: `{}`\n", git_sha()));
@@ -579,6 +608,9 @@ fn render_markdown(samples: &[Sample]) -> String {
             "release"
         }
     ));
+    if let Some(binary) = binary {
+        out.push_str(&format!("- process binary: `{binary}`\n\n"));
+    }
     out.push_str("| metric | median ms | min ms | max ms | n | note |\n");
     out.push_str("|---|---:|---:|---:|---:|---|\n");
     for sample in samples {
@@ -599,6 +631,7 @@ fn write_reports(
     base: &Path,
     samples: &[Sample],
     markdown: &str,
+    binary: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = base.parent() {
         std::fs::create_dir_all(parent)?;
@@ -611,6 +644,7 @@ fn write_reports(
             .unwrap_or_default()
             .as_secs(),
         "git_sha": git_sha(),
+        "process_binary": binary,
         "rustc": rustc_version(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,

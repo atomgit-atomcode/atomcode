@@ -1,7 +1,7 @@
 # Benchmark harness
 
-The benchmark harness records medians for a few stable paths. It does not gate
-CI. It does not prove a release is fast. It gives a same-machine before/after
+The benchmark harness records medians for a few stable paths. Timing results do
+not gate CI. It does not prove a release is fast. It gives a same-machine before/after
 number for a change.
 
 Run it through the script:
@@ -54,8 +54,22 @@ A non-zero exit, a spawn failure or empty stdout drops the whole process-level
 metric. The harness prints the exit code and stderr. It never reports a failed
 run as a fast sample.
 
-The script builds `target/release/atomcode` if it is missing. Set
-`BENCH_ATOMCODE_BIN` to time an existing binary.
+The script always runs `cargo build -p atomcode --bin atomcode --release`
+for the current working tree when E2E is requested without an explicit binary.
+It selects the rustc host target and writes under
+`<CARGO_TARGET_DIR or target>/<host>/release/atomcode` (`.exe` on Windows),
+so an existing artifact or cross-compilation setting cannot select an old or
+non-runnable default binary. Cargo still reuses unchanged build artifacts.
+
+Set `BENCH_ATOMCODE_BIN` to time an existing binary instead; this explicitly
+skips the build and enables process-level metrics. Relative paths are resolved
+from the repository root. A missing executable is an error.
+
+JSON reports include `process_binary` (path, SHA-256 and source: `working_tree`
+or `external`); Markdown includes the same identity. This is captured outside
+the timed region. The report's `git_sha` identifies the harness checkout, not
+the commit that produced an externally supplied executable. Working-tree builds
+can also include uncommitted changes; use clean checkouts for commit comparisons.
 
 ## How to read a result
 
@@ -85,3 +99,14 @@ report. Use debug numbers only for relative comparisons.
 2. Create the fixture in a `TempTree`.
 3. Call `measure(iterations, ...)` and return a `Sample`.
 4. Add one row to the table above.
+
+## Verification
+
+`bash scripts/bench.spec.sh` checks script orchestration with stub build tools,
+including paths with spaces, forced rebuilds, custom target directories and
+explicit external binaries. It does not build or benchmark AtomCode.
+
+Compile the opt-in target explicitly with
+`cargo check -p atomcode-capabilities --features bench --bench core`;
+the default workspace check does not enable it. The feature phase of
+`bash gates/compile.sh` compiles it without running it or gating on timings.

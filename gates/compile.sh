@@ -58,7 +58,8 @@ rm -f /tmp/atomcode-compile-gate.$$
 # 选择,哪天没人再开就又掉出去了;在这里显式开,比依赖别人碰巧开着稳。**别改成 run**
 # —— e2e 与 lsp-e2e 都要真实的外部服务。
 echo "→ feature 门控的测试也能编译"
-FEATURE_GATED='session,memory,setup,e2e,mcp,lsp-e2e'
+# Compile the opt-in bench target too; never run or threshold its timings here.
+FEATURE_GATED='session,memory,setup,e2e,mcp,lsp-e2e,bench'
 if cargo check -p atomcode-capabilities --all-targets \
      --features "$FEATURE_GATED" \
      >/tmp/atomcode-feature-gate.$$ 2>&1; then

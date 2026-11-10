@@ -22,27 +22,42 @@ BASE="${BENCH_OUT:-target/bench/core-${SHA}}"
 # (`crates/atomcode-capabilities`), so a relative --out would land in the
 # package's target/ tree, not the repository's. Resolve it here.
 case "$BASE" in
-  /*|[A-Za-z]:/*) ;;
+  /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
   *) BASE="$REPO/$BASE" ;;
 esac
 
 ARGS=(--iterations "$ITERATIONS" --out "$BASE")
 
-if [ "${BENCH_E2E:-0}" = "1" ]; then
-  BIN="${BENCH_ATOMCODE_BIN:-target/release/atomcode}"
-  if [ ! -x "$BIN" ]; then
-    echo "building $BIN for the process-level metrics (this can take a while)..."
-    cargo build -p atomcode-cli --release
-  fi
-  if [ -x "$BIN" ]; then
-    case "$BIN" in
-      /*|[A-Za-z]:/*) export BENCH_ATOMCODE_BIN="$BIN" ;;
-      *) export BENCH_ATOMCODE_BIN="$REPO/$BIN" ;;
-    esac
-    ARGS+=(--e2e)
+if [ "${BENCH_E2E:-0}" = "1" ] || [ -n "${BENCH_ATOMCODE_BIN:-}" ]; then
+  if [ -n "${BENCH_ATOMCODE_BIN:-}" ]; then
+    BIN="$BENCH_ATOMCODE_BIN"
+    export BENCH_BINARY_SOURCE="external"
   else
-    echo "skipping --e2e: $BIN is not executable" >&2
+    # Always ask Cargo to build this working tree, even if a binary exists.
+    # Force the host target so a cross-compilation config cannot select a
+    # non-runnable binary. An explicit target-dir keeps path discovery honest.
+    HOST="$(rustc -vV | sed -n 's/^host: //p')"
+    [ -n "$HOST" ] || { echo "could not determine the rustc host" >&2; exit 1; }
+    BUILD_DIR="${CARGO_TARGET_DIR:-target}"
+    case "$BUILD_DIR" in
+      /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
+      *) BUILD_DIR="$REPO/$BUILD_DIR" ;;
+    esac
+    cargo build -p atomcode --bin atomcode --release --target "$HOST" --target-dir "$BUILD_DIR"
+    BIN="$BUILD_DIR/$HOST/release/atomcode"
+    case "$HOST" in *-windows-*) BIN="$BIN.exe" ;; esac
+    export BENCH_BINARY_SOURCE="working_tree"
   fi
+  case "$BIN" in
+    /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
+    *) BIN="$REPO/$BIN" ;;
+  esac
+  if [ ! -x "$BIN" ]; then
+    echo "cannot run requested benchmark binary: $BIN" >&2
+    exit 1
+  fi
+  export BENCH_ATOMCODE_BIN="$BIN"
+  ARGS+=(--e2e)
 fi
 
 cargo bench -p atomcode-capabilities --features bench --bench core -- "${ARGS[@]}"
