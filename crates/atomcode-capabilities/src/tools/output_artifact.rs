@@ -184,8 +184,13 @@ impl ArtifactStore {
         }
         match std::fs::metadata(self.dir.join(id)) {
             Ok(m) => Ok(Some(m.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            // Mirror `get`: a capture that spilled to the temp store must report its real
+            // length, otherwise the fetch hint reads "showing bytes 0–0 of 0".
+            Err(primary) => match std::fs::metadata(fallback_dir().join(id)) {
+                Ok(m) => Ok(Some(m.len())),
+                Err(_) if primary.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(primary),
+            },
         }
     }
 }
@@ -558,6 +563,39 @@ mod tests {
         let got = store.get(&id, 0, usize::MAX).unwrap();
         let got = got.unwrap_or_else(|| panic!("artifact {id} must be readable, got None"));
         assert!(String::from_utf8_lossy(&got).contains("second"), "wrong bytes");
+    }
+
+    /// `get` falls back to the temp store, but `size` did not — so a temporary
+    /// artifact reported `[showing bytes 0–0 of 0]` while its bytes came back fine.
+    #[test]
+    fn a_fallback_artifact_reports_its_real_size() {
+        let d = tempfile::tempdir().unwrap();
+        let blocked = d.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let original = "first\nsecond\nthird\n[exit code 0]";
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: original.into(),
+            ..Default::default()
+        };
+        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "[atomcode: output truncated");
+        let id = result
+            .content
+            .split("TEMPORARY artifact ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '(']).next())
+            .expect("the message must carry an id")
+            .to_string();
+        assert!(
+            store.get(&id, 0, 1).unwrap().is_some(),
+            "get reads the temp store"
+        );
+        assert_eq!(
+            store.size(&id).unwrap(),
+            Some(original.len() as u64),
+            "size must agree with get for a temporary artifact"
+        );
     }
 
     #[test]

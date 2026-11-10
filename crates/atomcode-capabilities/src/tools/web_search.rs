@@ -50,6 +50,34 @@ impl SearchProvider {
     }
 }
 
+/// Exa's MCP backend treats `numResults` as a HINT — the remote server decides how
+/// many blocks to send, so `max_results: 1` still came back with several. Cap the
+/// returned blocks locally so the parameter means the same thing on both backends
+/// (the DuckDuckGo path already truncates while parsing).
+fn cap_exa_results(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line.trim() == "---" {
+            blocks.push(current.join("\n"));
+            current.clear();
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+    if blocks.len() <= max {
+        return text.to_string();
+    }
+    blocks.truncate(max);
+    blocks.join("\n\n---\n\n").trim_end().to_string()
+}
+
 /// `web_search` tool. Backend + optional Exa key are resolved once at construction.
 #[derive(Debug, Clone)]
 pub struct WebSearchTool {
@@ -269,10 +297,10 @@ impl WebSearchTool {
             Err(e) => return fail(format!("Exa web search: failed to read response: {e}")),
         };
         match parse_exa_sse(&sse) {
-            Some(text) if !text.trim().is_empty() => ok(format!(
-                "Search results for \"{query}\":\n\n{}",
-                text.trim()
-            )),
+            Some(text) if !text.trim().is_empty() => {
+                let capped = cap_exa_results(text.trim(), max);
+                ok(format!("Search results for \"{query}\":\n\n{capped}"))
+            }
             _ => fail(format!(
                 "Exa web search returned no usable results for '{query}' ({} bytes received).",
                 sse.len()
@@ -606,6 +634,26 @@ mod tests {
         let env_wins = WebSearchTool::with_provider_and_key("exa", Some("from-config".into()));
         std::env::remove_var("EXA_API_KEY");
         assert_eq!(env_wins.exa_api_key.as_deref(), Some("from-env"));
+    }
+
+    /// The Exa backend treats `numResults` as a hint — the remote server still sent
+    /// several blocks with `max_results: 1`. The cap has to be applied locally, or the
+    /// parameter means one thing on DuckDuckGo and another on Exa.
+    #[test]
+    fn exa_result_blocks_are_capped_locally() {
+        let text =
+            "Title: a\nURL: u1\n\n---\n\nTitle: b\nURL: u2\n\n---\n\nTitle: c\nURL: u3";
+        let one = cap_exa_results(text, 1);
+        assert!(one.contains("Title: a"), "{one}");
+        assert!(
+            !one.contains("Title: b") && !one.contains("Title: c"),
+            "{one}"
+        );
+        assert_eq!(
+            cap_exa_results(text, 8),
+            text,
+            "under the cap nothing is rewritten"
+        );
     }
 
     #[test]
