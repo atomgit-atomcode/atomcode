@@ -1648,11 +1648,14 @@ pub struct Tui {
     /// What this screen last told the terminal the window is called, so a
     /// frame that changes nothing writes nothing.
     named: Mutex<Option<String>>,
-    /// Where an attached image's bytes were written on disk, by marker number, so
-    /// a person clicking `[Image #N]` opens it in their desktop viewer. Written
-    /// on first open and reused after — the picture is decoded once, not on every
-    /// click. Session-scoped, like the gallery it mirrors.
-    image_files: Mutex<std::collections::HashMap<usize, std::path::PathBuf>>,
+    /// Private previews keyed by exact content, independent of attachment numbers.
+    /// Retained files are removed when the TUI drops them.
+    image_files: Mutex<
+        Vec<(
+            atomcode_kernel::message::ImageContent,
+            tempfile::NamedTempFile,
+        )>,
+    >,
     /// What a click hands a picture or a link to: this machine's desktop.
     ///
     /// [`LocalOpener`](atomcode_capabilities::tools::LocalOpener) directly, not
@@ -7768,8 +7771,8 @@ impl Tui {
     /// bytes, cannot write the file) are said out loud; the open itself runs
     /// off-thread, since `act` is not async and a desktop launcher must not block
     /// the render loop.
-    fn preview_image(&self, n: usize, image: Option<atomcode_kernel::message::ImageContent>) {
-        let path = match self.image_temp_file(n, image) {
+    fn preview_image(&self, image: Option<atomcode_kernel::message::ImageContent>) {
+        let path = match self.image_temp_file(image) {
             Ok(path) => path,
             Err(reason) => {
                 self.say_refused(&t(Msg::ImagePreviewFailed { reason: &reason }));
@@ -7830,52 +7833,58 @@ impl Tui {
         });
     }
 
-    /// The on-disk path of attached image `n`, written once and cached. `image`
-    /// is the bytes if the caller had them; otherwise they come from the gallery.
-    /// The extension follows the media type so the desktop viewer opens it right.
+    /// Decode on explicit click only. Exact content, not an attachment number,
+    /// identifies previews across tools and session switches. Random private
+    /// files remain alive for this TUI and are removed when it drops them.
     fn image_temp_file(
         &self,
-        n: usize,
         image: Option<atomcode_kernel::message::ImageContent>,
     ) -> Result<std::path::PathBuf, String> {
         use base64::Engine as _;
-
-        let mut cache = self.image_files.lock().expect("image files poisoned");
-        if let Some(path) = cache.get(&n) {
-            if path.exists() {
-                return Ok(path.clone());
-            }
-        }
+        use std::io::Write as _;
         let image = image.ok_or_else(|| t(Msg::ImageGone).into_owned())?;
-        let ext = match image.media_type.as_str() {
-            "image/jpeg" => "jpg",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            _ => "png",
+        let corrupt = || t(Msg::ImageCorrupt).into_owned();
+        let suffix = match image.media_type.as_str() {
+            "image/png" => ".png",
+            "image/jpeg" => ".jpg",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            _ => return Err(corrupt()),
         };
+        // Bound base64 decoding and file writes; the desktop viewer decodes the raster.
+        const MAX_ENCODED: usize = 32 * 1024 * 1024;
+        if image.data.len() > MAX_ENCODED {
+            return Err(corrupt());
+        }
+        let mut cache = self.image_files.lock().expect("image files poisoned");
+        if let Some((_, file)) = cache
+            .iter()
+            .find(|(prior, file)| prior == &image && file.path().exists())
+        {
+            return Ok(file.path().to_owned());
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(image.data.as_bytes())
-            .map_err(|_| t(Msg::ImageCorrupt).into_owned())?;
-        // A per-run subdirectory: `std::process::id` scopes it so two sessions do
-        // not clobber each other's `[Image #1]`, and on unix it is created private
-        // (0700) so another local user on a shared machine cannot read a person's
-        // screenshots or pre-create a file for the viewer to open — the temp dir
-        // is world-traversable and the path would otherwise be predictable.
-        let dir = std::env::temp_dir().join(format!("atomcode-images-{}", std::process::id()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)
-                .map_err(|e| e.to_string())?;
+            .map_err(|_| corrupt())?;
+        let matches_type = match suffix {
+            ".png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            ".jpg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            ".gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            ".webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+            _ => false,
+        };
+        if !matches_type {
+            return Err(corrupt());
         }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join(format!("img-{n}.{ext}"));
-        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-        cache.insert(n, path.clone());
+        let mut file = tempfile::Builder::new()
+            .prefix("atomcode-preview-")
+            .suffix(suffix)
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        let path = file.path().to_owned();
+        cache.push((image, file));
         Ok(path)
     }
 
@@ -8809,7 +8818,7 @@ impl Tui {
                         if let Some(n) = crate::attach::marker_at_offset(&m.input, at) {
                             if let Some(image) = m.attachments.image_at(n).cloned() {
                                 drop(m);
-                                self.preview_image(n, Some(image));
+                                self.preview_image(Some(image));
                                 return false;
                             }
                         }
@@ -8846,6 +8855,10 @@ impl Tui {
                 // hit map is per-row, not per-cell, so the block-level answer —
                 // open the image the message holds — is the one available here;
                 // a message is one screenshot in the overwhelmingly common case.
+                if let Some(image) = self.host.result_image_at(id) {
+                    self.preview_image(Some(image));
+                    return false;
+                }
                 let markers = self.host.image_markers_at(id);
                 for &n in &markers {
                     let image = self
@@ -8857,7 +8870,7 @@ impl Tui {
                         .image_at(n)
                         .cloned();
                     if let Some(image) = image {
-                        self.preview_image(n, Some(image));
+                        self.preview_image(Some(image));
                         return false;
                     }
                 }
@@ -11607,7 +11620,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),
-            image_files: Mutex::new(std::collections::HashMap::new()),
+            image_files: Mutex::new(Vec::new()),
             opener: Arc::new(atomcode_capabilities::tools::LocalOpener),
             presses: Arc::default(),
             probes: Arc::default(),
@@ -17759,5 +17772,124 @@ mod display_history_tests {
             tui.client.view.lock().unwrap().sessions["lead"].history_request,
             Some(2)
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_image_tests {
+    use super::*;
+    use atomcode_harness::session::SessionEvent;
+    use atomcode_kernel::message::ImageContent;
+    use base64::Engine as _;
+
+    fn png(bytes: &[u8]) -> ImageContent {
+        ImageContent {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    #[test]
+    fn preview_files_follow_exact_bytes_and_are_private_and_temporary() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        let first = png(crate::terminal_image::MASCOT_PNG);
+        let second = png(crate::terminal_image::MASCOT_WAIT_PNG);
+        let a = tui.image_temp_file(Some(first.clone())).unwrap();
+        let b = tui.image_temp_file(Some(second)).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a, tui.image_temp_file(Some(first)).unwrap());
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            crate::terminal_image::MASCOT_PNG
+        );
+        assert!(tui.image_temp_file(None).is_err());
+        for bad in [
+            ImageContent {
+                media_type: "image/svg+xml".into(),
+                data: "PHN2Zz4=".into(),
+            },
+            ImageContent {
+                media_type: "image/png".into(),
+                data: "not base64".into(),
+            },
+            png(b"not png"),
+        ] {
+            assert!(tui.image_temp_file(Some(bad)).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(tui);
+        assert!(!a.exists() && !b.exists());
+    }
+
+    #[derive(Default)]
+    struct Opened(Mutex<Vec<std::path::PathBuf>>);
+    #[async_trait]
+    impl atomcode_capabilities::tools::Opener for Opened {
+        fn describe(&self) -> String {
+            "test viewer".into()
+        }
+        async fn open(
+            &self,
+            target: &atomcode_capabilities::tools::OpenTarget,
+        ) -> Result<String, String> {
+            if let atomcode_capabilities::tools::OpenTarget::Path(path) = target {
+                self.0.lock().unwrap().push(path.clone());
+            }
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn each_returned_picture_has_its_own_click_target_and_opens_its_own_bytes() {
+        let (host, mut tui) = assemble(crate::surface::Headless::new(80, 40));
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        let opened = Arc::new(Opened::default());
+        tui.opener = opened.clone();
+        host.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "unpaired".into(),
+            content: "ok".into(),
+            is_error: false,
+            images: vec![
+                png(crate::terminal_image::MASCOT_PNG),
+                png(crate::terminal_image::MASCOT_WAIT_PNG),
+            ],
+        });
+        let frame = host.compose((80, 40));
+        let rect = frame.part("stream").unwrap().rect;
+        let mut targets = Vec::new();
+        for y in rect.y..rect.bottom() {
+            if let Some((id, "tool_image")) = host.block_at(2, y) {
+                if !targets.iter().any(|(prior, _)| *prior == id) {
+                    targets.push((id, y));
+                }
+            }
+        }
+        assert_eq!(targets.len(), 2);
+        for (_, y) in targets {
+            tui.act(Action::ClickAt(2, y), &tui.client);
+        }
+        tokio::task::yield_now().await;
+        let paths = opened.0.lock().unwrap().clone();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            crate::terminal_image::MASCOT_PNG
+        );
+        assert_eq!(
+            std::fs::read(&paths[1]).unwrap(),
+            crate::terminal_image::MASCOT_WAIT_PNG
+        );
+        assert!(host.moment.read().unwrap().attachments.is_empty());
     }
 }

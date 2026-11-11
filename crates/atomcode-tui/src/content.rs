@@ -1129,6 +1129,43 @@ pub(crate) const GUTTER: usize = 2;
 /// row wraps, a lid that took every row of it would cost the run it stands for.
 const FOLDED_ROWS: usize = 2;
 
+/// One returned picture. Its bytes never become terminal text or attachment IDs.
+#[derive(Debug)]
+pub struct ToolImage {
+    pub image: atomcode_kernel::message::ImageContent,
+    pub ordinal: usize,
+}
+
+impl Content for ToolImage {
+    fn kind(&self) -> &'static str {
+        "tool_image"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "tool_image",
+            &self.ordinal.to_string(),
+            &self.image.media_type,
+            &self.image.data,
+        ])
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        vec![Line::styled(
+            t(Msg::ToolImage {
+                ordinal: self.ordinal,
+            })
+            .into_owned(),
+            tool(),
+        )
+        .truncate(ctx.width as usize)]
+    }
+    fn always_open(&self) -> bool {
+        true
+    }
+    fn result_image(&self) -> Option<&atomcode_kernel::message::ImageContent> {
+        Some(&self.image)
+    }
+}
+
 /// A tool call and, once it lands, its result. One block, two facts.
 #[derive(Debug)]
 pub struct ToolCallBlock {

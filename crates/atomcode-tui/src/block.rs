@@ -228,6 +228,11 @@ pub trait Content: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// A result picture opened by the reader; never a composer attachment.
+    fn result_image(&self) -> Option<&atomcode_kernel::message::ImageContent> {
+        None
+    }
+
     /// One line standing in for the whole block when it is folded.
     fn summary(&self, ctx: &RenderCtx) -> Line {
         self.lines(ctx).into_iter().next().unwrap_or_default()

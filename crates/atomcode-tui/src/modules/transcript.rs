@@ -16,7 +16,7 @@ use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
     ChoiceBlock, CommandSaid, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome,
-    SkillBlock, ToolCallBlock, TurnEndBlock, TurnStats, UserSaid,
+    SkillBlock, ToolCallBlock, ToolImage, TurnEndBlock, TurnStats, UserSaid,
 };
 use crate::module::Producer;
 
@@ -516,6 +516,7 @@ impl Producer for Transcript {
                 call_id,
                 content,
                 is_error,
+                images,
                 ..
             } => {
                 let named = open
@@ -539,6 +540,15 @@ impl Producer for Transcript {
                         let orphan = ToolCallBlock::pending(call_id, "(unpaired)", "{}");
                         out.emit(at, Arc::new(orphan.with(outcome)));
                     }
+                }
+                for (index, image) in images.iter().enumerate() {
+                    out.emit(
+                        at,
+                        Arc::new(ToolImage {
+                            image: image.clone(),
+                            ordinal: index + 1,
+                        }),
+                    );
                 }
             }
 
@@ -1161,6 +1171,55 @@ mod tests {
             t.absorb(&conformance::logged(i, f), &mut w);
         }
         s
+    }
+
+    #[test]
+    fn tool_result_pictures_replay_in_order_even_when_failed_or_unpaired() {
+        let image = |data: &str| atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: data.into(),
+        };
+        let facts = [SessionEvent::ToolResultLogged {
+            turn: 2,
+            round: 3,
+            call_id: "missing".into(),
+            content: "failed with pictures".into(),
+            is_error: true,
+            images: vec![image("first-bytes"), image("second-bytes")],
+        }];
+        let first = fold(&facts);
+        let replay = fold(&facts);
+        let signature = |s: &Stream| {
+            s.slots()
+                .iter()
+                .map(|slot| {
+                    let b = slot.block();
+                    (
+                        b.kind(),
+                        b.content_hash(),
+                        b.content.reading_text(&crate::block::RenderCtx::bare(80)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&first), signature(&replay));
+        let kinds: Vec<_> = first.slots().iter().map(|s| s.block().kind()).collect();
+        assert_eq!(kinds, ["tool_call", "tool_image", "tool_image"]);
+        let images: Vec<_> = first
+            .slots()
+            .iter()
+            .filter_map(|s| s.block().content.result_image())
+            .collect();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.data.as_str())
+                .collect::<Vec<_>>(),
+            ["first-bytes", "second-bytes"]
+        );
+        assert!(!signature(&first)
+            .iter()
+            .any(|(_, _, text)| text.contains("first-bytes") || text.contains("second-bytes")));
     }
 
     #[test]

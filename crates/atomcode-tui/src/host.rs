@@ -6546,10 +6546,11 @@ impl Host {
             // click worked once and then the row stopped answering.
             let foldable = !block.content.always_open();
             // A block that carries a picture is clickable too — clicking its
-            // `[Image #N]` opens the picture — even though a user message does not
-            // fold and so is not in `CLICKABLE`. Without this the row never enters
+            // attachment marker or result-image row opens the picture, even
+            // though neither folds. Without this the row never enters
             // the hit map and `block_at` could never answer a click on it.
-            let carries_image = !block.content.image_markers().is_empty();
+            let carries_image =
+                !block.content.image_markers().is_empty() || block.content.result_image().is_some();
             let mut own = ((foldable && CLICKABLE.contains(&kind)) || carries_image)
                 .then_some((block.id, kind));
             // The column this block leaves on the left, and the width that is
@@ -7885,6 +7886,14 @@ impl Host {
             .get(id)
             .map(|slot| slot.block().content.image_markers())
             .unwrap_or_default()
+    }
+
+    pub fn result_image_at(&self, id: BlockId) -> Option<atomcode_kernel::message::ImageContent> {
+        self.stream
+            .read()
+            .expect("stream poisoned")
+            .get(id)
+            .and_then(|slot| slot.block().content.result_image().cloned())
     }
 
     /// Fold or unfold what a click landed on.

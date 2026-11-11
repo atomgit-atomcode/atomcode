@@ -1655,6 +1655,9 @@ pub enum Msg<'a> {
     /// This front end cannot show a file — no desktop opener is wired.
     NoOpener,
     /// The clicked image marker no longer resolves to any bytes.
+    ToolImage {
+        ordinal: usize,
+    },
     ImageGone,
     /// The attached image's stored bytes could not be decoded.
     ImageCorrupt,

@@ -1035,6 +1035,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OpenLinkFailed { reason } => format!("打不开链接：{reason}").into(),
         Msg::ImagePreviewFailed { reason } => format!("打不开图片：{reason}").into(),
         Msg::NoOpener => "这个界面不能打开文件".into(),
+        Msg::ToolImage { ordinal } => format!("图片 {ordinal} · 点击打开").into(),
         Msg::ImageGone => "这张图已经找不到了".into(),
         Msg::ImageCorrupt => "图片数据损坏".into(),
         Msg::MouseTaken => "鼠标已收回 · ctrl+g 交还终端".into(),

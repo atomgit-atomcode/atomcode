@@ -1095,6 +1095,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OpenLinkFailed { reason } => format!("could not open the link: {reason}").into(),
         Msg::ImagePreviewFailed { reason } => format!("could not open the image: {reason}").into(),
         Msg::NoOpener => "this front end cannot open files".into(),
+        Msg::ToolImage { ordinal } => format!("Image {ordinal} · click to open").into(),
         Msg::ImageGone => "that image is no longer available".into(),
         Msg::ImageCorrupt => "the image data is corrupt".into(),
         Msg::MouseTaken => "mouse taken back · ctrl+g hands it to the terminal".into(),
