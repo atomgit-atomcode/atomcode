@@ -222,6 +222,7 @@ atomcode computer doctor
 atomcode computer enable
 # 自定义安装位置：上述两个命令均支持 --executable /完整路径/可执行文件</code></pre>
       <p>在 macOS 系统设置中，为后端应用开启辅助功能和屏幕录制权限。<code>atomcode computer doctor</code> 只做有时限的无界面诊断，不会申请权限或抓屏；缺少权限时 <code>enable</code> 会失败，不写 MCP 配置或技能。它保留其他 MCP 项，拒绝覆盖同名自定义服务或技能，并关闭已知的前台输入与全局指针回退开关。</p>
+      <p>若后端报告了需要授权的 App，<code>computer doctor</code> 和权限不足提示都会显示其确切路径及 bundle identifier。请为这个 App 授权，Codex Computer Use 或其他副本的授权不会自动转移。旧后端未提供此信息时会明确显示 App 未识别，请先运行后端自己的 doctor 确认。</p>
       <p>启用后重启 AtomCode，或在当前会话运行 <code>/computer reload</code>。明确的桌面操作请求（如“帮我在 Safari 窗口点击搜索按钮”）会自动加载已安装的 <code>computer-use</code> 静态指导；也可以显式输入 <code>$computer-use 帮我在指定应用中完成任务</code>。自动加载不执行工具、不授予权限，实际调用仍由模型选择并沿用现有 MCP 审批。说明文档、引用示例、代码开发请求和拒绝桌面操作的请求不会触发该规则；匹配不明确时请显式指定技能。<code>[no-auto-skills]</code> 或技能的 <code>auto-load: off</code> 可以关闭自动加载，宿主的 <code>skills-host.auto_load: false</code> 设置也仍然有效。</p>
       <pre><code>/computer help
 /computer status

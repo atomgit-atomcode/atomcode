@@ -63,3 +63,52 @@ fn permissions_gate_prevents_even_startup_writes_and_enable_is_reversible() {
     assert_eq!(read()["mcpServers"]["computer-use"]["disabled"], true);
     assert!(!root.join("skills/computer-use/SKILL.md").exists());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_and_refused_enable_identify_the_reported_app_without_startup_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("not-created");
+    let backend = temp.path().join("backend");
+    let app = "/Applications/Open Computer Use (AtomCode Lease).app";
+    let mut report = serde_json::json!({
+        "schema_version":1, "kind":"doctor", "ui":false,
+        "permissions":{"accessibility":false,"screen_recording":false},
+        "runtime":{"permission_app":app,"bundle_identifier":"com.ifuryst.opencomputeruse.dev", "unrelated_secret":"not-for-output"},
+    });
+    let put = |report: &serde_json::Value| {
+        std::fs::write(&backend, format!("#!/bin/sh\nprintf '%s' '{}'\n", report)).unwrap();
+        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    put(&report);
+    for command in ["doctor", "enable"] {
+        let output = invoke(&root, &[command, "--executable", backend.to_str().unwrap()]);
+        assert!(!output.status.success());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains(app) && diagnostic.contains("permissions incomplete"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("not-for-output"));
+        assert!(!root.exists());
+    }
+    report["permissions"] = serde_json::json!({"accessibility":true,"screen_recording":true});
+    put(&report);
+    let output = invoke(
+        &root,
+        &["doctor", "--executable", backend.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains(app));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("not-for-output"));
+    assert!(!root.exists());
+    report["runtime"]["permission_app"] = serde_json::json!("relative.app");
+    put(&report);
+    let output = invoke(
+        &root,
+        &["enable", "--executable", backend.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    assert!(!root.exists());
+}

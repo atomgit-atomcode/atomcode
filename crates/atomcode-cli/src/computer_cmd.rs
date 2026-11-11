@@ -55,12 +55,19 @@ struct Permissions {
     accessibility: bool,
     screen_recording: bool,
 }
+/// Backend-reported display context, never an authorization decision.
+#[derive(Debug, Deserialize)]
+struct RuntimeIdentity {
+    permission_app: Option<String>,
+    bundle_identifier: Option<String>,
+}
 #[derive(Debug, Deserialize)]
 struct Probe {
     schema_version: u32,
     kind: String,
     ui: bool,
     permissions: Permissions,
+    runtime: Option<RuntimeIdentity>,
 }
 impl Probe {
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -69,11 +76,41 @@ impl Probe {
         if probe.schema_version != 1 || probe.kind != "doctor" || probe.ui {
             bail!("unsupported backend diagnostic schema; use Open Computer Use 1.3.0 with doctor --no-ui");
         }
+        if let Some(app) = probe
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.permission_app.as_deref())
+        {
+            if !Path::new(app).is_absolute() {
+                bail!("backend permission App identity must be an absolute path");
+            }
+        }
         Ok(probe)
+    }
+    fn permission_identity(&self) -> String {
+        match self.runtime.as_ref().and_then(|runtime| runtime.permission_app.as_deref()) {
+            Some(app) => {
+                let mut hint = format!("Permission App (reported by backend): {}", app.escape_debug());
+                if let Some(identifier) = self.runtime.as_ref().and_then(|runtime| runtime.bundle_identifier.as_deref()) {
+                    hint.push_str(&format!("\nBundle identifier (reported by backend): {}", identifier.escape_debug()));
+                }
+                hint
+            }
+            None => "Permission App: not identified by this backend. Run its local doctor to identify the App before changing OS permissions.".into(),
+        }
+    }
+    fn describe(&self, backend: &Path) -> String {
+        format!(
+            "Backend: {}\n{}\nAccessibility: {}\nScreen Recording: {}",
+            backend.to_string_lossy().escape_debug(),
+            self.permission_identity(),
+            self.permissions.accessibility,
+            self.permissions.screen_recording
+        )
     }
     fn require_ready(&self) -> Result<()> {
         if !self.permissions.accessibility || !self.permissions.screen_recording {
-            bail!("Computer Use permissions incomplete: Accessibility={}, Screen Recording={}. Run open-computer-use doctor yourself and grant the backend app access in macOS settings; then retry.", self.permissions.accessibility, self.permissions.screen_recording);
+            bail!("Computer Use permissions incomplete: Accessibility={}, Screen Recording={}.\n{}\nGrant the identified backend App access in macOS settings, then retry; another App's grant does not apply.", self.permissions.accessibility, self.permissions.screen_recording, self.permission_identity());
         }
         Ok(())
     }
@@ -106,12 +143,7 @@ pub async fn execute(dirs: &ProductDirs, command: ComputerCli) -> Result<String>
             let backend = backend_for(dirs, executable.as_deref())?;
             let report = probe(&backend, PROBE_TIMEOUT).await?;
             report.require_ready()?;
-            Ok(format!(
-                "Backend: {}\nAccessibility: {}\nScreen Recording: {}",
-                backend.display(),
-                report.permissions.accessibility,
-                report.permissions.screen_recording
-            ))
+            Ok(report.describe(&backend))
         }
         ComputerCli::Enable { executable } => {
             require_platform()?;
@@ -417,6 +449,56 @@ mod tests {
                 .require_ready()
                 .is_err());
         }
+    }
+
+    #[test]
+    fn reported_permission_app_is_display_context_and_never_grants_permissions() {
+        let app = std::env::temp_dir().join("Open Computer Use (AtomCode Lease).app");
+        let mut report: Value = serde_json::from_str(READY).unwrap();
+        report["runtime"] = json!({
+            "permission_app": app, "bundle_identifier": "com.ifuryst.opencomputeruse.dev",
+            "unrelated_secret": "do-not-print-this",
+        });
+        let ready = Probe::parse(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let displayed = ready.describe(Path::new("backend"));
+        assert!(displayed.contains(&app.to_string_lossy().escape_debug().to_string()));
+        assert!(displayed.contains("com.ifuryst.opencomputeruse.dev"));
+        assert!(!displayed.contains("do-not-print-this"));
+        report["permissions"]["accessibility"] = json!(false);
+        let error = Probe::parse(&serde_json::to_vec(&report).unwrap())
+            .unwrap()
+            .require_ready()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("permissions incomplete") && error.contains("Accessibility=false"));
+        assert!(error.contains(&app.to_string_lossy().escape_debug().to_string()));
+        assert!(!error.contains("do-not-print-this"));
+        assert!(Probe::parse(READY.as_bytes())
+            .unwrap()
+            .describe(Path::new("legacy"))
+            .contains("not identified"));
+    }
+
+    #[test]
+    fn permission_identity_is_typed_absolute_and_safe_for_terminal_text() {
+        let mut report: Value = serde_json::from_str(READY).unwrap();
+        for invalid in [
+            json!(42),
+            json!({"permission_app": 42}),
+            json!({"permission_app": "relative.app"}),
+            json!({"permission_app": ""}),
+        ] {
+            report["runtime"] = invalid;
+            assert!(Probe::parse(&serde_json::to_vec(&report).unwrap()).is_err());
+        }
+        let app = std::env::temp_dir().join("unexpected\n\u{1b}[31m.app");
+        report["runtime"] = json!({"permission_app": app, "bundle_identifier": "id\n\u{1b}[31m"});
+        let displayed = Probe::parse(&serde_json::to_vec(&report).unwrap())
+            .unwrap()
+            .permission_identity();
+        assert!(!displayed.contains('\u{1b}'));
+        assert_eq!(displayed.lines().count(), 2);
+        assert!(displayed.contains("\\n"));
     }
 
     #[test]
