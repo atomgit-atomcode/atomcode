@@ -101,7 +101,7 @@ pub struct SessionState {
 /// [`handle_delete_session`]). The remaining gap: a session whose kernel agent
 /// finishes on its own (e.g. an internal stop) is not auto-pruned — it stays in
 /// the table until the client closes/deletes it or the whole connection ends
-/// (all are freed when the process exits / the client disconnects).
+/// (connection teardown drains and awaits all remaining sessions).
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 
 /// A host that says yes and remembers what it was asked.
@@ -499,6 +499,19 @@ async fn stop_and_wait(state: SessionState) {
     .await;
 }
 
+/// The connection has ended. Stop all its remaining sessions through the same
+/// runtime-owned path as explicit close, concurrently so the existing stop
+/// timeout bounds the whole batch rather than each session in sequence.
+pub(crate) async fn shutdown_sessions(sessions: &Sessions) {
+    let states: Vec<_> = sessions
+        .lock()
+        .await
+        .drain()
+        .map(|(_, state)| state)
+        .collect();
+    futures::future::join_all(states.into_iter().map(stop_and_wait)).await;
+}
+
 /// Handle a `session/close` request.
 ///
 /// Per the protocol the agent cancels any ongoing work (as if `session/cancel`
@@ -848,6 +861,40 @@ mod tests {
             .await
             .unwrap();
         assert!(sessions.lock().await.contains_key("acp-target"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn disconnected_sessions_stop_concurrently_with_a_bounded_wait() {
+        let sessions = sessions_with(vec![]);
+        let mut receivers = Vec::new();
+        let mut held_senders = Vec::new();
+        for id in ["one", "two"] {
+            let mut state = stub_session(id, "/work");
+            let (commands, receiver) = mpsc::unbounded_channel();
+            let (events, event_receiver) = mpsc::unbounded_channel();
+            state.commands = commands;
+            state.events = Arc::new(Mutex::new(event_receiver));
+            receivers.push(receiver);
+            held_senders.push(events);
+            sessions.lock().await.insert(format!("acp-{id}"), state);
+        }
+        let started = tokio::time::Instant::now();
+        shutdown_sessions(&sessions).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(5),
+            "must await teardown"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "must not multiply timeout per session: {elapsed:?}"
+        );
+        assert!(sessions.lock().await.is_empty());
+        for mut receiver in receivers {
+            assert!(matches!(receiver.try_recv(), Ok(AgentCommand::Cancel)));
+            assert!(matches!(receiver.try_recv(), Ok(AgentCommand::Shutdown)));
+        }
+        drop(held_senders);
     }
 
     #[tokio::test]

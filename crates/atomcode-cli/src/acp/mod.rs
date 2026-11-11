@@ -193,17 +193,22 @@ where
     // v2 chain (draft, feature-gated): a distinct handler set. Both chains
     // share the same session table, engine, provider factory, config-option
     // catalog, and message-id counter through the shared bundle.
+    let sessions = Arc::clone(&state.sessions);
     let v2_agent = v2::build_v2_agent(state);
 
     // The router picks v1 or v2 per connection from the client's `initialize`
     // protocol version; the SDK negotiates and rejects mismatches.
-    Agent
+    let result = Agent
         .protocol_router()
         .with_v1(v1_agent)
         .with_v2(v2_agent)
         .connect_to(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("acp serve failed: {e}"))
+        .await;
+    // EOF/transport failure ends the client connection, not the accepted
+    // native turn. Let the existing runtime cancellation/shutdown path commit
+    // its terminal and release MCP/session resources before the host exits.
+    sessions::shutdown_sessions(&sessions).await;
+    result.map_err(|e| anyhow::anyhow!("acp serve failed: {e}"))
 }
 
 /// Build the stable v1 handler chain.

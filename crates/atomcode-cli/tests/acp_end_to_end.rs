@@ -2434,3 +2434,117 @@ async fn v2_plan_update_from_todo() {
 
     agent_task.abort();
 }
+
+/// Transport EOF must finish the accepted native turn before serve_over returns.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial]
+async fn v2_disconnect_finishes_inflight_native_turn_and_releases_lease() {
+    use agent_client_protocol::schema::v2;
+    use atomcode_kernel::message::Message;
+    use atomcode_kernel::provider::ChatOptions;
+    use atomcode_kernel::tool::ToolDef;
+    use futures::{stream, StreamExt};
+
+    struct PendingProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for PendingProvider {
+        fn model_name(&self) -> &str {
+            "pending"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolDef],
+            _: &ChatOptions,
+        ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
+            Ok(
+                stream::once(async { StreamEvent::TextDelta("IN_FLIGHT".into()) })
+                    .chain(stream::pending())
+                    .boxed(),
+            )
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let cwd = tempfile::tempdir().unwrap();
+    let (agent, client) = Channel::duplex();
+    let opts = AcpServeOptions {
+        engine: Some(dummy_engine()),
+        provider_factory: Some(Arc::new(StubProviderFactory(Arc::new(PendingProvider)))),
+        ..Default::default()
+    };
+    let agent_task = tokio::spawn(serve_over(opts, agent));
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let observed = seen.clone();
+    let cwd_path = cwd.path().to_path_buf();
+    let client_run = Client
+        .v2()
+        .on_receive_notification(
+            move |notification: v2::UpdateSessionNotification, _| {
+                let observed = observed.clone();
+                async move {
+                    if serde_json::to_string(&notification.update)
+                        .unwrap()
+                        .contains("IN_FLIGHT")
+                    {
+                        observed.notify_one();
+                    }
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            client,
+            move |cx: ConnectionTo<agent_client_protocol::Agent>| async move {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("disconnect-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let id = cx
+                    .send_request(v2::NewSessionRequest::new(cwd_path))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(v2::PromptRequest::new(
+                    id.clone(),
+                    vec![v2::ContentBlock::Text(v2::TextContent::new(
+                        "start pending stream",
+                    ))],
+                ))
+                .block_task()
+                .await?;
+                seen.notified().await;
+                // No session/cancel or session/close: the transport ends here.
+                Ok(id)
+            },
+        );
+    let id = tokio::time::timeout(Duration::from_secs(30), client_run)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), agent_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let manager = atomcode_capabilities::session::SessionManager::for_project(cwd.path(), &dirs);
+    let native = id.0.strip_prefix("acp-").unwrap();
+    let events = manager.load_events(native).unwrap();
+    assert!(
+        events.iter().any(|fact| matches!(
+            &fact.event,
+            atomcode_kernel::session::SessionEvent::TurnEnd {
+                stop: atomcode_kernel::event::StopReason::Cancelled,
+                ..
+            }
+        )),
+        "EOF must commit the accepted turn's cancellation"
+    );
+    let _lease = manager
+        .acquire_lease(native)
+        .expect("serve_over must release native lease");
+}
