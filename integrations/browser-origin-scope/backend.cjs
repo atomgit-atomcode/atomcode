@@ -165,10 +165,20 @@ async function main() {
   }
   if (!config.outputDir) throw new Error('--output-dir is required');
   const { stop } = await serve({ ...config, origins });
-  for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
+  let stopping = false;
+  const requestStop = () => {
+    if (stopping) return;
+    stopping = true;
     const deadline = setTimeout(() => process.exit(1), 5000);
     void stop().then(() => { clearTimeout(deadline); process.exitCode = 0; }, () => process.exit(1));
-  });
+  };
+  // The pinned SDK transport listens to data/error, not EOF. The process host
+  // must feed EOF into the same owned cleanup path as explicit termination.
+  process.stdin.once('end', requestStop);
+  process.stdin.once('close', requestStop);
+  process.stdout.on('error', requestStop);
+  for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, requestStop);
+  if (process.stdin.readableEnded || process.stdin.destroyed) requestStop();
 }
 
 if (require.main === module) main().catch(() => {

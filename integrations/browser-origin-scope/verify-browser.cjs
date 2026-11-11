@@ -8,7 +8,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const readline = require('node:readline');
 const { once } = require('node:events');
 const { createRequire } = require('node:module');
 const { loadBackend, ownedBrowser } = require('./backend.cjs');
@@ -36,6 +37,30 @@ function descendants(pid) {
   found.delete(pid); return [...found];
 }
 
+// This transport has no signal fallback. It proves pipe EOF itself closes the
+// backend, unlike SDK StdioClientTransport.close() which escalates after 2s.
+function eofTransport(args, env, stderrData) {
+  const child = spawn(process.execPath, args, {env,stdio:['pipe','pipe','pipe']});
+  const ready = new Promise((resolve,reject) => {child.once('spawn',resolve);child.once('error',reject);});
+  child.stderr.on('data',stderrData);
+  const transport = {
+    async start() {
+      child.on('error',error=>transport.onerror?.(error));
+      child.on('close',()=>transport.onclose?.());
+      child.stdin.on('error',error=>transport.onerror?.(error));
+      readline.createInterface({input:child.stdout}).on('line',line=>{
+        try {transport.onmessage?.(JSON.parse(line));} catch(error) {transport.onerror?.(error);}
+      });
+      await ready;
+    },
+    async send(message) {
+      await new Promise((resolve,reject)=>child.stdin.write(JSON.stringify(message)+'\n',error=>error?reject(error):resolve()));
+    },
+    async close() {child.stdin.end();},
+  };
+  return {child,transport};
+}
+
 async function verify(root, reportPath) {
   const external = loadBackend(root);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'atomcode-origin-'));
@@ -44,6 +69,7 @@ async function verify(root, reportPath) {
   const report = { backend: '0.0.85', playwright: '1.66.0-alpha-2026-11-09', node: process.version,
     platform: process.platform, source_hashes: external.sourceHashes, cases: [], passed: false };
   let owner, client, transport;
+  let withheldResponse;
   const key = path.join(temp, 'key.pem'), cert = path.join(temp, 'cert.pem');
   const generated = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
     '-out', cert, '-days', '1', '-subj', '/CN=localhost'], { stdio: 'ignore' });
@@ -60,6 +86,7 @@ async function verify(root, reportPath) {
     if (req.url === '/redirect' || req.url === '/redirect-307') { res.writeHead(req.url === '/redirect' ? 302 : 307, { Location: bad + '/redirected' }); return res.end(); }
     if (req.url === '/redirect-secure') { res.writeHead(302, {Location: bad.replace('http:', 'https:') + '/redirected-secure'}); return res.end(); }
     if (req.url === '/chain') { res.writeHead(302, { Location: '/redirect' }); return res.end(); }
+    if (req.url === '/withheld-for-output-close') { withheldResponse=res; return; }
     if (req.url === '/download') { res.writeHead(200, {'Content-Disposition':'attachment; filename=forbidden-download.txt'}); return res.end('DO NOT SAVE'); }
     if (req.url === '/nested-frame') { res.setHeader('Content-Type','text/html'); return res.end(`<iframe src="${bad}/nested-frame-denied"></iframe>`); }
     if (req.url === '/fixture') {
@@ -233,6 +260,37 @@ async function verify(root, reportPath) {
     const reopenedPids = descendants(pid); assert.ok(reopenedPids.length > 0);
     await client.close(); client = undefined;
     await waitFor(() => [pid,...reopenedPids].every(pid=>!alive(pid)), 'stdio EOF browser cleanup');
+    const pure = eofTransport([path.join(__dirname,'backend.cjs'),'--backend-root',root,'--output-dir',outputDir],
+      {...process.env,[POLICY_ENV]:JSON.stringify({version:1,origins:[good]})},data=>{stderr+=data.toString();});
+    client = new Client({name:'atomcode-origin-pure-eof',version:'1'},{capabilities:{}});
+    await client.connect(pure.transport);
+    const purePid=pure.child.pid;
+    const pureNavigation=await client.callTool({name:'browser_navigate',arguments:{url:good+'/clean'}});
+    assert.ok(!pureNavigation.isError);
+    const pureChildren=descendants(purePid);assert.ok(pureChildren.length>0);
+    pure.child.stdin.end(); // No SDK close and no SIGTERM/SIGKILL escalation.
+    await waitFor(()=>[purePid,...pureChildren].every(pid=>!alive(pid)),'pure stdin EOF cleanup');
+    assert.equal(pure.child.exitCode,0);assert.equal(pure.child.signalCode,null);
+    await client.close();client=undefined;
+    report.cases.push('pure stdin EOF without signals reaps the backend and observed Chrome descendants with exit 0');
+    const outputLost = eofTransport([path.join(__dirname,'backend.cjs'),'--backend-root',root,'--output-dir',outputDir],
+      {...process.env,[POLICY_ENV]:JSON.stringify({version:1,origins:[good]})},data=>{stderr+=data.toString();});
+    client = new Client({name:'atomcode-origin-output-pipe-loss',version:'1'},{capabilities:{}});
+    await client.connect(outputLost.transport);
+    const outputPid=outputLost.child.pid;
+    const established=await client.callTool({name:'browser_navigate',arguments:{url:good+'/clean'}});
+    assert.ok(!established.isError);
+    const outputChildren=descendants(outputPid);assert.ok(outputChildren.length>0);
+    const pending=client.callTool({name:'browser_navigate',arguments:{url:good+'/withheld-for-output-close'}});
+    void pending.catch(()=>{});
+    await waitFor(()=>!!withheldResponse,'fixture observed in-flight call before output loss');
+    outputLost.child.stdout.destroy();
+    withheldResponse.end('<h1>Owned output-loss fixture</h1>');
+    // Keep stdin open: only the broken response pipe can initiate this cleanup.
+    await waitFor(()=>[outputPid,...outputChildren].every(pid=>!alive(pid)),'broken stdout cleanup');
+    assert.equal(outputLost.child.exitCode,0);assert.equal(outputLost.child.signalCode,null);
+    await pending.catch(()=>{});await client.close();client=undefined;
+    report.cases.push('broken stdout during an in-flight call, with stdin still open, reaps observed descendants without signals');
     transport = new StdioClientTransport({ command: process.execPath,
       args: [path.join(__dirname,'backend.cjs'),'--backend-root',root,'--output-dir',outputDir],
       env: {...process.env,[POLICY_ENV]:JSON.stringify({version:1,origins:[good]})},stderr:'pipe' });
@@ -247,7 +305,7 @@ async function verify(root, reportPath) {
     await waitFor(()=>[signalPid,...signalChildren].every(pid=>!alive(pid)),'SIGTERM owned browser cleanup');
     await client.close();client=undefined;
     assert.equal(deniedHits.length, 0);
-    report.cases.push('actual MCP capability/discovery/direct refusal; no launch on metadata/refusal; inherited attachment config ignored; allowed navigate/snapshot/image; close/reopen, EOF and SIGTERM reap observed owned descendants');
+    report.cases.push('actual MCP capability/discovery/direct refusal; no launch on metadata/refusal; inherited attachment config ignored; allowed navigate/snapshot/image; close/reopen, SDK transport close and SIGTERM reap observed owned descendants');
     report.mcp_stderr_bytes = Buffer.byteLength(stderr);
     assert.equal(deniedConnections, 0);
     report.denied_server_connections = deniedConnections;

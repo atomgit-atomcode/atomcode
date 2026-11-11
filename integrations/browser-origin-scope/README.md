@@ -29,7 +29,7 @@ The backend lazily creates its own temporary Chrome profile/context through Play
 
 A loopback forward proxy checks every HTTP destination and CONNECT authority, including new requests caused by redirects, frames, subresources and popups. Chromium also uses CONNECT for plain WebSockets. CONNECT therefore checks the initial protocol before forwarding: TLS requires HTTPS permission; plain traffic must pass Node's HTTP parser, exact-authority and WebSocket checks. Permission for one scheme is not a raw TCP tunnel for the other scheme on the same port. WSS uses the HTTPS boundary.
 
-`browser_close` waits for this backend's browser/proxy cleanup. Subsequent explicit calls may create a new isolated browser. EOF/SIGTERM close owned resources; a five-second process exit deadline bounds graceful cleanup. Test evidence checks observed descendant PIDs, not arbitrary detached descendants. Run this through an owner such as AtomCode's normal MCP stdio process-group supervision for escalation on hangs. No replay of a lost or cancelled operation is introduced here.
+`browser_close` waits for this backend's browser/proxy cleanup. Subsequent explicit calls may create a new isolated browser. Pure stdin EOF, a broken stdout pipe and SIGTERM use the same owned cleanup path; a five-second process exit deadline bounds graceful cleanup. Test evidence checks observed descendant PIDs, not arbitrary detached descendants. Run this through an owner such as AtomCode's normal MCP stdio process-group supervision for escalation on hangs. No replay of a lost or cancelled operation is introduced here.
 
 This is a boundary for this browser interface's tested HTTP(S)/WS(S) traffic, not an OS network sandbox or a guarantee about all browser protocols. Shell tools, other browser servers/clients, malicious same-user processes and effects performed by a permitted remote server are outside it. Do not infer global agent restrictions or signed backend attestation from a capability declaration.
 
@@ -101,7 +101,7 @@ node integrations/browser-origin-scope/verify-browser.cjs \
   --report /absolute/private/acceptance.json
 ```
 
-The verifier owns two allowed HTTP/HTTPS fixtures, a forbidden fixture, temporary profiles and a temporary certificate. A test-only SPKI pin trusts that one fixture certificate; production does not ignore HTTPS errors. It checks positive permitted traffic as well as zero forbidden TCP connections/HTTP requests, transfers, raw MCP refusals, image output, browser close/reopen and process cleanup. A PNG accompanies the report. No personal browser profile, external website, account or user credential is used. Report hashes measure selected dependency files; they are provenance, not complete package attestation.
+The verifier owns two allowed HTTP/HTTPS fixtures, a forbidden fixture, temporary profiles and a temporary certificate. A test-only SPKI pin trusts that one fixture certificate; production does not ignore HTTPS errors. It checks positive permitted traffic as well as zero forbidden TCP connections/HTTP requests, transfers, raw MCP refusals, image output, browser close/reopen and process cleanup. Pure EOF is tested with a raw transport that sends no signals; broken stdout is tested during an in-flight call while stdin remains open. SDK transport close is a separate case because it escalates to SIGTERM/SIGKILL. A PNG accompanies the report. No personal browser profile, external website, account or user credential is used. Report hashes measure selected dependency files; they are provenance, not complete package attestation.
 
 The production Rust registry/adapter is also exercised explicitly:
 
@@ -112,4 +112,17 @@ ATOMCODE_BROWSER_ORIGIN_TEST_ROOT=/absolute/installed/node_modules/@playwright/m
 
 This exercises real managed setup followed by production configuration loading, redirects, native image results, risky approval classification, required capability mismatch and stale-adapter withdrawal. The backend itself is also independently tested through raw MCP in the Node verifier. It does not substitute for full CodingRuntime approval/cancel/unknown-result or real-model acceptance of this new backend.
 
-Local recorded acceptance is macOS 14.5 / Apple Silicon, Chrome 157.0.8103.39, Node 22.22.0. Other operating systems/browser versions are unverified. Managed setup and actual runtime approval-denial have local acceptance. Full cancellation/unknown-result and real-model acceptance for this new backend, richer per-origin permissions and native GUI/platform work remain in the overall delivery audit.
+Local recorded acceptance is macOS 14.5 / Apple Silicon, Chrome 157.0.8103.39, Node 22.22.0. Other operating systems/browser versions are unverified. Managed setup, actual runtime approval-denial, and real adapter/transport fault acceptance have local evidence. The latter covers a successful submitted click whose response is lost, committed effects followed by cancellation/forced future drop, late success which cannot restore the old client, explicit reconnect without replay, Drop cleanup and awaited shutdown. These adapter tests do not by themselves prove the complete CodingRuntime turn-cancel or remote-driver flow. Real-model use of this backend, richer per-origin permissions and native GUI/platform work remain in the overall delivery audit.
+
+Run the stock and scoped fault suite explicitly (all pages/profiles are temporary local fixtures):
+
+```sh
+ATOMCODE_BROWSER_TEST_SERVER=/absolute/installed/node_modules/@playwright/mcp/cli.js \
+ATOMCODE_BROWSER_ORIGIN_TEST_ROOT=/absolute/installed/node_modules/@playwright/mcp \
+ATOMCODE_BROWSER_TEST_ARTIFACTS=/absolute/private/fault-evidence \
+  cargo nextest run -p atomcode --test browser_live --run-ignored all --test-threads 1
+```
+
+Evidence is separated by stock/scoped case directories. Result JSON records the external submission counter and, for fault cases, actual click RPC/spawn counts. Scoped cancellation and forced drop require one old spawn/one click, an observed late successful reply which leaves the client poisoned, and exactly one explicitly requested replacement. Captured PIDs are checked synchronously with signal 0 before an awaited cleanup assertion, not after spawning a separate PID-check process.
+
+The first strengthened real Drop test exposed missing EOF handling in the optional backend: the pinned SDK server transport listens to data/error but not stdin end. Its client close helper's signal escalation had masked this in earlier verification. The process host now sends EOF/broken-stdout into the existing cleanup path. Earlier SDK-close evidence should not be read as pure-EOF proof; the separate raw transport cases provide that proof now.
