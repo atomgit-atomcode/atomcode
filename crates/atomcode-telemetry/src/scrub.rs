@@ -54,11 +54,14 @@ fn usable_path(path: Option<&Path>) -> Option<&str> {
 
 pub fn scrub_path(s: &str, home: Option<&Path>, cwd: Option<&Path>) -> String {
     let mut out = s.to_string();
-    if let Some(h) = usable_path(home) {
-        out = out.replace(h, "<HOME>");
-    }
+    // The working directory goes first: when the session lives under home it
+    // is the longer, more specific prefix, so a project path reads as
+    // `<CWD>/…` rather than exposing the rest of the home-relative tree.
     if let Some(c) = usable_path(cwd) {
         out = out.replace(c, "<CWD>");
+    }
+    if let Some(h) = usable_path(home) {
+        out = out.replace(h, "<HOME>");
     }
     out
 }
@@ -110,6 +113,17 @@ mod tests {
         let s = "error in /tmp/proj/src/main.rs:3";
         assert_eq!(
             scrub_path(s, None, Some(&cwd)),
+            "error in <CWD>/src/main.rs:3"
+        );
+    }
+
+    #[test]
+    fn cwd_wins_over_home_for_a_project_below_it() {
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/home/u/proj");
+        let s = "error in /home/u/proj/src/main.rs:3";
+        assert_eq!(
+            scrub_path(s, Some(&home), Some(&cwd)),
             "error in <CWD>/src/main.rs:3"
         );
     }
