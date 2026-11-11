@@ -314,26 +314,28 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                         &scan,
                     )
                     .await?;
-                    // v1 resume: silent restore (MUST NOT replay). The response
-                    // echoes the initial mode/config state, mirroring
-                    // `session/new`.
-                    let mut resp = ResumeSessionResponse::new().modes(session_mode_state(engine_ref.initial_mode()));
-                    if !config_options.is_empty() {
-                        resp = resp.config_options(config_options.to_vec());
-                    }
-                    responder.respond(resp)?;
-                    // Best-effort: a dropped notification must not fail the
-                    // already-accepted session/resume (same reasoning as the
-                    // session/new handler above).
-                    let catalog =
-                        crate::acp::commands::catalog_of(&sessions, id.0.as_ref()).await;
-                    let _ = cx.send_notification(SessionNotification::new(
-                        id,
-                        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands(&catalog),
-                        )),
-                    ));
-                    Ok(())
+                    sessions::finish_restore(&sessions, &req.session_id, async {
+                        // v1 resume: silent restore (MUST NOT replay). The response
+                        // echoes the initial mode/config state, mirroring
+                        // `session/new`.
+                        let mut resp = ResumeSessionResponse::new().modes(session_mode_state(engine_ref.initial_mode()));
+                        if !config_options.is_empty() {
+                            resp = resp.config_options(config_options.to_vec());
+                        }
+                        responder.respond(resp)?;
+                        // Best-effort: a dropped notification must not fail the
+                        // already-accepted session/resume (same reasoning as the
+                        // session/new handler above).
+                        let catalog =
+                            crate::acp::commands::catalog_of(&sessions, id.0.as_ref()).await;
+                        let _ = cx.send_notification(SessionNotification::new(
+                            id,
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                crate::acp::commands::available_acp_commands(&catalog),
+                            )),
+                        ));
+                        Ok(())
+                    }).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -365,26 +367,28 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                         &scan,
                     )
                     .await?;
-                    // `session/load` MUST replay the full history via
-                    // `session/update` before responding (v1 spec). Same native
-                    // catalog and display rules as `session/list` / v2 resume.
-                    let native_id = sessions::native_id_from_wire(&req.session_id).ok_or_else(|| {
-                        agent_client_protocol::util::internal_error(
-                            "acp: load replay: invalid session id",
-                        )
-                    })?;
-                    let entries = build_replay_entries(native_id, &req.cwd)
-                        .map_err(agent_client_protocol::util::internal_error)?;
-                    let updates = replay_entries_to_v1_updates(&entries, &msg_ids);
-                    for update in updates {
-                        cx.send_notification(SessionNotification::new(id.clone(), update))?;
-                    }
-                    // Echo initial mode/config state, mirroring `session/resume`.
-                    let mut resp = LoadSessionResponse::new().modes(session_mode_state(engine_ref.initial_mode()));
-                    if !config_options.is_empty() {
-                        resp = resp.config_options(config_options.to_vec());
-                    }
-                    responder.respond(resp)
+                    sessions::finish_restore(&sessions, &req.session_id, async {
+                        // `session/load` MUST replay the full history via
+                        // `session/update` before responding (v1 spec). Same native
+                        // catalog and display rules as `session/list` / v2 resume.
+                        let native_id = sessions::native_id_from_wire(&req.session_id).ok_or_else(|| {
+                            agent_client_protocol::util::internal_error(
+                                "acp: load replay: invalid session id",
+                            )
+                        })?;
+                        let entries = build_replay_entries(native_id, &req.cwd)
+                            .map_err(agent_client_protocol::util::internal_error)?;
+                        let updates = replay_entries_to_v1_updates(&entries, &msg_ids);
+                        for update in updates {
+                            cx.send_notification(SessionNotification::new(id.clone(), update))?;
+                        }
+                        // Echo initial mode/config state, mirroring `session/resume`.
+                        let mut resp = LoadSessionResponse::new().modes(session_mode_state(engine_ref.initial_mode()));
+                        if !config_options.is_empty() {
+                            resp = resp.config_options(config_options.to_vec());
+                        }
+                        responder.respond(resp)
+                    }).await
                 }
             },
             agent_client_protocol::on_receive_request!(),

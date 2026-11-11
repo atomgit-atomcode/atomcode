@@ -1,0 +1,19 @@
+# ACP restore failure cleanup
+
+Baseline: release/v5.2.7 7b51c6d09, clean main and isolated worktree. Reviewed v1 load, v2 resume/start, shared resume registration, native replay and close/stop paths plus their recent Git history.
+
+State owner remains CodingRuntime, accessed through the existing ACP Sessions table. After registration, both replay handlers currently propagate read/send/response errors without closing the restored session. A failed request can therefore leave a live session and its native lease; retry conflicts instead of restoring. History must remain intact and the original protocol error must remain visible.
+
+Use one shared completion wrapper around the post-registration replay/response future. On error, call the existing handle_close_session and await its existing bounded stop; on success leave the session live. Do not close on errors before successful registration (a live-session conflict must never close an existing runtime). Do not introduce a runtime owner, persistence fallback or new cancellation mechanism. An alternative of replaying before restore conflicts with required conversion and fail-closed ordering. Duplicating cleanup at individual question-mark sites is easy to omit; wrap the entire completion instead.
+
+1. Add failing shared completion tests: error returns unchanged, exact target removed, Cancel then Shutdown observed, lease released before return, neighbor untouched; success leaves target live. Use native SessionManager leases and deterministic channels, without model/network/OS grants.
+2. Implement wrapper in crates/atomcode-cli/src/acp/sessions.rs and wire v1 load and v2 replay/success-response blocks in mod.rs and v2.rs.
+3. Run targeted ACP and affected CLI nextest, cargo fmt/check, compile gate, layers/product-dir and lock checks. Review diffs and update acceptance limits before committing/pushing. Shared teardown tests do not constitute real ACP disconnect/browser-in-flight acceptance.
+
+The same post-registration response cleanup also wraps v1 silent resume; best-effort command-catalog notifications after a successful response keep their existing semantics. v2 wraps both silent and start replay. Read/notification/response errors remain visible, and pre-registration lease conflicts remain outside the wrapper.
+
+Regression baseline: a passthrough completion returned the original error while leaving acp-target in the live map; the new cleanup test failed on that authoritative table assertion. Success-path test already passed. The initial real-runtime test fixture used a nonexistent SessionMode::New variant; corrected to the existing Fresh variant before running, with no production API change.
+
+Additional deterministic real-runtime coverage starts and closes a fresh native session, resumes via the production handler, verifies its lease is held, moves only its test event file aside, then feeds the actual native read error through the shared completion. It checks runtime teardown, lease reacquisition, identical preserved event bytes and successful same-ID resume after restoring the file. This exercises the native store/runtime/teardown seam, not a JSON-RPC disk-race fault or actual browser operation.
+
+Validation: the three completion/native-runtime regressions pass; the earlier targeted ACP run passed 97 tests before the additional real-runtime regression. Final full affected CLI run passes 688 tests, with 13 pre-existing opt-in tests skipped. This includes the ordinary v1/v2 lifecycle and live-session conflict protocol tests. No new dependencies, schema, event writer or OS permissions are involved. The full compile gate (including feature-gated targets and negative controls), cargo fmt --all and its check, layer and product-directory gates, diff check and unchanged clean Cargo.lock checks all pass. Full transport disconnect/in-flight browser and manual editor rendering acceptance remains outstanding in the overall audit.

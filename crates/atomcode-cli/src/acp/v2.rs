@@ -870,45 +870,48 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                         &scan,
                     )
                     .await?;
-                    // `replayFrom: start`: emit the persisted conversation as
-                    // full-content message updates BEFORE responding — the
-                    // protocol requires all requested replay entries before the
-                    // resume response.
-                    if let Some(agent_client_protocol::schema::v2::ReplayFrom::Start(_)) =
-                        req.replay_from.as_ref()
-                    {
-                        let native_id = crate::acp::sessions::native_id_from_wire(&v1_sid)
-                            .ok_or_else(|| {
-                                agent_client_protocol::util::internal_error(
-                                    "acp: resume replay: invalid session id",
-                                )
-                            })?;
-                        let updates = build_replay_updates(native_id, &cwd, &msg_ids)?;
-                        for update in updates {
-                            cx.send_notification(UpdateSessionNotification::new(
-                                req.session_id.clone(),
-                                update,
-                            ))?;
+                    crate::acp::sessions::finish_restore(&sessions, &v1_sid, async {
+                        // `replayFrom: start`: emit the persisted conversation as
+                        // full-content message updates BEFORE responding — the
+                        // protocol requires all requested replay entries before the
+                        // resume response.
+                        if let Some(agent_client_protocol::schema::v2::ReplayFrom::Start(_)) =
+                            req.replay_from.as_ref()
+                        {
+                            let native_id = crate::acp::sessions::native_id_from_wire(&v1_sid)
+                                .ok_or_else(|| {
+                                    agent_client_protocol::util::internal_error(
+                                        "acp: resume replay: invalid session id",
+                                    )
+                                })?;
+                            let updates = build_replay_updates(native_id, &cwd, &msg_ids)?;
+                            for update in updates {
+                                cx.send_notification(UpdateSessionNotification::new(
+                                    req.session_id.clone(),
+                                    update,
+                                ))?;
+                            }
                         }
-                    }
-                    // Advertise the initial config catalog (skipped on the wire
-                    // when empty), mirroring `session/new`.
-                    responder.respond(
-                        ResumeSessionResponse::new()
-                            .config_options(v1_to_v2_config_options(&config_options)),
-                    )?;
-                    // Advertise the slash-command surface right after resume
-                    // (best-effort, mirroring the v1 chain's reasoning).
-                    let catalog =
-                        crate::acp::commands::catalog_of(&sessions, req.session_id.0.as_ref())
-                            .await;
-                    let _ = cx.send_notification(UpdateSessionNotification::new(
-                        req.session_id.clone(),
-                        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands_v2(&catalog),
-                        )),
-                    ));
-                    Ok(())
+                        // Advertise the initial config catalog (skipped on the wire
+                        // when empty), mirroring `session/new`.
+                        responder.respond(
+                            ResumeSessionResponse::new()
+                                .config_options(v1_to_v2_config_options(&config_options)),
+                        )?;
+                        // Advertise the slash-command surface right after resume
+                        // (best-effort, mirroring the v1 chain's reasoning).
+                        let catalog =
+                            crate::acp::commands::catalog_of(&sessions, req.session_id.0.as_ref())
+                                .await;
+                        let _ = cx.send_notification(UpdateSessionNotification::new(
+                            req.session_id.clone(),
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                crate::acp::commands::available_acp_commands_v2(&catalog),
+                            )),
+                        ));
+                        Ok(())
+                    })
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
