@@ -2,7 +2,7 @@
 
 This is a small source patch and protocol acceptance harness for **Open Computer Use v1.3.0**, pinned to commit `e551c13e7082ce4c097234137582fbf4a1bc647a`. It contains no backend binary, browser, profile or captured desktop data. Upstream code is MIT licensed; see UPSTREAM-LICENSE.
 
-**Not a completed AtomCode feature:** host scope propagation and normal runtime turn-end wiring are implemented for negotiated stdio protocol v1. Isolated App/socket activation, actual GUI cancellation/fresh-observation acceptance and other-platform support are still required. The current shipped backend does not acquire these leases. This patch is not installed automatically and has not replaced the user's App.
+**Not a completed AtomCode feature:** host scope propagation and normal runtime turn-end wiring are implemented for negotiated stdio protocol v1. Isolated App/socket construction and no-GUI proxy acceptance are implemented. Actual GUI cancellation/fresh-observation acceptance and other-platform support are still required. The current shipped backend does not acquire these leases. This patch is not installed automatically and has not replaced the user's App.
 
 ## Why execution-side ownership
 
@@ -25,9 +25,41 @@ python3 integrations/open-computer-use/verify_lease.py \
 
 The exact executable subdirectory depends on the host target. A repeat build of an already patched clone can use the printed Swift build command directly; the patch script deliberately refuses dirty clones.
 
-The checked build baseline is macOS 14.5 / SDK 14.5 with Swift 6.1.3. The patch lowers the manifest's tools requirement from 6.2 to 6.1 and adds **compiler-checked Sendable conformance** to two immutable value types needed by Swift 6.1. It does not disable concurrency checking. This is a modified backend build, not proof that upstream's original manifest builds unchanged. The local Command Line Tools installation lacks XCTest: upstream XCTest targets were not run. Product compilation, an XCTest-independent native cache/identity/lease smoke executable and separate real-process protocol acceptance are the evidence here. The smoke tests verify cache invalidation without reissuing old screenshot identities and perform no GUI operation.
+The original lease build baseline was macOS 14.5 / SDK 14.5 with Swift 6.1.3; the isolated-App extension was freshly built on macOS 14.5 / SDK 15.2 with the same Swift 6.1.3 toolchain. The patch lowers the manifest's tools requirement from 6.2 to 6.1 and adds **compiler-checked Sendable conformance** to two immutable value types needed by Swift 6.1. It does not disable concurrency checking. This is a modified backend build, not proof that upstream's original manifest builds unchanged. The local Command Line Tools installation lacks XCTest: upstream XCTest targets were not run. Product compilation, an XCTest-independent native cache/identity/lease smoke executable and separate real-process protocol acceptance are the evidence here. The smoke tests verify cache invalidation without reissuing old screenshot identities, including a new connection's first observation, and perform no GUI operation. A separate native namespace smoke tests lifetime locking, stale/live sockets, replacement-inode cleanup and file defenses.
 
-The protocol harness sends handshake, lease control, ping and nonexistent-tool requests. It requests no screenshots, application contents or GUI actions. Direct-process cases explicitly disable installed-App proxy discovery so they cannot attach to the user's default App socket. Shared-App cases launch the exact test executable on a unique private socket, close only test-owned connections and stop only that test-owned helper PID. No OS permissions are granted or bypassed. The test binary currently reports Accessibility=false; no GUI acceptance is claimed. Ordinary invocation of a raw development binary can resolve the installed App through upstream discovery. Do not put this raw binary into the managed desktop configuration yet: an isolated App bundle/default-socket identity and actual GUI acceptance are still required before activation.
+The protocol harness sends handshake, lease control, ping and nonexistent-tool requests. It requests no screenshots, application contents or GUI actions. Direct-process cases explicitly disable installed-App proxy discovery so they cannot attach to the user's default App socket. Shared-App cases launch the exact test executable on a unique private socket, close only test-owned connections and stop only that test-owned helper PID. No OS permissions are granted or bypassed. The test binary currently reports Accessibility=false; no GUI acceptance is claimed. Upstream raw development binaries can resolve an installed App through discovery. This derivative refuses that proxy fallback: use the explicitly packaged, protocol-marked development App. Direct mode exists for protocol tests only; it is not the real App/proxy acceptance path. Do not activate the experimental backend for normal use until actual GUI acceptance is complete.
+
+## Isolated App packaging and diagnostics
+
+The build recipe records source inputs before and after compilation/smoke, the pinned patch, compiler/SDK and executable measurements in `atomcode-build-provenance.json`. The optional packager requires that manifest to match both the current patch and the input executable, refuses a binary without both lease/isolation capabilities and refuses an existing output. These are local build measurements, not a publisher-signed attestation. It probes the copied payload, ad-hoc signs a separate development bundle, verifies its signature and exact permission-App discovery, and records upstream/patch/executable provenance. It does not install, replace another App, set default handlers or grant OS permissions. The bundle uses `com.ifuryst.opencomputeruse.dev` and the display name `Open Computer Use (AtomCode Lease)`.
+
+```sh
+python3 integrations/open-computer-use/package-macos-lease-app.py \
+  --backend /tmp/ocu-lease-build/arm64-apple-macosx/debug/OpenComputerUse \
+  --build-provenance /tmp/ocu-lease-build/atomcode-build-provenance.json \
+  --output '/tmp/Open Computer Use (AtomCode Lease).app' \
+  --report /tmp/ocu-lease-app-provenance.json
+python3 integrations/open-computer-use/verify_app_isolation.py \
+  --app '/tmp/Open Computer Use (AtomCode Lease).app' \
+  --report /tmp/ocu-app-isolation.json
+```
+
+The proxy namespace hashes the POSIX-canonical App path and executable SHA-256 in a private per-user directory, independent of product profiles. Only the actual listener holds the separate lifetime lock and may reclaim a checked stale socket. Its versioned lock-file record binds the real listener PID and filesystem socket inode. Recovery requires a demonstrably dead PID and the same inode; connection refusal is insufficient because macOS can return it for a live full backlog. Unknown records and reused/live PIDs fail closed. Active/mismatched/hung listeners and their sockets are left intact; connection and identity negotiation are bounded. Cleanup compares the bound filesystem inode. These checks are cooperative same-user hygiene, not authentication against a malicious same-user process.
+
+App acceptance launches the exact scratch bundle via LaunchServices, verifies two proxies/profiles share its helper, checks EOF/lease handover, mismatch refusal, hung identity reads, a full connection backlog and concurrent listener startup/stale recovery. A live legacy-default-socket sentinel must stay untouched. All these tests use diagnostics and lease RPCs only. The upstream patch also includes `docs/ATOMCODE_LEASE_OVERLAY.md` to distinguish this experimental behavior from upstream defaults.
+
+## Opt-in real GUI acceptance
+
+Build the dedicated AppKit fixture with `build-gui-fixture.py --swiftc /absolute/path/to/swiftc --output '/tmp/AtomCode CU Fixture.app'`. This only compiles/signs the target; it does not launch it. After the exact isolated backend App has Accessibility and Screen Recording grants, run:
+
+```sh
+python3 integrations/open-computer-use/verify_gui.py \
+  --app '/tmp/Open Computer Use (AtomCode Lease).app' \
+  --fixture '/tmp/AtomCode CU Fixture.app' \
+  --report /tmp/ocu-real-gui.json --perform-gui
+```
+
+Without the explicit flag or both actual runtime grants, no fixture is launched. The intended test observes only its own window, assigns a known text value, presses a normal button and a bounded gated button, kills the owned proxy while the gated action is accepted, checks the native lease against a second process, then verifies fresh-connection observation IDs reject the old ID. The fixture state file witnesses actual widget actions; it is not an automation control bridge. This script is prepared and compiled where possible but real GUI acceptance remains pending OS permission; a no-GUI result is not a substitute.
 
 ## Protocol v1
 
@@ -35,7 +67,7 @@ A host opts in at initialize with `capabilities.experimental["atomcode/turn-scop
 
 Control RPCs `atomcode/desktop/acquire` and `atomcode/desktop/release` take `params._meta["atomcode/turn"]`, a bounded nonempty opaque host owner. The same metadata is required on `tools/call`; model tool arguments cannot supply it. Successful acquire returns `result.acquired=true`; successful release returns `result.released=true`. The host must validate that exact acknowledgement, not treat any JSON-RPC result as success: backend errors can be represented as `result.isError=true`.
 
-Acquire is idempotent for the same owner on the same connection. Another owner or process gets a busy error. A connection without the lease cannot release another connection, even if it supplies the same owner string. Matching release clears that connection's observation caches while preserving its monotonic screenshot identity sequence. Negotiated legacy app actions require an explicit observation; they cannot silently refresh and apply an old element index. Unaddressed legacy `notifications/turn-ended` does not release a negotiated lease. Legacy clients remain compatible but are not cooperatively isolated.
+Acquire is idempotent for the same owner on the same connection. Another owner or process gets a busy error. A connection without the lease cannot release another connection, even if it supplies the same owner string. Matching release clears that connection's observation caches while preserving its monotonic screenshot identity sequence. Negotiated connections also use a random per-service screenshot namespace, so a new connection cannot reissue an old connection's ID. First negotiation clears legacy observations. Negotiated legacy app actions require an explicit observation; they cannot silently refresh and apply an old element index. Unaddressed legacy `notifications/turn-ended` does not release a negotiated lease. Legacy clients remain compatible but are not cooperatively isolated.
 
 The host generates scope identity from the real executing agent's session ID and committed TurnStart sequence, hashes it into bounded opaque metadata outside model arguments, and uses the existing awaited TurnFinishing boundary. Adapters resolve the executing context at call time; delegated children do not inherit their lead's lease. Exact acknowledgements are validated. A negotiated connection cannot silently lose this capability during recovery, and scoped acquire/tool/release transport failures require explicit reconnect and re-observation rather than cross-connection replay. Cleanup errors are applied only to the captured client, never a replacement published under the same name. Unknown remote outcomes still require transport retirement/reconciliation. It must not add a kernel coding command, treat approvals as desktop ownership, call the global CLI turn-ended broadcast or kill a shared App as cleanup.
 

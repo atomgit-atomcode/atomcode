@@ -16,13 +16,539 @@ index 2316014..a8d6b5d 100644
 +            dependencies: ["OpenComputerUseKit"],
 +            path: "packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke"
 +        ),
+diff --git a/apps/OpenComputerUse/Sources/OpenComputerUse/AppAgentNamespace.swift b/apps/OpenComputerUse/Sources/OpenComputerUse/AppAgentNamespace.swift
+new file mode 100644
+index 0000000..abaa5a8
+--- /dev/null
++++ b/apps/OpenComputerUse/Sources/OpenComputerUse/AppAgentNamespace.swift
+@@ -0,0 +1,208 @@
++import CryptoKit
++import Darwin
++import Foundation
++
++struct AppAgentNamespaceError: LocalizedError {
++    let errorDescription: String?
++    init(_ message: String) { errorDescription = message }
++}
++
++/// A private, variant/binary-specific socket. This is separate from the desktop
++/// turn lock: idle helpers do not reserve the desktop.
++struct AppAgentNamespace {
++    let path: String
++
++    static func digest(of executable: URL) throws -> String {
++        let file = try FileHandle(forReadingFrom: executable)
++        defer { try? file.close() }
++        var hash = SHA256()
++        while let data = try file.read(upToCount: 65536), !data.isEmpty {
++            hash.update(data: data)
++        }
++        return hash.finalize().map { String(format: "%02x", $0) }.joined()
++    }
++
++    static func canonicalPath(_ url: URL) throws -> String {
++        guard let resolved = realpath(url.path, nil) else {
++            throw AppAgentNamespaceError("Cannot resolve the exact App path.")
++        }
++        defer { free(resolved) }
++        return String(cString: resolved)
++    }
++
++    static func forApp(_ app: URL) throws -> Self {
++        guard let bundle = Bundle(url: app),
++              bundle.bundleIdentifier == "com.ifuryst.opencomputeruse.dev",
++              bundle.object(forInfoDictionaryKey: "AtomCodeDesktopLeaseProtocol") as? String == "1",
++              let executable = bundle.executableURL else {
++            throw AppAgentNamespaceError("Use the isolated AtomCode Lease development App, not an installed release App or raw binary.")
++        }
++        let identity = try canonicalPath(app) + "\0" + digest(of: executable)
++        let hash = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
++        let directory = "/tmp/atomcode-ocu-agent-\(getuid())"
++        try prepareDirectory(directory)
++        return Self(path: directory + "/" + hash.prefix(32) + ".sock")
++    }
++
++    static func prepareDirectory(_ directory: String) throws {
++        guard directory.hasPrefix("/"), !directory.utf8.contains(0) else {
++            throw AppAgentNamespaceError("App-agent directory must be an absolute local path.")
++        }
++        if mkdir(directory, mode_t(0o700)) != 0 && errno != EEXIST {
++            throw AppAgentNamespaceError("Cannot create the private App-agent directory.")
++        }
++        var info = stat()
++        guard lstat(directory, &info) == 0,
++              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
++              info.st_uid == getuid(), info.st_mode & mode_t(0o077) == 0 else {
++            throw AppAgentNamespaceError("App-agent directory must be private, owned by this user, and not a symlink.")
++        }
++    }
++
++    /// No connection may follow an unexpected socket/symlink into another App.
++    func validateSocketIfPresent() throws {
++        _ = try Self.socketInfo(path)
++    }
++
++    static func socketInfo(_ path: String) throws -> stat? {
++        guard path.hasPrefix("/"), !path.utf8.contains(0),
++              path.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
++            throw AppAgentNamespaceError("Invalid or too-long App-agent socket path.")
++        }
++        var info = stat()
++        if lstat(path, &info) != 0 {
++            if errno == ENOENT { return nil }
++            throw AppAgentNamespaceError("Cannot inspect the App-agent socket.")
++        }
++        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
++              info.st_uid == getuid(), info.st_mode & mode_t(0o077) == 0,
++              info.st_nlink == 1 else {
++            throw AppAgentNamespaceError("App-agent socket must be private, owned by this user, and not a symlink.")
++        }
++        return info
++    }
++
++    static func address(_ path: String) throws -> sockaddr_un {
++        guard path.hasPrefix("/"), !path.utf8.contains(0) else {
++            throw AppAgentNamespaceError("Invalid App-agent socket path.")
++        }
++        var address = sockaddr_un()
++        address.sun_family = sa_family_t(AF_UNIX)
++        let bytes = Array(path.utf8)
++        let capacity = MemoryLayout.size(ofValue: address.sun_path)
++        guard bytes.count < capacity else { throw AppAgentNamespaceError("App-agent socket path is too long.") }
++        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
++            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { buffer in
++                for i in 0..<bytes.count { buffer[i] = CChar(bitPattern: bytes[i]) }
++                buffer[bytes.count] = 0
++            }
++        }
++        return address
++    }
++}
++
++/// Held by the actual listener, not proxies. Never unlinks a live listener or a
++/// lock file. Only an acquired lifetime lock can reclaim a checked stale socket.
++final class AppAgentSocketLease {
++    let path: String
++    private let lockFD: Int32
++    private var bound: stat?
++
++    init(path: String) throws {
++        let directory = (path as NSString).deletingLastPathComponent
++        try AppAgentNamespace.prepareDirectory(directory)
++        _ = try AppAgentNamespace.address(path)
++        let fd = open(path + ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
++        guard fd >= 0 else { throw AppAgentNamespaceError("Cannot open the private App-agent lifetime lock.") }
++        var success = false
++        defer { if !success { close(fd) } }
++        var info = stat()
++        guard fstat(fd, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
++              info.st_uid == getuid(), info.st_mode & mode_t(0o077) == 0, info.st_nlink == 1 else {
++            throw AppAgentNamespaceError("App-agent lifetime lock must be a private regular file owned by this user.")
++        }
++        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
++            throw AppAgentNamespaceError("This App-agent namespace is already occupied; its listener was not replaced.")
++        }
++        if let stale = try AppAgentNamespace.socketInfo(path) {
++            // ECONNREFUSED is not proof of death: macOS can return it for a
++            // live Unix listener with a full backlog. Reclaim only the inode
++            // recorded by a listener whose process is provably gone.
++            guard try Self.recordedOwnerIsDead(fd: fd, socket: stale) else {
++                throw AppAgentNamespaceError("App-agent socket has no verifiable dead owner; the existing listener was left untouched.")
++            }
++            guard let current = try AppAgentNamespace.socketInfo(path),
++                  current.st_dev == stale.st_dev, current.st_ino == stale.st_ino else {
++                throw AppAgentNamespaceError("App-agent socket changed during stale recovery.")
++            }
++            guard unlink(path) == 0 else { throw AppAgentNamespaceError("Cannot reclaim the stale App-agent socket.") }
++        }
++        // Until recordBoundSocket completes, this owner has not published a
++        // listener. Never let an older record authorize reclaiming a new path.
++        guard ftruncate(fd, 0) == 0 else { throw AppAgentNamespaceError("Cannot clear the previous listener record.") }
++        self.path = path
++        self.lockFD = fd
++        success = true
++    }
++
++    private static func recordedOwnerIsDead(fd: Int32, socket: stat) throws -> Bool {
++        var file = stat()
++        guard fstat(fd, &file) == 0, file.st_size > 0, file.st_size <= 4096 else { return false }
++        var bytes = [UInt8](repeating: 0, count: Int(file.st_size))
++        let count = bytes.withUnsafeMutableBytes { buffer in
++            pread(fd, buffer.baseAddress, buffer.count, 0)
++        }
++        guard count == bytes.count,
++              let object = try? JSONSerialization.jsonObject(with: Data(bytes)) as? [String: String],
++              object["version"] == "1", object["device"] == String(socket.st_dev),
++              object["inode"] == String(socket.st_ino),
++              let rawPID = object["pid"], let pid = Int32(rawPID), pid > 0 else { return false }
++        // A reused PID is conservatively considered live. EPERM/unknown is
++        // also occupied, never permission to remove somebody else's socket.
++        return kill(pid, 0) == -1 && errno == ESRCH
++    }
++
++    /// Capture the filesystem socket identity immediately after bind, never
++    /// fstat(socketFD): that descriptor need not have the pathname's inode.
++    func recordBoundSocket() throws {
++        var info = stat()
++        guard lstat(path, &info) == 0,
++              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK), info.st_uid == getuid() else {
++            throw AppAgentNamespaceError("Cannot identify the newly bound App-agent socket.")
++        }
++        bound = info
++        let record = ["version": "1", "pid": String(getpid()),
++                      "device": String(info.st_dev), "inode": String(info.st_ino)]
++        let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
++        guard ftruncate(lockFD, 0) == 0, lseek(lockFD, 0, SEEK_SET) >= 0 else {
++            throw AppAgentNamespaceError("Cannot prepare the App-agent listener record.")
++        }
++        try data.withUnsafeBytes { buffer in
++            var offset = 0
++            while offset < buffer.count {
++                let count = write(lockFD, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
++                if count < 0 && errno == EINTR { continue }
++                guard count > 0 else { throw AppAgentNamespaceError("Cannot record the App-agent listener identity.") }
++                offset += count
++            }
++        }
++        guard fsync(lockFD) == 0 else { throw AppAgentNamespaceError("Cannot commit the App-agent listener record.") }
++    }
++
++    func removeOwnedSocket() {
++        guard let bound else { return }
++        var current = stat()
++        if lstat(path, &current) == 0,
++           current.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
++           current.st_uid == getuid(), current.st_dev == bound.st_dev, current.st_ino == bound.st_ino {
++            _ = unlink(path)
++        }
++        self.bound = nil
++        _ = ftruncate(lockFD, 0)
++    }
++
++    deinit {
++        removeOwnedSocket()
++        close(lockFD)
++    }
++}
+diff --git a/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift b/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift
+index 6c87ae9..c118d2d 100644
+--- a/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift
++++ b/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift
+@@ -19,0 +20,2 @@ private struct AppAgentLaunchState: Sendable {
++    let executableSHA256: String?
++    let socketPath: String
+@@ -47,2 +49,8 @@ enum MacOSAppAgentProxy {
+-        let socketPath = defaultSocketPath()
+-        let client = try connectOrLaunchAgent(socketPath: socketPath)
++        // A raw development executable must never discover/control the user's
++        // installed release App through PermissionSupport's fallback lookup.
++        let appURL = Bundle.main.bundleURL.resolvingSymlinksInPath()
++        guard appURL.pathExtension == "app" else {
++            throw OpenComputerUseCLIError(message: "Run this experimental backend from its isolated AtomCode Lease App bundle.")
++        }
++        let namespace = try AppAgentNamespace.forApp(appURL)
++        let client = try connectOrLaunchAgent(namespace: namespace, appURL: appURL)
+@@ -80,7 +87,0 @@ enum MacOSAppAgentProxy {
+-    private static func defaultSocketPath() -> String {
+-        FileManager.default.temporaryDirectory
+-            .appendingPathComponent("open-computer-use-agent.sock")
+-            .standardizedFileURL
+-            .path
+-    }
+-
+@@ -88,8 +89,5 @@ enum MacOSAppAgentProxy {
+-    private static func connectOrLaunchAgent(socketPath: String) throws -> AppAgentSocketClient {
+-        guard let appURL = PermissionSupport.currentAppBundleURL() else {
+-            throw OpenComputerUseCLIError(message: "Unable to locate Open Computer Use.app for app-scoped macOS permissions.")
+-        }
+-
+-        if let client = AppAgentSocketClient.connect(path: socketPath) {
+-            if (try? client.isCurrentAgent(for: appURL)) == true {
+-                return client
++    private static func connectOrLaunchAgent(namespace: AppAgentNamespace, appURL: URL) throws -> AppAgentSocketClient {
++        try namespace.validateSocketIfPresent()
++        if let client = AppAgentSocketClient.connect(path: namespace.path) {
++            guard try client.isCurrentAgent(for: appURL, socketPath: namespace.path) else {
++                throw OpenComputerUseCLIError(message: "App-agent identity mismatch; the existing listener was left untouched.")
+@@ -97,5 +95 @@ enum MacOSAppAgentProxy {
+-
+-            _ = try? client.request(["kind": "terminate"])
+-            unlink(socketPath)
+-        } else {
+-            unlink(socketPath)
++            return client
+@@ -105 +99 @@ enum MacOSAppAgentProxy {
+-        configuration.arguments = [appAgentCommand, socketPath]
++        configuration.arguments = [appAgentCommand, namespace.path]
+@@ -108 +101,0 @@ enum MacOSAppAgentProxy {
+-
+@@ -113 +106,5 @@ enum MacOSAppAgentProxy {
+-            if let client = AppAgentSocketClient.connect(path: socketPath) {
++            try namespace.validateSocketIfPresent()
++            if let client = AppAgentSocketClient.connect(path: namespace.path) {
++                guard try client.isCurrentAgent(for: appURL, socketPath: namespace.path) else {
++                    throw OpenComputerUseCLIError(message: "Launched App-agent identity mismatch; no listener was terminated or replaced.")
++                }
+@@ -118,2 +115 @@ enum MacOSAppAgentProxy {
+-
+-        throw OpenComputerUseCLIError(message: "Timed out waiting for Open Computer Use.app agent to start.")
++        throw OpenComputerUseCLIError(message: "Timed out waiting for the isolated AtomCode Lease App agent; its namespace was not modified by the proxy.")
+@@ -190 +186,3 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
+-            buildMetadata: resolvedOpenComputerUseBuildMetadata()
++            buildMetadata: resolvedOpenComputerUseBuildMetadata(),
++            executableSHA256: try? Bundle.main.executableURL.map { try AppAgentNamespace.digest(of: $0) },
++            socketPath: socketPath
+@@ -237 +234,0 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-    private let path: String
+@@ -239,0 +237,2 @@ private final class AppAgentSocketListener: @unchecked Sendable {
++    private let binding: AppAgentSocketLease
++    private let stateLock = NSLock()
+@@ -242,25 +241,5 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-    init(path: String, launchState: AppAgentLaunchState) throws {
+-        self.path = path
+-        self.launchState = launchState
+-        unlink(path)
+-
+-        socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+-        guard socketFD >= 0 else {
+-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+-        }
+-
+-        var address = sockaddr_un()
+-        address.sun_family = sa_family_t(AF_UNIX)
+-        let pathCapacity = MemoryLayout.size(ofValue: address.sun_path)
+-        try withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+-            try pointer.withMemoryRebound(to: CChar.self, capacity: pathCapacity) { buffer in
+-                let bytes = Array(path.utf8)
+-                guard bytes.count < pathCapacity else {
+-                    throw OpenComputerUseCLIError(message: "Socket path is too long: \(path)")
+-                }
+-                for index in 0..<bytes.count {
+-                    buffer[index] = CChar(bitPattern: bytes[index])
+-                }
+-                buffer[bytes.count] = 0
+-            }
+-        }
++    private var isRunning: Bool {
++        stateLock.lock()
++        defer { stateLock.unlock() }
++        return running
++    }
+@@ -268 +247,9 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-        let bindResult = withUnsafePointer(to: &address) { pointer in
++    init(path: String, launchState: AppAgentLaunchState) throws {
++        let binding = try AppAgentSocketLease(path: path)
++        var address = try AppAgentNamespace.address(path)
++        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
++        guard fd >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
++        var transferred = false
++        defer { if !transferred { close(fd); binding.removeOwnedSocket() } }
++        guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
++        let result = withUnsafePointer(to: &address) { pointer in
+@@ -270 +257 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-                bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
++                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+@@ -273,13 +260,3 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-        guard bindResult == 0 else {
+-            close(socketFD)
+-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+-        }
+-
+-        guard listen(socketFD, 16) == 0 else {
+-            close(socketFD)
+-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+-        }
+-
+-        guard chmod(path, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+-            close(socketFD)
+-            unlink(path)
++        guard result == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
++        try binding.recordBoundSocket()
++        guard chmod(path, mode_t(0o600)) == 0, listen(fd, 16) == 0 else {
+@@ -287,0 +265,4 @@ private final class AppAgentSocketListener: @unchecked Sendable {
++        self.launchState = launchState
++        self.socketFD = fd
++        self.binding = binding
++        transferred = true
+@@ -291,3 +272 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-        Thread.detachNewThread {
+-            self.acceptLoop()
+-        }
++        Thread.detachNewThread { self.acceptLoop() }
+@@ -296,0 +276,3 @@ private final class AppAgentSocketListener: @unchecked Sendable {
++        stateLock.lock()
++        defer { stateLock.unlock() }
++        guard running else { return }
+@@ -298,6 +279,0 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-        // Capture the bound socket's identity before closing: a replacement
+-        // agent may already have re-bound the same path, and unlinking it
+-        // would orphan the new agent's listener.
+-        var bound = stat()
+-        let haveBound = fstat(socketFD, &bound) == 0
+-        // close(2) alone does not wake a thread blocked in accept(2).
+@@ -306,8 +282,2 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-        guard haveBound else { return }
+-        var current = stat()
+-        guard lstat(path, &current) == 0,
+-              current.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
+-              current.st_dev == bound.st_dev,
+-              current.st_ino == bound.st_ino
+-        else { return } // path no longer belongs to this listener
+-        unlink(path)
++        binding.removeOwnedSocket()
++        // binding keeps the lifetime lock until listener/process destruction.
+@@ -317 +287 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-        while running {
++        while isRunning {
+@@ -320 +290 @@ private final class AppAgentSocketListener: @unchecked Sendable {
+-                if running {
++                if isRunning {
+@@ -338,0 +309 @@ private func applyConnectionSocketOptions(_ fd: Int32) {
++    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+@@ -384,0 +356,3 @@ private final class AppAgentConnection: @unchecked Sendable {
++                    "atomcodeDesktopLeaseProtocol": 1,
++                    "socketPath": launchState.socketPath,
++                    "processId": Int(ProcessInfo.processInfo.processIdentifier),
+@@ -385,0 +360 @@ private final class AppAgentConnection: @unchecked Sendable {
++                if let digest = launchState.executableSHA256 { response["executableSHA256"] = digest }
+@@ -591 +566,8 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-        let result = withUnsafePointer(to: &address) { pointer in
++        // A full Unix-socket backlog must not block before the identity
++        // deadline even starts. Restore blocking I/O for ordinary requests.
++        guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0,
++              fcntl(fd, F_SETFL, O_NONBLOCK) == 0 else {
++            close(fd)
++            return nil
++        }
++        var result = withUnsafePointer(to: &address) { pointer in
+@@ -596 +578,12 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-        guard result == 0, let file = fdopen(fd, "r+") else {
++        if result != 0 && errno == EINPROGRESS {
++            var waiting = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
++            if poll(&waiting, 1, 2000) > 0 {
++                var error: Int32 = 0
++                var length = socklen_t(MemoryLayout<Int32>.size)
++                if getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0 {
++                    result = 0
++                }
++            }
++        }
++        guard result == 0, fcntl(fd, F_SETFL, 0) == 0,
++              let file = fdopen(fd, "r+") else {
+@@ -604 +597 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-    func request(_ object: [String: Any]) throws -> [String: Any] {
++    func request(_ object: [String: Any], identityDeadline: Date? = nil) throws -> [String: Any] {
+@@ -612 +605 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-        guard let responseLine = readAgentLine(file),
++        guard let responseLine = readAgentLine(file, deadline: identityDeadline, maxBytes: identityDeadline == nil ? nil : 65536),
+@@ -625,2 +618,12 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-    func isCurrentAgent(for appURL: URL) throws -> Bool {
+-        let response = try request(["kind": "agentInfo"])
++    func isCurrentAgent(for appURL: URL, socketPath: String) throws -> Bool {
++        // Identity negotiation has a small budget, separate from GUI requests.
++        var short = timeval(tv_sec: 0, tv_usec: 250000)
++        _ = setsockopt(fileno(file), SOL_SOCKET, SO_RCVTIMEO, &short, socklen_t(MemoryLayout<timeval>.size))
++        _ = setsockopt(fileno(file), SOL_SOCKET, SO_SNDTIMEO, &short, socklen_t(MemoryLayout<timeval>.size))
++        defer {
++            var normal = timeval(tv_sec: 120, tv_usec: 0)
++            _ = setsockopt(fileno(file), SOL_SOCKET, SO_RCVTIMEO, &normal, socklen_t(MemoryLayout<timeval>.size))
++            normal.tv_sec = 30
++            _ = setsockopt(fileno(file), SOL_SOCKET, SO_SNDTIMEO, &normal, socklen_t(MemoryLayout<timeval>.size))
++        }
++        let response = try request(["kind": "agentInfo"], identityDeadline: Date().addingTimeInterval(2))
+@@ -629 +632,6 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-        guard response["bundleURL"] as? String == expectedBundleURL.path else {
++        guard response["bundleURL"] as? String == expectedBundleURL.path,
++              response["bundleIdentifier"] as? String == "com.ifuryst.opencomputeruse.dev",
++              response["socketPath"] as? String == socketPath,
++              response["atomcodeDesktopLeaseProtocol"] as? Int == 1,
++              let executable = executableURL(for: expectedBundleURL),
++              response["executableSHA256"] as? String == (try AppAgentNamespace.digest(of: executable)) else {
+@@ -637,2 +645 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-        // agent that cannot prove its identity is treated as stale and gets
+-        // relaunched.
++        // agent that cannot prove its identity is refused and left untouched.
+@@ -666 +673 @@ private final class AppAgentSocketClient: @unchecked Sendable {
+-private func readAgentLine(_ file: UnsafeMutablePointer<FILE>) -> String? {
++private func readAgentLine(_ file: UnsafeMutablePointer<FILE>, deadline: Date? = nil, maxBytes: Int? = nil) -> String? {
+@@ -669,0 +677,2 @@ private func readAgentLine(_ file: UnsafeMutablePointer<FILE>) -> String? {
++        if let deadline, Date() >= deadline { return nil }
++        if let maxBytes, bytes.count >= maxBytes { return nil }
+@@ -671,0 +681,4 @@ private func readAgentLine(_ file: UnsafeMutablePointer<FILE>) -> String? {
++            if deadline != nil && ferror(file) != 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
++                clearerr(file)
++                continue
++            }
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index fbb3f57..373df1c 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -2,0 +3,2 @@
++> 应用 AtomCode 实验补丁后，macOS 的协商占用、App/socket 隔离与验证边界按 [desktop lease overlay](ATOMCODE_LEASE_OVERLAY.md) 覆盖下文相应的上游默认行为。
++
+diff --git a/docs/ATOMCODE_LEASE_OVERLAY.md b/docs/ATOMCODE_LEASE_OVERLAY.md
+new file mode 100644
+index 0000000..b42a032
+--- /dev/null
++++ b/docs/ATOMCODE_LEASE_OVERLAY.md
+@@ -0,0 +1,22 @@
++# AtomCode 实验性 desktop lease overlay
++
++这是针对 v1.3.0 固定源码的可选 macOS 实验补丁，不是上游正式发行版。宿主集成说明、构建、开发 App 打包和验收脚本由 AtomCode 仓库的 `integrations/open-computer-use/` 维护。本补丁没有改动 Go 平台实现，也不证明 Windows/Linux GUI 已支持相同的占用协议。
++
++## 与上游默认行为的差异
++
++- 宿主在 initialize 协商 `atomcode/turn-scopes` v1；服务端公布 `atomcode/desktop-turn-lease` v1。`atomcode/desktop/acquire`、`atomcode/desktop/release` 与 `tools/call` 的顶层 `_meta["atomcode/turn"]` 使用同一宿主生成的 bounded opaque scope。模型参数不能替代它。
++- 协作式 OS 文件锁由实际执行连接持有。正常释放需匹配 owner；连接释放要等当前同步请求返回。它不能回滚 GUI 效果，也不能保证目标应用在回复后停止所有异步更新。未参与协议的客户端与人仍在隔离范围之外；这不是对恶意同用户进程的 sandbox。
++- release 清理观察缓存，不重置截图计数；协商连接还使用独立随机截图命名空间，防止重连后第一张截图重新发出旧连接的 ID。首次从 legacy 模式协商时清理已有观察；后续动作必须重新观察。旧客户端保持原有 ID 格式。
++- 实验 App 使用显式 development bundle 和协议标记。代理拒绝裸程序借发现机制连接已安装 release App。socket 命名空间由真实文件系统 App 路径和二进制 SHA-256 决定，位于私有 per-user 目录，不再使用 legacy default socket。
++- 实际 listener 持有独立 lifetime lock，只有它可以回收已检查的 stale socket。锁文件中的版本化记录保存真实 listener 的 PID 与 bind 后的 inode；只有该 PID 确认为已退出、inode 仍匹配时才回收。连接被拒绝（包括满队列）不作为进程死亡的证据；未知记录或 PID 复用一律保留现场。活跃或不确定的 listener 不会被 unlink；身份不匹配时不 terminate。监听器记录 bind 后的文件系统 inode，仅清理仍属于自己的 socket。lock 文件不在正常运行时删除。
++- 代理对连接和身份读取设置边界；身份响应有独立期限与大小上限。普通 GUI 请求保留原有响应期限。诊断 `doctor --no-ui` 增加 capability 与实际 runtime/permission App 信息，仍只做运行时 preflight，不请求或伪造 OS 权限。
++
++## 构建与验证范围
++
++补丁的宿主构建配方先构建产品，再运行 `OpenComputerUseLeaseSmoke` 与独立编译的 `tests/AppAgentNamespaceSmoke/main.swift`。前者直接测试真实服务的观察失效、跨连接截图标识和占用；后者测试 socket 生命周期锁、stale/live listener、路径别名、文件防护和旧 inode 清理。两者不调用 GUI。
++
++宿主的 native/process/App-proxy 协议验收也不进行截图或输入。真实 GUI 验收另外需要这个确切开发 App 的 Accessibility 与 Screen Recording 授权，只针对宿主自有的 AppKit fixture；fixture 状态文件仅作效果观察，不复用这里的 `FixtureBridge` 控制通道。
++
++当前开发环境没有 XCTest 模块，因此这里的 smoke 和协议测试不冒充 `swift test` 已通过。原有 XCTest 和上游 GUI smoke 仍属于未验证范围；实际执行证据与剩余限制由宿主交付记录说明。
++
++开发 App 仅 ad-hoc 签名，包含固定 upstream commit、源码补丁摘要与单独的 executable provenance。它不是签名正式 release，不会自动安装、替换已安装 App、修改 TCC 或授予权限。关闭托管配置也不是撤销已经送达目标 App 的操作。
+diff --git a/docs/RELIABILITY.md b/docs/RELIABILITY.md
+index 068a2cc..cb0bd10 100644
+--- a/docs/RELIABILITY.md
++++ b/docs/RELIABILITY.md
+@@ -2,0 +3,2 @@
++> 应用 AtomCode 实验补丁后，macOS 的协商占用、App/socket 隔离与验证边界按 [desktop lease overlay](ATOMCODE_LEASE_OVERLAY.md) 覆盖下文相应的上游默认行为。
++
+diff --git a/docs/SECURITY.md b/docs/SECURITY.md
+index 83ba567..77775e0 100644
+--- a/docs/SECURITY.md
++++ b/docs/SECURITY.md
+@@ -2,0 +3,2 @@
++> 应用 AtomCode 实验补丁后，macOS 的协商占用、App/socket 隔离与验证边界按 [desktop lease overlay](ATOMCODE_LEASE_OVERLAY.md) 覆盖下文相应的上游默认行为。
++
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
-index 9d96b02..7c57981 100644
+index 9d96b02..36b74d8 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
-@@ -456,0 +457 @@ public final class ComputerUseService {
-+    var requiresExplicitTurnObservations = false
-@@ -470,0 +472,8 @@ public final class ComputerUseService {
+@@ -456,0 +457,11 @@ public final class ComputerUseService {
++    var requiresExplicitTurnObservations = false {
++        didSet {
++            if requiresExplicitTurnObservations && scopedObservationNamespace == nil {
++                scopedObservationNamespace = UUID().uuidString
++                // A connection opting in after legacy calls cannot carry those
++                // observations into its first host-owned turn.
++                clearTurnObservations()
++            }
++        }
++    }
++    private var scopedObservationNamespace: String?
+@@ -466 +477,2 @@ public final class ComputerUseService {
+-    // must be unique per service instance, not per window.
++    // must be unique per service instance, not per window. Negotiated services
++    // also have a random instance namespace, so reconnects cannot reissue IDs.
+@@ -470,0 +483,8 @@ public final class ComputerUseService {
 +    // A matching host-turn release invalidates observations, but must not reset
 +    // the screenshot sequence and accidentally reissue a prior owner's IDs.
 +    func clearTurnObservations() {
@@ -31,7 +557,11 @@ index 9d96b02..7c57981 100644
 +        windowScreenshotMeta.removeAll()
 +    }
 +
-@@ -1546,0 +1556,3 @@ public final class ComputerUseService {
+@@ -474 +494,2 @@ public final class ComputerUseService {
+-        "shot-\(windowID)-\(counter)"
++        let prefix = scopedObservationNamespace.map { "shot-\($0)" } ?? "shot"
++        return "\(prefix)-\(windowID)-\(counter)"
+@@ -1546,0 +1568,3 @@ public final class ComputerUseService {
 +        if requiresExplicitTurnObservations {
 +            throw ComputerUseError.message("No app state is available for this turn. Observe the selected target before action tools.")
 +        }
@@ -218,17 +748,27 @@ index 52c236c..8caeeb3 100644
 +    }
 +
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
-index 3d377b0..b9f5a5f 100644
+index 3d377b0..abefcf8 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
-@@ -137,0 +138 @@ public struct SilentPermissionReport: Sendable {
-+            "capabilities": ["desktop_turn_lease": ["version": 1]],
+@@ -137,0 +138,11 @@ public struct SilentPermissionReport: Sendable {
++            "capabilities": [
++                "desktop_turn_lease": ["version": 1],
++                "app_agent_isolation": ["version": 1],
++            ],
++            "runtime": [
++                "bundle_identifier": Bundle.main.bundleIdentifier ?? "",
++                "process_id": Int(ProcessInfo.processInfo.processIdentifier),
++                "app_bundle": Bundle.main.bundleURL.standardizedFileURL.path,
++                "permission_app": PermissionSupport.currentAppBundleURL()?.standardizedFileURL.path ?? "",
++                "executable": Bundle.main.executableURL?.standardizedFileURL.path ?? "",
++            ],
 diff --git a/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
 new file mode 100644
-index 0000000..45e9496
+index 0000000..ab2f834
 --- /dev/null
 +++ b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,83 @@
 +import Foundation
 +@testable import OpenComputerUseKit
 +
@@ -260,6 +800,22 @@ index 0000000..45e9496
 +try require(refused, "the prior identity stays stale after a new observation")
 +
 +service.requiresExplicitTurnObservations = true
++refused = false
++do { try service.checkScreenshotID(next, windowID: 7) } catch { refused = true }
++try require(refused, "initial scope negotiation clears legacy observations")
++let scopedA = ComputerUseService()
++let scopedB = ComputerUseService()
++scopedA.requiresExplicitTurnObservations = true
++scopedB.requiresExplicitTurnObservations = true
++let oldConnection = scopedA.issueWindowScreenshotID(windowID: 7, hasImage: true, bounds: bounds,
++                                                  screenshotPixelSize: CGSize(width: 200, height: 100))
++let newConnection = scopedB.issueWindowScreenshotID(windowID: 7, hasImage: true, bounds: bounds,
++                                                  screenshotPixelSize: CGSize(width: 200, height: 100))
++try require(oldConnection != newConnection, "fresh connections must not reissue the prior connection's first screenshot id")
++try scopedB.checkScreenshotID(newConnection, windowID: 7)
++refused = false
++do { try scopedB.checkScreenshotID(oldConnection, windowID: 7) } catch { refused = true }
++try require(refused, "a previous connection's screenshot stays stale after fresh observation")
 +var freshObservationRequired = false
 +do {
 +    _ = try service.click(app: "atomcode-absent-\(UUID().uuidString)", elementIndex: "0",
@@ -296,3 +852,155 @@ index 0000000..45e9496
 +// that is still owned. Both test leases are released before successful cleanup.
 +try FileManager.default.removeItem(at: directory)
 +print("Passed native cache/identity and in-process lease smoke; no GUI actions dispatched.")
+diff --git a/tests/AppAgentNamespaceSmoke/main.swift b/tests/AppAgentNamespaceSmoke/main.swift
+new file mode 100644
+index 0000000..047d64b
+--- /dev/null
++++ b/tests/AppAgentNamespaceSmoke/main.swift
+@@ -0,0 +1,146 @@
++import Darwin
++import Foundation
++
++func check(_ ok: @autoclosure () -> Bool, _ message: String) {
++    precondition(ok(), message)
++}
++func refused(_ message: String, _ action: () throws -> Void) {
++    do { try action(); fatalError("expected refusal: \(message)") }
++    catch { }
++}
++func socketAt(_ path: String, listening: Bool = false) throws -> Int32 {
++    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
++    guard fd >= 0 else { throw AppAgentNamespaceError("socket") }
++    var ok = false
++    defer { if !ok { close(fd) } }
++    var address = try AppAgentNamespace.address(path)
++    let result = withUnsafePointer(to: &address) { pointer in
++        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
++            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
++        }
++    }
++    guard result == 0, chmod(path, mode_t(0o600)) == 0 else { throw AppAgentNamespaceError("bind") }
++    if listening && listen(fd, 16) != 0 { throw AppAgentNamespaceError("listen") }
++    ok = true
++    return fd
++}
++func inode(_ path: String) -> ino_t {
++    var info = stat()
++    precondition(lstat(path, &info) == 0)
++    return info.st_ino
++}
++func fdCount() -> Int { (0..<1024).filter { fcntl(Int32($0), F_GETFD) != -1 }.count }
++
++if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--stale-owner" {
++    let binding = try AppAgentSocketLease(path: CommandLine.arguments[2])
++    let fd = try socketAt(CommandLine.arguments[2], listening: true)
++    try binding.recordBoundSocket()
++    // Exercise actual process death without running normal inode cleanup.
++    withExtendedLifetime((binding, fd)) { _exit(0) }
++}
++
++let root = "/tmp/ac-ocu-smoke-\(getpid())"
++try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
++defer { try? FileManager.default.removeItem(atPath: root) }
++let path = root + "/agent.sock"
++var lease: AppAgentSocketLease? = try AppAgentSocketLease(path: path)
++let lockInode = inode(path + ".lock")
++refused("another listener cannot take the same namespace even before bind") { _ = try AppAgentSocketLease(path: path) }
++lease = nil
++lease = try AppAgentSocketLease(path: path)
++check(inode(path + ".lock") == lockInode, "lifetime lock inode must never be replaced")
++lease = nil
++
++let staleOwner = Process()
++staleOwner.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
++staleOwner.arguments = ["--stale-owner", path]
++try staleOwner.run()
++staleOwner.waitUntilExit()
++check(staleOwner.terminationStatus == 0, "owned child published a stale socket and exited")
++lease = try AppAgentSocketLease(path: path)
++check(!FileManager.default.fileExists(atPath: path), "checked stale socket is reclaimed under lifetime lock")
++lease = nil
++// An orphan without the listener's recorded ownership is not auto-reclaimed.
++let unknown = try socketAt(path)
++close(unknown)
++refused("unverifiable orphan must be preserved") { _ = try AppAgentSocketLease(path: path) }
++unlink(path)
++let sentinel = try socketAt(path, listening: true)
++let sentinelInode = inode(path)
++refused("active nonparticipating listener is protected too") { _ = try AppAgentSocketLease(path: path) }
++check(inode(path) == sentinelInode, "live sentinel socket was untouched")
++close(sentinel)
++unlink(path)
++
++lease = try AppAgentSocketLease(path: path)
++let owned = try socketAt(path, listening: true)
++try lease!.recordBoundSocket()
++unlink(path)
++let replacement = try socketAt(path, listening: true)
++let replacementInode = inode(path)
++lease!.removeOwnedSocket()
++check(inode(path) == replacementInode, "old cleanup cannot unlink a replacement inode")
++lease = nil
++close(owned)
++close(replacement)
++unlink(path)
++lease = try AppAgentSocketLease(path: path)
++let own = try socketAt(path)
++try lease!.recordBoundSocket()
++lease!.removeOwnedSocket()
++check(!FileManager.default.fileExists(atPath: path), "owned cleanup removes its filesystem socket")
++close(own)
++lease = nil
++check(inode(path + ".lock") == lockInode, "cleanup retains the lock file")
++
++try Data("unrelated".utf8).write(to: URL(fileURLWithPath: path))
++refused("regular file is never unlinked as a socket") { _ = try AppAgentSocketLease(path: path) }
++let unrelated = try String(contentsOfFile: path, encoding: .utf8)
++check(unrelated == "unrelated", "unrelated file preserved")
++try FileManager.default.removeItem(atPath: path)
++try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: "elsewhere")
++refused("symlink socket") { _ = try AppAgentSocketLease(path: path) }
++try FileManager.default.removeItem(atPath: path)
++let unsafe = root + "/unsafe"
++try FileManager.default.createDirectory(atPath: unsafe, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
++refused("unsafe parent") { _ = try AppAgentSocketLease(path: unsafe + "/a.sock") }
++let alias = root + "/alias"
++try FileManager.default.createSymbolicLink(atPath: alias, withDestinationPath: root)
++refused("symlink parent") { _ = try AppAgentSocketLease(path: alias + "/a.sock") }
++refused("relative path") { _ = try AppAgentSocketLease(path: "relative.sock") }
++refused("overlong path") { _ = try AppAgentSocketLease(path: root + "/" + String(repeating: "a", count: 110)) }
++let badLockPath = root + "/bad.sock"
++try FileManager.default.createSymbolicLink(atPath: badLockPath + ".lock", withDestinationPath: path + ".lock")
++let descriptors = fdCount()
++for _ in 0..<20 {
++    refused("symlink lock") { _ = try AppAgentSocketLease(path: badLockPath) }
++}
++check(fdCount() == descriptors, "rejected lock acquisitions do not leak descriptors")
++try FileManager.default.removeItem(atPath: badLockPath + ".lock")
++try FileManager.default.linkItem(atPath: path + ".lock", toPath: badLockPath + ".lock")
++refused("hardlinked lock") { _ = try AppAgentSocketLease(path: badLockPath) }
++try FileManager.default.removeItem(atPath: badLockPath + ".lock")
++
++func app(_ name: String, marker: String? = "1") throws -> URL {
++    let url = URL(fileURLWithPath: root).appendingPathComponent(name + ".app")
++    let macOS = url.appendingPathComponent("Contents/MacOS")
++    try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
++    var info: [String: Any] = ["CFBundleIdentifier": "com.ifuryst.opencomputeruse.dev", "CFBundleExecutable": "test", "CFBundlePackageType": "APPL"]
++    if let marker { info["AtomCodeDesktopLeaseProtocol"] = marker }
++    try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: url.appendingPathComponent("Contents/Info.plist"))
++    try Data("binary-a".utf8).write(to: macOS.appendingPathComponent("test"))
++    chmod(macOS.appendingPathComponent("test").path, 0o700)
++    return url
++}
++let first = try app("first")
++let firstPath = try AppAgentNamespace.forApp(first).path
++let canonicalFirst = URL(fileURLWithPath: try AppAgentNamespace.canonicalPath(first))
++let canonicalNamespace = try AppAgentNamespace.forApp(canonicalFirst).path
++check(firstPath == canonicalNamespace, "filesystem aliases select the same namespace")
++let otherPath = try AppAgentNamespace.forApp(app("other")).path
++check(firstPath != otherPath, "different bundles have different namespaces")
++try Data("binary-b".utf8).write(to: first.appendingPathComponent("Contents/MacOS/test"))
++let changedPath = try AppAgentNamespace.forApp(first).path
++check(firstPath != changedPath, "changed binary has a new namespace")
++refused("ordinary dev App without the protocol marker") { _ = try AppAgentNamespace.forApp(app("unmarked", marker: nil)) }
++print("App-agent namespace smoke passed: lock ownership, stale/live sockets, inode cleanup, file defenses, namespaces; GUI actions=0")

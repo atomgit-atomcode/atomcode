@@ -1,6 +1,6 @@
 # Isolated macOS lease App activation
 
-Baseline: AtomCode 99fd18f2e plus the pending host-scope integration; OpenComputerUse v1.3.0 e551c13e7082ce4c097234137582fbf4a1bc647a plus the separately verified lease patch. This is the next delivery phase, not a completed implementation.
+Baseline: AtomCode host-scope integration 70d0db025; isolated delivery rebased onto 3f6957ed5 to retain the independently delivered auxiliary-response fixes; OpenComputerUse v1.3.0 e551c13e7082ce4c097234137582fbf4a1bc647a plus the separately verified lease patch. This is the next delivery phase, not a completed implementation.
 
 ## Current boundary and hazards
 
@@ -19,3 +19,31 @@ Inspection of `MacOSAppAgentProxy.swift` confirms that the proxy uses one legacy
 7. Only after a concrete isolated App and diagnostics are reviewable, request any missing OS permission for that exact App. Then run real GUI observe/action, in-flight cancel/proxy death, busy neighboring turn and fresh screenshot/window reference handover. Host disposal alone is not proof that the shared App's accepted GUI work ended; the native lease must remain held until it does.
 
 The final artifact remains optional and separately installed. No native executable or browser is added to the Rust release binary by default. Windows/Linux/HarmonyOS execution and GUI acceptance remain separate requirements, not consequences of adding configuration fields.
+
+## Implementation and verified evidence
+
+- Pinned source patch now includes namespace/listener ownership, exact App/binary identity, bounded connection/identity negotiation, developer diagnostics and an overlay document linked from upstream architecture/security/reliability docs. The legacy default socket is not used by this derivative proxy. Proxy mismatch paths never terminate or unlink another listener.
+- Per-user lifetime lock and per-connection desktop lease remain separate. Actual bind captures filesystem lstat identity for cleanup; failure paths retain descriptor ownership. Full-backlog connect uses nonblocking I/O before identity negotiation. Socket descriptors are close-on-exec.
+- Review found that service-local monotonic screenshot counters could reissue a prior connection's first ID. Negotiated services now additionally have a random per-instance namespace; first scope negotiation clears legacy observations. Native smoke checks two fresh services and stale-ID refusal after a fresh observation, without GUI APIs.
+- Unit smoke passed live nonparticipating sentinel protection, stale socket recovery, duplicate listener lock refusal, alias canonicalization, replacement-inode cleanup, symlink/hardlink/mode/length rejection and rejected-acquisition descriptor cleanup.
+- Clean pinned-source builds passed on macOS 14.5 / SDK 15.2 / Swift 6.1.3. The final patch applies cleanly; all 15 patched files match the development overlay, and all 11 freshly compiled source/smoke inputs match byte-for-byte. The current SDK was directly checked and still lacks XCTest; original XCTest targets are not claimed passed.
+- Optional packaging probes before/after copying/signing, refuses legacy binaries and existing output, verifies the bundle and its exact permission-App discovery, records patch/binary provenance and installs nothing. Refusal cases preserve existing files and leave no new App/report.
+- Actual LaunchServices App/proxy tests pass scoped handover, two profiles, EOF/neighbor survival, mismatch refusal, identity timeout, concurrent listeners/stale recovery and a live legacy-socket sentinel. Final full-backlog case and final artifact evidence are recorded below after execution.
+- The dedicated AppKit fixture compiled and ad-hoc signature verified, but was not launched. Its file records real widget effects independently of automation replies; it does not use upstream FixtureBridge. The opt-in GUI harness refuses absent explicit opt-in, checks runtime grants before launching and has no success report from a GUI run yet.
+
+An early v3 permission prompt was withdrawn after the cross-connection screenshot-ID gap was found. It must not be treated as permission for a different artifact. The current exact artifact and actual diagnostic observations will be stated at the GUI boundary; no TCC entry is changed automatically. Real GUI/host cancellation and platform/app-origin policy/activity/size work remain unfinished.
+
+## Final artifact and validation
+
+- Final scratch App: `/tmp/atomcode-computer-use-acceptance/Open Computer Use (AtomCode Lease).app`. It comes from a clean pinned checkout built with the complete current patch; all 15 overlay files match development, with 34 measured compiler/smoke inputs. Both native smoke executables passed.
+- Actual full-backlog acceptance first failed: macOS returned ECONNREFUSED for a known live listener (controlled connect results `[0,61,61,61,61]`). The old heuristic unlinked it. Fixed the cause rather than weakening the assertion: the listener now commits a private versioned PID/inode record, and reclamation requires a dead PID plus matching inode. Unknown records/live or reused PIDs stay untouched. A real owned helper is SIGKILLed to establish the stale-recovery fixture; synthetic unowned orphan sockets are deliberately refused.
+- Final App/proxy acceptance: 6 groups passed, including that full-backlog regression, actual concurrent listener startup and dead-owner recovery, mismatched/hung identity, profile/connection turnover, EOF/neighbor survival and a live legacy-default sentinel. No GUI action or screenshot was requested.
+- Final native lease protocol: 5 groups passed. Production Rust registry opt-in against the exact packaged executable passed. Legacy output replacement and old-binary refusal were also checked during development.
+- Packaging now binds a measured build manifest to both patch and input executable, then records the separately signed output digest. Four persistent refusal groups passed (existing App, stale patch manifest, changed binary and existing report). A controlled source mutation made provenance finalization fail; original source bytes were restored exactly and no false report was written. This is local measurement, not signed publisher provenance.
+- Original XCTest remains unavailable, verified directly with the current SDK. Native product, direct production-cache/socket smoke and process/proxy acceptance are the covered evidence.
+- Workspace compile gate including feature and negative controls, rustfmt/check and diff checks passed on the rebased source. No Rust dependency or App binary was added. Native GUI fixture compiles/signs but remains unlaunched; GUI acceptance has no passing report yet.
+- Last final-App runtime diagnostics: Accessibility=false, Screen Recording=false. Finder and the permission page have been opened for this exact final artifact; the earlier v3 prompt was explicitly withdrawn. Await actual OS grants, re-probe, then run the owned-fixture GUI test. No TCC entry was edited or grant bypassed.
+
+- Compiled the current AtomCode CLI and ran `computer doctor --executable` against the exact final App with an isolated, initially absent product home. It refused missing permissions, returned exit 1 and created no product state. Direct native diagnostic stderr was empty in this run.
+- The real opt-in GUI harness was invoked with the final App while both grants were absent: it refused before fixture launch, exact fixture PID inventory remained empty, and no GUI success report was created. This is rejection-path evidence only, not GUI action acceptance.
+- Repeating the complete build command on the already-patched source was rejected before writes. Source and measured build-provenance bytes were preserved exactly. Signing/packaging provenance remains outside the signed bundle; no installed App or Rust dependency was changed.
