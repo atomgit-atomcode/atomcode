@@ -1,5 +1,8 @@
 //! Verify that permission grants survive agent re-assembly (model swaps/reloads).
 
+#[path = "support/non_temp.rs"]
+mod non_temp;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,10 +24,7 @@ fn _isolate_atomcode_home() {
 async fn always_allow_grants_survive_reassembly() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let workspace_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target");
-    let outside_dir = tempfile::tempdir_in(workspace_target).unwrap();
+    let outside_dir = non_temp::tempdir();
     std::env::set_var("ATOMCODE_HOME", home.path());
 
     let mut cfg = CodingAgentConfig::new(

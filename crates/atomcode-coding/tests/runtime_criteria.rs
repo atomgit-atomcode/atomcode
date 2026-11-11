@@ -11,6 +11,9 @@
 //! that rig cannot see: everything the runtime does ACROSS turns (resume, undo,
 //! the durable store the catalog reads).
 
+#[path = "support/non_temp.rs"]
+mod non_temp;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -577,15 +580,9 @@ async fn turn_answering(
     }
 }
 
-/// A directory that is neither the workspace nor a temp root, so a write there
-/// is one the write gate asks about. Under the build's `target/`, the same
-/// place `permission_grants.rs` uses.
+/// A directory outside both the workspace and temp-path approval exception.
 fn outside_dir() -> tempfile::TempDir {
-    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target");
-    std::fs::create_dir_all(&target).unwrap();
-    tempfile::tempdir_in(target).unwrap()
+    non_temp::tempdir()
 }
 
 fn user_texts(messages: &[Message]) -> Vec<String> {

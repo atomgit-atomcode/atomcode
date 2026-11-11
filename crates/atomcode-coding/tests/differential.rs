@@ -18,6 +18,9 @@
 //! one, and a gate that is red on day one gets deleted. What matters is that the
 //! number cannot silently grow.
 
+#[path = "support/non_temp.rs"]
+mod non_temp;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -641,16 +644,13 @@ async fn drive_answering(
 /// a throwaway write, not project code. So every "write outside the workspace"
 /// scenario built on `scratch` was writing INTO the temp dir and being
 /// auto-approved by design: zero approval requests, zero divergence, and nothing
-/// measured. Under `target/` the question is a real one again.
-fn scratch_outside_temp(tag: &str) -> std::path::PathBuf {
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/diff-scratch")
-        .join(format!("{}-{tag}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+/// measured. A per-test cache directory makes the question real even when
+/// the checkout and its target directory are themselves under `/tmp`.
+fn scratch_outside_temp(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let scratch = non_temp::tempdir();
+    let dir = scratch.path().join(tag);
     std::fs::create_dir_all(&dir).expect("scratch outside temp");
-    dir
+    (scratch, dir)
 }
 
 fn scratch(tag: &str) -> std::path::PathBuf {
@@ -2270,7 +2270,7 @@ async fn a_write_outside_the_workspace_diverges_and_here_is_why() {
     // watching sees the write announced as started and is THEN asked whether to
     // allow it. Frozen at 2 (one difference, reported twice because the
     // alignment cannot pair events that moved past each other).
-    let dir = scratch_outside_temp("ask-yes");
+    let (_scratch, dir) = scratch_outside_temp("ask-yes");
     let outside = dir.parent().unwrap().join("outside-yes.txt");
     let _ = std::fs::remove_file(&outside);
     let (a, b, report) = ask_chain_vs_rows(
@@ -3492,7 +3492,7 @@ async fn an_always_covers_the_scope_not_just_the_one_call() {
     // `ui-handle`'s `Asker` keyed its grants on the exact argument bytes (so
     // the scope the five gate rows compute was ignored — the second file asked
     // again). Both are why the scenario is here.
-    let dir = scratch_outside_temp("grant-scope");
+    let (_scratch, dir) = scratch_outside_temp("grant-scope");
     let outside = dir.parent().unwrap();
     for name in ["scope-a.txt", "scope-b.txt"] {
         let _ = std::fs::remove_file(outside.join(name));

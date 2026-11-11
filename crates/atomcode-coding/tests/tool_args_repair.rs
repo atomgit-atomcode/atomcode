@@ -1,3 +1,6 @@
+#[path = "support/non_temp.rs"]
+mod non_temp;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -76,13 +79,8 @@ async fn the_assembly_repairs_tool_arguments_before_execution() {
 #[tokio::test]
 async fn approval_sees_the_repaired_arguments_that_execute() {
     let project = tempfile::tempdir().unwrap();
-    // The write gate intentionally auto-approves the OS temp directory. Put the
-    // target under the workspace's build output instead: it is outside this
-    // test's project root but not covered by the temp-path exception.
-    let workspace_target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target");
-    let outside = tempfile::tempdir_in(workspace_target).unwrap();
+    // The target must escape the temp exception even in a temporary checkout.
+    let outside = non_temp::tempdir();
     let file_path = outside.path().join("approved.txt");
     let mut cfg = CodingAgentConfig::new(
         "k",
