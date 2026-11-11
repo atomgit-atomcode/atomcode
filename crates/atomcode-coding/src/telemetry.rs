@@ -1296,6 +1296,13 @@ mod tests {
         assert!(data.chars().count() <= 200, "the cap still applies: {data}");
     }
 
+    #[test]
+    fn safe_message_caps_the_redacted_text_at_head_max() {
+        let long = "x".repeat(atomcode_telemetry::scrub::HEAD_MAX + 50);
+        let data = safe_message(&long, std::path::Path::new("some-directory"));
+        assert_eq!(data.chars().count(), atomcode_telemetry::scrub::HEAD_MAX);
+    }
+
     #[tokio::test]
     async fn normal_stop_emits_no_extra_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
