@@ -1167,6 +1167,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── how the conversation reads (`content.rs`) ──
         Msg::ThoughtLines { gutter, n } => format!("{gutter} thought, {n} lines").into(),
         Msg::ToolsRun { count } => format!("{count} tools were run").into(),
+        Msg::BrowserActions { count } => format!("{count} browser actions").into(),
+        Msg::ComputerActions { count } => format!("{count} computer actions").into(),
         Msg::ToolsFailed { failed } => format!(" · {failed} failed").into(),
         Msg::VerbSkill => "skill".into(),
         Msg::VerbMemory => "memory".into(),

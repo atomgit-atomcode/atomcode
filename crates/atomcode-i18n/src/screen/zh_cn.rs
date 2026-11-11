@@ -1107,6 +1107,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── how the conversation reads (`content.rs`) ──
         Msg::ThoughtLines { gutter, n } => format!("{gutter} 思考 {n} 行").into(),
         Msg::ToolsRun { count } => format!("已执行了 {count} 个工具").into(),
+        Msg::BrowserActions { count } => format!("已执行 {count} 次浏览器操作").into(),
+        Msg::ComputerActions { count } => format!("已执行 {count} 次桌面操作").into(),
         Msg::ToolsFailed { failed } => format!(" · {failed} 失败").into(),
         Msg::VerbSkill => "技能".into(),
         Msg::VerbMemory => "记忆".into(),

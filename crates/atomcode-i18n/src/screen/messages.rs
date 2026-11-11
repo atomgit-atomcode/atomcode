@@ -1755,6 +1755,12 @@ pub enum Msg<'a> {
     ToolsRun {
         count: usize,
     },
+    BrowserActions {
+        count: usize,
+    },
+    ComputerActions {
+        count: usize,
+    },
     ToolsFailed {
         failed: usize,
     },

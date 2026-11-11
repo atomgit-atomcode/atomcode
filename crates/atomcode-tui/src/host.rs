@@ -893,6 +893,7 @@ fn behind_a_lid(block: &crate::block::Block) -> bool {
         // not swallowed by the neighbouring calls' group count.
         && !block.content.as_tool_call().is_some_and(|call| {
             call.edit_text_mismatch()
+                || call.is_interrupted()
                 // A slow call's activity must stay visible even when a later
                 // parallel call would otherwise own the merged run's lid.
                 || (call.is_running() && call.progress.is_some())
@@ -917,6 +918,18 @@ fn same_poll_run(a: &crate::block::Block, b: &crate::block::Block) -> bool {
     job.is_some() && job == next.idle_poll_job() && a.at.turn == b.at.turn && first.dir == next.dir
 }
 
+/// Drawing and expansion use the same membership rule. Names only select
+/// presentation; the runtime remains responsible for identity and permissions.
+fn same_tool_run(a: &crate::block::Block, b: &crate::block::Block) -> bool {
+    let (Some(first), Some(next)) = (a.content.as_tool_call(), b.content.as_tool_call()) else {
+        return false;
+    };
+    if first.idle_poll_job().is_some() || next.idle_poll_job().is_some() {
+        return same_poll_run(a, b);
+    }
+    a.at.turn == b.at.turn && first.activity() == next.activity()
+}
+
 /// The run of drawn calls starting at `start`, and the slot the scan stopped on.
 ///
 /// A block the reader cannot see is stepped over, not stopped at — a hidden
@@ -938,11 +951,6 @@ fn run_from(
     pres: &Presentation,
 ) -> (Vec<usize>, usize) {
     let mut members = vec![start];
-    let poll = slots[start]
-        .block()
-        .content
-        .as_tool_call()
-        .is_some_and(|c| c.idle_poll_job().is_some());
     let mut j = start + 1;
     while j < slots.len() {
         if pres.is_hidden(slots[j].block().kind()) {
@@ -952,13 +960,7 @@ fn run_from(
         if !behind_a_lid(slots[j].block()) {
             break;
         }
-        let next_poll = slots[j]
-            .block()
-            .content
-            .as_tool_call()
-            .is_some_and(|c| c.idle_poll_job().is_some());
-        if (poll && !same_poll_run(slots[start].block(), slots[j].block())) || (!poll && next_poll)
-        {
+        if !same_tool_run(slots[start].block(), slots[j].block()) {
             break;
         }
         members.push(j);
@@ -1248,11 +1250,6 @@ fn run_around(
     }
     // Back to the run's first call: over the members, and over the hidden slots
     // between them, stopping at the first thing that is neither.
-    let poll = slots[at]
-        .block()
-        .content
-        .as_tool_call()
-        .is_some_and(|c| c.idle_poll_job().is_some());
     let mut start = at;
     let mut j = at;
     while j > 0 {
@@ -1263,13 +1260,7 @@ fn run_around(
         if !behind_a_lid(slots[j].block()) {
             break;
         }
-        let previous_poll = slots[j]
-            .block()
-            .content
-            .as_tool_call()
-            .is_some_and(|c| c.idle_poll_job().is_some());
-        if (poll && !same_poll_run(slots[at].block(), slots[j].block())) || (!poll && previous_poll)
-        {
+        if !same_tool_run(slots[at].block(), slots[j].block()) {
             break;
         }
         start = j;
@@ -14419,6 +14410,117 @@ mod tests {
             "the failure earlier in the run is not on the lid: {:?}",
             &rows[count..count + 3]
         );
+    }
+
+    #[test]
+    fn computer_activity_runs_keep_categories_turns_and_expansion_together() {
+        let h = host();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(ToolOutput::Group);
+        let calls = [
+            (1, "mcp__browser-use__navigate"),
+            (1, "mcp__browser-use__click"),
+            (1, "mcp__computer-use__screenshot"),
+            (1, "mcp__computer-use__click"),
+            (1, "read_file"),
+            (1, "mcp__browser-use-evil__click"),
+            (2, "mcp__computer-use__click"),
+            (3, "mcp__computer-use__click"),
+        ];
+        for (i, (turn, name)) in calls.into_iter().enumerate() {
+            let id = format!("activity-{i}");
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                    id: id.clone(),
+                    name: name.into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            });
+            h.absorb(&SessionEvent::ToolResultLogged {
+                turn,
+                round: 1,
+                call_id: id,
+                content: format!("detail-{i}"),
+                is_error: i == 0,
+                images: Vec::new(),
+            });
+        }
+        let stream = h.stream.read().unwrap();
+        let slots = stream.slots();
+        let pres = h.presentation.read().unwrap();
+        let ids: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot.block().content.as_tool_call().is_some())
+            .map(|slot| slot.block().id)
+            .collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(run_around(slots, &pres, ids[0]), ids[0..2]);
+        assert_eq!(run_around(slots, &pres, ids[1]), ids[0..2]);
+        assert_eq!(run_around(slots, &pres, ids[3]), ids[2..4]);
+        assert_eq!(run_around(slots, &pres, ids[4]), ids[4..6]);
+        assert_eq!(run_around(slots, &pres, ids[6]), vec![ids[6]]);
+        assert_eq!(run_around(slots, &pres, ids[7]), vec![ids[7]]);
+        drop(pres);
+        drop(stream);
+        let rows = h.compose((100, 60)).rows().join("\n");
+        assert!(rows.contains("已执行 2 次浏览器操作"), "{rows}");
+        assert!(rows.contains("1 失败"), "{rows}");
+        assert!(rows.contains("已执行 2 次桌面操作"), "{rows}");
+        h.toggle_block(ids[0], "tool_call");
+        let expanded = h.compose((100, 80)).rows().join("\n");
+        assert!(expanded.contains("detail-0"), "{expanded}");
+        assert!(expanded.contains("detail-1"), "{expanded}");
+        assert!(expanded.contains("已执行 2 次桌面操作"), "{expanded}");
+    }
+
+    #[test]
+    fn interrupted_computer_actions_remain_individually_visible() {
+        let h = host();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(ToolOutput::Group);
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: ["first", "second"]
+                .into_iter()
+                .map(|id| atomcode_kernel::tool::ToolCall {
+                    id: id.into(),
+                    name: "mcp__computer-use__click".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::Cancelled,
+            error: None,
+        });
+        let stream = h.stream.read().unwrap();
+        let calls: Vec<_> = stream
+            .slots()
+            .iter()
+            .map(|slot| slot.block())
+            .filter(|block| block.content.as_tool_call().is_some())
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|block| block.content.as_tool_call().unwrap().is_interrupted()));
+        assert!(calls.iter().all(|block| !behind_a_lid(block)));
     }
 
     #[test]

@@ -1145,7 +1145,37 @@ pub struct ToolCallBlock {
     pub progress: Option<String>,
 }
 
+/// A display category, never a trust or approval decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolActivity {
+    Ordinary,
+    Browser,
+    Computer,
+}
+
 impl ToolCallBlock {
+    pub(crate) fn activity(&self) -> ToolActivity {
+        if self
+            .name
+            .strip_prefix("mcp__browser-use__")
+            .is_some_and(|tool| !tool.is_empty())
+        {
+            ToolActivity::Browser
+        } else if self
+            .name
+            .strip_prefix("mcp__computer-use__")
+            .is_some_and(|tool| !tool.is_empty())
+        {
+            ToolActivity::Computer
+        } else {
+            ToolActivity::Ordinary
+        }
+    }
+
+    pub(crate) fn is_interrupted(&self) -> bool {
+        matches!(self.outcome, Outcome::Interrupted)
+    }
+
     /// Only the exact no-output/running result emitted by bash_poll is noise.
     /// New output, terminal states, errors and pending calls remain independent.
     pub(crate) fn idle_poll_job(&self) -> Option<String> {
@@ -1626,7 +1656,15 @@ impl ToolCallBlock {
         let caps = Caps::default();
         let mut spans = vec![
             Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
-            Span::styled(t(Msg::ToolsRun { count }).into_owned(), muted()),
+            Span::styled(
+                t(match last.activity() {
+                    ToolActivity::Ordinary => Msg::ToolsRun { count },
+                    ToolActivity::Browser => Msg::BrowserActions { count },
+                    ToolActivity::Computer => Msg::ComputerActions { count },
+                })
+                .into_owned(),
+                muted(),
+            ),
         ];
         if failed > 0 {
             spans.push(Span::styled(
