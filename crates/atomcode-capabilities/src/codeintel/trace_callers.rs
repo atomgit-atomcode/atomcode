@@ -1,7 +1,7 @@
 //! `trace_callers` — reverse call graph (who calls a symbol), BFS to a depth. `Safe`.
 
 use super::index::{CodeIndex, IndexLimits};
-use super::{canonical, display_path, err, ok};
+use super::{ambiguous_symbols, canonical, display_path, err, narrow_by_file, not_indexed, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -24,6 +24,9 @@ struct Args {
     symbol: String,
     #[serde(default)]
     depth: Option<usize>,
+    /// Path suffix that picks one of several same-named symbols.
+    #[serde(default)]
+    file: Option<String>,
 }
 
 #[async_trait]
@@ -40,7 +43,8 @@ impl Tool for TraceCallersTool {
             "type": "object",
             "properties": {
                 "symbol": { "type": "string", "description": "Symbol to trace callers for" },
-                "depth": { "type": "integer", "description": "Max traversal depth (default 3, max 5)" }
+                "depth": { "type": "integer", "description": "Max traversal depth (default 3, max 5)" },
+                "file": { "type": "string", "description": "Optional path suffix (e.g. \"src/db.rs\") that picks one of several same-named symbols. Required when a name is ambiguous." }
             },
             "required": ["symbol"]
         })
@@ -58,25 +62,44 @@ impl Tool for TraceCallersTool {
         let index = self.index.clone();
         let root = ctx.working_dir.clone();
         let symbol = a.symbol.clone();
-        tokio::task::spawn_blocking(move || render(&index, &root, &symbol, depth))
-            .await
-            .unwrap_or_else(|_| err("trace_callers: task failed"))
+        let file = a.file.clone();
+        tokio::task::spawn_blocking(move || {
+            render(&index, &root, &symbol, file.as_deref(), depth)
+        })
+        .await
+        .unwrap_or_else(|_| err("trace_callers: task failed"))
     }
 }
 
-fn render(index: &CodeIndex, root: &Path, symbol: &str, depth: usize) -> ToolResult {
+fn render(
+    index: &CodeIndex,
+    root: &Path,
+    symbol: &str,
+    file: Option<&str>,
+    depth: usize,
+) -> ToolResult {
     let g = match index.get_limited(root, &IndexLimits::default()) {
         Ok(g) => g,
         Err(e) => return err(format!("trace_callers: {}", e)),
     };
     let croot = canonical(root);
     let root: &Path = &croot;
-    let matches = g.find_by_name(symbol);
+    let filter = file.map(str::trim).filter(|f| !f.is_empty());
+    let matches = narrow_by_file(g.find_by_name(symbol), filter);
     if matches.is_empty() {
-        return err(format!(
-            "Symbol '{symbol}' not found in code graph ({} symbols indexed).",
-            g.node_count()
-        ));
+        return err(match filter {
+            Some(f) => format!(
+                "trace_callers: symbol '{symbol}' not found under '{f}' — the index covers {} \
+(only the working directory is indexed).",
+                root.display()
+            ),
+            None => not_indexed("trace_callers", "", symbol, root),
+        });
+    }
+    // Same refusal `trace_chain` gives: dumping every same-named `add`/`main` mixes the
+    // answer with unrelated projects and the caller cannot tell which part is theirs.
+    if filter.is_none() && matches.len() > 1 {
+        return err(ambiguous_symbols("trace_callers", symbol, &matches, root));
     }
     let mut out = String::new();
     for sym in &matches {
@@ -113,6 +136,59 @@ mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
     use tokio_util::sync::CancellationToken;
+
+    /// Two files, each with `main` calling `add`: dumping every same-named symbol buries
+    /// the one the caller asked about. `trace_chain` already refuses this way.
+    #[tokio::test]
+    async fn ambiguous_symbol_names_are_refused_with_candidates() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn add() {}\nfn main() { add(); }\n").unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn add() {}\nfn main() { add(); }\n").unwrap();
+        let tool =
+            TraceCallersTool::new(Arc::new(CodeIndex::new(&crate::product_dirs::test_dirs())));
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let r = tool.execute(r#"{"symbol":"add","depth":1}"#, &ctx).await;
+        assert!(
+            r.is_error,
+            "ambiguous names must be refused, got: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("a.rs") && r.content.contains("b.rs"),
+            "the error must list every candidate: {}",
+            r.content
+        );
+        assert!(r.content.contains("file"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn file_filter_narrows_to_one_symbol() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "fn add() {}\nfn main() { add(); }\n").unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn add() {}\nfn main() { add(); }\n").unwrap();
+        let tool =
+            TraceCallersTool::new(Arc::new(CodeIndex::new(&crate::product_dirs::test_dirs())));
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let r = tool
+            .execute(r#"{"symbol":"add","depth":1,"file":"b.rs"}"#, &ctx)
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("b.rs") && !r.content.contains("a.rs"),
+            "the answer must stay inside the requested file: {}",
+            r.content
+        );
+    }
 
     #[tokio::test]
     async fn traces_callers_across_files() {

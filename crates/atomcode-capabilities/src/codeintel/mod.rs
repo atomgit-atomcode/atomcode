@@ -231,6 +231,61 @@ pub(crate) fn display_path(p: &Path, root: &Path) -> String {
     }
 }
 
+/// Keep only the symbols whose path ends with `file`. A blank/absent filter keeps all.
+///
+/// Shared by `trace_chain` / `trace_callers` / `trace_callees`: all three resolve a
+/// symbol by NAME, so a common name (`main`, `add`, `new`) matches every project in
+/// the index. One implementation keeps the three from drifting apart again.
+pub(crate) fn narrow_by_file<'a>(
+    nodes: Vec<&'a graph::SymbolNode>,
+    file: Option<&str>,
+) -> Vec<&'a graph::SymbolNode> {
+    let Some(suffix) = file.map(str::trim).filter(|f| !f.is_empty()) else {
+        return nodes;
+    };
+    nodes
+        .into_iter()
+        .filter(|n| n.file.to_string_lossy().ends_with(suffix))
+        .collect()
+}
+
+/// The refusal a codeintel tool returns when several symbols share a name: listing the
+/// candidates turns an unanswerable question into a retry with `file`.
+pub(crate) fn ambiguous_symbols(
+    tool: &str,
+    name: &str,
+    hits: &[&graph::SymbolNode],
+    root: &Path,
+) -> String {
+    let mut out = format!(
+        "{tool}: several symbols share the name '{name}' — pass \"file\" (a path suffix) to disambiguate:\n"
+    );
+    for n in hits.iter().take(5) {
+        out.push_str(&format!(
+            "  {} ({:?}) — {}\n",
+            n.name,
+            n.kind,
+            display_path(&n.file, root)
+        ));
+    }
+    out
+}
+
+/// `Symbol 'x' not found` is only actionable with the scope it searched: the index is
+/// built from the working directory, so a fixture outside it can never match.
+pub(crate) fn not_indexed(tool: &str, label: &str, name: &str, root: &Path) -> String {
+    let prefix = if label.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{} ", label.trim())
+    };
+    format!(
+        "{tool}: {prefix}symbol '{name}' not found in code graph — the index covers {} \
+(only the working directory is indexed).",
+        root.display()
+    )
+}
+
 pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
     ToolResult {
         call_id: String::new(),

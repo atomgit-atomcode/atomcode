@@ -1,7 +1,7 @@
 //! `trace_chain` — shortest call chain between two symbols (BFS, ≤10 hops). `Safe`.
 
 use super::index::{CodeIndex, IndexLimits};
-use super::{canonical, display_path, err, ok};
+use super::{canonical, display_path, err, not_indexed, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -63,15 +63,12 @@ impl Tool for TraceChainTool {
     }
 }
 
-/// Keep only the symbols whose path ends with `file`. A blank/absent filter keeps all.
-fn narrow<'a>(nodes: Vec<&'a super::graph::SymbolNode>, file: Option<&str>) -> Vec<&'a super::graph::SymbolNode> {
-    let Some(suffix) = file.map(str::trim).filter(|f| !f.is_empty()) else {
-        return nodes;
-    };
-    nodes
-        .into_iter()
-        .filter(|n| n.file.to_string_lossy().ends_with(suffix))
-        .collect()
+/// Local alias so all three trace tools narrow through the one shared implementation.
+fn narrow<'a>(
+    nodes: Vec<&'a super::graph::SymbolNode>,
+    file: Option<&str>,
+) -> Vec<&'a super::graph::SymbolNode> {
+    super::narrow_by_file(nodes, file)
 }
 
 fn render(index: &CodeIndex, root: &Path, from: &str, to: &str, file: Option<&str>) -> ToolResult {
@@ -86,14 +83,22 @@ fn render(index: &CodeIndex, root: &Path, from: &str, to: &str, file: Option<&st
     let to_matches = narrow(g.find_by_name(to), filter);
     if from_matches.is_empty() {
         return err(match filter {
-            Some(f) => format!("Source symbol '{from}' not found in code graph under '{f}'."),
-            None => format!("Source symbol '{from}' not found in code graph."),
+            Some(f) => format!(
+                "Source symbol '{from}' not found in code graph under '{f}' — the index covers {} \
+(only the working directory is indexed).",
+                root.display()
+            ),
+            None => not_indexed("trace_chain", "Source", from, root),
         });
     }
     if to_matches.is_empty() {
         return err(match filter {
-            Some(f) => format!("Target symbol '{to}' not found in code graph under '{f}'."),
-            None => format!("Target symbol '{to}' not found in code graph."),
+            Some(f) => format!(
+                "Target symbol '{to}' not found in code graph under '{f}' — the index covers {} \
+(only the working directory is indexed).",
+                root.display()
+            ),
+            None => not_indexed("trace_chain", "Target", to, root),
         });
     }
     // Two same-named symbols in different files: answering with the first one found
