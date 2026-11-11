@@ -1,3 +1,5 @@
+> Current delivery status: [completion audit](2026-11-11-computer-use-delivery-audit.md). Progress paragraphs below preserve their historical baseline. Host scope wiring, isolated App/socket construction, activity grouping and clickable result pictures were implemented afterward; GUI and execution-policy acceptance remain incomplete.
+
 # 浏览器与跨平台 Computer Use 设计
 
 状态：第一阶段已在本分支实现，最终验收与交付记录见 `2026-11-11-browser-use-implementation.md`。现有 macOS Computer Use 不因本文扩大支持范围。

@@ -1,0 +1,22 @@
+# Computer Use delivery audit
+
+This table checks the approved design, distinguishing implementation, protocol tests and actual GUI effects. Local Codex remains 806d9732c9. Its configuration types describe policy vocabulary, not proof of a reusable execution backend.
+
+| Requirement | Evidence | State |
+| --- | --- | --- |
+| Optional external components, no bundled browser/native binary | [First-stage audit](2026-11-11-browser-use-implementation.md), unchanged dependency manifests/lock, source-only integrations | Delivered |
+| CLI/TUI setup, explicit reload, configuration ownership and approvals | First-stage audit and real-model controlled form/screenshot/close run | Accepted on recorded macOS browser baseline |
+| Unknown dispatched results never replay; bounded awaited shutdown | [Cancellation](2026-11-11-computer-use-cancellation.md), [shutdown barrier](2026-11-11-mcp-shutdown-barrier.md), real Chrome process-tree checks | Verified for recorded backend; not arbitrary detached descendants |
+| Actual agent/turn identity, execution-side cross-process lease, addressed release | 70d0db025; [host wiring](2026-11-11-desktop-lease-host-wiring.md), native smoke and five process-protocol groups | Code/protocol verified; actual GUI effects not accepted |
+| Separate experimental App/socket, preserving installed App and neighbors | eeafc349f; [integration recipe](../../integrations/open-computer-use/README.md), seven real App/proxy groups (including the corrected cold launch) and measured provenance | No-GUI paths verified; not a signed production install |
+| Activity grouping, failure/interruption/image indication, ordered expandable details | 613996b3e, 6c99543ef; [groups](2026-11-11-computer-activity-presentation.md), [pictures](2026-11-11-tool-image-presentation.md); 2041 TUI/i18n tests | Delivered; each picture opens explicitly in the local viewer |
+| Origin policy enforced over redirects, frames, subresources, upload/download and CDP | Current allowedTools restricts tool catalog only; guidance/navigation arguments cannot enforce this boundary | Not implemented |
+| Native application access enforced at execution boundary | Generic MCP approvals/cooperative leases are not application allowlists | Not implemented |
+| Native screenshot/action/re-observation, denial, real in-flight cancel/handover | Independent AppKit fixture and verify_gui.py prepared; exact experimental App still reports both OS permissions false | Not accepted; OS authorization blocker |
+| Windows/Linux browser/native desktop; HarmonyOS PC | Only macOS actual acceptance exists. Upstream Windows/Linux source does not prove AtomCode wiring/permissions/screenshots/cancellation | Not accepted; do not merely relax platform checks |
+| daemon/Web/ACP execution-host clarity, approval, disconnect and cancel | Generic MCP does not automatically control the frontend client's machine; no full product acceptance for this scope | Incomplete |
+| Final binary/package size | First stage measured +33,200 bytes with same profile/target; later changes lack final complete/multi-platform package comparison | Final measurement incomplete |
+
+Inline terminal raster painting is optional enhancement, not an additional completion condition from the approved design, which requires image indication and retrievable details. The existing graphics implementation remains a static mascot slot; no general inline screenshot capability is claimed.
+
+The reproduced cold-launch actor warning is corrected and verified by old-App-fails/new-App-passes acceptance; see [launch correction](2026-11-11-native-launch-callback.md). Next required work remains execution policy and platform/GUI acceptance. Only the user can grant the exact App's OS permissions; a Codex Computer Use grant does not transfer to it. The overall objective is not complete.

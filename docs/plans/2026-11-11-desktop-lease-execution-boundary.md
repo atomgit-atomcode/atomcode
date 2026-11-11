@@ -1,3 +1,5 @@
+> Current delivery status: [completion audit](2026-11-11-computer-use-delivery-audit.md). Progress paragraphs below preserve their historical baseline. Host scope wiring, isolated App/socket construction, activity grouping and clickable result pictures were implemented afterward; GUI and execution-policy acceptance remain incomplete.
+
 # Desktop turn lease: execution-boundary findings
 
 Status: execution-side macOS protocol prototype is implemented and separately tested; AtomCode host integration and actual GUI exclusivity are not complete or certified.

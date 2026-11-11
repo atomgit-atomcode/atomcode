@@ -231,7 +231,7 @@ index 0000000..abaa5a8
 +    }
 +}
 diff --git a/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift b/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift
-index 6c87ae9..c118d2d 100644
+index 6c87ae9..0b96825 100644
 --- a/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift
 +++ b/apps/OpenComputerUse/Sources/OpenComputerUse/MacOSAppAgentProxy.swift
 @@ -19,0 +20,2 @@ private struct AppAgentLaunchState: Sendable {
@@ -280,8 +280,10 @@ index 6c87ae9..c118d2d 100644
 @@ -105 +99 @@ enum MacOSAppAgentProxy {
 -        configuration.arguments = [appAgentCommand, socketPath]
 +        configuration.arguments = [appAgentCommand, namespace.path]
-@@ -108 +101,0 @@ enum MacOSAppAgentProxy {
+@@ -108,2 +102 @@ enum MacOSAppAgentProxy {
 -
+-        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, _ in }
++        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration, completionHandler: nil)
 @@ -113 +106,5 @@ enum MacOSAppAgentProxy {
 -            if let client = AppAgentSocketClient.connect(path: socketPath) {
 +            try namespace.validateSocketIfPresent()
@@ -488,10 +490,10 @@ index fbb3f57..373df1c 100644
 +
 diff --git a/docs/ATOMCODE_LEASE_OVERLAY.md b/docs/ATOMCODE_LEASE_OVERLAY.md
 new file mode 100644
-index 0000000..b42a032
+index 0000000..f824605
 --- /dev/null
 +++ b/docs/ATOMCODE_LEASE_OVERLAY.md
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,24 @@
 +# AtomCode 实验性 desktop lease overlay
 +
 +这是针对 v1.3.0 固定源码的可选 macOS 实验补丁，不是上游正式发行版。宿主集成说明、构建、开发 App 打包和验收脚本由 AtomCode 仓库的 `integrations/open-computer-use/` 维护。本补丁没有改动 Go 平台实现，也不证明 Windows/Linux GUI 已支持相同的占用协议。
@@ -504,6 +506,8 @@ index 0000000..b42a032
 +- 实验 App 使用显式 development bundle 和协议标记。代理拒绝裸程序借发现机制连接已安装 release App。socket 命名空间由真实文件系统 App 路径和二进制 SHA-256 决定，位于私有 per-user 目录，不再使用 legacy default socket。
 +- 实际 listener 持有独立 lifetime lock，只有它可以回收已检查的 stale socket。锁文件中的版本化记录保存真实 listener 的 PID 与 bind 后的 inode；只有该 PID 确认为已退出、inode 仍匹配时才回收。连接被拒绝（包括满队列）不作为进程死亡的证据；未知记录或 PID 复用一律保留现场。活跃或不确定的 listener 不会被 unlink；身份不匹配时不 terminate。监听器记录 bind 后的文件系统 inode，仅清理仍属于自己的 socket。lock 文件不在正常运行时删除。
 +- 代理对连接和身份读取设置边界；身份响应有独立期限与大小上限。普通 GUI 请求保留原有响应期限。诊断 `doctor --no-ui` 增加 capability 与实际 runtime/permission App 信息，仍只做运行时 preflight，不请求或伪造 OS 权限。
++
++代理启动 App 时不注册无用的 completion closure，避免它继承 MainActor 隔离后被 AppKit 在后台线程回调；启动成功仍由既有的有界 socket 身份握手判断。
 +
 +## 构建与验证范围
 +

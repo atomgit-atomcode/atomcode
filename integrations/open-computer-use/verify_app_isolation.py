@@ -154,6 +154,7 @@ def run(app, report):
             assert first_info["processId"] != a.process.pid
             doctor = subprocess.run([str(binary), "doctor", "--no-ui"], env=base_env,
                                     capture_output=True, text=True, timeout=10, check=True)
+            assert not doctor.stderr, doctor.stderr
             diagnostic = json.loads(doctor.stdout)
             assert Path(diagnostic["runtime"]["app_bundle"]).resolve() == app
             assert Path(diagnostic["runtime"]["permission_app"]).resolve() == app
@@ -298,6 +299,9 @@ def run(app, report):
             sentinel.intact()
             assert not sentinel.requests
             evidence["checks"].append("live legacy default-socket sentinel remained untouched throughout acceptance")
+        proxy_errors = (root / "proxy-stderr").read_text()
+        assert "data race detected" not in proxy_errors.lower(), proxy_errors
+        evidence["checks"].append("cold launch and proxy diagnostics have no actor-isolation race warning")
     evidence["passed"] = True
     report.write_text(json.dumps(evidence, indent=2) + "\n")
     print(f"Passed {len(evidence['checks'])} isolated App acceptance groups; GUI actions=0")
