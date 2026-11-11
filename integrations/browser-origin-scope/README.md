@@ -91,6 +91,8 @@ Configure this optional backend on the machine running the MCP host. For daemon 
 
 Daemon `/chat` clients must echo both `call_id` and the one-shot `approval_id` from each `permission_request`, together with `session_id`, for every `/chat/permission` choice. Missing/stale/duplicate IDs return `success:false`; older clients need to upgrade with the daemon. This does not replace origin policy or grant a new permission. The current WebUI and IDE senders carry the IDs. See [authenticated daemon acceptance](../../docs/plans/2026-11-12-remote-browser-approval-correlation.md) for actual API allow/deny/disconnect/stop/cancel evidence and the limits of that acceptance. SSE disconnection alone leaves the operation available for recovery; use explicit stop when cancellation is intended.
 
+ACP v1/v2 [actual stdio acceptance](../../docs/plans/2026-11-12-acp-browser-images.md) additionally covers ordinary approvals with argument previews, a submitted form, standard live image content, pending denial/cancellation and historical screenshots. v1 `session/load` replays history; plain v1 `session/resume` is silent. The v2 draft uses `session/resume` with `replayFrom: {"type":"start"}` and reports turn completion through an idle state update. A cancelling ACP client must also answer outstanding permission requests with the protocol's `Cancelled` outcome. These checks do not prove in-flight/disconnect faults, arbitrary editor rendering or another host OS.
+
 ## Verification
 
 Fast standard-library-only tests (no browser or external MCP install):

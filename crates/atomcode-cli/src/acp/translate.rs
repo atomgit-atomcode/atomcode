@@ -1,6 +1,7 @@
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, MessageId, SessionUpdate, TextContent, ToolCall as AcpToolCall,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ContentBlock, ContentChunk, ImageContent as AcpImageContent, MessageId, SessionUpdate,
+    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use atomcode_kernel::event::AgentEvent;
 
@@ -31,6 +32,22 @@ pub fn tool_kind(name: &str) -> ToolKind {
     } else {
         ToolKind::Other
     }
+}
+
+/// Preserve native tool output for both live delivery and historical replay.
+pub(crate) fn tool_result_contents(
+    text: &str,
+    images: &[atomcode_kernel::message::ImageContent],
+) -> Vec<ToolCallContent> {
+    let mut content: Vec<ToolCallContent> = vec![text.to_owned().into()];
+    content.extend(images.iter().map(|image| {
+        ContentBlock::Image(AcpImageContent::new(
+            image.data.clone(),
+            image.media_type.clone(),
+        ))
+        .into()
+    }));
+    content
 }
 
 /// Translate one kernel event to an optional v1 `session/update`.
@@ -81,10 +98,9 @@ pub fn event_to_update(ev: &AgentEvent, message_id: Option<&str>) -> Option<Sess
             // nothing to map. Edit tools render their changes as text in the
             // result; a true `diff` block needs an event-side structure first
             // (tracked as a later-phase item in the ACP roadmap).
-            let content: ToolCallContent = result.content.clone().into();
             let fields = ToolCallUpdateFields::new()
                 .status(status)
-                .content(vec![content]);
+                .content(tool_result_contents(&result.content, &result.images));
             Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 ToolCallId::new(result.call_id.clone()),
                 fields,
@@ -223,6 +239,73 @@ mod tests {
         assert_eq!(v["sessionUpdate"], "tool_call");
         assert_eq!(v["toolCallId"], "c1");
         assert_eq!(v["kind"], "execute");
+    }
+
+    #[test]
+    fn replay_tool_images_match_live_wire_content() {
+        let images = vec![atomcode_kernel::message::ImageContent {
+            data: "IMAGE".into(),
+            media_type: "image/png".into(),
+        }];
+        let entries = vec![crate::acp::replay::ReplayEntry::ToolCall {
+            id: "image-call".into(),
+            name: "browser_take_screenshot".into(),
+            arguments: "{}".into(),
+            result: Some(crate::acp::replay::ReplayToolResult {
+                content: "captured".into(),
+                is_error: false,
+                images: images.clone(),
+            }),
+        }];
+        let updates = crate::acp::dispatch::replay_entries_to_v1_updates(
+            &entries,
+            &std::sync::atomic::AtomicU64::new(0),
+        );
+        let replay = serde_json::to_value(updates.last().unwrap()).unwrap();
+        let event = AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "image-call".into(),
+                content: "captured".into(),
+                is_error: false,
+                images,
+            },
+        };
+        let live = serde_json::to_value(event_to_update(&event, None).unwrap()).unwrap();
+        assert_eq!(replay["content"], live["content"]);
+        assert_eq!(replay["content"].as_array().unwrap().len(), 2);
+        assert_eq!(replay["content"][1]["content"]["data"], "IMAGE");
+    }
+
+    #[test]
+    fn tool_result_images_preserve_order_bytes_mime_and_error_status() {
+        let event = AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "image-call".into(),
+                content: "captured".into(),
+                is_error: true,
+                images: vec![
+                    atomcode_kernel::message::ImageContent {
+                        data: "FIRST".into(),
+                        media_type: "image/png".into(),
+                    },
+                    atomcode_kernel::message::ImageContent {
+                        data: "SECOND".into(),
+                        media_type: "image/jpeg".into(),
+                    },
+                ],
+            },
+        };
+        let value = serde_json::to_value(event_to_update(&event, None).unwrap()).unwrap();
+        assert_eq!(value["toolCallId"], "image-call");
+        assert_eq!(value["status"], "failed");
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["content"]["text"], "captured");
+        assert_eq!(blocks[1]["content"]["type"], "image");
+        assert_eq!(blocks[1]["content"]["data"], "FIRST");
+        assert_eq!(blocks[1]["content"]["mimeType"], "image/png");
+        assert_eq!(blocks[2]["content"]["data"], "SECOND");
+        assert_eq!(blocks[2]["content"]["mimeType"], "image/jpeg");
     }
 
     #[test]

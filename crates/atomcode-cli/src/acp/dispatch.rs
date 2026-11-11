@@ -323,20 +323,21 @@ pub fn replay_entries_to_v1_updates(
                     .status(agent_client_protocol::schema::v1::ToolCallStatus::InProgress)
                     .raw_input(crate::acp::replay::raw_input_from_arguments(arguments)),
                 ));
-                if let Some((content, is_error)) = result {
-                    let status = if *is_error {
+                if let Some(result) = result {
+                    let status = if result.is_error {
                         agent_client_protocol::schema::v1::ToolCallStatus::Failed
                     } else {
                         agent_client_protocol::schema::v1::ToolCallStatus::Completed
                     };
-                    let content: agent_client_protocol::schema::v1::ToolCallContent =
-                        content.clone().into();
                     updates.push(SessionUpdate::ToolCallUpdate(
                         agent_client_protocol::schema::v1::ToolCallUpdate::new(
                             agent_client_protocol::schema::v1::ToolCallId::new(id.clone()),
                             agent_client_protocol::schema::v1::ToolCallUpdateFields::new()
                                 .status(status)
-                                .content(vec![content]),
+                                .content(crate::acp::translate::tool_result_contents(
+                                    &result.content,
+                                    &result.images,
+                                )),
                         ),
                     ));
                 }
@@ -564,7 +565,8 @@ impl TurnWire for V1Wire {
                         tool.to_string(),
                     )
                     .kind(crate::acp::translate::tool_kind(tool))
-                    .status(agent_client_protocol::schema::v1::ToolCallStatus::Pending),
+                    .status(agent_client_protocol::schema::v1::ToolCallStatus::Pending)
+                    .raw_input(crate::acp::permission::approval_input(&payload)),
                 ),
             ))?;
             self.announced.insert(call_id.to_string());
@@ -779,7 +781,11 @@ mod tests {
                 id: "call-1".into(),
                 name: "bash".into(),
                 arguments: r#"{"cmd":"ls"}"#.into(),
-                result: Some(("file list".into(), false)),
+                result: Some(crate::acp::replay::ReplayToolResult {
+                    content: "file list".into(),
+                    is_error: false,
+                    images: vec![],
+                }),
             },
             ReplayEntry::ToolCall {
                 id: "call-2".into(),

@@ -2055,6 +2055,10 @@ async fn v2_approval_uses_v2_request_shape() {
         got["subject"]["toolCall"]["title"], "bash",
         "v2 subject must be a ToolCall subject with the tool name: {got}"
     );
+    assert_eq!(
+        got["subject"]["toolCall"]["rawInput"]["command"],
+        "rm -rf /tmp/atomcode-e2e-nonexistent"
+    );
     let options: Vec<String> = got["options"]
         .as_array()
         .unwrap()
