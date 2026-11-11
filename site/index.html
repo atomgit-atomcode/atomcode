@@ -1390,6 +1390,10 @@ const INVITE_PARAM=(()=>{
   return m?m[1]:'';
 })();
 const INVITE_CODE=/^[A-Za-z0-9]{8}$/.test(INVITE_PARAM)?INVITE_PARAM:'';
+function releaseDownloadUrl(file){
+  const url=`${RELEASE_BASE}/${file}`;
+  return INVITE_CODE?`${url}?invite=${encodeURIComponent(INVITE_CODE)}`:url;
+}
 function unixInstallCmd(){
   return `curl -fsSL ${SCRIPT_BASE}/install.sh | sh${INVITE_CODE?` -s -- --invite=${INVITE_CODE}`:''}`;
 }
@@ -1433,8 +1437,8 @@ const METHOD_CMDS={
         en:`# macOS / Linux only\n${brewInstallCmd()}`},
   source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
           en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
-  binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
-          en:`# Download from Releases page\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# Or curl for your platform\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`},
+  binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  "${releaseDownloadUrl(`atomcode-${VERSION}-darwin-arm64`)}"\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
+          en:`# Download from Releases page\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# Or curl for your platform\ncurl -L -o atomcode \\\n  "${releaseDownloadUrl(`atomcode-${VERSION}-darwin-arm64`)}"\nchmod +x atomcode && mv atomcode /usr/local/bin/`},
 };
 function methodHint(m){return t('method.'+m);}
 const DOWNLOADS=[
@@ -1850,7 +1854,7 @@ window.applyWizardNav=null;
 
   // downloads — actual release URLs
   document.getElementById('downloadRow').innerHTML=DOWNLOADS.map(d=>`
-    <a class="dl-btn" href="${RELEASE_BASE}/${d.file}" target="_blank" rel="noopener"><span>↓ ${d.os}</span><small>${d.arch}</small></a>`).join('');
+    <a class="dl-btn" href="${releaseDownloadUrl(d.file)}" target="_blank" rel="noopener"><span>↓ ${d.os}</span><small>${d.arch}</small></a>`).join('');
 
   // wizard
   const next=document.getElementById('wizNext'),prev=document.getElementById('wizPrev');
