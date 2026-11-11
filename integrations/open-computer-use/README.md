@@ -76,3 +76,20 @@ The host generates scope identity from the real executing agent's session ID and
 Native-process acceptance covers different product homes, same-owner reentrancy, different/wrong/stale owners, metadata injection refusal, scoped downgrade refusal, strict capability versions, normal EOF, direct process death, symlink directory/file, hardlink and unsafe-mode refusal, and UTF-8 owner limits. A private shared App verifies per-connection leases, exclusion against direct processes, lease release on disconnected connections and survival of neighboring connections/App.
 
 Still unverified: an actual GUI operation executing when the host/proxy dies, fresh window/screenshot references after turnover, actual GUI approval/cancel/reload interaction and non-macOS backends. Host fixture tests cover normal runtime end/cancel, child identity, queued cancellation, malformed acknowledgements, release deadlines, connection loss and negotiation downgrade. An opt-in native test covers scoped calls and lease handover between two production registries without GUI actions. Do not mark desktop exclusivity complete until these are tested.
+
+## Windows/Linux build evidence (not desktop acceptance)
+
+The pinned upstream also contains separate Go runtimes for Windows and Linux. They are not covered by the macOS lease overlay. Both currently print prose from doctor rather than AtomCode's structured permission diagnostic, and neither advertises the experimental desktop-turn lease. AtomCode's managed computer setup remains macOS-only.
+
+Use an unmodified pinned checkout, not the patched macOS clone, and a fresh output directory outside it:
+
+```sh
+python3 integrations/open-computer-use/verify_portable_builds.py \
+  --source /tmp/ocu-portable-source --output /tmp/ocu-portable-builds
+python3 integrations/open-computer-use/verify_portable_refusals.py \
+  --source /tmp/ocu-portable-source --report /tmp/ocu-portable-refusals.json
+```
+
+This opt-in developer verifier uses an installed Go compiler with automatic toolchain fetching disabled; public locked Go dependencies may enter the Go cache. It builds Linux/Windows amd64/arm64 products and test binaries, records their module graphs, source/verifier digests and sizes, and never installs or runs the target products. On macOS only, Linux's non-Linux-stub logic tests also run. Their pass/skip counts remain separate from target compilation. Pinned input bytes are checked against committed blobs even when Git index flags hide edits; existing/nested output and dirty/wrong source are refused. Reports are local measurements, not signed upstream attestations.
+
+The recorded Go 1.26.3 macOS run passed 97 top-level Linux logic tests and skipped two Linux desktop-session discovery tests (110 pass events including subtests). All four product and test-binary cross-compiles passed. Stripped optional backend products measured Linux amd64 4,595,874 bytes, Linux arm64 4,391,074 bytes, Windows amd64 3,802,624 bytes and Windows arm64 3,513,344 bytes. These external unsigned products are not added to AtomCode or its installer. Five real CLI refusal groups passed. None of this proves actual desktop screenshots/input, Wayland support, permissions, cancellation, app policy or desktop lease handover. See [platform verification](../../docs/plans/2026-11-11-portable-backend-verification.md).

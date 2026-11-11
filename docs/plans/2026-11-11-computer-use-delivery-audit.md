@@ -13,7 +13,7 @@ This table checks the approved design, distinguishing implementation, protocol t
 | Origin policy enforced over redirects, frames, subresources, upload/download and CDP | Current allowedTools restricts tool catalog only; guidance/navigation arguments cannot enforce this boundary | Not implemented |
 | Native application access enforced at execution boundary | Generic MCP approvals/cooperative leases are not application allowlists | Not implemented |
 | Native screenshot/action/re-observation, denial, real in-flight cancel/handover | Independent AppKit fixture and verify_gui.py prepared; exact experimental App still reports both OS permissions false | Not accepted; OS authorization blocker |
-| Windows/Linux browser/native desktop; HarmonyOS PC | Only macOS actual acceptance exists. Upstream Windows/Linux source does not prove AtomCode wiring/permissions/screenshots/cancellation | Not accepted; do not merely relax platform checks |
+| Windows/Linux browser/native desktop; HarmonyOS PC | [Portable build verification](2026-11-11-portable-backend-verification.md): four product/test cross-compiles, 97 host logic tests passed and 2 skipped. Target desktop execution, structured readiness and lease support remain absent | Not accepted; do not merely relax platform checks |
 | daemon/Web/ACP execution-host clarity, approval, disconnect and cancel | Generic MCP does not automatically control the frontend client's machine; no full product acceptance for this scope | Incomplete |
 | Final binary/package size | First stage measured +33,200 bytes with same profile/target; later changes lack final complete/multi-platform package comparison | Final measurement incomplete |
 
