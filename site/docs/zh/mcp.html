@@ -197,7 +197,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       <p>此能力不包含桌面执行器，不会自动获取屏幕录制或辅助功能权限，也不会替换当前模型。文本模型不会因此获得视觉能力。暂不自动获取图片资源链接或将嵌入资源的 blob 作为截图使用。</p>
 
       <h2 id="browser-use">隔离浏览器工作流</h2>
-      <p>浏览器集成采用外部 <a href="https://github.com/microsoft/playwright-mcp">Playwright MCP</a> 后端。AtomCode 不捆绑 Node 或浏览器，启动时也不下载它们。请显式安装 Node 18+ 和 Chrome。目前仅有 macOS 本机验收条件；Windows、Linux 需要分别完成实机验收，不能视为已验证。</p>
+      <p>浏览器集成采用外部 <a href="https://github.com/microsoft/playwright-mcp">Playwright MCP</a> 后端。AtomCode 不捆绑 Node 或浏览器，启动时也不下载它们。请显式安装 Node 20+ 和 Chrome。目前仅有 macOS 本机验收条件；Windows、Linux 需要分别完成实机验收，不能视为已验证。</p>
       <pre><code># 显式安装到仓库之外的自选目录
 npm install --prefix /absolute/path/browser-backend @playwright/mcp@0.0.85
 atomcode browser doctor --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
@@ -211,10 +211,23 @@ $browser-use 打开本地测试页，填写已授权的表单并核对结果。
 /browser disable
 /browser reload</code></pre>
       <p>首次设置需在终端指定后端路径；设置后 <code>/browser enable</code> 可复用它。修改配置需要显式重载或重启。<code>status</code> 读取保存的配置，实时连接、项目覆盖和暂停状态请看 <code>/mcp</code>。自定义同名配置及修改过的技能会保留，不覆盖。</p>
-      <p>托管后端使用隔离 profile，关闭页面提供的 WebMCP，不连接个人 Chrome profile，不导入 Cookie。保留原生 MCP 审批（<code>trust: false</code>、空 <code>autoApprove</code>）；只读标记与工具级“始终允许”仍按现有机制生效。它们<strong>不等于站点授权</strong>，当前没有强制 origin 白名单。浏览器位于 MCP 宿主机器，不一定是客户端所在电脑。</p>
+      <p>托管后端使用隔离 profile，关闭页面提供的 WebMCP，不连接个人 Chrome profile，不导入 Cookie。保留原生 MCP 审批（<code>trust: false</code>、空 <code>autoApprove</code>）；只读标记与工具级“始终允许”仍按现有机制生效。它们<strong>不等于站点授权</strong>，原版后端没有强制 origin 白名单；下方可选来源限制后端提供显式执行边界。浏览器位于 MCP 宿主机器，不一定是客户端所在电脑。</p>
       <p>托管 <code>allowedTools</code> 只暴露已审查的导航、观察、表单、交互和关闭工具，排除代码求值、不安全脚本、文件上传和浏览器安装工具。通用 MCP 也可配置精确原始工具名列表：省略表示不限，空数组表示全部禁止。发现、缓存和调用入口都检查该列表；它不授予审批，也不是操作系统或网络沙箱。</p>
       <p>生成的页面快照和截图放在项目外的 <code>&lt;用户目录&gt;/integrations/browser-use/artifacts</code>。Unix 设置为仅所有者可访问，Windows 沿用目录 ACL。后端设置 16 MiB 输出清理目标，不是硬磁盘配额；禁用不会删除这些文件，不再需要时请自行清理。</p>
       <p>通过 <code>$browser-use</code> 显式调用技能，安装后不会自动选用。截图任务需要视觉模型；结构化页面快照可供文本模型使用。取消和禁用不能撤销已发出的外部操作；结果未知时重新观察后再决定是否重试，只关闭本工作流拥有的浏览器资源。</p>
+
+      <h3 id="browser-origin-scope">确切来源范围（可选后端）</h3>
+      <p>首次配置需要显式指定已安装的来源后端 <code>backend.cjs</code> 和固定版本依赖目录，不会自动下载或复制。这一后端检查实际 HTTP(S)/WS(S) 目标，覆盖重定向、iframe 与子资源，不把 Playwright 的便利性 <code>allowed-origins</code> 参数当作执行边界。</p>
+      <pre><code>atomcode browser enable --origin-backend /absolute/path/to/backend.cjs \
+  --backend-root /absolute/installed/node_modules/@playwright/mcp \
+  --allow-origin https://example.test
+/browser enable --allow-origin https://example.test --allow-origin https://example.test:8443
+/browser enable --deny-all-origins
+# 显式切回原版；普通 enable 保留范围
+/browser enable --unrestricted-origins
+/browser reload</code></pre>
+      <p>来源必须是确切的 HTTP(S) 协议、主机和端口，不接受凭据、路径、查询或通配符。<code>--deny-all-origins</code> 保存空允许列表。配置前验证无浏览器 doctor 报告，并同时保存策略和必需的 <code>atomcode/browser-origin-scope</code> v1 能力；每次实际初始化或恢复独立检查能力。其他必需能力和已有更窄工具限制会保留。保存的范围无效时会报错，不会静默移除。<code>doctor</code>、<code>status</code> 理解保存的范围，但不查询当前连接；项目覆盖和显式 reload 仍然适用。</p>
+      <p>限制模式的截图和快照放在 <code>&lt;用户目录&gt;/integrations/browser-use/origin-artifacts/files</code>，所有权标记位于清理目录之外；后端拒绝已有的无标记非空根目录和末级符号链接。本版拒绝接受下载文件、本地文件上传和完整 CDP 工具，尚未实现按来源放开传输或 CDP 的设置；HTTPS 响应字节仍可能进入 Chrome。这不是系统沙箱，也不全局限制 Shell、其他浏览器服务或客户端、以及允许站点内部的效果。目前仅有 macOS Chrome 本机验证，其他平台执行与完整策略矩阵尚待验收。</p>
 
       <h2 id="computer-use">CLI 操作 macOS 应用</h2>
       <p>可通过本地 <a href="https://github.com/opensymph/open-computer-use">Open Computer Use</a> MCP 后端连接桌面。当前集成支持 macOS 14 及以上；截图任务需要当前模型支持视觉。AtomCode 不自动安装后端，也不额外启动一套模型代理。</p>

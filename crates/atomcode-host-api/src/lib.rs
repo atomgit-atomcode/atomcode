@@ -41,11 +41,17 @@ pub enum ComputerAction {
 }
 
 /// Explicit user intents for the host-local browser integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrowserAction {
     Status,
     Doctor,
     Enable,
+    /// Exact origin restriction; an empty vector denies all origins.
+    EnableScoped {
+        origins: Vec<String>,
+    },
+    /// Explicit return to the stock backend without a saved origin restriction.
+    EnableUnrestricted,
     Disable,
 }
 
@@ -1716,6 +1722,20 @@ mod tests {
             HostCommand::Browser {
                 session: "a".into(),
                 action: BrowserAction::Disable,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnableScoped {
+                    origins: vec!["https://example.test".into()],
+                },
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnableScoped { origins: vec![] },
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnableUnrestricted,
             },
             HostCommand::ImportPatch {
                 session: "a".into(),

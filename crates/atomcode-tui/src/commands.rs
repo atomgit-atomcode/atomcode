@@ -2897,7 +2897,7 @@ impl CommandSet for SessionCommands {
                         return Outcome::Said(t(Msg::BrowserHelp).into_owned())
                     }
                     "reload" => {
-                        if let Some(why) = waits_for_the_turn("computer reload") {
+                        if let Some(why) = waits_for_the_turn("browser reload") {
                             return why;
                         }
                         let control = match host(control) {
@@ -2910,7 +2910,32 @@ impl CommandSet for SessionCommands {
                     "doctor" => BrowserAction::Doctor,
                     "enable" => BrowserAction::Enable,
                     "disable" => BrowserAction::Disable,
-                    _ => return Outcome::Refused(t(Msg::BrowserHelp).into_owned()),
+                    _ => {
+                        let words: Vec<_> = args.split_whitespace().collect();
+                        match words.as_slice() {
+                            ["enable", "--deny-all-origins"] => BrowserAction::EnableScoped {
+                                origins: Vec::new(),
+                            },
+                            ["enable", "--unrestricted-origins"] => {
+                                BrowserAction::EnableUnrestricted
+                            }
+                            ["enable", rest @ ..]
+                                if !rest.is_empty()
+                                    && rest.len() % 2 == 0
+                                    && rest.chunks_exact(2).all(|pair| {
+                                        pair[0] == "--allow-origin" && !pair[1].starts_with('-')
+                                    }) =>
+                            {
+                                BrowserAction::EnableScoped {
+                                    origins: rest
+                                        .chunks_exact(2)
+                                        .map(|pair| pair[1].to_string())
+                                        .collect(),
+                                }
+                            }
+                            _ => return Outcome::Refused(t(Msg::BrowserHelp).into_owned()),
+                        }
+                    }
                 };
                 let control = match host(control) {
                     Ok(c) => c,
@@ -5389,6 +5414,23 @@ mod tests {
             ("doctor", BrowserAction::Doctor),
             ("enable", BrowserAction::Enable),
             ("disable", BrowserAction::Disable),
+            (
+                "enable --allow-origin https://example.test --allow-origin http://localhost:8080",
+                BrowserAction::EnableScoped {
+                    origins: vec![
+                        "https://example.test".into(),
+                        "http://localhost:8080".into(),
+                    ],
+                },
+            ),
+            (
+                "enable --deny-all-origins",
+                BrowserAction::EnableScoped { origins: vec![] },
+            ),
+            (
+                "enable --unrestricted-origins",
+                BrowserAction::EnableUnrestricted,
+            ),
         ] {
             host.replies
                 .lock()
@@ -5410,7 +5452,7 @@ mod tests {
         }
         assert_eq!(
             host.asked.lock().unwrap().len(),
-            5,
+            8,
             "no implicit reload or desktop action"
         );
         for arg in [
@@ -5418,17 +5460,20 @@ mod tests {
             "--help",
             "unknown",
             "enable extra",
+            "enable --allow-origin",
+            "enable --deny-all-origins --allow-origin https://example.test",
+            "enable --allow-origin --unrestricted-origins",
             "doctor --server /tmp/custom",
         ] {
             let out = all
                 .dispatch(&format!("/browser {arg}"), &app.context())
                 .await;
             assert!(matches!(out, Outcome::Said(_) | Outcome::Refused(_)));
-            assert_eq!(host.asked.lock().unwrap().len(), 5, "{arg}");
+            assert_eq!(host.asked.lock().unwrap().len(), 8, "{arg}");
         }
         all.dispatch("/browser reload", &app.context()).await;
         assert!(
-            matches!(&host.asked.lock().unwrap()[5], HostCommand::Reload { session } if session == "lead")
+            matches!(&host.asked.lock().unwrap()[8], HostCommand::Reload { session } if session == "lead")
         );
         host.replies
             .lock()

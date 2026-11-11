@@ -124,6 +124,7 @@ async fn acceptance(drop_response: bool, verify_disposal: bool, await_shutdown: 
         BrowserCli::Enable {
             server: Some(server.into()),
             node: None,
+            scope: Default::default(),
         },
     )
     .await

@@ -553,7 +553,7 @@ fn disable(dirs: &ProductDirs) -> Result<()> {
 }
 
 #[cfg(unix)]
-struct ProbeGroup(Option<i32>);
+pub(crate) struct ProbeGroup(pub(crate) Option<i32>);
 #[cfg(unix)]
 impl Drop for ProbeGroup {
     fn drop(&mut self) {

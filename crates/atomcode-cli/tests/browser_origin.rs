@@ -1,10 +1,9 @@
-//! Opt-in production registry/adapter acceptance for the optional source-only
+//! Opt-in managed setup and production registry/adapter acceptance for the source-only
 //! backend. All pages and artifacts belong to this test; no external website.
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
+use atomcode_capabilities::mcp::config::McpConfigSource;
 use atomcode_capabilities::mcp::{McpRegistry, McpToolAdapter};
 use atomcode_kernel::tool::{ProgressSink, RiskLevel, Tool, ToolContext};
 use serde_json::json;
@@ -55,35 +54,42 @@ async fn real_origin_backend_enforces_policy_through_production_registry_and_ada
             });
         }
     });
-    let make_config = |version| McpServerConfig {
-        name: "origin-test".into(),
-        source: McpConfigSource::User,
-        disabled: false,
-        trust: false,
-        auto_approve: vec![],
-        allowed_tools: None, // The backend itself must gate discovery/direct calls.
-        required_experimental_capabilities: BTreeMap::from([(
-            "atomcode/browser-origin-scope".into(),
-            version,
-        )]),
-        config: McpTransportConfig::Stdio {
-            command: node.to_string_lossy().into_owned(),
-            args: vec![
-                backend.to_string_lossy().into_owned(),
-                "--backend-root".into(),
-                root.to_string_lossy().into_owned(),
-                "--output-dir".into(),
-                temp.path().join("artifacts").to_string_lossy().into_owned(),
-            ],
-            env: BTreeMap::from([(
-                "ATOMCODE_BROWSER_ORIGIN_POLICY".into(),
-                json!({"version":1,"origins":[origin]}).to_string(),
-            )]),
-            timeout_ms: Some(30_000),
+    let dirs = atomcode_capabilities::ProductDirs::new(temp.path().join("user"), ".test-product");
+    atomcode::browser_cmd::execute(
+        &dirs,
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: Some(node),
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(backend),
+                backend_root: Some(root.into()),
+                allowed_origins: vec![origin.clone()],
+                ..Default::default()
+            },
         },
+    )
+    .await
+    .unwrap();
+    let source = std::fs::read_to_string(dirs.user().join("mcp.json")).unwrap();
+    let configured = atomcode_capabilities::mcp::parse_mcp_servers(&source, McpConfigSource::User)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        configured
+            .required_experimental_capabilities
+            .get("atomcode/browser-origin-scope"),
+        Some(&1)
+    );
+    let make_config = |version| {
+        let mut config = configured.clone();
+        config
+            .required_experimental_capabilities
+            .insert("atomcode/browser-origin-scope".into(), version);
+        config
     };
-    let registry = McpRegistry::new(temp.path()).share();
-    registry.add_server(make_config(1)).await.unwrap();
+    let registry = McpRegistry::from_config(temp.path(), dirs.user())
+        .await
+        .share();
     let catalog = registry.list_all_tools().await;
     assert_eq!(catalog.len(), 16);
     for name in [
@@ -94,13 +100,13 @@ async fn real_origin_backend_enforces_policy_through_production_registry_and_ada
     ] {
         assert!(!catalog.iter().any(|tool| tool.tool_name == name));
         assert!(registry
-            .call_tool("origin-test", name, json!({}))
+            .call_tool("browser-use", name, json!({}))
             .await
             .is_err());
     }
     assert!(registry
         .call_tool(
-            "origin-test",
+            "browser-use",
             "browser_navigate",
             json!({"url":denied_origin})
         )
@@ -131,7 +137,7 @@ async fn real_origin_backend_enforces_policy_through_production_registry_and_ada
         .await;
     assert!(!navigated.is_error, "{}", navigated.content);
     let snapshot = registry
-        .call_tool("origin-test", "browser_snapshot", json!({}))
+        .call_tool("browser-use", "browser_snapshot", json!({}))
         .await
         .unwrap();
     assert!(format!("{snapshot:?}").contains("ATOMCODE_ORIGIN_REGISTRY_FIXTURE"));
@@ -157,7 +163,7 @@ async fn real_origin_backend_enforces_policy_through_production_registry_and_ada
         .await;
     assert!(!redirected.is_error, "{}", redirected.content);
     let refusal = registry
-        .call_tool("origin-test", "browser_snapshot", json!({}))
+        .call_tool("browser-use", "browser_snapshot", json!({}))
         .await
         .unwrap();
     assert!(format!("{refusal:?}").contains("Browser origin policy refused this request"));

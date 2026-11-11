@@ -4040,21 +4040,58 @@ async fn browser_setup_is_addressed_and_does_not_mutate_the_live_runtime() {
 #[serial_test::serial(atomcode_home)]
 #[ignore = "requires an explicitly installed browser backend; local controlled acceptance"]
 async fn a_real_browser_navigation_can_be_denied_before_external_effects() {
-    let backend =
-        std::env::var_os("ATOMCODE_BROWSER_TEST_SERVER").expect("explicit installed cli.js");
+    browser_navigation_denial(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires ATOMCODE_BROWSER_ORIGIN_TEST_ROOT, pinned runtime and Chrome; controlled runtime approval"]
+async fn a_scoped_browser_navigation_can_be_denied_before_external_effects() {
+    tokio::time::resume();
+    browser_navigation_denial(true).await;
+}
+
+#[cfg(unix)]
+async fn browser_navigation_denial(scoped: bool) {
     let env = env();
     let dirs = atomcode_coding::config::product_dirs_from_env();
-    atomcode::browser_cmd::execute(
-        &dirs,
-        atomcode::browser_cmd::BrowserCli::Enable {
-            server: Some(backend.into()),
-            node: None,
-        },
-    )
-    .await
-    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let command = if scoped {
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: None,
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../integrations/browser-origin-scope/backend.cjs")
+                        .canonicalize()
+                        .unwrap(),
+                ),
+                backend_root: Some(
+                    std::env::var_os("ATOMCODE_BROWSER_ORIGIN_TEST_ROOT")
+                        .expect("explicit installed package root")
+                        .into(),
+                ),
+                allowed_origins: vec![format!("http://{address}")],
+                ..Default::default()
+            },
+        }
+    } else {
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: Some(
+                std::env::var_os("ATOMCODE_BROWSER_TEST_SERVER")
+                    .expect("explicit installed cli.js")
+                    .into(),
+            ),
+            node: None,
+            scope: Default::default(),
+        }
+    };
+    atomcode::browser_cmd::execute(&dirs, command)
+        .await
+        .unwrap();
     let (mut connection, _) = started(&env, SubagentPolicy::Disabled, None, vec![], true).await;
     let session = connection.session.clone();
     assert!(tools_on_the_model(&connection, &session, "browser-use")
@@ -4147,6 +4184,89 @@ async fn computer_application_scope_setup_is_local_and_never_implicitly_reloads(
             env.script.built.lock().unwrap().len(),
             before,
             "setup must not rebuild the runtime"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn browser_origin_setup_is_host_local_and_never_implicitly_reloads() {
+    use atomcode_host_api::BrowserAction;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::resume();
+    let env = env();
+    let connection = connected(&env).await;
+    let before = env.script.built.lock().unwrap().len();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let script = env._home.path().join("scope backend.cjs");
+    std::fs::write(&script, "fixture").unwrap();
+    let package = env._home.path().join("installed package");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("cli.js"), "fixture").unwrap();
+    let node = env._home.path().join("scope node");
+    let put_node = |count: usize| {
+        let report = serde_json::json!({"version":1,"kind":"doctor","browser_launched":false,"capability":"atomcode/browser-origin-scope","mcp":"0.0.85","playwright":"1.66.0-alpha-2026-11-09","allowed_origin_count":count,"downloads":"deny-artifacts","uploads":"deny","full_cdp_access":"deny"});
+        std::fs::write(&node,format!("#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then echo v22.0.0; exit 0; fi\nfor arg do if [ \"$arg\" = --doctor ]; then printf '%s' '{report}'; exit 0; fi; done\necho 'Version 0.0.85'\n")).unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    put_node(1);
+    atomcode::browser_cmd::execute(
+        &dirs,
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: Some(node.clone()),
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(script),
+                backend_root: Some(package),
+                allowed_origins: vec!["https://initial.test".into()],
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    for (action, count, expected) in [
+        (
+            BrowserAction::EnableScoped {
+                origins: vec!["https://next.test".into()],
+            },
+            1,
+            Some(serde_json::json!(["https://next.test"])),
+        ),
+        (
+            BrowserAction::Enable,
+            1,
+            Some(serde_json::json!(["https://next.test"])),
+        ),
+        (
+            BrowserAction::EnableScoped { origins: vec![] },
+            0,
+            Some(serde_json::json!([])),
+        ),
+        (BrowserAction::EnableUnrestricted, 0, None),
+    ] {
+        put_node(count);
+        let reply = connection
+            .control
+            .call(HostCommand::Browser {
+                session: connection.session.clone(),
+                action,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, HostReply::DoneWithNote { .. }));
+        let source: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dirs.user().join("mcp.json")).unwrap())
+                .unwrap();
+        let actual = source["mcpServers"]["browser-use"]["env"]["ATOMCODE_BROWSER_ORIGIN_POLICY"]
+            .as_str()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap()["origins"].clone());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            env.script.built.lock().unwrap().len(),
+            before,
+            "no implicit runtime rebuild"
         );
     }
 }

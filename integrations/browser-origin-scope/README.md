@@ -1,6 +1,6 @@
 # Optional browser origin-scope backend
 
-This source-only prototype adds an execution boundary to the externally installed, pinned Playwright MCP runtime. It does **not** change `atomcode browser enable` or bundle Node/Chrome. Managed setup and Codex's complete per-origin access/download/upload/full-CDP matrix remain unfinished.
+This source-only prototype adds an execution boundary to the externally installed, pinned Playwright MCP runtime. It integrates with explicit `atomcode browser enable` options and bundles neither Node nor Chrome. Codex's complete per-origin access/download/upload/full-CDP matrix remains unfinished.
 
 The local reference is `/Users/theo/Documents/workspace/codex` at `806d9732c9`, especially `codex-rs/config/src/browser_use.rs`. Those types define policy vocabulary; they are not a reusable browser executor. The installed Playwright MCP's own `allowed-origins` option explicitly does not cover redirects, so this prototype does not use it as the enforcement boundary.
 
@@ -43,6 +43,23 @@ ATOMCODE_BROWSER_ORIGIN_POLICY='{"version":1,"origins":["https://example.test"]}
   --backend-root /absolute/installed/node_modules/@playwright/mcp --doctor
 ```
 
+Managed setup requires explicit installed paths and an origin policy on first use:
+
+```sh
+atomcode browser enable \
+  --origin-backend /absolute/path/to/atomcode/integrations/browser-origin-scope/backend.cjs \
+  --backend-root /absolute/installed/node_modules/@playwright/mcp \
+  --allow-origin https://example.test
+/browser enable --allow-origin https://example.test --allow-origin https://example.test:8443
+/browser enable --deny-all-origins
+/browser enable --unrestricted-origins
+/browser reload
+```
+
+Repeat `--allow-origin` to permit more exact origins. Plain `enable`, including after disable, preserves the saved scope. Unrestriction is explicit and returns to the stock `cli.js` in the saved package (or terminal `--server`). Other required capabilities and narrower tool restrictions remain. Missing/malformed scope metadata fails rather than falling back to stock. A changed config snapshot during doctor is refused without overwriting it. Doctor launches neither a browser nor an installer and creates no output tree. Scope setup writes the policy, exact arguments, managed mode marker and version-1 required MCP capability together. Existing sessions still need explicit reload; status describes configuration, not live adoption or project overrides.
+
+The installed bundled browser guidance recognizes either backend. Its exact previous unmodified version can upgrade; customized guidance remains protected. Other unmanaged MCP entries are never rewritten by these commands.
+
 For an explicit experimental MCP entry, use resolved absolute paths in the ordinary MCP configuration. This example uses a separate name to avoid overwriting a managed entry:
 
 ```json
@@ -66,7 +83,7 @@ For an explicit experimental MCP entry, use resolved absolute paths in the ordin
 }
 ```
 
-The required capability is checked by AtomCode on every initialize/recovery. It does not activate policy on the stock backend. This prototype requires its own script and policy together. It remains subject to normal MCP approvals and explicit reload. Another unrestricted browser MCP entry is a different interface with different permissions. The existing `/browser` setup commands do not manage this experimental entry; no automatic skill-loading/product integration is claimed. `--headed` is an explicit optional launch flag; acceptance below uses headless Chrome.
+The required capability is checked by AtomCode on every initialize/recovery. It does not activate policy on the stock backend. This prototype requires its own script and policy together. It remains subject to normal MCP approvals and explicit reload. Another unrestricted browser MCP entry is a different interface with different permissions. The managed `/browser` commands manage only their own `browser-use` entry, not this separately named manual entry. The browser-use skill remains explicitly selected rather than automatically loaded. `--headed` is an explicit optional launch flag; acceptance below uses headless Chrome.
 
 ## Verification
 
@@ -93,6 +110,6 @@ ATOMCODE_BROWSER_ORIGIN_TEST_ROOT=/absolute/installed/node_modules/@playwright/m
   cargo nextest run -p atomcode --test browser_origin --run-ignored all
 ```
 
-This verifies direct backend restrictions, redirects, native image results, risky approval classification, required capability mismatch and stale-adapter withdrawal. It does not substitute for full CodingRuntime approval/cancel/unknown-result or real-model acceptance of this new backend.
+This exercises real managed setup followed by production configuration loading, redirects, native image results, risky approval classification, required capability mismatch and stale-adapter withdrawal. The backend itself is also independently tested through raw MCP in the Node verifier. It does not substitute for full CodingRuntime approval/cancel/unknown-result or real-model acceptance of this new backend.
 
-Local recorded acceptance is macOS 14.5 / Apple Silicon, Chrome 157.0.8103.39, Node 22.22.0. Other operating systems/browser versions are unverified. Full CLI/runtime approval/cancel/unknown-result acceptance for this new backend, managed origin setup, richer per-origin permissions and native GUI/platform work remain in the overall delivery audit.
+Local recorded acceptance is macOS 14.5 / Apple Silicon, Chrome 157.0.8103.39, Node 22.22.0. Other operating systems/browser versions are unverified. Managed setup and actual runtime approval-denial have local acceptance. Full cancellation/unknown-result and real-model acceptance for this new backend, richer per-origin permissions and native GUI/platform work remain in the overall delivery audit.
