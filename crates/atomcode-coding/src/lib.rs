@@ -153,3 +153,6 @@ mod mode_models;
 
 /// Opt-in, runtime-owned quality verification and evidence.
 pub mod quality;
+
+#[cfg(test)]
+mod auxiliary_response_tests;

@@ -88,6 +88,9 @@ pub(crate) async fn generate_recap(
     let transcript = recent_stable_transcript(messages)?;
     let prompt = format!("{INSTRUCTIONS}\n\nConversation records (JSON Lines):\n{transcript}");
     let sample = sample_side_call(provider, prompt, SAMPLE_TIMEOUT, "recap").await?;
+    if sample.cut_off {
+        return None;
+    }
     sanitize_recap(&sample.raw)
 }
 

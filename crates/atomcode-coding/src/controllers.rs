@@ -943,8 +943,19 @@ pub(crate) async fn evaluate_goal_with_evidence(
                     StreamEvent::Done { truncated: true } => {
                         return GoalResult::Inconclusive("evaluator response was truncated".into())
                     }
+                    StreamEvent::Malformed
+                    | StreamEvent::ToolCall(_)
+                    | StreamEvent::ToolCallDelta { .. } => {
+                        return GoalResult::Inconclusive(
+                            "evaluator returned malformed or tool output instead of a verdict"
+                                .into(),
+                        );
+                    }
                     _ => {}
                 }
+                // Let the existing cancellation/deadline owner run even when
+                // a custom provider continuously yields ready metadata.
+                tokio::task::yield_now().await;
             }
             if !terminal {
                 return GoalResult::Inconclusive(
@@ -1011,6 +1022,11 @@ pub(crate) async fn evaluate_goal_with_evidence(
 }
 
 fn explicit_unknown(text: &str) -> bool {
+    // Only a valid unknown verdict may ask for another evidence sample.
+    // A contaminated last line is not an instruction to expand evidence.
+    if atomcode_capabilities::provider::contains_native_chat_template_token(text) {
+        return false;
+    }
     let line = text
         .lines()
         .rev()
@@ -1708,6 +1724,11 @@ fn sanitize_for_sentinel(value: &str) -> String {
 }
 
 fn parse_evaluator_response(text: &str) -> GoalResult {
+    if atomcode_capabilities::provider::contains_native_chat_template_token(text) {
+        return GoalResult::Inconclusive(
+            "evaluator response contained a native chat-template token".into(),
+        );
+    }
     let line = text
         .lines()
         .map(str::trim)
