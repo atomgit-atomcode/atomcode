@@ -374,12 +374,12 @@ impl StdioClient {
     }
 
     async fn clear_transport(&self) {
-        self.stdin.lock().await.take();
-        self.reader.lock().await.take();
+        let stdin = self.stdin.lock().await.take();
+        let reader = self.reader.lock().await.take();
         self.preread_line.lock().await.take();
-        if let Some(mut child) = self.process.lock().await.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        let child = self.process.lock().await.take();
+        if let Some(child) = child {
+            stop_owned_process(child, stdin, reader).await;
         }
     }
 
@@ -907,14 +907,56 @@ fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>)
     wrap_cmd_script(command, args, "cmd.exe")
 }
 
+/// EOF lets a cooperative MCP server dispose its owned resources. Drain stdout
+/// so disposal cannot block on a full pipe; never call a business cleanup tool.
+async fn stop_owned_process(
+    mut child: Child,
+    stdin: Option<ChildStdin>,
+    reader: Option<BufReader<ChildStdout>>,
+) {
+    drop(stdin);
+    let graceful = async {
+        let drain = async {
+            if let Some(mut reader) = reader {
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            }
+        };
+        let _ = tokio::join!(child.wait(), drain);
+    };
+    if tokio::time::timeout(Duration::from_secs(2), graceful)
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    }
+    // kill_on_drop is still the fallback if cleanup is itself interrupted.
+}
+
 impl Drop for StdioClient {
     fn drop(&mut self) {
         if !self.owns_transport_lifetime {
             return;
         }
         self.recovery_cancel.cancel();
-        // Try to kill the subprocess gracefully
-        if let Ok(mut process) = self.process.try_lock() {
+        let owned = match (
+            self.process.try_lock(),
+            self.stdin.try_lock(),
+            self.reader.try_lock(),
+        ) {
+            (Ok(mut process), Ok(mut stdin), Ok(mut reader)) => process
+                .take()
+                .map(|child| (child, stdin.take(), reader.take())),
+            _ => None,
+        };
+        if let Some((child, stdin, reader)) = owned {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(stop_owned_process(child, stdin, reader));
+            }
+            // Without an executor the owned Child drops here (kill_on_drop).
+        } else if let Ok(mut process) = self.process.try_lock() {
+            // Recovery can hold a pipe lock. Its cancelled branch also tears
+            // down the transport; do not wait synchronously from Drop.
             if let Some(mut child) = process.take() {
                 let _ = child.start_kill();
             }
@@ -925,6 +967,98 @@ impl Drop for StdioClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn wait_for_cleanup_marker(marker: std::path::PathBuf) {
+        tokio::task::spawn_blocking(move || {
+            let began = std::time::Instant::now();
+            while !marker.exists() && began.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(marker.exists(), "owned child observed stdin EOF");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn owned_process_observes_eof_and_uncooperative_exit_is_bounded() {
+        let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || {
+            let _ = release_clock.recv_timeout(Duration::from_secs(10));
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        for stubborn in [false, true] {
+            let marker = scratch
+                .path()
+                .join(if stubborn { "stubborn" } else { "graceful" });
+            let script = if stubborn {
+                "cat >/dev/null; printf eof > \"$1\"; exec sleep 60"
+            } else {
+                "cat >/dev/null; printf eof > \"$1\""
+            };
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", script, "cleanup-test"])
+                .arg(&marker)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            let stdin = child.stdin.take();
+            let reader = child.stdout.take().map(BufReader::new);
+            let began = tokio::time::Instant::now();
+            let cleanup = tokio::spawn(stop_owned_process(child, stdin, reader));
+            wait_for_cleanup_marker(marker).await;
+            if stubborn {
+                assert!(!cleanup.is_finished());
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+            cleanup.await.unwrap();
+            assert_eq!(
+                began.elapsed(),
+                if stubborn {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::ZERO
+                }
+            );
+            let exists = Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .unwrap()
+                .success();
+            assert!(!exists, "the owned child was reaped");
+        }
+        drop(keep_clock);
+        clock.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dropping_stdio_client_allows_its_owned_child_to_dispose() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("disposed");
+        let client = StdioClient::new(
+            "cleanup".into(),
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "cat >/dev/null; printf eof > \"$1\"".into(),
+                "cleanup-test".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            BTreeMap::new(),
+            None,
+        );
+        client.start().await.unwrap();
+        drop(client);
+        wait_for_cleanup_marker(marker).await;
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bounded_lines_check_before_appending_and_preserve_following_frames() {

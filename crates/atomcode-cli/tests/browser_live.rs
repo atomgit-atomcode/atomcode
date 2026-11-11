@@ -47,16 +47,65 @@ fn element_ref(snapshot: &str, label: &str) -> String {
 #[tokio::test]
 #[ignore = "requires an explicitly installed @playwright/mcp 0.0.85 and Chrome; local acceptance only"]
 async fn real_browser_navigates_fills_submits_and_returns_inline_screenshot() {
-    acceptance(false).await;
+    acceptance(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires an explicitly installed browser backend and Chrome; fault injection acceptance"]
 async fn real_submitted_browser_click_is_not_replayed_after_its_response_is_lost() {
-    acceptance(true).await;
+    acceptance(true, false).await;
 }
 
-async fn acceptance(drop_response: bool) {
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires installed browser backend and Chrome; verifies owned process disposal"]
+async fn real_browser_registry_drop_disposes_its_owned_browser_processes() {
+    acceptance(false, true).await;
+}
+
+#[cfg(unix)]
+async fn owned_process_tree(root: u32) -> Vec<u32> {
+    let output = tokio::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    // Inspect only the exact launched backend's tree; never kill by name or
+    // emit the user's unrelated process command lines into test output.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u32>().ok()?,
+                line,
+            ))
+        })
+        .collect();
+    let mut owned = vec![root];
+    loop {
+        let children: Vec<_> = rows
+            .iter()
+            .filter(|(pid, parent, _)| owned.contains(parent) && !owned.contains(pid))
+            .map(|(pid, _, _)| *pid)
+            .collect();
+        if children.is_empty() {
+            break;
+        }
+        owned.extend(children);
+    }
+    assert!(
+        rows.iter().any(|(pid, _, line)| owned.contains(pid)
+            && (line.contains("Google Chrome") || line.contains("chromium"))),
+        "the exact owned backend has a live browser child"
+    );
+    owned
+}
+
+async fn acceptance(drop_response: bool, verify_disposal: bool) {
     let server = std::env::var_os("ATOMCODE_BROWSER_TEST_SERVER")
         .expect("set explicit installed cli.js path");
     let temp = tempfile::tempdir().unwrap();
@@ -76,6 +125,23 @@ async fn acceptance(drop_response: bool) {
     let config = dirs.user().join("mcp.json");
     let mut root: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
     root["mcpServers"]["browser-use"]["env"]["PLAYWRIGHT_MCP_HEADLESS"] = json!("true");
+    let backend_pid_file = temp.path().join("backend.pid");
+    if verify_disposal {
+        let wrapper = temp.path().join("owned-backend.cjs");
+        let server = root["mcpServers"]["browser-use"]["args"][0]
+            .as_str()
+            .unwrap();
+        std::fs::write(
+            &wrapper,
+            format!(
+                "require('node:fs').writeFileSync({}, String(process.pid)); require({});",
+                json!(backend_pid_file),
+                json!(server)
+            ),
+        )
+        .unwrap();
+        root["mcpServers"]["browser-use"]["args"][0] = json!(wrapper);
+    }
     if drop_response {
         // Forward the real protocol, but drop exactly one successful click response.
         // The underlying browser has already submitted; reconnect must not replay it.
@@ -249,6 +315,43 @@ process.on('SIGTERM',()=>{{child.kill();process.exit(0);}});
         std::fs::write(dir.join("accepted-record.png"), pixels).unwrap();
         std::fs::write(dir.join("accepted-record.json"), json!({"backend":"@playwright/mcp 0.0.85","submission_count":submissions.load(Ordering::SeqCst),"inline_image_count":screenshot.images.len(),"final_snapshot":fresh.content}).to_string()).unwrap();
     }
-    invoke(&registry, "browser_close", json!({}), &ctx).await;
+    if verify_disposal {
+        #[cfg(unix)]
+        {
+            let pid: u32 = std::fs::read_to_string(backend_pid_file)
+                .unwrap()
+                .parse()
+                .unwrap();
+            let owned = owned_process_tree(pid).await;
+            drop(click); // The adapter also holds the registry.
+            drop(registry);
+            let began = std::time::Instant::now();
+            loop {
+                let mut alive = Vec::new();
+                for pid in &owned {
+                    if tokio::process::Command::new("/bin/kill")
+                        .args(["-0", &pid.to_string()])
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await
+                        .unwrap()
+                        .success()
+                    {
+                        alive.push(*pid);
+                    }
+                }
+                if alive.is_empty() {
+                    break;
+                }
+                assert!(
+                    began.elapsed() < std::time::Duration::from_secs(5),
+                    "owned process IDs still alive after bounded disposal: {alive:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    } else {
+        invoke(&registry, "browser_close", json!({}), &ctx).await;
+    }
     web.abort();
 }
