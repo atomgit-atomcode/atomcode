@@ -2147,6 +2147,70 @@ impl HostConfig for Models {
     }
 }
 
+/// The catalog can retain its startup selection while the runtime swaps only
+/// the provider. Host control must report the live selection, even for aliases
+/// that send the very same model name to different accounts.
+#[tokio::test]
+async fn the_model_catalog_reports_the_runtime_selection_after_same_wire_switches() {
+    struct Catalog;
+    #[async_trait::async_trait]
+    impl atomcode_harness::seams::Models for Catalog {
+        fn list(&self) -> Vec<atomcode_harness::seams::ModelInfo> {
+            Vec::new()
+        }
+        fn current(&self) -> Option<String> {
+            Some("stale/startup".into())
+        }
+        async fn provider(&self, _: &str) -> Result<Arc<dyn LlmProvider>, String> {
+            Err("not needed for this catalog".into())
+        }
+    }
+    struct SameWire(std::path::PathBuf);
+    impl HostConfig for SameWire {
+        fn for_model(&self, id: &str) -> Result<CodingAgentConfig, String> {
+            let mut config = Models(self.0.clone()).for_model("deepseek-flash")?;
+            config.provider_name = id.into();
+            Ok(config)
+        }
+        fn current(&self) -> Result<CodingAgentConfig, String> {
+            self.for_model("a/ds")
+        }
+    }
+    let env = env();
+    let (connection, front_end) = connected_as(
+        &env,
+        SubagentPolicy::Disabled,
+        Some(Arc::new(SameWire(env.project.path().to_path_buf()))),
+    )
+    .await;
+    let _catalog = front_end
+        .app()
+        .unwrap()
+        .provide::<atomcode_harness::seams::ModelsSvc>(Arc::new(Catalog))
+        .unwrap();
+    for id in ["a/ds", "b/ds", "a/ds"] {
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: connection.session.clone(),
+                model: id.into(),
+            })
+            .await
+            .unwrap();
+        match connection
+            .control
+            .call(HostCommand::Models {
+                session: connection.session.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            HostReply::Models { current, .. } => assert_eq!(current.as_deref(), Some(id)),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
 /// A model switched through host control is the one the next request goes to;
 /// one the host cannot resolve is refused. Signing out takes the model away and
 /// signing in reapplies the saved configuration while keeping the session.

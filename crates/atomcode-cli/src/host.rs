@@ -2719,7 +2719,10 @@ impl HostControl for RuntimeControl {
                     .ok_or_else(|| HostError::Failed {
                         message: tr(SMsg::HostNoModelCatalog).into_owned(),
                     })?;
-                let current = models.current();
+                // The mounted catalog can outlive a provider swap. The runtime
+                // owns the live selection, including mode-bound model changes.
+                let current = self.handle.model_selection().await.map_err(refused)?.model;
+                let current = (!current.is_empty()).then_some(current);
                 Ok(HostReply::Models {
                     models: models
                         .list()
