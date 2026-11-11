@@ -1678,6 +1678,7 @@ async fn a_turn_is_transcribed_and_metered() {
 /// `<CWD>`. The hook's own unit test starts with a directory; this one proves
 /// the runtime actually passes the one the session runs in.
 #[tokio::test]
+#[serial_test::serial(engine)]
 async fn a_provider_error_is_scrubbed_with_the_session_working_dir() {
     let env = env();
     let recorder = Arc::new(Recorder::default());

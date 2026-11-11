@@ -54,14 +54,18 @@ fn usable_path(path: Option<&Path>) -> Option<&str> {
 
 pub fn scrub_path(s: &str, home: Option<&Path>, cwd: Option<&Path>) -> String {
     let mut out = s.to_string();
-    // The working directory goes first: when the session lives under home it
-    // is the longer, more specific prefix, so a project path reads as
-    // `<CWD>/…` rather than exposing the rest of the home-relative tree.
+    let mut paths: Vec<(&str, &str)> = Vec::new();
     if let Some(c) = usable_path(cwd) {
-        out = out.replace(c, "<CWD>");
+        paths.push((c, "<CWD>"));
     }
     if let Some(h) = usable_path(home) {
-        out = out.replace(h, "<HOME>");
+        paths.push((h, "<HOME>"));
+    }
+    // Longest first: the more specific prefix must be replaced before a
+    // shorter ancestor can hide the rest of the path behind it.
+    paths.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (path, marker) in paths {
+        out = out.replace(path, marker);
     }
     out
 }
@@ -125,6 +129,17 @@ mod tests {
         assert_eq!(
             scrub_path(s, Some(&home), Some(&cwd)),
             "error in <CWD>/src/main.rs:3"
+        );
+    }
+
+    #[test]
+    fn home_wins_when_cwd_is_its_parent() {
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/home");
+        let s = "error in /home/u/proj/src/main.rs:3";
+        assert_eq!(
+            scrub_path(s, Some(&home), Some(&cwd)),
+            "error in <HOME>/proj/src/main.rs:3"
         );
     }
 
