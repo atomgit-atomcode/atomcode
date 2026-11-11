@@ -193,23 +193,24 @@ struct ConnectingClient {
     client: Option<Box<dyn McpClient>>,
     connection: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
-impl std::ops::Deref for ConnectingClient {
-    type Target = dyn McpClient;
-    fn deref(&self) -> &Self::Target {
-        self.client.as_deref().expect("unpublished client")
-    }
-}
-impl std::ops::DerefMut for ConnectingClient {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.client.as_deref_mut().expect("unpublished client")
-    }
-}
 impl ConnectingClient {
-    fn publish(mut self) -> (Arc<dyn McpClient>, tokio::sync::OwnedRwLockReadGuard<()>) {
-        (
-            Arc::from(self.client.take().expect("unpublished client")),
-            self.connection.take().expect("connection lease"),
-        )
+    async fn initialize(&mut self) -> Result<super::types::InitializeResult> {
+        match self.client.as_mut() {
+            Some(client) => client.initialize().await,
+            None => anyhow::bail!("MCP initialization has no unpublished client"),
+        }
+    }
+
+    fn publish(mut self) -> Result<(Arc<dyn McpClient>, tokio::sync::OwnedRwLockReadGuard<()>)> {
+        match (self.client.take(), self.connection.take()) {
+            (Some(client), Some(connection)) => Ok((Arc::from(client), connection)),
+            (client, connection) => {
+                // Preserve whatever we still own for Drop's cleanup path.
+                self.client = client;
+                self.connection = connection;
+                anyhow::bail!("MCP publication lost its client or connection lease")
+            }
+        }
     }
 }
 impl Drop for ConnectingClient {
@@ -247,7 +248,7 @@ impl RetiringClient {
 }
 impl Drop for RetiringClient {
     fn drop(&mut self) {
-        self.detach();
+        let _ = self.detach();
     }
 }
 
@@ -840,7 +841,30 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                         }
                                     }
                                     let mut servers = servers.write().await;
-                                    let (client, connection) = client.publish();
+                                    let (client, connection) = match client.publish() {
+                                        Ok(published) => published,
+                                        Err(error) => {
+                                            drop(servers);
+                                            let message = error.to_string();
+                                            failed_servers
+                                                .write()
+                                                .await
+                                                .insert(name.clone(), message.clone());
+                                            if let Some(tx) = tx {
+                                                let _ = tx.send(McpConnectEvent::Failed {
+                                                    name,
+                                                    error: message,
+                                                    attempt: Some(ConnectAttempt {
+                                                        transport,
+                                                        source,
+                                                        duration_ms: started.elapsed().as_millis()
+                                                            as u64,
+                                                    }),
+                                                });
+                                            }
+                                            return;
+                                        }
+                                    };
                                     let old = servers.insert(name.clone(), client);
                                     let retired = RetiringClient {
                                         client: old,
@@ -1011,7 +1035,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
         self.record_server_instructions(&config.name, initialization.instructions.as_deref());
 
         let mut servers = self.servers.write().await;
-        let (client, connection) = client.publish();
+        let (client, connection) = client.publish()?;
         let old = servers.insert(config.name.clone(), client);
         let retired = RetiringClient {
             client: old,

@@ -25,3 +25,9 @@ Capabilities/MCP: 1481 passed, two skipped. Runtime MCP criteria: 15 passed. Rea
 An intermediate regression exposed that initial readiness had accidentally waited for cleanup. The final leased-drop implementation preserves prompt cancellation readiness while the owner shutdown barrier still waits for disposal. Tests also explicitly poll shutdown before asserting its fence, rather than mistaking an earlier cancel_pending_work notification for shutdown having started.
 
 Final focused lifecycle rerun: five passed. Full compile gate passed on final source, including all-targets, feature variants and both negative canaries. Format and diff checks passed. Cargo.lock has zero hkdf/hmac/zeroize_derive package names and index flag H; no new dependency was added.
+
+## Follow-up panic-boundary audit
+
+A targeted production Clippy run found four expect calls in the private ConnectingClient lease wrapper. They were introduced by this change and violate the MCP module's explicit no-panic lint even though ordinary compile/tests passed. The wrapper now exposes fallible initialize/publication operations, preserves owned resources on invalid state, and reports background publication failure rather than panicking or claiming Connected. The targeted production Clippy run then passed; existing unrelated warnings are retained. No lint exemption was added.
+
+Follow-up validation: targeted production MCP Clippy exits zero; capabilities/MCP 1481 passed, two skipped; runtime MCP criteria 15 passed; compile gate (including feature variants and negative canaries), cargo fmt check, diff check and forbidden-lock-package check passed. No dependency change.
