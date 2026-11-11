@@ -278,3 +278,30 @@ test('cancellation before an existing-context lookup completes cannot read cooki
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(cookieReads, 0); assert.equal(f.requests(), 0);
 });
+
+test('response synchronization requires explicit valid authentication flags before dispatch', async t => {
+  const f = await fixture(t, (_req, res) => res.end('unexpected'));
+  for (const args of [
+    { url: f.origin, sync_response_cookies: true },
+    { url: f.origin, use_browser_context: false, sync_response_cookies: true },
+    { url: f.origin, use_browser_context: true, sync_response_cookies: 'true' },
+  ]) await assert.rejects(f.owner.execute(JSON.stringify(args), args));
+  assert.equal(f.requests(), 0);
+});
+
+test('read-only cookie mode stays read-only and failed native sync closes the captured context without publishing or retrying', async t => {
+  let pages = 0, closed = 0, captured;
+  const context = {
+    async cookies() { return []; },
+    async newPage() { pages++; return { async route() {}, async goto() { throw new Error('uncertain navigation'); }, async close() {} }; },
+  };
+  const f = await fixture(t, (_req, res) => { res.setHeader('Set-Cookie', 'session=fixture; HttpOnly'); res.end('body'); }, {
+    getContext: async () => context, closeContext: async value => { captured = value; closed++; },
+  });
+  const saved = await f.owner.execute(1, { url: f.origin, use_browser_context: true });
+  assert.equal(fs.readFileSync(saved.path, 'utf8'), 'body');
+  assert.equal(pages, 0); assert.equal(closed, 0);
+  await assert.rejects(f.owner.execute(2, { url: f.origin, use_browser_context: true, sync_response_cookies: true }));
+  assert.equal(pages, 1); assert.equal(closed, 1); assert.equal(captured, context);
+  assert.equal(f.requests(), 2); assert.equal(fs.readdirSync(f.files).length, 1);
+});

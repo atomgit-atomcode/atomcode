@@ -64,6 +64,7 @@ function prepareOutput(outputDir) {
 // factory; production always launches the installed Chrome through a pipe.
 function ownedBrowser(chromium, origins, headed) {
   let current;
+  const contextOpenings = new WeakMap(), disposedOpenings = new WeakMap();
   let closing = false;
   let cleanup = Promise.resolve();
   async function get() {
@@ -81,6 +82,7 @@ function ownedBrowser(chromium, origins, headed) {
             args: ['--disable-quic', '--disable-background-networking', '--dns-prefetch-disable',
               '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] });
           const context = await browser.newContext({ acceptDownloads: false, serviceWorkers: 'block', permissions: [] });
+          contextOpenings.set(context, opening);
           return { browser, context, proxy };
         } catch (error) {
           await browser?.close().catch(() => {});
@@ -106,7 +108,14 @@ function ownedBrowser(chromium, origins, headed) {
       }
       if (previous.status === 'rejected') throw previous.reason;
     })();
+    if (old) disposedOpenings.set(old, cleanup);
     return cleanup;
+  }
+
+  function closeCaptured(context) {
+    const opening = contextOpenings.get(context);
+    if (!opening) return Promise.reject(new Error('Unknown owned context'));
+    return opening === current ? close() : disposedOpenings.get(opening) || Promise.resolve();
   }
 
   async function existing() {
@@ -116,7 +125,7 @@ function ownedBrowser(chromium, origins, headed) {
     if (current !== opening || closing) throw new Error('Owned context was replaced or closed');
     return owned.context;
   }
-  return { get, close, existing, async stats() { return { ...(await current)?.proxy.stats }; } };
+  return { get, close, closeCaptured, existing, async stats() { return { ...(await current)?.proxy.stats }; } };
 }
 
 async function serve({ root, outputDir, origins, headed = false }) {
@@ -125,7 +134,7 @@ async function serve({ root, outputDir, origins, headed = false }) {
   const policy = policyDetails(origins);
   const owner = ownedBrowser(external.chromium, origins, headed);
   const downloads = policy.downloads.size ? new ControlledDownloads({
-    files, authorize: origin => origins.has(origin) && policy.downloads.has(origin), getContext: owner.existing,
+    files, authorize: origin => origins.has(origin) && policy.downloads.has(origin), getContext: owner.existing, closeContext: context => owner.closeCaptured(context),
   }) : undefined;
   const closeOwned = permanent => {
     // Fence browser launches synchronously, before awaiting transfer teardown.
@@ -178,7 +187,7 @@ async function main() {
   if (config.doctor) {
     console.log(JSON.stringify({ version: policyDetails(origins).version, kind: 'doctor', browser_launched: false,
       mcp: MCP_VERSION, playwright: CORE_VERSION, capability: CAPABILITY,
-      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny' }));
+      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny', response_cookie_sync: policyDetails(origins).downloads.size ? 'explicit-native-interception' : 'deny' }));
     return;
   }
   if (!config.outputDir) throw new Error('--output-dir is required');

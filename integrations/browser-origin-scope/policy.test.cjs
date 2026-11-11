@@ -314,3 +314,23 @@ test('existing context lookup never launches, reopens or adopts a disposed conte
   await assert.rejects(owner.existing());
   assert.equal(launches, 2);
 });
+
+test('late cookie cleanup closes its captured generation without disposing a replacement', async () => {
+  const { ownedBrowser } = require('./backend.cjs');
+  let launches = 0;
+  const closed = [];
+  const owner = ownedBrowser({ async launch() {
+    const generation = ++launches;
+    return { async newContext() { return { generation }; }, async close() { closed.push(generation); } };
+  } }, new Set(), false);
+  const first = await owner.get();
+  await owner.close();
+  const replacement = await owner.get();
+  await owner.closeCaptured(first);
+  assert.equal(await owner.existing(), replacement);
+  assert.deepEqual(closed, [1]);
+  await owner.closeCaptured(replacement);
+  assert.deepEqual(closed, [1, 2]);
+  await assert.rejects(owner.existing());
+  await owner.close(true);
+});

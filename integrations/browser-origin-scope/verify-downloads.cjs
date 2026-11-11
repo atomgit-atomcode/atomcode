@@ -44,11 +44,18 @@ async function verify(root, reportPath) {
     return { cert, options: { key: fs.readFileSync(key), cert: fs.readFileSync(cert) } };
   }
   const trusted = certificate('trusted-fixture'), untrusted = certificate('untrusted-fixture');
-  let secureRequests = 0, untrustedRequests = 0, unexpectedAuthorization = false;
+  let secureRequests = 0, untrustedRequests = 0, unexpectedAuthorization = false, plaintextSecureCookieSeen = false;
+  const secureHits = [];
   const tls = https.createServer(trusted.options, (req, res) => {
-    secureRequests++;
+    secureRequests++; secureHits.push(req.url);
+    if (req.url === '/tls/check') {
+      if (req.headers.cookie !== 'secureRotation=https-fixture') { res.writeHead(401); return res.end('SECURE_COOKIE_MISSING'); }
+      return res.end('TLS_COOKIE_ROTATION_CONFIRMED');
+    }
     if (req.headers.cookie !== 'session=ephemeral-download-fixture') { res.writeHead(401); return res.end('AUTH_REQUIRED'); }
-    unexpectedAuthorization ||= req.headers.authorization !== undefined; res.end('TLS_AUTHENTICATED_DOWNLOAD_FIXTURE');
+    unexpectedAuthorization ||= req.headers.authorization !== undefined;
+    if (req.url === '/auth/https-sync') res.setHeader('Set-Cookie', 'secureRotation=https-fixture; Secure; HttpOnly; Path=/tls/; SameSite=Strict');
+    res.end('TLS_AUTHENTICATED_DOWNLOAD_FIXTURE');
   });
   const badTls = https.createServer(untrusted.options, (_req, res) => { untrustedRequests++; res.end('MUST_NOT_FETCH'); });
 
@@ -75,8 +82,45 @@ async function verify(root, reportPath) {
       res.setHeader('Set-Cookie', 'session=ephemeral-download-fixture; HttpOnly; Path=/auth/; SameSite=Strict');
       res.setHeader('Content-Type', 'text/html'); return res.end('<h1>OWNED_BROWSER_LOGIN_FIXTURE</h1>');
     }
+    if (req.url === '/tls/check') {
+      plaintextSecureCookieSeen ||= req.headers.cookie !== undefined; return res.end('SECURE_COOKIE_WITHHELD_FROM_HTTP');
+    }
+    if (req.url === '/auth/assert-logged-out') {
+      res.setHeader('Content-Type', 'text/html');
+      return res.end(req.headers.cookie === undefined ? '<h1>COOKIE_LOGGED_OUT</h1>' : '<h1>COOKIE_STILL_PRESENT</h1>');
+    }
     if (req.url.startsWith('/auth/')) {
-      if (req.headers.cookie !== 'session=ephemeral-download-fixture') { res.writeHead(401); return res.end('AUTH_REQUIRED'); }
+      if (!['session=ephemeral-download-fixture', 'session=rotated-sync-fixture', 'session=denied-sync-fixture', 'session=readonly-fixture'].includes(req.headers.cookie)) { res.writeHead(401); return res.end('AUTH_REQUIRED'); }
+      if (req.url === '/auth/partitioned-response') {
+        res.setHeader('Set-Cookie', 'session=partitioned-fixture; Secure; SameSite=None; Partitioned; Path=/auth/'); return res.end('PARTITIONED_UNSUPPORTED');
+      }
+      if (req.url === '/auth/assert-original') {
+        res.setHeader('Content-Type', 'text/html'); return res.end(req.headers.cookie === 'session=ephemeral-download-fixture' ? '<h1>ORIGINAL_COOKIE_RETAINED</h1>' : '<h1>ORIGINAL_COOKIE_LOST</h1>');
+      }
+      if (req.url === '/auth/readonly-rotate') {
+        res.writeHead(302, { 'Set-Cookie': 'session=readonly-fixture; Path=/auth/; HttpOnly', Location: '/auth/readonly-final' }); return res.end();
+      }
+      if (req.url === '/auth/readonly-final') {
+        if (req.headers.cookie === 'session=readonly-fixture') return res.end('READ_ONLY_COOKIE_WAS_APPLIED');
+        res.writeHead(401); return res.end('READ_ONLY_COOKIE_WAS_NOT_APPLIED');
+      }
+      if (req.url === '/auth/sync-rotate') {
+        res.writeHead(302, { 'Set-Cookie': 'session=rotated-sync-fixture; Path=/auth/; HttpOnly; SameSite=Strict', Location: '/auth/sync-final' }); return res.end();
+      }
+      if (req.url === '/auth/sync-final') {
+        if (req.headers.cookie !== 'session=rotated-sync-fixture') { res.writeHead(401); return res.end('COOKIE_NOT_ROTATED'); }
+        return res.end('STATEFUL_DOWNLOAD_FIXTURE');
+      }
+      if (req.url === '/auth/sync-delete') {
+        res.setHeader('Set-Cookie', 'session=deleted; Path=/auth/; Max-Age=0; HttpOnly'); return res.end('COOKIE_DELETION_FIXTURE');
+      }
+      if (req.url === '/auth/sync-denied') {
+        res.writeHead(302, { 'Set-Cookie': 'session=denied-sync-fixture; Path=/auth/; HttpOnly', Location: bad + '/auth/forbidden' }); return res.end();
+      }
+      if (req.url === '/auth/assert-rotated' || req.url === '/auth/assert-denied-rotated') {
+        const expected = req.url === '/auth/assert-rotated' ? 'session=rotated-sync-fixture' : 'session=denied-sync-fixture';
+        res.setHeader('Content-Type', 'text/html'); return res.end(req.headers.cookie === expected ? '<h1>COOKIE_ROTATED_IN_BROWSER</h1>' : '<h1>COOKIE_NOT_ROTATED</h1>');
+      }
       unexpectedAuthorization ||= req.headers.authorization !== undefined;
       if (req.url === '/auth/redirect') { res.writeHead(302, { Location: bad + '/auth/stolen' }); return res.end(); }
       if (req.url === '/auth/cross') { res.writeHead(302, { Location: crossOrigin + '/auth/target' }); return res.end(); }
@@ -182,6 +226,45 @@ async function verify(root, reportPath) {
     assert.equal(secureRequests, 1); assert.equal(untrustedRequests, 0);
     assert.equal(unexpectedAuthorization, false);
     report.cases.push('HTTPS authenticated download uses only the generated fixture CA; separately untrusted certificate is refused before HTTP despite an origin grant');
+    const secureSync = await call('browser_download', { url: secureOrigin + '/auth/https-sync', use_browser_context: true, sync_response_cookies: true });
+    assert.equal(secureSync.result.isError, undefined);
+    const secureCheck = await call('browser_download', { url: secureOrigin + '/tls/check', use_browser_context: true });
+    assert.equal(secureCheck.result.isError, undefined);
+    assert.equal(fs.readFileSync(JSON.parse(secureCheck.result.content[0].text).path, 'utf8'), 'TLS_COOKIE_ROTATION_CONFIRMED');
+    const plaintextCheck = await call('browser_download', { url: good + '/tls/check', use_browser_context: true });
+    assert.equal(plaintextCheck.result.isError, undefined); assert.equal(plaintextSecureCookieSeen, false);
+    assert.equal(secureHits.filter(hit => hit === '/auth/https-sync').length, 1);
+    assert.equal(secureHits.filter(hit => hit === '/tls/check').length, 1);
+    report.cases.push('HTTPS response Cookie sync retains Secure/HttpOnly/path semantics, reaches only HTTPS and never repeats the remote GET');
+
+    assert.equal((await call('browser_download', { url: good + '/auth/partitioned-response', use_browser_context: true, sync_response_cookies: true })).result.isError, true);
+    await call('browser_navigate', { url: good + '/auth/assert-original' });
+    assert.ok(JSON.stringify((await call('browser_snapshot')).result).includes('ORIGINAL_COOKIE_RETAINED'));
+    assert.equal(hits.filter(hit => hit === '/auth/partitioned-response').length, 1);
+    report.cases.push('Partitioned sync response fails before cookie mutation/publication and is not replayed');
+    assert.equal((await call('browser_download', { url: good + '/auth/readonly-rotate', use_browser_context: true })).result.isError, true);
+    const beforeTabs = (await call('browser_tabs', { action: 'list' })).result.content;
+    const synced = await call('browser_download', { url: good + '/auth/sync-rotate', use_browser_context: true, sync_response_cookies: true });
+    assert.equal(synced.result.isError, undefined);
+    assert.equal(fs.readFileSync(JSON.parse(synced.result.content[0].text).path, 'utf8'), 'STATEFUL_DOWNLOAD_FIXTURE');
+    assert.deepEqual((await call('browser_tabs', { action: 'list' })).result.content, beforeTabs);
+    await call('browser_navigate', { url: good + '/auth/assert-rotated' });
+    assert.ok(JSON.stringify((await call('browser_snapshot')).result).includes('COOKIE_ROTATED_IN_BROWSER'));
+    const deleted = await call('browser_download', { url: good + '/auth/sync-delete', use_browser_context: true, sync_response_cookies: true });
+    assert.equal(deleted.result.isError, undefined);
+    await call('browser_navigate', { url: good + '/auth/assert-logged-out' });
+    assert.ok(JSON.stringify((await call('browser_snapshot')).result).includes('COOKIE_LOGGED_OUT'));
+    await call('browser_navigate', { url: good + '/login' });
+    const deniedSync = await call('browser_download', { url: good + '/auth/sync-denied', use_browser_context: true, sync_response_cookies: true });
+    assert.equal(deniedSync.result.isError, true); assert.equal(deniedHits, 0);
+    await call('browser_navigate', { url: good + '/auth/assert-denied-rotated' });
+    assert.ok(JSON.stringify((await call('browser_snapshot')).result).includes('COOKIE_ROTATED_IN_BROWSER'));
+    await call('browser_navigate', { url: good + '/login' });
+    for (const value of ['/auth/sync-rotate', '/auth/sync-final', '/auth/sync-delete', '/auth/sync-denied'])
+      assert.equal(hits.filter(hit => hit === value).length, 1, 'no second remote cookie-sync GET');
+    report.cases.push('explicit response-cookie sync rotates a redirect session, updates original browser state and deletes it, with unchanged tab list and one remote GET per hop; read-only default stays read-only');
+    report.cases.push('a refused redirect can retain its authorized source cookie effect; no forbidden request and no automatic replay');
+
 
 
     const held = request('tools/call', { name: 'browser_download', arguments: { url: good + '/auth/hold-close', use_browser_context: true } });
@@ -201,13 +284,14 @@ async function verify(root, reportPath) {
     // EOF may prevent a terminal delivery; no replay and no publication is authoritative.
     pending.get(eof.id)?.resolve({ result: { isError: true } }); pending.delete(eof.id);
     assert.ok(captured.every(pid => !alive(pid)));
-    assert.equal(fs.readdirSync(path.join(output, 'files')).filter(name => name.startsWith('download-')).length, 5);
+    assert.equal(fs.readdirSync(path.join(output, 'files')).filter(name => name.startsWith('download-')).length, 10);
     assert.deepEqual(fs.readdirSync(path.join(output, 'download-staging')), []);
     assert.equal(stderr, '');
     report.cases.push('pure stdin EOF drains transfer and exits zero, without signal fallback or staged remnants');
     report.denied_requests = deniedHits;
     report.untrusted_tls_http_requests = untrustedRequests;
     report.cross_host_cookie_seen = crossHadCookie;
+    report.secure_cookie_over_plaintext_seen = plaintextSecureCookieSeen;
     report.authorization_header_seen = unexpectedAuthorization || crossHadAuthorization;
     report.owned_pids = captured;
     report.stderr_bytes = Buffer.byteLength(stderr);

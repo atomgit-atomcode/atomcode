@@ -7,17 +7,19 @@ const https = require('node:https');
 const { randomUUID, createHash } = require('node:crypto');
 const { Transform, Writable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
+const { synchronizeResponseCookies } = require('./cookies.cjs');
 
 // Backend-owned publication boundary. Transport cancellation and shutdown
 // must drain jobs here before disposing the owned browser.
 class ControlledDownloads {
-  constructor({ files, authorize, getContext, maxBytes = 64 * 1024 * 1024, timeoutMs = 15000 }) {
+  constructor({ files, authorize, getContext, closeContext, maxBytes = 64 * 1024 * 1024, timeoutMs = 15000 }) {
     if (!path.isAbsolute(files) || !Number.isSafeInteger(maxBytes) || maxBytes <= 0 ||
         !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || typeof authorize !== 'function')
       throw new Error('Invalid controlled download configuration');
     this.files = files;
     this.authorize = authorize;
     this.getContext = getContext;
+    this.closeContext = closeContext;
     this.maxBytes = maxBytes;
     this.timeoutMs = timeoutMs;
     this.jobs = new Map();
@@ -40,14 +42,16 @@ class ControlledDownloads {
   execute(id, args) {
     if (this.closed || this.draining || this.jobs.has(id)) return Promise.reject(new Error('Download unavailable'));
     if (!args || typeof args !== 'object' || Array.isArray(args) ||
-        Object.keys(args).some(key => !['url', 'use_browser_context'].includes(key)) ||
-        !Object.hasOwn(args, 'url') || (Object.hasOwn(args, 'use_browser_context') && typeof args.use_browser_context !== 'boolean'))
+        Object.keys(args).some(key => !['url', 'use_browser_context', 'sync_response_cookies'].includes(key)) ||
+        !Object.hasOwn(args, 'url') || (Object.hasOwn(args, 'use_browser_context') && typeof args.use_browser_context !== 'boolean') ||
+        (Object.hasOwn(args, 'sync_response_cookies') && typeof args.sync_response_cookies !== 'boolean') ||
+        (args.sync_response_cookies === true && args.use_browser_context !== true))
       return Promise.reject(new Error('Expected only a download URL'));
     const controller = new AbortController();
     const job = { controller };
     this.jobs.set(id, job);
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    job.promise = this.transfer(args.url, controller.signal, args.use_browser_context === true).finally(() => {
+    job.promise = this.transfer(args.url, controller.signal, args.use_browser_context === true, args.sync_response_cookies === true).finally(() => {
       clearTimeout(timer);
       this.jobs.delete(id);
     });
@@ -82,12 +86,13 @@ class ControlledDownloads {
     return url;
   }
 
-  async transfer(value, signal, authenticated) {
+  async transfer(value, signal, authenticated, synchronizeCookies) {
     let temporary;
     let handle;
     let response;
     try {
       let url = this.permitted(value);
+      if (synchronizeCookies && typeof this.closeContext !== 'function') throw new Error('Missing owned-context cleanup');
       // Capture one existing context; never launch or adopt a replacement.
       const context = authenticated ? await abortable(() => this.getContext?.(), signal) : undefined;
       signal.throwIfAborted();
@@ -106,12 +111,16 @@ class ControlledDownloads {
         }
         response = await new Promise((resolve, reject) => {
           const request = (url.protocol === 'https:' ? https : http).get(url, {
-            agent: false, signal, headers, rejectUnauthorized: true,
+            agent: false, signal, headers, rejectUnauthorized: true, maxHeaderSize: 16384, insecureHTTPParser: false,
           }, resolve);
           request.once('error', reject);
         });
         // Install immediately, including while headers are inspected.
         response.on('error', () => {});
+        if (synchronizeCookies) {
+          await synchronizeResponseCookies(context, url, response.headers['set-cookie'], signal, () => this.closeContext(context));
+          signal.throwIfAborted();
+        }
         if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
           const location = response.headers.location;
           response.destroy();
