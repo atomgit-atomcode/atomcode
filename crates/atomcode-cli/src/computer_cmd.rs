@@ -209,6 +209,15 @@ pub(crate) fn write_checked(path: &Path, before: &Option<String>, text: &str) ->
     }
     atomic_write(path, text.as_bytes(), 0o600)
 }
+
+/// Managed desktop/browser setup edits the same MCP document. Serialize both
+/// integrations; optimistic text checks still detect non-cooperating edits.
+pub(crate) fn lock_mcp_setup(dirs: &ProductDirs) -> Result<SetupLock> {
+    Ok(SetupLock::acquire(
+        &dirs.user().join("integrations/mcp-setup"),
+        false,
+    )?)
+}
 async fn enable_after_probe(dirs: &ProductDirs, backend: &Path, deadline: Duration) -> Result<()> {
     probe(backend, deadline).await?.require_ready()?;
     enable(dirs, backend)
@@ -219,7 +228,7 @@ fn is_bundled_skill(text: &str) -> bool {
 }
 
 fn enable(dirs: &ProductDirs, backend: &Path) -> Result<()> {
-    let _lock = SetupLock::acquire(&dirs.user().join("integrations/computer-use"), false)?;
+    let _lock = lock_mcp_setup(dirs)?;
     let config = config_path(dirs);
     let before = read_optional(&config)?;
     owned_entry(before.as_deref())?;
@@ -264,7 +273,7 @@ fn disable(dirs: &ProductDirs) -> Result<()> {
     if owned_entry(before.as_deref())?.is_none() {
         return Ok(());
     }
-    let _lock = SetupLock::acquire(&dirs.user().join("integrations/computer-use"), false)?;
+    let _lock = lock_mcp_setup(dirs)?;
     let after = set_mcp_server_disabled_in_text(
         before
             .as_deref()

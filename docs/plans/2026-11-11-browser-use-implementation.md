@@ -22,3 +22,7 @@ Later design stages remain in scope for separate verified work: enforceable orig
 - Isolated tree: 406 CLI/lib/host/setup tests passed (one opt-in live test skipped), 1,972 host API/TUI tests passed, 1,464 capabilities/MCP tests passed (two opt-in tests skipped).
 - Explicit live runs: local form navigate/fill/submit/screenshot passed through AtomCode adapter; fault-injected lost click response reports unknown result and preserves submission count one after reconnect; actual runtime approval denial prevented any HTTP request.
 - Isolated compile gate including feature checks and negative controls passed. Final branch integration and final-state checks still pending.
+
+- Rebased implementation commits onto committed provider-diagnostics baseline 8966af165 without importing the ongoing title-validation edits. Existing coding runtime MCP criteria: 13 passed.
+- Review found desktop/browser setup used different locks for the same user document; both now share the managed MCP setup lock. A cross-service contention test and all related setup/probe tests passed: 22 tests. Non-cooperating editors still receive optimistic precommit checks, not an atomic filesystem CAS guarantee.
+- Actual final-page PNG inspected: expected confirmation, marker and submission-count=1; evidence retained outside Git at /tmp/atomcode-browser-evidence. Browser Chrome 157.0.8103.39, Node v22.22.0; MCP package 0.0.85 reports Playwright 1.66.0-alpha-2026-11-09.

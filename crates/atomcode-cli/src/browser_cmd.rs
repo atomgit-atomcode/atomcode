@@ -7,13 +7,12 @@ use anyhow::{bail, Context, Result};
 use atomcode_capabilities::mcp::{
     merge_stdio_mcp_server_into_text, set_mcp_server_disabled_in_text,
 };
-use atomcode_capabilities::setup::lock::SetupLock;
 use atomcode_capabilities::ProductDirs;
 use clap::Subcommand;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
-use crate::computer_cmd::{read_optional, write_checked};
+use crate::computer_cmd::{lock_mcp_setup, read_optional, write_checked};
 
 const SERVER: &str = "browser-use";
 const OWNER: &str = "atomcode-browser-use-v1";
@@ -79,9 +78,11 @@ fn managed_env(dirs: &ProductDirs) -> Result<Value> {
     }
     env.insert(
         "PLAYWRIGHT_MCP_OUTPUT_DIR".into(),
-        json!(std::path::absolute(dirs.user().join("integrations/browser-use/artifacts"))?
-            .to_str()
-            .context("output path must be UTF-8")?),
+        json!(
+            std::path::absolute(dirs.user().join("integrations/browser-use/artifacts"))?
+                .to_str()
+                .context("output path must be UTF-8")?
+        ),
     );
     env.insert("PLAYWRIGHT_MCP_OUTPUT_MAX_SIZE".into(), json!("16777216"));
     Ok(Value::Object(env))
@@ -279,7 +280,7 @@ async fn check(node: &Path, server: &Path) -> Result<()> {
 }
 
 fn enable(dirs: &ProductDirs, node: &Path, server: &Path) -> Result<()> {
-    let _lock = SetupLock::acquire(&dirs.user().join("integrations/browser-use"), false)?;
+    let _lock = lock_mcp_setup(dirs)?;
     let path = config_path(dirs);
     let before = read_optional(&path)?;
     owned_entry(before.as_deref())?;
@@ -326,7 +327,7 @@ fn disable(dirs: &ProductDirs) -> Result<()> {
     if owned_entry(read_optional(&path)?.as_deref())?.is_none() {
         return Ok(());
     }
-    let _lock = SetupLock::acquire(&dirs.user().join("integrations/browser-use"), false)?;
+    let _lock = lock_mcp_setup(dirs)?;
     let before = read_optional(&path)?;
     owned_entry(before.as_deref())?.context("managed browser configuration disappeared")?;
     let after = set_mcp_server_disabled_in_text(
@@ -456,6 +457,29 @@ mod tests {
             read_optional(&skill_path(&dirs)).unwrap().unwrap(),
             "custom skill\nauto-load: off"
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_and_browser_setup_share_the_same_document_lock() {
+        let (_t, dirs) = tree();
+        setup(&dirs);
+        let mut root: Value =
+            serde_json::from_str(&read_optional(&config_path(&dirs)).unwrap().unwrap()).unwrap();
+        root["mcpServers"]["computer-use"] =
+            json!({"command":"unused", "managedBy":"atomcode-computer-use-v1"});
+        put(&config_path(&dirs), &root.to_string());
+        let before = read_optional(&config_path(&dirs)).unwrap();
+        let lock = lock_mcp_setup(&dirs).unwrap();
+        assert!(enable(&dirs, Path::new("node"), Path::new("server")).is_err());
+        assert!(disable(&dirs).is_err());
+        assert!(
+            crate::computer_cmd::execute(&dirs, crate::computer_cmd::ComputerCli::Disable)
+                .await
+                .is_err()
+        );
+        assert_eq!(read_optional(&config_path(&dirs)).unwrap(), before);
+        drop(lock);
+        disable(&dirs).unwrap();
     }
 
     #[cfg(unix)]
