@@ -3395,6 +3395,7 @@ mod tests {
             trust: false,
             auto_approve: vec![],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
         let part_before = partition_by_trust(vec![project_cfg.clone()], &proj, &tree);
         assert_eq!(

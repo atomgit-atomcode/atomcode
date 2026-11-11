@@ -138,7 +138,18 @@ fn main() -> io::Result<()> {
                 })
             }
             "tools/list" => id.map(|id| {
-                if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST").is_some() {
+                if let Some(marker) = std::env::var_os("MCP_TEST_EXIT_ONCE_TOOLS_LIST_MARKER") {
+                    if !std::path::Path::new(&marker).exists() {
+                        if std::fs::write(marker, "exited").is_err() {
+                            std::process::exit(2);
+                        }
+                        std::process::exit(0);
+                    }
+                }
+                if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST").is_some()
+                    || std::env::var_os("MCP_TEST_EXIT_TOOLS_LIST_MARKER")
+                        .is_some_and(|path| std::path::Path::new(&path).exists())
+                {
                     std::process::exit(0);
                 }
                 serde_json::json!({
@@ -296,6 +307,19 @@ fn main() -> io::Result<()> {
                     .unwrap_or(1);
                 response["result"]["capabilities"]["experimental"] =
                     serde_json::json!({"atomcode/desktop-turn-lease":{"version":version}});
+            }
+        }
+        if method == "initialize"
+            && !std::env::var_os("MCP_TEST_CAPABILITIES_DISABLE_MARKER")
+                .is_some_and(|path| std::path::Path::new(&path).exists())
+        {
+            if let (Some(response), Ok(raw)) = (
+                response.as_mut(),
+                std::env::var("MCP_TEST_EXPERIMENTAL_CAPABILITIES"),
+            ) {
+                let supplied: serde_json::Value =
+                    serde_json::from_str(&raw).map_err(io::Error::other)?;
+                response["result"]["capabilities"]["experimental"] = supplied;
             }
         }
         if let Some(response) = response {

@@ -111,6 +111,13 @@
       <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
       <p><code>.mcp.json</code> 还支持 <strong>JSONC 注释</strong> —— <code>//</code> 行注释和 <code>/* */</code> 块注释 —— 可以给某个 server 加说明或临时注释掉而不必删除。字符串值内部的注释符号(比如 URL 里的 <code>//</code>)会被原样保留。</p>
 
+      <h3 id="required-experimental-capabilities">所需扩展能力（可选）</h3>
+      <p>在单个服务配置中，<code>requiredExperimentalCapabilities</code> 将后端明确声明的能力名映射到精确的正整数版本，例如：</p>
+      <pre><code>"requiredExperimentalCapabilities": {
+  "vendor/feature": 1
+}</code></pre>
+      <p>只填写后端文档明确支持的能力和版本。每次 MCP 初始化（包括 stdio 自动恢复）都会在连接可用前检查；缺失、格式错误或版本不同均拒绝连接。对配置了该要求的 HTTP 会话，未经重新初始化的会话 ID 变化也会被拒绝，需重连。省略该字段保持原行为。版本校验不会自动启用功能或协商其使用协议，不授予工具权限，也不能证明外部后端正确实现了其声明的策略。</p>
+
       <h3 id="stdio-示例本地子进程">stdio 示例(本地子进程)</h3>
       <pre><code>{
   "mcpServers": {

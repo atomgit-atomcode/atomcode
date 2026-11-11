@@ -36,6 +36,7 @@ const MAX_MCP_HEADER_BYTES: usize = 16 * 1024;
 /// stdio-based MCP client.
 pub struct StdioClient {
     server_name: String,
+    required_experimental_capabilities: BTreeMap<String, u64>,
     command: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
@@ -115,6 +116,21 @@ struct RequestAttemptError {
 }
 
 impl StdioClient {
+    /// Requirements belong to this connection's lifetime and cannot be changed
+    /// after construction. They grant no approval or tool authority.
+    pub fn new_with_required_experimental_capabilities(
+        server_name: String,
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        timeout_ms: Option<u64>,
+        requirements: BTreeMap<String, u64>,
+    ) -> Self {
+        let mut client = Self::new(server_name, command, args, env, timeout_ms);
+        client.required_experimental_capabilities = requirements;
+        client
+    }
+
     /// Create a new stdio client.
     pub fn new(
         server_name: String,
@@ -125,6 +141,7 @@ impl StdioClient {
     ) -> Self {
         Self {
             server_name,
+            required_experimental_capabilities: BTreeMap::new(),
             command,
             args,
             env,
@@ -216,6 +233,18 @@ impl StdioClient {
         // section. A caller may have waited here while another caller replaced
         // the process.
         let generation = self.connection_generation.load(Ordering::SeqCst);
+        if method != "initialize"
+            && !self.required_experimental_capabilities.is_empty()
+            && !matches!(*self.status.lock().await, ServerStatus::Connected)
+        {
+            return Err(RequestAttemptError {
+                error: anyhow::anyhow!(
+                    "MCP required capabilities have not been validated for this connection"
+                ),
+                generation,
+                request_may_have_been_sent: false,
+            });
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // IMPORTANT: omit `params` when it's None.
@@ -346,6 +375,7 @@ impl StdioClient {
     }
 
     async fn initialize_connection(&self) -> Result<InitializeResult> {
+        super::requirements::validate(&self.required_experimental_capabilities)?;
         *self.status.lock().await = ServerStatus::Connecting;
         self.start().await?;
         self.drain_startup_messages().await?;
@@ -356,6 +386,11 @@ impl StdioClient {
                 .map_err(|attempt| attempt.error)?,
         )
         .context("Failed to parse initialize result")?;
+
+        super::requirements::check(
+            &self.required_experimental_capabilities,
+            &result.capabilities,
+        )?;
 
         let scoped = match result
             .capabilities
@@ -484,6 +519,7 @@ impl StdioClient {
     fn clone_for_recovery(&self) -> Self {
         Self {
             server_name: self.server_name.clone(),
+            required_experimental_capabilities: self.required_experimental_capabilities.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
             env: self.env.clone(),

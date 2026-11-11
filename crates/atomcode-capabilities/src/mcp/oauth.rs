@@ -1547,6 +1547,7 @@ mod tests {
             trust: false,
             auto_approve: Vec::new(),
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
             source: McpConfigSource::User,
         };
         std::env::set_var("ATOMCODE_GITHUB_MCP_CLIENT_ID", "gh-client");
@@ -1612,6 +1613,7 @@ mod tests {
             trust: false,
             auto_approve: Vec::new(),
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
             source,
         };
         let metadata: AuthorizationServerMetadata = serde_json::from_value(serde_json::json!({

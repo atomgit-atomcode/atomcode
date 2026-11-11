@@ -111,6 +111,13 @@
       <p>Strings support <code>${VAR}</code> and <code>${VAR:-default}</code> environment expansion; never hard-code sensitive tokens — keep them in env vars. <code>disabled: true</code> temporarily turns off a server without removing the entry.</p>
       <p><code>.mcp.json</code> also accepts <strong>JSONC comments</strong> — <code>//</code> line comments and <code>/* */</code> block comments — so you can annotate a server or comment one out without deleting it. Comment tokens inside string values (e.g. the <code>//</code> in a URL) are preserved.</p>
 
+      <h3 id="required-experimental-capabilities">Required experimental capabilities (optional)</h3>
+      <p>Inside a server entry, <code>requiredExperimentalCapabilities</code> maps documented backend capability names to exact positive integer versions. For example:</p>
+      <pre><code>"requiredExperimentalCapabilities": {
+  "vendor/feature": 1
+}</code></pre>
+      <p>Use only a capability and version the backend actually documents. AtomCode checks every MCP initialization, including stdio recovery, before making the connection available. Missing, malformed or different versions fail closed. For constrained HTTP sessions, an unexpected session ID change requires reconnecting. Omit this field for existing behavior. Version checks do not activate a feature or negotiate its client protocol. They grant no tool permissions and do not prove that an external backend correctly implements its advertised policy.</p>
+
       <h3 id="stdio-example-local-subprocess">stdio example (local subprocess)</h3>
       <pre><code>{
   "mcpServers": {

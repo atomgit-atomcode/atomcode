@@ -2817,6 +2817,7 @@ fn start_with_mcp_server(
         trust,
         auto_approve: Vec::new(),
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     start
 }
@@ -2911,6 +2912,10 @@ async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
 
     // 人要做的三件事,各有一个真的落点:信任项目与 OAuth 登录在 `/mcp` 那块
     // 面板上,改完文件重连是 `/reload`。
+    assert!(
+        said.contains("requiredExperimentalCapabilities"),
+        "the MCP owner must describe its supported connection contract:\n{said}"
+    );
     for real in ["/mcp", "/reload"] {
         assert!(said.contains(real), "`{real}` 得说出来:\n{said}");
     }
@@ -3080,6 +3085,7 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
         trust: true,
         auto_approve: Vec::new(),
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
@@ -3680,6 +3686,7 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
         trust: true,
         auto_approve: Vec::new(),
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
@@ -5701,6 +5708,7 @@ async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
         trust: true,
         auto_approve: Vec::new(),
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     turn(&mut runtime, "describe operations").await;
@@ -6520,6 +6528,7 @@ async fn a_failed_mcp_connection_is_metered() {
         trust: true,
         auto_approve: Vec::new(),
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     // The catalog settles whether or not the server came up; a failure to

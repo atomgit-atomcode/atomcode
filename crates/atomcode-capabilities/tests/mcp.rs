@@ -44,6 +44,7 @@ fn test_server_config_with_env_and_timeout(
         trust: false,
         auto_approve: vec![],
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }
 }
 
@@ -960,6 +961,7 @@ async fn installed_computer_backend_exposes_scoped_tools_through_the_production_
             trust: false,
             auto_approve: vec![],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
             config: McpTransportConfig::Stdio {
                 command: executable.to_str().unwrap().into(),
                 args: vec!["mcp".into()],
@@ -1279,6 +1281,7 @@ async fn cancelled_http_request_cannot_be_unpoisoned_by_a_late_response() {
         trust: false,
         auto_approve: vec![],
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
         config: McpTransportConfig::Http {
             url: format!("http://{address}/mcp"),
             headers: BTreeMap::new(),
@@ -1859,6 +1862,7 @@ async fn native_desktop_lease_hands_over_between_production_registries() {
         trust: false,
         auto_approve: vec![],
         allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
         config: McpTransportConfig::Stdio {
             command: executable.to_string_lossy().into_owned(),
             args: vec!["mcp".into()],
@@ -2063,4 +2067,450 @@ async fn ending_a_scope_waits_for_its_accepted_acquire_before_releasing_it() {
         ServerStatus::Connected
     ));
     registry.shutdown().await;
+}
+
+fn require_test_capability(config: &mut McpServerConfig) {
+    config.required_experimental_capabilities = BTreeMap::from([("test/strict".into(), 1)]);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_refuse_publication_on_initial_mismatch() {
+    // The transport's startup noise drain has a real idle deadline, including
+    // reconnect startup. These real-process checks make no virtual-time claims.
+    tokio::time::resume();
+    for capabilities in [
+        "{}",
+        r#"{"test/strict":{"version":true}}"#,
+        r#"{"test/strict":{"version":"1"}}"#,
+        r#"{"test/strict":{"version":2}}"#,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("calls");
+        let mut config = test_server_config_with_env(
+            "required",
+            BTreeMap::from([
+                (
+                    "MCP_TEST_EXPERIMENTAL_CAPABILITIES".into(),
+                    capabilities.into(),
+                ),
+                (
+                    "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                    calls.display().to_string(),
+                ),
+            ]),
+        );
+        require_test_capability(&mut config);
+        let reg = McpRegistry::new(NO_TREE);
+        assert!(reg
+            .add_server(config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("required experimental capability"));
+        assert!(reg.list_all_tools().await.is_empty());
+        assert!(reg
+            .call_tool("required", "echo", serde_json::json!({}))
+            .await
+            .is_err());
+        assert_eq!(spawn_count(&calls), 0);
+        reg.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_survive_automatic_reconnect_and_reject_stale_adapters() {
+    // The transport's startup noise drain has a real idle deadline, including
+    // reconnect startup. These real-process checks make no virtual-time claims.
+    tokio::time::resume();
+    let temp = tempfile::tempdir().unwrap();
+    let dropped = temp.path().join("drop-capabilities");
+    let disconnect = temp.path().join("disconnect-on-list");
+    let calls = temp.path().join("calls");
+    let spawns = temp.path().join("spawns");
+    let mut config = test_server_config_with_env(
+        "required",
+        BTreeMap::from([
+            (
+                "MCP_TEST_EXPERIMENTAL_CAPABILITIES".into(),
+                r#"{"test/strict":{"version":1}}"#.into(),
+            ),
+            (
+                "MCP_TEST_CAPABILITIES_DISABLE_MARKER".into(),
+                dropped.display().to_string(),
+            ),
+            (
+                "MCP_TEST_EXIT_TOOLS_LIST_MARKER".into(),
+                disconnect.display().to_string(),
+            ),
+            (
+                "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                calls.display().to_string(),
+            ),
+            (
+                "MCP_TEST_SPAWN_COUNTER".into(),
+                spawns.display().to_string(),
+            ),
+        ]),
+    );
+    require_test_capability(&mut config);
+    let reg = Arc::new(McpRegistry::new(NO_TREE));
+    reg.add_server(config).await.unwrap();
+    let info = reg.list_all_tools().await.remove(0);
+    let stale = McpToolAdapter::new(reg.clone(), info).unwrap();
+    std::fs::write(&dropped, "").unwrap();
+    std::fs::write(&disconnect, "").unwrap();
+    assert!(reg.list_all_tools().await.is_empty());
+    assert!(
+        stale
+            .execute(r#"{"message":"must not dispatch"}"#, &ctx())
+            .await
+            .is_error
+    );
+    assert_eq!(spawn_count(&spawns), 2);
+    assert_eq!(spawn_count(&calls), 0);
+    reg.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_survive_background_unknown_outcome_recovery() {
+    // The transport's startup noise drain has a real idle deadline, including
+    // reconnect startup. These real-process checks make no virtual-time claims.
+    tokio::time::resume();
+    let temp = tempfile::tempdir().unwrap();
+    let dropped = temp.path().join("drop-capabilities");
+    let calls = temp.path().join("calls");
+    let disposed = temp.path().join("disposed");
+    let mut config = test_server_config_with_env(
+        "required",
+        BTreeMap::from([
+            (
+                "MCP_TEST_EXPERIMENTAL_CAPABILITIES".into(),
+                r#"{"test/strict":{"version":1}}"#.into(),
+            ),
+            (
+                "MCP_TEST_CAPABILITIES_DISABLE_MARKER".into(),
+                dropped.display().to_string(),
+            ),
+            ("MCP_TEST_EXIT_ON_EVERY_TOOL_CALL".into(), "1".into()),
+            (
+                "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                calls.display().to_string(),
+            ),
+            (
+                "MCP_TEST_EOF_FINISHED".into(),
+                disposed.display().to_string(),
+            ),
+        ]),
+    );
+    require_test_capability(&mut config);
+    let reg = McpRegistry::new(NO_TREE);
+    reg.add_server(config).await.unwrap();
+    std::fs::write(&dropped, "").unwrap();
+    let error = reg
+        .call_tool("required", "echo", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("unknown"));
+    wait_for_tool_counter(disposed, 1).await;
+    assert!(reg
+        .call_tool("required", "echo", serde_json::json!({}))
+        .await
+        .is_err());
+    assert_eq!(
+        spawn_count(&calls),
+        1,
+        "uncertain mutation is never replayed on a downgraded connection"
+    );
+    reg.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_allow_reconnect_when_the_contract_is_preserved() {
+    tokio::time::resume(); // Startup noise drain uses a real idle deadline.
+    let temp = tempfile::tempdir().unwrap();
+    let spawns = temp.path().join("spawns");
+    let calls = temp.path().join("calls");
+    let once = temp.path().join("exit-once");
+    let mut config = test_server_config_with_env(
+        "required",
+        BTreeMap::from([
+            (
+                "MCP_TEST_EXPERIMENTAL_CAPABILITIES".into(),
+                r#"{"test/strict":{"version":1}}"#.into(),
+            ),
+            (
+                "MCP_TEST_EXIT_ONCE_TOOLS_LIST_MARKER".into(),
+                once.display().to_string(),
+            ),
+            (
+                "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                calls.display().to_string(),
+            ),
+            (
+                "MCP_TEST_SPAWN_COUNTER".into(),
+                spawns.display().to_string(),
+            ),
+        ]),
+    );
+    require_test_capability(&mut config);
+    let reg = McpRegistry::new(NO_TREE);
+    reg.add_server(config).await.unwrap();
+    assert_eq!(reg.list_all_tools().await.len(), 1);
+    let result = reg
+        .call_tool(
+            "required",
+            "echo",
+            serde_json::json!({"message":"preserved"}),
+        )
+        .await
+        .unwrap();
+    assert!(result_text(result).contains("preserved"));
+    assert_eq!(spawn_count(&spawns), 2);
+    assert_eq!(spawn_count(&calls), 1);
+    reg.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_http_handshake_rejects_missing_or_mistyped_contracts() {
+    use atomcode_capabilities::mcp::client::McpClient;
+    use atomcode_capabilities::mcp::transport_http::HttpClient;
+    use atomcode_capabilities::mcp::McpTokenStore;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _clock = ExternalIoClock::hold();
+    for declaration in [
+        serde_json::json!(null),
+        serde_json::json!({"version":true}),
+        serde_json::json!({"version":"1"}),
+        serde_json::json!({"version":2}),
+    ] {
+        let server = MockServer::start().await;
+        let caps = serde_json::json!({"experimental":{"test/strict":declaration}});
+        Mock::given(method("POST")).and(body_partial_json(serde_json::json!({"method":"initialize"})))
+            .respond_with(move |request: &wiremock::Request| {
+                let body:serde_json::Value=request.body_json().unwrap();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],
+                    "result":{"protocolVersion":"2025-11-05","capabilities":caps,"serverInfo":{"name":"required","version":"1"}}}))
+            }).expect(1).mount(&server).await;
+        let mut client = HttpClient::new_with_required_experimental_capabilities(
+            "required".into(),
+            server.uri(),
+            BTreeMap::new(),
+            None,
+            Some(2000),
+            McpTokenStore::new("/nonexistent/mcp_auth.toml".into()),
+            BTreeMap::from([("test/strict".into(), 1)]),
+        );
+        assert!(client
+            .list_tools()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not been validated"));
+        assert!(client
+            .initialize()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("required experimental capability"));
+        assert!(client
+            .call_tool("never-dispatched", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not been validated"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        client.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_http_session_rotation_fails_closed_without_tool_dispatch() {
+    use atomcode_capabilities::mcp::client::McpClient;
+    use atomcode_capabilities::mcp::transport_http::HttpClient;
+    use atomcode_capabilities::mcp::McpTokenStore;
+    use wiremock::matchers::{body_partial_json, header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _clock = ExternalIoClock::hold();
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(body_partial_json(serde_json::json!({"method":"initialize"})))
+        .respond_with(|request: &wiremock::Request| {
+            let body:serde_json::Value=request.body_json().unwrap();
+            ResponseTemplate::new(200).insert_header("mcp-session-id","initial-private-session")
+                .set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{
+                    "protocolVersion":"2025-11-05","capabilities":{"experimental":{"test/strict":{"version":1}}},
+                    "serverInfo":{"name":"required","version":"1"}}}))
+        }).expect(1).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            serde_json::json!({"method":"notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let listings = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            serde_json::json!({"method":"tools/list"}),
+        ))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let sid = if listings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                "initial-private-session"
+            } else {
+                "rotated-private-session"
+            };
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", sid)
+                .set_body_json(
+                    serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{"tools":[]}}),
+                )
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(header("mcp-session-id", "initial-private-session"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut client = HttpClient::new_with_required_experimental_capabilities(
+        "required".into(),
+        server.uri(),
+        BTreeMap::new(),
+        None,
+        Some(2000),
+        McpTokenStore::new("/nonexistent/mcp_auth.toml".into()),
+        BTreeMap::from([("test/strict".into(), 1)]),
+    );
+    client.initialize().await.unwrap();
+    assert!(client.list_tools().await.unwrap().tools.is_empty());
+    let error = client.list_tools().await.unwrap_err().to_string();
+    assert!(error.contains("session identity changed"));
+    assert!(
+        !error.contains("initial-private-session") && !error.contains("rotated-private-session")
+    );
+    assert!(client
+        .call_tool("never-dispatched", serde_json::json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not been validated"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_invalid_driver_requirements_do_not_spawn_a_backend() {
+    let temp = tempfile::tempdir().unwrap();
+    let spawns = temp.path().join("spawns");
+    let mut config = test_server_config_with_env(
+        "invalid-required",
+        BTreeMap::from([(
+            "MCP_TEST_SPAWN_COUNTER".into(),
+            spawns.display().to_string(),
+        )]),
+    );
+    config.required_experimental_capabilities = BTreeMap::from([("test/strict".into(), 0)]);
+    let reg = McpRegistry::new(NO_TREE);
+    assert!(reg
+        .add_server(config)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("invalid required MCP"));
+    reg.shutdown().await;
+    assert_eq!(spawn_count(&spawns), 0);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[ignore = "requires an application-scope-capable ATOMCODE_LEASE_TEST_EXECUTABLE; no GUI actions"]
+async fn native_required_capabilities_gate_production_registry() {
+    tokio::time::resume(); // Real native process startup uses an idle noise-drain deadline.
+    let executable =
+        std::fs::canonicalize(std::env::var("ATOMCODE_LEASE_TEST_EXECUTABLE").unwrap()).unwrap();
+    let make_config = |version| McpServerConfig {
+        name: "native-required".into(),
+        source: McpConfigSource::Driver,
+        disabled: false,
+        trust: false,
+        auto_approve: vec![],
+        allowed_tools: None,
+        required_experimental_capabilities: BTreeMap::from([(
+            "atomcode/application-scope".into(),
+            version,
+        )]),
+        config: McpTransportConfig::Stdio {
+            command: executable.display().to_string(),
+            args: vec!["mcp".into()],
+            env: BTreeMap::from([(
+                "OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY".into(),
+                "1".into(),
+            )]),
+            timeout_ms: Some(10_000),
+        },
+    };
+    let reg = McpRegistry::new(NO_TREE);
+    reg.add_server(make_config(1)).await.unwrap();
+    assert_eq!(
+        reg.list_all_tools().await.len(),
+        15,
+        "metadata only; no GUI tool requested"
+    );
+    assert!(reg
+        .reconnect_server(make_config(2))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("required experimental capability"));
+    assert!(reg.list_all_tools().await.is_empty());
+    assert!(reg
+        .call_tool("native-required", "capture_display", serde_json::json!({}))
+        .await
+        .is_err());
+    reg.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_capabilities_apply_to_background_connections_loaded_from_user_config() {
+    tokio::time::resume(); // Real external startup idle-drain, not a timing assertion.
+    for advertised in [false, true] {
+        let scratch = tempfile::tempdir().unwrap();
+        let capabilities = if advertised {
+            serde_json::json!({"test/strict":{"version":1}})
+        } else {
+            serde_json::json!({})
+        };
+        let source = serde_json::json!({"mcpServers":{"required":{
+            "command":env!("CARGO_BIN_EXE_mcp-test-server"), "timeout_ms":5000,
+            "env":{"MCP_TEST_EXPERIMENTAL_CAPABILITIES":capabilities.to_string()},
+            "requiredExperimentalCapabilities":{"test/strict":1}
+        }}});
+        std::fs::write(scratch.path().join("mcp.json"), source.to_string()).unwrap();
+        let reg = McpRegistry::from_config_background_with_extra(
+            scratch.path(),
+            scratch.path(),
+            None,
+            Vec::new(),
+        );
+        let completed = reg.wait_for_initial_connections(CONNECT_TIMEOUT).await;
+        assert!(
+            completed,
+            "advertised={advertised}, statuses={:?}",
+            reg.server_statuses().await
+        );
+        assert_eq!(reg.list_all_tools().await.len(), usize::from(advertised));
+        assert_eq!(
+            reg.connected_server_names().await.len(),
+            usize::from(advertised)
+        );
+        if !advertised {
+            assert!(reg.server_statuses().await.iter().any(|(_, status)| matches!(status,
+                ServerStatus::Failed(message) if message.contains("required experimental capability"))),
+                "a generic timeout must not count as capability validation");
+        }
+        reg.shutdown().await;
+    }
 }

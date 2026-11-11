@@ -785,26 +785,32 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                     args,
                                     env,
                                     timeout_ms,
-                                } => Box::new(StdioClient::new(
-                                    name.clone(),
-                                    command.clone(),
-                                    args.clone(),
-                                    env.clone(),
-                                    *timeout_ms,
-                                )),
+                                } => Box::new(
+                                    StdioClient::new_with_required_experimental_capabilities(
+                                        name.clone(),
+                                        command.clone(),
+                                        args.clone(),
+                                        env.clone(),
+                                        *timeout_ms,
+                                        config.required_experimental_capabilities.clone(),
+                                    ),
+                                ),
                                 super::config::McpTransportConfig::Http {
                                     url,
                                     headers,
                                     auth,
                                     timeout_ms,
-                                } => Box::new(HttpClient::new(
-                                    name.clone(),
-                                    url.clone(),
-                                    headers.clone(),
-                                    auth.clone(),
-                                    *timeout_ms,
-                                    token_store,
-                                )),
+                                } => Box::new(
+                                    HttpClient::new_with_required_experimental_capabilities(
+                                        name.clone(),
+                                        url.clone(),
+                                        headers.clone(),
+                                        auth.clone(),
+                                        *timeout_ms,
+                                        token_store,
+                                        config.required_experimental_capabilities.clone(),
+                                    ),
+                                ),
                             };
 
                             let mut client = ConnectingClient {
@@ -987,25 +993,27 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 args,
                 env,
                 timeout_ms,
-            } => Box::new(StdioClient::new(
+            } => Box::new(StdioClient::new_with_required_experimental_capabilities(
                 config.name.clone(),
                 command.clone(),
                 args.clone(),
                 env.clone(),
                 *timeout_ms,
+                config.required_experimental_capabilities.clone(),
             )),
             super::config::McpTransportConfig::Http {
                 url,
                 headers,
                 auth,
                 timeout_ms,
-            } => Box::new(HttpClient::new(
+            } => Box::new(HttpClient::new_with_required_experimental_capabilities(
                 config.name.clone(),
                 url.clone(),
                 headers.clone(),
                 auth.clone(),
                 *timeout_ms,
                 self.token_store(),
+                config.required_experimental_capabilities.clone(),
             )),
         };
 
@@ -2226,6 +2234,7 @@ mod tests {
             trust: false,
             auto_approve: vec![],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2281,6 +2290,7 @@ mod tests {
             trust: false,
             auto_approve: vec!["query".to_string(), "mcp__docs__search".to_string()],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
         reg.apply_trust_from_config(&cfg);
         assert!(
@@ -2317,6 +2327,7 @@ mod tests {
             trust: false,
             auto_approve: vec![format!("mcp__{server}__{tool}")],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
 
         reg.apply_trust_from_config(&cfg);
@@ -2387,6 +2398,7 @@ mod tests {
             trust: false,
             auto_approve: vec![],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
 
         let result = registry.add_server(config).await;
@@ -2413,6 +2425,7 @@ mod tests {
             trust: false,
             auto_approve: vec![],
             allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
             config: super::super::config::McpTransportConfig::Stdio {
                 command: "server".into(),
                 args: vec![],
@@ -2439,6 +2452,14 @@ mod tests {
         assert!(
             registry.connection_matches(&granted),
             "a live Always grant already took effect"
+        );
+        let mut changed = original.clone();
+        changed
+            .required_experimental_capabilities
+            .insert("test/strict".into(), 1);
+        assert!(
+            !registry.connection_matches(&changed),
+            "stricter protocol requirements need a new connection"
         );
         let mut changed = original.clone();
         changed.trust = true;

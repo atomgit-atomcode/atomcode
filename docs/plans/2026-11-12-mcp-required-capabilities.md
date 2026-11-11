@@ -1,0 +1,23 @@
+# Required MCP experimental capabilities
+
+Baseline release/v5.2.7 4110811b8, clean isolated worktree. Current registry initialization has two production constructor paths; stdio reconnects internally through initialize_connection, so a registry-only check would be insufficient. HTTP has explicit initialization, no automatic session reinitialization, and currently accepts changed response session IDs. MCP config is owned by McpStorage; transport owns its connection/session. No agent/runtime/session-log ownership changes.
+
+Add optional requiredExperimentalCapabilities (experimental name -> exact positive integer version) to server config. Missing defaults to empty. Validate bounded names/count/versions both when loading configuration and at transport initialization for driver-supplied configs. Requirements are printable protocol metadata, never credentials or approval grants. Preserve them through managed storage and connection identity; ACP/daemon injected configs which expose no such field keep empty requirements and make no scope claim.
+
+Store immutable requirements in each concrete transport before initialize. Validate every initialize result before Connected, initialized notification and publication. Stdio handle clones retain requirements and every automatic reconnect revalidates them. Under nonempty requirements, business requests before a validated Connected state fail before dispatch. HTTP response session rotation after Connected fails the client and requires explicit initialization; dispatched calls remain potentially unknown and are not retried. Session IDs are not printed in diagnostics. Empty requirements preserve existing behavior.
+
+Update all explicit config producers without introducing product/server-name checks. Add strict configuration/round-trip tests, actual stdio startup/downgrade/no-dispatch tests, HTTP handshake/session-rotation checks and registry publication checks. Check affected coding/driver consumers via full compile gate and relevant tests; run capabilities suites, production MCP clippy, format and lock checks. This is generic enforcement infrastructure; managed app-scope enable UX and capability-required policy wiring follow separately.
+
+## Implementation review
+
+Requirements are set only by fresh concrete transport constructors; there is no builder/mutator that could change requirements while retaining a previously Connected state. Private stdio recovery handles carry the same immutable map. Configuration identity comparison includes requirements, so a changed map requires a new connection. Both registry constructor paths apply the map. No requirement name is interpreted as an approval grant or as automatic activation/negotiation of that feature.
+
+The config loader accepts the canonical camelCase key and its snake_case alias, rejects null/wrong-shaped maps and non-integer/zero versions, and preserves requirements through ordinary enabled/disabled document edits. ACP injected config schema has no such field; those producers explicitly retain empty requirements and do not claim application-scope enforcement. No ACP wire/session or persisted conversation schema changed.
+
+The background config test initially expired its five-second outer wait while transport configuration still allowed a thirty-second handshake. Status diagnostics were added, the fixture now explicitly uses a five-second RPC budget with the production outer connection budget, and the negative case must contain the specific capability mismatch rather than accepting a timeout. Real subprocess tests use the established paused-test declaration and resume the clock for the transport's real startup idle drain; pure state/network tests keep the paused clock with the existing external-I/O guard.
+
+## Validation
+
+Final immutable-constructor implementation: capabilities suite 1553 passed, 4 skipped; focused connection-contract matrix 10 passed; opt-in native backend registry test 1 passed (45 filtered/ignored), using the existing pinned application-scope executable without GUI operations. Production MCP clippy completed with 40 pre-existing warnings and no errors. Coding MCP subset 39 passed, CLI/ACP/setup subset 18 passed, and the owning-row self-knowledge criterion passed. No dependencies or lockfile changes. Native OS grants, allowed-window GUI acceptance, managed scope setup, origin enforcement and other-platform execution remain outside this increment.
+
+Full `bash gates/compile.sh` passed, including workspace/all-targets, feature-gated targets and both negative controls. `cargo fmt --all` and its check passed; diff whitespace checks passed. Cargo.lock is unchanged with normal H index status and zero hkdf/hmac/zeroize_derive packages.

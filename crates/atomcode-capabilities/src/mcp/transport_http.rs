@@ -40,6 +40,7 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 /// HTTP-based MCP client.
 pub struct HttpClient {
     server_name: String,
+    required_experimental_capabilities: BTreeMap<String, u64>,
     url: String,
     headers: BTreeMap<String, String>,
     auth: Option<McpHttpAuthConfig>,
@@ -63,6 +64,22 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    /// Requirements belong to this connection's lifetime and cannot be changed
+    /// after construction. They grant no approval or tool authority.
+    pub fn new_with_required_experimental_capabilities(
+        server_name: String,
+        url: String,
+        headers: BTreeMap<String, String>,
+        auth: Option<McpHttpAuthConfig>,
+        timeout_ms: Option<u64>,
+        token_store: McpTokenStore,
+        requirements: BTreeMap<String, u64>,
+    ) -> Self {
+        let mut client = Self::new(server_name, url, headers, auth, timeout_ms, token_store);
+        client.required_experimental_capabilities = requirements;
+        client
+    }
+
     /// Create a new HTTP client.
     pub fn new(
         server_name: String,
@@ -81,6 +98,7 @@ impl HttpClient {
 
         Self {
             server_name,
+            required_experimental_capabilities: BTreeMap::new(),
             url,
             headers,
             auth,
@@ -117,14 +135,44 @@ impl HttpClient {
         negotiated.filter(|v| !v.is_empty())
     }
 
-    /// Capture the `Mcp-Session-Id` response header (case-insensitive) so it can be
-    /// echoed on later requests. A missing or empty value leaves the prior id intact.
-    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) {
-        if let Some(value) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-            if !value.is_empty() {
-                *self.session_id.lock().await = Some(value.to_string());
-            }
+    /// Required declarations must be validated for this logical MCP session.
+    async fn require_validated_session(&self, method: &str) -> Result<()> {
+        if method != "initialize"
+            && !self.required_experimental_capabilities.is_empty()
+            && !matches!(*self.status.lock().await, ServerStatus::Connected)
+        {
+            bail!("MCP required capabilities have not been validated for this session");
         }
+        Ok(())
+    }
+
+    /// Preserve session identity after a required-capability handshake.
+    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) -> Result<()> {
+        if let Some(value) = headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
+            let negotiating = matches!(*self.status.lock().await, ServerStatus::Connecting);
+            let mut session = self.session_id.lock().await;
+            let expected = self
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("mcp-session-id"))
+                .map(|(_, value)| value.as_str())
+                .or(session.as_deref());
+            if !self.required_experimental_capabilities.is_empty()
+                && !negotiating
+                && expected != Some(value)
+            {
+                drop(session);
+                let message = "MCP session identity changed; reinitialize to validate required capabilities; a dispatched request outcome may be unknown";
+                *self.status.lock().await = ServerStatus::Failed(message.into());
+                bail!(message);
+            }
+            *session = Some(value.to_owned());
+        }
+        Ok(())
     }
 
     /// Send a request and wait for response.
@@ -145,6 +193,7 @@ impl HttpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        self.require_validated_session(method).await?;
         if self.abandoned_request.load(Ordering::SeqCst) != 0 {
             bail!(CANCELLED_TOOL_REQUEST);
         }
@@ -216,6 +265,7 @@ impl HttpClient {
         let guard =
             (method == "tools/call").then(|| ToolRequestGuard::new(self.abandoned_request.clone()));
         let result = async {
+            self.require_validated_session(method).await?;
             if let Some(guard) = &guard {
                 guard.dispatched(id);
             }
@@ -233,7 +283,7 @@ impl HttpClient {
                 })?;
 
             // Capture the session id the server may have handed out (e.g. on initialize).
-            self.capture_session_id(response.headers()).await;
+            self.capture_session_id(response.headers()).await?;
 
             if !response.status().is_success() {
                 let status = response.status();
@@ -508,6 +558,7 @@ async fn delete_http_session(
 #[async_trait]
 impl McpClient for HttpClient {
     async fn initialize(&mut self) -> Result<InitializeResult> {
+        super::requirements::validate(&self.required_experimental_capabilities)?;
         let mut status = self.status.lock().await;
         *status = ServerStatus::Connecting;
         drop(status);
@@ -518,6 +569,14 @@ impl McpClient for HttpClient {
 
         let init_result: InitializeResult =
             serde_json::from_value(result).context("Failed to parse initialize result")?;
+
+        if let Err(error) = super::requirements::check(
+            &self.required_experimental_capabilities,
+            &init_result.capabilities,
+        ) {
+            *self.status.lock().await = ServerStatus::Failed(error.to_string());
+            return Err(error);
+        }
 
         // Record what the server actually agreed to speak. Every request from here on
         // must label itself with THIS value (not what we asked for) — an older server
@@ -990,7 +1049,7 @@ mod session_tests {
         );
         let mut h = HeaderMap::new();
         h.insert("mcp-session-id", "abc-123".parse().unwrap());
-        c.capture_session_id(&h).await;
+        c.capture_session_id(&h).await.unwrap();
         assert_eq!(
             c.session_id().await.as_deref(),
             Some("abc-123"),
@@ -1053,11 +1112,11 @@ mod session_tests {
     #[tokio::test]
     async fn ignores_missing_or_empty_session_id() {
         let c = client();
-        c.capture_session_id(&HeaderMap::new()).await; // header absent
+        c.capture_session_id(&HeaderMap::new()).await.unwrap(); // header absent
         assert!(c.session_id().await.is_none());
         let mut h = HeaderMap::new();
         h.insert("mcp-session-id", "".parse().unwrap());
-        c.capture_session_id(&h).await; // header present but empty
+        c.capture_session_id(&h).await.unwrap(); // header present but empty
         assert!(
             c.session_id().await.is_none(),
             "empty value must not overwrite"

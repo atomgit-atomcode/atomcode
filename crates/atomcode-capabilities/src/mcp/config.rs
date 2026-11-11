@@ -105,6 +105,8 @@ pub struct McpServerConfig {
     pub auto_approve: Vec<String>,
     /// Exact raw MCP tool names permitted for discovery and execution. None permits all; empty denies all.
     pub allowed_tools: Option<Vec<String>>,
+    /// Exact positive versions required in every initialize response, including reconnect.
+    pub required_experimental_capabilities: BTreeMap<String, u64>,
 }
 
 /// Configuration source for a server.
@@ -169,6 +171,12 @@ struct McpServerEntry {
     auto_approve: Vec<String>,
     #[serde(default, rename = "allowedTools", alias = "allowed_tools")]
     allowed_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "requiredExperimentalCapabilities",
+        alias = "required_experimental_capabilities"
+    )]
+    required_experimental_capabilities: BTreeMap<String, u64>,
 }
 
 use serde::Deserialize;
@@ -628,6 +636,7 @@ fn servers_in(
 }
 
 fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServerConfig> {
+    super::requirements::validate(&entry.required_experimental_capabilities)?;
     let trust = entry.trust;
     let disabled = entry.disabled;
     let transport = if let Some(command) = entry.command {
@@ -679,6 +688,7 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         trust,
         auto_approve: entry.auto_approve,
         allowed_tools: entry.allowed_tools,
+        required_experimental_capabilities: entry.required_experimental_capabilities,
     })
 }
 
@@ -2161,5 +2171,44 @@ mod recommendation_tests {
             );
         }
         assert!(add_disabled_http_server_into_text(None, "docs", "http://example.com").is_err());
+    }
+}
+
+#[cfg(test)]
+mod required_capabilities_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn requirements_survive_configuration_edits_and_reject_malformed_versions() {
+        let source = json!({"mcpServers":{"strict":{"command":"test-server",
+            "requiredExperimentalCapabilities":{"test/strict":1}}}})
+        .to_string();
+        let edited = set_mcp_server_disabled_in_text(&source, "strict", true).unwrap();
+        let config = parse_mcp_servers(&edited, McpConfigSource::User)
+            .unwrap()
+            .remove(0);
+        assert!(config.disabled);
+        assert_eq!(
+            config.required_experimental_capabilities,
+            BTreeMap::from([("test/strict".into(), 1)])
+        );
+        let legacy = parse_mcp_servers(
+            r#"{"mcpServers":{"legacy":{"command":"test"}}}"#,
+            McpConfigSource::User,
+        )
+        .unwrap();
+        assert!(legacy[0].required_experimental_capabilities.is_empty());
+        for bad in [
+            json!(null),
+            json!([]),
+            json!({"test/strict":true}),
+            json!({"test/strict":"1"}),
+            json!({"test/strict":1.0}),
+            json!({"test/strict":0}),
+        ] {
+            let value = json!({"mcpServers":{"strict":{"command":"test", "requiredExperimentalCapabilities":bad}}});
+            assert!(parse_mcp_servers(&value.to_string(), McpConfigSource::User).is_err());
+        }
     }
 }

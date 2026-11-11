@@ -1874,6 +1874,10 @@ impl Plugin for McpHostPlugin {
                  and for HTTP `auth: {{ \"type\": \"oauth\" }}`. `${{VAR}}` is read from the \
                  environment, so a secret need not be written into the file. Comments are \
                  allowed; trailing commas are not.\n\
+                 `requiredExperimentalCapabilities` optionally maps a documented server \
+                 extension name to its exact positive integer version. Every MCP \
+                 initialize, including recovery, must satisfy it; this grants no \
+                 approval and is not proof of backend policy correctness.\n\
                  To add a server for the person: write the entry (for a stdio server, \
                  `atomcode mcp add <name> <command> [args…]` writes `.mcp.json`, and \
                  `--global` the user file). Two things only the person can do, and both \

@@ -1035,6 +1035,7 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     trust: false,
                     auto_approve: Vec::new(),
                     allowed_tools: None,
+                    required_experimental_capabilities: Default::default(),
                 });
             }
             McpServer::Http(h) => {
@@ -1061,6 +1062,7 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     trust: false,
                     auto_approve: Vec::new(),
                     allowed_tools: None,
+                    required_experimental_capabilities: Default::default(),
                 });
             }
             // `Acp` (MCP-over-ACP) is feature-gated upstream and this agent
