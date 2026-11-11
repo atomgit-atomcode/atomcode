@@ -321,7 +321,7 @@ async fn provider_error_diagnostics_do_not_dump_untrusted_error_payloads() {
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
     }
-    struct Failing(bool);
+    struct Failing(bool, u16);
     #[async_trait::async_trait]
     impl LlmProvider for Failing {
         fn model_name(&self) -> &str {
@@ -336,7 +336,9 @@ async fn provider_error_diagnostics_do_not_dump_untrusted_error_payloads() {
             let error = ProviderError {
                 message: "PRIVATE_ERROR_PAYLOAD".into(),
                 code: Some("PRIVATE_UPSTREAM_CODE".into()),
-                http_status: Some(401),
+                http_status: Some(self.1),
+                retryable: self.1 != 401,
+                retry_after_secs: Some(17),
                 ..Default::default()
             };
             if self.0 {
@@ -350,13 +352,56 @@ async fn provider_error_diagnostics_do_not_dump_untrusted_error_payloads() {
     let guard = tracing::subscriber::set_default(capture.clone());
     for open_error in [true, false] {
         assert!(sample_side_call(
-            Arc::new(Failing(open_error)),
+            Arc::new(Failing(open_error, 401)),
             "PRIVATE_PROMPT".into(),
             Duration::from_secs(1),
             "test"
         )
         .await
         .is_none());
+    }
+    for status in [401, 429, 503] {
+        for open_error in [true, false] {
+            let outcome = evaluate_goal(
+                7,
+                11,
+                13,
+                Arc::new(Failing(open_error, status)),
+                "PRIVATE_PROMPT".into(),
+                "work".into(),
+                String::new(),
+                CancellationToken::new(),
+                Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(
+                (
+                    outcome.generation,
+                    outcome.controller_id,
+                    outcome.async_epoch
+                ),
+                (7, 11, 13)
+            );
+            assert_eq!(outcome.requests, 1);
+            assert!(!outcome.evidence_expanded && !outcome.evidence_exhausted);
+            let message = match outcome.result {
+                GoalResult::RetryableError {
+                    message,
+                    retry_after_secs,
+                } => {
+                    assert_ne!(status, 401);
+                    assert_eq!(retry_after_secs, Some(17));
+                    message
+                }
+                GoalResult::Error(message) => {
+                    assert_eq!(status, 401);
+                    message
+                }
+                _ => panic!("provider failure must remain a failure"),
+            };
+            assert!(message.contains(&status.to_string()), "{message}");
+            assert!(!message.contains("PRIVATE_"), "{message}");
+        }
     }
     drop(guard);
     let log = capture.0.lock().unwrap().join("\n");

@@ -1046,18 +1046,32 @@ fn explicit_unknown(text: &str) -> bool {
 }
 
 fn evaluator_error(error: atomcode_kernel::stream::ProviderError) -> GoalResult {
-    if transient_provider_failure(
+    let retryable = transient_provider_failure(
         Some(error.retryable),
         error.http_status,
         error.code.as_deref(),
         error.retry_after_secs,
-    ) {
+    );
+    // This message reaches goal progress and driver warnings. Gateway payloads
+    // and even structured codes can contain echoed input; keep only metadata.
+    let message = match error.http_status {
+        Some(status) => format!("evaluator provider error (HTTP {status})"),
+        None => "evaluator provider error (no HTTP status)".into(),
+    };
+    tracing::debug!(
+        http_status = error.http_status,
+        retryable,
+        has_error_code = error.code.is_some(),
+        retry_after_secs = error.retry_after_secs,
+        "goal evaluator provider failure"
+    );
+    if retryable {
         GoalResult::RetryableError {
-            message: format!("evaluator provider error: {error:?}"),
+            message,
             retry_after_secs: error.retry_after_secs,
         }
     } else {
-        GoalResult::Error(format!("evaluator provider error: {error:?}"))
+        GoalResult::Error(message)
     }
 }
 
