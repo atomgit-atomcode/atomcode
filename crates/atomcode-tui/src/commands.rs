@@ -1011,6 +1011,20 @@ fn session_catalogue() -> Vec<Command> {
             .map(|(value, about)| CommandOption::new(value, t(about)))
             .collect(),
         ),
+        Command::said_taking("browser", t(Msg::CmdTakesBrowser), t(Msg::CmdAboutBrowser))
+            .selecting(
+                [
+                    ("status", Msg::BrowserStatusAbout),
+                    ("doctor", Msg::BrowserDoctorAbout),
+                    ("enable", Msg::BrowserEnableAbout),
+                    ("disable", Msg::BrowserDisableAbout),
+                    ("reload", Msg::BrowserReloadAbout),
+                    ("help", Msg::BrowserHelpAbout),
+                ]
+                .into_iter()
+                .map(|(value, about)| CommandOption::new(value, t(about)))
+                .collect(),
+            ),
         Command::said("language", t(Msg::CmdAboutLanguage)).selecting(language_options()),
         Command::said("reload", t(Msg::CmdAboutReload)),
         Command::said("logout", t(Msg::CmdAboutLogout)),
@@ -2853,6 +2867,44 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
+            "browser" => {
+                use atomcode_host_api::BrowserAction;
+                let action = match args.trim().to_ascii_lowercase().as_str() {
+                    "help" | "--help" | "-h" => {
+                        return Outcome::Said(t(Msg::BrowserHelp).into_owned())
+                    }
+                    "reload" => {
+                        if let Some(why) = waits_for_the_turn("computer reload") {
+                            return why;
+                        }
+                        let control = match host(control) {
+                            Ok(c) => c,
+                            Err(e) => return e,
+                        };
+                        return mcp(control, root, "reload", "").await;
+                    }
+                    "" | "status" => BrowserAction::Status,
+                    "doctor" => BrowserAction::Doctor,
+                    "enable" => BrowserAction::Enable,
+                    "disable" => BrowserAction::Disable,
+                    _ => return Outcome::Refused(t(Msg::BrowserHelp).into_owned()),
+                };
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                match control
+                    .call(HostCommand::Browser {
+                        session: root,
+                        action,
+                    })
+                    .await
+                {
+                    Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
+                    Ok(other) => Outcome::Refused(format!("unexpected host reply: {other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "mcp" => {
                 // 无参要的是那块面板,不是一列文本(设计 §5.1):它读的端口是面板自己的,
                 // 而命令这一层连不上宿主——所以举起动作,由插件那一侧升起它(`/toolbox`
@@ -4471,6 +4523,7 @@ mod tests {
             "/rewind 1",
             "/reload",
             "/computer reload",
+            "/browser reload",
         ] {
             let host = Arc::new(Recording::default());
             let (app, client, all) = following(&host);
@@ -5270,6 +5323,80 @@ mod tests {
             }));
         assert!(
             matches!(all.dispatch("/computer enable", &app.context()).await, Outcome::Refused(text) if text == "permissions incomplete")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_commands_are_local_host_intents_and_reload_is_explicit() {
+        use atomcode_host_api::BrowserAction;
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        let catalogue = SessionCommands.commands();
+        let command = catalogue.iter().find(|c| c.name == "browser").unwrap();
+        assert_eq!(
+            command
+                .options
+                .iter()
+                .map(|o| o.value.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["status", "doctor", "enable", "disable", "reload", "help"]
+        );
+        for (verb, action) in [
+            ("", BrowserAction::Status),
+            ("status", BrowserAction::Status),
+            ("doctor", BrowserAction::Doctor),
+            ("enable", BrowserAction::Enable),
+            ("disable", BrowserAction::Disable),
+        ] {
+            host.replies
+                .lock()
+                .unwrap()
+                .push_back(Ok(HostReply::DoneWithNote {
+                    note: "configuration only".into(),
+                }));
+            let out = all
+                .dispatch(&format!("/browser {verb}"), &app.context())
+                .await;
+            assert!(matches!(out, Outcome::Said(text) if text == "configuration only"));
+            assert_eq!(
+                host.asked.lock().unwrap().last(),
+                Some(&HostCommand::Browser {
+                    session: "lead".into(),
+                    action
+                })
+            );
+        }
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            5,
+            "no implicit reload or desktop action"
+        );
+        for arg in [
+            "help",
+            "--help",
+            "unknown",
+            "enable extra",
+            "doctor --server /tmp/custom",
+        ] {
+            let out = all
+                .dispatch(&format!("/browser {arg}"), &app.context())
+                .await;
+            assert!(matches!(out, Outcome::Said(_) | Outcome::Refused(_)));
+            assert_eq!(host.asked.lock().unwrap().len(), 5, "{arg}");
+        }
+        all.dispatch("/browser reload", &app.context()).await;
+        assert!(
+            matches!(&host.asked.lock().unwrap()[5], HostCommand::Reload { session } if session == "lead")
+        );
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Err(HostError::Failed {
+                message: "permissions incomplete".into(),
+            }));
+        assert!(
+            matches!(all.dispatch("/browser enable", &app.context()).await, Outcome::Refused(text) if text == "permissions incomplete")
         );
     }
 

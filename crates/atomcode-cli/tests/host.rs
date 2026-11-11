@@ -103,6 +103,13 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text.starts_with("browser navigate ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "mcp__browser-use__browser_navigate".into(),
+                    arguments: serde_json::json!({"url": &m.text[17..]}).to_string(),
+                })
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -3985,4 +3992,108 @@ async fn computer_setup_is_addressed_and_does_not_mutate_the_live_runtime() {
         before,
         "no implicit runtime rebuild"
     );
+}
+
+/// Browser setup uses the host's configured product tree and rejects stale
+/// sessions before resolving or launching any executable. No GUI is involved.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn browser_setup_is_addressed_and_does_not_mutate_the_live_runtime() {
+    use atomcode_host_api::BrowserAction;
+    let env = env();
+    let connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Browser {
+                session: "not-this-session".into(),
+                action: BrowserAction::Enable,
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+    let before = env.script.built.lock().unwrap().len();
+    for action in [BrowserAction::Status, BrowserAction::Disable] {
+        let reply = connection
+            .control
+            .call(HostCommand::Browser {
+                session: session.clone(),
+                action,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, HostReply::DoneWithNote { note } if note.contains("Browser Use")));
+    }
+    assert!(!env._home.path().join("mcp.json").exists());
+    assert_eq!(
+        env.script.built.lock().unwrap().len(),
+        before,
+        "no implicit runtime rebuild"
+    );
+}
+
+/// A real browser MCP mutation goes through the actual runtime approval seam.
+/// Denial must prevent even the first local HTTP request.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires an explicitly installed browser backend; local controlled acceptance"]
+async fn a_real_browser_navigation_can_be_denied_before_external_effects() {
+    let backend =
+        std::env::var_os("ATOMCODE_BROWSER_TEST_SERVER").expect("explicit installed cli.js");
+    let env = env();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    atomcode::browser_cmd::execute(
+        &dirs,
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: Some(backend.into()),
+            node: None,
+        },
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (mut connection, _) = started(&env, SubagentPolicy::Disabled, None, vec![], true).await;
+    let session = connection.session.clone();
+    assert!(tools_on_the_model(&connection, &session, "browser-use")
+        .await
+        .iter()
+        .any(|name| name.contains("browser_navigate")));
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session,
+            mode: atomcode_host_api::Mode::Ask,
+        })
+        .await
+        .unwrap();
+    connection
+        .commands
+        .send(message(&format!("browser navigate http://{address}/")))
+        .unwrap();
+    let (id, kind) = loop {
+        match tokio::time::timeout(Duration::from_secs(15), connection.events.recv()).await {
+            Ok(Some(AgentEvent::Request { id, kind, .. })) => break (id, kind),
+            Ok(Some(_)) => continue,
+            other => panic!("no browser approval: {other:?}"),
+        }
+    };
+    assert_eq!(kind, "approval");
+    connection
+        .commands
+        .send(AgentCommand::Respond {
+            id,
+            value: serde_json::json!({"decision":"deny"}),
+        })
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "denied browser navigation reached the web server"
+    );
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
 }

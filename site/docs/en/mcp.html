@@ -189,6 +189,26 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       <p>Base64, declared MIME type, actual encoding and pixel data are validated. Limits are 4 MiB of Base64 per image, four images and 8 MiB of Base64 per result, 8192 pixels per edge and 16 million pixels per image. The request-level image budget can further omit historical images. Invalid or oversized output retains text and returns an explicit tool error, with no partial screenshot set or automatic re-execution. Ask the server to capture a smaller region when needed.</p>
       <p>This does not install a desktop executor, grant operating-system permissions or change the selected model. Text-only models do not gain vision. Image resource links are not fetched automatically, and embedded resource blobs are not treated as screenshots.</p>
 
+      <h2 id="browser-use">Isolated browser workflow</h2>
+      <p>The optional browser integration uses an external <a href="https://github.com/microsoft/playwright-mcp">Playwright MCP</a> backend. AtomCode bundles neither Node nor a browser and does not download them on startup. Install Node 18+ and Chrome explicitly. Only macOS has local acceptance evidence so far; Windows and Linux require their own acceptance before being called verified.</p>
+      <pre><code># Explicit external installation; choose a directory outside the repository
+npm install --prefix /absolute/path/browser-backend @playwright/mcp@0.0.85
+atomcode browser doctor --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
+atomcode browser enable --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
+atomcode</code></pre>
+      <p>On Windows, use an absolute Windows path for <code>--server</code>; <code>--node</code> can select an installed Node executable. Setup checks versions only: it does not launch Chrome or prove that browser binaries are installed. An unavailable browser is an explicit runtime error; AtomCode does not install it automatically.</p>
+      <pre><code>/browser status
+/browser doctor
+/browser reload
+$browser-use Open the local test page, fill the authorized form and verify the result.
+/browser disable
+/browser reload</code></pre>
+      <p>The first setup requires a terminal server path. Once configured, <code>/browser enable</code> reuses it. Configuration changes need an explicit reload or restart. <code>status</code> reads saved configuration; use <code>/mcp</code> for live connections, project overrides and pause/resume. Custom same-name configuration and edited skills are preserved rather than overwritten.</p>
+      <p>The managed backend uses an isolated profile and disables page-provided WebMCP. It does not attach your personal Chrome profile or import cookies. Native MCP approvals remain in place (<code>trust: false</code>, empty <code>autoApprove</code>); read-only annotations and tool-wide Always grants still apply. These approvals are <strong>not site-scoped access control</strong>. There is no enforced origin allowlist. The browser runs on the MCP host, which may differ from your client computer.</p>
+      <p>The managed <code>allowedTools</code> list exposes reviewed navigation, observation, form, interaction and close tools. Code evaluation, unsafe scripts, file upload and browser-install tools are excluded. Generic MCP configurations may also use <code>allowedTools</code> with exact raw tool names: omitted permits all, an empty array permits none. This filter is checked for discovery, cached tools and execution; it grants no approval and is not an operating-system or network sandbox.</p>
+      <p>Generated snapshots and screenshots are stored under <code>&lt;user tree&gt;/integrations/browser-use/artifacts</code>, outside the project. Setup restricts that directory to the owner on Unix; Windows inherits directory ACLs. The backend receives a 16 MiB output eviction target, not a hard disk quota. Disabling preserves these files; remove them yourself when no longer needed.</p>
+      <p>The skill is invoked explicitly using <code>$browser-use</code>; installing it does not automatically select it. Screenshots require a vision-capable model, while structured page snapshots can support text-only models. Cancellation and disabling configuration cannot undo dispatched external actions. Re-observe unknown outcomes before retrying; close only browser resources owned by your workflow.</p>
+
       <h2 id="computer-use">Operate macOS apps from the CLI</h2>
       <p>Connect the local <a href="https://github.com/opensymph/open-computer-use">Open Computer Use</a> MCP backend on macOS 14 or later. Screenshot tasks require a vision-capable selected model. AtomCode does not install the backend automatically or launch a separate model agent.</p>
       <pre><code># Explicitly install the pinned backend (requires Node.js / npm)

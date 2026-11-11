@@ -34,6 +34,15 @@ pub enum ComputerAction {
     Disable,
 }
 
+/// Explicit user intents for the host-local browser integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrowserAction {
+    Status,
+    Doctor,
+    Enable,
+    Disable,
+}
+
 /// What a front end asks the host to do.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,6 +52,11 @@ pub enum HostCommand {
     Computer {
         session: String,
         action: ComputerAction,
+    },
+    /// Host-local browser MCP configuration; Reload applies it to live sessions.
+    Browser {
+        session: String,
+        action: BrowserAction,
     },
     /// Host-local hooks configuration preview and explicit script diagnostic.
     Hooks { session: String, args: String },
@@ -377,7 +391,8 @@ impl HostCommand {
     /// The live session this command acts on, if it acts on one.
     pub fn addressed(&self) -> Option<&str> {
         match self {
-            Self::Computer { session, .. }
+            Self::Browser { session, .. }
+            | Self::Computer { session, .. }
             | Self::DisplayHistory { session, .. }
             | Self::NewSession { session }
             | Self::Resume { session, .. }
@@ -1666,6 +1681,22 @@ mod tests {
                 session: "a".into(),
                 action: ComputerAction::Disable,
             },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Status,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Doctor,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Enable,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Disable,
+            },
             HostCommand::ImportPatch {
                 session: "a".into(),
                 bytes: b"patch\r\n".to_vec(),
@@ -1843,7 +1874,8 @@ mod tests {
         ];
         for c in &all {
             match c {
-                HostCommand::Computer { .. }
+                HostCommand::Browser { .. }
+                | HostCommand::Computer { .. }
                 | HostCommand::DisplayHistory { .. }
                 | HostCommand::NewSession { .. }
                 | HostCommand::Resume { .. }

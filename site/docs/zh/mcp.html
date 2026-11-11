@@ -189,6 +189,26 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       <p>图片会校验 Base64、声明的 MIME 类型、实际编码和像素数据。每张图片最多 4 MiB Base64，每次结果最多 4 张、合计 8 MiB Base64；单边最多 8192 像素，总像素最多 1600 万。请求级图片预算还可能进一步裁减历史图片。无效或超限时保留原文字、返回明确的工具错误，不附带部分截图，也不自动重跑已执行的操作；需要更小的截图时，应让服务端裁取目标区域。</p>
       <p>此能力不包含桌面执行器，不会自动获取屏幕录制或辅助功能权限，也不会替换当前模型。文本模型不会因此获得视觉能力。暂不自动获取图片资源链接或将嵌入资源的 blob 作为截图使用。</p>
 
+      <h2 id="browser-use">隔离浏览器工作流</h2>
+      <p>浏览器集成采用外部 <a href="https://github.com/microsoft/playwright-mcp">Playwright MCP</a> 后端。AtomCode 不捆绑 Node 或浏览器，启动时也不下载它们。请显式安装 Node 18+ 和 Chrome。目前仅有 macOS 本机验收条件；Windows、Linux 需要分别完成实机验收，不能视为已验证。</p>
+      <pre><code># 显式安装到仓库之外的自选目录
+npm install --prefix /absolute/path/browser-backend @playwright/mcp@0.0.85
+atomcode browser doctor --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
+atomcode browser enable --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
+atomcode</code></pre>
+      <p>Windows 请使用绝对 Windows 路径；<code>--node</code> 可指定已安装的 Node 可执行文件。诊断仅检查版本，不启动 Chrome，也不能证明浏览器已安装。缺少浏览器时运行会明确报错，AtomCode 不自动安装。</p>
+      <pre><code>/browser status
+/browser doctor
+/browser reload
+$browser-use 打开本地测试页，填写已授权的表单并核对结果。
+/browser disable
+/browser reload</code></pre>
+      <p>首次设置需在终端指定后端路径；设置后 <code>/browser enable</code> 可复用它。修改配置需要显式重载或重启。<code>status</code> 读取保存的配置，实时连接、项目覆盖和暂停状态请看 <code>/mcp</code>。自定义同名配置及修改过的技能会保留，不覆盖。</p>
+      <p>托管后端使用隔离 profile，关闭页面提供的 WebMCP，不连接个人 Chrome profile，不导入 Cookie。保留原生 MCP 审批（<code>trust: false</code>、空 <code>autoApprove</code>）；只读标记与工具级“始终允许”仍按现有机制生效。它们<strong>不等于站点授权</strong>，当前没有强制 origin 白名单。浏览器位于 MCP 宿主机器，不一定是客户端所在电脑。</p>
+      <p>托管 <code>allowedTools</code> 只暴露已审查的导航、观察、表单、交互和关闭工具，排除代码求值、不安全脚本、文件上传和浏览器安装工具。通用 MCP 也可配置精确原始工具名列表：省略表示不限，空数组表示全部禁止。发现、缓存和调用入口都检查该列表；它不授予审批，也不是操作系统或网络沙箱。</p>
+      <p>生成的页面快照和截图放在项目外的 <code>&lt;用户目录&gt;/integrations/browser-use/artifacts</code>。Unix 设置为仅所有者可访问，Windows 沿用目录 ACL。后端设置 16 MiB 输出清理目标，不是硬磁盘配额；禁用不会删除这些文件，不再需要时请自行清理。</p>
+      <p>通过 <code>$browser-use</code> 显式调用技能，安装后不会自动选用。截图任务需要视觉模型；结构化页面快照可供文本模型使用。取消和禁用不能撤销已发出的外部操作；结果未知时重新观察后再决定是否重试，只关闭本工作流拥有的浏览器资源。</p>
+
       <h2 id="computer-use">CLI 操作 macOS 应用</h2>
       <p>可通过本地 <a href="https://github.com/opensymph/open-computer-use">Open Computer Use</a> MCP 后端连接桌面。当前集成支持 macOS 14 及以上；截图任务需要当前模型支持视觉。AtomCode 不自动安装后端，也不额外启动一套模型代理。</p>
       <pre><code># 显式安装固定版本后端（需要 Node.js / npm）

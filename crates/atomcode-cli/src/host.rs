@@ -2456,6 +2456,30 @@ impl HostControl for RuntimeControl {
                     })?;
                 Ok(HostReply::DoneWithNote { note })
             }
+            HostCommand::Browser { session, action } => {
+                self.addressed(&session)?;
+                use crate::browser_cmd::BrowserCli;
+                use atomcode_host_api::BrowserAction;
+                let command = match action {
+                    BrowserAction::Status => BrowserCli::Status,
+                    BrowserAction::Doctor => BrowserCli::Doctor {
+                        server: None,
+                        node: None,
+                    },
+                    BrowserAction::Enable => BrowserCli::Enable {
+                        server: None,
+                        node: None,
+                    },
+                    BrowserAction::Disable => BrowserCli::Disable,
+                };
+                let dirs = self.config.lock().expect("config poisoned").dirs.clone();
+                let note = crate::browser_cmd::execute(&dirs, command)
+                    .await
+                    .map_err(|error| HostError::Failed {
+                        message: format!("{error:#}"),
+                    })?;
+                Ok(HostReply::DoneWithNote { note })
+            }
             HostCommand::McpStatus { session } => {
                 self.addressed(&session)?;
                 use atomcode_capabilities::mcp::ServerStatus;

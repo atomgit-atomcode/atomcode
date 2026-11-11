@@ -154,7 +154,7 @@ fn skill_path(dirs: &ProductDirs) -> PathBuf {
     dirs.user().join("skills/computer-use/SKILL.md")
 }
 
-fn read_optional(path: &Path) -> Result<Option<String>> {
+pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if !meta.file_type().is_file() => {
             bail!("refusing non-regular file: {}", path.display())
@@ -203,7 +203,7 @@ fn backend_for(dirs: &ProductDirs, explicit: Option<&Path>) -> Result<PathBuf> {
         .and_then(Value::as_str);
     resolve_backend(Path::new(saved.unwrap_or("open-computer-use")))
 }
-fn write_checked(path: &Path, before: &Option<String>, text: &str) -> Result<()> {
+pub(crate) fn write_checked(path: &Path, before: &Option<String>, text: &str) -> Result<()> {
     if &read_optional(path)? != before {
         bail!("{} changed; retry without overwriting it", path.display());
     }
