@@ -85,6 +85,11 @@ fn managed_env(dirs: &ProductDirs) -> Result<Value> {
         ),
     );
     env.insert("PLAYWRIGHT_MCP_OUTPUT_MAX_SIZE".into(), json!("16777216"));
+    // This transport reads server frames during RPCs, not while the person is
+    // considering an approval. The backend's optional 5s client heartbeat
+    // would close an otherwise healthy idle connection. AtomCode retains its
+    // own bounded RPC deadline and subprocess ownership.
+    env.insert("PLAYWRIGHT_MCP_PING_TIMEOUT_MS".into(), json!("0"));
     Ok(Value::Object(env))
 }
 
@@ -410,6 +415,7 @@ mod tests {
             .contains(&json!("--isolated")));
         assert_eq!(entry["env"]["PLAYWRIGHT_MCP_STORAGE_STATE"], "");
         assert_eq!(entry["env"]["PLAYWRIGHT_MCP_EXTENSION"], "false");
+        assert_eq!(entry["env"]["PLAYWRIGHT_MCP_PING_TIMEOUT_MS"], "0");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

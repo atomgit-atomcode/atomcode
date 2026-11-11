@@ -143,6 +143,10 @@ process.on('SIGTERM',()=>{{child.kill();process.exit(0);}});
         .share();
     let tools = registry.list_all_tools().await;
     assert!(!tools.is_empty());
+    // Real Node process time must pass: Tokio's paused clock cannot advance
+    // the external backend's 5s heartbeat timer. Represents a person waiting
+    // before approving the first action.
+    tokio::time::sleep(std::time::Duration::from_secs(7)).await;
     for forbidden in [
         "browser_evaluate",
         "browser_run_code_unsafe",

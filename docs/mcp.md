@@ -97,6 +97,7 @@ TUI 里等价的是 `/mcp login <server>` / `/mcp logout <server>`。token 存 `
 | `disabled` | 两者 | `true` 时该 server 完全跳过 |
 | `trust` | 两者 | `true` ⇒ 该 server 所有工具免审批 |
 | `autoApprove` | 两者 | 按工具名白名单免审批（别名 `auto_approve`） |
+| `allowedTools` | 两者 | 仅允许精确匹配的原始 MCP 工具名（别名 `allowed_tools`）；省略不限，空数组全部禁止，不支持通配符 |
 
 `auth` 子字段：`type`（`"oauth"`）、`provider`、`issuer`、`resource`、`client_id`、`client_secret_env`、`scopes`、`bearer`、`header`。省略 `issuer` 时客户端先请求 MCP server，从 `WWW-Authenticate` 发现 resource metadata；省略 `client_id` 时尝试动态客户端注册（RFC 7591），授权服务器不支持则报错要求预注册 ID。
 
