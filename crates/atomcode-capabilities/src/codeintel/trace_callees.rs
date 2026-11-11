@@ -1,9 +1,7 @@
 //! `trace_callees` — forward call graph (what a symbol calls), BFS to a depth. `Safe`.
 
 use super::index::{CodeIndex, IndexLimits};
-use super::{
-    ambiguous_symbols, canonical, display_path, err, narrow_by_file, not_indexed, ok,
-};
+use super::{ambiguous_symbols, canonical, display_path, err, narrow_by_file, not_indexed, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -65,11 +63,9 @@ impl Tool for TraceCalleesTool {
         let root = ctx.working_dir.clone();
         let symbol = a.symbol.clone();
         let file = a.file.clone();
-        tokio::task::spawn_blocking(move || {
-            render(&index, &root, &symbol, file.as_deref(), depth)
-        })
-        .await
-        .unwrap_or_else(|_| err("trace_callees: task failed"))
+        tokio::task::spawn_blocking(move || render(&index, &root, &symbol, file.as_deref(), depth))
+            .await
+            .unwrap_or_else(|_| err("trace_callees: task failed"))
     }
 }
 

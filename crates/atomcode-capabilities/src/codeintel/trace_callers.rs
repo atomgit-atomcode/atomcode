@@ -63,11 +63,9 @@ impl Tool for TraceCallersTool {
         let root = ctx.working_dir.clone();
         let symbol = a.symbol.clone();
         let file = a.file.clone();
-        tokio::task::spawn_blocking(move || {
-            render(&index, &root, &symbol, file.as_deref(), depth)
-        })
-        .await
-        .unwrap_or_else(|_| err("trace_callers: task failed"))
+        tokio::task::spawn_blocking(move || render(&index, &root, &symbol, file.as_deref(), depth))
+            .await
+            .unwrap_or_else(|_| err("trace_callers: task failed"))
     }
 }
 
