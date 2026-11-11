@@ -270,6 +270,9 @@ pub struct TelemetryHook {
     /// failed turn. (`on_error` also fires for tool errors, but `turn_complete` only
     /// reads it on a PROVIDER terminal reason — so tool errors never become LlmChat.)
     last_error: StdMutex<Option<String>>,
+    /// The session's working directory, so a provider error that quotes a path
+    /// reads as `<CWD>/…` before it leaves the process.
+    working_dir: std::path::PathBuf,
 }
 
 impl TelemetryHook {
@@ -280,6 +283,7 @@ impl TelemetryHook {
         model: impl Into<String>,
         session_id: Option<&str>,
         position: Arc<Position>,
+        working_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
         Self {
             attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
@@ -291,7 +295,25 @@ impl TelemetryHook {
             last_tool_result_tokens: AtomicU32::new(0),
             last_tool_def_tokens: AtomicU32::new(0),
             last_error: StdMutex::new(None),
+            working_dir: working_dir.into(),
         }
+    }
+
+    /// The provider's own words, made safe to send: scrub this session's paths
+    /// and redact known secret shapes before the 200-char cut, so a credential
+    /// or path straddling that edge cannot survive as a prefix. The MCP half
+    /// does the same in `McpTelemetry::safe_message`.
+    fn safe_message(&self, error: &str) -> String {
+        let home = atomcode_config::util::real_home_dir();
+        let scrubbed = atomcode_telemetry::scrub::scrub_path(
+            error,
+            home.as_deref(),
+            Some(self.working_dir.as_path()),
+        );
+        atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
+            200,
+        )
     }
 }
 
@@ -450,7 +472,7 @@ impl LifecycleHooks for TelemetryHook {
             message_tokens: 0,
             messages_count: self.last_messages_count.load(Ordering::Relaxed),
             error_kind: Some(kind),
-            error_data: last.map(|e| e.chars().take(200).collect()),
+            error_data: last.map(|e| self.safe_message(&e)),
         };
         // The round the turn died on, from the terminal's own context rather
         // than the shared position: a turn can fail before any request went out,
@@ -888,6 +910,7 @@ mod tests {
             "deepseek-v4",
             None,
             Default::default(),
+            std::env::temp_dir(),
         );
 
         hook.on_request(
@@ -941,7 +964,15 @@ mod tests {
     async fn breaks_down_prompt_zones() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            std::env::temp_dir(),
+        );
 
         let mut sys = Message::user("you are a helpful coding agent");
         sys.role = Role::System;
@@ -1034,7 +1065,15 @@ mod tests {
     #[tokio::test]
     async fn a_rate_limited_turn_is_counted_and_a_normal_one_is_not() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            std::env::temp_dir(),
+        );
         let convo = Conversation {
             messages: Vec::new(),
             cache_epoch: 0,
@@ -1096,7 +1135,15 @@ mod tests {
     async fn anchors_real_assistant_tokens_in_breakdown() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            std::env::temp_dir(),
+        );
 
         let mut sys = Message::user("system persona");
         sys.role = Role::System;
@@ -1161,7 +1208,15 @@ mod tests {
     #[tokio::test]
     async fn no_meta_emits_nothing() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            std::env::temp_dir(),
+        );
         let mut resp = Message::assistant("hi", vec![]); // meta = None
         hook.on_model_response(&mut resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1171,7 +1226,15 @@ mod tests {
     #[tokio::test]
     async fn provider_error_turn_emits_had_error_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            std::env::temp_dir(),
+        );
 
         hook.on_error("HTTP 429: rate limited").await;
         hook.turn_complete(
@@ -1197,10 +1260,74 @@ mod tests {
         }
     }
 
+    /// The provider error is the one LlmChat field that can quote outside text.
+    /// It must be scrubbed before the 200-char cut: a token straddling that
+    /// edge would otherwise survive as an unredacted prefix.
+    #[tokio::test]
+    async fn provider_error_data_is_scrubbed_before_it_is_sent() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        // A short synthetic path keeps the token inside the 200-char window
+        // after the marker replaces it.
+        let working_dir = std::path::PathBuf::from("atomcode-telemetry-hook-test");
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            working_dir.clone(),
+        );
+        let token = "ghp_Qq1234567890abcdefghijKLMNOP0987654321";
+        // The token starts before the 200th character and ends after it, so
+        // truncating first would leave a visible prefix.
+        hook.on_error(&format!(
+            "{} failed in {} with Authorization: token {}",
+            "a".repeat(100),
+            working_dir.display(),
+            token
+        ))
+        .await;
+        hook.turn_complete(
+            &Conversation::default(),
+            &StopReason::ProviderError,
+            &TurnCtx::default(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        let data = match &records[0].event {
+            Event::LlmChat {
+                error_data: Some(data),
+                ..
+            } => data,
+            other => panic!("expected a failed LlmChat with a reason, got {other:?}"),
+        };
+        assert!(
+            !data.contains("ghp_"),
+            "no token prefix may survive: {data}"
+        );
+        assert!(data.contains("<REDACTED>"), "expected redaction: {data}");
+        assert!(
+            !data.contains(&working_dir.display().to_string()),
+            "the session path must be scrubbed: {data}"
+        );
+        assert!(data.contains("<CWD>"), "expected the path marker: {data}");
+        assert!(data.chars().count() <= 200, "the cap still applies: {data}");
+    }
+
     #[tokio::test]
     async fn normal_stop_emits_no_extra_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let hook = TelemetryHook::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+            std::env::temp_dir(),
+        );
         // A tool error fired on_error, but the turn stopped normally → no LlmChat.
         hook.on_error("tool failed").await;
         hook.turn_complete(
