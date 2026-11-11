@@ -9,11 +9,14 @@ use atomcode_capabilities::mcp::{
 };
 use atomcode_capabilities::setup::{fs_atomic::atomic_write, lock::SetupLock};
 use atomcode_capabilities::ProductDirs;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
+
+const SCOPE_ENV: &str = "OPEN_COMPUTER_USE_ALLOWED_BUNDLE_IDS";
+const SCOPE_CAPABILITY: &str = "atomcode/application-scope";
 
 const SERVER: &str = "computer-use";
 const OWNER: &str = "atomcode-computer-use-v1";
@@ -38,6 +41,8 @@ pub enum ComputerCli {
     Enable {
         #[arg(long)]
         executable: Option<PathBuf>,
+        #[command(flatten)]
+        scope: ApplicationScopeArgs,
     },
     /// Show configuration without capturing the desktop or changing files.
     Status,
@@ -48,6 +53,93 @@ pub enum ComputerCli {
     },
     /// Disable the managed entry for new/reloaded sessions (not an emergency stop).
     Disable,
+}
+
+/// Explicit setup intent; omitted options preserve the saved policy.
+#[derive(Clone, Debug, Default, Args)]
+pub struct ApplicationScopeArgs {
+    /// Restrict to exact bundle IDs (repeatable); requires the patched backend.
+    #[arg(long = "allow-app", conflicts_with_all = ["deny_all_apps", "unrestricted_apps"])]
+    pub allowed_apps: Vec<String>,
+    /// Deny every application, including unknown applications.
+    #[arg(long, conflicts_with = "unrestricted_apps")]
+    pub deny_all_apps: bool,
+    /// Explicitly remove the saved application restriction (not OS/backend denials).
+    #[arg(long)]
+    pub unrestricted_apps: bool,
+}
+
+impl ApplicationScopeArgs {
+    fn apply(&self, saved: Option<Vec<String>>) -> Result<Option<Vec<String>>> {
+        let modes = usize::from(!self.allowed_apps.is_empty())
+            + usize::from(self.deny_all_apps)
+            + usize::from(self.unrestricted_apps);
+        if modes > 1 {
+            bail!("application scope options are mutually exclusive");
+        }
+        if self.unrestricted_apps {
+            return Ok(None);
+        }
+        if self.deny_all_apps {
+            return Ok(Some(Vec::new()));
+        }
+        if !self.allowed_apps.is_empty() {
+            return Ok(Some(normalize_bundle_ids(self.allowed_apps.clone())?));
+        }
+        Ok(saved)
+    }
+}
+
+fn normalize_bundle_ids(mut ids: Vec<String>) -> Result<Vec<String>> {
+    if ids.len() > 256 {
+        bail!("application scope permits at most 256 bundle IDs");
+    }
+    for id in &mut ids {
+        if id.len() > 255
+            || !id.contains('.')
+            || !id.split('.').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+        {
+            bail!("application scope requires exact bundle IDs such as com.apple.TextEdit; no names, wildcards or paths");
+        }
+        id.make_ascii_lowercase();
+    }
+    ids.sort();
+    ids.dedup();
+    if serde_json::to_vec(&ids)?.len() > 65536 {
+        bail!("application scope exceeds the backend JSON size limit");
+    }
+    Ok(ids)
+}
+
+fn saved_scope(entry: Option<&Value>) -> Result<Option<Vec<String>>> {
+    let Some(raw) = entry
+        .and_then(|entry| entry.get("env"))
+        .and_then(|env| env.get(SCOPE_ENV))
+    else {
+        return Ok(None);
+    };
+    let raw = raw
+        .as_str()
+        .context("saved application scope must be a JSON-array string")?;
+    if raw.len() > 65536 {
+        bail!("saved application scope is too large");
+    }
+    Ok(Some(normalize_bundle_ids(
+        serde_json::from_str(raw).context("invalid saved application scope")?,
+    )?))
+}
+
+fn describe_scope(scope: Option<&[String]>) -> String {
+    match scope {
+        None => "Application scope: not restricted by managed configuration (host environment and backend denials still apply).".into(),
+        Some([]) => "Application scope: deny all applications.".into(),
+        Some(ids) => format!("Application scope: {}", ids.join(", ")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +160,7 @@ struct Probe {
     ui: bool,
     permissions: Permissions,
     runtime: Option<RuntimeIdentity>,
+    application_scope: Option<Value>,
 }
 impl Probe {
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -108,6 +201,19 @@ impl Probe {
             self.permissions.screen_recording
         )
     }
+    fn require_scope(&self, scope: Option<&[String]>) -> Result<()> {
+        if scope.is_some()
+            && self
+                .application_scope
+                .as_ref()
+                .and_then(|value| value.get("version"))
+                .and_then(Value::as_u64)
+                != Some(1)
+        {
+            bail!("application scope requires a backend reporting application_scope version 1; no configuration was changed");
+        }
+        Ok(())
+    }
     fn require_ready(&self) -> Result<()> {
         if !self.permissions.accessibility || !self.permissions.screen_recording {
             bail!("Computer Use permissions incomplete: Accessibility={}, Screen Recording={}.\n{}\nGrant the identified backend App access in macOS settings, then retry; another App's grant does not apply.", self.permissions.accessibility, self.permissions.screen_recording, self.permission_identity());
@@ -136,7 +242,8 @@ pub async fn execute(dirs: &ProductDirs, command: ComputerCli) -> Result<String>
                 }
                 Some(_) => "enabled in configuration (live connection not queried)",
             };
-            Ok(format!("Computer Use: {state}\nBackend: Open Computer Use; supported integration: macOS 14+.\nInstall: npm install -g @opensymph/open-computer-use@1.3.0\nCheck: atomcode computer doctor; enable: atomcode computer enable\nUse /mcp to inspect the current session; project overrides and MCP pause still apply."))
+            let scope = describe_scope(saved_scope(entry.as_ref())?.as_deref());
+            Ok(format!("Computer Use: {state}\n{scope}\nBackend: Open Computer Use; supported integration: macOS 14+.\nInstall: npm install -g @opensymph/open-computer-use@1.3.0\nCheck: atomcode computer doctor; enable: atomcode computer enable\nUse /mcp to inspect the current session; project overrides and MCP pause still apply."))
         }
         ComputerCli::Doctor { executable } => {
             require_platform()?;
@@ -145,11 +252,12 @@ pub async fn execute(dirs: &ProductDirs, command: ComputerCli) -> Result<String>
             report.require_ready()?;
             Ok(report.describe(&backend))
         }
-        ComputerCli::Enable { executable } => {
+        ComputerCli::Enable { executable, scope } => {
             require_platform()?;
             let backend = backend_for(dirs, executable.as_deref())?;
-            enable_after_probe(dirs, &backend, PROBE_TIMEOUT).await?;
-            Ok("Computer Use configured with native MCP approvals. Restart AtomCode or run /computer reload, then describe a desktop task or use $computer-use explicitly. Screenshot tasks need a vision-capable model; automatic skill loading grants no tool permissions.".into())
+            let policy =
+                enable_after_probe_with_scope(dirs, &backend, PROBE_TIMEOUT, &scope).await?;
+            Ok(format!("{}\nComputer Use configured with native MCP approvals. Restart AtomCode or run /computer reload, then describe a desktop task or use $computer-use explicitly. Screenshot tasks need a vision-capable model; automatic skill loading grants no tool permissions.", describe_scope(policy.as_deref())))
         }
         ComputerCli::Disable => {
             disable(dirs)?;
@@ -214,6 +322,11 @@ fn owned_entry(text: Option<&str>) -> Result<Option<Value>> {
                 if entry.get("managedBy").and_then(Value::as_str) != Some(OWNER) {
                     bail!("MCP server 'computer-use' already exists outside this integration; inspect /mcp instead of overwriting it");
                 }
+                if found.is_some() {
+                    bail!(
+                        "duplicate managed computer-use entries; keep a single entry before setup"
+                    );
+                }
                 found = Some(entry.clone());
             }
         }
@@ -250,20 +363,73 @@ pub(crate) fn lock_mcp_setup(dirs: &ProductDirs) -> Result<SetupLock> {
         false,
     )?)
 }
+#[cfg(test)]
 async fn enable_after_probe(dirs: &ProductDirs, backend: &Path, deadline: Duration) -> Result<()> {
-    probe(backend, deadline).await?.require_ready()?;
-    enable(dirs, backend)
+    enable_after_probe_with_scope(dirs, backend, deadline, &ApplicationScopeArgs::default())
+        .await?;
+    Ok(())
+}
+
+async fn enable_after_probe_with_scope(
+    dirs: &ProductDirs,
+    backend: &Path,
+    deadline: Duration,
+    change: &ApplicationScopeArgs,
+) -> Result<Option<Vec<String>>> {
+    let before = read_optional(&config_path(dirs))?;
+    let prior = owned_entry(before.as_deref())?;
+    // Explicit replacement can repair a malformed saved scope. Preservation must
+    // understand it and cannot quietly discard it.
+    let saved =
+        if change.unrestricted_apps || change.deny_all_apps || !change.allowed_apps.is_empty() {
+            None
+        } else {
+            saved_scope(prior.as_ref())?
+        };
+    let scope = change.apply(saved)?;
+    let report = probe(backend, deadline).await?;
+    report.require_ready()?;
+    report.require_scope(scope.as_deref())?;
+    enable_with_scope(
+        dirs,
+        backend,
+        scope.as_deref(),
+        change.unrestricted_apps,
+        Some(&before),
+    )?;
+    Ok(scope)
 }
 
 fn is_bundled_skill(text: &str) -> bool {
     text == SKILL || format!("{:x}", Sha256::digest(text.as_bytes())) == SHIPPED_V1_SKILL_SHA256
 }
 
+#[cfg(test)]
 fn enable(dirs: &ProductDirs, backend: &Path) -> Result<()> {
+    let entry = owned_entry(read_optional(&config_path(dirs))?.as_deref())?;
+    enable_with_scope(
+        dirs,
+        backend,
+        saved_scope(entry.as_ref())?.as_deref(),
+        false,
+        None,
+    )
+}
+
+fn enable_with_scope(
+    dirs: &ProductDirs,
+    backend: &Path,
+    scope: Option<&[String]>,
+    clear_scope_requirement: bool,
+    expected: Option<&Option<String>>,
+) -> Result<()> {
     let _lock = lock_mcp_setup(dirs)?;
     let config = config_path(dirs);
     let before = read_optional(&config)?;
-    owned_entry(before.as_deref())?;
+    if expected.is_some_and(|expected| expected != &before) {
+        bail!("MCP configuration changed during permission probe; retry without overwriting it");
+    }
+    let prior = owned_entry(before.as_deref())?;
     let skill = skill_path(dirs);
     let prior_skill = read_optional(&skill)?;
     if prior_skill
@@ -280,16 +446,78 @@ fn enable(dirs: &ProductDirs, backend: &Path) -> Result<()> {
     )?;
     let mut root: Value = serde_json::from_str(&merged)?;
     let entry = &mut root["mcpServers"][SERVER];
+    if let Some(prior) = prior {
+        *entry = prior;
+    }
+    entry["command"] = json!(backend.to_str().context("backend path must be UTF-8")?);
+    entry["args"] = json!(["mcp"]);
     entry["managedBy"] = json!(OWNER);
     entry["disabled"] = json!(false);
     entry["trust"] = json!(false);
     entry["autoApprove"] = json!([]);
     entry["timeout_ms"] = json!(30_000);
-    entry["env"] = BLOCKED_OPT_INS
-        .iter()
-        .map(|name| (name.to_string(), json!("0")))
-        .collect::<serde_json::Map<String, Value>>()
-        .into();
+    let mut env = match entry.get("env") {
+        None => serde_json::Map::new(),
+        Some(value) => value
+            .as_object()
+            .context("managed MCP env must be an object")?
+            .clone(),
+    };
+    if env.values().any(|value| !value.is_string()) {
+        bail!("managed MCP env values must be strings");
+    }
+    for flag in BLOCKED_OPT_INS {
+        env.insert((*flag).into(), json!("0"));
+    }
+    if let Some(ids) = scope {
+        env.insert(SCOPE_ENV.into(), json!(serde_json::to_string(ids)?));
+    } else {
+        env.remove(SCOPE_ENV);
+    }
+    entry["env"] = Value::Object(env);
+    if entry.get("requiredExperimentalCapabilities").is_some()
+        && entry.get("required_experimental_capabilities").is_some()
+    {
+        bail!("duplicate required capabilities fields in managed MCP configuration");
+    }
+    let mut required: std::collections::BTreeMap<String, u64> = match entry
+        .get("requiredExperimentalCapabilities")
+        .or_else(|| entry.get("required_experimental_capabilities"))
+    {
+        Some(value) => {
+            serde_json::from_value(value.clone()).context("invalid saved required capabilities")?
+        }
+        None => Default::default(),
+    };
+    if scope.is_some() {
+        if required
+            .get(SCOPE_CAPABILITY)
+            .is_some_and(|version| *version != 1)
+        {
+            bail!("saved application scope capability version conflicts with supported version 1; inspect configuration before replacing it");
+        }
+        required.insert(SCOPE_CAPABILITY.into(), 1);
+    } else if clear_scope_requirement {
+        required.remove(SCOPE_CAPABILITY);
+    }
+    entry
+        .as_object_mut()
+        .context("managed MCP entry must be an object")?
+        .remove("required_experimental_capabilities");
+    if !required.is_empty() {
+        entry["requiredExperimentalCapabilities"] = json!(required);
+    } else {
+        entry
+            .as_object_mut()
+            .context("managed MCP entry must be an object")?
+            .remove("requiredExperimentalCapabilities");
+    }
+    // Validate only the edited entry, not unrelated servers. This also enforces
+    // generic requirement bounds before any product file is written.
+    atomcode_capabilities::mcp::parse_mcp_servers(
+        &json!({"mcpServers":{SERVER:entry.clone()}}).to_string(),
+        atomcode_capabilities::mcp::McpConfigSource::User,
+    )?;
     write_checked(&skill, &prior_skill, SKILL)?;
     // Retain the identical skill if the config commit is uncertain. Deleting
     // it could undo part of a commit that actually reached disk.
@@ -422,6 +650,203 @@ mod tests {
     }
     fn configured(dirs: &ProductDirs) {
         enable(dirs, Path::new("/test/desktop backend")).unwrap();
+    }
+
+    #[test]
+    fn scope_ids_are_exact_bounded_normalized_and_modes_are_exclusive() {
+        let ids = normalize_bundle_ids(vec![
+            "com.apple.TextEdit".into(),
+            "COM.APPLE.TEXTEDIT".into(),
+        ])
+        .unwrap();
+        assert_eq!(ids, vec!["com.apple.textedit"]);
+        for id in [
+            "TextEdit",
+            "*",
+            "com.apple.*",
+            "com..app",
+            ".com.app",
+            "com.app.",
+            "com.app/name",
+            "com.app\n",
+            "com.你好",
+        ] {
+            assert!(normalize_bundle_ids(vec![id.into()]).is_err(), "{id}");
+        }
+        assert!(normalize_bundle_ids(vec!["com.app".into(); 257]).is_err());
+        assert!(normalize_bundle_ids(
+            (0..256)
+                .map(|i| format!("com.{i:03}{}", "a".repeat(248)))
+                .collect()
+        )
+        .is_err());
+        assert!(normalize_bundle_ids(vec![format!("com.{}", "a".repeat(252))]).is_err());
+        let args = ApplicationScopeArgs {
+            allowed_apps: vec!["com.app".into()],
+            deny_all_apps: true,
+            unrestricted_apps: false,
+        };
+        assert!(args.apply(None).is_err());
+        assert_eq!(
+            ApplicationScopeArgs::default()
+                .apply(Some(ids.clone()))
+                .unwrap(),
+            Some(ids)
+        );
+    }
+
+    #[test]
+    fn scoped_enable_preserves_policy_and_only_explicit_unrestriction_removes_it() {
+        let (_temp, dirs) = tree();
+        configured(&dirs);
+        let mut root = config(&dirs);
+        let entry = &mut root["mcpServers"][SERVER];
+        entry["env"][SCOPE_ENV] = json!("[\"com.apple.TextEdit\"]");
+        entry["env"]["CUSTOM_SETTING"] = json!("keep-private");
+        entry["required_experimental_capabilities"] = json!({"vendor/another":2});
+        entry["allowedTools"] = json!(["observe"]);
+        put(&config_path(&dirs), &root.to_string());
+        configured(&dirs);
+        let root = config(&dirs);
+        let entry = &root["mcpServers"][SERVER];
+        assert_eq!(entry["env"][SCOPE_ENV], "[\"com.apple.textedit\"]");
+        assert_eq!(entry["env"]["CUSTOM_SETTING"], "keep-private");
+        assert_eq!(entry["allowedTools"], json!(["observe"]));
+        assert_eq!(
+            entry["requiredExperimentalCapabilities"],
+            json!({SCOPE_CAPABILITY:1,"vendor/another":2})
+        );
+        assert!(entry.get("required_experimental_capabilities").is_none());
+        disable(&dirs).unwrap();
+        configured(&dirs);
+        assert_eq!(
+            config(&dirs)["mcpServers"][SERVER]["env"][SCOPE_ENV],
+            "[\"com.apple.textedit\"]"
+        );
+        enable_with_scope(&dirs, Path::new("/test/backend"), Some(&[]), false, None).unwrap();
+        assert_eq!(config(&dirs)["mcpServers"][SERVER]["env"][SCOPE_ENV], "[]");
+        assert!(describe_scope(Some(&[])).contains("deny all"));
+        enable_with_scope(&dirs, Path::new("/test/backend"), None, true, None).unwrap();
+        let root = config(&dirs);
+        let entry = &root["mcpServers"][SERVER];
+        assert!(entry["env"].get(SCOPE_ENV).is_none());
+        assert_eq!(
+            entry["requiredExperimentalCapabilities"],
+            json!({"vendor/another":2})
+        );
+        assert_eq!(entry["env"]["CUSTOM_SETTING"], "keep-private");
+    }
+
+    #[test]
+    fn plain_enable_retains_requirements_even_without_an_environment_scope() {
+        let (_temp, dirs) = tree();
+        configured(&dirs);
+        let mut root = config(&dirs);
+        root["mcpServers"][SERVER]["requiredExperimentalCapabilities"] =
+            json!({SCOPE_CAPABILITY:1,"vendor/other":3});
+        put(&config_path(&dirs), &root.to_string());
+        configured(&dirs);
+        assert_eq!(
+            config(&dirs)["mcpServers"][SERVER]["requiredExperimentalCapabilities"],
+            json!({SCOPE_CAPABILITY:1,"vendor/other":3})
+        );
+    }
+
+    #[test]
+    fn conflicting_or_ambiguous_saved_policies_are_not_silently_replaced() {
+        for required in [
+            json!({SCOPE_CAPABILITY:2}),
+            json!({"vendor/bad":0}),
+            json!(null),
+        ] {
+            let (_temp, dirs) = tree();
+            configured(&dirs);
+            let mut root = config(&dirs);
+            root["mcpServers"][SERVER]["requiredExperimentalCapabilities"] = required;
+            let before = root.to_string();
+            put(&config_path(&dirs), &before);
+            assert!(
+                enable_with_scope(&dirs, Path::new("/replacement"), Some(&[]), false, None)
+                    .is_err()
+            );
+            assert_eq!(read_optional(&config_path(&dirs)).unwrap().unwrap(), before);
+        }
+        let duplicate = json!({"servers":{SERVER:{"managedBy":OWNER}},"mcpServers":{SERVER:{"managedBy":OWNER}}});
+        assert!(owned_entry(Some(&duplicate.to_string())).is_err());
+    }
+
+    #[test]
+    fn configuration_changed_during_probe_is_not_overwritten() {
+        let (_temp, dirs) = tree();
+        configured(&dirs);
+        let before = read_optional(&config_path(&dirs)).unwrap();
+        let changed = before.as_ref().unwrap().replace("30000", "40000");
+        put(&config_path(&dirs), &changed);
+        assert!(enable_with_scope(
+            &dirs,
+            Path::new("/replacement"),
+            Some(&[]),
+            false,
+            Some(&before)
+        )
+        .is_err());
+        assert_eq!(
+            read_optional(&config_path(&dirs)).unwrap().unwrap(),
+            changed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scoped_probe_requires_typed_version_before_writing_and_checks_preserved_policy() {
+        tokio::time::resume(); // Real subprocess I/O, as with the existing probe tests.
+        let (temp, dirs) = tree();
+        let args = ApplicationScopeArgs {
+            allowed_apps: vec!["com.apple.TextEdit".into()],
+            ..Default::default()
+        };
+        for declaration in [
+            json!(null),
+            json!({}),
+            json!({"version":true}),
+            json!({"version":"1"}),
+            json!({"version":1.0}),
+            json!({"version":2}),
+        ] {
+            let mut report: Value = serde_json::from_str(READY).unwrap();
+            report["application_scope"] = declaration;
+            let backend = fake_backend(temp.path(), &format!("printf '%s' '{report}'"));
+            assert!(
+                enable_after_probe_with_scope(&dirs, &backend, PROBE_TIMEOUT, &args)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("application_scope version 1")
+            );
+            assert!(!dirs.user().exists());
+        }
+        let mut report: Value = serde_json::from_str(READY).unwrap();
+        report["application_scope"] = json!({"version":1});
+        let backend = fake_backend(temp.path(), &format!("printf '%s' '{report}'"));
+        enable_after_probe_with_scope(&dirs, &backend, PROBE_TIMEOUT, &args)
+            .await
+            .unwrap();
+        let before = read_optional(&config_path(&dirs)).unwrap();
+        let legacy = fake_backend(temp.path(), &format!("printf '%s' '{READY}'"));
+        assert!(enable_after_probe(&dirs, &legacy, PROBE_TIMEOUT)
+            .await
+            .is_err());
+        assert_eq!(read_optional(&config_path(&dirs)).unwrap(), before);
+        let clear = ApplicationScopeArgs {
+            unrestricted_apps: true,
+            ..Default::default()
+        };
+        enable_after_probe_with_scope(&dirs, &legacy, PROBE_TIMEOUT, &clear)
+            .await
+            .unwrap();
+        assert!(config(&dirs)["mcpServers"][SERVER]["env"]
+            .get(SCOPE_ENV)
+            .is_none());
     }
 
     #[test]

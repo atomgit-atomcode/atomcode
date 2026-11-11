@@ -2445,7 +2445,25 @@ impl HostControl for RuntimeControl {
                 let command = match action {
                     ComputerAction::Status => ComputerCli::Status,
                     ComputerAction::Doctor => ComputerCli::Doctor { executable: None },
-                    ComputerAction::Enable => ComputerCli::Enable { executable: None },
+                    ComputerAction::Enable => ComputerCli::Enable {
+                        executable: None,
+                        scope: Default::default(),
+                    },
+                    ComputerAction::EnableScoped { bundle_ids } => ComputerCli::Enable {
+                        executable: None,
+                        scope: crate::computer_cmd::ApplicationScopeArgs {
+                            deny_all_apps: bundle_ids.is_empty(),
+                            allowed_apps: bundle_ids,
+                            unrestricted_apps: false,
+                        },
+                    },
+                    ComputerAction::EnableUnrestricted => ComputerCli::Enable {
+                        executable: None,
+                        scope: crate::computer_cmd::ApplicationScopeArgs {
+                            unrestricted_apps: true,
+                            ..Default::default()
+                        },
+                    },
                     ComputerAction::Disable => ComputerCli::Disable,
                 };
                 let dirs = self.config.lock().expect("config poisoned").dirs.clone();

@@ -4097,3 +4097,56 @@ async fn a_real_browser_navigation_can_be_denied_before_external_effects() {
     );
     connection.commands.send(AgentCommand::Shutdown).unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn computer_application_scope_setup_is_local_and_never_implicitly_reloads() {
+    use atomcode_host_api::ComputerAction;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::resume(); // This setup intentionally performs real subprocess I/O.
+    let env = env();
+    let connection = connected(&env).await;
+    let before = env.script.built.lock().unwrap().len();
+    let backend = env._home.path().join("scope backend");
+    std::fs::write(&backend, "#!/bin/sh\nprintf '%s' '{\"schema_version\":1,\"kind\":\"doctor\",\"ui\":false,\"permissions\":{\"accessibility\":true,\"screen_recording\":true},\"application_scope\":{\"version\":1}}'\n").unwrap();
+    std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = env._home.path().join("mcp.json");
+    std::fs::write(&path, serde_json::json!({"mcpServers":{"computer-use":{"command":backend,"args":["mcp"],"managedBy":"atomcode-computer-use-v1"}}}).to_string()).unwrap();
+    for (action, expected) in [
+        (
+            ComputerAction::EnableScoped {
+                bundle_ids: vec!["com.apple.TextEdit".into()],
+            },
+            Some("[\"com.apple.textedit\"]"),
+        ),
+        (ComputerAction::Enable, Some("[\"com.apple.textedit\"]")),
+        (
+            ComputerAction::EnableScoped { bundle_ids: vec![] },
+            Some("[]"),
+        ),
+        (ComputerAction::EnableUnrestricted, None),
+    ] {
+        let reply = connection
+            .control
+            .call(HostCommand::Computer {
+                session: connection.session.clone(),
+                action,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, HostReply::DoneWithNote { .. }));
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["mcpServers"]["computer-use"]["env"]["OPEN_COMPUTER_USE_ALLOWED_BUNDLE_IDS"]
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            env.script.built.lock().unwrap().len(),
+            before,
+            "setup must not rebuild the runtime"
+        );
+    }
+}

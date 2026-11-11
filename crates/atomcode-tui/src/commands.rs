@@ -2849,7 +2849,30 @@ impl CommandSet for SessionCommands {
                     "doctor" => ComputerAction::Doctor,
                     "enable" => ComputerAction::Enable,
                     "disable" => ComputerAction::Disable,
-                    _ => return Outcome::Refused(t(Msg::ComputerHelp).into_owned()),
+                    _ => {
+                        let words: Vec<_> = args.split_whitespace().collect();
+                        match words.as_slice() {
+                            ["enable", "--deny-all-apps"] => ComputerAction::EnableScoped {
+                                bundle_ids: Vec::new(),
+                            },
+                            ["enable", "--unrestricted-apps"] => ComputerAction::EnableUnrestricted,
+                            ["enable", rest @ ..]
+                                if !rest.is_empty()
+                                    && rest.len() % 2 == 0
+                                    && rest.chunks_exact(2).all(|pair| {
+                                        pair[0] == "--allow-app" && !pair[1].starts_with('-')
+                                    }) =>
+                            {
+                                ComputerAction::EnableScoped {
+                                    bundle_ids: rest
+                                        .chunks_exact(2)
+                                        .map(|pair| pair[1].to_string())
+                                        .collect(),
+                                }
+                            }
+                            _ => return Outcome::Refused(t(Msg::ComputerHelp).into_owned()),
+                        }
+                    }
                 };
                 let control = match host(control) {
                     Ok(c) => c,
@@ -5274,6 +5297,20 @@ mod tests {
             ("doctor", ComputerAction::Doctor),
             ("enable", ComputerAction::Enable),
             ("disable", ComputerAction::Disable),
+            (
+                "enable --allow-app com.apple.TextEdit --allow-app com.example.fixture",
+                ComputerAction::EnableScoped {
+                    bundle_ids: vec!["com.apple.TextEdit".into(), "com.example.fixture".into()],
+                },
+            ),
+            (
+                "enable --deny-all-apps",
+                ComputerAction::EnableScoped { bundle_ids: vec![] },
+            ),
+            (
+                "enable --unrestricted-apps",
+                ComputerAction::EnableUnrestricted,
+            ),
         ] {
             host.replies
                 .lock()
@@ -5295,7 +5332,7 @@ mod tests {
         }
         assert_eq!(
             host.asked.lock().unwrap().len(),
-            5,
+            8,
             "no implicit reload or desktop action"
         );
         for arg in [
@@ -5303,17 +5340,21 @@ mod tests {
             "--help",
             "unknown",
             "enable extra",
+            "enable --allow-app",
+            "enable --deny-all-apps --allow-app com.app",
+            "enable --allow-app --unrestricted-apps",
+            "enable --unrestricted-apps extra",
             "doctor --executable /tmp/custom",
         ] {
             let out = all
                 .dispatch(&format!("/computer {arg}"), &app.context())
                 .await;
             assert!(matches!(out, Outcome::Said(_) | Outcome::Refused(_)));
-            assert_eq!(host.asked.lock().unwrap().len(), 5, "{arg}");
+            assert_eq!(host.asked.lock().unwrap().len(), 8, "{arg}");
         }
         all.dispatch("/computer reload", &app.context()).await;
         assert!(
-            matches!(&host.asked.lock().unwrap()[5], HostCommand::Reload { session } if session == "lead")
+            matches!(&host.asked.lock().unwrap()[8], HostCommand::Reload { session } if session == "lead")
         );
         host.replies
             .lock()

@@ -26,11 +26,17 @@ use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::SeqNo;
 
 /// Explicit user intents for the host-local desktop integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComputerAction {
     Status,
     Doctor,
     Enable,
+    /// Explicit exact application policy; an empty list denies all.
+    EnableScoped {
+        bundle_ids: Vec<String>,
+    },
+    /// Explicitly remove only the saved application restriction.
+    EnableUnrestricted,
     Disable,
 }
 
@@ -1680,6 +1686,20 @@ mod tests {
             HostCommand::Computer {
                 session: "a".into(),
                 action: ComputerAction::Disable,
+            },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::EnableScoped {
+                    bundle_ids: vec!["com.apple.TextEdit".into()],
+                },
+            },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::EnableScoped { bundle_ids: vec![] },
+            },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::EnableUnrestricted,
             },
             HostCommand::Browser {
                 session: "a".into(),

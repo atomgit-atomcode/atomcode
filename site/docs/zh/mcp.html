@@ -230,6 +230,17 @@ atomcode computer enable
 # 自定义安装位置：上述两个命令均支持 --executable /完整路径/可执行文件</code></pre>
       <p>在 macOS 系统设置中，为后端应用开启辅助功能和屏幕录制权限。<code>atomcode computer doctor</code> 只做有时限的无界面诊断，不会申请权限或抓屏；缺少权限时 <code>enable</code> 会失败，不写 MCP 配置或技能。它保留其他 MCP 项，拒绝覆盖同名自定义服务或技能，并关闭已知的前台输入与全局指针回退开关。</p>
       <p>若后端报告了需要授权的 App，<code>computer doctor</code> 和权限不足提示都会显示其确切路径及 bundle identifier。请为这个 App 授权，Codex Computer Use 或其他副本的授权不会自动转移。旧后端未提供此信息时会明确显示 App 未识别，请先运行后端自己的 doctor 确认。</p>
+      <h3 id="application-scope">应用范围（可选补丁后端）</h3>
+      <p>使用实现 <code>atomcode/application-scope</code> 版本 1 的后端时，可按确切 bundle ID 限制应用。上方固定版本的 npm 原版不包含此 AtomCode 扩展；需要可选补丁后端，并指定其可执行文件。应用名、路径和通配符均被拒绝。</p>
+      <pre><code>atomcode computer enable --executable /path/to/patched/backend --allow-app com.apple.TextEdit
+# 可重复 --allow-app 允许更多应用
+/computer enable --allow-app com.apple.TextEdit
+/computer enable --deny-all-apps
+# 显式移除已保存的应用限制
+/computer enable --unrestricted-apps
+/computer reload</code></pre>
+      <p>普通 <code>enable</code> 保留已保存的范围，包括拒绝全部。设置时要求系统权限就绪且后端报告范围版本 1，再同时保存策略和 MCP 必需能力。每次实际连接或恢复均在工具可用前检查能力版本。配置状态不代表当前连接状态：请查看 <code>/mcp</code> 并显式重载。设置操作不修改当前连接，也不中断已经发出的操作；其他必需能力和工具限制会保留。</p>
+      <p>后端检查实际解析的应用、窗口及缓存观察；限制模式拒绝全屏捕获和全局指针回退。这不是系统沙箱：Shell 工具、其他客户端或进程，以及允许应用内部产生的效果仍有各自边界。移除配置中的限制后，宿主环境限制和后端内置拒绝规则仍然适用。</p>
       <p>启用后重启 AtomCode，或在当前会话运行 <code>/computer reload</code>。明确的桌面操作请求（如“帮我在 Safari 窗口点击搜索按钮”）会自动加载已安装的 <code>computer-use</code> 静态指导；也可以显式输入 <code>$computer-use 帮我在指定应用中完成任务</code>。自动加载不执行工具、不授予权限，实际调用仍由模型选择并沿用现有 MCP 审批。说明文档、引用示例、代码开发请求和拒绝桌面操作的请求不会触发该规则；匹配不明确时请显式指定技能。<code>[no-auto-skills]</code> 或技能的 <code>auto-load: off</code> 可以关闭自动加载，宿主的 <code>skills-host.auto_load: false</code> 设置也仍然有效。</p>
       <pre><code>/computer help
 /computer status
@@ -240,7 +251,7 @@ atomcode computer enable
       <p>这些 slash 命令在当前会话内委托宿主执行，与终端子命令共用诊断和配置实现。启用、关闭先保存配置；<code>reload</code> 单独通过现有重载流程使其生效，忙碌时会明确拒绝。自定义执行器路径请使用终端的 <code>--executable</code> 参数；不会在 slash 命令中拼接 shell 命令。</p>
       <pre><code>atomcode computer status
 atomcode computer disable</code></pre>
-      <p><code>status</code> 读取用户配置，不代表当前会话的实时连接状态；项目级同名 MCP 配置仍按既有优先级覆盖用户配置，请用 <code>/mcp</code> 检查。<code>disable</code> 仅禁用本集成管理的用户配置项，并移除未修改的附带技能；运行中的会话需要重新加载。它不是紧急停止命令，无法保证撤回已发出的桌面操作。应用级强制授权、多个代理的桌面互斥和远程取消保证尚未包含，代码 rewind 也不会撤销外部 GUI 效果。</p>
+      <p><code>status</code> 读取用户配置，不代表当前会话的实时连接状态；项目级同名 MCP 配置仍按既有优先级覆盖用户配置，请用 <code>/mcp</code> 检查。<code>disable</code> 仅禁用本集成管理的用户配置项，并移除未修改的附带技能；运行中的会话需要重新加载。它不是紧急停止命令，无法保证撤回已发出的桌面操作。原版后端不包含 AtomCode 可选的范围与租约扩展；真实 GUI 效果、跨代理及远程取消保证仍需在执行宿主验收，代码 rewind 也不会撤销外部 GUI 效果。</p>
 
       <p>更新 AtomCode 后，可再次运行 <code>atomcode computer enable</code> 或会话内的 <code>/computer enable</code>，再重载以采用新版内置指导。只升级精确识别的原版技能；用户修改（包括 <code>auto-load: off</code>）会保留并明确提示，不覆盖。指导会区分换行的显示转义与实际文字，并要求保存后重新观察；界面状态仍不明确时应报告未验证。</p>
 

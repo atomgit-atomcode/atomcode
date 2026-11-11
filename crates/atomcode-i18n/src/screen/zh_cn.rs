@@ -457,7 +457,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ComputerDisableAbout => "保存关闭配置；已发出的操作可能仍在执行".into(),
         Msg::ComputerReloadAbout => "重载配置，使其在当前会话生效".into(),
         Msg::ComputerHelpAbout => "查看设置与使用说明".into(),
-        Msg::ComputerHelp => "/computer [status|doctor|enable|disable|reload|help]\nstatus 读取配置；doctor 无界面检查权限，不打开授权向导。enable 需要已安装的后端和系统权限；disable 修改本集成管理的配置。reload 通过现有重载流程让配置在当前会话生效。关闭不能中断已经发出的桌面操作。自定义后端路径：atomcode computer enable --executable <路径>。".into(),
+        Msg::ComputerHelp => "/computer [status|doctor|enable|disable|reload|help]\nstatus 读取配置；doctor 无界面检查权限，不打开授权向导。enable 需要已安装的后端和系统权限；disable 修改本集成管理的配置。reload 通过现有重载流程让配置在当前会话生效。关闭不能中断已经发出的桌面操作。自定义后端路径：atomcode computer enable --executable <路径>。 应用范围：/computer enable --allow-app com.apple.TextEdit（可重复）；--deny-all-apps 拒绝全部；--unrestricted-apps 显式移除已保存的限制。普通 enable 保留范围。限制模式需要支持 application-scope v1 的后端，之后仍需显式 reload。".into(),
         Msg::CmdAboutBrowser => "管理外部隔离浏览器 MCP；/browser help 查看设置说明".into(),
         Msg::CmdTakesBrowser => "[status|doctor|enable|disable|reload|help]".into(),
         Msg::BrowserStatusAbout => "查看已保存的配置".into(),
