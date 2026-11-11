@@ -214,6 +214,8 @@ atomcode computer enable
 atomcode computer disable</code></pre>
       <p><code>status</code> 读取用户配置，不代表当前会话的实时连接状态；项目级同名 MCP 配置仍按既有优先级覆盖用户配置，请用 <code>/mcp</code> 检查。<code>disable</code> 仅禁用本集成管理的用户配置项，并移除未修改的附带技能；运行中的会话需要重新加载。它不是紧急停止命令，无法保证撤回已发出的桌面操作。应用级强制授权、多个代理的桌面互斥和远程取消保证尚未包含，代码 rewind 也不会撤销外部 GUI 效果。</p>
 
+      <p>更新 AtomCode 后，可再次运行 <code>atomcode computer enable</code> 或会话内的 <code>/computer enable</code>，再重载以采用新版内置指导。只升级精确识别的原版技能；用户修改（包括 <code>auto-load: off</code>）会保留并明确提示，不覆盖。指导会区分换行的显示转义与实际文字，并要求保存后重新观察；界面状态仍不明确时应报告未验证。</p>
+
       <h2 id="工具命名">工具命名</h2>
       <p>每个远端 tool 注册成 <code>mcp__&lt;server 键名&gt;__&lt;远端 tool 名&gt;</code>。</p>
       <p>例:配置里 <code>"mcpServers": { "github": { ... } }</code>,远端有 <code>get_issue</code>,模型看到的工具名就是 <code>mcp__github__get_issue</code>。</p>

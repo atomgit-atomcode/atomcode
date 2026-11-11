@@ -214,6 +214,8 @@ atomcode computer enable
 atomcode computer disable</code></pre>
       <p><code>status</code> reads user configuration, not a running session's connection. A same-name project MCP entry still takes precedence; check <code>/mcp</code>. <code>disable</code> changes only this integration's managed user entry and removes its unmodified bundled skill. Running sessions need a reload. It is not an emergency stop and cannot guarantee interruption of dispatched desktop operations. Enforced app-level authorization, desktop exclusivity across agents, and remote cancellation guarantees remain outside this integration; code rewind cannot undo external GUI effects.</p>
 
+      <p>After updating AtomCode, run <code>atomcode computer enable</code> again (or <code>/computer enable</code> in a session) and reload to adopt updated bundled guidance. Only an exact recognized bundled skill is upgraded; local edits, including <code>auto-load: off</code>, are preserved and reported instead of overwritten. The guidance distinguishes display-escaped newlines from actual text and requires fresh observations after saving; ambiguous UI status is reported as unverified.</p>
+
       <h2 id="tool-naming">Tool naming</h2>
       <p>Each remote tool is registered as <code>mcp__&lt;server-key&gt;__&lt;remote-tool-name&gt;</code>.</p>
       <p>Example: with <code>"mcpServers": { "github": { ... } }</code> and a remote <code>get_issue</code> tool, the model sees the tool name <code>mcp__github__get_issue</code>.</p>

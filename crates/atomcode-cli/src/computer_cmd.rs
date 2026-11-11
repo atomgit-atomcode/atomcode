@@ -12,11 +12,16 @@ use atomcode_capabilities::ProductDirs;
 use clap::Subcommand;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 const SERVER: &str = "computer-use";
 const OWNER: &str = "atomcode-computer-use-v1";
 const SKILL: &str = include_str!("../assets/computer-use/SKILL.md");
+/// Byte identity of the shipped d8be8b9bf skill; only this exact older body may
+/// be upgraded. Local edits (including auto-load opt-out) stay protected.
+const SHIPPED_V1_SKILL_SHA256: &str =
+    "c5adc72d2559d6c52d7b880e152e48d0598d8d37abc92099015c8799e022be91";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: u64 = 16 * 1024;
 const BLOCKED_OPT_INS: &[&str] = &[
@@ -209,6 +214,10 @@ async fn enable_after_probe(dirs: &ProductDirs, backend: &Path, deadline: Durati
     enable(dirs, backend)
 }
 
+fn is_bundled_skill(text: &str) -> bool {
+    text == SKILL || format!("{:x}", Sha256::digest(text.as_bytes())) == SHIPPED_V1_SKILL_SHA256
+}
+
 fn enable(dirs: &ProductDirs, backend: &Path) -> Result<()> {
     let _lock = SetupLock::acquire(&dirs.user().join("integrations/computer-use"), false)?;
     let config = config_path(dirs);
@@ -216,7 +225,10 @@ fn enable(dirs: &ProductDirs, backend: &Path) -> Result<()> {
     owned_entry(before.as_deref())?;
     let skill = skill_path(dirs);
     let prior_skill = read_optional(&skill)?;
-    if prior_skill.as_deref().is_some_and(|text| text != SKILL) {
+    if prior_skill
+        .as_deref()
+        .is_some_and(|text| !is_bundled_skill(text))
+    {
         bail!("computer-use skill has local changes; preserve or rename it before enabling");
     }
     let merged = merge_stdio_mcp_server_into_text(
@@ -262,7 +274,10 @@ fn disable(dirs: &ProductDirs) -> Result<()> {
     )?;
     write_checked(&path, &before, &after)?;
     let skill = skill_path(dirs);
-    if read_optional(&skill)?.as_deref() == Some(SKILL) {
+    if read_optional(&skill)?
+        .as_deref()
+        .is_some_and(is_bundled_skill)
+    {
         std::fs::remove_file(skill)?;
     }
     Ok(())
@@ -440,6 +455,47 @@ mod tests {
             assert_eq!(read_optional(&config_path(&dirs)).unwrap().unwrap(), before);
             assert!(!skill_path(&dirs).exists());
         }
+    }
+
+    #[test]
+    fn shipped_skill_can_upgrade_without_overwriting_local_edits() {
+        const OLD: &str = include_str!("../tests/fixtures/computer-use-v1.md");
+        assert!(is_bundled_skill(OLD));
+        assert_ne!(OLD, SKILL);
+        let (_temp, dirs) = tree();
+        configured(&dirs);
+        put(&skill_path(&dirs), OLD);
+        configured(&dirs);
+        assert_eq!(
+            read_optional(&skill_path(&dirs)).unwrap().as_deref(),
+            Some(SKILL)
+        );
+        for changed in [
+            format!("{OLD}\nLocal instructions"),
+            OLD.replace("auto-load: computer-use", "auto-load: off"),
+        ] {
+            put(&skill_path(&dirs), &changed);
+            let before = read_optional(&config_path(&dirs)).unwrap();
+            assert!(enable(&dirs, Path::new("/replacement/backend")).is_err());
+            assert_eq!(
+                read_optional(&skill_path(&dirs)).unwrap().as_deref(),
+                Some(changed.as_str())
+            );
+            assert_eq!(read_optional(&config_path(&dirs)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn disable_removes_an_unmodified_shipped_old_skill() {
+        let (_temp, dirs) = tree();
+        configured(&dirs);
+        put(
+            &skill_path(&dirs),
+            include_str!("../tests/fixtures/computer-use-v1.md"),
+        );
+        disable(&dirs).unwrap();
+        assert!(!skill_path(&dirs).exists());
+        assert_eq!(config(&dirs)["mcpServers"][SERVER]["disabled"], true);
     }
 
     #[test]
