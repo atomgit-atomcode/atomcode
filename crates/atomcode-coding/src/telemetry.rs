@@ -131,6 +131,23 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
     }
 }
 
+/// A provider or MCP server's own words, made safe to send.
+///
+/// The retired engine sent `truncate_head(error, 200)` raw. Two things that
+/// sent: the absolute path of whatever failed — which contains the person's
+/// username — and, for an HTTP request, whatever a transport error quoted back
+/// of it, which can include the `Authorization` header. This scrubs the
+/// session's paths and redacts known secret shapes before the char cap, so a
+/// credential or path straddling that edge cannot survive as a prefix.
+fn safe_message(error: &str, working_dir: &std::path::Path) -> String {
+    let home = atomcode_config::util::real_home_dir();
+    let scrubbed = atomcode_telemetry::scrub::scrub_path(error, home.as_deref(), Some(working_dir));
+    atomcode_telemetry::scrub::truncate_head(
+        &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
+        atomcode_telemetry::scrub::HEAD_MAX,
+    )
+}
+
 /// Where in the conversation the adapters currently are.
 ///
 /// The correlation chain the envelope carries is
@@ -298,23 +315,6 @@ impl TelemetryHook {
             working_dir: working_dir.into(),
         }
     }
-
-    /// The provider's own words, made safe to send: scrub this session's paths
-    /// and redact known secret shapes before the 200-char cut, so a credential
-    /// or path straddling that edge cannot survive as a prefix. The MCP half
-    /// does the same in `McpTelemetry::safe_message`.
-    fn safe_message(&self, error: &str) -> String {
-        let home = atomcode_config::util::real_home_dir();
-        let scrubbed = atomcode_telemetry::scrub::scrub_path(
-            error,
-            home.as_deref(),
-            Some(self.working_dir.as_path()),
-        );
-        atomcode_telemetry::scrub::truncate_head(
-            &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
-            200,
-        )
-    }
 }
 
 #[async_trait]
@@ -472,7 +472,7 @@ impl LifecycleHooks for TelemetryHook {
             message_tokens: 0,
             messages_count: self.last_messages_count.load(Ordering::Relaxed),
             error_kind: Some(kind),
-            error_data: last.map(|e| self.safe_message(&e)),
+            error_data: last.map(|e| safe_message(&e, self.working_dir.as_path())),
         };
         // The round the turn died on, from the terminal's own context rather
         // than the shared position: a turn can fail before any request went out,
@@ -801,31 +801,6 @@ impl McpTelemetry {
         }
     }
 
-    /// The server's own words, made safe to send.
-    ///
-    /// **This is the one deliberate departure from the retired engine**, which
-    /// sent `truncate_head(error, 200)` raw. Two things it therefore sent that
-    /// this does not: the absolute path of whatever failed to spawn — which
-    /// contains the person's username — and, for an HTTP server, whatever a
-    /// transport error quoted back of the request, which can include the
-    /// `Authorization` header. `a0dd5b49` made the same change for tool-call
-    /// failures; this is the MCP half of it.
-    ///
-    /// Redaction runs before truncation, so a secret cannot survive by sitting
-    /// past the 200th character.
-    fn safe_message(&self, error: &str) -> String {
-        let home = atomcode_config::util::real_home_dir();
-        let scrubbed = atomcode_telemetry::scrub::scrub_path(
-            error,
-            home.as_deref(),
-            Some(self.working_dir.as_path()),
-        );
-        atomcode_telemetry::scrub::truncate_head(
-            &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
-            200,
-        )
-    }
-
     /// Report `event`, if it is one of the two that are reported.
     pub fn report(&self, event: &atomcode_capabilities::mcp::McpConnectEvent) {
         use atomcode_capabilities::mcp::McpConnectEvent;
@@ -855,7 +830,8 @@ impl McpTelemetry {
                 detail["tool_count"] = serde_json::json!(0);
             }
             Some(error) => {
-                detail["message"] = serde_json::json!(self.safe_message(error));
+                detail["message"] =
+                    serde_json::json!(safe_message(error, self.working_dir.as_path()));
             }
         }
         self.telemetry.track(Event::McpConnect {
@@ -1279,11 +1255,15 @@ mod tests {
             working_dir.clone(),
         );
         let token = "ghp_Qq1234567890abcdefghijKLMNOP0987654321";
-        // The token starts before the 200th character and ends after it, so
-        // truncating first would leave a visible prefix.
+        // After the path is scrubbed to `<CWD>`, 158 'a's put the token at
+        // character 185. A truncate-first cut leaves only 15 characters of it —
+        // below the 20-character shape the token regex needs. There is
+        // deliberately no key/value prefix (`Authorization: …`) here: its
+        // shorter 6-character rule would redact the truncated fragment too,
+        // and the test would pass under either order.
         hook.on_error(&format!(
-            "{} failed in {} with Authorization: token {}",
-            "a".repeat(100),
+            "{} failed in {} with token {}",
+            "a".repeat(158),
             working_dir.display(),
             token
         ))
