@@ -28,3 +28,10 @@ The existing utility-title test exposed that the shared replay provider ended af
 - The UTF-8 native-persistence cases kept 80 ASCII bytes and 78 Chinese UTF-8 bytes respectively, instead of the old 20-character approximation. Limits never split a UTF-8 code point.
 - These are deterministic protocol fault-injection tests against the release executable, not a new claim that the external gateway anomaly was reproduced or cured. No external model calls were made and no real user credentials were copied in this round. The known native-prefix check applies to generated title candidates; original body text and first-prompt fallback remain intact. Previously stored titles are not rewritten.
 - Evidence directory: `/var/folders/f_/yb9v7zss01sbpj531mbvd7q00000gn/T/atomcode-title-check-bh1_eg8t` (verification-summary.json, sse-validation-summary.json, per-case JSONL/native event logs, build.log and regression logs). The controlled server used only loopback with a fake fixture key. Owned private build sources were removed; public crypto stub and root Cargo.lock were never overlaid.
+
+
+## Latest complete-branch release refresh
+
+Parallel browser commits landed while the first isolated build was running. Rebuilt the complete functional commit `97910188c895cd086e12fb50fface2465810cb5f` so the final executable includes both the browser changes and this title fix. Latest compile gate passed; repeated all eleven release SSE/native-persistence/resume cases successfully. No production-source changes followed that build snapshot. This is the final executable delivered at `target/release/atomcode`.
+
+Final SHA-256: `1f85e20eb806877708370fd23fdd9065814049b0b5ab7f2323e27953cf16c0d9`; size: 40044096 bytes. Refreshed proof: `/var/folders/f_/yb9v7zss01sbpj531mbvd7q00000gn/T/atomcode-title-check-bh1_eg8t/latest-release/verification-summary.json`. The earlier binary digest remains historical evidence only. The repeated controlled tests again used no external model calls or real credentials; owned private sources were removed.
