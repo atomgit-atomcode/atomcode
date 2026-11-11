@@ -33,6 +33,26 @@ pub trait McpClient: Send + Sync {
         arguments: serde_json::Value,
     ) -> Result<CallToolResult>;
 
+    /// A host-owned scope is separate from model arguments. Ordinary clients
+    /// retain their existing contract; negotiated transports validate the scope.
+    async fn call_tool_scoped(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        _scope: Option<&super::McpScope>,
+    ) -> Result<CallToolResult> {
+        self.call_tool(tool_name, arguments).await
+    }
+
+    fn supports_scopes(&self) -> bool {
+        false
+    }
+
+    /// Addressed, transport-owned cleanup on the existing host turn-end seam.
+    async fn finish_scope(&self, _scope: &super::McpScope) -> Result<()> {
+        Ok(())
+    }
+
     /// Await transport-owned cleanup. Stateless test/custom clients need none.
     /// Implementations must bound cleanup and must not invoke business tools.
     async fn shutdown(&self) {}

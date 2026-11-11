@@ -359,17 +359,28 @@ async fn stdio_reconnects_once_after_server_exit_for_concurrent_calls() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
+    let _clock = ExternalIoClock::hold();
     let temp = tempfile::tempdir().unwrap();
+    let read_gate = temp.path().join("read-gate");
+    let response_gate = temp.path().join("response-gate");
+    let read_started = temp.path().join("read-started");
     let calls = temp.path().join("tool-call-count");
     let spawns = temp.path().join("spawn-count");
     let reconnect_delay = temp.path().join("delay-reconnect-initialize");
     let env = BTreeMap::from([
-        ("MCP_TEST_READ_DELAY_MS".to_string(), "350".to_string()),
         (
-            "MCP_TEST_TOOL_RESPONSE_DELAY_MS".to_string(),
-            "350".to_string(),
+            "MCP_TEST_READ_GATE".into(),
+            read_gate.to_string_lossy().into_owned(),
+        ),
+        (
+            "MCP_TEST_READ_STARTED".into(),
+            read_started.to_string_lossy().into_owned(),
+        ),
+        (
+            "MCP_TEST_TOOL_RESPONSE_GATE".into(),
+            response_gate.to_string_lossy().into_owned(),
         ),
         (
             "MCP_TEST_TOOL_CALL_COUNTER".to_string(),
@@ -389,6 +400,7 @@ async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
         ),
     ]);
     let registry = McpRegistry::new(NO_TREE);
+    tokio::time::resume();
     registry
         .add_server(test_server_config_with_env_and_timeout(
             "shared-deadline",
@@ -397,31 +409,42 @@ async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
         ))
         .await
         .expect("stdio MCP server should connect");
+    wait_for_tool_counter(read_started, 1).await;
     std::fs::write(&reconnect_delay, "delay replacement only").unwrap();
+    tokio::time::pause();
 
     let message = "x".repeat(4 * 1024 * 1024);
     let started = tokio::time::Instant::now();
-    let result = registry
-        .call_tool(
-            "shared-deadline",
-            "echo",
-            serde_json::json!({ "message": message }),
-        )
-        .await;
-    let elapsed = started.elapsed();
-    let error = match result {
-        Err(error) => error,
-        Ok(_) => panic!("write and response delays must share one deadline"),
+    let call = registry.call_tool(
+        "shared-deadline",
+        "echo",
+        serde_json::json!({ "message": message }),
+    );
+    tokio::pin!(call);
+    assert!(
+        futures::poll!(call.as_mut()).is_pending(),
+        "4 MiB cannot fit in the blocked pipe"
+    );
+    tokio::time::advance(Duration::from_millis(300)).await;
+    assert!(
+        !calls.exists(),
+        "the server cannot read the request before its gate opens"
+    );
+    std::fs::write(read_gate, "read request").unwrap();
+    tokio::select! {
+        result = call.as_mut() => panic!("response gate is still closed: {result:?}"),
+        _ = wait_for_tool_counter(calls.clone(), 1) => {}
+    }
+    tokio::time::advance(Duration::from_millis(201)).await;
+    let result = match futures::poll!(call.as_mut()) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => panic!("write and response must share the original 500ms deadline; foreground must not await recovery"),
     };
-
-    assert!(
-        error.to_string().contains("result is unknown"),
-        "timed out tool result must stay unknown: {error:#}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_millis(700),
-        "the foreground tool call must not wait for the delayed reconnect: {elapsed:?}"
-    );
+    let error = result.expect_err("the response gate is still closed");
+    assert!(error.to_string().contains("result is unknown"), "{error:#}");
+    assert_eq!(started.elapsed(), Duration::from_millis(501));
+    std::fs::write(response_gate, "late response").unwrap();
+    tokio::time::resume();
     assert_eq!(spawn_count(&calls), 1, "the tool must run only once");
 
     let mut recovered = false;
@@ -447,6 +470,7 @@ async fn stdio_timeout_uses_one_deadline_without_replaying_tool() {
         "the recovered process must remain usable after the recovery task exits"
     );
     assert_eq!(spawn_count(&spawns), 2, "the client should only reconnect");
+    registry.shutdown().await;
 }
 
 #[tokio::test]
@@ -1452,4 +1476,591 @@ async fn aborted_replacement_keeps_old_transport_cleanup_inside_shutdown_barrier
         assert_eq!(shutdown.await, 0);
         assert!(disposed.exists());
     }
+}
+
+fn scoped_config(
+    name: &str,
+    scratch: &std::path::Path,
+    extra: BTreeMap<String, String>,
+) -> McpServerConfig {
+    let mut env = BTreeMap::from([
+        ("MCP_TEST_TURN_SCOPES".into(), "1".into()),
+        (
+            "MCP_TEST_SCOPE_LOG".into(),
+            scratch.join("scope-log").to_string_lossy().into_owned(),
+        ),
+        (
+            "MCP_TEST_TOOL_CALL_COUNTER".into(),
+            scratch.join("calls").to_string_lossy().into_owned(),
+        ),
+    ]);
+    env.extend(extra);
+    test_server_config_with_env(name, env)
+}
+fn scope_records(scratch: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(scratch.join("scope-log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn negotiated_scopes_exclude_other_turns_and_do_not_trust_model_metadata() {
+    use atomcode_capabilities::mcp::McpScope;
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let registry = McpRegistry::new(NO_TREE).share();
+    tokio::time::resume();
+    registry
+        .add_server(scoped_config("scoped", scratch.path(), BTreeMap::new()))
+        .await
+        .unwrap();
+    registry.list_all_tools().await;
+    tokio::time::pause();
+    assert!(registry
+        .call_tool("scoped", "echo", serde_json::json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("host turn scope"));
+    assert!(
+        scope_records(scratch.path()).is_empty(),
+        "no unscoped RPC was dispatched"
+    );
+    let a = McpScope::from_identity("lead", 1);
+    let b = McpScope::from_identity("member", 1);
+    let next = McpScope::from_identity("lead", 2);
+    assert_ne!(a, b);
+    assert_ne!(a, next);
+    assert!(a.owner().len() < 100);
+    let call = |scope: McpScope| {
+        let registry = registry.clone();
+        async move {
+            registry
+                .call_tool_scoped(
+                    "scoped",
+                    "echo",
+                    serde_json::json!({"_meta":{"atomcode/turn":"forged-model-owner"}}),
+                    Some(&scope),
+                )
+                .await
+        }
+    };
+    assert!(!call(a.clone()).await.unwrap().is_error);
+    assert!(call(b.clone())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("busy"));
+    registry.finish_scope(&b).await;
+    assert!(
+        !call(a.clone()).await.unwrap().is_error,
+        "a child's refused scope cannot release its lead"
+    );
+    assert_eq!(
+        scope_records(scratch.path())
+            .iter()
+            .filter(|v| v["method"] == "atomcode/desktop/acquire")
+            .count(),
+        1
+    );
+    registry.finish_scope(&a).await;
+    assert!(!call(b.clone()).await.unwrap().is_error);
+    let before = scope_records(scratch.path()).len();
+    registry.finish_scope(&a).await;
+    assert_eq!(
+        scope_records(scratch.path()).len(),
+        before,
+        "late old scope end cannot dispatch a release for the new owner"
+    );
+    assert!(!call(b.clone()).await.unwrap().is_error);
+    registry.finish_scope(&b).await;
+    let records = scope_records(scratch.path());
+    assert_eq!(records.len(), 8);
+    assert!(records[..4].iter().all(|v| v["scope"] == a.owner()));
+    assert!(records[4..].iter().all(|v| v["scope"] == b.owner()));
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn malformed_scope_ack_never_dispatches_a_tool_and_requires_reconnect() {
+    let _clock = ExternalIoClock::hold();
+    for ack in [
+        "{}",
+        r#"{"acquired":"true"}"#,
+        r#"{"acquired":true,"isError":"false"}"#,
+        r#"{"acquired":true,"isError":true}"#,
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let registry = McpRegistry::new(NO_TREE);
+        tokio::time::resume();
+        registry
+            .add_server(scoped_config(
+                "bad",
+                scratch.path(),
+                BTreeMap::from([("MCP_TEST_SCOPE_BAD_ACQUIRE_ACK".into(), ack.into())]),
+            ))
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let scope = atomcode_capabilities::mcp::McpScope::from_identity("actual-host", 4);
+        assert!(registry
+            .call_tool_scoped("bad", "echo", serde_json::json!({}), Some(&scope))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("acknowledgement"));
+        assert!(!scratch.path().join("calls").exists());
+        assert!(registry
+            .call_tool_scoped("bad", "echo", serde_json::json!({}), Some(&scope))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+        registry.finish_scope(&scope).await;
+        assert!(matches!(
+            &registry.server_statuses().await[0].1,
+            ServerStatus::Failed(_)
+        ));
+        registry.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelled_acquire_is_not_replayed_and_scope_end_retires_its_connection() {
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let gate = scratch.path().join("release-acquire");
+    let config = scoped_config(
+        "scoped",
+        scratch.path(),
+        BTreeMap::from([(
+            "MCP_TEST_SCOPE_ACQUIRE_GATE".into(),
+            gate.to_string_lossy().into_owned(),
+        )]),
+    );
+    let registry = McpRegistry::new(NO_TREE).share();
+    tokio::time::resume();
+    registry.add_server(config.clone()).await.unwrap();
+    let info = registry.list_all_tools().await.remove(0);
+    tokio::time::pause();
+    let scope = atomcode_capabilities::mcp::McpScope::from_identity("cancelled", 1);
+    let provided = scope.clone();
+    let adapter = Arc::new(
+        McpToolAdapter::new(registry.clone(), info)
+            .unwrap()
+            .with_scope_provider(Arc::new(move || Some(provided.clone()))),
+    );
+    let ctx = ToolContext {
+        working_dir: scratch.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
+    let cancel = ctx.cancel.clone();
+    let running = tokio::spawn(async move { adapter.execute("{}", &ctx).await });
+    wait_for_tool_counter(scratch.path().join("scope-log"), 1).await;
+    cancel.cancel();
+    assert!(running.await.unwrap().is_error);
+    assert!(matches!(
+        &registry.server_statuses().await[0].1,
+        ServerStatus::Failed(_)
+    ));
+    std::fs::write(&gate, "late acknowledgement").unwrap();
+    registry.finish_scope(&scope).await;
+    assert!(!scratch.path().join("calls").exists());
+    assert_eq!(scope_records(scratch.path()).len(), 1, "the interrupted acquire was not retried and no release/tool was sent into an uncertain stream");
+    tokio::time::resume();
+    registry.add_server(config).await.unwrap();
+    tokio::time::pause();
+    let fresh = atomcode_capabilities::mcp::McpScope::from_identity("cancelled", 2);
+    assert!(
+        !registry
+            .call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&fresh))
+            .await
+            .unwrap()
+            .is_error
+    );
+    registry.finish_scope(&fresh).await;
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn queued_scope_cancellation_and_cleanup_do_not_disrupt_the_executing_owner() {
+    use atomcode_capabilities::mcp::McpScope;
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let gate = scratch.path().join("tool-gate");
+    let registry = McpRegistry::new(NO_TREE).share();
+    tokio::time::resume();
+    registry
+        .add_server(scoped_config(
+            "scoped",
+            scratch.path(),
+            BTreeMap::from([(
+                "MCP_TEST_TOOL_RESPONSE_GATE".into(),
+                gate.to_string_lossy().into_owned(),
+            )]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let a = McpScope::from_identity("lead", 1);
+    let b = McpScope::from_identity("child", 1);
+    let first = {
+        let reg = registry.clone();
+        let scope = a.clone();
+        tokio::spawn(async move {
+            reg.call_tool_scoped(
+                "scoped",
+                "echo",
+                serde_json::json!({"message":"lead"}),
+                Some(&scope),
+            )
+            .await
+        })
+    };
+    wait_for_tool_counter(scratch.path().join("calls"), 1).await;
+    let queued = {
+        let reg = registry.clone();
+        let scope = b.clone();
+        tokio::spawn(async move {
+            reg.call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&scope))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    let end = registry.finish_scope(&b);
+    tokio::pin!(end);
+    assert!(
+        futures::poll!(end.as_mut()).is_ready(),
+        "ending a queued child must not wait behind its lead's tool"
+    );
+    assert_eq!(scope_records(scratch.path()).len(), 2);
+    assert!(matches!(
+        registry.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+    std::fs::write(gate, "finish lead").unwrap();
+    assert!(result_text(first.await.unwrap().unwrap()).contains("lead"));
+    registry.finish_scope(&a).await;
+    assert_eq!(scope_records(scratch.path()).len(), 3);
+    assert_eq!(scope_records(scratch.path())[2]["scope"], a.owner());
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unsupported_desktop_scope_version_fails_before_tools_are_published() {
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let registry = McpRegistry::new(NO_TREE);
+    tokio::time::resume();
+    let result = registry
+        .add_server(scoped_config(
+            "future",
+            scratch.path(),
+            BTreeMap::from([("MCP_TEST_SCOPE_VERSION".into(), "2".into())]),
+        ))
+        .await;
+    tokio::time::pause();
+    assert!(result.is_err());
+    assert!(registry.list_all_tools().await.is_empty());
+    assert!(scope_records(scratch.path()).is_empty());
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn timed_out_scope_release_is_not_replayed_or_reused() {
+    use atomcode_capabilities::mcp::McpScope;
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let gate = scratch.path().join("release-gate");
+    let registry = McpRegistry::new(NO_TREE).share();
+    tokio::time::resume();
+    registry
+        .add_server(scoped_config(
+            "scoped",
+            scratch.path(),
+            BTreeMap::from([(
+                "MCP_TEST_SCOPE_RELEASE_GATE".into(),
+                gate.to_string_lossy().into_owned(),
+            )]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let a = McpScope::from_identity("lead", 1);
+    registry
+        .call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&a))
+        .await
+        .unwrap();
+    let ending = {
+        let reg = registry.clone();
+        let scope = a.clone();
+        tokio::spawn(async move { reg.finish_scope(&scope).await })
+    };
+    wait_for_tool_counter(scratch.path().join("scope-log"), 3).await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    // Observe retirement before allowing the external late response; the
+    // paused timer has millisecond granularity at its exact deadline.
+    for _ in 0..100 {
+        if matches!(
+            registry.server_statuses().await[0].1,
+            ServerStatus::Disconnected | ServerStatus::Failed(_)
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(!matches!(
+        registry.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+    std::fs::write(gate, "late release acknowledgement").unwrap();
+    ending.await.unwrap();
+    assert!(matches!(
+        registry.server_statuses().await[0].1,
+        ServerStatus::Failed(_)
+    ));
+    let next = McpScope::from_identity("lead", 2);
+    assert!(registry
+        .call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&next))
+        .await
+        .is_err());
+    registry.finish_scope(&a).await;
+    let records = scope_records(scratch.path());
+    assert_eq!(
+        records.len(),
+        3,
+        "no release replay and no later acquire/tool on an uncertain stream"
+    );
+    assert_eq!(records[2]["method"], "atomcode/desktop/release");
+    assert_eq!(spawn_count(&scratch.path().join("calls")), 1);
+    registry.shutdown().await;
+}
+
+/// Explicit opt-in to the patched native executor, direct protocol only. No
+/// desktop enumeration, capture, input, installed App socket or TCC changes.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires ATOMCODE_LEASE_TEST_EXECUTABLE; no GUI actions"]
+async fn native_desktop_lease_hands_over_between_production_registries() {
+    use atomcode_capabilities::mcp::McpScope;
+    let executable =
+        std::fs::canonicalize(std::env::var("ATOMCODE_LEASE_TEST_EXECUTABLE").unwrap()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let make_config = |profile: &str| McpServerConfig {
+        name: "desktop".into(),
+        source: McpConfigSource::Driver,
+        disabled: false,
+        trust: false,
+        auto_approve: vec![],
+        allowed_tools: None,
+        config: McpTransportConfig::Stdio {
+            command: executable.to_string_lossy().into_owned(),
+            args: vec!["mcp".into()],
+            env: BTreeMap::from([
+                (
+                    "OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY".into(),
+                    "1".into(),
+                ),
+                (
+                    "OPEN_COMPUTER_USE_TURN_LEASE_DIRECTORY".into(),
+                    scratch.path().join("leases").to_string_lossy().into_owned(),
+                ),
+                (
+                    "ATOMCODE_HOME".into(),
+                    scratch.path().join(profile).to_string_lossy().into_owned(),
+                ),
+            ]),
+            timeout_ms: Some(10_000),
+        },
+    };
+    let a = McpRegistry::new(scratch.path().join("a"));
+    let b = McpRegistry::new(scratch.path().join("b"));
+    a.add_server(make_config("a")).await.unwrap();
+    b.add_server(make_config("b")).await.unwrap();
+    let first = McpScope::from_identity("lead-a", 1);
+    let second = McpScope::from_identity("lead-b", 1);
+    let unknown = "__nonexistent_test_tool__";
+    let result = a
+        .call_tool_scoped("desktop", unknown, serde_json::json!({}), Some(&first))
+        .await
+        .unwrap();
+    assert!(result.is_error && result.content.iter().any(|c| matches!(c, atomcode_capabilities::mcp::ContentBlock::Text { text } if text.contains("unsupportedTool"))), "unknown tool is rejected only after scoped acquisition; no GUI action");
+    let busy = b
+        .call_tool_scoped("desktop", unknown, serde_json::json!({}), Some(&second))
+        .await
+        .unwrap_err();
+    assert!(format!("{busy:#}").contains("busy"));
+    b.finish_scope(&second).await;
+    assert!(
+        b.call_tool_scoped("desktop", unknown, serde_json::json!({}), Some(&second))
+            .await
+            .is_err(),
+        "ending a refused owner cannot unlock a neighbor"
+    );
+    a.finish_scope(&first).await;
+    assert!(matches!(
+        a.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+    let result = b
+        .call_tool_scoped("desktop", unknown, serde_json::json!({}), Some(&second))
+        .await
+        .unwrap();
+    assert!(result.is_error && result.content.iter().any(|c| matches!(c, atomcode_capabilities::mcp::ContentBlock::Text { text } if text.contains("unsupportedTool"))));
+    a.finish_scope(&first).await;
+    b.finish_scope(&second).await;
+    assert!(matches!(
+        b.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+    assert_eq!(a.shutdown().await, 0);
+    assert_eq!(b.shutdown().await, 0);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn scoped_connection_loss_requires_explicit_reconnect_without_replaying_a_tool() {
+    use atomcode_capabilities::mcp::McpScope;
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let registry = McpRegistry::new(NO_TREE);
+    let spawns = scratch.path().join("spawns");
+    tokio::time::resume();
+    registry
+        .add_server(scoped_config(
+            "scoped",
+            scratch.path(),
+            BTreeMap::from([
+                ("MCP_TEST_EXIT_ON_EVERY_TOOL_CALL".into(), "1".into()),
+                (
+                    "MCP_TEST_SPAWN_COUNTER".into(),
+                    spawns.to_string_lossy().into_owned(),
+                ),
+            ]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let a = McpScope::from_identity("lead", 1);
+    let error = registry
+        .call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&a))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("not replayed"));
+    assert!(matches!(
+        registry.server_statuses().await[0].1,
+        ServerStatus::Failed(_)
+    ));
+    let b = McpScope::from_identity("lead", 2);
+    assert!(registry
+        .call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&b))
+        .await
+        .is_err());
+    registry.finish_scope(&a).await;
+    assert_eq!(
+        spawn_count(&spawns),
+        1,
+        "no replacement process is silently created for a scoped operation"
+    );
+    let records = scope_records(scratch.path());
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["method"], "atomcode/desktop/acquire");
+    assert_eq!(records[1]["method"], "tools/call");
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn negotiated_scope_protocol_cannot_disappear_during_transport_recovery() {
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let registry = McpRegistry::new(NO_TREE);
+    let marker = scratch.path().join("disable-scopes");
+    let spawns = scratch.path().join("spawns");
+    tokio::time::resume();
+    registry
+        .add_server(scoped_config(
+            "scoped",
+            scratch.path(),
+            BTreeMap::from([
+                ("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST".into(), "1".into()),
+                (
+                    "MCP_TEST_SCOPE_DISABLE_MARKER".into(),
+                    marker.to_string_lossy().into_owned(),
+                ),
+                (
+                    "MCP_TEST_SPAWN_COUNTER".into(),
+                    spawns.to_string_lossy().into_owned(),
+                ),
+            ]),
+        ))
+        .await
+        .unwrap();
+    std::fs::write(marker, "replacement no longer supports leases").unwrap();
+    // The external replacement handshake has the normal startup idle-drain.
+    assert!(registry.list_all_tools().await.is_empty());
+    tokio::time::pause();
+    assert_eq!(spawn_count(&spawns), 2);
+    assert!(matches!(
+        registry.server_statuses().await[0].1,
+        ServerStatus::Failed(_)
+    ));
+    assert!(
+        scope_records(scratch.path()).is_empty(),
+        "no acquire or action was dispatched through a downgraded connection"
+    );
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn ending_a_scope_waits_for_its_accepted_acquire_before_releasing_it() {
+    use atomcode_capabilities::mcp::McpScope;
+    let _clock = ExternalIoClock::hold();
+    let scratch = tempfile::tempdir().unwrap();
+    let gate = scratch.path().join("acquire-gate");
+    let registry = McpRegistry::new(NO_TREE).share();
+    tokio::time::resume();
+    registry
+        .add_server(scoped_config(
+            "scoped",
+            scratch.path(),
+            BTreeMap::from([(
+                "MCP_TEST_SCOPE_ACQUIRE_GATE".into(),
+                gate.to_string_lossy().into_owned(),
+            )]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let scope = McpScope::from_identity("lead", 1);
+    let calling = {
+        let reg = registry.clone();
+        let scope = scope.clone();
+        tokio::spawn(async move {
+            reg.call_tool_scoped("scoped", "echo", serde_json::json!({}), Some(&scope))
+                .await
+        })
+    };
+    wait_for_tool_counter(scratch.path().join("scope-log"), 1).await;
+    let ending = registry.finish_scope(&scope);
+    tokio::pin!(ending);
+    assert!(
+        futures::poll!(ending.as_mut()).is_pending(),
+        "accepted acquire cannot be forgotten before its acknowledgement"
+    );
+    std::fs::write(gate, "acknowledge acquire").unwrap();
+    assert!(!calling.await.unwrap().unwrap().is_error);
+    ending.await;
+    let records = scope_records(scratch.path());
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2]["method"], "atomcode/desktop/release");
+    assert!(matches!(
+        registry.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+    registry.shutdown().await;
 }

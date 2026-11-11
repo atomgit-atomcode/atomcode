@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{McpClient, ToolRequestGuard, CANCELLED_TOOL_REQUEST};
 use super::types::{
-    initialize_params, CallToolResult, InitializeResult, ListToolsResult, ServerStatus,
+    scoped_initialize_params, CallToolResult, InitializeResult, ListToolsResult, ServerStatus,
 };
 
 /// Default timeout for MCP operations (30 seconds).
@@ -79,6 +79,9 @@ pub struct StdioClient {
     /// A dispatched tool future was dropped before its result was reconciled.
     /// The stream is no longer usable until an explicit replacement client.
     abandoned_generation: Arc<AtomicU64>,
+    scoped_turns: Arc<AtomicBool>,
+    scope_uncertain: Arc<AtomicBool>,
+    scope: Arc<std::sync::Mutex<super::scope::ScopeState>>,
 }
 
 #[derive(Debug)]
@@ -141,6 +144,9 @@ impl StdioClient {
             owns_transport_lifetime: true,
             connection_generation: Arc::new(AtomicU64::new(0)),
             abandoned_generation: Arc::new(AtomicU64::new(0)),
+            scoped_turns: Arc::new(AtomicBool::new(false)),
+            scope_uncertain: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::Mutex::new(super::scope::ScopeState::default())),
         }
     }
 
@@ -345,11 +351,27 @@ impl StdioClient {
         self.drain_startup_messages().await?;
 
         let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", Some(initialize_params()), None)
+            self.send_request("initialize", Some(scoped_initialize_params()), None)
                 .await
                 .map_err(|attempt| attempt.error)?,
         )
         .context("Failed to parse initialize result")?;
+
+        let scoped = match result
+            .capabilities
+            .experimental
+            .get("atomcode/desktop-turn-lease")
+        {
+            None if self.scoped_turns.load(Ordering::SeqCst) => {
+                anyhow::bail!("MCP desktop turn lease protocol disappeared during reconnect");
+            }
+            None => false,
+            Some(extension) if extension.get("version").and_then(Value::as_u64) == Some(1) => true,
+            Some(_) => anyhow::bail!("unsupported MCP desktop turn lease protocol"),
+        };
+        *self.scope_state()? = super::scope::ScopeState::default();
+        self.scoped_turns.store(scoped, Ordering::SeqCst);
+        self.scope_uncertain.store(false, Ordering::SeqCst);
 
         {
             let mut stdin = self.stdin.lock().await;
@@ -481,6 +503,9 @@ impl StdioClient {
             owns_transport_lifetime: false,
             connection_generation: self.connection_generation.clone(),
             abandoned_generation: self.abandoned_generation.clone(),
+            scoped_turns: self.scoped_turns.clone(),
+            scope_uncertain: self.scope_uncertain.clone(),
+            scope: self.scope.clone(),
         }
     }
 
@@ -504,12 +529,29 @@ impl StdioClient {
         retry_after_send: bool,
     ) -> Result<serde_json::Value> {
         let _operation = self.operation_lock.lock().await;
+        self.send_request_locked(method, params, retry_after_send)
+            .await
+    }
+
+    /// Caller holds operation_lock across related control and tool RPCs.
+    async fn send_request_locked(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        retry_after_send: bool,
+    ) -> Result<Value> {
+        if self.scope_uncertain.load(Ordering::SeqCst) {
+            anyhow::bail!("MCP scope ownership is unknown; reconnect and re-observe before acting");
+        }
         if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
             anyhow::bail!(CANCELLED_TOOL_REQUEST);
         }
         self.wait_for_background_recovery().await?;
-        let guard = (method == "tools/call")
-            .then(|| ToolRequestGuard::new(self.abandoned_generation.clone()));
+        let guard = matches!(
+            method,
+            "tools/call" | "atomcode/desktop/acquire" | "atomcode/desktop/release"
+        )
+        .then(|| ToolRequestGuard::new(self.abandoned_generation.clone()));
         let result = async {
             match self
                 .send_request(method, params.clone(), guard.as_ref())
@@ -517,6 +559,21 @@ impl StdioClient {
             {
                 Ok(value) => Ok(value),
                 Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
+                    if self.scoped_turns.load(Ordering::SeqCst)
+                        && matches!(method, "tools/call" | "atomcode/desktop/acquire" | "atomcode/desktop/release")
+                    {
+                        // A replacement connection has no lease or observations.
+                        // Never carry an operation across that boundary, even if
+                        // the failing write was known not to have completed.
+                        self.scope_uncertain.store(true, Ordering::SeqCst);
+                        self.mark_failed_if_generation_current(
+                            attempt.generation,
+                            format!("desktop scope connection lost: {:#}", attempt.error),
+                        ).await;
+                        return Err(attempt.error).context(
+                            "MCP desktop scope outcome is unknown; request was not replayed, reconnect and re-observe",
+                        );
+                    }
                     if attempt.request_may_have_been_sent && !retry_after_send {
                         let first_error = format!("{:#}", attempt.error);
                         self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
@@ -558,6 +615,108 @@ impl StdioClient {
         }
         result
     }
+
+    fn scope_state(&self) -> Result<std::sync::MutexGuard<'_, super::scope::ScopeState>> {
+        self.scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP scope state is unavailable; reconnect"))
+    }
+
+    async fn scoped_call_open(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        scope: Option<&super::McpScope>,
+    ) -> Result<CallToolResult> {
+        let _operation = self.operation_lock.lock().await;
+        self.wait_for_background_recovery().await?;
+        let mut params = serde_json::json!({"name": tool_name, "arguments": arguments});
+        if self.scoped_turns.load(Ordering::SeqCst) {
+            let scope = scope.ok_or_else(|| anyhow::anyhow!("This MCP backend requires a host turn scope; unscoped calls are not dispatched"))?;
+            if self.scope_uncertain.load(Ordering::SeqCst)
+                || self.abandoned_generation.load(Ordering::SeqCst) != 0
+            {
+                anyhow::bail!("MCP scope or request outcome is unknown; reconnect and re-observe before acting");
+            }
+            let current = self.scope_state()?.owner.clone();
+            if current.as_ref().is_some_and(|owner| owner != scope) {
+                anyhow::bail!("Desktop is busy with another turn; retry after that turn finishes");
+            }
+            if current.is_none() {
+                self.scope_state()?.attempted = Some(scope.clone());
+                let result = self
+                    .send_request_locked(
+                        "atomcode/desktop/acquire",
+                        Some(serde_json::json!({"_meta": {"atomcode/turn": scope.owner()}})),
+                        false,
+                    )
+                    .await;
+                match result {
+                    Ok(value) => match scope_ack(&value, "acquired", false) {
+                        Ok(_) => {
+                            let mut state = self.scope_state()?;
+                            state.owner = Some(scope.clone());
+                            state.attempted = None;
+                        }
+                        Err(error) => {
+                            if value.get("isError").and_then(Value::as_bool) == Some(true)
+                                && value
+                                    .get("acquired")
+                                    .is_none_or(|v| v == &Value::Bool(false))
+                            {
+                                self.scope_state()?.attempted = None;
+                            } else {
+                                self.scope_uncertain.store(true, Ordering::SeqCst);
+                            }
+                            return Err(error);
+                        }
+                    },
+                    Err(error) => {
+                        if !self.recovery_in_progress.load(Ordering::Acquire)
+                            && self.abandoned_generation.load(Ordering::SeqCst) == 0
+                        {
+                            self.scope_state()?.attempted = None;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            params["_meta"] = serde_json::json!({"atomcode/turn": scope.owner()});
+        }
+        let value = self
+            .send_request_locked("tools/call", Some(params), false)
+            .await?;
+        serde_json::from_value(value).context("Failed to parse tools/call result")
+    }
+
+    async fn finish_scope_open(&self, scope: &super::McpScope) -> Result<()> {
+        let _operation = self.operation_lock.lock().await;
+        self.wait_for_background_recovery().await?;
+        let owner = self.scope_state()?.owner.clone();
+        if owner.as_ref() != Some(scope) {
+            let mut state = self.scope_state()?;
+            if state.attempted.as_ref() == Some(scope) {
+                state.attempted = None;
+            }
+            return Ok(());
+        }
+        let value = self
+            .send_request_locked(
+                "atomcode/desktop/release",
+                Some(serde_json::json!({"_meta": {"atomcode/turn": scope.owner()}})),
+                false,
+            )
+            .await?;
+        scope_ack(&value, "released", true)?;
+        let mut state = self.scope_state()?;
+        if state.owner.as_ref() == Some(scope) {
+            state.owner = None;
+        }
+        if state.attempted.as_ref() == Some(scope) {
+            state.attempted = None;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -586,20 +745,63 @@ impl McpClient for StdioClient {
         serde_json::from_value(result).context("Failed to parse tools/list result")
     }
 
-    async fn call_tool(
+    async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult> {
+        self.call_tool_scoped(tool_name, arguments, None).await
+    }
+
+    async fn call_tool_scoped(
         &self,
         tool_name: &str,
-        arguments: serde_json::Value,
+        arguments: Value,
+        scope: Option<&super::McpScope>,
     ) -> Result<CallToolResult> {
-        let params = serde_json::json!({
-            "name": tool_name,
-            "arguments": arguments
-        });
+        tokio::select! {
+            biased;
+            _ = self.recovery_cancel.cancelled() => anyhow::bail!("MCP transport is shut down"),
+            result = self.scoped_call_open(tool_name, arguments, scope) => result,
+        }
+    }
 
-        let result = self
-            .send_request_with_reconnect("tools/call", Some(params), false)
-            .await?;
-        serde_json::from_value(result).context("Failed to parse tools/call result")
+    fn supports_scopes(&self) -> bool {
+        self.scoped_turns.load(Ordering::SeqCst)
+    }
+
+    async fn finish_scope(&self, scope: &super::McpScope) -> Result<()> {
+        let relevant = {
+            let state = self.scope_state()?;
+            state.owner.as_ref() == Some(scope) || state.attempted.as_ref() == Some(scope)
+        };
+        if !relevant {
+            return Ok(());
+        }
+        if self.recovery_cancel.is_cancelled()
+            || self.scope_uncertain.load(Ordering::SeqCst)
+            || self.abandoned_generation.load(Ordering::SeqCst) != 0
+        {
+            self.shutdown().await;
+            anyhow::bail!(
+                "MCP scope outcome is unknown; owned connection retired, reconnect and re-observe"
+            );
+        }
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), self.finish_scope_open(scope)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            failed => {
+                let still_owned = {
+                    let state = self.scope_state()?;
+                    state.owner.as_ref() == Some(scope) || state.attempted.as_ref() == Some(scope)
+                };
+                if !still_owned && self.abandoned_generation.load(Ordering::SeqCst) == 0 {
+                    return Ok(());
+                }
+                self.shutdown().await;
+                match failed {
+                    Ok(Err(error)) => Err(error),
+                    _ => anyhow::bail!("MCP scope cleanup timed out; owned connection retired"),
+                }
+            }
+        }
     }
 
     async fn shutdown(&self) {
@@ -628,6 +830,11 @@ impl McpClient for StdioClient {
     fn status(&self) -> ServerStatus {
         if self.recovery_cancel.is_cancelled() {
             return ServerStatus::Disconnected;
+        }
+        if self.scope_uncertain.load(Ordering::SeqCst) {
+            return ServerStatus::Failed(
+                "MCP scope ownership is unknown; reconnect and re-observe".into(),
+            );
         }
         if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
             return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
@@ -945,6 +1152,32 @@ fn wrap_cmd_script(command: &str, args: &[String], shell: &str) -> (String, Vec<
 #[cfg(target_os = "windows")]
 fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>) {
     wrap_cmd_script(command, args, "cmd.exe")
+}
+
+fn scope_ack(value: &Value, key: &str, allow_false: bool) -> Result<bool> {
+    let error_flag_ok = value
+        .get("isError")
+        .is_none_or(|flag| flag.as_bool() == Some(false));
+    if error_flag_ok {
+        if let Some(ack) = value.get(key).and_then(Value::as_bool) {
+            if ack || allow_false {
+                return Ok(ack);
+            }
+        }
+    }
+    let message = value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .find_map(|block| block.get("text").and_then(Value::as_str))
+        })
+        .unwrap_or("invalid acknowledgement")
+        .chars()
+        .take(512)
+        .collect::<String>();
+    anyhow::bail!("MCP desktop lease {key} failed: {message}")
 }
 
 /// EOF lets a cooperative MCP server dispose its owned resources. Drain stdout

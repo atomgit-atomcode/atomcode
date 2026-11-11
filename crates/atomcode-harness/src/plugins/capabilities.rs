@@ -1500,6 +1500,39 @@ impl Plugin for MemoryPlugin {
     }
 }
 
+/// Resolve the actual executing realm, never the publication tree or a tool
+/// call ID. Missing context is an unavailable scope, not the lead's identity.
+pub fn current_mcp_scope() -> Option<atomcode_capabilities::mcp::McpScope> {
+    let here = crate::agent::current()?;
+    let session = here.service::<SessionSvc>()?;
+    let (_, sequence) = session.current_turn_start()?;
+    Some(atomcode_capabilities::mcp::McpScope::from_identity(
+        session.id(),
+        sequence,
+    ))
+}
+
+struct McpScopeFinish(Arc<McpRegistry>);
+#[async_trait]
+impl atomcode_plexus::Listener<crate::events::TurnFinishing> for McpScopeFinish {
+    async fn call(&self, outcome: &crate::seams::TurnOutcome) -> Option<()> {
+        let here = crate::agent::current()?;
+        let session = here.service::<SessionSvc>()?;
+        let (turn, _) = session.current_turn_start()?;
+        if session.id() != outcome.session_id || turn != outcome.turn {
+            return None;
+        }
+        self.0.finish_scope(&current_mcp_scope()?).await;
+        Some(())
+    }
+}
+
+/// Both the generic harness row and coding's replacement use this existing
+/// awaited seam; no driver-owned or model-visible cleanup tool is added.
+pub fn mount_mcp_scope_lifecycle(ctx: &Context, registry: Arc<McpRegistry>) {
+    let _ = ctx.on_parallel::<crate::events::TurnFinishing>(Arc::new(McpScopeFinish(registry)));
+}
+
 // ---- mcp ----------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]
@@ -1558,6 +1591,7 @@ impl Plugin for McpPlugin {
             .wait_for_initial_connections(std::time::Duration::from_millis(row.connect_timeout_ms))
             .await;
 
+        mount_mcp_scope_lifecycle(ctx, registry.clone());
         let infos = registry.list_all_tools().await;
         let mut mounted = Vec::new();
         let mut adapters: Vec<Arc<dyn Tool>> = Vec::new();
@@ -1567,7 +1601,9 @@ impl Plugin for McpPlugin {
             match McpToolAdapter::new(registry.clone(), info) {
                 Ok(adapter) => {
                     mounted.push(adapter.name().to_string());
-                    adapters.push(Arc::new(adapter));
+                    adapters.push(Arc::new(
+                        adapter.with_scope_provider(Arc::new(current_mcp_scope)),
+                    ));
                 }
                 Err(reason) => eprintln!("mcp: skipping a tool: {reason}"),
             }

@@ -39,6 +39,7 @@ pub mod config;
 pub mod oauth;
 pub mod registry;
 mod result;
+mod scope;
 pub mod tool;
 pub mod transport_http;
 pub mod transport_stdio;
@@ -64,6 +65,7 @@ pub use oauth::{
     McpOAuthStep, McpOAuthToken, McpTokenStore,
 };
 pub use registry::{project_trust_key, ConnectAttempt, McpConnectEvent, McpRegistry};
+pub use scope::McpScope;
 pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};
 pub use types::*;
 

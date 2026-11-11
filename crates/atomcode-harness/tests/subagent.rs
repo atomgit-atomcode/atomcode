@@ -811,3 +811,70 @@ config = { script = [ { text = "Done." } ] }
         vec![Some("Audit Chat.tsx".to_string())]
     );
 }
+
+struct RecordMcpScope {
+    seen: Arc<Mutex<Vec<(String, String, atomcode_capabilities::mcp::McpScope)>>>,
+}
+#[async_trait]
+impl Waterfall<ToolsExecute> for RecordMcpScope {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        let here = atomcode_harness::agent::current().expect("actual executing agent");
+        let session = here
+            .service::<atomcode_harness::seams::SessionSvc>()
+            .unwrap();
+        let scope = atomcode_harness::plugins::capabilities::current_mcp_scope()
+            .expect("actual turn scope");
+        let (_, sequence) = session.current_turn_start().unwrap();
+        assert_eq!(
+            scope,
+            atomcode_capabilities::mcp::McpScope::from_identity(session.id(), sequence)
+        );
+        self.seen
+            .lock()
+            .unwrap()
+            .push((exec.call.name.clone(), session.id().to_owned(), scope));
+        next.run(exec).await
+    }
+}
+
+#[tokio::test]
+async fn delegated_tools_resolve_the_childs_real_mcp_scope_and_restore_the_lead() {
+    use atomcode_harness::plugins::capabilities::current_mcp_scope;
+    assert!(
+        current_mcp_scope().is_none(),
+        "publication outside a turn cannot invent the lead's scope"
+    );
+    let dir = scratch("mcp-scope");
+    std::fs::write(dir.join("a.txt"), "content").unwrap();
+    let script = delegating_script(
+        "read a.txt",
+        r#"{ text = "Looking.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "done" },"#,
+    ).replace(
+        r#"{ text = "The subagent reported back." },"#,
+        r#"{ text = "Checking.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "The subagent reported back." },"#,
+    );
+    let app = start(tree(&dir, &script, &[YOLO])).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<ToolsExecute>(Arc::new(RecordMcpScope { seen: seen.clone() }), true);
+    run_turn(&app, "delegate").await.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "lead task, child read, lead read: {seen:?}");
+    assert_eq!(seen[0].0, "task");
+    assert_eq!(seen[1].0, "read_file");
+    assert_eq!(seen[2].0, "read_file");
+    assert_ne!(seen[0].1, seen[1].1);
+    assert_ne!(
+        seen[0].2, seen[1].2,
+        "the child must not inherit a published lead scope"
+    );
+    assert_eq!(seen[0].1, seen[2].1);
+    assert_eq!(
+        seen[0].2, seen[2].2,
+        "returning from delegation restores the lead's scope"
+    );
+    assert!(current_mcp_scope().is_none());
+}

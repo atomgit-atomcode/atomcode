@@ -1679,7 +1679,9 @@ async fn publish_mcp(
         .filter_map(|info| {
             let server = info.server_name.clone();
             match atomcode_capabilities::mcp::McpToolAdapter::new(Arc::clone(registry), info) {
-                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
+                Ok(adapter) => Some(Arc::new(adapter.with_scope_provider(Arc::new(
+                    atomcode_harness::plugins::capabilities::current_mcp_scope,
+                ))) as Arc<dyn atomcode_kernel::tool::Tool>),
                 Err(error) => {
                     // Through the registry's own event channel, the one a
                     // failed tools/list already takes to the front end — not
@@ -1902,6 +1904,7 @@ impl Plugin for McpHostPlugin {
             toolbox_slot,
             prompts_slot,
         } = publication;
+        atomcode_harness::plugins::capabilities::mount_mcp_scope_lifecycle(ctx, registry.clone());
         let _ = ctx
             .provide::<atomcode_harness::seams::McpSvc>(Arc::clone(&registry))
             .map_err(|e| e.to_string())?;

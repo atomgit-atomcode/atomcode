@@ -1,7 +1,7 @@
 # 0032: Desktop turn leases belong to the executing connection
 
 Date: 2026-11-11
-Status: Experimental macOS backend prototype; host integration and GUI acceptance pending
+Status: Experimental macOS backend with negotiated stdio host integration; isolated App activation and GUI acceptance pending
 
 ## Context
 
@@ -19,4 +19,4 @@ Keep the backend optional and separately built. Store only a pinned MIT source p
 
 A fresh pinned checkout builds on the recorded Swift 6.1.3 / SDK 14.5 baseline with compiler-checked compatibility changes. Native smoke verifies cache invalidation, non-reuse of screenshot IDs, explicit-observation refusal and in-process exclusion. Five real-process protocol groups cover profiles/processes, owners, negotiation, EOF/death, file defenses and private shared-App connections/neighbor survival. Dirty-source refusal preserves source. Original XCTest targets were not run because the local SDK lacks XCTest.
 
-These tests do not prove actual GUI in-flight cancellation or window handover. Host scope propagation, normal lifecycle wiring, isolated App/default-socket identity, permission validation and other platforms are not completed. The prototype is not enabled in the current product. Evidence and remaining criteria are in the desktop-lease execution-boundary plan and integrations/open-computer-use/README.md.
+These tests do not prove actual GUI in-flight cancellation or window handover. Host scope propagation and awaited normal/cancel lifecycle wiring are implemented and tested through the production runtime. Scope identity is resolved from the actual executing realm and its committed TurnStart sequence; no model argument or publication-time lead context supplies authority. Negotiated mutation RPCs cannot cross a recovered connection, and cleanup errors cannot poison a replacement client. Isolated App/default-socket identity, GUI permission validation and other platforms are not completed. The prototype is not enabled in the current product. Evidence and remaining criteria are in the desktop-lease execution-boundary plan and integrations/open-computer-use/README.md.

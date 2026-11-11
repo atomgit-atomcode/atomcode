@@ -104,6 +104,20 @@ impl SessionLog {
         self.turn.load(Ordering::SeqCst)
     }
 
+    /// Read-only identity of the current committed turn, without cloning tool
+    /// results/images or inventing a second invocation counter.
+    pub fn current_turn_start(&self) -> Option<(u64, SeqNo)> {
+        self.events
+            .read()
+            .ok()?
+            .iter()
+            .rev()
+            .find_map(|logged| match logged.event {
+                SessionEvent::TurnStart { turn, .. } => Some((turn, logged.seq)),
+                _ => None,
+            })
+    }
+
     /// Append without telling anyone.
     ///
     /// Almost always the wrong call. A fact that is appended and not broadcast
