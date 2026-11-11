@@ -2169,6 +2169,8 @@ struct SseDecoder {
     /// layer has no reasoning parser configured. Per decoder, so an unclosed
     /// block cannot reach the next response — see [`InlineThink`].
     think: super::reasoning::InlineThink,
+    /// Observe the original content field without changing its meaning/output.
+    content_marker: super::content_marker::ContentMarker,
     /// Where to record the name thinking came under in its own field, for the
     /// provider to answer in. `None` in tests that feed bytes directly.
     heard: Option<std::sync::Arc<HeardReasoningField>>,
@@ -2192,6 +2194,7 @@ impl SseDecoder {
             tool_call_delta_count: 0,
             last_tool_idx: 0,
             think: super::reasoning::InlineThink::new(),
+            content_marker: super::content_marker::ContentMarker::default(),
             heard: None,
         }
     }
@@ -2628,6 +2631,7 @@ impl SseDecoder {
             }
         }
         if let Some(c) = choice.delta.content {
+            self.content_marker.observe(&c);
             if !c.is_empty() {
                 // A `<think>` block here is reasoning that came down the wrong
                 // channel; it goes out of the right one rather than to the
@@ -5086,6 +5090,90 @@ mod tests {
                 StreamEvent::Malformed => "malformed",
             })
             .collect()
+    }
+
+    #[test]
+    fn native_tool_markers_in_content_remain_text_at_every_split_point() {
+        let text = "Literal example: `]<]minimax[>[<tool_call>PRIVATE_ARGUMENTS</tool_call>`。";
+        for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+            let mut decoder = SseDecoder::new();
+            let mut events = Vec::new();
+            for part in [&text[..split], &text[split..]] {
+                events.extend(
+                    decoder.feed(line(json!({"choices":[{"delta":{"content":part}}]})).as_bytes()),
+                );
+            }
+            events.extend(
+                decoder.feed(
+                    line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes(),
+                ),
+            );
+            events.extend(decoder.finish());
+            assert!(decoder.content_marker.seen, "split {split}");
+            let actual: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actual, text, "literal text must remain intact at {split}");
+            assert!(events.iter().all(|e| !matches!(
+                e,
+                StreamEvent::ToolCall(_)
+                    | StreamEvent::ToolCallDelta { .. }
+                    | StreamEvent::Error(_)
+                    | StreamEvent::Malformed
+            )));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { truncated: false })));
+        }
+    }
+
+    #[test]
+    fn native_content_observation_does_not_duplicate_a_structured_call() {
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(line(json!({"choices":[{"delta":{
+            "content":"]<]minimax[>[<tool_call>",
+            "tool_calls":[{"index":0,"id":"real-call","type":"function","function":{"name":"read_file","arguments":"{}"}}]
+        }}]})).as_bytes());
+        events.extend(
+            decoder.feed(
+                line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes(),
+            ),
+        );
+        events.extend(decoder.finish());
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "real-call");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "{}");
+        assert!(decoder.content_marker.seen);
+    }
+
+    #[test]
+    fn native_marker_observation_is_scoped_to_the_original_content_field() {
+        let mut decoder = SseDecoder::new();
+        decoder.feed(
+            line(json!({"choices":[{"delta":{"reasoning_content":"]<]minimax[>[<tool_call>"}}]}))
+                .as_bytes(),
+        );
+        assert!(!decoder.content_marker.seen);
+        // Inline thinking is still the content wire field, even though it is
+        // routed to Reasoning events for display after this observation.
+        let events = decoder.feed(line(json!({"choices":[{"delta":{"content":"<think>]<]minimax[>[<tool_call></think>"}}]})).as_bytes());
+        assert!(decoder.content_marker.seen);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Reasoning(_))));
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::ToolCall(_))));
     }
 
     /// A gateway whose reasoning parser is not configured passes `<think>`

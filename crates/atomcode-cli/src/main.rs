@@ -3341,6 +3341,13 @@ pub(crate) async fn spawn_native_cli_runtime(
     // CLI serves both interactive and headless spawns, which is why
     // `prepare_from_config` resolves bypass-downgrade from `cfg.interactive`.
     let mut prepare = atomcode_coding::prepare_from_config(cfg);
+    if ephemeral {
+        // This headless session is neither shown in a picker nor persisted.
+        // Its first prompt must not spend a separate model call on a title.
+        prepare.host_plugins = prepare.host_plugins.with_layer(
+            atomcode_coding::host::Layer::new().disable("session-title-on-first-prompt"),
+        );
+    }
     if no_tools {
         prepare.tools = false;
         prepare.skill_dirs = Some(Vec::new());

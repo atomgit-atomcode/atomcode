@@ -22,6 +22,7 @@ mod auto_proxy;
 /// the `bench` feature, which is not part of any default or test build.
 #[cfg(feature = "bench")]
 pub mod bench;
+mod content_marker;
 pub mod discovery;
 mod input_profile;
 mod latency;

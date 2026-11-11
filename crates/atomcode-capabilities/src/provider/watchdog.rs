@@ -47,8 +47,10 @@ impl StreamWatchdog {
         Some(self.first_reasoning? + self.reasoning_limit?)
     }
     pub fn reasoning_expired(&self) -> bool {
-        self.reasoning_deadline()
-            .is_some_and(|d| Instant::now() >= d)
+        self.reasoning_is_next()
+            && self
+                .reasoning_deadline()
+                .is_some_and(|d| Instant::now() >= d)
     }
     fn reasoning_is_next(&self) -> bool {
         self.reasoning_deadline()
@@ -150,6 +152,29 @@ impl StreamWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delayed_polling_attributes_the_earliest_deadline_when_both_have_expired() {
+        let mut w = StreamWatchdog::new(None, Some(Duration::from_secs(10)))
+            .with_reasoning_limit(Some(Duration::from_secs(120)));
+        w.observe(&StreamEvent::Reasoning("first".into()));
+        tokio::time::advance(Duration::from_secs(121)).await;
+        assert_eq!(w.phase(), "stream_idle");
+        assert_eq!(w.budget(), Some(Duration::from_secs(10)));
+        assert!(
+            !w.reasoning_expired(),
+            "the earlier idle timeout owns the error"
+        );
+        let mut ready = futures::stream::repeat(StreamEvent::Reasoning("more".into()));
+        assert!(w.next(&mut ready).await.is_err());
+
+        let mut w = StreamWatchdog::new(None, Some(Duration::from_secs(300)))
+            .with_reasoning_limit(Some(Duration::from_secs(120)));
+        w.observe(&StreamEvent::Reasoning("first".into()));
+        tokio::time::advance(Duration::from_secs(301)).await;
+        assert_eq!(w.phase(), "reasoning_without_output");
+        assert_eq!(w.budget(), Some(Duration::from_secs(120)));
+        assert!(w.reasoning_expired());
+    }
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn reasoning_deadline_excludes_prefill_and_cannot_be_extended_by_progress() {
         let mut w = StreamWatchdog::new(
