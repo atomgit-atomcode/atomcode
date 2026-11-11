@@ -2290,26 +2290,25 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 self.fresh(&session, based_on)?;
                 let undone = match turn {
-                    None => self.handle.undo_to_prompt(None).await,
+                    None => self.handle.undo_to_prompt(None).await.map_err(refused),
                     // A point names a turn of the log, and is undone as one: not
                     // as its prompt ordinal, which a compaction since has made
                     // point past the end of the folded conversation.
+                    // Conversation undo is owned by the native log. A turn
+                    // cancelled before its first request may have no workspace
+                    // checkpoint, but its accepted prompt is still undoable.
                     Some(turn) => {
-                        if !self
-                            .handle
-                            .rewind_points()
+                        self.handle
+                            .undo_to_turn(turn)
                             .await
-                            .map_err(refused)?
-                            .points
-                            .iter()
-                            .any(|point| point.turn_id == turn)
-                        {
-                            return Err(HostError::RewindPointNotFound { turn });
-                        }
-                        self.handle.undo_to_turn(turn).await
+                            .map_err(|error| match error {
+                                atomcode_coding::RuntimeError::RewindPointUnavailable {
+                                    turn_id,
+                                } => HostError::RewindPointNotFound { turn: turn_id },
+                                other => refused(other),
+                            })
                     }
-                }
-                .map_err(refused)?;
+                }?;
                 Ok(HostReply::Undone {
                     prompt: Some(undone.restored_prompt),
                     restored_files: Vec::new(),

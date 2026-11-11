@@ -3584,6 +3584,7 @@ impl RunningAgent {
                     self.rt.emit(AgentEvent::OutputTruncationRecovery {
                         attempt: truncation_continuations,
                         max_attempts: MAX_TRUNCATION_CONTINUATIONS,
+                        reason: Some("output token limit reached".into()),
                     });
                     self.compact_before_internal_continuation(
                         convo,

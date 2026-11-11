@@ -4850,15 +4850,21 @@ mod goal_rate_limit_classification_tests {
                 error.message.contains("request recovery budget exhausted"),
                 "{error}"
             );
-            assert_eq!(began.elapsed(), Duration::from_secs(expected_wait));
-            assert_eq!(
-                req.options
-                    .request_recovery
-                    .unwrap()
-                    .snapshot()
-                    .reserved_wait,
-                began.elapsed()
-            );
+            let ceiling = Duration::from_secs(expected_wait);
+            let floor = if statuses[0] == 503 {
+                ceiling.mul_f64(0.8)
+            } else {
+                ceiling
+            };
+            assert!((floor..=ceiling).contains(&began.elapsed()));
+            let reserved = req
+                .options
+                .request_recovery
+                .unwrap()
+                .snapshot()
+                .reserved_wait;
+            // One jittered sleep, rounded up to Tokio's millisecond resolution.
+            assert!((reserved..=reserved + Duration::from_millis(1)).contains(&began.elapsed()));
         }
     }
 }

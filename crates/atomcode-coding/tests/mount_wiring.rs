@@ -33,6 +33,7 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     );
     cfg.first_token_timeout = std::time::Duration::from_secs(600);
     cfg.stream_timeout = std::time::Duration::from_secs(120);
+    cfg.reasoning_timeout = std::time::Duration::from_secs(90);
     let dump = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
         .await
         .dump();
@@ -41,6 +42,7 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
         "{dump}"
     );
     assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
+    assert!(dump.contains("\"reasoning_timeout_ms\": 90000"), "{dump}");
 }
 
 #[tokio::test]
@@ -1224,4 +1226,46 @@ async fn architecture_topology_follows_standard_config_and_host_can_disable_it()
             .coding
             .architecture_topology
     );
+}
+
+#[tokio::test]
+async fn no_tools_does_not_advertise_a_disk_skill_catalog() {
+    use atomcode_kernel::stream::StreamEvent;
+    use atomcode_kernel::testkit::RecordingProvider;
+    let project = tempfile::tempdir().unwrap();
+    let dirs =
+        atomcode_capabilities::ProductDirs::new(project.path().join("user"), ".test-product");
+    let skill = dirs.user().join("skills/no-tools-catalog-sentinel");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: no-tools-catalog-sentinel\ndescription: unique-catalog-sentinel-do-not-advertise\n---\nUse this skill.\n").unwrap();
+    std::fs::write(
+        project.path().join("AGENTS.md"),
+        "Project instruction sentinel: keep-user-instructions.\n",
+    )
+    .unwrap();
+    let cfg = CodingAgentConfig::new(
+        "placeholder",
+        "http://localhost",
+        "lumen-alpha",
+        project.path(),
+        dirs,
+    );
+    let mut opts = quiet_options();
+    opts.tools = false;
+    opts.skill_dirs = Some(vec![skill.parent().unwrap().to_path_buf()]);
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("done".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let mut mounted = support::mount(&cfg, opts, provider.clone()).await;
+    let result = turn(&mut mounted.handle, "hello", allow()).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let requests = provider.recorded();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].1.is_empty());
+    let prompt = format!("{:?}", requests[0].0);
+    assert!(!prompt.contains("no-tools-catalog-sentinel"), "{prompt}");
+    assert!(!prompt.contains("unique-catalog-sentinel"), "{prompt}");
+    assert!(prompt.contains("keep-user-instructions"), "{prompt}");
+    mounted.shutdown().await;
 }

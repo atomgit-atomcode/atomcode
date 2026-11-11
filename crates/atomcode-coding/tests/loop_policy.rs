@@ -839,10 +839,10 @@ async fn the_guard_warns_then_ends_a_turn_that_is_not_progressing() {
 #[tokio::test]
 async fn the_guard_tells_a_repeating_todo_update_that_the_same_status_will_not_change_again() {
     let dir = scratch("guard-todo");
-    let script = always_calls(
-        "todowrite",
-        r#"{ action = "update", id = 4, status = "completed" }"#,
-    );
+    // Seed a real item before repeating a no-op status update. Updating id 4
+    // in an empty plan tests invalid arguments, not repeated valid updates.
+    let repeated = r#"{ text = "again", calls = [ { name = "todowrite", args = { action = "update", id = 1, status = "completed" } } ] }"#;
+    let script = format!("[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [{{ text = \"create plan\", calls = [{{ name = \"todowrite\", args = {{ todos = [{{ content = \"verify result\", status = \"completed\" }}] }} }}] }}, {}] }}", vec![repeated; 40].join(","));
     let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 20 }\n\n\
                 [[remove]]\nid = \"repeat-fuse\"\n\n\
                 [[patch]]\nid = \"tool-loop-guard\"\nconfig = { warn_after = 3, stop_after = 5 }";
@@ -860,7 +860,7 @@ async fn the_guard_tells_a_repeating_todo_update_that_the_same_status_will_not_c
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("reported Todo #4 as `completed`"),
+        text.contains("reported Todo #1 as `completed`"),
         "the soft correction must name the status the repeated result reported: {text}"
     );
     assert!(text.contains("no logical state change"), "{text}");

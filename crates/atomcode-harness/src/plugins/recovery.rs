@@ -620,12 +620,16 @@ struct StreamRow {
     /// about the connection, not something to paper over indefinitely.
     #[serde(default = "default_recoveries")]
     max_recoveries: u32,
+    /// Ask before restarting a reasoning-only stream stopped by the host.
+    #[serde(default)]
+    reasoning_checkpoint: bool,
 }
 
 impl Default for StreamRow {
     fn default() -> Self {
         Self {
             max_recoveries: default_recoveries(),
+            reasoning_checkpoint: false,
         }
     }
 }
@@ -653,6 +657,7 @@ struct StreamRecovery {
     ctx: Context,
     max_recoveries: u32,
     progress: Arc<Progress>,
+    reasoning_checkpoint: bool,
 }
 
 #[async_trait]
@@ -663,8 +668,19 @@ impl Waterfall<AgentRequest> for StreamRecovery {
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
         let mut recovered = false;
+        let mut original_effort = req.options.reasoning_effort;
+        let mut temporary_effort = false;
         loop {
-            let mut error = match next.run(req).await {
+            let result = next.run(req).await;
+            // Preserve defaults resolved below us; a person's override applies
+            // only to the next resumed request, never the session default.
+            if temporary_effort {
+                req.options.reasoning_effort = original_effort;
+                temporary_effort = false;
+            } else {
+                original_effort = req.options.reasoning_effort;
+            }
+            let mut error = match result {
                 Ok(response) => {
                     if recovered {
                         notice(
@@ -729,6 +745,55 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                         },
                     );
                 }
+            }
+            if error.code.as_deref() == Some(atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE)
+            {
+                // The existing partial-stream commit above is the only writer.
+                // Local spending limits never authorize automatic recovery.
+                if !self.reasoning_checkpoint || error.unexecuted_tool_output || has_text {
+                    return Err(error);
+                }
+                let scoped = crate::agent::scoped(&self.ctx);
+                let lower = scoped.service::<LlmSvc>().and_then(|provider| {
+                    super::truncation::lower_effort(original_effort, &provider.effort_levels())
+                });
+                let requester = scoped
+                    .service::<crate::seams::ToolDriverSvc>()
+                    .and_then(|driver| driver.requester(session.id()));
+                let answer = match requester {
+                    Some(requester) => requester.request(
+                        atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND,
+                        serde_json::json!({"reasoning_only":true, "lower_effort":lower.map(|e| e.as_str()), "message":error.message}),
+                    ).await,
+                    None => Value::Null,
+                };
+                let wants_lower = answer.get("lower_effort").and_then(Value::as_bool) == Some(true);
+                if answer.get("continue").and_then(Value::as_bool) != Some(true)
+                    || !answer.get("lower_effort").map_or(true, Value::is_boolean)
+                    || (wants_lower && lower.is_none())
+                {
+                    return Err(error);
+                }
+                if wants_lower {
+                    req.options.reasoning_effort = lower;
+                    temporary_effort = true;
+                }
+                crate::session::commit(&self.ctx, &session, SessionEvent::Injected {
+                    turn,
+                    text: "The client stopped the last stream after continuous reasoning without an answer. Use the work already done to give a concise answer or take one concrete next step; do not restart the analysis.".into(),
+                    origin: crate::session::InjectionOrigin::Continuation,
+                });
+                let mut messages: Vec<Message> = req
+                    .messages
+                    .iter()
+                    .take_while(|m| {
+                        m.role == atomcode_kernel::message::Role::System && !m.synthetic
+                    })
+                    .cloned()
+                    .collect();
+                messages.extend(session.derive_messages());
+                req.messages = messages;
+                continue;
             }
             let attempt = eligible
                 .then(|| {
@@ -808,6 +873,9 @@ impl Plugin for StreamRecoveryPlugin {
     fn name(&self) -> &'static str {
         "llm-stream-recovery"
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["tool-driver", "llm"]
+    }
     fn provides(&self) -> &'static [&'static str] {
         &["stream-recovery-progress"]
     }
@@ -836,6 +904,7 @@ impl Plugin for StreamRecoveryPlugin {
             Arc::new(StreamRecovery {
                 ctx: ctx.clone(),
                 max_recoveries: row.max_recoveries,
+                reasoning_checkpoint: row.reasoning_checkpoint,
                 progress,
             }),
             false,

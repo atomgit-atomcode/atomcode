@@ -42,6 +42,10 @@ pub const OPEN_TIMEOUT_CODE: &str = "open_timeout";
 /// code never authorizes replaying a request or executing incomplete calls.
 pub const STREAM_TRANSPORT_INTERRUPTED_CODE: &str = "stream_transport_interrupted";
 
+/// A host stopped continuous reasoning before any answer/tool output. This is
+/// a local spending limit, never a provider length result or automatic retry.
+pub const REASONING_OUTPUT_TIMEOUT_CODE: &str = "reasoning_output_timeout";
+
 /// No new stream data arrived within the configured idle deadline. Like a
 /// transport interruption, this may authorize bounded continuation from saved
 /// progress, never blind replay of partial output or incomplete tool calls.

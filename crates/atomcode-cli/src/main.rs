@@ -3735,6 +3735,7 @@ pub(crate) async fn run_native_headless_detailed(
             CodingRuntimeEvent::Agent(KernelEvent::OutputTruncationRecovery {
                 attempt,
                 max_attempts,
+                reason,
             }) if jsonl => {
                 write_headless_json_event(&headless_json::HeadlessEvent::Retry {
                     kind: "output_truncation".into(),
@@ -3742,7 +3743,7 @@ pub(crate) async fn run_native_headless_detailed(
                     max_attempts,
                     recovered: None,
                     backoff_secs: None,
-                    reason: None,
+                    reason,
                 })?;
             }
             CodingRuntimeEvent::Agent(KernelEvent::ProviderRetry {

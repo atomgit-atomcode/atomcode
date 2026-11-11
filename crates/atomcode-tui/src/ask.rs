@@ -720,14 +720,24 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
         // screen that says nothing means downstream is "stop", so a turn simply
         // ended and nobody was told why.
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
-        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
+        | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND => {
             let (prompt, asker) = if kind == atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND {
                 (t(Msg::AskStepLimitQuestion), t(Msg::AskStepLimitTitle))
+            } else if kind == atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND {
+                (
+                    t(Msg::AskReasoningTimeoutQuestion),
+                    t(Msg::AskReasoningTimeoutTitle),
+                )
             } else {
                 (
                     t(
                         if payload.get("reasoning_only").and_then(Value::as_bool) == Some(true) {
                             Msg::AskReasoningTruncatedQuestion
+                        } else if payload.get("no_visible_progress").and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            Msg::AskNoProgressTruncatedQuestion
                         } else {
                             Msg::AskTruncatedQuestion
                         },
@@ -735,12 +745,37 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
                     t(Msg::AskTruncatedTitle),
                 )
             };
+            let mut options = vec![Answer::labelled(
+                CONTINUE.to_string(),
+                t(Msg::AskContinue).into_owned(),
+            )];
+            if matches!(
+                kind,
+                atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
+                    | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND
+            ) && (payload.get("reasoning_only").and_then(Value::as_bool) == Some(true)
+                || payload.get("no_visible_progress").and_then(Value::as_bool) == Some(true))
+                && payload
+                    .get("lower_effort")
+                    .and_then(Value::as_str)
+                    .is_some()
+            {
+                options.push(Answer::labelled(
+                    "lower_effort".to_string(),
+                    format!(
+                        "{} ({})",
+                        t(Msg::AskLowerEffortOnce),
+                        payload["lower_effort"].as_str().unwrap_or_default()
+                    ),
+                ));
+            }
+            options.push(Answer::labelled(
+                STOP.to_string(),
+                t(Msg::AskStop).into_owned(),
+            ));
             Some(Question {
                 prompt: prompt.into(),
-                options: vec![
-                    Answer::labelled(CONTINUE.to_string(), t(Msg::AskContinue).into_owned()),
-                    Answer::labelled(STOP.to_string(), t(Msg::AskStop).into_owned()),
-                ],
+                options,
                 asker: Some(asker.into()),
                 about: None,
             })
@@ -897,8 +932,18 @@ pub fn response_for(kind: &str, reply: Option<Reply>) -> Value {
         // going" is a stop — the kernel degrades a missing or malformed answer
         // to `false`, and this agrees with it rather than hoping.
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
-        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
-            serde_json::json!({ "continue": answer.as_deref() == Some(CONTINUE) })
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
+        | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND => {
+            if matches!(
+                kind,
+                atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
+                    | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND
+            ) && answer.as_deref() == Some("lower_effort")
+            {
+                serde_json::json!({ "continue": true, "lower_effort": true })
+            } else {
+                serde_json::json!({ "continue": answer.as_deref() == Some(CONTINUE) })
+            }
         }
         // A kind this screen does not know: the value the person picked, as it
         // was written. `Null` stays what a *declined* question answers with —
@@ -1723,6 +1768,30 @@ mod tests {
     /// down. Answered here: nothing does — the panel is already gone, and the
     /// fact is the screen's own answer coming back.
     #[test]
+    fn reasoning_timeout_has_its_own_title_and_all_explicit_choices() {
+        let kind = atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND;
+        let question = q(
+            kind,
+            &serde_json::json!({"reasoning_only":true,"lower_effort":"medium"}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(question.prompt, t(Msg::AskReasoningTimeoutQuestion));
+        assert_eq!(
+            question.asker.as_deref(),
+            Some(t(Msg::AskReasoningTimeoutTitle).as_ref())
+        );
+        assert_eq!(nth(&question, 2).as_deref(), Some("lower_effort"));
+        assert_eq!(
+            response_for(kind, Some(Reply::from("lower_effort"))),
+            serde_json::json!({"continue":true,"lower_effort":true})
+        );
+        assert_eq!(
+            response_for(kind, None),
+            serde_json::json!({"continue":false})
+        );
+    }
+    #[test]
     fn a_ledger_takes_down_what_closed_elsewhere_and_nothing_it_answered() {
         let mut l = Ledger::default();
         l.asked("lead", &asked_q("Allow `write_file`?", None));
@@ -1925,6 +1994,39 @@ mod tests {
         let one = serde_json::json!({ "questions": [two["questions"][0].clone()] });
         assert!(batch_for(REQUEST_USER_INPUT_KIND, &one, &[]).is_none());
         assert!(batch_for(APPROVAL_KIND, &two, &[]).is_none());
+    }
+
+    #[test]
+    fn reasoning_checkpoint_offers_an_explicit_one_request_effort_reduction() {
+        let kind = atomcode_kernel::OUTPUT_TRUNCATION_CHECKPOINT_KIND;
+        let question = q(
+            kind,
+            &serde_json::json!({"reasoning_only":true,"lower_effort":"medium"}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(question.options.len(), 3);
+        assert_eq!(nth(&question, 1).as_deref(), Some(CONTINUE));
+        assert_eq!(nth(&question, 2).as_deref(), Some("lower_effort"));
+        assert_eq!(nth(&question, 3).as_deref(), Some(STOP));
+        assert_eq!(
+            response_for(kind, Some(Reply::from("lower_effort"))),
+            serde_json::json!({"continue":true,"lower_effort":true})
+        );
+        let generic = q(kind, &serde_json::json!({"lower_effort":"medium"}), &[]).unwrap();
+        assert_eq!(generic.options.len(), 2);
+    }
+
+    #[test]
+    fn a_no_progress_checkpoint_does_not_claim_hidden_reasoning_was_observed() {
+        let kind = atomcode_kernel::OUTPUT_TRUNCATION_CHECKPOINT_KIND;
+        let question = q(kind, &serde_json::json!({"no_visible_progress":true,"reasoning_only":false,"lower_effort":"medium"}), &[]).unwrap();
+        assert_eq!(
+            question.prompt,
+            t(Msg::AskNoProgressTruncatedQuestion).into_owned()
+        );
+        assert_eq!(question.options.len(), 3);
+        assert_eq!(nth(&question, 2).as_deref(), Some("lower_effort"));
     }
 
     #[test]

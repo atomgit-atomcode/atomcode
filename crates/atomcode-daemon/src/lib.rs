@@ -5229,10 +5229,13 @@ impl ChatRuntimeProjector {
             Agent::OutputTruncationRecovery {
                 attempt,
                 max_attempts,
+                reason,
             } => vec![ChatEvent::Warning {
-                message: format!(
-                    "output limit reached; automatically continuing ({attempt}/{max_attempts})"
-                ),
+                message: reason.unwrap_or_else(|| {
+                    format!(
+                        "output limit reached; automatically continuing ({attempt}/{max_attempts})"
+                    )
+                }),
             }],
             Agent::PolicyIntervention { intervention } => {
                 vec![ChatEvent::PolicyIntervention {
@@ -8461,6 +8464,7 @@ mod tests {
             atomcode_kernel::event::AgentEvent::OutputTruncationRecovery {
                 attempt: 1,
                 max_attempts: 2,
+                reason: None,
             },
         );
 

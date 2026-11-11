@@ -411,12 +411,14 @@ impl Projector {
                         max_attempts: 0,
                         recovered: true,
                     },
-                    crate::session::NoticeKind::OutputTruncated => {
-                        AgentEvent::OutputTruncationRecovery {
-                            attempt: 0,
-                            max_attempts: 0,
-                        }
-                    }
+                    crate::session::NoticeKind::OutputTruncated => match retry {
+                        Some(retry) => AgentEvent::OutputTruncationRecovery {
+                            attempt: retry.attempt,
+                            max_attempts: retry.max_attempts,
+                            reason: Some(detail.clone()),
+                        },
+                        None => AgentEvent::Warning(detail.clone()),
+                    },
                     // Compaction is not a recovery the protocol names; it stays
                     // a warning rather than being forced into a shape that means
                     // something else.

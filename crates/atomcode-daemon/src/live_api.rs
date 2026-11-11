@@ -1097,10 +1097,13 @@ impl NativeLiveWireProjector {
                 Kernel::OutputTruncationRecovery {
                     attempt,
                     max_attempts,
+                    reason,
                 } => LiveWireEvent::Warning {
-                    message: format!(
+                    message: reason.unwrap_or_else(|| {
+                        format!(
                         "output limit reached; automatically continuing ({attempt}/{max_attempts})"
-                    ),
+                    )
+                    }),
                 },
                 Kernel::RateLimited {
                     reset_at_display,

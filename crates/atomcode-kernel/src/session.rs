@@ -122,7 +122,7 @@ pub enum NoticeKind {
     SessionInterrupted,
 }
 
-/// Where a [`NoticeKind::ProviderRetry`] stands, as numbers a screen can say in
+/// Where a recovery notice stands, as numbers a screen can say in
 /// its own language — rather than a sentence it would have to parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryAttempt {

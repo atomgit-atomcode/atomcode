@@ -217,7 +217,7 @@ async fn ordinary_requests_survive_a_short_gateway_outage() {
     .await;
     assert_eq!(run.text, "recovered");
     assert_eq!(run.attempts, 5);
-    assert_eq!(run.elapsed, Duration::from_secs(45));
+    assert!((Duration::from_secs(36)..=Duration::from_secs(45)).contains(&run.elapsed));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -235,7 +235,7 @@ async fn ordinary_request_recovery_is_finite() {
     )
     .await;
     assert_eq!(run.attempts, 6);
-    assert_eq!(run.elapsed, Duration::from_secs(75));
+    assert!((Duration::from_secs(60)..=Duration::from_secs(75)).contains(&run.elapsed));
     assert!(run
         .error
         .as_deref()
@@ -2057,8 +2057,13 @@ async fn mixed_failures_share_six_attempts_and_keep_partial_progress() {
         .iter()
         .all(|o| o.request_recovery.as_ref() == Some(shared)));
     assert_eq!(shared.snapshot().attempts, 6);
-    assert_eq!(shared.snapshot().reserved_wait, Duration::from_secs(23));
-    assert_eq!(began.elapsed(), Duration::from_secs(23));
+    // A 1s server wait plus 22s of local baselines (80–100% jitter).
+    assert!((Duration::from_millis(18_600)..=Duration::from_secs(23))
+        .contains(&shared.snapshot().reserved_wait));
+    // Tokio rounds each timer to millisecond resolution; accounting retains
+    // the exact jittered duration. Five waits may round up by at most 5ms.
+    let reserved = shared.snapshot().reserved_wait;
+    assert!((reserved..=reserved + Duration::from_millis(5)).contains(&began.elapsed()));
     assert!(outcome
         .error
         .unwrap()
@@ -2101,7 +2106,9 @@ async fn mixed_failures_share_the_wait_allowance_without_shortening_retry_after(
     let began = Instant::now();
     let outcome = run_turn(&app, "go").await.unwrap();
     assert_eq!(provider.recorded().len(), 2);
-    assert_eq!(began.elapsed(), Duration::from_secs(3));
+    // Only the first local 3s baseline is spent (80–100% jitter); the
+    // subsequent 2s Retry-After cannot fit and must not be shortened.
+    assert!((Duration::from_millis(2400)..=Duration::from_secs(3)).contains(&began.elapsed()));
     let error = outcome.error.unwrap();
     assert!(
         error.contains("upstream status 429"),

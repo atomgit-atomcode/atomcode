@@ -93,6 +93,9 @@ pub struct CodingAgentConfig {
     /// inter-token budget. Once the first content arrives, `stream_timeout` takes over.
     /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
     pub first_token_timeout: Duration,
+    /// Continuous reasoning before any answer/tool output. Default 120s;
+    /// ATOMCODE_REASONING_TIMEOUT_SECS overrides it, 0 disables it. Prefill excluded.
+    pub reasoning_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -1128,6 +1131,15 @@ fn env_duration_secs(var: &str) -> Option<Duration> {
 fn default_stream_timeout() -> Duration {
     env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
 }
+/// Limit only reasoning before useful output, independently of prefill/idle.
+fn default_reasoning_timeout() -> Duration {
+    std::env::var("ATOMCODE_REASONING_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(120))
+}
+
 /// The default first-token (prefill / TTFB) timeout. An explicit
 /// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
 /// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
@@ -1316,6 +1328,7 @@ impl CodingAgentConfig {
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
             first_token_timeout: default_first_token_timeout(),
+            reasoning_timeout: default_reasoning_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
@@ -2149,6 +2162,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
             .field("first_token_timeout", &self.first_token_timeout)
+            .field("reasoning_timeout", &self.reasoning_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

@@ -12482,6 +12482,7 @@ struct AgentLoopOptionsPatch<'a> {
     undo_cancelled: bool,
     stream_idle_ms: u128,
     stream_first_content_ms: u128,
+    reasoning_timeout_ms: u128,
     /// Carried, not left to the row's default: this patch is the last word on
     /// `agent-loop` in this host, so omitting it would *be* the fuse value — the
     /// serde default in `harness/plugins/agent_loop.rs`. See
@@ -12496,7 +12497,15 @@ fn harness_option_rows(
 ) -> Result<atomcode_plexus::Layer, String> {
     let wd = config.working_dir.as_path();
     let mut rows = atomcode_plexus::Layer::new()
-        .when(!prepare.tools, |layer| layer.disable("memory"))
+        .when(!prepare.tools, |layer| {
+            // The explicit host switch disables both tools and declarations
+            // of tool-backed skills, without changing ordinary embedder mounts.
+            layer
+                .disable("memory")
+                .disable("skills")
+                .disable("skill-catalog-inline")
+                .disable("skill-first")
+        })
         .when(!prepare.tools || !prepare.web, |layer| {
             layer.disable("tool-web")
         })
@@ -12584,6 +12593,7 @@ fn harness_option_rows(
             undo_cancelled: !config.keep_interrupted_context,
             stream_idle_ms: config.stream_timeout.as_millis(),
             stream_first_content_ms: config.first_token_timeout.as_millis(),
+            reasoning_timeout_ms: config.reasoning_timeout.as_millis(),
             max_rounds: crate::on_harness::RUNAWAY_FUSE_ROUNDS,
         },
     )

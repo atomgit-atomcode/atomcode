@@ -924,6 +924,12 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     if cfg.round_cap_checkpoint {
         out = out
             .patch(
+                "llm-stream-recovery",
+                serde_json::json!({"reasoning_checkpoint":true}),
+            )
+            .map_err(|e| e.to_string())?;
+        out = out
+            .patch(
                 "truncation-recovery",
                 TruncationPatch {
                     max_continuations: 4,
@@ -2047,9 +2053,9 @@ fn compose_hosted(
         .when(host.session_context.is_some(), |layer| {
             layer.swap("project-instructions", "session-context")
         })
-        .when(!host.tools.is_empty(), |layer| {
-            layer.insert(Entry::named("host-tools"))
-        })
+        // config_rows patches this row even for a model-only host. Mounting
+        // an empty list is valid; omitting the row made that assembly fail.
+        .insert(Entry::named("host-tools"))
         .when(host.skills.is_some(), |layer| {
             layer
                 .swap("skills", "skills-host")
@@ -2228,9 +2234,7 @@ fn compose_hosted(
             atomcode_harness::plugins::capabilities::WebPlugin::with_api_key(key),
         ));
     }
-    if !host.tools.is_empty() {
-        registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));
-    }
+    registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));
     if let Some(engine) = host.cc_hooks {
         registry.register(Arc::new(crate::host_rows::CcHooksHostPlugin(engine)));
     }

@@ -1530,6 +1530,24 @@ impl Background {
             state.front.control.clone()
         };
         if self.in_background(&target) {
+            if project_navigation {
+                let control = self
+                    .state
+                    .lock()
+                    .expect("background poisoned")
+                    .slots
+                    .iter()
+                    .find(|slot| slot.control.session_id() == target)
+                    .map(|slot| slot.control.clone())
+                    .ok_or(HostError::NotFound)?;
+                // A retained runtime must satisfy the same project check as a
+                // newly prepared destination before publishing a shared switch.
+                if !control.working_dir_now().await.is_dir() {
+                    return Err(HostError::Failed {
+                        message: "The session's project directory is unavailable.".into(),
+                    });
+                }
+            }
             return self.foreground_locked(session, target).await;
         }
         if target == session
