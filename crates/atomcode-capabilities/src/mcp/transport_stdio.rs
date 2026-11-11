@@ -16,7 +16,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use super::client::McpClient;
+use super::client::{McpClient, ToolRequestGuard, CANCELLED_TOOL_REQUEST};
 use super::types::{
     initialize_params, CallToolResult, InitializeResult, ListToolsResult, ServerStatus,
 };
@@ -76,6 +76,9 @@ pub struct StdioClient {
     /// its failed generation after taking `reconnect_lock` to detect that another
     /// caller already repaired the connection.
     connection_generation: Arc<AtomicU64>,
+    /// A dispatched tool future was dropped before its result was reconciled.
+    /// The stream is no longer usable until an explicit replacement client.
+    abandoned_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -137,6 +140,7 @@ impl StdioClient {
             recovery_cancel: CancellationToken::new(),
             owns_transport_lifetime: true,
             connection_generation: Arc::new(AtomicU64::new(0)),
+            abandoned_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -199,6 +203,7 @@ impl StdioClient {
         &self,
         method: &str,
         params: Option<serde_json::Value>,
+        tool_guard: Option<&ToolRequestGuard>,
     ) -> std::result::Result<serde_json::Value, RequestAttemptError> {
         let _req_guard = self.request_lock.lock().await;
         // Record the generation only after entering the serialized request
@@ -258,6 +263,9 @@ impl StdioClient {
             // Once write_all starts, a failure can still mean that a partial or
             // complete request reached the server. Treat the outcome as unknown
             // so side-effecting tools are never replayed automatically.
+            if let Some(guard) = tool_guard {
+                guard.dispatched(generation);
+            }
             tokio::time::timeout_at(deadline, stdin.write_all(&body))
                 .await
                 .with_context(|| {
@@ -337,7 +345,7 @@ impl StdioClient {
         self.drain_startup_messages().await?;
 
         let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", Some(initialize_params()))
+            self.send_request("initialize", Some(initialize_params()), None)
                 .await
                 .map_err(|attempt| attempt.error)?,
         )
@@ -472,6 +480,7 @@ impl StdioClient {
             recovery_cancel: self.recovery_cancel.clone(),
             owns_transport_lifetime: false,
             connection_generation: self.connection_generation.clone(),
+            abandoned_generation: self.abandoned_generation.clone(),
         }
     }
 
@@ -482,41 +491,59 @@ impl StdioClient {
         retry_after_send: bool,
     ) -> Result<serde_json::Value> {
         let _operation = self.operation_lock.lock().await;
+        if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
+            anyhow::bail!(CANCELLED_TOOL_REQUEST);
+        }
         self.wait_for_background_recovery().await?;
-        match self.send_request(method, params.clone()).await {
-            Ok(value) => Ok(value),
-            Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
-                if attempt.request_may_have_been_sent && !retry_after_send {
-                    let first_error = format!("{:#}", attempt.error);
-                    self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
-                        .await;
-                    return Err(attempt.error).context(
+        let guard = (method == "tools/call")
+            .then(|| ToolRequestGuard::new(self.abandoned_generation.clone()));
+        let result = async {
+            match self
+                .send_request(method, params.clone(), guard.as_ref())
+                .await
+            {
+                Ok(value) => Ok(value),
+                Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
+                    if attempt.request_may_have_been_sent && !retry_after_send {
+                        let first_error = format!("{:#}", attempt.error);
+                        self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
+                            .await;
+                        return Err(attempt.error).context(
                         "MCP tool execution result is unknown; request was not replayed to avoid \
                          duplicate side effects, and stdio recovery continues in the background",
                     );
-                }
-                if let Err(reconnect_error) = self
-                    .reconnect_after_failure(attempt.generation, &attempt.error)
-                    .await
-                {
-                    return Err(reconnect_error);
-                }
-                match self.send_request(method, params).await {
-                    Ok(value) => Ok(value),
-                    Err(retry) => {
-                        if is_reconnectable_stdio_error(&retry.error) {
-                            self.mark_failed_if_generation_current(
-                                retry.generation,
-                                format!("stdio connection lost after reconnect: {:#}", retry.error),
-                            )
-                            .await;
+                    }
+                    if let Err(reconnect_error) = self
+                        .reconnect_after_failure(attempt.generation, &attempt.error)
+                        .await
+                    {
+                        return Err(reconnect_error);
+                    }
+                    match self.send_request(method, params, guard.as_ref()).await {
+                        Ok(value) => Ok(value),
+                        Err(retry) => {
+                            if is_reconnectable_stdio_error(&retry.error) {
+                                self.mark_failed_if_generation_current(
+                                    retry.generation,
+                                    format!(
+                                        "stdio connection lost after reconnect: {:#}",
+                                        retry.error
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(retry.error).context("MCP request failed after one stdio reconnect")
                         }
-                        Err(retry.error).context("MCP request failed after one stdio reconnect")
                     }
                 }
+                Err(attempt) => Err(attempt.error),
             }
-            Err(attempt) => Err(attempt.error),
         }
+        .await;
+        if let Some(guard) = &guard {
+            guard.disarm();
+        }
+        result
     }
 }
 
@@ -562,6 +589,9 @@ impl McpClient for StdioClient {
     }
 
     fn status(&self) -> ServerStatus {
+        if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
+            return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
+        }
         if let Ok(mut process) = self.process.try_lock() {
             if let Some(child) = process.as_mut() {
                 match child.try_wait() {

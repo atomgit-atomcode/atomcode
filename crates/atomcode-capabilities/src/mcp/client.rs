@@ -39,3 +39,40 @@ pub trait McpClient: Send + Sync {
     /// Get the current server status.
     fn status(&self) -> ServerStatus;
 }
+
+/// Shared cancellation diagnostic; transports own their own uncertainty marker.
+pub(super) const CANCELLED_TOOL_REQUEST: &str = "MCP tool call was cancelled after dispatch; result is unknown. Reconnect this server and re-observe before acting; the interrupted call was not replayed.";
+
+/// Publish uncertainty synchronously before a cancelled RPC releases its locks.
+/// The tag is a nonzero transport generation or HTTP request identity, not data
+/// from a tool result. Normal terminals disarm only this guard, never clear an
+/// uncertainty marker established by another concurrently cancelled request.
+pub(super) struct ToolRequestGuard {
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    dispatched: std::sync::atomic::AtomicU64,
+}
+impl ToolRequestGuard {
+    pub(super) fn new(abandoned: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            abandoned,
+            dispatched: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    pub(super) fn dispatched(&self, tag: u64) {
+        self.dispatched
+            .store(tag, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(super) fn disarm(&self) {
+        self.dispatched
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl Drop for ToolRequestGuard {
+    fn drop(&mut self) {
+        let tag = self.dispatched.load(std::sync::atomic::Ordering::SeqCst);
+        if tag != 0 {
+            self.abandoned
+                .store(tag, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}

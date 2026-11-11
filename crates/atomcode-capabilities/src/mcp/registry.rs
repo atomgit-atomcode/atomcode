@@ -1690,6 +1690,69 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn adapter_honors_pre_cancel_and_interrupts_an_active_remote_call() {
+        use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext};
+        let registry = Arc::new(McpRegistry::new("/nonexistent/tree"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        registry.servers.write().await.insert(
+            "blocking".into(),
+            Arc::new(BlockingCallClient {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let adapter = Arc::new(
+            super::super::tool::McpToolAdapter::new(
+                registry,
+                McpToolInfo {
+                    server_name: "blocking".into(),
+                    tool_name: "wait".into(),
+                    description: "wait".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    read_only: false,
+                },
+            )
+            .unwrap(),
+        );
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let context = |cancel| ToolContext {
+            working_dir: "/tmp".into(),
+            cancel,
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+        let result = adapter.execute("{}", &context(cancelled)).await;
+        assert!(result.is_error && result.content.contains("before dispatch"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), entered.notified())
+                .await
+                .is_err()
+        );
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = {
+            let adapter = adapter.clone();
+            let ctx = context(cancel.clone());
+            tokio::spawn(async move { adapter.execute("{}", &ctx).await })
+        };
+        entered.notified().await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_error && result.content.contains("unverified"));
+        release.notify_one();
+        let result = adapter.execute("{}", &context(Default::default())).await;
+        assert!(
+            !result.is_error,
+            "a separate stateless client remains usable"
+        );
+    }
+
     #[async_trait::async_trait]
     impl McpClient for BarrierListClient {
         async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {

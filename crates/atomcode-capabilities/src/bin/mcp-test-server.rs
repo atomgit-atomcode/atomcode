@@ -112,6 +112,11 @@ fn main() -> io::Result<()> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 sleep_from_env("MCP_TEST_TOOL_RESPONSE_DELAY_MS")?;
+                if let Some(path) = std::env::var_os("MCP_TEST_TOOL_RESPONSE_GATE") {
+                    while !std::path::Path::new(&path).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
                 if std::env::var_os("MCP_TEST_SERVER_REQUEST").is_some() {
                     write_frame(
                         &mut writer,
@@ -204,6 +209,9 @@ fn main() -> io::Result<()> {
 
         if let Some(response) = response {
             write_frame(&mut writer, &response)?;
+            if method == "tools/call" {
+                append_event_from_env("MCP_TEST_TOOL_FINISH_COUNTER", "finished")?;
+            }
         }
     }
 }

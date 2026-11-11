@@ -7944,3 +7944,103 @@ async fn vl_originals_are_saved_for_other_clients_without_reentering_model_conte
         images
     );
 }
+
+/// Real runtime cancel reaches an executing MCP call; reconnect is explicit and
+/// preserves the coding session instead of rebuilding a second live agent.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_session() {
+    let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+    let external_io = tokio::task::spawn_blocking(move || {
+        let _ = release_clock.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns");
+    let calls = scratch.path().join("calls");
+    let gate = scratch.path().join("release");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let text = std::fs::read_to_string(&script).unwrap();
+    let text = text.replace("*'\"method\":\"tools/call\"'*)", "*'\"method\":\"tools/call\"'*)\n      printf 'call\\n' >> \"$ATOMCODE_TEST_MCP_CALLS\"\n      while [ ! -f \"$ATOMCODE_TEST_MCP_GATE\" ]; do sleep 0.01; done");
+    std::fs::write(&script, text).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { env, .. } =
+        &mut input.prepare.extra_mcp_servers[0].config
+    {
+        env.insert(
+            "ATOMCODE_TEST_MCP_CALLS".into(),
+            calls.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "ATOMCODE_TEST_MCP_GATE".into(),
+            gate.to_string_lossy().into_owned(),
+        );
+    }
+    // The external handshake's startup idle-drain needs real time. Cancellation
+    // assertions below run with the clock paused and no arbitrary delay gate.
+    tokio::time::resume();
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let session = runtime.session.as_ref().unwrap().id.clone();
+    runtime
+        .handle
+        .submit(UserInput::from("mcp echo"))
+        .await
+        .unwrap();
+    let marker = calls.clone();
+    tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        while !marker.exists() && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(marker.exists(), "the external call actually started");
+    })
+    .await
+    .unwrap();
+    let cancelled_at = tokio::time::Instant::now();
+    runtime.handle.cancel().await.unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), runtime.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert_eq!(
+        cancelled_at.elapsed(),
+        std::time::Duration::ZERO,
+        "cancel does not wait for the external response or RPC deadline"
+    );
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    let statuses = runtime.handle.mcp_status().await.unwrap();
+    assert!(statuses.servers.iter().any(|(name, status)| name == "t" && matches!(status, atomcode_capabilities::mcp::ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))));
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    std::fs::write(gate, "release old response").unwrap();
+    tokio::time::resume();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    tokio::time::pause();
+    turn(&mut runtime, "mcp echo").await;
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        2,
+        "only the explicitly requested next turn runs"
+    );
+    assert_eq!(std::fs::read_to_string(spawns).unwrap().lines().count(), 2);
+    runtime.handle.shutdown().await.unwrap();
+    drop(keep_clock);
+    let _ = external_io.await;
+}

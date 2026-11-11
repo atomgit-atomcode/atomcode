@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use atomcode_capabilities::mcp::config::{McpConfigSource, McpServerConfig, McpTransportConfig};
 use atomcode_capabilities::mcp::{McpRegistry, McpToolAdapter, ServerStatus, CONNECT_TIMEOUT};
@@ -978,4 +979,335 @@ async fn installed_computer_backend_exposes_scoped_tools_through_the_production_
                 .is_some());
         }
     }
+}
+
+/// Keep external-process I/O on real time without letting a paused Tokio clock
+/// manufacture an RPC timeout before the OS schedules the fixture. Tokio 1.50
+/// inhibits automatic clock advance while spawn_blocking work is active. The
+/// real watchdog releases that inhibition even if a test fails to finish.
+struct ExternalIoClock(std::sync::mpsc::Sender<()>);
+impl ExternalIoClock {
+    fn hold() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+        });
+        Self(tx)
+    }
+}
+impl Drop for ExternalIoClock {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+async fn wait_for_tool_counter(path: std::path::PathBuf, count: usize) {
+    tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        while spawn_count(&path) < count && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            spawn_count(&path),
+            count,
+            "fixture reached the expected external effect"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dispatched_cancellation_and_forced_drop_require_explicit_reconnect_without_replay() {
+    let _clock = ExternalIoClock::hold();
+    for forced_drop in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("calls");
+        let spawns = temp.path().join("spawns");
+        let gate = temp.path().join("release");
+        let finished = temp.path().join("finished");
+        let env = BTreeMap::from([
+            (
+                "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                calls.to_str().unwrap().into(),
+            ),
+            (
+                "MCP_TEST_SPAWN_COUNTER".into(),
+                spawns.to_str().unwrap().into(),
+            ),
+            (
+                "MCP_TEST_TOOL_RESPONSE_GATE".into(),
+                gate.to_str().unwrap().into(),
+            ),
+            (
+                "MCP_TEST_TOOL_FINISH_COUNTER".into(),
+                finished.to_str().unwrap().into(),
+            ),
+        ]);
+        let config = test_server_config_with_env("cancelled", env);
+        let registry = McpRegistry::new(NO_TREE).share();
+        // The startup noise-drain uses a real idle deadline; freeze only once
+        // the external handshake has completed, not while it is draining.
+        tokio::time::resume();
+        registry.add_server(config.clone()).await.unwrap();
+        tokio::time::pause();
+        let info = registry.list_all_tools().await.remove(0);
+        let adapter = Arc::new(McpToolAdapter::new(registry.clone(), info).unwrap());
+        let cancel = CancellationToken::new();
+        let task = {
+            let tool = adapter.clone();
+            let mut context = ctx();
+            context.cancel = cancel.clone();
+            tokio::spawn(async move { tool.execute(r#"{"message":"first"}"#, &context).await })
+        };
+        wait_for_tool_counter(calls.clone(), 1).await;
+        if forced_drop {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            cancel.cancel();
+            let result = task.await.unwrap();
+            assert!(result.is_error && result.content.contains("unverified"));
+        }
+        assert!(
+            matches!(&registry.server_statuses().await[0].1, ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))
+        );
+        let blocked = adapter
+            .execute(r#"{"message":"must not run"}"#, &ctx())
+            .await;
+        assert!(blocked.is_error && blocked.content.contains("Reconnect"));
+        assert!(registry.list_tools_for_server("cancelled").await.is_empty());
+        assert_eq!(spawn_count(&calls), 1);
+        assert_eq!(
+            spawn_count(&spawns),
+            1,
+            "no automatic replacement or replay"
+        );
+        std::fs::write(&gate, "release late response").unwrap();
+        wait_for_tool_counter(finished, 1).await;
+        assert!(
+            adapter.execute("{}", &ctx()).await.is_error,
+            "late success cannot unpoison the cancelled stream"
+        );
+        tokio::time::resume();
+        registry.add_server(config).await.unwrap();
+        tokio::time::pause();
+        let result = adapter
+            .execute(r#"{"message":"explicit new request"}"#, &ctx())
+            .await;
+        assert!(!result.is_error && result.content.contains("explicit new request"));
+        assert_eq!(spawn_count(&calls), 2);
+        assert_eq!(spawn_count(&spawns), 2);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dropping_a_queued_stdio_call_does_not_poison_another_call_or_dispatch_it() {
+    let _clock = ExternalIoClock::hold();
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let gate = temp.path().join("release");
+    let env = BTreeMap::from([
+        (
+            "MCP_TEST_TOOL_CALL_COUNTER".into(),
+            calls.to_str().unwrap().into(),
+        ),
+        (
+            "MCP_TEST_TOOL_RESPONSE_GATE".into(),
+            gate.to_str().unwrap().into(),
+        ),
+    ]);
+    let registry = McpRegistry::new(NO_TREE).share();
+    tokio::time::resume();
+    registry
+        .add_server(test_server_config_with_env("queue", env))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    let first = {
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            reg.call_tool("queue", "echo", serde_json::json!({"message":"first"}))
+                .await
+        })
+    };
+    wait_for_tool_counter(calls.clone(), 1).await;
+    let queued = {
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            reg.call_tool("queue", "echo", serde_json::json!({"message":"never"}))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    std::fs::write(gate, "release first response").unwrap();
+    assert!(result_text(first.await.unwrap().unwrap()).contains("first"));
+    assert!(matches!(
+        &registry.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+    assert!(result_text(
+        registry
+            .call_tool("queue", "echo", serde_json::json!({"message":"next"}))
+            .await
+            .unwrap()
+    )
+    .contains("next"));
+    assert_eq!(
+        spawn_count(&calls),
+        2,
+        "queued cancelled call was never sent"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelled_http_request_cannot_be_unpoisoned_by_a_late_response() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let _clock = ExternalIoClock::hold();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let parallel_entered = Arc::new(tokio::sync::Notify::new());
+    let parallel_release = Arc::new(tokio::sync::Notify::new());
+    let server = {
+        let calls = calls.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        let finished = finished.clone();
+        let parallel_entered = parallel_entered.clone();
+        let parallel_release = parallel_release.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let calls = calls.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                let finished = finished.clone();
+                let parallel_entered = parallel_entered.clone();
+                let parallel_release = parallel_release.clone();
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    let mut size = 0;
+                    loop {
+                        line.clear();
+                        if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                size = value.trim().parse::<usize>().unwrap();
+                            }
+                        }
+                    }
+                    let mut body = vec![0; size];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let method = request["method"].as_str().unwrap_or("");
+                    let mut first_tool = false;
+                    let result = match method {
+                        "initialize" => {
+                            serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"http-cancel","version":"1"}})
+                        }
+                        "tools/list" => {
+                            serde_json::json!({"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]})
+                        }
+                        "tools/call" => {
+                            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                            if n == 1 {
+                                first_tool = true;
+                                entered.notify_one();
+                                release.notified().await;
+                            }
+                            if n == 2 {
+                                parallel_entered.notify_one();
+                                parallel_release.notified().await;
+                            }
+                            serde_json::json!({"content":[{"type":"text","text":format!("http-call-{n}")} ]})
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    let reply=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                    let _ = stream.get_mut().write_all(reply.as_bytes()).await;
+                    if first_tool {
+                        finished.notify_one();
+                    }
+                });
+            }
+        })
+    };
+    let config = McpServerConfig {
+        name: "http-cancel".into(),
+        disabled: false,
+        source: McpConfigSource::User,
+        trust: false,
+        auto_approve: vec![],
+        allowed_tools: None,
+        config: McpTransportConfig::Http {
+            url: format!("http://{address}/mcp"),
+            headers: BTreeMap::new(),
+            auth: None,
+            timeout_ms: Some(5_000),
+        },
+    };
+    let registry = McpRegistry::new(NO_TREE).share();
+    registry.add_server(config.clone()).await.unwrap();
+    let adapter = Arc::new(
+        McpToolAdapter::new(registry.clone(), registry.list_all_tools().await.remove(0)).unwrap(),
+    );
+    let cancel = CancellationToken::new();
+    let task = {
+        let tool = adapter.clone();
+        let mut context = ctx();
+        context.cancel = cancel.clone();
+        tokio::spawn(async move { tool.execute("{}", &context).await })
+    };
+    entered.notified().await;
+    let parallel = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.execute("{}", &ctx()).await })
+    };
+    parallel_entered.notified().await;
+    cancel.cancel();
+    let result = task.await.unwrap();
+    assert!(result.is_error && result.content.contains("unverified"));
+    assert!(
+        matches!(&registry.server_statuses().await[0].1,ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))
+    );
+    assert!(adapter.execute("{}", &ctx()).await.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    parallel_release.notify_one();
+    let concurrent_result = parallel.await.unwrap();
+    assert!(!concurrent_result.is_error && concurrent_result.content.contains("http-call-2"));
+    assert!(
+        adapter.execute("{}", &ctx()).await.is_error,
+        "another completed call cannot clear the cancelled call's uncertainty"
+    );
+    release.notify_one();
+    finished.notified().await;
+    assert!(
+        adapter.execute("{}", &ctx()).await.is_error,
+        "late remote completion does not reopen the old client"
+    );
+    registry.add_server(config).await.unwrap();
+    let result = adapter.execute("{}", &ctx()).await;
+    assert!(!result.is_error && result.content.contains("http-call-3"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "only the two accepted calls and explicitly requested next call execute"
+    );
+    server.abort();
 }

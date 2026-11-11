@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use super::client::McpClient;
+use super::client::{McpClient, ToolRequestGuard, CANCELLED_TOOL_REQUEST};
 use super::config::McpHttpAuthConfig;
 use super::oauth::{refresh_mcp_oauth_token, token_is_expired, McpTokenStore};
 use super::types::{
@@ -46,6 +46,7 @@ pub struct HttpClient {
     timeout_ms: u64,
     status: Arc<Mutex<ServerStatus>>,
     next_id: AtomicU64,
+    abandoned_request: Arc<AtomicU64>,
     client: reqwest::Client,
     /// Streamable-HTTP session id. Stateful servers (e.g. Figma Dev Mode) return
     /// `Mcp-Session-Id` on the `initialize` response and REJECT later requests that
@@ -84,6 +85,7 @@ impl HttpClient {
             timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
             status: Arc::new(Mutex::new(ServerStatus::Disconnected)),
             next_id: AtomicU64::new(1),
+            abandoned_request: Arc::new(AtomicU64::new(0)),
             client,
             session_id: Arc::new(Mutex::new(None)),
             negotiated_version: Arc::new(Mutex::new(None)),
@@ -127,6 +129,9 @@ impl HttpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        if self.abandoned_request.load(Ordering::SeqCst) != 0 {
+            bail!(CANCELLED_TOOL_REQUEST);
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // IMPORTANT: omit `params` when it's None.
@@ -189,83 +194,101 @@ impl HttpClient {
             req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
         }
 
-        let timeout_duration = Duration::from_millis(self.timeout_ms);
-        let response = timeout(timeout_duration, req.send())
-            .await
-            .with_context(|| {
-                format!(
-                    "HTTP request to MCP server {} timed out after {}ms",
-                    self.server_name, self.timeout_ms
-                )
-            })?
-            .with_context(|| format!("HTTP request to MCP server {} failed", self.server_name))?;
+        if self.abandoned_request.load(Ordering::SeqCst) != 0 {
+            bail!(CANCELLED_TOOL_REQUEST);
+        }
+        let guard =
+            (method == "tools/call").then(|| ToolRequestGuard::new(self.abandoned_request.clone()));
+        let result = async {
+            if let Some(guard) = &guard {
+                guard.dispatched(id);
+            }
+            let timeout_duration = Duration::from_millis(self.timeout_ms);
+            let response = timeout(timeout_duration, req.send())
+                .await
+                .with_context(|| {
+                    format!(
+                        "HTTP request to MCP server {} timed out after {}ms",
+                        self.server_name, self.timeout_ms
+                    )
+                })?
+                .with_context(|| {
+                    format!("HTTP request to MCP server {} failed", self.server_name)
+                })?;
 
-        // Capture the session id the server may have handed out (e.g. on initialize).
-        self.capture_session_id(response.headers()).await;
+            // Capture the session id the server may have handed out (e.g. on initialize).
+            self.capture_session_id(response.headers()).await;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            if (status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN)
-                && self.auth.is_some()
-            {
-                bail!(
+            if !response.status().is_success() {
+                let status = response.status();
+                if (status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN)
+                    && self.auth.is_some()
+                {
+                    bail!(
                     "MCP server {} requires OAuth; run `atomcode mcp login {}` or `/mcp login {}`",
                     self.server_name,
                     self.server_name,
                     self.server_name
                 );
+                }
+                let body = read_limited_response_text(response, &self.server_name).await?;
+                bail!(
+                    "MCP server {} returned HTTP {}: {}",
+                    self.server_name,
+                    status,
+                    body
+                );
             }
+
+            // MCP "Streamable HTTP" servers (deepwiki, context7, etc.) may
+            // return responses as `text/event-stream` SSE frames rather than
+            // a single JSON body — the spec lets the server pick whichever
+            // content type it sent in its response. We negotiated both via
+            // the `Accept` header above, so handle both on the receive side.
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+
             let body = read_limited_response_text(response, &self.server_name).await?;
-            bail!(
-                "MCP server {} returned HTTP {}: {}",
-                self.server_name,
-                status,
-                body
-            );
-        }
 
-        // MCP "Streamable HTTP" servers (deepwiki, context7, etc.) may
-        // return responses as `text/event-stream` SSE frames rather than
-        // a single JSON body — the spec lets the server pick whichever
-        // content type it sent in its response. We negotiated both via
-        // the `Accept` header above, so handle both on the receive side.
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-
-        let body = read_limited_response_text(response, &self.server_name).await?;
-
-        let result: super::types::JsonRpcResponse = if content_type.contains("text/event-stream") {
-            parse_sse_jsonrpc(&body, id).with_context(|| {
-                format!(
-                    "Failed to parse MCP SSE response from {} (first 200 bytes: {:?})",
-                    self.server_name,
-                    body.chars().take(200).collect::<String>()
-                )
-            })?
-        } else {
-            serde_json::from_str(&body).with_context(|| {
-                format!(
-                    "Failed to parse MCP HTTP response from {} (content-type={:?}, \
+            let result: super::types::JsonRpcResponse =
+                if content_type.contains("text/event-stream") {
+                    parse_sse_jsonrpc(&body, id).with_context(|| {
+                        format!(
+                            "Failed to parse MCP SSE response from {} (first 200 bytes: {:?})",
+                            self.server_name,
+                            body.chars().take(200).collect::<String>()
+                        )
+                    })?
+                } else {
+                    serde_json::from_str(&body).with_context(|| {
+                        format!(
+                            "Failed to parse MCP HTTP response from {} (content-type={:?}, \
                      first 200 bytes: {:?})",
-                    self.server_name,
-                    content_type,
-                    body.chars().take(200).collect::<String>()
-                )
-            })?
-        };
+                            self.server_name,
+                            content_type,
+                            body.chars().take(200).collect::<String>()
+                        )
+                    })?
+                };
 
-        if let Some(error) = result.error {
-            bail!("MCP error {} (code {}): {}", error.message, error.code, "");
+            if let Some(error) = result.error {
+                bail!("MCP error {} (code {}): {}", error.message, error.code, "");
+            }
+
+            result
+                .result
+                .ok_or_else(|| anyhow::anyhow!("MCP response missing result"))
         }
-
+        .await;
+        if let Some(guard) = &guard {
+            guard.disarm();
+        }
         result
-            .result
-            .ok_or_else(|| anyhow::anyhow!("MCP response missing result"))
     }
 
     fn load_oauth_token(&self) -> Result<Option<String>> {
@@ -430,9 +453,9 @@ impl Drop for HttpClient {
 }
 
 /// Send the MCP session-termination `DELETE`. Mirrors `send_request`'s header handling:
-/// user-supplied headers (incl. a pinned `Mcp-Session-Id` or auth) are applied, and the
-/// captured session id is added only when the user didn't already provide one. Best-effort
-/// — errors are intentionally ignored.
+/// A user-pinned session is an attached resource, not this client's lease to
+/// destroy. Only a server-issued session is eligible for best-effort cleanup.
+/// Errors do not imply rollback or confirmed remote cleanup.
 async fn delete_http_session(
     client: reqwest::Client,
     url: String,
@@ -443,6 +466,9 @@ async fn delete_http_session(
     let user_has_session = headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+    if user_has_session {
+        return;
+    }
     let user_has_version = headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case(MCP_PROTOCOL_VERSION_HEADER));
@@ -458,7 +484,9 @@ async fn delete_http_session(
             req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
         }
     }
-    let _ = req.send().await;
+    // Teardown has its own short budget; a long ordinary RPC timeout must not
+    // leave shutdown cleanup running indefinitely. No business tool is called.
+    let _ = timeout(Duration::from_secs(2), req.send()).await;
 }
 
 #[async_trait]
@@ -515,6 +543,9 @@ impl McpClient for HttpClient {
     }
 
     fn status(&self) -> ServerStatus {
+        if self.abandoned_request.load(Ordering::SeqCst) != 0 {
+            return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
+        }
         self.status
             .try_lock()
             .map(|s| s.clone())
@@ -761,6 +792,71 @@ mod session_tests {
     use super::*;
     use crate::mcp::types::MCP_PROTOCOL_VERSION;
     use reqwest::header::HeaderMap;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cleanup_preserves_attached_sessions_and_bounds_owned_session_delete() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || {
+            let _ = release_clock.recv_timeout(Duration::from_secs(10));
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/mcp");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let began = tokio::time::Instant::now();
+        delete_http_session(
+            client.clone(),
+            url.clone(),
+            BTreeMap::from([("mCp-SeSsIoN-iD".into(), "attached-not-owned".into())]),
+            "server-offered".into(),
+            None,
+        )
+        .await;
+        assert_eq!(began.elapsed(), Duration::ZERO);
+        // No request was dispatched: the first actual connection below must
+        // carry the owned ID, never the attached ID or the ignored offer.
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let seen = observed.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.starts_with("DELETE "));
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: owned"));
+            assert!(!headers.contains("attached-not-owned"));
+            seen.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let deletion = tokio::spawn(delete_http_session(
+            client,
+            url,
+            BTreeMap::new(),
+            "owned".into(),
+            None,
+        ));
+        observed.notified().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        deletion.await.unwrap();
+        assert_eq!(began.elapsed(), Duration::from_secs(2));
+        server.abort();
+        drop(keep_clock);
+        let _ = clock.await;
+    }
 
     fn client() -> HttpClient {
         HttpClient::new(
