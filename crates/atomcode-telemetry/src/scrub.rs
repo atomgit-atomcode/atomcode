@@ -45,10 +45,10 @@ pub fn redact_secrets(s: &str) -> String {
 
 /// A path worth replacing. A bare `/`, `.` or `..` would match separators or
 /// dots all over the message (URLs, versions), turning the diagnostic into
-/// unreadable text without hiding anything; an empty string matches everywhere.
+/// unreadable text without hiding anything; an empty string matches wherever
+/// the message has one. All of them have no alphanumeric character.
 fn usable_path(path: Option<&Path>) -> Option<&str> {
     path.and_then(Path::to_str)
-        .filter(|p| !p.is_empty() && *p != "." && *p != "..")
         .filter(|p| p.chars().any(|c| c.is_alphanumeric()))
 }
 
