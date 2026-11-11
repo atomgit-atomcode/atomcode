@@ -80,7 +80,7 @@ export type SSEEvent =
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
   | { type: 'tool_output'; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
-  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
+  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number; images?: ImageData[] }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; approval_id?: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | UserInputRequestEvent
@@ -307,6 +307,7 @@ export interface ToolResultInfo {
   success: boolean;
   summary: string;
   line_count: number;
+  images?: ImageData[];
 }
 
 export interface SessionMessage {
@@ -1127,7 +1128,7 @@ export type LiveWireEvent =
   | { type: 'tool_start'; id: string; name: string; arguments: string }
   | { type: 'tool_output'; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
-  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
+  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number; images?: ImageData[] }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string; stats?: TurnStats }
   | { type: 'error'; message: string }

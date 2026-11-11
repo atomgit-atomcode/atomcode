@@ -82,7 +82,7 @@ import {
   ensureActiveDescendantVisible,
   splitAtToken,
 } from '../lib/atMention';
-import { settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { completedToolPatch, settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { backgroundPresentation, groupEmptyPolls, type PollGroups } from '../lib/backgroundTools';
 import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
 import {
@@ -1695,8 +1695,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         const result = msg.tool_result;
         const tool = displayTools.get(result.call_id);
         if (tool) {
-          tool.output = result.summary;
-          tool.status = toolResultStatus(result.success, result.summary);
+          Object.assign(tool, completedToolPatch(result.success, result.summary, result.images));
           const pending = pendingTodoCalls.get(result.call_id);
           if (pending && isTodoTool(pending.name)) {
             const call = orderedTodoCalls.find(candidate => candidate.id === result.call_id);
@@ -1748,7 +1747,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments };
       case 'tool_output': return { type: 'tool_output', chunk: e.chunk };
       case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
-      case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
+      case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms, images: e.images };
       case 'context_summary': return e;
       case 'context_compacting': return e;
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
@@ -2762,12 +2761,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           if (pending && event.success) setTodoSourceRevision(value => value + 1);
           pendingTodoCallsRef.current.delete(event.id);
         }
-        updateToolInLastAssistant(event.id, {
-          status: toolResultStatus(event.success, event.output),
-          duration_ms: event.duration_ms,
-          output: event.output,
-          progress: undefined,
-        });
+        updateToolInLastAssistant(event.id,
+          completedToolPatch(event.success, event.output, event.images, event.duration_ms));
         // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
         onPermissionResolved?.(event.id);
         break;
@@ -5343,7 +5338,8 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
   }
 
   if (background) annotation = { cls: background.cls, label: t(background.label, background.params) };
-  const hasDetail = calls.some(call => Boolean(call.args || call.output));
+  const imageCount = calls.reduce((count, call) => count + (call.images?.length ?? 0), 0);
+  const hasDetail = calls.some(call => Boolean(call.args || call.output || call.images?.length));
 
   return (
     <div class="tool-body">
@@ -5352,6 +5348,7 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
         <span class="tool-name">{background?.title ? t(background.title) : displayToolName(tool.name)}</span>
         <span class="tool-name-secondary">{abbreviateArgs(background?.detail ?? tool.detail ?? formatToolDetail(tool.name, tool.args))}</span>
         {calls.length > 1 && <span class="tool-poll-count">{t('tool.pollCount', { n: calls.length })}</span>}
+        {imageCount > 0 && <span class="tool-poll-count">{t('tool.images', { n: imageCount })}</span>}
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>
             <ToolStatusIcon cls={annotation.cls} />
@@ -5379,6 +5376,15 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
               <div key={`${call.id}-output`} class="tool-body-row">
                 <div class="tool-body-row-label">{t('tool.output')}</div>
                 <div class="tool-body-row-content">{call.output}</div>
+              </div>
+            ),
+            Boolean(call.images?.length) && (
+              <div key={`${call.id}-images`} class="tool-body-row">
+                <div class="tool-body-row-label">{t('tool.images', { n: call.images!.length })}</div>
+                <div class="msg-images">
+                  {call.images!.map((image, index) => <img key={index} class="msg-image" loading="lazy" decoding="async"
+                    src={imageDataUrl(image)} alt={t('tool.image', { n: index + 1 })} />)}
+                </div>
               </div>
             ),
           ])}

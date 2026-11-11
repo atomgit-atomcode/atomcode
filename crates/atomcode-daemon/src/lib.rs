@@ -62,6 +62,7 @@ pub use runtime_host::{
     gather_plugin_skill_dirs_for, installed_plugin_hook_source,
 };
 pub(crate) mod live_api;
+mod tool_images;
 // 远端那一侧的「模式」徽标就是这个值。启动器(新 tui 的共享)要能核对它确实跟着
 // 这台机器上的会话走——读得到才判得了。
 pub use live_api::live_current_approval_mode;
@@ -855,6 +856,8 @@ pub struct ToolResultInfo {
     pub success: bool,
     pub summary: String,
     pub line_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageData>,
 }
 
 /// Message info for API response
@@ -901,6 +904,16 @@ pub struct ImageData {
     pub data: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
+}
+
+impl From<atomcode_kernel::message::ImageContent> for ImageData {
+    fn from(image: atomcode_kernel::message::ImageContent) -> Self {
+        Self {
+            media_type: image.media_type,
+            data: image.data,
+            missing: false,
+        }
+    }
 }
 
 impl ImageData {
@@ -962,6 +975,7 @@ impl MessageInfo {
                 success: !msg.is_error,
                 summary,
                 line_count: msg.text.lines().count(),
+                images: msg.images.iter().cloned().map(ImageData::from).collect(),
             }
         });
         let artifacts = extract_artifacts_from_call_fields(
@@ -3081,6 +3095,11 @@ fn merge_catalog_session_messages_for_display(
         &atomcode_coding::config::product_dirs_from_env(),
     );
     let display_manager = storage.unwrap_or(&fallback_manager);
+    let tool_images = display_manager
+        .load_events(&session.meta.id)
+        .ok()
+        .map(|events| tool_images::from_events(&session.snapshot, &events))
+        .unwrap_or_default();
     let mut messages =
         Vec::with_capacity(session.snapshot.messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
@@ -3133,6 +3152,11 @@ fn merge_catalog_session_messages_for_display(
                 && atomcode_capabilities::reminder::is_system_reminder(&message.text));
         if !hidden_internal {
             let mut info = MessageInfo::from_kernel(message);
+            if let (Some(result), Some(images)) =
+                (info.tool_result.as_mut(), tool_images.get(index))
+            {
+                result.images = images.clone();
+            }
             (info.source_seq, info.task_spec_pinned) = spec_sources[index];
             info.created_at =
                 snapshot_message_timestamp(&session.meta, message, index, turn_timestamps);
@@ -4151,6 +4175,8 @@ pub enum ChatEvent {
         output: String,
         success: bool,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageData>,
     },
     /// Token usage update
     #[serde(rename = "tokens")]
@@ -5213,6 +5239,7 @@ impl ChatRuntimeProjector {
                     id: result.call_id,
                     name,
                     output: result.content,
+                    images: result.images.into_iter().map(ImageData::from).collect(),
                     success: !result.is_error,
                     duration_ms: started.elapsed().as_millis() as u64,
                 }]
@@ -8488,6 +8515,35 @@ mod fs_list_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_result_images_preserve_wire_order_mime_and_failed_status() {
+        let mut projector = ChatRuntimeProjector::default();
+        let event = atomcode_kernel::event::AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "picture-call".into(),
+                content: "captured".into(),
+                is_error: true,
+                images: vec![
+                    atomcode_kernel::message::ImageContent {
+                        data: "FIRST".into(),
+                        media_type: "image/png".into(),
+                    },
+                    atomcode_kernel::message::ImageContent {
+                        data: "SECOND".into(),
+                        media_type: "image/jpeg".into(),
+                    },
+                ],
+            },
+        };
+        let json = serde_json::to_value(&projector.project_agent(event)[0]).unwrap();
+        assert_eq!(json["images"][0]["data"], "FIRST");
+        assert_eq!(json["images"][1]["data"], "SECOND");
+        assert_eq!(json["images"][1]["media_type"], "image/jpeg");
+        assert_eq!(json["success"], false);
+        assert_eq!(json["output"], "captured");
+        assert_eq!(json["id"], "picture-call");
+    }
+
     use super::*;
 
     #[test]

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type MsgPart, type ToolRow } from './toolRows.ts';
+import { completedToolPatch, settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type MsgPart, type ToolRow } from './toolRows.ts';
 
 const tool = (id: string, over: Partial<ToolRow> = {}): ToolRow => ({
   id,
@@ -89,4 +89,15 @@ test('turn termination settles only open tools and discards their activity', () 
   assert.equal(settled[1].kind === 'tool' && settled[1].tool.output, 'partial output');
   assert.deepEqual(settled[3], parts[3]);
   assert.deepEqual(updateToolProgress(settled, 'open', 'late progress'), settled);
+});
+
+test('live and history result patches preserve ordered pictures and failure without stale activity', () => {
+  const images = [{ media_type: 'image/png', data: 'FIRST' }, { media_type: 'image/jpeg', data: 'SECOND' }];
+  const patch = completedToolPatch(false, 'captured but incomplete', images, 12);
+  assert.deepEqual(patch.images, images);
+  assert.equal(patch.status, 'error');
+  assert.equal(patch.output, 'captured but incomplete');
+  assert.equal(patch.progress, undefined);
+  assert.equal(patch.duration_ms, 12);
+  assert.equal(completedToolPatch(true, 'old text-only result').images, undefined);
 });

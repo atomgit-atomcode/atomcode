@@ -832,6 +832,8 @@ pub(crate) enum LiveWireEvent {
         output: String,
         success: bool,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::ImageData>,
     },
     #[serde(rename = "tokens")]
     Tokens {
@@ -1074,6 +1076,11 @@ impl NativeLiveWireProjector {
                         id: result.call_id,
                         name,
                         output: result.content,
+                        images: result
+                            .images
+                            .into_iter()
+                            .map(crate::ImageData::from)
+                            .collect(),
                         success: !result.is_error,
                         duration_ms: started.elapsed().as_millis() as u64,
                     }
@@ -1663,11 +1670,20 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &atomcode_coding::config::product_dirs_from_env(),
     );
-    for ((info, (seq, pinned)), raw) in snapshot_messages
+    let tool_images = display_manager
+        .load_events(&join.binding.session_id)
+        .ok()
+        .map(|events| crate::tool_images::from_events(&join.snapshot, &events))
+        .unwrap_or_default();
+    for (index, ((info, (seq, pinned)), raw)) in snapshot_messages
         .iter_mut()
         .zip(sources)
         .zip(&join.snapshot.messages)
+        .enumerate()
     {
+        if let (Some(result), Some(images)) = (info.tool_result.as_mut(), tool_images.get(index)) {
+            result.images = images.clone();
+        }
         info.source_seq = seq;
         info.task_spec_pinned = pinned;
         crate::attach_native_display_images(
@@ -3089,6 +3105,42 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_result_images_preserve_wire_order_mime_and_failed_status() {
+        let mut projector = NativeLiveWireProjector::default();
+        let event = atomcode_kernel::event::AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "picture-call".into(),
+                content: "captured".into(),
+                is_error: true,
+                images: vec![
+                    atomcode_kernel::message::ImageContent {
+                        data: "FIRST".into(),
+                        media_type: "image/png".into(),
+                    },
+                    atomcode_kernel::message::ImageContent {
+                        data: "SECOND".into(),
+                        media_type: "image/jpeg".into(),
+                    },
+                ],
+            },
+        };
+        let json = serde_json::to_value(
+            &projector
+                .project(crate::live_hub::LiveViewEvent::Runtime(
+                    atomcode_coding::CodingRuntimeEvent::Agent(event),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["images"][0]["data"], "FIRST");
+        assert_eq!(json["images"][1]["data"], "SECOND");
+        assert_eq!(json["images"][1]["media_type"], "image/jpeg");
+        assert_eq!(json["success"], false);
+        assert_eq!(json["output"], "captured");
+        assert_eq!(json["id"], "picture-call");
+    }
+
     #[test]
     fn loop_quota_progress_crosses_the_live_wire_as_a_loop() {
         let mut projector = NativeLiveWireProjector::default();
