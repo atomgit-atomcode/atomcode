@@ -2819,6 +2819,7 @@ fn start_with_mcp_server(
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust,
         auto_approve: Vec::new(),
+        allowed_tools: None,
     }];
     start
 }
@@ -3081,6 +3082,7 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
@@ -3680,6 +3682,7 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
@@ -5700,6 +5703,7 @@ async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     turn(&mut runtime, "describe operations").await;
@@ -6518,6 +6522,7 @@ async fn a_failed_mcp_connection_is_metered() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     // The catalog settles whether or not the server came up; a failure to

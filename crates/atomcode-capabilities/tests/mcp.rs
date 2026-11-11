@@ -42,6 +42,7 @@ fn test_server_config_with_env_and_timeout(
         },
         trust: false,
         auto_approve: vec![],
+        allowed_tools: None,
     }
 }
 
@@ -71,6 +72,79 @@ fn ctx() -> ToolContext {
         progress: ProgressSink::noop(),
         requester: None,
     }
+}
+
+/// Discovery, remount cache and direct/stale adapter calls share the same policy.
+#[tokio::test]
+async fn allowed_tools_filter_discovery_and_execution_without_granting_approval() {
+    let registry = McpRegistry::new(NO_TREE).share();
+    let mut config = test_server_config("restricted");
+    config.allowed_tools = Some(vec!["echo".into()]);
+    registry.add_server(config.clone()).await.unwrap();
+    let infos = registry.list_all_tools().await;
+    assert_eq!(infos.len(), 1);
+    let adapter = McpToolAdapter::new(registry.clone(), infos[0].clone()).unwrap();
+    assert_eq!(adapter.risk("{}"), RiskLevel::Risky);
+    assert!(
+        !adapter
+            .execute(r#"{"message":"allowed"}"#, &ctx())
+            .await
+            .is_error
+    );
+    assert_eq!(registry.listed_tools().len(), 1);
+
+    // Even a trusted server and an already-created adapter cannot bypass deny-all.
+    config.allowed_tools = Some(vec![]);
+    config.trust = true;
+    registry.add_server(config.clone()).await.unwrap();
+    assert!(registry.listed_tools().is_empty());
+    assert!(registry.list_all_tools().await.is_empty());
+    assert!(registry
+        .list_tools_for_server("restricted")
+        .await
+        .is_empty());
+    let denied = adapter.execute(r#"{"message":"blocked"}"#, &ctx()).await;
+    assert!(denied.is_error && denied.content.contains("blocked by allowedTools"));
+    assert!(registry
+        .call_tool("restricted", "echo", serde_json::json!({}))
+        .await
+        .is_err());
+
+    config.allowed_tools = Some(vec!["*".into(), "mcp__restricted__echo".into()]);
+    registry.add_server(config.clone()).await.unwrap();
+    assert!(
+        registry.list_all_tools().await.is_empty(),
+        "only exact raw tool names match"
+    );
+    config.allowed_tools = None;
+    registry.add_server(config).await.unwrap();
+    assert_eq!(
+        registry.list_all_tools().await.len(),
+        1,
+        "omitted policy preserves existing behavior"
+    );
+}
+
+#[test]
+fn allowed_tools_config_distinguishes_absent_empty_and_invalid() {
+    use atomcode_capabilities::mcp::parse_mcp_servers;
+    let parse = |extra: &str| {
+        parse_mcp_servers(
+            &format!(r#"{{"mcpServers":{{"b":{{"command":"node"{extra}}}}}}}"#),
+            McpConfigSource::User,
+        )
+    };
+    assert_eq!(parse("").unwrap()[0].allowed_tools, None);
+    assert_eq!(
+        parse(r#", "allowedTools": []"#).unwrap()[0].allowed_tools,
+        Some(vec![])
+    );
+    assert_eq!(
+        parse(r#", "allowed_tools": ["echo"]"#).unwrap()[0].allowed_tools,
+        Some(vec!["echo".into()])
+    );
+    assert!(parse(r#", "allowedTools": "echo""#).is_err());
+    assert!(parse(r#", "allowedTools": [42]"#).is_err());
 }
 
 /// The core happy path: connect a stdio server, discover its tool, wrap it as a
@@ -860,6 +934,7 @@ async fn installed_computer_backend_exposes_scoped_tools_through_the_production_
             disabled: false,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
             config: McpTransportConfig::Stdio {
                 command: executable.to_str().unwrap().into(),
                 args: vec!["mcp".into()],

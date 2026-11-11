@@ -103,6 +103,8 @@ pub struct McpServerConfig {
     /// Per-tool auto-approve allowlist (the `autoApprove` array): bare tool names
     /// (e.g. `["query", "search"]`) whose calls skip the approval prompt.
     pub auto_approve: Vec<String>,
+    /// Exact raw MCP tool names permitted for discovery and execution. None permits all; empty denies all.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Configuration source for a server.
@@ -165,6 +167,8 @@ struct McpServerEntry {
     /// `autoApprove: ["query", ...]` ⇒ per-tool auto-approve allowlist.
     #[serde(default, rename = "autoApprove", alias = "auto_approve")]
     auto_approve: Vec<String>,
+    #[serde(default, rename = "allowedTools", alias = "allowed_tools")]
+    allowed_tools: Option<Vec<String>>,
 }
 
 use serde::Deserialize;
@@ -674,6 +678,7 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         source: McpConfigSource::Project, // default; overwritten by load_config_file
         trust,
         auto_approve: entry.auto_approve,
+        allowed_tools: entry.allowed_tools,
     })
 }
 

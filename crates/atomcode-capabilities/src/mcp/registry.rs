@@ -173,6 +173,7 @@ pub struct McpRegistry {
     /// Exact model-visible alias -> original MCP identity. This is authoritative
     /// for routing and persistent approval; sanitized names are not reversible.
     tool_aliases: Arc<std::sync::RwLock<BTreeMap<String, (String, String)>>>,
+    allowed_tools: Arc<std::sync::RwLock<BTreeMap<String, HashSet<String>>>>,
     config_auto_approvals: Arc<std::sync::RwLock<BTreeMap<String, HashSet<String>>>>,
     /// Current initialize-time instructions, keyed by the configured server name.
     /// This is live connection state: it is never copied into session persistence.
@@ -203,6 +204,7 @@ impl McpRegistry {
             trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            allowed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             config_auto_approvals: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -471,6 +473,19 @@ It cannot override system, user, project, safety, permission, or approval rules.
     /// property independent of connection success, so this is safe to call before/
     /// regardless of connecting. Idempotent.
     fn apply_trust_from_config(&self, config: &McpServerConfig) {
+        let mut allowed = self
+            .allowed_tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match &config.allowed_tools {
+            Some(tools) => {
+                allowed.insert(config.name.clone(), tools.iter().cloned().collect());
+            }
+            None => {
+                allowed.remove(&config.name);
+            }
+        }
+        drop(allowed);
         if config.trust {
             self.mark_server_trusted(&config.name);
         } else {
@@ -513,6 +528,18 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(config.name.clone(), configured);
+    }
+
+    fn tool_allowed(&self, server: &str, tool: &str) -> bool {
+        self.allowed_tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server)
+            .is_none_or(|tools| tools.contains(tool))
+    }
+
+    fn filter_tools(&self, tools: &mut Vec<McpToolInfo>) {
+        tools.retain(|tool| self.tool_allowed(&tool.server_name, &tool.tool_name));
     }
 
     /// Load MCP configuration and start connecting to servers in the background.
@@ -992,7 +1019,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&server_name);
-                    let tools = tool_infos(&server_name, result.tools);
+                    let mut tools = tool_infos(&server_name, result.tools);
+                    self.filter_tools(&mut tools);
                     self.record_listed(&server_name, Some(&tools));
                     all_tools.extend(tools);
                 }
@@ -1033,6 +1061,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut tools: Vec<McpToolInfo> = listed.values().flatten().cloned().collect();
+        self.filter_tools(&mut tools);
         tools.sort_by(|left, right| {
             (&left.server_name, &left.tool_name).cmp(&(&right.server_name, &right.tool_name))
         });
@@ -1076,7 +1105,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(server_name);
-                let tools = tool_infos(server_name, result.tools);
+                let mut tools = tool_infos(server_name, result.tools);
+                self.filter_tools(&mut tools);
                 self.record_listed(server_name, Some(&tools));
                 tools
             }
@@ -1112,6 +1142,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<super::types::CallToolResult> {
+        if !self.tool_allowed(server_name, tool_name) {
+            anyhow::bail!(
+                "MCP tool is blocked by allowedTools for server '{}'",
+                server_name
+            );
+        }
         // Take a stable client snapshot, then release the registry lock before the
         // potentially slow transport call. Reload/add-server writes must not wait
         // for an MCP tool execution to finish or time out.
@@ -1226,6 +1262,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             trusted_servers: self.trusted_servers.clone(),
             auto_approved_tools: self.auto_approved_tools.clone(),
             tool_aliases: self.tool_aliases.clone(),
+            allowed_tools: self.allowed_tools.clone(),
             config_auto_approvals: self.config_auto_approvals.clone(),
             server_instructions: self.server_instructions.clone(),
             listed_tools: self.listed_tools.clone(),
@@ -1781,6 +1818,7 @@ mod tests {
             source: super::super::config::McpConfigSource::Driver,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1835,6 +1873,7 @@ mod tests {
             },
             trust: false,
             auto_approve: vec!["query".to_string(), "mcp__docs__search".to_string()],
+            allowed_tools: None,
         };
         reg.apply_trust_from_config(&cfg);
         assert!(
@@ -1870,6 +1909,7 @@ mod tests {
             },
             trust: false,
             auto_approve: vec![format!("mcp__{server}__{tool}")],
+            allowed_tools: None,
         };
 
         reg.apply_trust_from_config(&cfg);
@@ -1939,6 +1979,7 @@ mod tests {
             },
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
         };
 
         let result = registry.add_server(config).await;
@@ -1964,6 +2005,7 @@ mod tests {
             disabled: false,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
             config: super::super::config::McpTransportConfig::Stdio {
                 command: "server".into(),
                 args: vec![],

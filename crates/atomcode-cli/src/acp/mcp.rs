@@ -72,6 +72,7 @@ pub fn acp_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    allowed_tools: None,
                 });
             }
             McpServer::Http(h) => {
@@ -96,6 +97,7 @@ pub fn acp_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    allowed_tools: None,
                 });
             }
             McpServer::Sse(s) => ignored.push(s.name.clone()),
