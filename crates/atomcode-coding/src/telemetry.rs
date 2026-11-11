@@ -1255,9 +1255,9 @@ mod tests {
             working_dir.clone(),
         );
         let token = "ghp_Qq1234567890abcdefghijKLMNOP0987654321";
-        // After the path is scrubbed to `<CWD>`, 158 'a's put the token at
-        // character 186. A truncate-first cut leaves only 14 characters of it —
-        // below the 20-character shape the token regex needs. There is
+        // After the path is scrubbed to `<CWD>`, the token starts at index 186
+        // (the 187th character). A truncate-first cut leaves only 14 characters
+        // of it — below the 20-character shape the token regex needs. There is
         // deliberately no key/value prefix (`Authorization: …`) here: its
         // shorter 6-character rule would redact the truncated fragment too,
         // and the test would pass under either order.
