@@ -138,3 +138,19 @@ The first strengthened real Drop test exposed missing EOF handling in the option
 ACP stdio in-flight cancellation and EOF acceptance is recorded in [the fault report](../../docs/plans/2026-11-12-acp-disconnect-acceptance.md). A disconnected client cannot receive a wire terminal: the host now awaits its existing bounded session teardown so the native cancellation is committed before exit. Explicit session close/resume permits re-observation of an uncertain effect; it does not retry that operation. Other transports and pending-permission EOF are not established by these runs.
 
 The [WebUI image report](../../docs/plans/2026-11-12-webui-tool-images.md) records corrected chat/live tool-result image payloads and native historical image association. WebUI preserves them in expandable tool details and counts their bytes in its existing memory budget. Actual /chat and history API image equality is verified; rendered WebUI/live browser workflows remain unaccepted.
+
+## Download expansion: completed-artifact counterexample
+
+Per-origin allow settings still are not a supported production mode. The [publication-boundary decision](../../docs/adr/0032-origin-downloads-remain-backend-owned.md) records why a download-event cancel listener is insufficient: in a real delayed-event case, cancel resolves but the pinned MCP still saves an already completed denied artifact. The unshipped v2 draft was withdrawn; v1 keeps acceptDownloads=false and HTTP attachment refusal.
+
+Run the source-only opt-in characterization on the recorded macOS host:
+
+```sh
+node integrations/browser-origin-scope/characterize-downloads.cjs \
+  --backend-root /absolute/installed/node_modules/@playwright/mcp \
+  --report /absolute/new-download-characterization.json
+```
+
+The report path must be new. This is a test, never an MCP backend to register: it intentionally enables automatic downloads only inside isolated synthetic loopback TLS fixtures, pins only their ephemeral certificate, and preserves one denied fixture payload as the negative-control evidence. Ordinary samples (one allowed and seven denied/redirects) look successful; a separate one-second delayed event exposes the completed-download race. The delay represents possible scheduling latency, not a measured frequency. Report data includes actual external runtime/source hashes, verifier hash, cases, cancellation events and exact captured process cleanup. Owned fixture/artifact directories remain private outside Git; no personal browser, model call, user configuration or OS grant is used.
+
+Future transfer support must own validation and artifact publication rather than infer authorization from cancellation success. Explicit origin validation at every redirect, blob handling, authenticated context, file capabilities for uploads, full-CDP boundaries and managed setup remain required work.
