@@ -146,7 +146,12 @@ def run(app, report):
             errors = cleanup.enter_context((root / "proxy-stderr").open("w"))
             a = ProxyPeer(binary, dict(base_env, ATOMCODE_HOME=str(root / "profile-a")), errors)
             cleanup.callback(a.close)
-            lease.initialize(a)
+            try:
+                lease.initialize(a)
+            except Exception as error:
+                errors.flush()
+                details = (root / "proxy-stderr").read_text()[-4096:]
+                raise AssertionError("initial test proxy failed: " + details) from error
             first_info = info(path)
             assert Path(first_info["bundleURL"]).resolve() == app
             assert first_info["executableSHA256"] == digest

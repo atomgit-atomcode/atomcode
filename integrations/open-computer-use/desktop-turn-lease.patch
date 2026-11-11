@@ -490,10 +490,10 @@ index fbb3f57..373df1c 100644
 +
 diff --git a/docs/ATOMCODE_LEASE_OVERLAY.md b/docs/ATOMCODE_LEASE_OVERLAY.md
 new file mode 100644
-index 0000000..f824605
+index 0000000..15486d9
 --- /dev/null
 +++ b/docs/ATOMCODE_LEASE_OVERLAY.md
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,36 @@
 +# AtomCode 实验性 desktop lease overlay
 +
 +这是针对 v1.3.0 固定源码的可选 macOS 实验补丁，不是上游正式发行版。宿主集成说明、构建、开发 App 打包和验收脚本由 AtomCode 仓库的 `integrations/open-computer-use/` 维护。本补丁没有改动 Go 平台实现，也不证明 Windows/Linux GUI 已支持相同的占用协议。
@@ -518,6 +518,18 @@ index 0000000..f824605
 +当前开发环境没有 XCTest 模块，因此这里的 smoke 和协议测试不冒充 `swift test` 已通过。原有 XCTest 和上游 GUI smoke 仍属于未验证范围；实际执行证据与剩余限制由宿主交付记录说明。
 +
 +开发 App 仅 ad-hoc 签名，包含固定 upstream commit、源码补丁摘要与单独的 executable provenance。它不是签名正式 release，不会自动安装、替换已安装 App、修改 TCC 或授予权限。关闭托管配置也不是撤销已经送达目标 App 的操作。
++
++## Optional application scope
++
++OPEN_COMPUTER_USE_ALLOWED_BUNDLE_IDS accepts a bounded JSON array of exact bundle IDs from the trusted host environment. Absence preserves legacy access, an empty array denies all, and malformed input refuses tool dispatch. Actual resolved app/window bundle IDs and cached snapshots are checked; catalogs omit denied recent/running apps and windows. Unknown identities are denied when scoped. The built-in password-manager deny list still wins. Full-display capture and global-pointer fallback are refused in scoped mode. The backend advertises application-scope v1; older backends must not be assumed to honor this variable.
++
++This scopes supported backend operations, not arbitrary shell commands, malicious same-user processes, other clients or effects within an allowed app. It does not attest bundle publishers. Managed host policy activation and actual allowed-window GUI acceptance remain separate requirements.
++
++The pinned MCP catalog currently contains 15 tools including capture_display; tests enumerate the actual catalog rather than assuming the older 14-tool documentation. Scoped catalogs reject unknown real bundle IDs before fixture display-name fallback, and launch results are checked again before window metadata is returned.
++
++Scoped snapshots bypass the legacy name-selected FixtureBridge and use real AX/window observation. Focus roots/elements are constrained to the resolved PID rather than racing system-wide focus, before selected text is read. Window images use the existing desktop-independent ScreenCaptureKit window filter. Actual GUI privacy/effect acceptance is still required.
++
++Scope denials use a generic target error rather than exposing an unallowed resolved bundle ID through arbitrary window probes.
 diff --git a/docs/RELIABILITY.md b/docs/RELIABILITY.md
 index 068a2cc..cb0bd10 100644
 --- a/docs/RELIABILITY.md
@@ -532,11 +544,135 @@ index 83ba567..77775e0 100644
 @@ -2,0 +3,2 @@
 +> 应用 AtomCode 实验补丁后，macOS 的协商占用、App/socket 隔离与验证边界按 [desktop lease overlay](ATOMCODE_LEASE_OVERLAY.md) 覆盖下文相应的上游默认行为。
 +
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
+index a3549f9..1073dde 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
+@@ -154 +154,2 @@ enum SnapshotBuilder {
+-        if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
++        try AppSafetyPolicy.requireAllowed(bundleIdentifier: app.bundleIdentifier)
++        if !(try ApplicationScope.current()).isRestricted, app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
+@@ -232 +233,2 @@ enum SnapshotBuilder {
+-        if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
++        try AppSafetyPolicy.requireAllowed(bundleIdentifier: app.bundleIdentifier)
++        if !(try ApplicationScope.current()).isRestricted, app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
+@@ -342,0 +345,4 @@ enum SnapshotBuilder {
++        if (try? ApplicationScope.current().isRestricted) != false,
++           let focused = focusedElement, pid(of: focused) != app.pid {
++            focusedElement = nil
++        }
+@@ -460,0 +467,7 @@ enum SnapshotBuilder {
++        // Scoped observations never use a racing system-wide focus as a root.
++        if (try? ApplicationScope.current().isRestricted) != false {
++            if let direct = copyElement(appElement, attribute: kAXFocusedWindowAttribute),
++               pid(of: direct) == appPID, let usable = usableWindowElement(from: direct) { return usable }
++            if let fallback = firstWindow(for: appElement), pid(of: fallback) == appPID { return fallback }
++            return nil
++        }
+@@ -485,0 +499,4 @@ enum SnapshotBuilder {
++        if (try? ApplicationScope.current().isRestricted) != false {
++            guard let element = copyElement(appElement, attribute: kAXFocusedUIElementAttribute), pid(of: element) == appPID else { return nil }
++            return element
++        }
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AppDiscovery.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AppDiscovery.swift
+index 6de61d2..7ab9d2e 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AppDiscovery.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AppDiscovery.swift
+@@ -131 +131 @@ enum AppDiscovery {
+-        let sorted = entriesByBundle.values.sorted(by: compareListedApps)
++        let sorted = entriesByBundle.values.filter { !AppSafetyPolicy.isBlocked(bundleIdentifier: $0.bundleIdentifier) }.sorted(by: compareListedApps)
+@@ -165,0 +166 @@ enum AppDiscovery {
++            try AppSafetyPolicy.requireAllowed(bundleIdentifier: match.bundleIdentifier)
+@@ -241,0 +243 @@ enum AppDiscovery {
++        try AppSafetyPolicy.requireAllowed(bundleIdentifier: descriptor.bundleIdentifier)
+@@ -341,0 +344 @@ enum AppDiscovery {
++            guard !AppSafetyPolicy.isBlocked(bundleIdentifier: descriptor.bundleIdentifier) else { continue }
+@@ -410,0 +414 @@ enum AppDiscovery {
++                try AppSafetyPolicy.requireAllowed(bundleIdentifier: Bundle(url: appURL)?.bundleIdentifier)
+@@ -706,4 +710,3 @@ enum AppSafetyPolicy {
+-        guard let bundleIdentifier else {
+-            return false
+-        }
+-
++        guard let scope = try? ApplicationScope.current() else { return true }
++        guard scope.permits(bundleIdentifier) else { return true }
++        guard let bundleIdentifier else { return false }
+@@ -712,0 +716,7 @@ enum AppSafetyPolicy {
++    static func requireAllowed(bundleIdentifier: String?) throws {
++        _ = try ApplicationScope.current()
++        if isBlocked(bundleIdentifier: bundleIdentifier) {
++            throw permissionDenied(bundleIdentifier: bundleIdentifier ?? "<unknown bundle>")
++        }
++    }
++
+@@ -714 +724,7 @@ enum AppSafetyPolicy {
+-        .permissionDenied("Computer Use is not allowed to use the app '\(bundleIdentifier)' for safety reasons.")
++        guard let scope = try? ApplicationScope.current() else {
++            return .permissionDenied("Invalid application scope.")
++        }
++        if !scope.permits(bundleIdentifier) {
++            return .permissionDenied("Application scope denied the resolved target.")
++        }
++        return .permissionDenied("Computer Use is not allowed to use the app '\(bundleIdentifier)' for safety reasons.")
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ApplicationScope.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ApplicationScope.swift
+new file mode 100644
+index 0000000..cfaf729
+--- /dev/null
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ApplicationScope.swift
+@@ -0,0 +1,46 @@
++import Foundation
++
++/// Trusted host configuration, never model arguments. Not an OS sandbox.
++struct ApplicationScope {
++    static let environmentKey = "OPEN_COMPUTER_USE_ALLOWED_BUNDLE_IDS"
++    let allowed: Set<String>?
++    var isRestricted: Bool { allowed != nil }
++    var deniesAll: Bool { allowed?.isEmpty == true }
++
++    init(environment: [String: String]) throws {
++        guard let raw = environment[Self.environmentKey] else { allowed = nil; return }
++        guard raw.utf8.count <= 65536,
++              let ids = try? JSONDecoder().decode([String].self, from: Data(raw.utf8)),
++              ids.count <= 256,
++              ids.allSatisfy(Self.validIdentifier)
++        else {
++            throw ComputerUseError.permissionDenied("Invalid application scope: expected a bounded JSON array of exact bundle IDs.")
++        }
++        allowed = Set(ids.map { $0.lowercased() })
++    }
++
++    static func current() throws -> ApplicationScope {
++        try ApplicationScope(environment: ProcessInfo.processInfo.environment)
++    }
++
++    private static func validIdentifier(_ id: String) -> Bool {
++        let parts = id.split(separator: ".", omittingEmptySubsequences: false)
++        return id.utf8.count <= 255 && parts.count >= 2 && parts.allSatisfy { part in
++            !part.isEmpty && part.utf8.allSatisfy { byte in
++                (65...90).contains(byte) || (97...122).contains(byte) || (48...57).contains(byte) || byte == 45 || byte == 95
++            }
++        }
++    }
++
++    func permits(_ bundleIdentifier: String?) -> Bool {
++        guard let allowed else { return true }
++        guard let bundleIdentifier else { return false }
++        return allowed.contains(bundleIdentifier.lowercased())
++    }
++
++    func requireUnrestrictedDisplay() throws {
++        if isRestricted {
++            throw ComputerUseError.permissionDenied("Application scope forbids full-display capture; observe an allowed window instead.")
++        }
++    }
++}
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
-index 9d96b02..36b74d8 100644
+index 9d96b02..9aa6607 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
-@@ -456,0 +457,11 @@ public final class ComputerUseService {
+@@ -177,0 +178 @@ func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
++    guard let scope = try? ApplicationScope(environment: environment), !scope.isRestricted else { return false }
+@@ -456,0 +458,11 @@ public final class ComputerUseService {
 +    var requiresExplicitTurnObservations = false {
 +        didSet {
 +            if requiresExplicitTurnObservations && scopedObservationNamespace == nil {
@@ -548,11 +684,11 @@ index 9d96b02..36b74d8 100644
 +        }
 +    }
 +    private var scopedObservationNamespace: String?
-@@ -466 +477,2 @@ public final class ComputerUseService {
+@@ -466 +478,2 @@ public final class ComputerUseService {
 -    // must be unique per service instance, not per window.
 +    // must be unique per service instance, not per window. Negotiated services
 +    // also have a random instance namespace, so reconnects cannot reissue IDs.
-@@ -470,0 +483,8 @@ public final class ComputerUseService {
+@@ -470,0 +484,8 @@ public final class ComputerUseService {
 +    // A matching host-turn release invalidates observations, but must not reset
 +    // the screenshot sequence and accidentally reissue a prior owner's IDs.
 +    func clearTurnObservations() {
@@ -561,16 +697,37 @@ index 9d96b02..36b74d8 100644
 +        windowScreenshotMeta.removeAll()
 +    }
 +
-@@ -474 +494,2 @@ public final class ComputerUseService {
+@@ -474 +495,2 @@ public final class ComputerUseService {
 -        "shot-\(windowID)-\(counter)"
 +        let prefix = scopedObservationNamespace.map { "shot-\($0)" } ?? "shot"
 +        return "\(prefix)-\(windowID)-\(counter)"
-@@ -1546,0 +1568,3 @@ public final class ComputerUseService {
+@@ -560 +582,5 @@ public final class ComputerUseService {
+-        ToolCallResult.text(
++        guard let scope = try? ApplicationScope.current() else {
++            return ToolCallResult.text("Invalid application scope.", isError: true)
++        }
++        if scope.deniesAll { return ToolCallResult.text("") }
++        return ToolCallResult.text(
+@@ -606,0 +633 @@ public final class ComputerUseService {
++        if try ApplicationScope.current().deniesAll { return ToolCallResult.text("[]") }
+@@ -648,0 +676 @@ public final class ComputerUseService {
++        try ApplicationScope.current().requireUnrestrictedDisplay()
+@@ -858 +886 @@ public final class ComputerUseService {
+-    private func cacheWindowSnapshot(_ snapshot: AppSnapshot, windowID: CGWindowID) {
++    func cacheWindowSnapshot(_ snapshot: AppSnapshot, windowID: CGWindowID) {
+@@ -871 +899 @@ public final class ComputerUseService {
+-    private func windowSnapshot(for windowID: CGWindowID) throws -> AppSnapshot {
++    func windowSnapshot(for windowID: CGWindowID) throws -> AppSnapshot {
+@@ -872,0 +901 @@ public final class ComputerUseService {
++            try AppSafetyPolicy.requireAllowed(bundleIdentifier: snapshot.app.bundleIdentifier)
+@@ -1543,0 +1573 @@ public final class ComputerUseService {
++            try AppSafetyPolicy.requireAllowed(bundleIdentifier: snapshot.app.bundleIdentifier)
+@@ -1546,0 +1577,3 @@ public final class ComputerUseService {
 +        if requiresExplicitTurnObservations {
 +            throw ComputerUseError.message("No app state is available for this turn. Observe the selected target before action tools.")
 +        }
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
-index d15220f..b3bf497 100644
+index d15220f..bfc5ec9 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
 @@ -60,0 +61,8 @@ public final class ComputerUseToolDispatcher {
@@ -582,6 +739,8 @@ index d15220f..b3bf497 100644
 +        service.clearTurnObservations()
 +    }
 +
+@@ -115,0 +124 @@ public final class ComputerUseToolDispatcher {
++        _ = try ApplicationScope.current()
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DesktopTurnLease.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DesktopTurnLease.swift
 new file mode 100644
 index 0000000..b57c25e
@@ -693,7 +852,7 @@ index 22e61f1..cacb89e 100644
 -public struct AvailableDisplay: Equatable {
 +public struct AvailableDisplay: Equatable, Sendable {
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift
-index 52c236c..8caeeb3 100644
+index 52c236c..05c70f2 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift
 @@ -8 +8 @@ Some apps might have a separate dedicated plugin or skill. You may want to use t
@@ -717,7 +876,7 @@ index 52c236c..8caeeb3 100644
 +                    dispatcher.requireExplicitTurnObservations()
 +                }
 @@ -62,0 +78 @@ public final class StdioMCPServer {
-+                            "experimental": ["atomcode/desktop-turn-lease": ["version": 1]],
++                            "experimental": ["atomcode/desktop-turn-lease": ["version": 1], "atomcode/application-scope": ["version": 1]],
 @@ -69,0 +86,4 @@ public final class StdioMCPServer {
 +                if hostTurnScopes {
 +                    // The unaddressed legacy broadcast is not a lease release.
@@ -752,13 +911,14 @@ index 52c236c..8caeeb3 100644
 +    }
 +
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
-index 3d377b0..abefcf8 100644
+index 3d377b0..e0a3120 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
-@@ -137,0 +138,11 @@ public struct SilentPermissionReport: Sendable {
+@@ -137,0 +138,12 @@ public struct SilentPermissionReport: Sendable {
 +            "capabilities": [
 +                "desktop_turn_lease": ["version": 1],
 +                "app_agent_isolation": ["version": 1],
++                "application_scope": ["version": 1],
 +            ],
 +            "runtime": [
 +                "bundle_identifier": Bundle.main.bundleIdentifier ?? "",
@@ -767,13 +927,23 @@ index 3d377b0..abefcf8 100644
 +                "permission_app": PermissionSupport.currentAppBundleURL()?.standardizedFileURL.path ?? "",
 +                "executable": Bundle.main.executableURL?.standardizedFileURL.path ?? "",
 +            ],
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WindowManagement.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WindowManagement.swift
+index 352c7b8..4daffdb 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WindowManagement.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/WindowManagement.swift
+@@ -269,3 +269 @@ enum WindowDirectory {
+-        if let bundleIdentifier = descriptor.bundleIdentifier, AppSafetyPolicy.isBlocked(bundleIdentifier: bundleIdentifier) {
+-            throw AppSafetyPolicy.permissionDenied(bundleIdentifier: bundleIdentifier)
+-        }
++        try AppSafetyPolicy.requireAllowed(bundleIdentifier: descriptor.bundleIdentifier)
 diff --git a/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
 new file mode 100644
-index 0000000..ab2f834
+index 0000000..1fb71f6
 --- /dev/null
 +++ b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,151 @@
 +import Foundation
++import AppKit
 +@testable import OpenComputerUseKit
 +
 +struct LeaseSmokeFailure: Error {
@@ -856,6 +1026,73 @@ index 0000000..ab2f834
 +// that is still owned. Both test leases are released before successful cleanup.
 +try FileManager.default.removeItem(at: directory)
 +print("Passed native cache/identity and in-process lease smoke; no GUI actions dispatched.")
++
++// Scope decisions use synthetic identities. No application state or GUI input.
++let scopeKey = ApplicationScope.environmentKey
++let absentScope = try ApplicationScope(environment: [:])
++try require(absentScope.permits(nil), "unconfigured scope preserves legacy unknown identities")
++let emptyScope = try ApplicationScope(environment: [scopeKey: "[]"])
++try require(emptyScope.deniesAll && !emptyScope.permits(nil) && !emptyScope.permits("com.example.allowed"), "empty scope denies every app")
++let allowScope = try ApplicationScope(environment: [scopeKey: "[\"com.example.Allowed\"]"])
++try require(allowScope.permits("COM.EXAMPLE.ALLOWED") && !allowScope.permits("com.example.allowed.other"), "bundle matching is exact and normalized")
++for invalid in ["", "{}", "null", "[1]", "[true]", "[\"*\"]", "[\"com..app\"]", "[\" com.example.app\"]", "[\"com.example/app\"]", String(repeating: " ", count: 65537)] {
++    var denied = false
++    do { _ = try ApplicationScope(environment: [scopeKey: invalid]) } catch { denied = true }
++    try require(denied, "malformed application policy must fail closed")
++}
++var displayDenied = false
++do { try allowScope.requireUnrestrictedDisplay() } catch { displayDenied = true }
++try require(displayDenied, "scoped requests cannot capture unrelated apps on a display")
++try require(!globalPointerFallbacksEnabled(environment: [scopeKey: "[]", "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "1"]), "app scope overrides global pointer opt-in")
++let previousScope = ProcessInfo.processInfo.environment[scopeKey]
++setenv(scopeKey, "[\"com.example.allowed\",\"com.1password.1password\"]", 1)
++try require(!AppSafetyPolicy.isBlocked(bundleIdentifier: "com.example.allowed"), "explicitly allowed app remains available")
++try require(AppSafetyPolicy.isBlocked(bundleIdentifier: "com.1password.1password"), "scope cannot override the existing password-manager deny policy")
++try require(AppSafetyPolicy.isBlocked(bundleIdentifier: nil), "unknown resolved bundle is denied when scoped")
++setenv(scopeKey, "[]", 1)
++var tightened = false
++do { try AppSafetyPolicy.requireAllowed(bundleIdentifier: "com.example.allowed") } catch { tightened = true }
++try require(tightened, "a previously allowed cached identity is checked against the current scope")
++let scopedService = ComputerUseService()
++try require(scopedService.listApps().asDictionary["isError"] as? Bool != true, "empty app catalog is not a permission grant")
++var captureDenied = false
++do { _ = try scopedService.captureDisplay(displayID: nil) } catch { captureDenied = true }
++try require(captureDenied, "service refuses full display capture before invoking capture API")
++let emptyApps = scopedService.listApps().asDictionary["content"] as? [[String: Any]]
++try require(emptyApps?.first?["text"] as? String == "", "deny-all catalog does not leak app metadata")
++let emptyWindows = try scopedService.listWindows().asDictionary["content"] as? [[String: Any]]
++try require(emptyWindows?.first?["text"] as? String == "[]", "deny-all window catalog stays empty")
++setenv(scopeKey, "[\"com.example.allowed\"]", 1)
++let ownProcess = NSRunningApplication.current
++let entry = CGWindowEntry(windowID: 777, ownerPID: getpid(), layer: 0, bounds: bounds, title: "synthetic", frontToBackIndex: 0)
++for identifier: String? in [nil, "com.example.denied", "com.example.allowed"] {
++    let descriptor = RunningAppDescriptor(name: "synthetic", bundleIdentifier: identifier, pid: getpid(), runningApplication: ownProcess)
++    var identityRead = false
++    var denied = false
++    do {
++        _ = try WindowDirectory.resolve(id: 777, entries: [entry], runningApps: [descriptor], identity: { _, _ in
++            identityRead = true
++            return .confirmed
++        })
++    } catch {
++        denied = true
++        try require(!String(describing: error).contains("com.example.denied"), "refusal cannot disclose an unallowed resolved identity")
++    }
++    let permitted = identifier == "com.example.allowed"
++    try require(identityRead == permitted && denied != permitted, "resolved identity is enforced before any AX liveness read")
++}
++let cachedApp = RunningAppDescriptor(name: "synthetic", bundleIdentifier: "com.example.allowed", pid: getpid(), runningApplication: ownProcess)
++let cachedSnapshot = AppSnapshot(app: cachedApp, windowTitle: nil, windowBounds: bounds,
++    targetWindowID: 777, targetWindowLayer: 0, screenshotPNGData: nil, mode: .accessibility,
++    treeLines: [], focusedSummary: nil, focusedElement: nil, selectedText: nil, elements: [:])
++scopedService.cacheWindowSnapshot(cachedSnapshot, windowID: 777)
++_ = try scopedService.windowSnapshot(for: 777)
++setenv(scopeKey, "[]", 1)
++var staleScopeDenied = false
++do { _ = try scopedService.windowSnapshot(for: 777) } catch { staleScopeDenied = true }
++try require(staleScopeDenied, "the actual cached snapshot reader rejects tightened app scope")
++if let previousScope { setenv(scopeKey, previousScope, 1) } else { unsetenv(scopeKey) }
++print("Passed native application-scope parsing/identity/deny/cache/global-capture checks; no GUI actions.")
 diff --git a/tests/AppAgentNamespaceSmoke/main.swift b/tests/AppAgentNamespaceSmoke/main.swift
 new file mode 100644
 index 0000000..047d64b
