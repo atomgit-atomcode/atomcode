@@ -8044,3 +8044,45 @@ async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_sessi
     drop(keep_clock);
     let _ = external_io.await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn runtime_shutdown_awaits_mcp_eof_cleanup_before_its_terminal() {
+    let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+    let clock = tokio::task::spawn_blocking(move || {
+        let _ = release_clock.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let script = write_mcp_server(scratch.path(), &scratch.path().join("spawns"));
+    let marker = scratch.path().join("disposed");
+    let text = std::fs::read_to_string(&script).unwrap()
+        + "\nprintf disposed > \"$ATOMCODE_TEST_MCP_DISPOSED\"\n";
+    std::fs::write(&script, text).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { env, .. } =
+        &mut input.prepare.extra_mcp_servers[0].config
+    {
+        env.insert(
+            "ATOMCODE_TEST_MCP_DISPOSED".into(),
+            marker.to_string_lossy().into_owned(),
+        );
+    }
+    tokio::time::resume();
+    let runtime = CodingRuntime::start(input).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    runtime.handle.shutdown().await.unwrap();
+    assert!(
+        marker.exists(),
+        "runtime shutdown returns only after the owned MCP server observed EOF and disposed"
+    );
+    drop(keep_clock);
+    clock.await.unwrap();
+}

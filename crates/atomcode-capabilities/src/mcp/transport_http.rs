@@ -47,6 +47,8 @@ pub struct HttpClient {
     status: Arc<Mutex<ServerStatus>>,
     next_id: AtomicU64,
     abandoned_request: Arc<AtomicU64>,
+    closing: tokio_util::sync::CancellationToken,
+    shutdown_lock: Mutex<()>,
     client: reqwest::Client,
     /// Streamable-HTTP session id. Stateful servers (e.g. Figma Dev Mode) return
     /// `Mcp-Session-Id` on the `initialize` response and REJECT later requests that
@@ -86,6 +88,8 @@ impl HttpClient {
             status: Arc::new(Mutex::new(ServerStatus::Disconnected)),
             next_id: AtomicU64::new(1),
             abandoned_request: Arc::new(AtomicU64::new(0)),
+            closing: tokio_util::sync::CancellationToken::new(),
+            shutdown_lock: Mutex::new(()),
             client,
             session_id: Arc::new(Mutex::new(None)),
             negotiated_version: Arc::new(Mutex::new(None)),
@@ -125,6 +129,18 @@ impl HttpClient {
 
     /// Send a request and wait for response.
     async fn send_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => bail!("MCP transport is shut down"),
+            result = self.send_open_request(method, params) => result,
+        }
+    }
+
+    async fn send_open_request(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
@@ -538,11 +554,32 @@ impl McpClient for HttpClient {
         serde_json::from_value(result).context("Failed to parse tools/call result")
     }
 
+    async fn shutdown(&self) {
+        self.closing.cancel();
+        let _shutdown = self.shutdown_lock.lock().await;
+        let session = self.session_id.lock().await.take();
+        if let Some(session) = session {
+            let version = self.negotiated_version.lock().await.clone();
+            delete_http_session(
+                self.client.clone(),
+                self.url.clone(),
+                self.headers.clone(),
+                session,
+                version,
+            )
+            .await;
+        }
+        *self.status.lock().await = ServerStatus::Disconnected;
+    }
+
     fn server_name(&self) -> &str {
         &self.server_name
     }
 
     fn status(&self) -> ServerStatus {
+        if self.closing.is_cancelled() {
+            return ServerStatus::Disconnected;
+        }
         if self.abandoned_request.load(Ordering::SeqCst) != 0 {
             return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
         }
@@ -856,6 +893,81 @@ mod session_tests {
         server.abort();
         drop(keep_clock);
         let _ = clock.await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_awaits_one_owned_session_delete_and_rejects_stale_calls() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || {
+            let _ = release_clock.recv_timeout(Duration::from_secs(10));
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server = {
+            let observed = observed.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("DELETE "));
+                loop {
+                    line.clear();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                observed.notify_one();
+                release.notified().await;
+                stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            })
+        };
+        let client = Arc::new(HttpClient::new(
+            "owned".into(),
+            url,
+            BTreeMap::new(),
+            None,
+            None,
+            McpTokenStore::new("/nonexistent/mcp_auth.toml".into()),
+        ));
+        *client.session_id.lock().await = Some("owned-session".into());
+        let first = {
+            let client = client.clone();
+            tokio::spawn(async move { client.shutdown().await })
+        };
+        observed.notified().await;
+        let second = {
+            let client = client.clone();
+            tokio::spawn(async move { client.shutdown().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        assert!(client
+            .call_tool("any", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shut down"));
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        server.await.unwrap();
+        assert!(
+            client.session_id().await.is_none(),
+            "Drop must not delete the same session again"
+        );
+        assert!(matches!(client.status(), ServerStatus::Disconnected));
+        drop(keep_clock);
+        clock.await.unwrap();
     }
 
     fn client() -> HttpClient {

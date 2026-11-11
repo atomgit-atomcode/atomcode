@@ -47,20 +47,20 @@ fn element_ref(snapshot: &str, label: &str) -> String {
 #[tokio::test]
 #[ignore = "requires an explicitly installed @playwright/mcp 0.0.85 and Chrome; local acceptance only"]
 async fn real_browser_navigates_fills_submits_and_returns_inline_screenshot() {
-    acceptance(false, false).await;
+    acceptance(false, false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires an explicitly installed browser backend and Chrome; fault injection acceptance"]
 async fn real_submitted_browser_click_is_not_replayed_after_its_response_is_lost() {
-    acceptance(true, false).await;
+    acceptance(true, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires installed browser backend and Chrome; verifies owned process disposal"]
 async fn real_browser_registry_drop_disposes_its_owned_browser_processes() {
-    acceptance(false, true).await;
+    acceptance(false, true, false).await;
 }
 
 #[cfg(unix)]
@@ -105,7 +105,14 @@ async fn owned_process_tree(root: u32) -> Vec<u32> {
     owned
 }
 
-async fn acceptance(drop_response: bool, verify_disposal: bool) {
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires installed browser backend and Chrome; awaited shutdown acceptance"]
+async fn real_browser_shutdown_disposes_before_return_and_fences_stale_adapters() {
+    acceptance(false, true, true).await;
+}
+
+async fn acceptance(drop_response: bool, verify_disposal: bool, await_shutdown: bool) {
     let server = std::env::var_os("ATOMCODE_BROWSER_TEST_SERVER")
         .expect("set explicit installed cli.js path");
     let temp = tempfile::tempdir().unwrap();
@@ -323,6 +330,13 @@ process.on('SIGTERM',()=>{{child.kill();process.exit(0);}});
                 .parse()
                 .unwrap();
             let owned = owned_process_tree(pid).await;
+            if await_shutdown {
+                registry.shutdown().await;
+                let stale = click
+                    .execute(&json!({"target":submit_ref}).to_string(), &ctx)
+                    .await;
+                assert!(stale.is_error && stale.content.contains("shut down"));
+            }
             drop(click); // The adapter also holds the registry.
             drop(registry);
             let began = std::time::Instant::now();
@@ -343,6 +357,10 @@ process.on('SIGTERM',()=>{{child.kill();process.exit(0);}});
                 if alive.is_empty() {
                     break;
                 }
+                assert!(
+                    !await_shutdown,
+                    "owned processes still alive after awaited shutdown returned: {alive:?}"
+                );
                 assert!(
                     began.elapsed() < std::time::Duration::from_secs(5),
                     "owned process IDs still alive after bounded disposal: {alive:?}"

@@ -490,6 +490,19 @@ impl StdioClient {
         params: Option<serde_json::Value>,
         retry_after_send: bool,
     ) -> Result<serde_json::Value> {
+        tokio::select! {
+            biased;
+            _ = self.recovery_cancel.cancelled() => anyhow::bail!("MCP transport is shut down"),
+            result = self.send_request_with_reconnect_open(method, params, retry_after_send) => result,
+        }
+    }
+
+    async fn send_request_with_reconnect_open(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        retry_after_send: bool,
+    ) -> Result<serde_json::Value> {
         let _operation = self.operation_lock.lock().await;
         if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
             anyhow::bail!(CANCELLED_TOOL_REQUEST);
@@ -551,7 +564,12 @@ impl StdioClient {
 impl McpClient for StdioClient {
     async fn initialize(&mut self) -> Result<InitializeResult> {
         let _reconnect = self.reconnect_lock.lock().await;
-        match self.initialize_connection().await {
+        let initialized = tokio::select! {
+            biased;
+            _ = self.recovery_cancel.cancelled() => anyhow::bail!("MCP transport is shut down"),
+            result = self.initialize_connection() => result,
+        };
+        match initialized {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.mark_failed(format!("stdio initialize failed: {error:#}"))
@@ -584,11 +602,33 @@ impl McpClient for StdioClient {
         serde_json::from_value(result).context("Failed to parse tools/call result")
     }
 
+    async fn shutdown(&self) {
+        self.recovery_cancel.cancel();
+        let settled = async {
+            loop {
+                let notified = self.recovery_notify.notified();
+                if !self.recovery_in_progress.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(4), settled).await;
+        // Recovery relinquishes any in-progress replacement before we take the
+        // same transport lock. No replacement may start after cancellation.
+        let _reconnect = self.reconnect_lock.lock().await;
+        self.clear_transport().await;
+        *self.status.lock().await = ServerStatus::Disconnected;
+    }
+
     fn server_name(&self) -> &str {
         &self.server_name
     }
 
     fn status(&self) -> ServerStatus {
+        if self.recovery_cancel.is_cancelled() {
+            return ServerStatus::Disconnected;
+        }
         if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
             return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
         }

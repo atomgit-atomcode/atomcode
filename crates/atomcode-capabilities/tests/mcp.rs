@@ -1311,3 +1311,145 @@ async fn cancelled_http_request_cannot_be_unpoisoned_by_a_late_response() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shutdown_awaits_unpublished_candidates_and_fences_late_connections() {
+    let _clock = ExternalIoClock::hold();
+    for (background, forced_drop) in [(false, false), (true, false), (false, true)] {
+        let scratch = tempfile::tempdir().unwrap();
+        let began = scratch.path().join("initializing");
+        let gate = scratch.path().join("release");
+        let mut config = test_server_config_with_env(
+            "shutdown",
+            BTreeMap::from([
+                (
+                    "MCP_TEST_INITIALIZE_STARTED".into(),
+                    began.to_string_lossy().into_owned(),
+                ),
+                (
+                    "MCP_TEST_INITIALIZE_GATE".into(),
+                    gate.to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        config.source = McpConfigSource::Driver;
+        let registry = if background {
+            McpRegistry::from_config_background_with_extra(
+                scratch.path(),
+                scratch.path(),
+                None,
+                vec![config.clone()],
+            )
+            .share()
+        } else {
+            McpRegistry::new(NO_TREE).share()
+        };
+        tokio::time::resume(); // external startup idle-drain
+        let mut adding = if background {
+            None
+        } else {
+            let registry = registry.clone();
+            Some(tokio::spawn(
+                async move { registry.add_server(config).await },
+            ))
+        };
+        wait_for_tool_counter(began, 1).await;
+        tokio::time::pause();
+        if forced_drop {
+            let adding = adding.take().unwrap();
+            adding.abort();
+            assert!(adding.await.unwrap_err().is_cancelled());
+        }
+        if background {
+            registry.cancel_pending_work();
+            assert!(
+                registry
+                    .wait_for_initial_connections(Duration::from_secs(1))
+                    .await,
+                "cancelled startup reports completion before asynchronous resource cleanup"
+            );
+        }
+        let closing = registry.shutdown();
+        tokio::pin!(closing);
+        assert!(
+            futures::poll!(closing.as_mut()).is_pending(),
+            "shutdown starts its fence and awaits unpublished candidate cleanup"
+        );
+        assert!(registry
+            .call_tool("shutdown", "echo", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shut down"));
+        std::fs::write(gate, "release").unwrap();
+        closing.await;
+        if let Some(adding) = adding {
+            assert!(adding.await.unwrap().is_err());
+        }
+        registry.shutdown().await;
+        assert!(registry.listed_tools().is_empty());
+        assert!(registry.list_all_tools().await.is_empty());
+        assert!(registry
+            .add_server(test_server_config("late"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shut down"));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn aborted_replacement_keeps_old_transport_cleanup_inside_shutdown_barrier() {
+    let _clock = ExternalIoClock::hold();
+    for reconnect in [false, true] {
+        let scratch = tempfile::tempdir().unwrap();
+        let eof = scratch.path().join("eof");
+        let disposed = scratch.path().join("disposed");
+        let gate = scratch.path().join("release");
+        let registry = McpRegistry::new(NO_TREE).share();
+        let old = test_server_config_with_env(
+            "replace",
+            BTreeMap::from([
+                (
+                    "MCP_TEST_EOF_STARTED".into(),
+                    eof.to_string_lossy().into_owned(),
+                ),
+                (
+                    "MCP_TEST_EOF_FINISHED".into(),
+                    disposed.to_string_lossy().into_owned(),
+                ),
+                (
+                    "MCP_TEST_EOF_GATE".into(),
+                    gate.to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        tokio::time::resume();
+        registry.add_server(old).await.unwrap();
+        let replacing = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let new = test_server_config("replace");
+                if reconnect {
+                    registry.reconnect_server(new).await
+                } else {
+                    registry.add_server(new).await
+                }
+            })
+        };
+        wait_for_tool_counter(eof, 1).await;
+        tokio::time::pause();
+        replacing.abort();
+        assert!(replacing.await.unwrap_err().is_cancelled());
+        let shutdown = registry.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            futures::poll!(shutdown.as_mut()).is_pending(),
+            "aborting a replacement does not abandon old transport disposal"
+        );
+        assert!(!disposed.exists());
+        std::fs::write(gate, "release").unwrap();
+        assert_eq!(shutdown.await, 0);
+        assert!(disposed.exists());
+    }
+}

@@ -24,7 +24,16 @@ fn main() -> io::Result<()> {
         }
         let request = match read_frame(&mut reader) {
             Ok(value) => value,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                append_event_from_env("MCP_TEST_EOF_STARTED", "eof")?;
+                if let Some(path) = std::env::var_os("MCP_TEST_EOF_GATE") {
+                    while !std::path::Path::new(&path).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+                append_event_from_env("MCP_TEST_EOF_FINISHED", "disposed")?;
+                return Ok(());
+            }
             Err(err) => return Err(err),
         };
 
@@ -35,6 +44,12 @@ fn main() -> io::Result<()> {
         let id = request.get("id").cloned();
         let response = match method {
             "initialize" => {
+                append_event_from_env("MCP_TEST_INITIALIZE_STARTED", "initialize")?;
+                if let Some(path) = std::env::var_os("MCP_TEST_INITIALIZE_GATE") {
+                    while !std::path::Path::new(&path).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
                 sleep_from_env_when_marker_exists(
                     "MCP_TEST_INITIALIZE_DELAY_MARKER",
                     "MCP_TEST_INITIALIZE_DELAY_MS",

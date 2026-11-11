@@ -11024,6 +11024,19 @@ fn spawn_runtime_owner_with_optional_agent(
         }
         drop(goal);
         drop(goal_checkpoints);
+        // Await transport cleanup while the owner and executor still exist.
+        // Releasing an Arc alone only schedules best-effort Drop cleanup.
+        if let Some(registry) = resources
+            .as_ref()
+            .and_then(|runtime| runtime.parts.mcp_registry.as_ref())
+        {
+            let timed_out = registry.shutdown().await;
+            if timed_out != 0 {
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                    "MCP cleanup exceeded its shutdown budget for {timed_out} server(s); external resources may still be running."
+                )));
+            }
+        }
         // Release the active-session lease before publishing the shutdown terminal,
         // so a caller may safely start a replacement immediately after `shutdown`.
         drop(resources);

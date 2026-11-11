@@ -33,6 +33,10 @@ pub trait McpClient: Send + Sync {
         arguments: serde_json::Value,
     ) -> Result<CallToolResult>;
 
+    /// Await transport-owned cleanup. Stateless test/custom clients need none.
+    /// Implementations must bound cleanup and must not invoke business tools.
+    async fn shutdown(&self) {}
+
     /// Get the server name.
     fn server_name(&self) -> &str;
 
