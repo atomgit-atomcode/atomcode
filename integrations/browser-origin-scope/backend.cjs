@@ -109,17 +109,24 @@ function ownedBrowser(chromium, origins, headed) {
     return cleanup;
   }
 
-  return { get, close, async stats() { return { ...(await current)?.proxy.stats }; } };
+  async function existing() {
+    const opening = current;
+    if (!opening || closing) throw new Error('No existing owned browser context');
+    const owned = await opening;
+    if (current !== opening || closing) throw new Error('Owned context was replaced or closed');
+    return owned.context;
+  }
+  return { get, close, existing, async stats() { return { ...(await current)?.proxy.stats }; } };
 }
 
 async function serve({ root, outputDir, origins, headed = false }) {
   const external = loadBackend(root);
   const files = prepareOutput(outputDir);
   const policy = policyDetails(origins);
-  const downloads = policy.downloads.size ? new ControlledDownloads({
-    files, authorize: origin => origins.has(origin) && policy.downloads.has(origin),
-  }) : undefined;
   const owner = ownedBrowser(external.chromium, origins, headed);
+  const downloads = policy.downloads.size ? new ControlledDownloads({
+    files, authorize: origin => origins.has(origin) && policy.downloads.has(origin), getContext: owner.existing,
+  }) : undefined;
   const closeOwned = permanent => {
     // Fence browser launches synchronously, before awaiting transfer teardown.
     const closing = owner.close(permanent);
@@ -171,7 +178,7 @@ async function main() {
   if (config.doctor) {
     console.log(JSON.stringify({ version: policyDetails(origins).version, kind: 'doctor', browser_launched: false,
       mcp: MCP_VERSION, playwright: CORE_VERSION, capability: CAPABILITY,
-      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny' }));
+      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny' }));
     return;
   }
   if (!config.outputDir) throw new Error('--output-dir is required');

@@ -292,3 +292,25 @@ test('download transport owns cancellation and its terminal without SDK dispatch
   inner.onmessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 99 } });
   assert.equal(delivered.length, 1);
 });
+
+test('existing context lookup never launches, reopens or adopts a disposed context', async () => {
+  const { ownedBrowser } = require('./backend.cjs');
+  let launches = 0;
+  const owner = ownedBrowser({ async launch() {
+    const context = { generation: ++launches };
+    return { async newContext() { return context; }, async close() {} };
+  } }, new Set(), false);
+  await assert.rejects(owner.existing());
+  assert.equal(launches, 0);
+  const first = await owner.get();
+  assert.equal(await owner.existing(), first);
+  await owner.close();
+  await assert.rejects(owner.existing());
+  assert.equal(launches, 1);
+  const next = await owner.get();
+  assert.notEqual(next, first);
+  assert.equal(await owner.existing(), next);
+  await owner.close(true);
+  await assert.rejects(owner.existing());
+  assert.equal(launches, 2);
+});

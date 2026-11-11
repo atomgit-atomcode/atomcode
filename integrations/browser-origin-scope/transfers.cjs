@@ -11,12 +11,13 @@ const { pipeline } = require('node:stream/promises');
 // Backend-owned publication boundary. Transport cancellation and shutdown
 // must drain jobs here before disposing the owned browser.
 class ControlledDownloads {
-  constructor({ files, authorize, maxBytes = 64 * 1024 * 1024, timeoutMs = 15000 }) {
+  constructor({ files, authorize, getContext, maxBytes = 64 * 1024 * 1024, timeoutMs = 15000 }) {
     if (!path.isAbsolute(files) || !Number.isSafeInteger(maxBytes) || maxBytes <= 0 ||
         !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || typeof authorize !== 'function')
       throw new Error('Invalid controlled download configuration');
     this.files = files;
     this.authorize = authorize;
+    this.getContext = getContext;
     this.maxBytes = maxBytes;
     this.timeoutMs = timeoutMs;
     this.jobs = new Map();
@@ -39,13 +40,14 @@ class ControlledDownloads {
   execute(id, args) {
     if (this.closed || this.draining || this.jobs.has(id)) return Promise.reject(new Error('Download unavailable'));
     if (!args || typeof args !== 'object' || Array.isArray(args) ||
-        Object.keys(args).length !== 1 || !Object.hasOwn(args, 'url'))
+        Object.keys(args).some(key => !['url', 'use_browser_context'].includes(key)) ||
+        !Object.hasOwn(args, 'url') || (Object.hasOwn(args, 'use_browser_context') && typeof args.use_browser_context !== 'boolean'))
       return Promise.reject(new Error('Expected only a download URL'));
     const controller = new AbortController();
     const job = { controller };
     this.jobs.set(id, job);
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    job.promise = this.transfer(args.url, controller.signal).finally(() => {
+    job.promise = this.transfer(args.url, controller.signal, args.use_browser_context === true).finally(() => {
       clearTimeout(timer);
       this.jobs.delete(id);
     });
@@ -80,20 +82,31 @@ class ControlledDownloads {
     return url;
   }
 
-  async transfer(value, signal) {
+  async transfer(value, signal, authenticated) {
     let temporary;
     let handle;
     let response;
     try {
       let url = this.permitted(value);
+      // Capture one existing context; never launch or adopt a replacement.
+      const context = authenticated ? await abortable(() => this.getContext?.(), signal) : undefined;
+      signal.throwIfAborted();
+      if (authenticated && !context) throw new Error('No owned browser context');
       const visited = new Set();
       for (let hop = 0; ; hop++) {
         signal.throwIfAborted();
         if (hop > 10 || visited.has(url.href)) throw new Error('Download redirect limit');
         visited.add(url.href);
+        const headers = { 'Accept-Encoding': 'identity' };
+        if (context) {
+          const cookies = await abortable(() => context.cookies(url.href), signal);
+          signal.throwIfAborted();
+          const cookie = cookieHeader(cookies, url);
+          if (cookie) headers.Cookie = cookie;
+        }
         response = await new Promise((resolve, reject) => {
           const request = (url.protocol === 'https:' ? https : http).get(url, {
-            agent: false, signal, headers: { 'Accept-Encoding': 'identity' },
+            agent: false, signal, headers, rejectUnauthorized: true,
           }, resolve);
           request.once('error', reject);
         });
@@ -151,4 +164,45 @@ class ControlledDownloads {
   }
 }
 
-module.exports = { ControlledDownloads };
+// A cancelled metadata read must not hold transfer shutdown open. The original
+// SDK promise stays observed, and its late value cannot resume dispatch.
+function abortable(read, signal) {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(new Error('Download cancelled'));
+    signal.addEventListener('abort', aborted, { once: true });
+    Promise.resolve().then(() => { signal.throwIfAborted(); return read(); }).then(resolve, reject)
+      .finally(() => signal.removeEventListener('abort', aborted));
+  });
+}
+
+// BrowserContext.cookies(url) already scopes cookies. Recheck before building
+// a header, and never infer the top-level partition for CHIPS cookies.
+function cookieHeader(cookies, url, now = Date.now() / 1000) {
+  if (!Array.isArray(cookies)) throw new Error('Invalid browser cookie response');
+  const applicable = cookies.filter(cookie => {
+    if (!cookie || typeof cookie.domain !== 'string' || typeof cookie.path !== 'string') return false;
+    const domain = cookie.domain.toLowerCase();
+    const host = url.hostname.toLowerCase();
+    const domainMatches = domain.startsWith('.') ? host === domain.slice(1) || host.endsWith(domain) : host === domain;
+    return domainMatches && cookie.path.startsWith('/') &&
+      (url.pathname === cookie.path || url.pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : cookie.path + '/')) &&
+      (!cookie.secure || url.protocol === 'https:') &&
+      (cookie.expires === -1 || (typeof cookie.expires === 'number' && cookie.expires > now)) &&
+      cookie.partitionKey === undefined;
+  });
+  // Most specific paths first, retaining the browser's order for ties.
+  applicable.sort((a, b) => b.path.length - a.path.length);
+  const values = applicable.map(cookie => {
+    if (typeof cookie.name !== 'string' || typeof cookie.value !== 'string' ||
+        !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(cookie.name) ||
+        !/^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*$/.test(cookie.value))
+      throw new Error('Unsupported browser cookie encoding');
+    return cookie.name + '=' + cookie.value;
+  });
+  const result = values.join('; ');
+  if (Buffer.byteLength(result) > 16384) throw new Error('Browser cookie header exceeds limit');
+  return result;
+}
+
+module.exports = { ControlledDownloads, cookieHeader };

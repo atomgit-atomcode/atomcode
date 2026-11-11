@@ -67,8 +67,8 @@ function parseTransferPolicy(policy) {
 
 const DOWNLOAD_TOOL = {
   name: 'browser_download',
-  description: 'Download an explicit HTTP(S) URL using the backend controlled publisher. Requires access and download grants at every redirect. This initial tool is unauthenticated: browser cookies and caller headers are not forwarded. Browser implicit downloads remain disabled. Use this tool initially for a known download link; never automatically retry an uncertain or previously dispatched download. Returns a generated artifact path, byte count and SHA-256; no caller filename, blob URL, upload or CDP access.',
-  inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'], additionalProperties: false },
+  description: 'Download an explicit HTTP(S) URL using the backend controlled publisher. Requires access and download grants at every redirect. Default is unauthenticated. Set use_browser_context:true explicitly to read cookies from the existing owned isolated browser; login there first. Cookies are scoped anew for every target, never imported from a personal profile, returned as metadata, or forwarded across unrelated hosts. Response Set-Cookie is not applied back to the browser; partitioned cookies and HTTP Authorization authentication are unsupported. Cookie/auth failures must not be retried automatically. Browser implicit downloads remain disabled. Use this tool initially for a known download link; never automatically retry an uncertain or previously dispatched download. Returns a generated artifact path, byte count and SHA-256; no caller filename, blob URL, upload or CDP access.',
+  inputSchema: { type: 'object', properties: { url: { type: 'string' }, use_browser_context: { type: 'boolean', default: false, description: 'Explicitly use existing isolated browser cookies; no personal profile or response cookie synchronization.' } }, required: ['url'], additionalProperties: false },
   annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: true },
 };
 
