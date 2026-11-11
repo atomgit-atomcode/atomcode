@@ -1,0 +1,298 @@
+diff --git a/Package.swift b/Package.swift
+index 2316014..a8d6b5d 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -1 +1 @@
+-// swift-tools-version: 6.2
++// swift-tools-version: 6.1
+@@ -18,0 +19,4 @@ let package = Package(
++        .executable(
++            name: "OpenComputerUseLeaseSmoke",
++            targets: ["OpenComputerUseLeaseSmoke"]
++        ),
+@@ -47,0 +52,5 @@ let package = Package(
++        .executableTarget(
++            name: "OpenComputerUseLeaseSmoke",
++            dependencies: ["OpenComputerUseKit"],
++            path: "packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke"
++        ),
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+index 9d96b02..7c57981 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
+@@ -456,0 +457 @@ public final class ComputerUseService {
++    var requiresExplicitTurnObservations = false
+@@ -470,0 +472,8 @@ public final class ComputerUseService {
++    // A matching host-turn release invalidates observations, but must not reset
++    // the screenshot sequence and accidentally reissue a prior owner's IDs.
++    func clearTurnObservations() {
++        snapshotsByApp.removeAll()
++        snapshotCacheOrder.removeAll()
++        windowScreenshotMeta.removeAll()
++    }
++
+@@ -1546,0 +1556,3 @@ public final class ComputerUseService {
++        if requiresExplicitTurnObservations {
++            throw ComputerUseError.message("No app state is available for this turn. Observe the selected target before action tools.")
++        }
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
+index d15220f..b3bf497 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
+@@ -60,0 +61,8 @@ public final class ComputerUseToolDispatcher {
++    func requireExplicitTurnObservations() {
++        service.requiresExplicitTurnObservations = true
++    }
++
++    func clearTurnObservations() {
++        service.clearTurnObservations()
++    }
++
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DesktopTurnLease.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DesktopTurnLease.swift
+new file mode 100644
+index 0000000..b57c25e
+--- /dev/null
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DesktopTurnLease.swift
+@@ -0,0 +1,94 @@
++import Darwin
++import Foundation
++
++/// Cooperative desktop ownership belongs to the executing connection, not its
++/// stdio proxy. In the App agent, connection teardown occurs after accepted
++/// work finishes, even when the proxy disappeared during that work.
++final class DesktopTurnLease {
++    private let mutex = NSLock()
++    private var descriptor: Int32 = -1
++    private var owner: String?
++
++    func acquire(owner requested: String) throws {
++        try validate(requested)
++        mutex.lock()
++        defer { mutex.unlock() }
++        if let owner {
++            guard owner == requested else { throw busy() }
++            return
++        }
++        let directory = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_TURN_LEASE_DIRECTORY"]
++            ?? "/tmp/open-computer-use-turn-\(getuid())"
++        guard directory.hasPrefix("/"), !directory.utf8.contains(0) else {
++            throw ComputerUseError.message("Desktop lease directory must be an absolute local path.")
++        }
++        if mkdir(directory, mode_t(0o700)) != 0 && errno != EEXIST {
++            throw ComputerUseError.message("Cannot create the private desktop lease directory.")
++        }
++        var directoryInfo = stat()
++        guard lstat(directory, &directoryInfo) == 0,
++              directoryInfo.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
++              directoryInfo.st_uid == getuid(),
++              directoryInfo.st_mode & mode_t(0o077) == 0 else {
++            throw ComputerUseError.message("Desktop lease directory must be private, owned by this user, and not a symlink.")
++        }
++        let path = (directory as NSString).appendingPathComponent("desktop.lock")
++        let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
++        guard fd >= 0 else { throw ComputerUseError.message("Cannot open the desktop lease file.") }
++        var fileInfo = stat()
++        guard fstat(fd, &fileInfo) == 0,
++              fileInfo.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
++              fileInfo.st_uid == getuid(),
++              fileInfo.st_mode & mode_t(0o077) == 0,
++              fileInfo.st_nlink == 1 else {
++            close(fd)
++            throw ComputerUseError.message("Desktop lease file must be a private regular file owned by this user.")
++        }
++        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
++            let failure = errno
++            close(fd)
++            if failure == EWOULDBLOCK || failure == EAGAIN { throw busy() }
++            throw ComputerUseError.message("Cannot acquire the desktop lease.")
++        }
++        descriptor = fd
++        owner = requested
++    }
++
++    func require(owner requested: String) throws {
++        try validate(requested)
++        mutex.lock()
++        defer { mutex.unlock() }
++        guard owner == requested, descriptor >= 0 else {
++            throw ComputerUseError.message("This desktop call does not own the current turn lease. The host must acquire it before dispatch.")
++        }
++    }
++
++    /// A stale or different owner cannot release an active turn.
++    @discardableResult
++    func release(owner requested: String) throws -> Bool {
++        try validate(requested)
++        mutex.lock()
++        defer { mutex.unlock() }
++        guard let owner else { return false }
++        guard owner == requested else { throw busy() }
++        close(descriptor)
++        descriptor = -1
++        self.owner = nil
++        return true
++    }
++
++    private func validate(_ owner: String) throws {
++        guard !owner.isEmpty, owner.utf8.count <= 512, !owner.utf8.contains(0) else {
++            throw ComputerUseError.message("A bounded, nonempty host turn scope is required.")
++        }
++    }
++
++    private func busy() -> ComputerUseError {
++        .message("Desktop is busy with another turn. Retry after that turn finishes; do not bypass the lease.")
++    }
++
++    deinit {
++        if descriptor >= 0 { close(descriptor) }
++        // Never unlink the lock file: waiters must keep using the same inode.
++    }
++}
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DisplayCapture.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DisplayCapture.swift
+index 22e61f1..cacb89e 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DisplayCapture.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/DisplayCapture.swift
+@@ -9 +9 @@ import ScreenCaptureKit
+-public enum DisplayCaptureErrorCode: String {
++public enum DisplayCaptureErrorCode: String, Sendable {
+@@ -34 +34 @@ public struct DisplayCaptureError: Error {
+-public struct AvailableDisplay: Equatable {
++public struct AvailableDisplay: Equatable, Sendable {
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift
+index 52c236c..8caeeb3 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/MCPServer.swift
+@@ -8 +8 @@ Some apps might have a separate dedicated plugin or skill. You may want to use t
+-Begin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. Codex will automatically stop the session after each assistant turn, so this step is required before interacting with apps in a new assistant turn.
++Begin each new turn with a fresh observation of the selected target. For window actions, use `get_window_state` and keep that window descriptor and screenshot identity. A host that negotiates desktop turn leases manages acquisition and addressed release outside the model tool catalog; release clears the prior observation cache. A busy lease is not permission to bypass the host through another automation path. Clients that do not negotiate leases do not gain this cooperative isolation.
+@@ -21,0 +22,2 @@ public final class StdioMCPServer {
++    private let desktopTurnLease = DesktopTurnLease()
++    private var hostTurnScopes = false
+@@ -50,0 +53,13 @@ public final class StdioMCPServer {
++                let capabilities = params["capabilities"] as? [String: Any] ?? [:]
++                let experimental = capabilities["experimental"] as? [String: Any] ?? [:]
++                if let declaration = experimental["atomcode/turn-scopes"] {
++                    guard let scopes = declaration as? [String: Any],
++                          let version = scopes["version"] as? NSNumber,
++                          CFGetTypeID(version) != CFBooleanGetTypeID(),
++                          version.stringValue == "1" else {
++                        return try encodeJSONRPCError(id: id, code: -32602, message: "Unsupported host turn scope protocol")
++                    }
++                    // A second initialize may not downgrade a scoped connection.
++                    hostTurnScopes = true
++                    dispatcher.requireExplicitTurnObservations()
++                }
+@@ -62,0 +78 @@ public final class StdioMCPServer {
++                            "experimental": ["atomcode/desktop-turn-lease": ["version": 1]],
+@@ -69,0 +86,4 @@ public final class StdioMCPServer {
++                if hostTurnScopes {
++                    // The unaddressed legacy broadcast is not a lease release.
++                    return nil
++                }
+@@ -73,0 +94,16 @@ public final class StdioMCPServer {
++            case "atomcode/desktop/acquire":
++                guard hostTurnScopes else {
++                    return try encodeJSONRPCError(id: id, code: -32601, message: "Turn scope protocol was not negotiated")
++                }
++                try desktopTurnLease.acquire(owner: try hostScope(params))
++                return try encodeJSONRPCResult(id: id, result: ["acquired": true])
++            case "atomcode/desktop/release":
++                guard hostTurnScopes else {
++                    return try encodeJSONRPCError(id: id, code: -32601, message: "Turn scope protocol was not negotiated")
++                }
++                let released = try desktopTurnLease.release(owner: try hostScope(params))
++                if released {
++                    // A new scope may not act using the prior owner's observations.
++                    dispatcher.clearTurnObservations()
++                }
++                return try encodeJSONRPCResult(id: id, result: ["released": released])
+@@ -83,0 +120 @@ public final class StdioMCPServer {
++                if hostTurnScopes { try desktopTurnLease.require(owner: try hostScope(params)) }
+@@ -121,0 +159,8 @@ public final class StdioMCPServer {
++    private func hostScope(_ params: [String: Any]) throws -> String {
++        let metadata = params["_meta"] as? [String: Any] ?? [:]
++        guard let scope = metadata["atomcode/turn"] as? String else {
++            throw ComputerUseError.message("Missing host-generated desktop turn scope metadata.")
++        }
++        return scope
++    }
++
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
+index 3d377b0..b9f5a5f 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/Permissions.swift
+@@ -137,0 +138 @@ public struct SilentPermissionReport: Sendable {
++            "capabilities": ["desktop_turn_lease": ["version": 1]],
+diff --git a/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
+new file mode 100644
+index 0000000..45e9496
+--- /dev/null
++++ b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
+@@ -0,0 +1,67 @@
++import Foundation
++@testable import OpenComputerUseKit
++
++struct LeaseSmokeFailure: Error {
++    let message: String
++}
++func require(_ condition: Bool, _ message: String) throws {
++    if !condition { throw LeaseSmokeFailure(message: message) }
++}
++
++// Synthetic observation metadata exercises the actual production cache gate;
++// no accessibility, screen capture, application query or input is requested.
++let service = ComputerUseService()
++let bounds = CGRect(x: 0, y: 0, width: 200, height: 100)
++let first = service.issueWindowScreenshotID(windowID: 7, hasImage: true, bounds: bounds,
++                                           screenshotPixelSize: CGSize(width: 200, height: 100))
++try require(first != nil, "a synthetic observation must have an identity")
++try service.checkScreenshotID(first, windowID: 7)
++service.clearTurnObservations()
++var refused = false
++do { try service.checkScreenshotID(first, windowID: 7) } catch { refused = true }
++try require(refused, "release must invalidate the old observation")
++let next = service.issueWindowScreenshotID(windowID: 7, hasImage: true, bounds: bounds,
++                                          screenshotPixelSize: CGSize(width: 200, height: 100))
++try require(first != next, "a released turn must not reissue old screenshot identities")
++try service.checkScreenshotID(next, windowID: 7)
++refused = false
++do { try service.checkScreenshotID(first, windowID: 7) } catch { refused = true }
++try require(refused, "the prior identity stays stale after a new observation")
++
++service.requiresExplicitTurnObservations = true
++var freshObservationRequired = false
++do {
++    _ = try service.click(app: "atomcode-absent-\(UUID().uuidString)", elementIndex: "0",
++                          x: nil, y: nil, clickCount: 1, mouseButton: "left", clickMethod: .accessibility)
++} catch ComputerUseError.message(let message) {
++    freshObservationRequired = message.hasPrefix("No app state is available for this turn.")
++}
++try require(freshObservationRequired, "scoped legacy app actions must not silently refresh and use stale indices")
++
++let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ocu-lease-smoke-\(UUID().uuidString)")
++let previous = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_TURN_LEASE_DIRECTORY"]
++setenv("OPEN_COMPUTER_USE_TURN_LEASE_DIRECTORY", directory.path, 1)
++defer {
++    if let previous { setenv("OPEN_COMPUTER_USE_TURN_LEASE_DIRECTORY", previous, 1) }
++    else { unsetenv("OPEN_COMPUTER_USE_TURN_LEASE_DIRECTORY") }
++}
++let a = DesktopTurnLease()
++let b = DesktopTurnLease()
++try a.acquire(owner: "scope-a")
++try a.acquire(owner: "scope-a")
++try a.require(owner: "scope-a")
++refused = false
++do { try b.acquire(owner: "scope-b") } catch { refused = true }
++try require(refused, "another object in the same process cannot bypass the OS lease")
++refused = false
++do { try a.release(owner: "stale-scope") } catch { refused = true }
++try require(refused, "a stale owner cannot release a live scope")
++try a.require(owner: "scope-a")
++try require(try a.release(owner: "scope-a"), "matching release must succeed")
++try b.acquire(owner: "scope-b")
++try b.require(owner: "scope-b")
++try require(try b.release(owner: "scope-b"), "next owner must release independently")
++// On failure preserve the private fixture for diagnosis; never unlink a lock
++// that is still owned. Both test leases are released before successful cleanup.
++try FileManager.default.removeItem(at: directory)
++print("Passed native cache/identity and in-process lease smoke; no GUI actions dispatched.")

@@ -1,6 +1,6 @@
 # Desktop turn lease: execution-boundary findings
 
-Status: design evidence; desktop mutual exclusion is not implemented or certified by this document.
+Status: execution-side macOS protocol prototype is implemented and separately tested; AtomCode host integration and actual GUI exclusivity are not complete or certified.
 
 ## Verified baseline
 
@@ -36,4 +36,20 @@ This is cooperative exclusivity between participating agent clients, not a sandb
 
 Use two actual processes (including different product directories), two agents within one runtime, normal turn end, approval waiting, cancellation after a real side effect, forced client death, stale owner cleanup, replacement/reload and shutdown. The second owner must not act until the first backend connection has finished its accepted work. Verify fresh-observation requirements after ownership changes, and keep unrelated backend connections alive.
 
-The available host is macOS 14.5 with SDK 14.5. The backend tag declares swift-tools-version 6.2; installed compilers are 5.10 and 6.1.3. No unsupported manifest downgrade or new backend build has been claimed as accepted. Backend extension/build and host wiring remain work, alongside browser origin enforcement, activity presentation and other-platform acceptance.
+The available host is macOS 14.5 with SDK 14.5. The backend tag declares swift-tools-version 6.2; installed compilers are 5.10 and 6.1.3. No unsupported manifest downgrade or new backend build has been claimed as accepted. An explicitly modified Swift 6.1.3 build baseline is now verified by the experimental patch described below. Host wiring and actual GUI acceptance remain work, alongside browser origin enforcement, activity presentation and other-platform acceptance.
+
+
+## Experimental backend implementation
+
+`integrations/open-computer-use/` now carries the pinned MIT source patch, a build script and an opt-in real-process acceptance harness. It does not bundle native binaries or activate the patch in current sessions. Backend support is negotiated as experimental protocol v1; the owner metadata is separate from model tool arguments. The OS lock belongs to each actual server connection in the shared App, and only matching addressed release clears its observation caches. Cache clearing preserves the monotonic screenshot counter. Negotiated legacy app actions require explicit prior observation instead of silently refreshing stale indices. Legacy clients remain compatible but outside cooperative exclusion.
+
+Verified on macOS 14.5 / SDK 14.5 / Swift 6.1.3:
+
+- Fresh clean v1.3.0 checkout accepts the patch and builds the native product. All eight patched source files match the development source. The script refuses dirty source without changing it.
+- An XCTest-independent native smoke validates screenshot cache invalidation, non-reuse of prior screenshot identities, explicit-observation refusal for a phantom app target, same-process lease exclusion and stale-owner refusal. No GUI action is dispatched.
+- Five real-process acceptance groups cover different product homes, reentrancy/wrong owners, metadata injection refusal, strict version negotiation/downgrade refusal, normal EOF, native process death, symlink defenses and owner byte bounds. Private shared-App connections exclude one another and direct processes; one connection may disconnect without terminating the shared App or its neighbor.
+- No installed App, user MCP configuration or OS permission was replaced or changed. The direct test binary reports Accessibility=false; original XCTest targets remain unavailable on this Command Line Tools installation. Actual GUI in-flight cancellation and window handover are not accepted by these protocol tests.
+
+Before activation, the host must still propagate the real agent/turn identity, release via the existing awaited TurnFinishing seam, handle unknown outcomes, and verify a lease-capable backend. An isolated App/default-socket identity is also required: raw development binaries can otherwise resolve the installed App through upstream discovery. The harness intentionally uses direct protocol mode or a unique private App socket to avoid that path. Do not enable this raw test executable as a production desktop backend.
+
+Prototype delivery checks: final clean-source product build plus native smoke passed; all eight patched files match the development source; five real-process groups passed on the reproduced executable, including strict successful EOF and actual SIGKILL cases. Shell/Python syntax, whitespace, cargo format, full compile gate (feature variants and negative canaries), and forbidden-lock-package checks passed. The only new integration payload is text source/patch/tests/license/docs; no Rust dependency or native binary is added. ADR 0032 records this boundary without claiming host or GUI completion.
