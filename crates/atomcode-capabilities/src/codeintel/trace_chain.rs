@@ -225,7 +225,11 @@ mod tests {
         let r = tool
             .execute(r#"{"from":"main","to":"add"}"#, &ctx(d.path()))
             .await;
-        assert!(r.is_error, "ambiguous names must be refused, got: {}", r.content);
+        assert!(
+            r.is_error,
+            "ambiguous names must be refused, got: {}",
+            r.content
+        );
         assert!(
             r.content.contains("a.rs") && r.content.contains("b.rs"),
             "the error must list every candidate: {}",
@@ -244,7 +248,10 @@ mod tests {
         ambiguous_fixture(d.path());
         let tool = TraceChainTool::new(Arc::new(CodeIndex::new(&crate::product_dirs::test_dirs())));
         let r = tool
-            .execute(r#"{"from":"main","to":"add","file":"b.rs"}"#, &ctx(d.path()))
+            .execute(
+                r#"{"from":"main","to":"add","file":"b.rs"}"#,
+                &ctx(d.path()),
+            )
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(

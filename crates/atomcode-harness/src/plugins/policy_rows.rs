@@ -79,8 +79,7 @@ impl Plugin for TodoPlugin {
         mount(
             ctx,
             vec![
-                Arc::new(TodoTool::with_sources(sources.clone()).with_list(list))
-                    as Arc<dyn Tool>,
+                Arc::new(TodoTool::with_sources(sources.clone()).with_list(list)) as Arc<dyn Tool>,
                 Arc::new(atomcode_capabilities::tools::todo_sources::TodoSourcesTool(
                     sources,
                 )) as Arc<dyn Tool>,

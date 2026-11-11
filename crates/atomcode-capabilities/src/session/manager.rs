@@ -1557,6 +1557,12 @@ impl SessionManager {
         // Keep the state before this write's calls so an undo that takes one
         // back can rebuild the list even when the plan itself is no longer in
         // the log. An older baseline is already the furthest recoverable point.
+        // A smaller message_count is not evidence that the conversation was
+        // taken back: compaction shrinks the projection too, and the list it
+        // shrank around is still the state before this write. When an undo
+        // does shrink it, the rebuild has already rewritten this sidecar (and
+        // cleared any baseline whose plan the undo took back) before the next
+        // hook write, so what this read sees is the standing list either way.
         let baseline = match self.read_todo_sidecar(id) {
             Ok(Some(previous)) => previous.baseline.or(Some(TodoSidecarBaseline {
                 todos: previous.todos,
@@ -1585,6 +1591,8 @@ impl SessionManager {
                 message: "invalid source references".into(),
             });
         }
+        // Adding recovery data must not halve the accepted size of a current
+        // plan, nor allow either state to grow beyond its original budget.
         let mut sidecar = TodoSidecar {
             source_seqs: source_seqs.to_vec(),
             todos: todos.to_vec(),
@@ -1592,8 +1600,6 @@ impl SessionManager {
             through,
             baseline: None,
         };
-        // Adding recovery data must not halve the accepted size of a current
-        // plan, nor allow either state to grow beyond its original budget.
         let current = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
         let bytes = if let Some(baseline) = baseline {
             serialize_bounded(&baseline, "todo baseline", MAX_TODO_SIDECAR_BYTES)?;
@@ -6658,6 +6664,81 @@ mod tests {
             sidecar.through,
             Some(through),
             "a through inside the fork's turn ids is kept, not clamped by the count"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_projection_keeps_the_older_baseline_over_the_stale_list() {
+        let item = |status: &str| TodoSidecarItem {
+            content: "task".into(),
+            status: status.into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        // A normal next write keeps the previous list as the recoverable state.
+        manager
+            .write_todo_sidecar("s", &[item("pending")], 4, None)
+            .unwrap();
+        manager
+            .write_todo_sidecar("s", &[item("completed")], 6, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the state before this write is recoverable"
+        );
+
+        // The projection shrank since the last write (as a compaction or an
+        // undo would shrink it). The older baseline is still the furthest
+        // recoverable point; the stale completed list does not displace it.
+        // The new list is deliberately distinct from the older baseline, so a
+        // baseline taken from this write cannot pass.
+        manager
+            .write_todo_sidecar("s", &[item("in_progress")], 4, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(sidecar.todos[0].status, "in_progress");
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the stale completed list is not kept, the older baseline is"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_conversation_without_a_baseline_keeps_the_state_before_the_write() {
+        let item = |status: &str| TodoSidecarItem {
+            content: "task".into(),
+            status: status.into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        // The first write has no older baseline. A compaction then shrinks the
+        // projection before the next write; that shrink is not evidence the
+        // list was taken back, so the state before the write is still the only
+        // state an undo can fall back to and must be kept.
+        manager
+            .write_todo_sidecar("s", &[item("pending")], 8, None)
+            .unwrap();
+        manager
+            .write_todo_sidecar("s", &[item("completed")], 3, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(sidecar.todos[0].status, "completed");
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the state before the shrunk write is the recoverable floor"
         );
     }
 

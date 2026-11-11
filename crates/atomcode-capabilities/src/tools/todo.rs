@@ -631,10 +631,17 @@ mod tests {
     async fn update_rejects_id_beyond_current_list() {
         let t = TodoTool::new().with_list(std::sync::Arc::new(FixedLen(6)));
         let r = t
-            .execute(r#"{"action":"update","id":999,"status":"completed"}"#, &ctx())
+            .execute(
+                r#"{"action":"update","id":999,"status":"completed"}"#,
+                &ctx(),
+            )
             .await;
         assert!(r.is_error, "out-of-range id must fail, got: {}", r.content);
-        assert!(r.content.contains("999"), "the error must name the id: {}", r.content);
+        assert!(
+            r.content.contains("999"),
+            "the error must name the id: {}",
+            r.content
+        );
     }
 
     fn ctx() -> ToolContext {

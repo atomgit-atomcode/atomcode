@@ -524,7 +524,13 @@ mod tests {
             content: "first\nsecond\nthird\n[exit code 0]".into(),
             ..Default::default()
         };
-        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "[atomcode: output truncated");
+        preview.shell_tail(
+            &mut result,
+            1,
+            "[exit code 0]",
+            true,
+            "[atomcode: output truncated",
+        );
         assert!(
             result.content.contains("TEMPORARY artifact"),
             "must fall back instead of giving up: {}",
@@ -551,8 +557,18 @@ mod tests {
             content: "first\nsecond\nthird\n[exit code 0]".into(),
             ..Default::default()
         };
-        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "[atomcode: output truncated");
-        assert!(result.content.contains("TEMPORARY artifact"), "{}", result.content);
+        preview.shell_tail(
+            &mut result,
+            1,
+            "[exit code 0]",
+            true,
+            "[atomcode: output truncated",
+        );
+        assert!(
+            result.content.contains("TEMPORARY artifact"),
+            "{}",
+            result.content
+        );
         let id = result
             .content
             .split("TEMPORARY artifact ")
@@ -562,7 +578,10 @@ mod tests {
             .to_string();
         let got = store.get(&id, 0, usize::MAX).unwrap();
         let got = got.unwrap_or_else(|| panic!("artifact {id} must be readable, got None"));
-        assert!(String::from_utf8_lossy(&got).contains("second"), "wrong bytes");
+        assert!(
+            String::from_utf8_lossy(&got).contains("second"),
+            "wrong bytes"
+        );
     }
 
     /// `get` falls back to the temp store, but `size` did not — so a temporary
@@ -579,7 +598,13 @@ mod tests {
             content: original.into(),
             ..Default::default()
         };
-        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "[atomcode: output truncated");
+        preview.shell_tail(
+            &mut result,
+            1,
+            "[exit code 0]",
+            true,
+            "[atomcode: output truncated",
+        );
         let id = result
             .content
             .split("TEMPORARY artifact ")
@@ -605,7 +630,10 @@ mod tests {
         let msg = super::both_failed_message(&primary, &fallback);
         assert!(msg.contains("primary denied"), "{msg}");
         assert!(msg.contains("fallback denied"), "{msg}");
-        assert!(!msg.contains("could not be saved.)"), "no bare message: {msg}");
+        assert!(
+            !msg.contains("could not be saved.)"),
+            "no bare message: {msg}"
+        );
     }
 
     #[test]

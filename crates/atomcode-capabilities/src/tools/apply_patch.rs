@@ -77,10 +77,13 @@ fn stage_err(stage: &str, rel: &str, e: impl std::fmt::Display) -> String {
 }
 
 async fn root(world: &dyn FileSystem, cwd: &Path) -> Result<PathBuf, String> {
-    world
-        .canonicalize(cwd)
-        .await
-        .map_err(|e| stage_err("canonicalize working directory", &cwd.display().to_string(), e))
+    world.canonicalize(cwd).await.map_err(|e| {
+        stage_err(
+            "canonicalize working directory",
+            &cwd.display().to_string(),
+            e,
+        )
+    })
 }
 async fn target_path(
     world: &dyn FileSystem,

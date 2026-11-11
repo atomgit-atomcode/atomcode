@@ -641,8 +641,7 @@ mod tests {
     /// parameter means one thing on DuckDuckGo and another on Exa.
     #[test]
     fn exa_result_blocks_are_capped_locally() {
-        let text =
-            "Title: a\nURL: u1\n\n---\n\nTitle: b\nURL: u2\n\n---\n\nTitle: c\nURL: u3";
+        let text = "Title: a\nURL: u1\n\n---\n\nTitle: b\nURL: u2\n\n---\n\nTitle: c\nURL: u3";
         let one = cap_exa_results(text, 1);
         assert!(one.contains("Title: a"), "{one}");
         assert!(

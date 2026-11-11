@@ -246,17 +246,12 @@ struct SessionView {
     history_request: Option<u64>,
     history_seed: Vec<Committed>,
     described: Option<AgentDescription>,
-    /// The **selection id** the session is on — `AtomGit/deepseek-flash`, which
-    /// an alias differs from — as of the last `/model` this screen saw land.
-    ///
-    /// The description reports the name sent on the wire, which is exactly what
-    /// cannot tell two accounts running the same model apart (see
-    /// [`crate::providers::ProvidersView::marked_row`]). This is the other name
-    /// for the same choice, and the one the providers list is keyed by. It is
-    /// the screen's own fact, not one the agent reports about itself: a build
-    /// whose rows never carried a selection id would leave this empty, and
-    /// `ProvidersView` falls back to matching the wire name.
+    /// Runtime-owned selection id reported by host control, cached for drawing.
+    /// The wire model name alone cannot distinguish accounts serving the same
+    /// model. This is a presentation projection, never a configuration default.
     selection: Option<String>,
+    /// Latest host query; an older reply must not replace a newer selection.
+    selection_request: Option<u64>,
     status: Option<AgentStatus>,
     /// Messages sent and not yet taken by a turn.
     outstanding: HashSet<CommandId>,
@@ -371,11 +366,73 @@ impl AgentClient {
         let mut views = self.view.lock().expect("client poisoned");
         let root = views.root.clone();
         if let Some(view) = views.sessions.get_mut(&root) {
+            // A reply accepted after an older query supersedes that query.
+            view.selection_request = None;
             if view.selection != selection {
                 view.selection = selection;
                 views.remark = true;
             }
         }
+    }
+
+    /// Ask the host for its runtime-owned selection. Wire names and the
+    /// configuration file's default cannot distinguish two live accounts.
+    pub(crate) fn refresh_model_selection(self: &Arc<Self>, session: &str) {
+        if session != self.root() {
+            return;
+        }
+        let Some(control) = self.control() else {
+            return;
+        };
+        let Some(wake) = self.history_sink.lock().expect("client poisoned").clone() else {
+            return;
+        };
+        let request = self.receipts.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut views = self.view.lock().expect("client poisoned");
+            let Some(view) = views.sessions.get_mut(session) else {
+                return;
+            };
+            view.selection_request = Some(request);
+        }
+        let client = self.clone();
+        let session = session.to_string();
+        tokio::spawn(async move {
+            let selection = match control
+                .call(HostCommand::Models {
+                    session: session.clone(),
+                })
+                .await
+            {
+                Ok(HostReply::Models { current, .. }) => current,
+                _ => None,
+            };
+            if client.accept_model_selection(&session, request, selection) {
+                let _ = wake.send(Wake::Fact);
+            }
+        });
+    }
+
+    fn accept_model_selection(
+        &self,
+        session: &str,
+        request: u64,
+        selection: Option<String>,
+    ) -> bool {
+        let mut views = self.view.lock().expect("client poisoned");
+        let Some(view) = views.sessions.get_mut(session) else {
+            return false;
+        };
+        if view.selection_request != Some(request) {
+            return false;
+        }
+        view.selection_request = None;
+        if view.selection == selection {
+            return false;
+        }
+        view.selection = selection;
+        views.remark = true;
+        true
     }
 
     /// Whether a `/model` moved the selection id since this was last asked —
@@ -385,7 +442,7 @@ impl AgentClient {
     }
 
     /// The selection id the session on screen is on, when this screen knows it
-    /// ([`Self::chose_model`]).
+    /// (refreshed from host control as well as an accepted local choice).
     pub fn selection(&self) -> Option<String> {
         self.view
             .lock()
@@ -4122,25 +4179,10 @@ impl Tui {
         // have been switched with `/model` since. The screen knows that, so it
         // marks the row rather than asking the port to know it.
         //
-        // The selection id first when this screen has one: it is the only name
-        // that can tell two accounts running the same model apart, and a wire
-        // name alone is exactly what `marked_row` refuses to guess from. The
-        // wire name is the fallback, for a session opened on a model this
-        // screen never switched.
-        //
-        // The id only while it still names a row. One the configuration has
-        // since dropped — a model deleted or renamed in the panel — resolves to
-        // nothing, and marking nothing is not neutral: `model_after` steps from
-        // the marked row, so F2 would step off the first one every time. The
-        // wire name is never stale in that way (it tracks what the agent
-        // reports), so it is the right thing to fall back to.
-        //
-        // And only while it still names what the agent reports. The id is a
-        // note of the last `/model` this screen sent; the model can move without
-        // one — a switch from the web page, `/login` adopting the server's
-        // default — and then the id describes a model the session has left.
-        // The description is the agent's own word on what it runs, so an id
-        // whose row sends anything else is dropped for it.
+        // Prefer the runtime selection reported by host control. Keep matching
+        // it against the description's wire name: while a swap is in flight the
+        // selection and description may arrive separately. Never infer an
+        // account from the file's default when that wire name is ambiguous.
         let rows = port.rows();
         let wire = self.client.described().and_then(|d| d.model);
         let live = self
@@ -7000,6 +7042,7 @@ impl Tui {
                 let refresh_allowance = description.session == self.client.session()
                     || description.session == self.client.root();
                 self.client.describe(&description);
+                self.client.refresh_model_selection(&description.session);
                 // Keep the status row's context window in step with the screen
                 // agent's mounted model. Read it back off the screen agent's
                 // description (not the one that just arrived, which may be a team
@@ -14644,9 +14687,86 @@ mod provider_probe_tests {
         m.providers.live_row().map(|row| row.id.clone())
     }
 
-    /// `/model` typed on a member's tab switches the lead — so the id it chose
-    /// is the lead's, and neither labels the member nor goes missing from the
-    /// lead.
+    struct LiveSelection(std::sync::Mutex<Option<String>>);
+
+    #[async_trait]
+    impl HostControl for LiveSelection {
+        async fn call(
+            &self,
+            command: HostCommand,
+        ) -> Result<HostReply, atomcode_host_api::HostError> {
+            assert!(matches!(command, HostCommand::Models { .. }));
+            Ok(HostReply::Models {
+                models: Vec::new(),
+                current: self.0.lock().unwrap().clone(),
+            })
+        }
+
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_live_provider_is_resolved_at_startup_and_after_same_wire_switches() {
+        let (host, tui, _woken) = screen_with(Arc::new(TwoAccounts));
+        tui.client.follow("lead");
+        let control = Arc::new(LiveSelection(std::sync::Mutex::new(Some(
+            "taotoken/ds".into(),
+        ))));
+        let (commands, _commands) = mpsc::unbounded_channel();
+        tui.client.connect(commands, control.clone());
+        let (wake, mut replies) = mpsc::unbounded_channel();
+        *tui.client.history_sink.lock().unwrap() = Some(wake);
+        for selected in ["taotoken/ds", "atomgit/ds", "taotoken/ds"] {
+            *control.0.lock().unwrap() = Some(selected.into());
+            tui.on_event(AgentEvent::Described {
+                description: Box::new(AgentDescription {
+                    session: "lead".into(),
+                    model: Some("deepseek-flash".into()),
+                    ..Default::default()
+                }),
+            });
+            assert!(matches!(replies.recv().await, Some(Wake::Fact)));
+            assert_eq!(live(&tui, &host).as_deref(), Some(selected));
+            described(&tui, "lead", "deepseek-flash");
+            assert_eq!(
+                live(&tui, &host).as_deref(),
+                Some(selected),
+                "a refresh keeps the account"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_selection_reply_cannot_overwrite_a_newer_provider() {
+        let (host, tui, _woken) = screen_with(Arc::new(TwoAccounts));
+        tui.client.follow("lead");
+        described(&tui, "lead", "deepseek-flash");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .selection_request = Some(2);
+        assert!(!tui
+            .client
+            .accept_model_selection("lead", 1, Some("atomgit/ds".into())));
+        assert!(tui
+            .client
+            .accept_model_selection("lead", 2, Some("taotoken/ds".into())));
+        assert!(!tui
+            .client
+            .accept_model_selection("lead", 1, Some("atomgit/ds".into())));
+        assert_eq!(live(&tui, &host).as_deref(), Some("taotoken/ds"));
+        assert!(!tui
+            .client
+            .accept_model_selection("gone", 2, Some("atomgit/ds".into())));
+    }
+
+    /// A lead selection must never label a member's same-named model.
     #[test]
     fn a_model_chosen_on_a_member_tab_is_the_leads() {
         let (host, tui, _woken) = screen_with(Arc::new(TwoAccounts));

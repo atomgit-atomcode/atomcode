@@ -437,16 +437,8 @@ impl SnapshotHook {
         pending.before_tree = result.ok().flatten();
         let before_tree = pending.before_tree.clone();
         drop(rewind);
-        if before_tree.is_none() {
-            tracing::warn!(
-                phase = "workspace_capture",
-                process_id = std::process::id(),
-                "workspace checkpoint unavailable for this turn"
-            );
-            self.persistence_status.report_auxiliary_warning(
-                "this turn has no workspace checkpoint; code rewind is unavailable for it",
-            );
-        }
+        // Code rewind is optional. Its capture job logs failures; do not turn
+        // an unavailable baseline into a conversation persistence warning.
         before_tree
     }
 
@@ -1136,12 +1128,13 @@ impl LifecycleHooks for SnapshotHook {
             let span = tracing::Span::current();
             let job = tokio::task::spawn_blocking(move || {
                 let started = std::time::Instant::now();
-                let result = pin.capture().map_err(|_| "capture_failed".to_string());
+                let result = pin.capture().map_err(|error| error.to_string());
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 span.in_scope(|| {
-                    if result.is_err() {
+                    if let Err(error) = &result {
                         tracing::warn!(
                             phase = "workspace_capture",
+                            error = %error,
                             elapsed_ms,
                             "workspace checkpoint failed"
                         );
@@ -1163,7 +1156,12 @@ impl LifecycleHooks for SnapshotHook {
                 result
             });
             Arc::new(
-                async move { job.await.map_err(|_| "capture_task_failed".to_string())? }
+                async move {
+                    job.await.map_err(|error| {
+                        tracing::warn!(phase = "workspace_capture", error = %error, "workspace checkpoint task failed");
+                        error.to_string()
+                    })?
+                }
                     .boxed()
                     .shared(),
             )
@@ -1266,13 +1264,22 @@ impl LifecycleHooks for SnapshotHook {
                     (Some(before_tree), Some(checkpoint)) => {
                         let pin = after_pin.clone().expect("checkpoint has a capture pin");
                         tokio::task::spawn_blocking(move || {
-                            let after_tree = pin.capture().ok()??;
-                            let files = checkpoint.diff(&before_tree, &after_tree).ok()?;
-                            Some((before_tree, after_tree, files))
+                            let after_tree = pin.capture()?;
+                            let Some(after_tree) = after_tree else {
+                                return Ok(None);
+                            };
+                            let files = checkpoint.diff(&before_tree, &after_tree)?;
+                            Ok::<_, WorkspaceCheckpointError>(Some((before_tree, after_tree, files)))
                         })
                         .await
-                        .ok()
-                        .flatten()
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(phase = "workspace_capture_after", error = %error, "workspace checkpoint task failed");
+                            Ok(None)
+                        })
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(phase = "workspace_capture_after", error = %error, "workspace checkpoint failed");
+                            None
+                        })
                     }
                     _ => None,
                 };
@@ -1894,24 +1901,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn failed_capture_reports_no_code_baseline_without_losing_the_prompt() {
-        let (hook, manager, _dir) = hook("failed-capture");
-        let mut conversation = convo_with(1);
-        hook.turn_start(&mut conversation).await;
-        pending_capture(
-            &hook,
-            Arc::new(async { Err("failed".to_string()) }.boxed().shared()),
-        );
-        assert_eq!(hook.wait_for_checkpoint().await, None);
-        assert_eq!(hook.checkpoint_taken(), None);
-        assert!(hook
-            .persistence_status
-            .take_auxiliary_warning()
-            .unwrap()
-            .contains("no workspace checkpoint"));
-        assert_eq!(hook.wait_for_checkpoint().await, None);
-        assert!(hook.persistence_status.take_auxiliary_warning().is_none());
-        assert!(manager.has_inflight_snapshot("failed-capture"));
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    async fn failed_capture_keeps_the_prompt_without_interrupting_the_conversation() {
+        for outcome in [Err("failed".to_string()), Ok(None)] {
+            let (hook, manager, _root, _worktree, _dirs) = workspace_hook("failed-capture");
+            let mut conversation = convo_with(1);
+            hook.turn_start(&mut conversation).await;
+            pending_capture(&hook, Arc::new(async move { outcome }.boxed().shared()));
+            assert_eq!(hook.wait_for_checkpoint().await, None);
+            assert_eq!(hook.checkpoint_taken(), None);
+            assert!(hook.persistence_status.take_auxiliary_warning().is_none());
+            assert_eq!(hook.wait_for_checkpoint().await, None);
+            assert!(hook.persistence_status.take_auxiliary_warning().is_none());
+            assert!(manager.has_inflight_snapshot("failed-capture"));
+            hook.turn_complete(&conversation, &StopReason::Stopped, &TurnCtx::default())
+                .await;
+            let points = hook.rewind_points();
+            assert_eq!(points.len(), 1);
+            assert!(points[0].before_tree.is_none() && points[0].after_tree.is_none());
+            assert!(hook.restore_workspace(&points[0]).is_err());
+            assert!(manager.load_snapshot("failed-capture").is_ok());
+            assert!(hook.persistence_status.take_auxiliary_warning().is_none());
+        }
     }
 
     fn convo_with(n_user: usize) -> Conversation {

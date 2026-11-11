@@ -451,7 +451,11 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "unknown group must be rejected, got: {}", r.content);
+        assert!(
+            r.is_error,
+            "unknown group must be rejected, got: {}",
+            r.content
+        );
         assert!(
             r.content.contains("1_DONE"),
             "the error must name the bad reference, got: {}",

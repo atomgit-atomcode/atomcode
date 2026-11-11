@@ -2088,29 +2088,22 @@ impl CommandSet for SessionCommands {
                     Ok(_) => (t(Msg::ModelSet { wanted }).into_owned(), None),
                     Err(error) => return Outcome::Refused(refusal(error)),
                 };
-                // 换成了,把**选择 id** 记下来:描述报的是 wire 名,而两个账号跑
-                // 同一个模型时,只有选择 id 认得出是哪一行(`ProvidersView`
-                // 先按 id 匹配)。状态行要靠它在同名时说清是哪个 provider。
-                //
-                // 只在**恰好一行**对得上时才认它的 id。打的是 id 就永远对得上;
-                // 打的是 wire 名或别名、而那个名字被几个账号共用时,这里认不出
-                // 宿主换过去的那一行——那就干脆不认(`None`)。认一个猜的行比不认
-                // 更糟:状态行会指着错的 provider 说,而 `marked_row` 本来就拒绝
-                // 在这种时候猜,让它继续用 wire 名、退回不标才是诚实的答案。
-                // 宿主其实知道换到了哪一行(`HostReply` 目前不带回来,正解是
-                // 在 reply 上加),所以这是权宜:宁可这一帧没有前缀。
+                // Keep the accepted exact choice available immediately for
+                // `/model <id> <effort>`. Resolve aliases and shared wire names
+                // from the runtime as well, rather than keeping a guessed row.
                 let selection = ctx
                     .service::<crate::plugin::ProvidersSvc>()
                     .and_then(|port| {
                         let rows = port.rows();
-                        let mut hit = rows
-                            .models()
-                            .iter()
-                            .filter(|m| m.id == wanted || m.model == wanted);
+                        if let Some(row) = rows.model(wanted) {
+                            return Some(row.id.clone());
+                        }
+                        let mut hit = rows.models().iter().filter(|row| row.model == wanted);
                         let first = hit.next()?;
                         hit.next().is_none().then(|| first.id.clone())
                     });
                 client.chose_model(selection);
+                client.refresh_model_selection(&client.root());
                 // 带了档位:走 `/effort` 那一套设过去(只有一份实现),于是
                 // 这一趟不再问第二次。模型此时已经换过去了,所以强度那一步
                 // 不管成不成,「换成了」这句都得留在屏上 —— 只报强度的拒绝,

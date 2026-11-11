@@ -605,9 +605,13 @@ impl WorkspaceCheckpoint {
     ) -> Result<Option<String>, WorkspaceCheckpointError> {
         // Invariant A: physical disk floor. Unknown free space → skip.
         // This check is read-only and safe to perform outside the lock.
-        if !checkpoint_phase("disk_floor", || {
-            disk_floor_ok(available_disk_bytes(&self.git_dir), floor)
-        }) {
+        let available = checkpoint_phase("disk_floor", || available_disk_bytes(&self.git_dir));
+        if !disk_floor_ok(available, floor) {
+            tracing::warn!(
+                available_bytes = ?available,
+                required_bytes = floor,
+                "code rewind capture skipped: free disk space is below the floor or unknown"
+            );
             return Ok(None);
         }
         // Invariant B: store must not exceed budget. The size check AND any gc
