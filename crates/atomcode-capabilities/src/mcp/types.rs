@@ -150,7 +150,11 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
     #[serde(rename = "resource")]
     Resource { resource: ResourceContent },
 }
@@ -164,7 +168,7 @@ pub struct ResourceContent {
     pub text: Option<String>,
     #[serde(default)]
     pub blob: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "mimeType", alias = "mime_type")]
     pub mime_type: Option<String>,
 }
 
@@ -172,7 +176,7 @@ pub struct ResourceContent {
 #[derive(Debug, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<ContentBlock>,
-    #[serde(default)]
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: bool,
 }
 
@@ -200,6 +204,32 @@ impl std::fmt::Display for ServerStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standard_tool_result_image_and_error_fields_are_retained() {
+        let result: super::CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}],
+            "isError": true
+        }))
+        .unwrap();
+        assert!(result.is_error);
+        assert!(
+            matches!(&result.content[0], super::ContentBlock::Image { mime_type, .. } if mime_type == "image/png")
+        );
+    }
+
+    #[test]
+    fn snake_case_tool_result_fields_still_parse() {
+        let result: super::CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "image", "data": "aGVsbG8=", "mime_type": "image/png"}],
+            "is_error": true
+        }))
+        .unwrap();
+        assert!(result.is_error);
+        assert!(
+            matches!(&result.content[0], super::ContentBlock::Image { mime_type, .. } if mime_type == "image/png")
+        );
+    }
+
     use super::*;
 
     #[test]

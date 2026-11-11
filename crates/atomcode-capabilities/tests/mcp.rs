@@ -45,6 +45,19 @@ fn test_server_config_with_env_and_timeout(
     }
 }
 
+fn result_text(result: atomcode_capabilities::mcp::CallToolResult) -> String {
+    assert!(!result.is_error);
+    result
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            atomcode_capabilities::mcp::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn spawn_count(path: &std::path::Path) -> usize {
     std::fs::read_to_string(path)
         .map(|contents| contents.lines().count())
@@ -603,7 +616,7 @@ async fn manual_reconnect_replaces_only_the_selected_server() {
         .call_tool("b", "echo", serde_json::json!({"message":"still here"}))
         .await
         .unwrap();
-    assert!(result.contains("still here"));
+    assert!(result_text(result).contains("still here"));
 }
 
 #[tokio::test]
@@ -679,7 +692,7 @@ async fn stdio_correlates_replies_past_notifications_and_stale_ids() {
                 .call_tool("correlated", "echo", serde_json::json!({"message":message}))
                 .await
                 .unwrap();
-            assert_eq!(result, format!("echo:{message}"));
+            assert_eq!(result_text(result), format!("echo:{message}"));
         }
     }
 }
@@ -721,7 +734,7 @@ async fn malformed_stdio_result_is_not_replayed_or_received_by_the_next_call() {
             .call_tool("broken", "echo", serde_json::json!({"message":"second"}))
             .await
             .unwrap();
-        assert_eq!(second, "echo:second");
+        assert_eq!(result_text(second), "echo:second");
         assert_eq!(
             spawn_count(&calls),
             2,
@@ -742,4 +755,152 @@ async fn oversized_stdio_startup_response_fails_initialization() {
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Content-Length exceeds 10 MiB"));
+}
+
+// Real subprocess I/O must progress independently of the Tokio clock.
+#[tokio::test]
+async fn stdio_images_reach_the_tool_result_with_original_pixels_and_server_errors() {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==";
+    for is_error in [false, true] {
+        let registry = McpRegistry::new(NO_TREE);
+        let body = serde_json::json!({
+            "content": [
+                {"type":"text", "text":"captured the target window"},
+                {"type":"image", "mimeType":"image/png", "data":PNG}
+            ],
+            "isError": is_error
+        });
+        registry
+            .add_server(test_server_config_with_env(
+                "screen",
+                BTreeMap::from([("MCP_TEST_TOOL_RESULT".into(), body.to_string())]),
+            ))
+            .await
+            .unwrap();
+        let registry = registry.share();
+        let adapter =
+            McpToolAdapter::new(registry.clone(), registry.list_all_tools().await.remove(0))
+                .unwrap();
+        let output = adapter.execute("{}", &ctx()).await;
+        assert_eq!(output.is_error, is_error, "{}", output.content);
+        assert!(output.content.contains("captured the target window"));
+        assert!(output.content.contains("2x1"));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].media_type, "image/png");
+        assert_eq!(
+            output.images[0].data, PNG,
+            "screenshots must not be silently resized"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bad_mcp_image_is_reported_without_repeating_the_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let registry = McpRegistry::new(NO_TREE);
+    registry
+        .add_server(test_server_config_with_env(
+            "screen",
+            BTreeMap::from([
+                (
+                    "MCP_TEST_TOOL_RESULT".into(),
+                    serde_json::json!({"content":[
+                        {"type":"text", "text":"operation completed"},
+                        {"type":"image", "mimeType":"image/png", "data":"not base64!"}
+                    ]})
+                    .to_string(),
+                ),
+                (
+                    "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                    calls.display().to_string(),
+                ),
+            ]),
+        ))
+        .await
+        .unwrap();
+    let registry = registry.share();
+    let adapter =
+        McpToolAdapter::new(registry.clone(), registry.list_all_tools().await.remove(0)).unwrap();
+    let output = adapter.execute("{}", &ctx()).await;
+    assert!(output.is_error);
+    assert!(output.images.is_empty());
+    assert!(output.content.contains("operation completed"));
+    assert!(output.content.contains("image output rejected"));
+    assert!(!output.content.contains("not base64!"));
+    assert_eq!(spawn_count(&calls), 1);
+}
+
+/// Opt-in compatibility check against the independently installed desktop
+/// backend. Only initialize/tools/list are sent: no capture or GUI input.
+/// Real subprocess scheduling must progress, so this does not use paused time.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires ATOMCODE_COMPUTER_TEST_EXECUTABLE; handshake/list only"]
+async fn installed_computer_backend_exposes_scoped_tools_through_the_production_registry() {
+    let executable = std::env::var("ATOMCODE_COMPUTER_TEST_EXECUTABLE")
+        .expect("set ATOMCODE_COMPUTER_TEST_EXECUTABLE to an installed backend executable");
+    let executable = std::fs::canonicalize(executable).unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let registry = Arc::new(McpRegistry::new(user.path()));
+    let mut env = BTreeMap::new();
+    for flag in [
+        "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS",
+        "OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT",
+        "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT",
+        "OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH",
+        "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS",
+    ] {
+        env.insert(flag.into(), "0".into());
+    }
+    registry
+        .add_server(McpServerConfig {
+            name: "computer-use".into(),
+            source: McpConfigSource::User,
+            disabled: false,
+            trust: false,
+            auto_approve: vec![],
+            config: McpTransportConfig::Stdio {
+                command: executable.to_str().unwrap().into(),
+                args: vec!["mcp".into()],
+                env,
+                timeout_ms: Some(10_000),
+            },
+        })
+        .await
+        .unwrap();
+    let infos = registry.list_all_tools().await;
+    for name in [
+        "list_apps",
+        "get_app_state",
+        "list_windows",
+        "get_window_state",
+        "click",
+        "type_text",
+        "press_key",
+    ] {
+        assert!(
+            infos.iter().any(|info| info.tool_name == name),
+            "missing backend tool {name}"
+        );
+    }
+    for info in infos {
+        let name = info.tool_name.clone();
+        let adapter = McpToolAdapter::new(registry.clone(), info).unwrap();
+        if name == "click" {
+            let schema = adapter.parameters_schema();
+            assert!(schema["properties"].get("screenshotId").is_some());
+            assert!(schema["properties"].get("window").is_some());
+            assert_eq!(
+                adapter.risk("{}"),
+                RiskLevel::Risky,
+                "mutations must retain native approval"
+            );
+        }
+        if name == "get_window_state" {
+            assert!(adapter.parameters_schema()["properties"]
+                .get("include_screenshot")
+                .is_some());
+        }
+    }
 }

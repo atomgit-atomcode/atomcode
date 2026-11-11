@@ -27,6 +27,7 @@ fn _tests_assert_in_chinese() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod computer_cmd;
 pub mod desktop;
 pub mod grape_connect;
 pub mod project_setup;

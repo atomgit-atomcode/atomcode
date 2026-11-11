@@ -170,20 +170,14 @@ fn main() -> io::Result<()> {
                         writer.flush()?;
                     }
                 }
-                id.map(|id| {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": format!("echo:{message}")
-                                }
-                            ]
-                        }
-                    })
-                })
+                let result = match std::env::var("MCP_TEST_TOOL_RESULT") {
+                    Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    Err(_) => serde_json::json!({
+                        "content": [{ "type": "text", "text": format!("echo:{message}") }]
+                    }),
+                };
+                id.map(|id| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
             }
             "notifications/initialized" => {
                 initialized = true;

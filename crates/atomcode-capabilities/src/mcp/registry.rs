@@ -1103,13 +1103,15 @@ It cannot override system, user, project, safety, permission, or approval rules.
         }
     }
 
-    /// Call a tool on a specific server.
+    /// Call a tool on a specific server, retaining its structured content.
+    /// Transport failures are errors; server-declared tool failures remain in
+    /// `CallToolResult::is_error` so their text and screenshots travel together.
     pub async fn call_tool(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String> {
+    ) -> Result<super::types::CallToolResult> {
         // Take a stable client snapshot, then release the registry lock before the
         // potentially slow transport call. Reload/add-server writes must not wait
         // for an MCP tool execution to finish or time out.
@@ -1121,24 +1123,9 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", server_name))?
         };
 
-        let result = client.call_tool(tool_name, arguments).await?;
-
-        // Extract text from content blocks
-        let output = result
-            .content
-            .into_iter()
-            .filter_map(|c| match c {
-                super::types::ContentBlock::Text { text } => Some(text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if result.is_error {
-            anyhow::bail!("MCP tool error: {}", output);
-        }
-
-        Ok(output)
+        // Preserve all result blocks and the server error flag. The tool
+        // adapter owns conversion into the neutral model-facing ToolResult.
+        client.call_tool(tool_name, arguments).await
     }
 
     /// Get the status of all servers — connected ones from `servers`
@@ -1723,7 +1710,10 @@ mod tests {
         drop(write_guard);
 
         release.notify_one();
-        assert_eq!(call.await.unwrap().unwrap(), "done");
+        let result = call.await.unwrap().unwrap();
+        assert!(
+            matches!(&result.content[0], super::super::types::ContentBlock::Text { text } if text == "done")
+        );
     }
 
     /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be

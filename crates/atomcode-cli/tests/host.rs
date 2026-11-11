@@ -3947,3 +3947,42 @@ async fn cancelling_an_image_skill_does_not_wait_for_the_vision_helper() {
     assert!(env.script.requests.lock().unwrap().is_empty());
     connection.commands.send(AgentCommand::Shutdown).unwrap();
 }
+
+/// Desktop setup uses the host's configured product tree and rejects stale
+/// sessions before resolving or launching any executable. No GUI is involved.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn computer_setup_is_addressed_and_does_not_mutate_the_live_runtime() {
+    use atomcode_host_api::ComputerAction;
+    let env = env();
+    let connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Computer {
+                session: "not-this-session".into(),
+                action: ComputerAction::Enable,
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+    let before = env.script.built.lock().unwrap().len();
+    for action in [ComputerAction::Status, ComputerAction::Disable] {
+        let reply = connection
+            .control
+            .call(HostCommand::Computer {
+                session: session.clone(),
+                action,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, HostReply::DoneWithNote { note } if note.contains("Computer Use")));
+    }
+    assert!(!env._home.path().join("mcp.json").exists());
+    assert_eq!(
+        env.script.built.lock().unwrap().len(),
+        before,
+        "no implicit runtime rebuild"
+    );
+}

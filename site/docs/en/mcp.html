@@ -184,6 +184,36 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </table>
       <p>In the TUI you'll see <code>✓ MCP server 'github' connected</code> or <code>✗ MCP server '…' failed: …</code> in the session area. <strong>A single server failure does not break other servers or the main program.</strong></p>
 
+      <h2 id="image-results">Image results</h2>
+      <p>Inline MCP <code>image</code> blocks enter the existing tool-image pipeline alongside text, for models that support vision. PNG, JPEG, GIF and WebP are supported. Original bytes and dimensions are preserved; screenshots are not silently resized. A result with <code>isError: true</code> retains both its error flag and valid screenshots.</p>
+      <p>Base64, declared MIME type, actual encoding and pixel data are validated. Limits are 4 MiB of Base64 per image, four images and 8 MiB of Base64 per result, 8192 pixels per edge and 16 million pixels per image. The request-level image budget can further omit historical images. Invalid or oversized output retains text and returns an explicit tool error, with no partial screenshot set or automatic re-execution. Ask the server to capture a smaller region when needed.</p>
+      <p>This does not install a desktop executor, grant operating-system permissions or change the selected model. Text-only models do not gain vision. Image resource links are not fetched automatically, and embedded resource blobs are not treated as screenshots.</p>
+
+      <h2 id="computer-use">Operate macOS apps from the CLI</h2>
+      <p>Connect the local <a href="https://github.com/opensymph/open-computer-use">Open Computer Use</a> MCP backend on macOS 14 or later. Screenshot tasks require a vision-capable selected model. AtomCode does not install the backend automatically or launch a separate model agent.</p>
+      <pre><code># Explicitly install the pinned backend (requires Node.js / npm)
+npm install -g @opensymph/open-computer-use@1.3.0
+
+# Open the backend's permission onboarding yourself
+open-computer-use doctor
+
+# Non-interactive check; configure only after permissions are ready
+atomcode computer doctor
+atomcode computer enable
+# Both commands accept --executable /absolute/path/to/executable</code></pre>
+      <p>Grant Accessibility and Screen Recording to the backend app in macOS settings. AtomCode's <code>doctor</code> has a deadline and requests neither permissions nor screenshots. Missing permissions prevent <code>enable</code> from writing MCP configuration or the skill. Setup preserves other servers, refuses custom same-name server/skill collisions, and disables known foreground-input and global-pointer fallback flags.</p>
+      <p>Restart AtomCode or run <code>/computer reload</code>. Clear desktop requests, such as “Click the search button in the Safari window”, automatically load the installed <code>computer-use</code> static guidance. You can also explicitly enter <code>$computer-use Complete this task in the specified app</code>. Automatic context neither executes tools nor grants permissions; the model chooses calls under existing MCP approvals. Documentation, quoted examples, code implementation and requests declining desktop operations do not trigger this rule. Use an explicit skill when matching is uncertain. Disable automatic loading with <code>[no-auto-skills]</code>, the skill's <code>auto-load: off</code>, or the host's <code>skills-host.auto_load: false</code> setting.</p>
+      <pre><code>/computer help
+/computer status
+/computer doctor
+/computer enable
+/computer disable
+/computer reload</code></pre>
+      <p>These session slash commands delegate to the host and share the terminal's setup implementation. Enable/disable save configuration; reload separately applies it through the existing lifecycle and refuses while busy. Custom executable paths remain a terminal <code>--executable</code> option; slash arguments are never shell commands.</p>
+      <pre><code>atomcode computer status
+atomcode computer disable</code></pre>
+      <p><code>status</code> reads user configuration, not a running session's connection. A same-name project MCP entry still takes precedence; check <code>/mcp</code>. <code>disable</code> changes only this integration's managed user entry and removes its unmodified bundled skill. Running sessions need a reload. It is not an emergency stop and cannot guarantee interruption of dispatched desktop operations. Enforced app-level authorization, desktop exclusivity across agents, and remote cancellation guarantees remain outside this integration; code rewind cannot undo external GUI effects.</p>
+
       <h2 id="tool-naming">Tool naming</h2>
       <p>Each remote tool is registered as <code>mcp__&lt;server-key&gt;__&lt;remote-tool-name&gt;</code>.</p>
       <p>Example: with <code>"mcpServers": { "github": { ... } }</code> and a remote <code>get_issue</code> tool, the model sees the tool name <code>mcp__github__get_issue</code>.</p>

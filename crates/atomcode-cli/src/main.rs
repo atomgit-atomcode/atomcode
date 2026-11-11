@@ -15,6 +15,7 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 mod cloud_cmd;
+use atomcode::computer_cmd;
 mod grape_cmd;
 mod headless_json;
 mod lsp_cmd;
@@ -768,6 +769,9 @@ enum HeadlessOutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Configure or diagnose the opt-in local desktop MCP (macOS 14+).
+    #[command(subcommand)]
+    Computer(computer_cmd::ComputerCli),
     /// Enable, disable or diagnose the bundled Huawei Cloud sandbox integration.
     #[command(subcommand)]
     Cloud(cloud_cmd::CloudCli),
@@ -1358,6 +1362,21 @@ fn merge_startup_notices(
 }
 
 async fn async_main(process_start: std::time::Instant) {
+    // Local desktop setup/diagnosis must precede logging, install bookkeeping
+    // and pending upgrades. In particular, status and a failed permission probe
+    // must not create a product tree. Parse the full CLI, not an argv substring
+    // that could also be a prompt or an option value.
+    if let Ok(cli) = Cli::try_parse() {
+        if let Some(Commands::Computer(command)) = cli.command {
+            match computer_cmd::handle(command).await {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("AtomCode error: {}", error_report(&error));
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
@@ -4109,6 +4128,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Setup is handled inline in run() before handle_command")
         }
         Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
+        Commands::Computer(sub) => computer_cmd::handle(sub).await,
         Commands::Cloud(sub) => cloud_cmd::handle(sub),
         Commands::Grape(sub) => tokio::task::spawn_blocking(move || grape_cmd::handle(sub)).await?,
         Commands::Plugin(sub) => handle_plugin_cli(sub),

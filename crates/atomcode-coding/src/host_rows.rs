@@ -1024,7 +1024,7 @@ impl SkillsHostPlugin {
                     loaded.plugins.join(", ")
                 ));
             }
-            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one. The skills-host row can statically auto-load one eligible debugging workflow before a real user turn; auto-load: debugging opts a skill in, auto-load: off opts it out. Its auto_load:false row setting or a user [no-auto-skills] directive disables automatic loading. Automatic context never executes embedded commands or grants allowed-tools.");
+            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one. The skills-host row can statically auto-load one eligible workflow before a real user turn; auto-load: debugging opts into debugging tasks, auto-load: computer-use into explicit desktop tasks, auto-load: off opts out. Its auto_load:false row setting or a user [no-auto-skills] directive disables automatic loading. Automatic context never executes embedded commands or grants allowed-tools.");
         }
         text
     }

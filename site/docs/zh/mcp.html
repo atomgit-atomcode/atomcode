@@ -184,6 +184,36 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </table>
       <p>TUI 下可在会话区看到 <code>✓ MCP server 'github' connected</code> 或 <code>✗ MCP server '…' failed: …</code>。<strong>单个 server 失败不会拖垮其他 server 与主程序。</strong></p>
 
+      <h2 id="image-results">图片结果</h2>
+      <p>MCP 工具返回的内联 <code>image</code> 内容会与文字结果一起传入现有工具图片链路，供支持视觉输入的模型查看。支持 PNG、JPEG、GIF 和 WebP，保留原始图片字节和尺寸，不静默缩放截图。工具返回 <code>isError: true</code> 时仍保留其有效截图和错误标记。</p>
+      <p>图片会校验 Base64、声明的 MIME 类型、实际编码和像素数据。每张图片最多 4 MiB Base64，每次结果最多 4 张、合计 8 MiB Base64；单边最多 8192 像素，总像素最多 1600 万。请求级图片预算还可能进一步裁减历史图片。无效或超限时保留原文字、返回明确的工具错误，不附带部分截图，也不自动重跑已执行的操作；需要更小的截图时，应让服务端裁取目标区域。</p>
+      <p>此能力不包含桌面执行器，不会自动获取屏幕录制或辅助功能权限，也不会替换当前模型。文本模型不会因此获得视觉能力。暂不自动获取图片资源链接或将嵌入资源的 blob 作为截图使用。</p>
+
+      <h2 id="computer-use">CLI 操作 macOS 应用</h2>
+      <p>可通过本地 <a href="https://github.com/opensymph/open-computer-use">Open Computer Use</a> MCP 后端连接桌面。当前集成支持 macOS 14 及以上；截图任务需要当前模型支持视觉。AtomCode 不自动安装后端，也不额外启动一套模型代理。</p>
+      <pre><code># 显式安装固定版本后端（需要 Node.js / npm）
+npm install -g @opensymph/open-computer-use@1.3.0
+
+# 由你打开后端权限向导，为后端应用授予系统权限
+open-computer-use doctor
+
+# 无界面检查；权限齐全后才写入配置
+atomcode computer doctor
+atomcode computer enable
+# 自定义安装位置：上述两个命令均支持 --executable /完整路径/可执行文件</code></pre>
+      <p>在 macOS 系统设置中，为后端应用开启辅助功能和屏幕录制权限。<code>atomcode computer doctor</code> 只做有时限的无界面诊断，不会申请权限或抓屏；缺少权限时 <code>enable</code> 会失败，不写 MCP 配置或技能。它保留其他 MCP 项，拒绝覆盖同名自定义服务或技能，并关闭已知的前台输入与全局指针回退开关。</p>
+      <p>启用后重启 AtomCode，或在当前会话运行 <code>/computer reload</code>。明确的桌面操作请求（如“帮我在 Safari 窗口点击搜索按钮”）会自动加载已安装的 <code>computer-use</code> 静态指导；也可以显式输入 <code>$computer-use 帮我在指定应用中完成任务</code>。自动加载不执行工具、不授予权限，实际调用仍由模型选择并沿用现有 MCP 审批。说明文档、引用示例、代码开发请求和拒绝桌面操作的请求不会触发该规则；匹配不明确时请显式指定技能。<code>[no-auto-skills]</code> 或技能的 <code>auto-load: off</code> 可以关闭自动加载，宿主的 <code>skills-host.auto_load: false</code> 设置也仍然有效。</p>
+      <pre><code>/computer help
+/computer status
+/computer doctor
+/computer enable
+/computer disable
+/computer reload</code></pre>
+      <p>这些 slash 命令在当前会话内委托宿主执行，与终端子命令共用诊断和配置实现。启用、关闭先保存配置；<code>reload</code> 单独通过现有重载流程使其生效，忙碌时会明确拒绝。自定义执行器路径请使用终端的 <code>--executable</code> 参数；不会在 slash 命令中拼接 shell 命令。</p>
+      <pre><code>atomcode computer status
+atomcode computer disable</code></pre>
+      <p><code>status</code> 读取用户配置，不代表当前会话的实时连接状态；项目级同名 MCP 配置仍按既有优先级覆盖用户配置，请用 <code>/mcp</code> 检查。<code>disable</code> 仅禁用本集成管理的用户配置项，并移除未修改的附带技能；运行中的会话需要重新加载。它不是紧急停止命令，无法保证撤回已发出的桌面操作。应用级强制授权、多个代理的桌面互斥和远程取消保证尚未包含，代码 rewind 也不会撤销外部 GUI 效果。</p>
+
       <h2 id="工具命名">工具命名</h2>
       <p>每个远端 tool 注册成 <code>mcp__&lt;server 键名&gt;__&lt;远端 tool 名&gt;</code>。</p>
       <p>例:配置里 <code>"mcpServers": { "github": { ... } }</code>,远端有 <code>get_issue</code>,模型看到的工具名就是 <code>mcp__github__get_issue</code>。</p>

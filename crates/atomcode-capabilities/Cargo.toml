@@ -217,6 +217,7 @@ mcp = [
     # `mcp.json` and `mcp_auth.toml` itself (encrypted, say) and hand them in.
     "dep:atomcode-config",
     "dep:anyhow", "dep:sha2", "dep:uuid", "dep:dirs", "dep:toml", "dep:tempfile",
+    "dep:image", "dep:tracing", "dep:tokio-util",
     "dep:reqwest", "reqwest/blocking", "dep:url",
     "tokio/process", "tokio/io-util",
 ]

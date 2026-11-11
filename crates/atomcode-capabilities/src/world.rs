@@ -797,6 +797,7 @@ pub trait Shell: Send + Sync {
 /// this machine and how is its tree reaped" is several hundred lines of platform
 /// probing with its own tests, and the seam above is the part a *different*
 /// world needs; re-exported here so the worlds are found in one place.
+#[cfg(feature = "tools")]
 pub use crate::tools::bash::LocalShell;
 
 /// The local disk, fenced to a root, optionally read-only.

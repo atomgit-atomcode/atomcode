@@ -2823,6 +2823,58 @@ fn start_with_mcp_server(
     start
 }
 
+/// An inline MCP screenshot must reach the next model request, through the
+/// same event-log projection as pictures produced by built-in tools.
+#[cfg(unix)]
+async fn an_mcp_screenshot_reaches_the_next_model_request() {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==";
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let script = write_mcp_server(env.project.path(), &env.project.path().join("spawns"));
+    let original = std::fs::read_to_string(&script).unwrap();
+    let content = serde_json::json!({"content":[
+        {"type":"text", "text":"captured the target window"},
+        {"type":"image", "mimeType":"image/png", "data":PNG}
+    ], "isError":false})
+    .to_string();
+    let replaced = original.replace(
+        "\"content\":[{\"type\":\"text\",\"text\":\"echo:from-server\"}]",
+        &content[1..content.len() - 1],
+    );
+    assert_ne!(replaced, original, "fixture result must be replaced");
+    std::fs::write(&script, replaced).unwrap();
+    let mut config = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    config.agent.supports_vision = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    turn(&mut runtime, "mcp echo").await;
+    let request = recorder.last_turn_request();
+    let tool = request
+        .iter()
+        .find(|m| m.role == Role::Tool && m.text.contains("captured the target window"))
+        .expect("the text result keeps its tool-call association");
+    assert!(
+        tool.images.is_empty(),
+        "provider tool messages remain text-only"
+    );
+    let pictures: Vec<_> = request
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.images.iter())
+        .collect();
+    assert_eq!(pictures.len(), 1);
+    assert_eq!(pictures[0].media_type, "image/png");
+    assert_eq!(
+        pictures[0].data, PNG,
+        "the next model request sees original screenshot bytes"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// The tools the model was offered in its most recent request.
 fn last_offered(recorder: &Recorder) -> Vec<String> {
     recorder
@@ -6989,6 +7041,8 @@ mod criteria {
         #[cfg(unix)]
         pausing_all_mcp_is_session_local_and_preserves_individual_switches,
         an_mcp_servers_tools_are_offered_and_run,
+        #[cfg(unix)]
+        an_mcp_screenshot_reaches_the_next_model_request,
         reconnecting_one_mcp_keeps_its_neighbor_and_session,
         a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries,
         a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel,

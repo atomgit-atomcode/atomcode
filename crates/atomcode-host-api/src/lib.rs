@@ -25,10 +25,25 @@ use tokio::sync::mpsc;
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::SeqNo;
 
+/// Explicit user intents for the host-local desktop integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComputerAction {
+    Status,
+    Doctor,
+    Enable,
+    Disable,
+}
+
 /// What a front end asks the host to do.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Local desktop MCP setup/diagnosis. This changes configuration only;
+    /// Reload applies it to a live session. Never grants OS or tool permissions.
+    Computer {
+        session: String,
+        action: ComputerAction,
+    },
     /// Host-local hooks configuration preview and explicit script diagnostic.
     Hooks { session: String, args: String },
     /// Explicit user registration of a one-shot same-session follow-up.
@@ -362,7 +377,8 @@ impl HostCommand {
     /// The live session this command acts on, if it acts on one.
     pub fn addressed(&self) -> Option<&str> {
         match self {
-            Self::DisplayHistory { session, .. }
+            Self::Computer { session, .. }
+            | Self::DisplayHistory { session, .. }
             | Self::NewSession { session }
             | Self::Resume { session, .. }
             | Self::TaskSpecs { session, .. }
@@ -1634,6 +1650,22 @@ mod tests {
                 session: "a".into(),
                 args: "list".into(),
             },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::Status,
+            },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::Doctor,
+            },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::Enable,
+            },
+            HostCommand::Computer {
+                session: "a".into(),
+                action: ComputerAction::Disable,
+            },
             HostCommand::ImportPatch {
                 session: "a".into(),
                 bytes: b"patch\r\n".to_vec(),
@@ -1811,7 +1843,8 @@ mod tests {
         ];
         for c in &all {
             match c {
-                HostCommand::DisplayHistory { .. }
+                HostCommand::Computer { .. }
+                | HostCommand::DisplayHistory { .. }
                 | HostCommand::NewSession { .. }
                 | HostCommand::Resume { .. }
                 | HostCommand::SetReasoningEffort { .. }

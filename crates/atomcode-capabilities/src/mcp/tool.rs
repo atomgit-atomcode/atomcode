@@ -182,12 +182,23 @@ impl Tool for McpToolAdapter {
             .call_tool(&self.server, &self.tool, arguments)
             .await
         {
-            Ok(content) => ToolResult {
-                call_id: String::new(),
-                content,
-                is_error: false,
-                images: vec![],
-            },
+            Ok(result) => {
+                if result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, super::types::ContentBlock::Image { .. }))
+                {
+                    tokio::task::spawn_blocking(move || super::result::into_tool_result(result))
+                        .await
+                        .unwrap_or_else(|_| ToolResult {
+                            is_error: true,
+                            content: "MCP tool executed, but image processing failed.".into(),
+                            ..ToolResult::default()
+                        })
+                } else {
+                    super::result::into_tool_result(result)
+                }
+            }
             Err(e) => ToolResult {
                 call_id: String::new(),
                 content: e.to_string(),

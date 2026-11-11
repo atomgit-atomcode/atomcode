@@ -195,8 +195,8 @@ impl Plugin for SkillsPlugin {
                  per-project and per-user skill directories plus anything the \
                  row's `dirs` config adds. To add one, drop a markdown file in \
                  a skill directory and restart; nothing needs recompiling. \
-                 `list_skills` shows what is loaded now. Static debugging workflows can be \
-                 loaded before a user turn; auto-load: debugging opts in, auto-load: off opts out. \
+                 `list_skills` shows what is loaded now. Static task workflows can be \
+                 loaded before a user turn; auto-load: debugging opts into debugging tasks, auto-load: computer-use into explicit desktop tasks; auto-load: off opts out. \
                  The skills row auto_load:false or user [no-auto-skills] disables auto-loading. \
                  Automatic loading executes no embedded commands and grants no allowed-tools."
             ),

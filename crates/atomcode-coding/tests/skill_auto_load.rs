@@ -316,3 +316,42 @@ async fn a_shared_registry_does_not_share_another_agents_loaded_state() {
     drop(ctx);
     mounted.shutdown().await;
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_tasks_load_static_guidance_without_granting_its_allowed_tools() {
+    for risky in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (cfg, opts) = setup(root.path(), "auto-load: computer-use");
+        let provider = Arc::new(RecordingProvider::new(vec![action(), done()]));
+        let mut mounted = support::mount(&cfg, opts, provider.clone()).await;
+        let count = Arc::new(AtomicUsize::new(0));
+        mounted
+            .context()
+            .require::<ToolsSvc>()
+            .unwrap()
+            .register(Arc::new(Probe {
+                count: count.clone(),
+                risky,
+            }))
+            .unwrap();
+        let result =
+            support::turn(&mut mounted.handle, "帮我在 Safari 窗口点击搜索按钮", None).await;
+        assert!(provider
+            .recorded()
+            .iter()
+            .any(|(messages, _, _)| messages.iter().any(|m| m.text.contains(BODY))));
+        if risky {
+            assert!(
+                !result.asked.is_empty(),
+                "desktop context must preserve approval: {result:?}"
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(result.error.is_none(), "{result:?}");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+        let log = mounted.context().only_session().unwrap();
+        assert!(log.events().iter().any(|e| matches!(&e.event, SessionEvent::Injected { origin: InjectionOrigin::Reminder, text, .. } if text.contains(BODY))));
+        mounted.shutdown().await;
+    }
+}

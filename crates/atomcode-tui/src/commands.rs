@@ -993,6 +993,24 @@ fn session_catalogue() -> Vec<Command> {
         Command::said("cost", t(Msg::CmdAboutCost)),
         Command::said("usage", t(Msg::CmdAboutUsage)),
         Command::said_taking("mcp", t(Msg::CmdTakesMcp), t(Msg::CmdAboutMcp)),
+        Command::said_taking(
+            "computer",
+            t(Msg::CmdTakesComputer),
+            t(Msg::CmdAboutComputer),
+        )
+        .selecting(
+            [
+                ("status", Msg::ComputerStatusAbout),
+                ("doctor", Msg::ComputerDoctorAbout),
+                ("enable", Msg::ComputerEnableAbout),
+                ("disable", Msg::ComputerDisableAbout),
+                ("reload", Msg::ComputerReloadAbout),
+                ("help", Msg::ComputerHelpAbout),
+            ]
+            .into_iter()
+            .map(|(value, about)| CommandOption::new(value, t(about)))
+            .collect(),
+        ),
         Command::said("language", t(Msg::CmdAboutLanguage)).selecting(language_options()),
         Command::said("reload", t(Msg::CmdAboutReload)),
         Command::said("logout", t(Msg::CmdAboutLogout)),
@@ -2797,6 +2815,44 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
+            "computer" => {
+                use atomcode_host_api::ComputerAction;
+                let action = match args.trim().to_ascii_lowercase().as_str() {
+                    "help" | "--help" | "-h" => {
+                        return Outcome::Said(t(Msg::ComputerHelp).into_owned())
+                    }
+                    "reload" => {
+                        if let Some(why) = waits_for_the_turn("computer reload") {
+                            return why;
+                        }
+                        let control = match host(control) {
+                            Ok(c) => c,
+                            Err(e) => return e,
+                        };
+                        return mcp(control, root, "reload", "").await;
+                    }
+                    "" | "status" => ComputerAction::Status,
+                    "doctor" => ComputerAction::Doctor,
+                    "enable" => ComputerAction::Enable,
+                    "disable" => ComputerAction::Disable,
+                    _ => return Outcome::Refused(t(Msg::ComputerHelp).into_owned()),
+                };
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                match control
+                    .call(HostCommand::Computer {
+                        session: root,
+                        action,
+                    })
+                    .await
+                {
+                    Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
+                    Ok(other) => Outcome::Refused(format!("unexpected host reply: {other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "mcp" => {
                 // 无参要的是那块面板,不是一列文本(设计 §5.1):它读的端口是面板自己的,
                 // 而命令这一层连不上宿主——所以举起动作,由插件那一侧升起它(`/toolbox`
@@ -4414,6 +4470,7 @@ mod tests {
             "/rewind",
             "/rewind 1",
             "/reload",
+            "/computer reload",
         ] {
             let host = Arc::new(Recording::default());
             let (app, client, all) = following(&host);
@@ -5139,6 +5196,80 @@ mod tests {
                 HostCommand::SignOut { session: lead() },
                 HostCommand::SignIn { session: lead() },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_commands_are_local_host_intents_and_reload_is_explicit() {
+        use atomcode_host_api::ComputerAction;
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        let catalogue = SessionCommands.commands();
+        let command = catalogue.iter().find(|c| c.name == "computer").unwrap();
+        assert_eq!(
+            command
+                .options
+                .iter()
+                .map(|o| o.value.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["status", "doctor", "enable", "disable", "reload", "help"]
+        );
+        for (verb, action) in [
+            ("", ComputerAction::Status),
+            ("status", ComputerAction::Status),
+            ("doctor", ComputerAction::Doctor),
+            ("enable", ComputerAction::Enable),
+            ("disable", ComputerAction::Disable),
+        ] {
+            host.replies
+                .lock()
+                .unwrap()
+                .push_back(Ok(HostReply::DoneWithNote {
+                    note: "configuration only".into(),
+                }));
+            let out = all
+                .dispatch(&format!("/computer {verb}"), &app.context())
+                .await;
+            assert!(matches!(out, Outcome::Said(text) if text == "configuration only"));
+            assert_eq!(
+                host.asked.lock().unwrap().last(),
+                Some(&HostCommand::Computer {
+                    session: "lead".into(),
+                    action
+                })
+            );
+        }
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            5,
+            "no implicit reload or desktop action"
+        );
+        for arg in [
+            "help",
+            "--help",
+            "unknown",
+            "enable extra",
+            "doctor --executable /tmp/custom",
+        ] {
+            let out = all
+                .dispatch(&format!("/computer {arg}"), &app.context())
+                .await;
+            assert!(matches!(out, Outcome::Said(_) | Outcome::Refused(_)));
+            assert_eq!(host.asked.lock().unwrap().len(), 5, "{arg}");
+        }
+        all.dispatch("/computer reload", &app.context()).await;
+        assert!(
+            matches!(&host.asked.lock().unwrap()[5], HostCommand::Reload { session } if session == "lead")
+        );
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Err(HostError::Failed {
+                message: "permissions incomplete".into(),
+            }));
+        assert!(
+            matches!(all.dispatch("/computer enable", &app.context()).await, Outcome::Refused(text) if text == "permissions incomplete")
         );
     }
 
