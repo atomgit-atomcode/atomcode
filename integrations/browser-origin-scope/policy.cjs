@@ -12,11 +12,17 @@ const TOOLS = new Set([
   'browser_hover', 'browser_select_option', 'browser_tabs', 'browser_wait_for',
 ]);
 
+const policyMetadata = new WeakMap();
+function policyDetails(origins) {
+  return policyMetadata.get(origins) || { version: 1, downloads: new Set() };
+}
+
 function parsePolicy(raw) {
   if (typeof raw !== 'string' || Buffer.byteLength(raw) > 65536)
     throw new Error('A bounded explicit browser origin policy is required');
   let policy;
   try { policy = JSON.parse(raw); } catch { throw new Error('Invalid browser origin policy JSON'); }
+  if (policy?.version === 2) return parseTransferPolicy(policy);
   if (!policy || Array.isArray(policy) || policy.version !== 1 ||
       Object.keys(policy).some(key => !['version', 'origins'].includes(key)) ||
       !Array.isArray(policy.origins) || policy.origins.length > 256)
@@ -35,6 +41,36 @@ function parsePolicy(raw) {
   }
   return origins;
 }
+
+function parseTransferPolicy(policy) {
+  if (Object.keys(policy).some(key => !['version', 'origins'].includes(key)) ||
+      !policy.origins || typeof policy.origins !== 'object' || Array.isArray(policy.origins) ||
+      Object.keys(policy.origins).length > 256)
+    throw new Error('Expected a bounded exact-origin permission map');
+  const origins = new Set(), downloads = new Set(), seen = new Set();
+  for (const [value, permissions] of Object.entries(policy.origins)) {
+    const [origin] = parsePolicy(JSON.stringify({ version: 1, origins: [value] }));
+    if (seen.has(origin)) throw new Error('Duplicate canonical browser origin');
+    seen.add(origin);
+    if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions) ||
+        Object.keys(permissions).some(key => !['access', 'downloads', 'uploads', 'full_cdp_access'].includes(key)) ||
+        Object.values(permissions).some(value => !['allow', 'deny'].includes(value)) ||
+        permissions.uploads === 'allow' || permissions.full_cdp_access === 'allow' ||
+        (permissions.downloads === 'allow' && permissions.access !== 'allow'))
+      throw new Error('Unsupported or inconsistent browser origin permissions');
+    if (permissions.access === 'allow') origins.add(origin);
+    if (permissions.downloads === 'allow') downloads.add(origin);
+  }
+  policyMetadata.set(origins, { version: 2, downloads });
+  return origins;
+}
+
+const DOWNLOAD_TOOL = {
+  name: 'browser_download',
+  description: 'Download an explicit HTTP(S) URL using the backend controlled publisher. Requires access and download grants at every redirect. This initial tool is unauthenticated: browser cookies and caller headers are not forwarded. Browser implicit downloads remain disabled. Use this tool initially for a known download link; never automatically retry an uncertain or previously dispatched download. Returns a generated artifact path, byte count and SHA-256; no caller filename, blob URL, upload or CDP access.',
+  inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'], additionalProperties: false },
+  annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: true },
+};
 
 function permittedUrl(value, origins, protocols = ['http:', 'https:']) {
   if (typeof value !== 'string' || /[\x00-\x20\x7f]/.test(value)) return null;
@@ -189,10 +225,24 @@ async function createProxy(origins) {
 
 // Public MCP Transport interface; no private SDK handlers/state are changed.
 class PolicyTransport {
-  constructor(inner, origins, closeBrowser) { this.inner = inner; this.origins = origins; this.closeBrowser = closeBrowser; }
+  constructor(inner, origins, closeBrowser, downloads) {
+    this.inner = inner; this.origins = origins; this.closeBrowser = closeBrowser; this.downloads = downloads;
+  }
   async start() {
     this.inner.onmessage = (message, extra) => {
       if (message.method === 'tools/call' && !Object.hasOwn(message, 'id')) return;
+      if (message.method === 'notifications/cancelled' && this.downloads?.has(message.params?.requestId)) {
+        this.downloads.cancel(message.params.requestId);
+        return;
+      }
+      if (message.method === 'tools/call' && message.params?.name === DOWNLOAD_TOOL.name && this.downloads) {
+        void this.downloads.execute(message.id, message.params.arguments).then(artifact =>
+          this.inner.send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: JSON.stringify(artifact) }] } }),
+          () => this.inner.send({ jsonrpc: '2.0', id: message.id, result: { isError: true, content: [{ type: 'text',
+            text: 'Download failed or cancelled; do not automatically retry: the request may have had effects' }] } }))
+          .catch(error => this.onerror?.(error));
+        return;
+      }
       if (message.method === 'tools/call' && !allowedCall(message.params, this.origins)) {
         if (Object.hasOwn(message, 'id')) void this.inner.send({ jsonrpc: '2.0', id: message.id,
           error: { code: -32602, message: 'Browser policy refused this tool or its arguments' } }).catch(error => this.onerror?.(error));
@@ -225,6 +275,7 @@ class PolicyTransport {
           inputSchema.required = inputSchema.required.filter(key => key !== 'filename' && key !== '_meta');
         return { ...tool, inputSchema };
       });
+      if (this.downloads) tools.push(structuredClone(DOWNLOAD_TOOL));
       message = { ...message, result: { ...message.result, tools } };
     }
     return this.inner.send(message, options);
@@ -232,4 +283,4 @@ class PolicyTransport {
   async close() { await this.inner.close(); }
 }
 
-module.exports = { CAPABILITY, POLICY_ENV, TOOLS, parsePolicy, permittedUrl, allowedCall, createProxy, PolicyTransport };
+module.exports = { CAPABILITY, POLICY_ENV, TOOLS, parsePolicy, policyDetails, permittedUrl, allowedCall, createProxy, PolicyTransport };

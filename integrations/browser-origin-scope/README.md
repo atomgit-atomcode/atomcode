@@ -21,7 +21,7 @@ Version 1 permits the listed origins and fixes these additional restrictions:
 - No accepted download artifacts (`acceptDownloads:false`); HTTP attachment responses are also refused. HTTPS traffic is not decrypted by the proxy, so this is **not** a claim that no download response bytes enter Chrome. Blob/HTTPS download persistence is tested. Normal page reads, text forms and their effects at permitted sites remain possible.
 - No caller-chosen artifact filenames or `_meta` argument overrides. Discovery removes these unsupported properties/required entries from the upstream tool schema; direct calls still reject them. Generated screenshots/snapshots use the explicit output root’s `files` directory. The root must be empty or carry this backend’s recognized ownership marker; foreign nonempty directories, leaf symlinks and filesystem roots are refused. Retention never touches the marker or unrelated directories. This is not a filesystem sandbox against the external runtime or another process.
 
-Unsupported allow settings for uploads/downloads/CDP are rejected as unknown policy fields. Do not treat this fixed-denial prototype as the complete per-origin permission matrix.
+Version 1 rejects additional permission fields. Version 2 below adds explicit controlled HTTP(S) downloads; upload and full-CDP allow settings still fail closed. Do not treat this fixed-denial prototype as the complete per-origin permission matrix.
 
 ## Execution and lifecycle
 
@@ -141,7 +141,7 @@ The [WebUI image report](../../docs/plans/2026-11-12-webui-tool-images.md) recor
 
 ## Download expansion: completed-artifact counterexample
 
-Per-origin allow settings still are not a supported production mode. The [publication-boundary decision](../../docs/adr/0032-origin-downloads-remain-backend-owned.md) records why a download-event cancel listener is insufficient: in a real delayed-event case, cancel resolves but the pinned MCP still saves an already completed denied artifact. The unshipped v2 draft was withdrawn; v1 keeps acceptDownloads=false and HTTP attachment refusal.
+The original cancellation-based per-origin download draft was rejected. The current v2 implementation instead owns the explicit HTTP(S) download publication path. The [publication-boundary decision](../../docs/adr/0032-origin-downloads-remain-backend-owned.md) records why a download-event cancel listener is insufficient: in a real delayed-event case, cancel resolves but the pinned MCP still saves an already completed denied artifact. That event-gate draft was withdrawn; both current policy versions retain acceptDownloads=false and HTTP attachment refusal for browser actions.
 
 Run the source-only opt-in characterization on the recorded macOS host:
 
@@ -153,4 +153,32 @@ node integrations/browser-origin-scope/characterize-downloads.cjs \
 
 The report path must be new. This is a test, never an MCP backend to register: it intentionally enables automatic downloads only inside isolated synthetic loopback TLS fixtures, pins only their ephemeral certificate, and preserves one denied fixture payload as the negative-control evidence. Ordinary samples (one allowed and seven denied/redirects) look successful; a separate one-second delayed event exposes the completed-download race. The delay represents possible scheduling latency, not a measured frequency. Report data includes actual external runtime/source hashes, verifier hash, cases, cancellation events and exact captured process cleanup. Owned fixture/artifact directories remain private outside Git; no personal browser, model call, user configuration or OS grant is used.
 
-Future transfer support must own validation and artifact publication rather than infer authorization from cancellation success. Explicit origin validation at every redirect, blob handling, authenticated context, file capabilities for uploads, full-CDP boundaries and managed setup remain required work.
+The explicit publisher below now owns validation at every redirect and artifact publication. Further transfer support must preserve that boundary; blob handling, authenticated context, file capabilities for uploads, full-CDP boundaries and managed v2 setup remain required work.
+
+
+## Version 2 controlled downloads
+
+A separately named explicit experimental MCP entry can select this policy:
+
+```json
+{"version":2,"origins":{"https://example.test":{"access":"allow","downloads":"allow","uploads":"deny","full_cdp_access":"deny"},"https://read-only.test":{"access":"allow","downloads":"deny"}}}
+```
+
+Set its `ATOMCODE_BROWSER_ORIGIN_POLICY` environment value to that JSON string and `requiredExperimentalCapabilities` to `{"atomcode/browser-origin-scope":2}`. Keep `trust:false`, `autoApprove:[]`, the absolute backend script/package paths and owned output directory shown above. The managed CLI/slash setup still supports v1 only; do not manually replace the managed entry with v2, since its status/enable checks deliberately reject unsupported metadata.
+
+Omitted permissions deny. Access and download grants are required at **every** HTTP(S) redirect. Duplicate canonical origins and upload/full-CDP allow settings are refused. Only policies with at least one download grant advertise `browser_download`; direct calls to it otherwise fail. Its only argument is `url`. It writes complete identity-encoded HTTP 200 responses up to 64 MiB into private staging, then publishes an exclusive generated `.bin` path and reports byte count/SHA-256. Response filenames, caller paths/headers and URL credentials are never accepted. Compressed responses and blob URLs fail closed in this initial implementation. Browser cookies are **not** forwarded: authenticated-context downloads remain unfinished.
+
+Normal navigation/click downloads remain disabled, even with a grant. Invoke the explicit tool initially for a known link, rather than automatically fetching a URL after an uncertain browser action. Download GETs can have remote effects. Cancellation or failure never retries automatically; cancellation before publication leaves no accepted artifact. Once publication commits, a lost response or late cancellation cannot undo the file, so an uncertain result must be re-observed rather than replayed. Existing SDK artifact retention may later evict files; this is not durable personal document storage.
+
+MCP cancellation notifications target the owned request ID. `browser_close` drains transfers and awaits browser cleanup before completing; later explicit work is possible. EOF/output loss/termination permanently fences new work and drains owned transfers. These controls add no Node, Chrome or npm dependencies to AtomCode's package.
+
+Run both fast suites and opt-in actual MCP/isolated Chrome acceptance:
+
+```sh
+node --test integrations/browser-origin-scope/policy.test.cjs integrations/browser-origin-scope/transfers.test.cjs
+node integrations/browser-origin-scope/verify-downloads.cjs \
+  --backend-root /absolute/installed/node_modules/@playwright/mcp \
+  --report /absolute/new-controlled-download-report.json
+```
+
+The verifier uses synthetic loopback HTTP fixtures and a private temporary output tree. It checks bytes/hash, denied redirects before dispatch, argument refusal, cancellation without replay, browser implicit download denial, close/reuse and pure EOF. HTTPS certificate failure, authenticated downloads, blob/compression support, native runtime turn cancellation of this new tool, managed v2 setup and the complete upload/CDP matrix still require further implementation/acceptance. It does not open a personal profile or change OS grants.

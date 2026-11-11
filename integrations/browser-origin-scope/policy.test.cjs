@@ -238,3 +238,57 @@ test('artifact ownership refuses foreign contents before chmod or retention and 
     }
   } finally {fs.rmSync(temp,{recursive:true,force:true});}
 });
+
+test('v2 permission maps preserve independent grants and refuse unsupported allows', () => {
+  const { policyDetails } = require('./policy.cjs');
+  const origins = parsePolicy(JSON.stringify({ version: 2, origins: {
+    'https://EXAMPLE.test:443/': { access: 'allow', downloads: 'allow', uploads: 'deny', full_cdp_access: 'deny' },
+    'https://read.test': { access: 'allow' }, 'https://denied.test': { access: 'deny' },
+  } }));
+  assert.deepEqual([...origins], ['https://example.test', 'https://read.test']);
+  assert.equal(policyDetails(origins).version, 2);
+  assert.deepEqual([...policyDetails(origins).downloads], ['https://example.test']);
+  for (const permissions of [null, [], { access: true }, { downloads: 'allow' },
+    { access: 'allow', uploads: 'allow' }, { access: 'allow', full_cdp_access: 'allow' }, { access: 'allow', extra: 'deny' }])
+    assert.throws(() => parsePolicy(JSON.stringify({ version: 2, origins: { 'https://a.test': permissions } })));
+  assert.throws(() => parsePolicy(JSON.stringify({ version: 2, origins: {
+    'https://a.test': { access: 'allow' }, 'https://A.test:443/': { access: 'deny' },
+  } })));
+  assert.equal(policyDetails(parsePolicy('{"version":1,"origins":[]}')).version, 1);
+});
+
+test('download transport owns cancellation and its terminal without SDK dispatch', async t => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const { ControlledDownloads } = require('./transfers.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomcode-transfer-wire-'));
+  const files = path.join(root, 'files'); fs.mkdirSync(files);
+  let arrived;
+  const ready = new Promise(resolve => { arrived = resolve; });
+  let requests = 0;
+  const server = http.createServer((_req, res) => { requests++; res.write('partial'); arrived(); });
+  const port = await listen(server), origin = `http://127.0.0.1:${port}`;
+  const downloads = new ControlledDownloads({ files, authorize: value => value === origin });
+  t.after(async () => { await downloads.close(); await close(server); fs.rmSync(root, { recursive: true }); });
+  const sent = [], delivered = [];
+  const inner = { async start() {}, async send(message) { sent.push(message); } };
+  const transport = new PolicyTransport(inner, new Set([origin]), () => downloads.drain(async () => {}), downloads);
+  transport.onmessage = message => delivered.push(message);
+  await transport.start();
+  await transport.send({ jsonrpc: '2.0', id: 0, result: { tools: [] } });
+  assert.equal(sent[0].result.tools[0].name, 'browser_download');
+  assert.equal(sent[0].result.tools[0].annotations.readOnlyHint, false);
+  inner.onmessage({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'browser_download', arguments: { url: origin } } });
+  assert.equal(downloads.jobs.size, 0);
+  inner.onmessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_download', arguments: { url: origin } } });
+  await ready;
+  inner.onmessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1 } });
+  await downloads.drain(async () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(delivered.length, 0);
+  assert.equal(sent.filter(message => message.id === 1).length, 1);
+  assert.equal(sent.find(message => message.id === 1).result.isError, true);
+  assert.equal(requests, 1);
+  assert.deepEqual(fs.readdirSync(files), []);
+  inner.onmessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 99 } });
+  assert.equal(delivered.length, 1);
+});

@@ -5,7 +5,9 @@ const fs = require('node:fs');
 const { createHash } = require('node:crypto');
 const path = require('node:path');
 const { createRequire } = require('node:module');
-const { CAPABILITY, POLICY_ENV, parsePolicy, createProxy, PolicyTransport } = require('./policy.cjs');
+const { CAPABILITY, POLICY_ENV, parsePolicy, policyDetails, createProxy, PolicyTransport } = require('./policy.cjs');
+
+const { ControlledDownloads } = require('./transfers.cjs');
 
 const MCP_VERSION = '0.0.85';
 const CORE_VERSION = '1.66.0-alpha-2026-11-09';
@@ -113,18 +115,27 @@ function ownedBrowser(chromium, origins, headed) {
 async function serve({ root, outputDir, origins, headed = false }) {
   const external = loadBackend(root);
   const files = prepareOutput(outputDir);
+  const policy = policyDetails(origins);
+  const downloads = policy.downloads.size ? new ControlledDownloads({
+    files, authorize: origin => origins.has(origin) && policy.downloads.has(origin),
+  }) : undefined;
   const owner = ownedBrowser(external.chromium, origins, headed);
+  const closeOwned = permanent => {
+    // Fence browser launches synchronously, before awaiting transfer teardown.
+    const closing = owner.close(permanent);
+    return downloads ? downloads.drain(() => closing, permanent) : closing;
+  };
   const server = await external.createConnection({ browser: { isolated: false },
     webmcp: false, extension: false, capabilities: [], ignoreRoots: true,
     allowUnrestrictedFileAccess: false, saveSession: false,
     imageResponses: 'allow', outputDir: files, outputMaxSize: 16777216,
     timeouts: { action: 5000, navigation: 10000, idle: 0 },
   }, owner.get);
-  server.registerCapabilities({ experimental: { [CAPABILITY]: { version: 1 } } });
+  server.registerCapabilities({ experimental: { [CAPABILITY]: { version: policy.version } } });
   let stopPromise;
   const stop = () => stopPromise ||= (async () => {
     // Mark closing before awaiting SDK disposal, so late calls cannot launch a replacement.
-    const closing = owner.close(true);
+    const closing = closeOwned(true);
     await server.close().catch(() => {});
     await closing;
   })();
@@ -132,9 +143,9 @@ async function serve({ root, outputDir, origins, headed = false }) {
   server.onclose = () => {
     oldClose?.();
     const deadline = setTimeout(() => process.exit(1), 5000);
-    void owner.close(true).then(() => clearTimeout(deadline), () => process.exit(1));
+    void closeOwned(true).then(() => clearTimeout(deadline), () => process.exit(1));
   };
-  await server.connect(new PolicyTransport(new external.StdioServerTransport(), origins, () => owner.close()));
+  await server.connect(new PolicyTransport(new external.StdioServerTransport(), origins, () => closeOwned(false), downloads));
   return { stop };
 }
 
@@ -158,9 +169,9 @@ async function main() {
   const origins = parsePolicy(process.env[POLICY_ENV]);
   const external = loadBackend(config.root);
   if (config.doctor) {
-    console.log(JSON.stringify({ version: 1, kind: 'doctor', browser_launched: false,
+    console.log(JSON.stringify({ version: policyDetails(origins).version, kind: 'doctor', browser_launched: false,
       mcp: MCP_VERSION, playwright: CORE_VERSION, capability: CAPABILITY,
-      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny' }));
+      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny' }));
     return;
   }
   if (!config.outputDir) throw new Error('--output-dir is required');

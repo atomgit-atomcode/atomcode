@@ -165,3 +165,16 @@ test('credentials, non-HTTP URLs and malformed redirects never publish', async t
   assert.equal(f.requests(), 1);
   assert.deepEqual(fs.readdirSync(f.files), []);
 });
+
+test('browser-close drain fences replacement work until cleanup completes', async t => {
+  const f = await fixture(t, (_req, res) => res.end('ok'));
+  let release, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const cleanup = new Promise(resolve => { release = resolve; });
+  const closing = f.owner.drain(async () => { entered(); await cleanup; });
+  await ready;
+  await assert.rejects(f.owner.execute(1, { url: f.origin }));
+  release(); await closing;
+  const result = await f.owner.execute(2, { url: f.origin });
+  assert.equal(fs.readFileSync(result.path, 'utf8'), 'ok');
+});

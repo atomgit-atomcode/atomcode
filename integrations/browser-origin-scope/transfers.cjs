@@ -8,8 +8,8 @@ const { randomUUID, createHash } = require('node:crypto');
 const { Transform, Writable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 
-// Internal boundary, deliberately not advertised as an MCP tool until the
-// policy/transport integration also owns cancellation and shutdown.
+// Backend-owned publication boundary. Transport cancellation and shutdown
+// must drain jobs here before disposing the owned browser.
 class ControlledDownloads {
   constructor({ files, authorize, maxBytes = 64 * 1024 * 1024, timeoutMs = 15000 }) {
     if (!path.isAbsolute(files) || !Number.isSafeInteger(maxBytes) || maxBytes <= 0 ||
@@ -21,6 +21,7 @@ class ControlledDownloads {
     this.timeoutMs = timeoutMs;
     this.jobs = new Map();
     this.closed = false;
+    this.draining = 0;
     this.checkDirectory(files);
     this.staging = path.join(path.dirname(files), 'download-staging');
     try { fs.mkdirSync(this.staging, { mode: 0o700 }); }
@@ -36,7 +37,7 @@ class ControlledDownloads {
   }
 
   execute(id, args) {
-    if (this.closed || this.jobs.has(id)) return Promise.reject(new Error('Download unavailable'));
+    if (this.closed || this.draining || this.jobs.has(id)) return Promise.reject(new Error('Download unavailable'));
     if (!args || typeof args !== 'object' || Array.isArray(args) ||
         Object.keys(args).length !== 1 || !Object.hasOwn(args, 'url'))
       return Promise.reject(new Error('Expected only a download URL'));
@@ -51,13 +52,21 @@ class ControlledDownloads {
     return job.promise;
   }
 
+  has(id) { return this.jobs.has(id); }
+
   cancel(id) { this.jobs.get(id)?.controller.abort(); }
 
-  async close() {
-    this.closed = true;
-    const pending = [...this.jobs.values()];
-    for (const job of pending) job.controller.abort();
-    await Promise.allSettled(pending.map(job => job.promise));
+  close() { return this.drain(async () => {}, true); }
+
+  async drain(closeBrowser, permanent = false) {
+    if (permanent) this.closed = true;
+    this.draining++;
+    try {
+      const pending = [...this.jobs.values()];
+      for (const job of pending) job.controller.abort();
+      await Promise.allSettled(pending.map(job => job.promise));
+      await closeBrowser();
+    } finally { this.draining--; }
   }
 
   permitted(value) {
