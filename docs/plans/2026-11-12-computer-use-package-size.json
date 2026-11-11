@@ -1,0 +1,305 @@
+{
+  "target": "aarch64-apple-darwin",
+  "profile": "release default features, no private crypto overlay, embedded built frontend",
+  "comparisons": {
+    "initial_to_current": {
+      "raw_bytes": {
+        "before": 40983568,
+        "after": 41234000,
+        "delta": 250432,
+        "delta_percent": 0.6110546548802193
+      },
+      "tar_gz_bytes": {
+        "before": 12800596,
+        "after": 12965947,
+        "delta": 165351,
+        "delta_percent": 1.2917445406448262
+      },
+      "frontend_bytes": {
+        "before": 1945075,
+        "after": 1945906,
+        "delta": 831,
+        "delta_percent": 0.04272328830507821
+      },
+      "npm_core": {
+        "before": 1255,
+        "after": 1255,
+        "delta": 0,
+        "delta_percent": 0.0
+      },
+      "npm_platform": {
+        "before": 13090203,
+        "after": 13261001,
+        "delta": 170798,
+        "delta_percent": 1.304777320871189
+      }
+    },
+    "baseline_to_current": {
+      "raw_bytes": {
+        "before": 41133936,
+        "after": 41234000,
+        "delta": 100064,
+        "delta_percent": 0.24326385882449955
+      },
+      "tar_gz_bytes": {
+        "before": 12893247,
+        "after": 12965947,
+        "delta": 72700,
+        "delta_percent": 0.5638610661844917
+      },
+      "frontend_bytes": {
+        "before": 1945075,
+        "after": 1945906,
+        "delta": 831,
+        "delta_percent": 0.04272328830507821
+      },
+      "npm_core": {
+        "before": 1255,
+        "after": 1255,
+        "delta": 0,
+        "delta_percent": 0.0
+      },
+      "npm_platform": {
+        "before": 13185560,
+        "after": 13261001,
+        "delta": 75441,
+        "delta_percent": 0.5721486231908239
+      }
+    }
+  },
+  "normalized_gzip_level": 6,
+  "other_platform_sizes_verified": false,
+  "whole_delivery_complete": false,
+  "observed_workspace_version": "5.2.6",
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)\nbinary: rustc\ncommit-hash: 4a4ef493e3a1488c6e321570238084b38948f6db\ncommit-date: 2026-03-02\nhost: aarch64-apple-darwin\nrelease: 1.94.0\nLLVM version: 21.1.8",
+  "node": "v22.22.0",
+  "macos_sdk": "14.5",
+  "source_interval": {
+    "initial": "eb424a4bec9cb3ff1bf516d506c8c662f7fc3426",
+    "current": "75c9c8c71",
+    "changed_paths": 193,
+    "binary_diff_paths": [],
+    "patch_bytes": 1378169,
+    "commit_count": 43,
+    "local_non_thin_git_pack_bytes": 2891091,
+    "local_git_pack_sha256": "dc59b8b0379b8952f2e413501f3b403cc5e19187ac2e23c38479d7e5bf3d669c",
+    "git_index_pack_validation": "7e206ed351cac2f562bd7b052d81fbe576d7bbc0",
+    "actual_push_bytes_measured": false
+  },
+  "publisher_signing_or_notarization_performed": false,
+  "private_crypto_overlay": false,
+  "registry_install_or_publish_performed": false,
+  "rendered_ui_verified": false,
+  "results": {
+    "initial": {
+      "revision": "eb424a4bec9cb3ff1bf516d506c8c662f7fc3426",
+      "raw_bytes": 40983568,
+      "raw_sha256": "647438f75f28b46323e0a32e71ce77d307588c27225d0ea0eb56fdf3bd20a534",
+      "tar_gz_bytes": 12800596,
+      "tar_gz_sha256": "958ebb38d0b2f71e02f7c2db84694cfb02e3fa01caed623bd1ebe0e5d6d654f0",
+      "frontend_bytes": 1945075,
+      "version": "atomcode 5.2.6 (eb424a4be)",
+      "wrapper_version_matches": true,
+      "cargo_fingerprint": {
+        "rustc": 10088478398040096810,
+        "features": "[\"default\"]",
+        "declared_features": "[\"codingplan-crypto\", \"default\", \"distro-pm\"]",
+        "profile": 12833233019932215290,
+        "rustflags": [],
+        "config": 8247474407144887393,
+        "compile_kind": 551198452465029181
+      },
+      "npm": {
+        "core": {
+          "bytes": 1255,
+          "sha256": "882b52bb8d61434bd4f30ef60e412d6cf27d8514f59b92c1bbe6db97d10063e3",
+          "unpacked_bytes": 2886,
+          "members": [
+            {
+              "path": "package/bin/atomcode.js",
+              "bytes": 1886,
+              "sha256": "4b6538a6ad95b6716b311bfb22b5b50e1029506d4305fbed72e011427d3c221c"
+            },
+            {
+              "path": "package/package.json",
+              "bytes": 1000,
+              "sha256": "12843c74c49e375b85bd5d9aa4f7a134ca2b2f348499db0e6a71a822c10e2699"
+            }
+          ]
+        },
+        "platform": {
+          "bytes": 13090203,
+          "sha256": "e73acba7f86f6f6b1b0f48558de04296ddc625b088eeb2fd41041f936b984e63",
+          "unpacked_bytes": 40983717,
+          "members": [
+            {
+              "path": "package/bin/atomcode",
+              "bytes": 40983568,
+              "sha256": "647438f75f28b46323e0a32e71ce77d307588c27225d0ea0eb56fdf3bd20a534"
+            },
+            {
+              "path": "package/package.json",
+              "bytes": 149,
+              "sha256": "14a799113738818217710300a95420127deeebb73b47904220a565607fd5e79b"
+            }
+          ]
+        }
+      },
+      "embedded_http_assets_verified": 42,
+      "frontend_manifest_sha256": "ca73041bd6f6ab8daa7ec814b81e01a50cf0c43e1e07ae4178db42dd2054b8db",
+      "release_build_real_seconds": 402.86,
+      "settings_sha256": {
+        "Cargo.toml": "2a1bbc840255979de6952bc02093e9d4f1bfa37449b160395fd5c32fca68dfcb",
+        "Cargo.lock": "629074274401c850f871256caf4e6c53aa742cff2712a036880455946ee0c2d2",
+        ".cargo/config.toml": "8c771d563f61bda90bff1d5b087b19b21f6702b6c091716cbe3d661d2e93f493",
+        "webui/package.json": "ac8e618f18e4862de1986275857029798ed853d2a48870722f471627b5c0f73c",
+        "webui/package-lock.json": "fc97d4f3d56db12b00fe2be1e803e45cf0ffdb35f5ae565abc45b0054999cf80"
+      }
+    },
+    "baseline": {
+      "revision": "8966af16540127cc28f30a6b81a910e75458f9e5",
+      "raw_bytes": 41133936,
+      "raw_sha256": "9ead1e8a672b02b0230e6b0ce1095fdd3ba07939a072449893e08c556ad241af",
+      "tar_gz_bytes": 12893247,
+      "tar_gz_sha256": "54c4c39428ebd3d9f89f269453c21e4921e2e6157cb98f9a177920b21ac935ad",
+      "frontend_bytes": 1945075,
+      "version": "atomcode 5.2.6 (8966af165)",
+      "wrapper_version_matches": true,
+      "cargo_fingerprint": {
+        "rustc": 10088478398040096810,
+        "features": "[\"default\"]",
+        "declared_features": "[\"codingplan-crypto\", \"default\", \"distro-pm\"]",
+        "profile": 12833233019932215290,
+        "rustflags": [],
+        "config": 8247474407144887393,
+        "compile_kind": 551198452465029181
+      },
+      "npm": {
+        "core": {
+          "bytes": 1255,
+          "sha256": "882b52bb8d61434bd4f30ef60e412d6cf27d8514f59b92c1bbe6db97d10063e3",
+          "unpacked_bytes": 2886,
+          "members": [
+            {
+              "path": "package/bin/atomcode.js",
+              "bytes": 1886,
+              "sha256": "4b6538a6ad95b6716b311bfb22b5b50e1029506d4305fbed72e011427d3c221c"
+            },
+            {
+              "path": "package/package.json",
+              "bytes": 1000,
+              "sha256": "12843c74c49e375b85bd5d9aa4f7a134ca2b2f348499db0e6a71a822c10e2699"
+            }
+          ]
+        },
+        "platform": {
+          "bytes": 13185560,
+          "sha256": "88709198fe3ddfc14a0af7ddf21ab2f0fe7633341923119cdb9a6506070a1b20",
+          "unpacked_bytes": 41134085,
+          "members": [
+            {
+              "path": "package/bin/atomcode",
+              "bytes": 41133936,
+              "sha256": "9ead1e8a672b02b0230e6b0ce1095fdd3ba07939a072449893e08c556ad241af"
+            },
+            {
+              "path": "package/package.json",
+              "bytes": 149,
+              "sha256": "14a799113738818217710300a95420127deeebb73b47904220a565607fd5e79b"
+            }
+          ]
+        }
+      },
+      "embedded_http_assets_verified": 42,
+      "frontend_manifest_sha256": "ca73041bd6f6ab8daa7ec814b81e01a50cf0c43e1e07ae4178db42dd2054b8db",
+      "release_build_real_seconds": 404.19,
+      "settings_sha256": {
+        "Cargo.toml": "2a1bbc840255979de6952bc02093e9d4f1bfa37449b160395fd5c32fca68dfcb",
+        "Cargo.lock": "629074274401c850f871256caf4e6c53aa742cff2712a036880455946ee0c2d2",
+        ".cargo/config.toml": "8c771d563f61bda90bff1d5b087b19b21f6702b6c091716cbe3d661d2e93f493",
+        "webui/package.json": "ac8e618f18e4862de1986275857029798ed853d2a48870722f471627b5c0f73c",
+        "webui/package-lock.json": "fc97d4f3d56db12b00fe2be1e803e45cf0ffdb35f5ae565abc45b0054999cf80"
+      }
+    },
+    "current": {
+      "revision": "75c9c8c71e95e9bb2a72252db47c8531017e4e9a",
+      "raw_bytes": 41234000,
+      "raw_sha256": "756a2e3c02ae7549c2f0e75bb2126062078bac8f571b8d3c6cafcb34d27f06f0",
+      "tar_gz_bytes": 12965947,
+      "tar_gz_sha256": "3fecc4ba0798597bd94ff6cf0b6477a3b0a6c565e20d1b649887ca8732a2c96f",
+      "frontend_bytes": 1945906,
+      "version": "atomcode 5.2.6 (75c9c8c71)",
+      "wrapper_version_matches": true,
+      "cargo_fingerprint": {
+        "rustc": 10088478398040096810,
+        "features": "[\"default\"]",
+        "declared_features": "[\"codingplan-crypto\", \"default\", \"distro-pm\"]",
+        "profile": 12833233019932215290,
+        "rustflags": [],
+        "config": 8247474407144887393,
+        "compile_kind": 551198452465029181
+      },
+      "npm": {
+        "core": {
+          "bytes": 1255,
+          "sha256": "882b52bb8d61434bd4f30ef60e412d6cf27d8514f59b92c1bbe6db97d10063e3",
+          "unpacked_bytes": 2886,
+          "members": [
+            {
+              "path": "package/bin/atomcode.js",
+              "bytes": 1886,
+              "sha256": "4b6538a6ad95b6716b311bfb22b5b50e1029506d4305fbed72e011427d3c221c"
+            },
+            {
+              "path": "package/package.json",
+              "bytes": 1000,
+              "sha256": "12843c74c49e375b85bd5d9aa4f7a134ca2b2f348499db0e6a71a822c10e2699"
+            }
+          ]
+        },
+        "platform": {
+          "bytes": 13261001,
+          "sha256": "5ec6284bcf24746b2fbc7fba0e7caad12b2e35f80a6de47069e6a327ec82aa71",
+          "unpacked_bytes": 41234149,
+          "members": [
+            {
+              "path": "package/bin/atomcode",
+              "bytes": 41234000,
+              "sha256": "756a2e3c02ae7549c2f0e75bb2126062078bac8f571b8d3c6cafcb34d27f06f0"
+            },
+            {
+              "path": "package/package.json",
+              "bytes": 149,
+              "sha256": "14a799113738818217710300a95420127deeebb73b47904220a565607fd5e79b"
+            }
+          ]
+        }
+      },
+      "embedded_http_assets_verified": 42,
+      "frontend_manifest_sha256": "b0adc3e87fd653d0a3ea86c50567b7ea0c5d942c1939ee50f88022ccc1fdee8f",
+      "release_build_real_seconds": 403.83,
+      "settings_sha256": {
+        "Cargo.toml": "2a1bbc840255979de6952bc02093e9d4f1bfa37449b160395fd5c32fca68dfcb",
+        "Cargo.lock": "629074274401c850f871256caf4e6c53aa742cff2712a036880455946ee0c2d2",
+        ".cargo/config.toml": "8c771d563f61bda90bff1d5b087b19b21f6702b6c091716cbe3d661d2e93f493",
+        "webui/package.json": "ac8e618f18e4862de1986275857029798ed853d2a48870722f471627b5c0f73c",
+        "webui/package-lock.json": "fc97d4f3d56db12b00fe2be1e803e45cf0ffdb35f5ae565abc45b0054999cf80"
+      }
+    }
+  },
+  "delivery_checks": {
+    "fresh_release_builds": 3,
+    "exact_http_asset_checks": 126,
+    "package_member_and_binary_hash_checks": true,
+    "offline_extracted_launcher_smokes": 3,
+    "existing_size_report_tests_passed": 5,
+    "compile_gate": "passed including feature targets and negative controls",
+    "cargo_fmt_check": "passed",
+    "cargo_lock_unchanged": true,
+    "forbidden_lock_package_counts": {
+      "hkdf": 0,
+      "hmac": 0,
+      "zeroize_derive": 0
+    }
+  }
+}
