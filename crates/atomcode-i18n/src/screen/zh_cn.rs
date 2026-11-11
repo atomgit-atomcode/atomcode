@@ -173,7 +173,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 模型向人提问 ──
         Msg::AskStepLimitQuestion => "这一轮已经跑了很多步。继续吗?".into(),
         Msg::AskStepLimitTitle => "步数上限".into(),
-        Msg::AskTruncatedQuestion => "回答一直被截断,自动接续已经用尽。继续吗?".into(),
+        Msg::AskTruncatedQuestion => "输出连续被截断，自动恢复已停止。继续吗？".into(),
+        Msg::AskReasoningTruncatedQuestion => "模型连续思考达到输出上限，尚未生成正文。自动恢复已停止，继续尝试吗？".into(),
         Msg::AskTruncatedTitle => "输出截断".into(),
         Msg::AskContinue => "继续".into(),
         Msg::AskStop => "停下".into(),

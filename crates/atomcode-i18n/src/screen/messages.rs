@@ -229,6 +229,7 @@ pub enum Msg<'a> {
     AskStepLimitQuestion,
     AskStepLimitTitle,
     AskTruncatedQuestion,
+    AskReasoningTruncatedQuestion,
     AskTruncatedTitle,
     AskContinue,
     AskStop,

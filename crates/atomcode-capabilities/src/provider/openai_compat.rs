@@ -804,6 +804,8 @@ impl LlmProvider for OpenAiCompatProvider {
             reasoning_effort = body.get("reasoning_effort").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
             thinking_type = body.pointer("/thinking/type").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
             enable_thinking = ?body.get("enable_thinking").and_then(serde_json::Value::as_bool),
+            max_tokens = ?body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            max_completion_tokens = ?body.get("max_completion_tokens").and_then(serde_json::Value::as_u64),
             request_bytes = body_bytes.len(), messages = messages.len(), tools = tools.len(),
             "provider request parameters"));
 
@@ -2751,6 +2753,7 @@ impl SseDecoder {
         // above discard every subsequent tool_call delta, so the whole call is
         // dropped and the model shows "0 工具". Treat "" as non-terminal.
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
+            tracing::info!(finish_reason = %fr, "provider finish reason");
             self.seen_finish = true;
             if fr == "length" {
                 self.truncated = true;

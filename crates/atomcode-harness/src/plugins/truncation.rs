@@ -36,6 +36,25 @@ complete, reply with a short summary and stop (no tool calls). Otherwise resume 
 off, writing the remaining content INCREMENTALLY to a file (append the next section with \
 `edit_file`) rather than re-emitting it all in one response.";
 
+const REASONING_NUDGE: &str =
+    "Your last response exhausted its output budget during reasoning without producing an answer. \
+Use the reasoning already done to take the next concrete step or give a concise answer. \
+Avoid restarting the analysis or repeating it.";
+
+fn reasoning_only(response: &ModelResponse) -> bool {
+    response.text.trim().is_empty()
+        && response.tool_calls.is_empty()
+        && (!response.reasoning.trim().is_empty() || !response.reasoning_blocks.is_empty())
+}
+
+fn resume_nudge(response: &ModelResponse) -> &'static str {
+    if reasoning_only(response) {
+        REASONING_NUDGE
+    } else {
+        RESUME_NUDGE
+    }
+}
+
 const TRUNCATED_CALL_COACH: &str = "\
 Tool call not executed: the response hit its output-token limit before the arguments finished \
 streaming, so the recorded arguments are truncated and unsafe to run. Do NOT retry by \
@@ -44,7 +63,7 @@ edit_file: write the first chunk, then append the rest with successive edit_file
 
 #[derive(Debug, Deserialize)]
 struct Row {
-    /// How many times a turn may be continued after a truncation before the
+    /// How many consecutive truncations may be continued before the
     /// nudging itself becomes the loop.
     #[serde(default = "default_max")]
     max_continuations: u32,
@@ -98,16 +117,15 @@ struct OnTruncation {
     ctx: Context,
     max_continuations: u32,
     checkpoint: bool,
-    /// Continuations spent in the current turn.
+    /// Continuations spent in the current consecutive truncation streak.
     seen: std::sync::atomic::AtomicU32,
-    /// Text of the last truncated round this turn, to catch a re-dump.
+    /// Text of the last truncated round in this streak, to catch a re-dump.
     last: std::sync::Mutex<Option<String>>,
 }
 
 impl OnTruncation {
-    /// A new turn starts with a fresh budget and no memory of the last one:
-    /// the cap is "per turn", and a re-dump is only meaningful against the
-    /// round the nudge answered.
+    /// A new turn or a completed response breaks the truncation streak.
+    /// A re-dump is only meaningful against the round the nudge answered.
     fn reset(&self) {
         self.seen.store(0, std::sync::atomic::Ordering::SeqCst);
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -119,7 +137,7 @@ impl OnTruncation {
     ///
     /// With the checkpoint, the person decides, and whatever they decide they
     /// already saw — no warning follows. Without it, the turn ends and says so.
-    async fn give_up(&self, attempts: u32) -> bool {
+    async fn give_up(&self, attempts: u32, response: &ModelResponse) -> bool {
         let scoped = crate::agent::scoped(&self.ctx);
         let Some(session) = scoped.service::<SessionSvc>() else {
             return false;
@@ -137,6 +155,7 @@ impl OnTruncation {
                             serde_json::json!({
                                 "attempts": attempts,
                                 "max_attempts": self.max_continuations,
+                                "reasoning_only": reasoning_only(response),
                             }),
                         )
                         .await
@@ -150,7 +169,7 @@ impl OnTruncation {
                     &session,
                     SessionEvent::Injected {
                         turn: session.current_turn(),
-                        text: RESUME_NUDGE.to_string(),
+                        text: resume_nudge(response).to_string(),
                         origin: InjectionOrigin::Continuation,
                     },
                 );
@@ -163,7 +182,12 @@ impl OnTruncation {
             SessionEvent::Notice {
                 turn: session.current_turn(),
                 notice: crate::session::NoticeKind::OutputLeftCutOff,
-                detail: LEFT_CUT_OFF.to_string(),
+                detail: if reasoning_only(response) {
+                    "模型思考已达到输出上限，尚未生成正文。可以调整输出预算或思考强度后重试。"
+                        .to_string()
+                } else {
+                    LEFT_CUT_OFF.to_string()
+                },
                 retry: None,
             },
         );
@@ -180,6 +204,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
     ) -> Result<ModelResponse, RequestError> {
         let mut response = next.run(req).await?;
         if !response.truncated {
+            self.reset();
             return Ok(response);
         }
 
@@ -199,7 +224,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
                 .seen
                 .load(std::sync::atomic::Ordering::SeqCst)
                 .min(self.max_continuations);
-            response.truncated = self.give_up(attempts).await;
+            response.truncated = self.give_up(attempts, &response).await;
             return Ok(response);
         }
 
@@ -213,7 +238,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
             // asking" and "this response is final" are the same statement. The
             // cap therefore lives here, once, rather than being re-derived by
             // whoever reads `truncated` next.
-            response.truncated = self.give_up(self.max_continuations).await;
+            response.truncated = self.give_up(self.max_continuations, &response).await;
             return Ok(response);
         }
 
@@ -236,7 +261,12 @@ impl Waterfall<AgentRequest> for OnTruncation {
                     turn: session.current_turn(),
                     notice: crate::session::NoticeKind::OutputTruncated,
                     detail: format!(
-                        "输出被截断，正在请模型接着写（第 {seen}/{} 次）",
+                        "{}（连续恢复第 {seen}/{} 次）",
+                        if reasoning_only(&response) {
+                            "模型思考达到输出上限，正在请求直接推进任务"
+                        } else {
+                            "输出被截断，正在请模型接着写"
+                        },
                         self.max_continuations
                     ),
                     retry: None,
@@ -250,7 +280,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
                     text: if cut_a_call {
                         TRUNCATED_CALL_COACH.to_string()
                     } else {
-                        RESUME_NUDGE.to_string()
+                        resume_nudge(&response).to_string()
                     },
                     origin: InjectionOrigin::Continuation,
                 },

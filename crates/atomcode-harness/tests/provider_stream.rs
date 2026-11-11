@@ -259,3 +259,123 @@ async fn a_recovered_attempt_keeps_its_own_signatures_and_identity() {
     drop(app);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn successful_tool_rounds_break_the_truncation_streak() {
+    let root =
+        std::env::temp_dir().join(format!("atomcode-truncation-streak-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut streams = VecDeque::new();
+    for i in 0..6 {
+        streams.push_back(vec![
+            StreamEvent::Reasoning(format!("analysis {i}")),
+            StreamEvent::Done { truncated: true },
+        ]);
+        streams.push_back(vec![
+            StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                id: format!("call-{i}"),
+                name: format!("unavailable-fixture-tool-{i}"),
+                arguments: format!(r#"{{"step":{i}}}"#),
+            }),
+            StreamEvent::Done { truncated: false },
+        ]);
+    }
+    streams.push_back(vec![
+        StreamEvent::TextDelta("finished".into()),
+        StreamEvent::Done { truncated: false },
+    ]);
+    let provider = Arc::new(Provider {
+        streams: Mutex::new(streams),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut app = app(&root, provider.clone(), false).await;
+    let outcome = run_turn(&app, "start").await.unwrap();
+    assert_eq!(outcome.text, "finished", "{outcome:?}");
+    assert_eq!(provider.requests.lock().unwrap().len(), 13);
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[1].iter().any(|m| m
+        .text
+        .contains("exhausted its output budget during reasoning")));
+    assert!(!requests[1].iter().any(|m| m
+        .text
+        .contains("writing the remaining content INCREMENTALLY")));
+    drop(requests);
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn consecutive_reasoning_only_truncations_stop_without_an_unbounded_retry() {
+    let root = std::env::temp_dir().join(format!("atomcode-truncation-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let provider = Arc::new(Provider {
+        streams: Mutex::new(
+            (0..5)
+                .map(|_| {
+                    vec![
+                        StreamEvent::Reasoning("thinking".into()),
+                        StreamEvent::Done { truncated: true },
+                    ]
+                })
+                .collect(),
+        ),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut app = app(&root, provider.clone(), false).await;
+    run_turn(&app, "start").await.unwrap();
+    assert_eq!(provider.requests.lock().unwrap().len(), 5);
+    let events = app.context().only_session().unwrap().events();
+    assert!(events.iter().any(|fact| matches!(&fact.event,
+        atomcode_harness::session::SessionEvent::Notice { detail, .. } if detail.contains("尚未生成正文"))));
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn repeated_text_is_only_a_redump_within_a_consecutive_truncation_streak() {
+    for break_streak in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "atomcode-truncation-redump-{}-{break_streak}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let text = "unfinished section ".repeat(40);
+        let cut = vec![
+            StreamEvent::TextDelta(text.clone()),
+            StreamEvent::Done { truncated: true },
+        ];
+        let mut streams = VecDeque::from([cut.clone()]);
+        if break_streak {
+            streams.push_back(vec![
+                StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                    id: "intervening-call".into(),
+                    name: "unavailable-fixture-tool".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ]);
+        }
+        streams.push_back(cut);
+        if break_streak {
+            streams.push_back(vec![
+                StreamEvent::TextDelta("finished".into()),
+                StreamEvent::Done { truncated: false },
+            ]);
+        }
+        let provider = Arc::new(Provider {
+            streams: Mutex::new(streams),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut app = app(&root, provider.clone(), false).await;
+        let outcome = run_turn(&app, "start").await.unwrap();
+        assert_eq!(outcome.text, if break_streak { "finished" } else { &text });
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), if break_streak { 4 } else { 2 });
+        assert!(requests[1]
+            .iter()
+            .any(|m| m.text.contains("resume where you left off")));
+        drop(requests);
+        app.stop();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

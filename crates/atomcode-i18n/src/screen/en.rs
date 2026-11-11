@@ -190,9 +190,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskStepLimitQuestion => "this turn has taken a lot of steps. Go on?".into(),
         Msg::AskStepLimitTitle => "step limit".into(),
         Msg::AskTruncatedQuestion => {
-            "the answer keeps being cut off and the automatic continuations are used up. Go on?"
+            "Output was repeatedly cut off; automatic recovery has stopped. Go on?"
                 .into()
         }
+        Msg::AskReasoningTruncatedQuestion => "The model repeatedly exhausted its output budget during reasoning without an answer. Try again?".into(),
         Msg::AskTruncatedTitle => "output cut off".into(),
         Msg::AskContinue => "go on".into(),
         Msg::AskStop => "stop".into(),

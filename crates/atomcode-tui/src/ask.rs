@@ -724,7 +724,16 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
             let (prompt, asker) = if kind == atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND {
                 (t(Msg::AskStepLimitQuestion), t(Msg::AskStepLimitTitle))
             } else {
-                (t(Msg::AskTruncatedQuestion), t(Msg::AskTruncatedTitle))
+                (
+                    t(
+                        if payload.get("reasoning_only").and_then(Value::as_bool) == Some(true) {
+                            Msg::AskReasoningTruncatedQuestion
+                        } else {
+                            Msg::AskTruncatedQuestion
+                        },
+                    ),
+                    t(Msg::AskTruncatedTitle),
+                )
             };
             Some(Question {
                 prompt: prompt.into(),
@@ -1916,6 +1925,20 @@ mod tests {
         let one = serde_json::json!({ "questions": [two["questions"][0].clone()] });
         assert!(batch_for(REQUEST_USER_INPUT_KIND, &one, &[]).is_none());
         assert!(batch_for(APPROVAL_KIND, &two, &[]).is_none());
+    }
+
+    #[test]
+    fn reasoning_only_checkpoint_explains_why_no_answer_was_produced() {
+        let kind = atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND;
+        let reasoning = q(kind, &serde_json::json!({ "reasoning_only": true }), &[]).unwrap();
+        let generic = q(kind, &serde_json::json!({}), &[]).unwrap();
+        assert_eq!(
+            reasoning.prompt,
+            t(Msg::AskReasoningTruncatedQuestion).into_owned()
+        );
+        assert_ne!(reasoning.prompt, generic.prompt);
+        assert_eq!(nth(&reasoning, 1).as_deref(), Some(CONTINUE));
+        assert_eq!(nth(&reasoning, 2).as_deref(), Some(STOP));
     }
 
     /// The kernel's own checkpoints are questions this screen can answer
