@@ -2910,6 +2910,13 @@ impl CommandSet for SessionCommands {
                     "doctor" => BrowserAction::Doctor,
                     "enable" => BrowserAction::Enable,
                     "disable" => BrowserAction::Disable,
+                    raw if raw.starts_with("enable --origin-policy-file ") => {
+                        let path = raw["enable --origin-policy-file ".len()..].trim();
+                        if path.is_empty() || path.chars().any(char::is_control) {
+                            return Outcome::Refused(t(Msg::BrowserHelp).into_owned());
+                        }
+                        BrowserAction::EnablePolicyFile { path: path.into() }
+                    }
                     _ => {
                         let words: Vec<_> = args.split_whitespace().collect();
                         match words.as_slice() {
@@ -5408,7 +5415,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["status", "doctor", "enable", "disable", "reload", "help"]
         );
-        for (verb, action) in [
+        let cases = [
             ("", BrowserAction::Status),
             ("status", BrowserAction::Status),
             ("doctor", BrowserAction::Doctor),
@@ -5428,10 +5435,18 @@ mod tests {
                 BrowserAction::EnableScoped { origins: vec![] },
             ),
             (
+                "enable --origin-policy-file /trusted/policy file.json",
+                BrowserAction::EnablePolicyFile {
+                    path: "/trusted/policy file.json".into(),
+                },
+            ),
+            (
                 "enable --unrestricted-origins",
                 BrowserAction::EnableUnrestricted,
             ),
-        ] {
+        ];
+        let expected = cases.len();
+        for (verb, action) in cases {
             host.replies
                 .lock()
                 .unwrap()
@@ -5452,7 +5467,7 @@ mod tests {
         }
         assert_eq!(
             host.asked.lock().unwrap().len(),
-            8,
+            expected,
             "no implicit reload or desktop action"
         );
         for arg in [
@@ -5469,11 +5484,11 @@ mod tests {
                 .dispatch(&format!("/browser {arg}"), &app.context())
                 .await;
             assert!(matches!(out, Outcome::Said(_) | Outcome::Refused(_)));
-            assert_eq!(host.asked.lock().unwrap().len(), 8, "{arg}");
+            assert_eq!(host.asked.lock().unwrap().len(), expected, "{arg}");
         }
         all.dispatch("/browser reload", &app.context()).await;
         assert!(
-            matches!(&host.asked.lock().unwrap()[8], HostCommand::Reload { session } if session == "lead")
+            matches!(host.asked.lock().unwrap().get(expected), Some(HostCommand::Reload { session }) if session == "lead")
         );
         host.replies
             .lock()

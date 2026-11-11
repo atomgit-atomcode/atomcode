@@ -466,7 +466,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BrowserDisableAbout => "保存关闭配置；已发出的操作可能仍在执行".into(),
         Msg::BrowserReloadAbout => "重载配置，使其在当前会话生效".into(),
         Msg::BrowserHelpAbout => "查看设置与使用说明".into(),
-        Msg::BrowserHelp => "/browser [status|doctor|enable|disable|reload|help]\nstatus 读取配置；doctor 检查 Node/后端版本，不验证浏览器启动。首次设置：atomcode browser enable --server <cli.js 绝对路径>。请显式安装 @playwright/mcp@0.0.85 及浏览器。enable/disable 修改配置；reload 走现有重载流程。关闭不能中断或撤销已发出操作。使用 $browser-use 显式发起任务。工具审批不等于站点授权。 来源范围：/browser enable --allow-origin https://example.test（可重复）；--deny-all-origins 拒绝全部；--unrestricted-origins 显式切回原版后端。普通 enable 保留范围。首次限制配置需要终端指定 --origin-backend 和 --backend-root；之后仍需显式 reload。".into(),
+        Msg::BrowserHelp => "/browser [status|doctor|enable|disable|reload|help]\nstatus 读取配置；doctor 检查 Node/后端版本，不验证浏览器启动。首次设置：atomcode browser enable --server <cli.js 绝对路径>。请显式安装 @playwright/mcp@0.0.85 及浏览器。enable/disable 修改配置；reload 走现有重载流程。关闭不能中断或撤销已发出操作。使用 $browser-use 显式发起任务。工具审批不等于站点授权。 来源范围：/browser enable --allow-origin https://example.test（可重复）；--deny-all-origins 拒绝全部；--unrestricted-origins 显式切回原版后端。普通 enable 保留范围。首次限制配置需要终端指定 --origin-backend 和 --backend-root；之后仍需显式 reload。 v2 权限：/browser enable --origin-policy-file /绝对路径/policy.json（执行主机上的文件；参数后全部作为路径，无需引号）。保存校验后的内容，保留已有工具限制。".into(),
         Msg::CmdAboutMcp => "MCP 服务器面板;reload 重连、tools 看工具、trust/untrust 信任、login/logout 登录、withdraw 撤下,/mcp help 看全部".into(),
         Msg::CmdAboutLanguage => "模型用哪种语言回答;不带参数则说现在是哪个,以及可选哪些".into(),
         Msg::CmdAboutReload => "重新读取 skills、MCP 与配置,会话不变".into(),

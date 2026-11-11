@@ -50,6 +50,10 @@ pub enum BrowserAction {
     EnableScoped {
         origins: Vec<String>,
     },
+    /// Read a trusted policy file on the execution host; save validated contents.
+    EnablePolicyFile {
+        path: String,
+    },
     /// Explicit return to the stock backend without a saved origin restriction.
     EnableUnrestricted,
     Disable,
@@ -1732,6 +1736,12 @@ mod tests {
             HostCommand::Browser {
                 session: "a".into(),
                 action: BrowserAction::EnableScoped { origins: vec![] },
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnablePolicyFile {
+                    path: "/trusted/policy file.json".into(),
+                },
             },
             HostCommand::Browser {
                 session: "a".into(),

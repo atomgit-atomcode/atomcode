@@ -2498,6 +2498,14 @@ impl HostControl for RuntimeControl {
                             ..Default::default()
                         },
                     },
+                    BrowserAction::EnablePolicyFile { path } => BrowserCli::Enable {
+                        server: None,
+                        node: None,
+                        scope: crate::browser_cmd::OriginArgs {
+                            origin_policy_file: Some(path.into()),
+                            ..Default::default()
+                        },
+                    },
                     BrowserAction::EnableUnrestricted => BrowserCli::Enable {
                         server: None,
                         node: None,

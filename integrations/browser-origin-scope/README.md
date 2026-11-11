@@ -51,12 +51,13 @@ atomcode browser enable \
   --backend-root /absolute/installed/node_modules/@playwright/mcp \
   --allow-origin https://example.test
 /browser enable --allow-origin https://example.test --allow-origin https://example.test:8443
+/browser enable --origin-policy-file /absolute/trusted-policy.json
 /browser enable --deny-all-origins
 /browser enable --unrestricted-origins
 /browser reload
 ```
 
-Repeat `--allow-origin` to permit more exact origins. Plain `enable`, including after disable, preserves the saved scope. Unrestriction is explicit and returns to the stock `cli.js` in the saved package (or terminal `--server`). Other required capabilities and narrower tool restrictions remain. Missing/malformed scope metadata fails rather than falling back to stock. A changed config snapshot during doctor is refused without overwriting it. Doctor launches neither a browser nor an installer and creates no output tree. Scope setup writes the policy, exact arguments, managed mode marker and version-1 required MCP capability together. Existing sessions still need explicit reload; status describes configuration, not live adoption or project overrides.
+Repeat `--allow-origin` to permit more exact origins. Plain `enable`, including after disable, preserves the saved scope. Unrestriction is explicit and returns to the stock `cli.js` in the saved package (or terminal `--server`). Other required capabilities and narrower tool restrictions remain. Missing/malformed scope metadata fails rather than falling back to stock. A changed config snapshot during doctor is refused without overwriting it. Doctor launches neither a browser nor an installer and creates no output tree. Scope setup writes the validated policy contents, exact arguments, managed mode marker and exact-version required MCP capability together. `--origin-policy-file` accepts bounded v1/v2 JSON from an absolute trusted execution-host file; its contents are saved rather than re-read on later enable/doctor. It conflicts with the other policy selectors. CLI paths follow normal shell quoting; in the slash command the entire remainder after the option is the path, without quotes, so spaces are supported. Existing sessions still need explicit reload; status describes configuration, not live adoption or project overrides.
 
 The installed bundled browser guidance recognizes either backend. Its exact previous unmodified version can upgrade; customized guidance remains protected. Other unmanaged MCP entries are never rewritten by these commands.
 
@@ -153,7 +154,7 @@ node integrations/browser-origin-scope/characterize-downloads.cjs \
 
 The report path must be new. This is a test, never an MCP backend to register: it intentionally enables automatic downloads only inside isolated synthetic loopback TLS fixtures, pins only their ephemeral certificate, and preserves one denied fixture payload as the negative-control evidence. Ordinary samples (one allowed and seven denied/redirects) look successful; a separate one-second delayed event exposes the completed-download race. The delay represents possible scheduling latency, not a measured frequency. Report data includes actual external runtime/source hashes, verifier hash, cases, cancellation events and exact captured process cleanup. Owned fixture/artifact directories remain private outside Git; no personal browser, model call, user configuration or OS grant is used.
 
-The explicit publisher below now owns validation at every redirect and artifact publication. Further transfer support must preserve that boundary; blob handling, authenticated context, file capabilities for uploads, full-CDP boundaries and managed v2 setup remain required work.
+The explicit publisher below now owns validation at every redirect and artifact publication. Further transfer support must preserve that boundary; blob handling, authenticated context, file capabilities for uploads, full-CDP boundaries remain required work.
 
 
 ## Version 2 controlled downloads
@@ -164,11 +165,13 @@ A separately named explicit experimental MCP entry can select this policy:
 {"version":2,"origins":{"https://example.test":{"access":"allow","downloads":"allow","uploads":"deny","full_cdp_access":"deny"},"https://read-only.test":{"access":"allow","downloads":"deny"}}}
 ```
 
-Set its `ATOMCODE_BROWSER_ORIGIN_POLICY` environment value to that JSON string and `requiredExperimentalCapabilities` to `{"atomcode/browser-origin-scope":2}`. Keep `trust:false`, `autoApprove:[]`, the absolute backend script/package paths and owned output directory shown above. The managed CLI/slash setup still supports v1 only; do not manually replace the managed entry with v2, since its status/enable checks deliberately reject unsupported metadata.
+Set its `ATOMCODE_BROWSER_ORIGIN_POLICY` environment value to that JSON string and `requiredExperimentalCapabilities` to `{"atomcode/browser-origin-scope":2}`. Keep `trust:false`, `autoApprove:[]`, the absolute backend script/package paths and owned output directory shown above. For managed setup, use terminal `atomcode browser enable --origin-backend /absolute/backend.cjs --backend-root /absolute/installed/node_modules/@playwright/mcp --origin-policy-file /absolute/trusted-policy.json`, then `/browser reload`. Later `/browser enable --origin-policy-file /absolute/trusted-policy.json` can replace the saved policy. Plain enable and disable/re-enable preserve it even if the source file is removed. Managed metadata, policy and capability versions must match; a v1 doctor cannot satisfy v2.
 
 Omitted permissions deny. Access and download grants are required at **every** HTTP(S) redirect. Duplicate canonical origins and upload/full-CDP allow settings are refused. Only policies with at least one download grant advertise `browser_download`; direct calls to it otherwise fail. Its only argument is `url`. It writes complete identity-encoded HTTP 200 responses up to 64 MiB into private staging, then publishes an exclusive generated `.bin` path and reports byte count/SHA-256. Response filenames, caller paths/headers and URL credentials are never accepted. Compressed responses and blob URLs fail closed in this initial implementation. Browser cookies are **not** forwarded: authenticated-context downloads remain unfinished.
 
 Normal navigation/click downloads remain disabled, even with a grant. Invoke the explicit tool initially for a known link, rather than automatically fetching a URL after an uncertain browser action. Download GETs can have remote effects. Cancellation or failure never retries automatically; cancellation before publication leaves no accepted artifact. Once publication commits, a lost response or late cancellation cannot undo the file, so an uncertain result must be re-observed rather than replayed. Existing SDK artifact retention may later evict files; this is not durable personal document storage.
+
+New download-enabled entries include `browser_download` in their tool filter. Existing `allowedTools` restrictions are preserved, so an upgraded entry may still hide it: explicitly add that one name to its saved `allowedTools` if desired, then reload. An origin download grant never widens an existing tool filter or auto-approves a call.
 
 MCP cancellation notifications target the owned request ID. `browser_close` drains transfers and awaits browser cleanup before completing; later explicit work is possible. EOF/output loss/termination permanently fences new work and drains owned transfers. These controls add no Node, Chrome or npm dependencies to AtomCode's package.
 
@@ -181,4 +184,4 @@ node integrations/browser-origin-scope/verify-downloads.cjs \
   --report /absolute/new-controlled-download-report.json
 ```
 
-The verifier uses synthetic loopback HTTP fixtures and a private temporary output tree. It checks bytes/hash, denied redirects before dispatch, argument refusal, cancellation without replay, browser implicit download denial, close/reuse and pure EOF. HTTPS certificate failure, authenticated downloads, blob/compression support, native runtime turn cancellation of this new tool, managed v2 setup and the complete upload/CDP matrix still require further implementation/acceptance. It does not open a personal profile or change OS grants.
+The verifier uses synthetic loopback HTTP fixtures and a private temporary output tree. It checks bytes/hash, denied redirects before dispatch, argument refusal, cancellation without replay, browser implicit download denial, close/reuse and pure EOF. HTTPS certificate failure, authenticated downloads, blob/compression support, native runtime turn cancellation of this new tool and the complete upload/CDP matrix still require further implementation/acceptance. It does not open a personal profile or change OS grants.

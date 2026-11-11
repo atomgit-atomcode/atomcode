@@ -4226,6 +4226,35 @@ async fn browser_origin_setup_is_host_local_and_never_implicitly_reloads() {
     )
     .await
     .unwrap();
+    let policy_file = env._home.path().join("trusted browser policy.json");
+    std::fs::write(&policy_file, r#"{"version":2,"origins":{"https://download.test":{"access":"allow","downloads":"allow"}}}"#).unwrap();
+    let report = serde_json::json!({"version":2,"kind":"doctor","browser_launched":false,"capability":"atomcode/browser-origin-scope","mcp":"0.0.85","playwright":"1.66.0-alpha-2026-11-09","allowed_origin_count":1,"downloads":"controlled-http-unauthenticated","uploads":"deny","full_cdp_access":"deny"});
+    std::fs::write(&node, format!("#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then echo v22.0.0; exit 0; fi\nprintf '%s' '{report}'\n")).unwrap();
+    let reply = connection
+        .control
+        .call(HostCommand::Browser {
+            session: connection.session.clone(),
+            action: BrowserAction::EnablePolicyFile {
+                path: policy_file.to_str().unwrap().into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(reply, HostReply::DoneWithNote { .. }));
+    let source: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dirs.user().join("mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(source["mcpServers"]["browser-use"]["originScope"], 2);
+    assert_eq!(
+        source["mcpServers"]["browser-use"]["requiredExperimentalCapabilities"]
+            ["atomcode/browser-origin-scope"],
+        2
+    );
+    assert_eq!(
+        env.script.built.lock().unwrap().len(),
+        before,
+        "policy setup must not reload the runtime"
+    );
     for (action, count, expected) in [
         (
             BrowserAction::EnableScoped {
