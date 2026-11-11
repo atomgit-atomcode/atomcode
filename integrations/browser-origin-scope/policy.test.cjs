@@ -76,6 +76,26 @@ test('transport filters discovery independently of SDK request IDs and refuses d
   assert.equal(delivered.length, 1);
 });
 
+test('discovery exposes only supported artifact arguments without mutating upstream schemas', async () => {
+  const sent = [];
+  const inner = { async send(message) { sent.push(message); } };
+  const gate = new PolicyTransport(inner, new Set());
+  const original = {name:'browser_take_screenshot',description:'Screenshot',inputSchema:{
+    type:'object',properties:{type:{enum:['png','jpeg']},filename:{type:'string'},_meta:{type:'object'}},
+    required:['type','filename'],additionalProperties:false,
+  },annotations:{readOnlyHint:true}};
+  const before = structuredClone(original);
+  await gate.send({jsonrpc:'2.0',id:42,result:{tools:[original]}});
+  const exposed = sent[0].result.tools[0];
+  assert.deepEqual(exposed.inputSchema.properties,{type:{enum:['png','jpeg']}});
+  assert.deepEqual(exposed.inputSchema.required,['type']);
+  assert.equal(exposed.inputSchema.additionalProperties,false);
+  assert.deepEqual(exposed.annotations,original.annotations);
+  assert.equal(exposed.description,'Screenshot');
+  assert.deepEqual(original,before);
+  assert.equal(allowedCall({name:original.name,arguments:{filename:'still-refused.png'}},new Set()),false);
+});
+
 test('HTTP proxy forwards allowed targets only and never follows redirects itself', async () => {
   let allowed = 0, denied = 0;
   const target = http.createServer((req,res) => { allowed++; if (req.url === '/attachment') res.setHeader('Content-Disposition','attachment; filename=x.txt'); res.end('allowed'); });

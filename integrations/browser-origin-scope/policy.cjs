@@ -212,8 +212,21 @@ class PolicyTransport {
     await this.inner.start();
   }
   async send(message, options) {
-    if (!Object.hasOwn(message, 'method') && Array.isArray(message.result?.tools))
-      message = { ...message, result: { ...message.result, tools: message.result.tools.filter(tool => TOOLS.has(tool.name)) } };
+    if (!Object.hasOwn(message, 'method') && Array.isArray(message.result?.tools)) {
+      const tools = message.result.tools.filter(tool => TOOLS.has(tool.name)).map(tool => {
+        if (!tool.inputSchema?.properties) return tool;
+        // The published contract must match the execution gate. Otherwise a
+        // model following the upstream schema can request a forbidden path.
+        const properties = { ...tool.inputSchema.properties };
+        delete properties.filename;
+        delete properties._meta;
+        const inputSchema = { ...tool.inputSchema, properties };
+        if (Array.isArray(inputSchema.required))
+          inputSchema.required = inputSchema.required.filter(key => key !== 'filename' && key !== '_meta');
+        return { ...tool, inputSchema };
+      });
+      message = { ...message, result: { ...message.result, tools } };
+    }
     return this.inner.send(message, options);
   }
   async close() { await this.inner.close(); }

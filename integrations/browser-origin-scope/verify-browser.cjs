@@ -236,6 +236,11 @@ async function verify(root, reportPath) {
     const catalog = await client.listTools();
     assert.equal(catalog.tools.length, TOOLS.size);
     assert.ok(catalog.tools.every(tool=>TOOLS.has(tool.name)));
+    for (const tool of catalog.tools) {
+      assert.ok(!Object.hasOwn(tool.inputSchema.properties || {}, 'filename'), tool.name);
+      assert.ok(!Object.hasOwn(tool.inputSchema.properties || {}, '_meta'), tool.name);
+      assert.ok(!(tool.inputSchema.required || []).some(key => key === 'filename' || key === '_meta'), tool.name);
+    }
     assert.deepEqual(descendants(pid), [], 'metadata must not launch a browser');
     for (const name of ['browser_evaluate','browser_run_code','browser_file_upload','browser_cdp','browser_route'])
       await assert.rejects(client.callTool({name,arguments:{}}), /policy refused/);
