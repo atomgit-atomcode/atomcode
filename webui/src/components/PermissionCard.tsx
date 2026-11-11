@@ -10,6 +10,7 @@ interface PermissionRequest {
   tool_name: string;
   reason: string;
   call_id: string;
+  approval_id?: string;
   arguments: unknown;
   /** True only for a non-sensitive bash call: the backend says the session-wide
    *  "allow all Bash (incl. destructive)" button may be offered. A sensitive
@@ -57,7 +58,7 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
       if (onDecide) {
         await onDecide(decision, req.tool_name);
       } else {
-        const result = await respondPermission(req.session_id, decision, req.tool_name, req.call_id);
+        const result = await respondPermission(req.session_id, decision, req.tool_name, req.call_id, req.approval_id);
         if (!result.success) throw new Error(t('perm.requestExpired'));
       }
     } catch (error) {

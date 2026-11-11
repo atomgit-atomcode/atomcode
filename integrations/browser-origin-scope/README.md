@@ -85,6 +85,12 @@ For an explicit experimental MCP entry, use resolved absolute paths in the ordin
 
 The required capability is checked by AtomCode on every initialize/recovery. It does not activate policy on the stock backend. This prototype requires its own script and policy together. It remains subject to normal MCP approvals and explicit reload. Another unrestricted browser MCP entry is a different interface with different permissions. The managed `/browser` commands manage only their own `browser-use` entry, not this separately named manual entry. The browser-use skill remains explicitly selected rather than automatically loaded. `--headed` is an explicit optional launch flag; acceptance below uses headless Chrome.
 
+## Remote execution and approvals
+
+Configure this optional backend on the machine running the MCP host. For daemon `/chat`, that is the daemon machine; the browser/frontend does not move execution to its own desktop. ACP similarly uses the agent-side configured MCP host. A loaded browser skill does not prove a frontend-local browser is being controlled.
+
+Daemon `/chat` clients must echo both `call_id` and the one-shot `approval_id` from each `permission_request`, together with `session_id`, for every `/chat/permission` choice. Missing/stale/duplicate IDs return `success:false`; older clients need to upgrade with the daemon. This does not replace origin policy or grant a new permission. The current WebUI and IDE senders carry the IDs. See [authenticated daemon acceptance](../../docs/plans/2026-11-12-remote-browser-approval-correlation.md) for actual API allow/deny/disconnect/stop/cancel evidence and the limits of that acceptance. SSE disconnection alone leaves the operation available for recovery; use explicit stop when cancellation is intended.
+
 ## Verification
 
 Fast standard-library-only tests (no browser or external MCP install):

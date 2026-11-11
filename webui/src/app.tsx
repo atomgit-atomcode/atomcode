@@ -632,9 +632,9 @@ export function App() {
             cwd={cwd}
             onPermission={setPending}
             pendingPermission={pending}
-            onPermissionResolved={(callId) =>
+            onPermissionResolved={(callId, approvalId) =>
               setPending((cur: any) =>
-                callId === null ? null : resolvePendingAfterDecision(cur, callId),
+                callId === null ? null : resolvePendingAfterDecision(cur, callId, approvalId),
               )}
             activeSession={activeSession}
             restoring={restoring}

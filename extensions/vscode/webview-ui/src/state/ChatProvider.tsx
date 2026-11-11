@@ -309,6 +309,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({
             type: 'PERMISSION_REQUEST',
             id: msg.id,
+            approvalId: msg.approvalId,
             sessionId: msg.sessionId,
             toolName: msg.toolName,
             reason: msg.reason,
@@ -320,6 +321,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({
             type: 'PERMISSION_RESPONSE_RESULT',
             id: msg.id,
+            approvalId: msg.approvalId,
             success: msg.success,
             message: msg.message,
           });

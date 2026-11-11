@@ -50,7 +50,7 @@ export type ChatEvent =
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string; title?: string }
   | { type: 'artifact_content'; id: string; content: string }
   | { type: 'artifact_end'; id: string }
-  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: string }
+  | { type: 'permission_request'; session_id: string; approval_id?: string; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; message: string; retry_after_seconds?: number; attempt?: number; max_attempts?: number }
@@ -326,7 +326,7 @@ export interface ChatStreamCallbacks {
   onToolStart: (id: string | undefined, name: string, args: string) => void;
   onToolProgress: (id: string, progress: string) => void;
   onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
-  onPermissionRequest: (request: { sessionId: string; toolName: string; reason: string; callId: string; args: string }) => void;
+  onPermissionRequest: (request: { sessionId: string; toolName: string; reason: string; callId: string; approvalId?: string; args: string }) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;
   onArtifactStart: (id: string, type: string, language?: string, title?: string) => void;
   onArtifactContent: (id: string, content: string) => void;

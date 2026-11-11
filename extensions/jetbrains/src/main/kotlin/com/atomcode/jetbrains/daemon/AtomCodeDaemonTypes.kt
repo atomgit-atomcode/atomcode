@@ -253,6 +253,8 @@ sealed interface ChatEvent {
         val reason: String,
         val callId: String,
         val arguments: String,
+        val approvalId: String = "",
+
     ) : ChatEvent
     data class Tokens(val prompt: Int, val completion: Int, val total: Int) : ChatEvent
     data class Warning(val message: String) : ChatEvent

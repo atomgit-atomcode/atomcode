@@ -549,17 +549,23 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
-                permission_routes.pending_call(&session_id, request.payload.get("call_id").and_then(serde_json::Value::as_str));
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
-                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
+                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload.clone())
                 else {
                     let _ = handle.respond(request.id, serde_json::Value::Null).await;
                     continue;
                 };
-                let answer = match &mut perm_rx {
+                permission_routes.pending_call(&session_id, Some(&approval.call_id));
+                // Capture identity before publishing: a fast HTTP client may consume
+                // the route as soon as it sees the projected permission event.
+                let expected_approval_id = permission_routes.approval_id(&session_id, &approval.call_id);
+                let interactive = perm_rx.is_some();
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                let mut answer = match &mut perm_rx {
                     None => fallback_approval_decision(approval_mode).into(),
                     Some(rx) => tokio::select! {
-                        _ = cancel.cancelled(), if !cancelled => {
+                        // A request can already be queued when the outer loop
+                        // observes cancellation. Its wait must still fail closed.
+                        _ = cancel.cancelled() => {
                             cancelled = true;
                             let _ = handle.cancel().await;
                             PermissionDecision::Deny.into()
@@ -567,6 +573,19 @@ pub(crate) async fn run_chat_turn_v2(
                         answer = rx.recv() => answer.unwrap_or(PermissionDecision::Deny.into()),
                     },
                 };
+                permission_routes.pending_call(&session_id, None);
+                // A cancellation or stale answer can never install a persistent grant.
+                // The HTTP route checks this too; the runtime remains authoritative.
+                if cancel.is_cancelled() {
+                    if !cancelled {
+                        cancelled = true;
+                        let _ = handle.cancel().await;
+                    }
+                    answer = PermissionDecision::Deny.into();
+                } else if interactive && (answer.call_id.as_deref() != Some(approval.call_id.as_str())
+                    || expected_approval_id.is_none() || answer.approval_id != expected_approval_id) {
+                    answer = PermissionDecision::Deny.into();
+                }
                 // "Always allow this MCP tool" is carried out by this runtime — the
                 // one the call belongs to — and names the tool the request is for,
                 // not whatever the client sent alongside its answer.
@@ -608,7 +627,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let answer = await_chat_user_input_response(rx, coding_cfg.request_timeout);
                 tokio::pin!(answer);
                 let value = tokio::select! {
-                    _ = cancel.cancelled(), if !cancelled => {
+                    _ = cancel.cancelled() => {
                         cancelled = true;
                         let _ = handle.cancel().await;
                         serde_json::Value::Null

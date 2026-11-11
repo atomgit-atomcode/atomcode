@@ -82,7 +82,7 @@ export type SSEEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
+  | { type: 'permission_request'; session_id: string; approval_id?: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
@@ -259,6 +259,7 @@ export async function respondPermission(
   decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
   callId?: string,
+  approvalId?: string,
 ): Promise<{ success: boolean }> {
   const resp = await apiFetch('/chat/permission', {
     method: 'POST',
@@ -266,7 +267,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName, call_id: callId }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName, call_id: callId, approval_id: approvalId }),
   });
   // A request that did not land throws: the card must stay up to be answered
   // again, or the person thinks it was approved while the turn waits on an

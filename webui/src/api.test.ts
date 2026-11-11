@@ -927,3 +927,18 @@ test('void API successes do not require a JSON response body', async () => {
     await api.openWorkspaceFile('file.ts', 'session');
   } finally { globalThis.fetch = originalFetch; }
 });
+
+
+test('chat permission answers echo tool and one-shot approval identities', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return new Response('{"success":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { respondPermission } = await import('./api.ts');
+    await respondPermission('session', 'allow', 'mcp__browser-use__browser_click', 'call', 'approval');
+    assert.deepEqual(body, {session_id:'session',decision:'allow',tool_name:'mcp__browser-use__browser_click',call_id:'call',approval_id:'approval'});
+  } finally { globalThis.fetch = originalFetch; }
+});

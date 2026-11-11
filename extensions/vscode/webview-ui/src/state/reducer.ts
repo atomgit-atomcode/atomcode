@@ -1203,6 +1203,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         );
         const request: PermissionRequestData = {
           id: action.id,
+          approvalId: action.approvalId,
           sessionId: action.sessionId,
           toolName: action.toolName,
           reason: action.reason,
@@ -1227,7 +1228,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => ({
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => request.approvalId !== action.approvalId ? request : ({
           ...request,
           status: 'submitting',
           decision: action.decision,
@@ -1241,7 +1242,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => action.success
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => request.approvalId !== action.approvalId ? request : action.success
           ? {
               ...request,
               status: request.decision === 'deny' ? 'denied' : 'allowed',

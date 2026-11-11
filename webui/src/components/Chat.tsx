@@ -282,6 +282,7 @@ interface PermissionRequestEvent {
   tool_name: string;
   reason: string;
   call_id: string;
+  approval_id?: string;
   arguments: unknown;
   allow_all_bash?: boolean;
   project_rule?: { rule: string; file: string };
@@ -300,7 +301,7 @@ interface ChatProps {
   pendingPermission?: PermissionRequestEvent | null;
   /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
    *  传 null 则无条件清（回合 done/stopped/error 或用户中止——此时不可能再有待批准项）。 */
-  onPermissionResolved?: (callId: string | null) => void;
+  onPermissionResolved?: (callId: string | null, approvalId?: string) => void;
   /** Metadata of the currently-active session (for loading history) */
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
@@ -4205,9 +4206,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // same composer seat as `/live` interactions.
   const chatPermissionCard = pendingPermission && (
     <PermissionCard
-      key={`chat:${pendingPermission.session_id}:${pendingPermission.call_id}`}
+      key={`chat:${pendingPermission.session_id}:${pendingPermission.approval_id ?? pendingPermission.call_id}`}
       req={pendingPermission}
-      onDone={() => onPermissionResolved?.(pendingPermission.call_id)}
+      onDone={() => onPermissionResolved?.(pendingPermission.call_id, pendingPermission.approval_id)}
     />
   );
 

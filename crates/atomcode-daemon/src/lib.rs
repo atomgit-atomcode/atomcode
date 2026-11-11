@@ -4191,11 +4191,14 @@ pub enum ChatEvent {
         message: Option<String>,
     },
     /// A tool requires user approval. The browser must POST the decision
-    /// back to `/chat/permission` keyed by `session_id`. The decider blocks
-    /// until the decision arrives (or the turn is cancelled).
+    /// back to `/chat/permission` with session_id, call_id and approval_id. The
+    /// runtime waits until a matching decision arrives or the turn is cancelled.
     #[serde(rename = "permission_request")]
     PermissionRequest {
         session_id: String,
+        /// Fresh one-shot HTTP approval identity, distinct from provider tool IDs.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_id: Option<String>,
         tool_name: String,
         reason: String,
         call_id: String,
@@ -4453,7 +4456,15 @@ mod chat_event_type_tests {
 
     #[test]
     fn native_approval_request_keeps_runtime_correlation() {
-        let mut projector = ChatRuntimeProjector::default();
+        let routes = crate::permission_bridge::PermissionResponders::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        routes.register("session-1".into(), tx);
+        routes.pending_call("session-1", Some("call-42"));
+        let approval_id = routes.approval_id("session-1", "call-42").unwrap();
+        let mut projector = ChatRuntimeProjector {
+            permission_routes: Some(routes),
+            ..Default::default()
+        };
         let request = atomcode_coding::RuntimeRequest {
             id: 42,
             kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
@@ -4472,6 +4483,8 @@ mod chat_event_type_tests {
         );
 
         let projected = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(projected["approval_id"], approval_id);
+        assert_eq!(projected["call_id"], "call-42");
         assert_eq!(projected["reason"], "the exact backend reason");
         assert_eq!(projected["project_rule"]["rule"], "Bash(git status)");
 
@@ -4928,6 +4941,7 @@ impl ArtifactDetector {
 }
 
 struct ChatRuntimeProjector {
+    permission_routes: Option<permission_bridge::PermissionResponders>,
     summary_location: Option<(PathBuf, String)>,
     summary_count: Option<u64>,
     artifacts: ArtifactDetector,
@@ -4942,6 +4956,7 @@ struct ChatRuntimeProjector {
 impl Default for ChatRuntimeProjector {
     fn default() -> Self {
         Self {
+            permission_routes: None,
             summary_location: None,
             summary_count: None,
             artifacts: ArtifactDetector::new(),
@@ -5026,8 +5041,12 @@ impl ChatRuntimeProjector {
                 else {
                     return Vec::new();
                 };
+                let approval_id = self.permission_routes.as_ref().and_then(|routes| {
+                    routes.approval_id(permission_session_id, &approval.call_id)
+                });
                 vec![ChatEvent::PermissionRequest {
                     session_id: permission_session_id.to_string(),
+                    approval_id,
                     tool_name: approval.tool,
                     reason: approval
                         .reason
@@ -5846,6 +5865,7 @@ async fn process_chat_request(
     }
 
     let mut projector = ChatRuntimeProjector {
+        permission_routes: Some(pending_permissions.clone()),
         summary_location: Some((working_dir.clone(), perm_session_key.clone())),
         summary_count: summary_baseline,
         ..Default::default()
@@ -5996,8 +6016,8 @@ async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoRespons
 /// POST /chat/permission - Deliver a permission decision for a pending tool-approval request.
 ///
 /// The browser receives a `permission_request` SSE event (emitted by `/chat`)
-/// that contains the `session_id`. It POSTs back here with the user's choice so
-/// the blocked turn can resume.
+/// that contains session_id, call_id and a fresh approval_id. Every choice must
+/// echo all three; missing, stale or duplicate identities fail closed.
 #[derive(Debug, serde::Deserialize)]
 pub struct PermissionDecisionRequest {
     pub session_id: String,
@@ -6010,6 +6030,9 @@ pub struct PermissionDecisionRequest {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub call_id: Option<String>,
+    /// Echo the current permission_request approval_id. Missing/expired IDs fail closed.
+    #[serde(default)]
+    pub approval_id: Option<String>,
 }
 
 async fn chat_permission(
@@ -6026,24 +6049,34 @@ async fn chat_permission(
                 decision: PermissionDecision::AllowOnce,
                 persist_mcp_tool: true,
                 persist_project_rule: false,
-                call_id: None,
+                call_id: req.call_id,
+                approval_id: req.approval_id,
             },
         );
         return Json(serde_json::json!({ "success": ok }));
     }
     if req.decision == "allow_project" {
         let ok = req.call_id.as_deref().is_some_and(|call| {
-            state
-                .pending_permissions
-                .deliver_project(&req.session_id, call)
+            state.pending_permissions.deliver_project(
+                &req.session_id,
+                call,
+                req.approval_id.as_deref(),
+            )
         });
         return Json(serde_json::json!({"success": ok}));
     }
     let decision = parse_permission_decision(&req.decision);
-    if state.pending_permissions.deliver(&req.session_id, decision) {
+    let answer = permission_bridge::ChatPermission {
+        call_id: req.call_id,
+        approval_id: req.approval_id,
+        ..decision.into()
+    };
+    if state.pending_permissions.deliver(&req.session_id, answer) {
         Json(serde_json::json!({ "success": true }))
     } else {
-        Json(serde_json::json!({ "success": false, "error": "no pending permission for session" }))
+        Json(
+            serde_json::json!({ "success": false, "error": "no matching pending approval; echo its current call_id and approval_id" }),
+        )
     }
 }
 
@@ -9486,6 +9519,93 @@ mod tests {
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn chat_http_approval_decisions_require_one_exact_pending_identity() {
+        use tower::ServiceExt;
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("approval-test-token".into());
+        let routes = state.pending_permissions.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        routes.register("session".into(), tx);
+        let app = Router::new()
+            .route("/chat/permission", post(chat_permission))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+        let send = |body: serde_json::Value, authorized: bool| {
+            let app = app.clone();
+            async move {
+                let mut req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/permission")
+                    .header("content-type", "application/json");
+                if authorized {
+                    req = req.header("authorization", "Bearer approval-test-token");
+                }
+                let response = app
+                    .oneshot(req.body(axum::body::Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            }
+        };
+        assert_eq!(
+            send(
+                serde_json::json!({"session_id":"session","decision":"allow"}),
+                false
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut previous = String::new();
+        for decision in [
+            "allow",
+            "deny",
+            "always_allow",
+            "allow_all_bash",
+            "allow_persist",
+            "allow_project",
+        ] {
+            routes.pending_call("session", Some("reused-call"));
+            let token = routes.approval_id("session", "reused-call").unwrap();
+            for (call, approval) in [
+                (Some("wrong"), Some(token.as_str())),
+                (None, Some(token.as_str())),
+                (Some("reused-call"), None),
+                (Some("reused-call"), Some(previous.as_str())),
+            ] {
+                let (_, reply) = send(serde_json::json!({"session_id":"session","decision":decision,"call_id":call,"approval_id":approval}), true).await;
+                assert_eq!(reply["success"], false, "{decision}: {reply}");
+                assert!(rx.try_recv().is_err());
+            }
+            let body = serde_json::json!({"session_id":"session","decision":decision,"call_id":"reused-call","approval_id":token});
+            assert_eq!(send(body.clone(), true).await.1["success"], true);
+            let answer = rx.try_recv().unwrap();
+            assert_eq!(answer.call_id.as_deref(), Some("reused-call"));
+            assert_eq!(answer.approval_id.as_deref(), Some(token.as_str()));
+            assert_eq!(answer.persist_mcp_tool, decision == "allow_persist");
+            assert_eq!(answer.persist_project_rule, decision == "allow_project");
+            assert_eq!(send(body, true).await.1["success"], false);
+            assert!(rx.try_recv().is_err());
+            previous = token;
+        }
+        routes.unregister("session");
+        assert_eq!(send(serde_json::json!({"session_id":"session","decision":"allow","call_id":"reused-call","approval_id":previous}), true).await.1["success"], false);
     }
 
     #[tokio::test]

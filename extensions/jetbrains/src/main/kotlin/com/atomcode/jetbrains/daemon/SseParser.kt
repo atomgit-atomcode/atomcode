@@ -83,6 +83,7 @@ class SseParser {
                 json.string("reason").orEmpty(),
                 json.string("call_id").orEmpty(),
                 json.string("arguments").orEmpty(),
+                json.string("approval_id").orEmpty(),
             )
             "tokens" -> ChatEvent.Tokens(json.int("prompt") ?: 0, json.int("completion") ?: 0, json.int("total") ?: 0)
             "warning" -> ChatEvent.Warning(json.string("message").orEmpty())

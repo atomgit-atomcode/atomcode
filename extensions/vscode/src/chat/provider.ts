@@ -1328,6 +1328,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const msg = {
           sessionId: request.sessionId,
           id: request.callId,
+          ...(request.approvalId ? { approvalId: request.approvalId } : {}),
           toolName: request.toolName,
           reason: request.reason,
           args: request.args,
@@ -1595,6 +1596,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     sessionId?: string;
     id?: string;
     toolName?: string;
+    approvalId?: string;
     decision?: unknown;
     allowed?: boolean;
     persist?: boolean;
@@ -1610,6 +1612,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessageForSession(msg.sessionId, {
         type: 'permissionResponseResult',
         id: msg.id,
+        ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: false,
         message: 'Invalid permission decision',
       });
@@ -1621,10 +1624,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         msg.sessionId,
         decision,
         msg.toolName,
+        msg.id,
+        msg.approvalId,
       );
       this._postMessageForSession(msg.sessionId, {
         type: 'permissionResponseResult',
         id: msg.id,
+        ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: result.success,
         message: result.error,
       });
@@ -1632,6 +1638,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessageForSession(msg.sessionId, {
         type: 'permissionResponseResult',
         id: msg.id,
+        ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: false,
         message: this._messageFromError(e),
       });

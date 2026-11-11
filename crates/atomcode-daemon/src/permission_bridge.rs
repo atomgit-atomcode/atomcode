@@ -1,8 +1,6 @@
-//! 把 daemon `/chat` 的交互式权限决策桥接到 HTTP。
-//!
-//! `InteractivePermissionDecider` 阻塞在 `response_rx` 上等待决定；
-//! `/chat/permission` 收到前端决定后，经 `PermissionResponders` 按
-//! session_id 路由到对应的 `response_tx`，唤醒 decider。
+//! Bridge daemon `/chat` approval answers to the runtime that owns the request.
+//! HTTP answers claim a live (session, tool call, one-shot approval) route once;
+//! the waiting runtime independently checks identity and cancellation before acting.
 
 use atomcode_capabilities::tools::PermissionDecision;
 use std::collections::HashMap;
@@ -20,6 +18,7 @@ pub struct ChatPermission {
     pub persist_mcp_tool: bool,
     pub persist_project_rule: bool,
     pub call_id: Option<String>,
+    pub approval_id: Option<String>,
 }
 
 impl From<PermissionDecision> for ChatPermission {
@@ -29,6 +28,7 @@ impl From<PermissionDecision> for ChatPermission {
             persist_mcp_tool: false,
             persist_project_rule: false,
             call_id: None,
+            approval_id: None,
         }
     }
 }
@@ -36,8 +36,12 @@ impl From<PermissionDecision> for ChatPermission {
 /// session_id -> decider 的 response 发送端。
 #[derive(Clone, Default)]
 pub struct PermissionResponders {
-    inner: Arc<RwLock<HashMap<String, UnboundedSender<ChatPermission>>>>,
-    calls: Arc<RwLock<HashMap<String, String>>>,
+    inner: Arc<RwLock<HashMap<String, PermissionRoute>>>,
+}
+
+struct PermissionRoute {
+    tx: UnboundedSender<ChatPermission>,
+    pending: Option<(String, String)>, // actual tool call ID, fresh driver approval ID
 }
 
 /// A pending `/chat` structured-input request, keyed by the native runtime request id.
@@ -90,20 +94,20 @@ impl UserInputResponders {
 
 impl PermissionResponders {
     pub fn pending_call(&self, session: &str, call: Option<&str>) {
-        let mut calls = self.calls.write().unwrap();
-        if let Some(call) = call {
-            calls.insert(session.into(), call.into());
-        } else {
-            calls.remove(session);
+        if let Some(route) = self.inner.write().unwrap().get_mut(session) {
+            route.pending = call
+                .filter(|call| !call.is_empty())
+                .map(|call| (call.to_owned(), uuid::Uuid::new_v4().to_string()));
         }
     }
-    pub fn deliver_project(&self, session: &str, call_id: &str) -> bool {
-        let mut calls = self.calls.write().unwrap();
-        if calls.get(session).map(String::as_str) != Some(call_id) {
-            return false;
-        }
-        calls.remove(session);
-        drop(calls);
+
+    pub fn approval_id(&self, session: &str, call: &str) -> Option<String> {
+        let routes = self.inner.read().unwrap();
+        let (pending_call, approval_id) = routes.get(session)?.pending.as_ref()?;
+        (pending_call == call).then(|| approval_id.clone())
+    }
+
+    pub fn deliver_project(&self, session: &str, call_id: &str, approval_id: Option<&str>) -> bool {
         self.deliver(
             session,
             ChatPermission {
@@ -111,32 +115,44 @@ impl PermissionResponders {
                 persist_mcp_tool: false,
                 persist_project_rule: true,
                 call_id: Some(call_id.into()),
+                approval_id: approval_id.map(str::to_owned),
             },
         )
     }
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 登记某 session 的决定发送端（`/chat` 启动时调用）。
     pub fn register(&self, session_id: String, tx: UnboundedSender<ChatPermission>) {
-        self.inner.write().unwrap().insert(session_id, tx);
+        self.inner
+            .write()
+            .unwrap()
+            .insert(session_id, PermissionRoute { tx, pending: None });
     }
 
-    /// `/chat` 结束时清理。
     pub fn unregister(&self, session_id: &str) {
-        self.pending_call(session_id, None);
         self.inner.write().unwrap().remove(session_id);
     }
 
-    /// 把决定送给对应 session 的 decider。返回是否成功（session 是否在等待）。
+    /// Claim one exact pending request while holding the routing lock. No answer
+    /// may be queued before a request or reused for a later request/registration.
     pub fn deliver(&self, session_id: &str, answer: impl Into<ChatPermission>) -> bool {
-        self.pending_call(session_id, None);
-        if let Some(tx) = self.inner.read().unwrap().get(session_id) {
-            tx.send(answer.into()).is_ok()
-        } else {
-            false
+        let answer = answer.into();
+        let mut routes = self.inner.write().unwrap();
+        let Some(route) = routes.get_mut(session_id) else {
+            return false;
+        };
+        let Some((call, approval)) = &route.pending else {
+            return false;
+        };
+        if answer.call_id.as_deref() != Some(call.as_str())
+            || answer.approval_id.as_deref() != Some(approval.as_str())
+        {
+            return false;
         }
+        route.pending = None;
+        route.tx.send(answer).is_ok()
     }
 }
 
@@ -145,61 +161,88 @@ mod tests {
     use super::*;
     use atomcode_capabilities::tools::PermissionDecision;
 
+    fn answer(reg: &PermissionResponders, session: &str, call: &str) -> ChatPermission {
+        ChatPermission {
+            call_id: Some(call.into()),
+            approval_id: reg.approval_id(session, call),
+            ..PermissionDecision::AllowOnce.into()
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_answers_require_a_live_matching_call_and_are_consumed_once() {
+        let reg = PermissionResponders::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register("session".into(), tx);
+        assert!(!reg.deliver("session", answer(&reg, "session", "not-pending")));
+        reg.pending_call("session", Some("current"));
+        assert!(!reg.deliver("session", answer(&reg, "session", "stale")));
+        assert!(!reg.deliver("session", PermissionDecision::AllowOnce));
+        let correct = answer(&reg, "session", "current");
+        let mut missing = correct.clone();
+        missing.approval_id = None;
+        assert!(!reg.deliver("session", missing));
+        let mut wrong = correct.clone();
+        wrong.approval_id = Some("wrong".into());
+        assert!(!reg.deliver("session", wrong));
+        assert!(rx.try_recv().is_err());
+        assert!(reg.deliver("session", correct.clone()));
+        assert_eq!(rx.recv().await, Some(correct.clone()));
+        assert!(!reg.deliver("session", correct.clone()));
+        // A provider can reuse a tool call ID. A fresh approval ID still fences it.
+        reg.pending_call("session", Some("current"));
+        assert!(!reg.deliver("session", correct));
+        assert!(reg.deliver("session", answer(&reg, "session", "current")));
+        assert!(rx.recv().await.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn project_save_rejects_stale_duplicate_and_resolved_call_ids() {
-        let registry = PermissionResponders::new();
+        let reg = PermissionResponders::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register("session".into(), tx);
-        registry.pending_call("session", Some("new-call"));
-        assert!(!registry.deliver_project("session", "old-call"));
-        assert!(rx.try_recv().is_err());
-        assert!(registry.deliver_project("session", "new-call"));
-        let answer = rx.recv().await.unwrap();
-        assert!(answer.persist_project_rule);
-        assert_eq!(answer.call_id.as_deref(), Some("new-call"));
-        assert!(!registry.deliver_project("session", "new-call"));
-        registry.pending_call("session", Some("next-call"));
-        registry.deliver("session", PermissionDecision::AllowOnce);
-        assert!(!registry.deliver_project("session", "next-call"));
-        registry.unregister("session");
-        assert!(!registry.deliver_project("session", "next-call"));
+        reg.register("session".into(), tx);
+        reg.pending_call("session", Some("current"));
+        let token = reg.approval_id("session", "current").unwrap();
+        assert!(!reg.deliver_project("session", "old", Some(&token)));
+        assert!(!reg.deliver_project("session", "current", None));
+        assert!(reg.deliver_project("session", "current", Some(&token)));
+        let received = rx.recv().await.unwrap();
+        assert!(received.persist_project_rule);
+        assert_eq!(received.call_id.as_deref(), Some("current"));
+        assert!(!reg.deliver_project("session", "current", Some(&token)));
+        reg.pending_call("session", Some("next"));
+        assert!(reg.deliver("session", answer(&reg, "session", "next")));
+        assert!(!reg.deliver_project("session", "next", Some(&token)));
+        reg.unregister("session");
+        assert!(!reg.deliver_project("session", "next", Some(&token)));
     }
 
     #[tokio::test]
-    async fn routes_decision_to_registered_session() {
+    async fn registration_replacement_and_cancelled_pending_requests_revoke_answers() {
         let reg = PermissionResponders::new();
+        let (old_tx, mut old_rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register("session".into(), old_tx);
+        reg.pending_call("session", Some("call"));
+        let old = answer(&reg, "session", "call");
+        reg.pending_call("session", None);
+        assert!(!reg.deliver("session", old.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        reg.register("sess-1".into(), tx);
-
-        assert!(reg.deliver("sess-1", PermissionDecision::AllowOnce));
-        assert_eq!(
-            rx.recv().await,
-            Some(ChatPermission::from(PermissionDecision::AllowOnce))
-        );
-    }
-
-    /// "Always allow this MCP tool" travels with the decision to the runtime that
-    /// asked, which carries it out through its own registry.
-    #[tokio::test]
-    async fn an_always_allow_reaches_the_runtime_with_its_decision() {
-        let reg = PermissionResponders::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        reg.register("sess-1".into(), tx);
-        let answer = ChatPermission {
-            decision: PermissionDecision::AllowOnce,
-            persist_mcp_tool: true,
-            persist_project_rule: false,
-            call_id: None,
-        };
-
-        assert!(reg.deliver("sess-1", answer.clone()));
-        assert_eq!(rx.recv().await, Some(answer));
+        reg.register("session".into(), tx);
+        reg.pending_call("session", Some("call"));
+        assert!(!reg.deliver("session", old));
+        let mut current = answer(&reg, "session", "call");
+        current.persist_mcp_tool = true;
+        assert!(reg.deliver("session", current.clone()));
+        assert_eq!(rx.recv().await, Some(current.clone()));
+        assert!(old_rx.try_recv().is_err());
+        reg.unregister("session");
+        assert!(!reg.deliver("session", current));
     }
 
     #[test]
     fn deliver_to_unknown_session_returns_false() {
-        let reg = PermissionResponders::new();
-        assert!(!reg.deliver("nope", PermissionDecision::Deny));
+        assert!(!PermissionResponders::new().deliver("nope", PermissionDecision::Deny));
     }
 
     #[tokio::test]

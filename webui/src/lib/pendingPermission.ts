@@ -11,16 +11,19 @@
 // approval stall bug.
 //
 // Fix: only clear when the slot still holds the exact request this card decided
-// (matched by call_id). If a newer request already replaced it, keep the new one
+// (matched by call_id and, for /chat, its one-shot approval_id). If a newer
+// request already replaced it, keep the new one
 // so its card renders.
 
 export interface PendingLike {
   call_id: string;
+  approval_id?: string;
 }
 
 export function resolvePendingAfterDecision<T extends PendingLike>(
   current: T | null,
   decidedCallId: string,
+  approvalId?: string,
 ): T | null {
-  return current && current.call_id === decidedCallId ? null : current;
+  return current && current.call_id === decidedCallId && (approvalId === undefined || current.approval_id === approvalId) ? null : current;
 }
