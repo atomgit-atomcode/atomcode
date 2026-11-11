@@ -630,6 +630,9 @@ impl LlmProvider for ReplayProvider {
             completion: 20,
             ..Default::default()
         }));
+        // A completed fixture reply follows the same terminal contract as a
+        // real adapter; EOF alone must not stand in for successful completion.
+        events.push(StreamEvent::Done { truncated: false });
         Ok(Box::pin(futures::stream::iter(events)))
     }
 }

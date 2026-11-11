@@ -3,6 +3,16 @@
 //! Only a prefix length and a flag survive a chunk: no argument or answer text
 //! is retained or logged. The token below appeared in a real gateway response.
 const MARKER: &[u8] = b"]<]minimax[>[";
+/// Whether text contains a known reserved native chat-template token.
+/// This is format evidence, not permission to parse or execute text as tools.
+/// Callers decide whether such text is usable in their own domain (a generated
+/// session title, for example). Ordinary XML/tag examples are not matched.
+pub fn contains_native_chat_template_token(text: &str) -> bool {
+    text.as_bytes()
+        .windows(MARKER.len())
+        .any(|part| part == MARKER)
+}
+
 // Prefix table keeps overlapping matches linear without retaining body bytes.
 const PREFIX: [usize; MARKER.len()] = {
     let mut table = [0; MARKER.len()];
@@ -58,6 +68,12 @@ mod tests {
     #[test]
     fn all_split_points_and_overlapping_prefixes_are_observed_once() {
         let token = std::str::from_utf8(MARKER).unwrap();
+        assert!(contains_native_chat_template_token(&format!(
+            "正文 {token} details"
+        )));
+        assert!(!contains_native_chat_template_token(
+            "<tool_call> literal XML"
+        ));
         for split in 0..=token.len() {
             let mut marker = ContentMarker::default();
             marker.observe("正文 ]<]<]");
@@ -106,6 +122,9 @@ mod tests {
         }
         let capture = Capture::default();
         tracing::subscriber::with_default(capture.clone(), || {
+            assert!(contains_native_chat_template_token(
+                "PRIVATE_BODY ]<]minimax[>["
+            ));
             let mut marker = ContentMarker::default();
             marker.observe("PRIVATE_BODY ]<]mini");
             marker.observe("max[>[<tool_call>PRIVATE_ARGUMENTS");

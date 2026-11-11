@@ -52,7 +52,11 @@ fn tidy(text: &str, max_words: usize, max_bytes: usize) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     if title.len() > max_bytes {
-        title = title.chars().take(max_bytes / 4).collect();
+        let mut end = max_bytes;
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title.truncate(end);
     }
     // Punctuation the cut left dangling — a comma at word eight, the period a
     // model puts on everything — is not part of a name.
@@ -206,14 +210,36 @@ impl ModelTitle {
             let mut stream = provider.chat_stream(&prompt, &[], &options).await.ok()?;
             let mut out = String::new();
             while let Some(event) = stream.next().await {
-                if let StreamEvent::TextDelta(text) = event {
-                    out.push_str(&text);
-                    if out.len() > 512 {
-                        break;
+                match event {
+                    StreamEvent::TextDelta(text) => {
+                        // Never accumulate beyond the existing read allowance,
+                        // including when one provider chunk is already huge.
+                        if text.len() > 512 - out.len() {
+                            return None;
+                        }
+                        out.push_str(&text);
                     }
+                    StreamEvent::Done { truncated: false } => {
+                        if atomcode_capabilities::provider::contains_native_chat_template_token(
+                            &out,
+                        ) {
+                            return None;
+                        }
+                        return Some(out);
+                    }
+                    StreamEvent::Done { truncated: true }
+                    | StreamEvent::Error(_)
+                    | StreamEvent::Malformed
+                    | StreamEvent::ToolCall(_)
+                    | StreamEvent::ToolCallDelta { .. } => return None,
+                    _ => {}
                 }
+                // The outer timeout must be polled even for a custom provider
+                // that continuously yields ready reasoning/metadata events.
+                tokio::task::yield_now().await;
             }
-            Some(out)
+            // EOF or a partial title is not successful model completion.
+            None
         };
         tokio::time::timeout(self.timeout, call)
             .await
@@ -226,7 +252,7 @@ impl ModelTitle {
 impl SessionTitle for ModelTitle {
     fn describe(&self) -> String {
         "a model, from the first prompt — the utility model, or the conversation's when there \
-         is none; the first prompt itself when the call fails"
+         is none; the first prompt itself when the call fails or the title is unusable"
             .into()
     }
 
@@ -384,5 +410,234 @@ impl Plugin for TitleOnFirstPromptPlugin {
                 });
             });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomcode_kernel::testkit::RecordingProvider;
+    use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
+
+    struct Utility(Arc<dyn LlmProvider>);
+    #[async_trait]
+    impl Plugin for Utility {
+        fn name(&self) -> &'static str {
+            "title-test-utility"
+        }
+        fn provides(&self) -> &'static [&'static str] {
+            &["llm-utility"]
+        }
+        async fn apply(&self, ctx: &Context, _: &Value) -> Result<(), String> {
+            let _ = ctx
+                .provide::<LlmUtilitySvc>(self.0.clone())
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+
+    async fn title_from(
+        provider: Arc<dyn LlmProvider>,
+        first: &str,
+        max_bytes: usize,
+    ) -> Option<String> {
+        let mut registry = PluginRegistry::new();
+        registry
+            .register(Arc::new(Utility(provider)))
+            .register(Arc::new(ModelTitlePlugin));
+        let layer = Layer::from_toml(&format!(
+            r#"
+[[insert]]
+name = "title-test-utility"
+[[insert]]
+name = "session-title-model"
+config = {{ max_bytes = {max_bytes} }}
+"#
+        ))
+        .unwrap();
+        let mut app = App::new(registry, ConfigTree::from_layers([layer]).unwrap());
+        app.start().await.unwrap();
+        let log = SessionLog::new("title-validation");
+        log.record(SessionEvent::UserMessage {
+            turn: 1,
+            text: first.into(),
+            images: vec![],
+        });
+        let title = app
+            .context()
+            .service::<SessionTitleSvc>()
+            .unwrap()
+            .title(&log)
+            .await;
+        app.stop();
+        title
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_or_unfinished_titles_fall_back_without_retrying() {
+        use atomcode_kernel::stream::ProviderError;
+        use atomcode_kernel::tool::ToolCall;
+        let candidates = vec![
+            vec![StreamEvent::TextDelta("partial".into())],
+            vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Error(ProviderError::default()),
+            ],
+            vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Malformed,
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::Done { truncated: true },
+            ],
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "unused".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("partial".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: Some("read_file".into()),
+                    arguments: "{".into(),
+                },
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::Reasoning("only thinking".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("Good title ]<]mini".into()),
+                StreamEvent::TextDelta("max[>[<tool_call>".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("safe first line\n]<]minimax[>[<tool_call>".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("x".repeat(513)),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("x".repeat(511)),
+                StreamEvent::TextDelta("🙂".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ];
+        for (i, events) in candidates.into_iter().enumerate() {
+            let provider = Arc::new(RecordingProvider::new(vec![events]));
+            assert_eq!(
+                title_from(provider.clone(), "Fix Windows build", 80)
+                    .await
+                    .as_deref(),
+                Some("Fix Windows build"),
+                "case {i}"
+            );
+            assert_eq!(provider.recorded().len(), 1, "case {i} must not retry");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completed_titles_allow_thinking_and_literal_xml_without_starving_reasoning() {
+        let provider = Arc::new(RecordingProvider::new(vec![vec![
+            StreamEvent::Reasoning("thinking first".repeat(100)),
+            StreamEvent::ReasoningSignature {
+                opaque: "signature".into(),
+                provider: "signed".into(),
+            },
+            StreamEvent::TextDelta("\"Understanding <tool_call> tags.\"".into()),
+            StreamEvent::Done { truncated: false },
+        ]]));
+        assert_eq!(
+            title_from(provider.clone(), "question", 80)
+                .await
+                .as_deref(),
+            Some("Understanding <tool_call> tags")
+        );
+        assert!(provider.recorded_options()[0].max_tokens.is_none());
+        let limit = Arc::new(RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("x".repeat(512)),
+            StreamEvent::Done { truncated: false },
+        ]]));
+        assert_eq!(title_from(limit, "question", 512).await.unwrap().len(), 512);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn only_generated_titles_are_rejected_for_native_tokens() {
+        let first = "]<]minimax[>[<tool_call> documentation";
+        let provider = Arc::new(RecordingProvider::new(vec![vec![
+            StreamEvent::TextDelta("]<]minimax[>[bad generated title".into()),
+            StreamEvent::Done { truncated: false },
+        ]]));
+        assert_eq!(
+            title_from(provider, first, 80).await.as_deref(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn byte_limits_keep_the_longest_whole_utf8_prefix() {
+        assert_eq!(tidy(&"a".repeat(81), 8, 80), Some("a".repeat(80)));
+        assert_eq!(tidy(&"中".repeat(30), 8, 80), Some("中".repeat(26)));
+        assert_eq!(tidy("ab中🙂cdef", 8, 8).as_deref(), Some("ab中"));
+        assert_eq!(tidy("ab中🙂cdef", 8, 9).as_deref(), Some("ab中🙂"));
+        assert_eq!(tidy("中", 8, 2), None);
+        assert_eq!(tidy("anything", 8, 0), None);
+        assert_eq!(tidy("one two three", 2, 80).as_deref(), Some("one two"));
+    }
+    struct NeverEnds {
+        ready: bool,
+        opened: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl LlmProvider for NeverEnds {
+        fn model_name(&self) -> &str {
+            "never-ending-title"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            self.opened.notify_one();
+            if self.ready {
+                Ok(Box::pin(futures::stream::repeat(StreamEvent::Usage(
+                    Default::default(),
+                ))))
+            } else {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_existing_timeout_also_bounds_continuously_ready_metadata() {
+        for ready in [false, true] {
+            let opened = Arc::new(tokio::sync::Notify::new());
+            let provider = Arc::new(NeverEnds {
+                ready,
+                opened: opened.clone(),
+            });
+            let clock = async move {
+                opened.notified().await;
+                tokio::time::advance(Duration::from_secs(16)).await;
+            };
+            let began = tokio::time::Instant::now();
+            let (title, ()) = tokio::join!(title_from(provider, "original prompt", 80), clock);
+            assert_eq!(title.as_deref(), Some("original prompt"));
+            assert_eq!(began.elapsed(), Duration::from_secs(16));
+        }
     }
 }
