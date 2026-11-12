@@ -63,6 +63,12 @@ pub(super) fn into_tool_result(result: CallToolResult) -> ToolResult {
             "MCP tool executed, but image output rejected: {reason}."
         ));
     } else {
+        // Some desktop servers embed the same screenshot in JSON metadata and
+        // an image block. Keep the validated attachment, not a second base64
+        // copy that can consume the text budget and truncate fresh target IDs.
+        for body in &mut text {
+            remove_duplicate_image_urls(body, &images);
+        }
         text.extend(descriptions);
     }
     let mut content = text.join("\n");
@@ -74,6 +80,41 @@ pub(super) fn into_tool_result(result: CallToolResult) -> ToolResult {
         content,
         is_error,
         images,
+    }
+}
+
+fn remove_duplicate_image_urls(text: &mut String, images: &[ImageContent]) {
+    if images.is_empty() || !text.contains("data:") {
+        return;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let urls: Vec<_> = images
+        .iter()
+        .map(|image| format!("data:{};base64,{}", image.media_type, image.data))
+        .collect();
+    fn visit(value: &mut serde_json::Value, urls: &[String]) -> bool {
+        match value {
+            serde_json::Value::String(value) => {
+                if let Some(index) = urls.iter().position(|url| url == value) {
+                    *value = format!("[MCP inline image {}; attached separately]", index + 1);
+                    true
+                } else {
+                    false
+                }
+            }
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .fold(false, |changed, value| visit(value, urls) || changed),
+            serde_json::Value::Object(values) => values
+                .values_mut()
+                .fold(false, |changed, value| visit(value, urls) || changed),
+            _ => false,
+        }
+    }
+    if visit(&mut value, &urls) {
+        *text = serde_json::to_string(&value).expect("JSON value serializes");
     }
 }
 
@@ -164,6 +205,43 @@ mod tests {
         assert_eq!(result.images[0].media_type, "image/png");
         assert!(result.content.contains("2x1"));
     }
+    #[test]
+    fn duplicate_json_screenshot_urls_keep_metadata_without_second_payload() {
+        let body = serde_json::json!({
+            "screenshots": [{"id":"fresh-shot", "url":format!("data:image/png;base64,{PNG}")}],
+            "window":{"id":42},
+            "other":"data:image/png;base64,unrelated",
+            "tree":"2 text field\n3 button"
+        })
+        .to_string();
+        let result = output(vec![
+            ContentBlock::Text { text: body },
+            picture("image/png", PNG),
+        ]);
+        assert!(!result.is_error);
+        assert_eq!(result.images[0].data, PNG);
+        assert!(!result.content.contains(PNG));
+        let metadata: serde_json::Value = serde_json::Deserializer::from_str(&result.content)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata["screenshots"][0]["id"], "fresh-shot");
+        assert_eq!(metadata["window"]["id"], 42);
+        assert_eq!(metadata["tree"], "2 text field\n3 button");
+        assert_eq!(metadata["other"], "data:image/png;base64,unrelated");
+        assert_eq!(
+            metadata["screenshots"][0]["url"],
+            "[MCP inline image 1; attached separately]"
+        );
+        // No attachment means no substitution, even for a syntactically valid URL.
+        let text = format!("data:image/png;base64,{PNG}");
+        assert_eq!(
+            output(vec![ContentBlock::Text { text: text.clone() }]).content,
+            text
+        );
+    }
+
     #[test]
     fn errors_retain_their_text_and_valid_screenshot() {
         let result = into_tool_result(CallToolResult {

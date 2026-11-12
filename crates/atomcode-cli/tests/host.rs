@@ -103,6 +103,14 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text.starts_with("desktop fixture ") => {
+                let request: serde_json::Value = serde_json::from_str(&m.text[16..]).unwrap();
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: format!("mcp__computer-use__{}", request["tool"].as_str().unwrap()),
+                    arguments: request["arguments"].to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text.starts_with("browser navigate ") => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -4494,4 +4502,205 @@ async fn a_scoped_download_is_denied_before_dispatch_and_cancelled_without_publi
         break;
     }
     connection.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+/// Real desktop effects are restricted to a disposable, explicitly supplied fixture.
+/// The installed backend is never patched or terminated by this test.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires explicit ATOMCODE_DESKTOP_TEST_BACKEND and ATOMCODE_DESKTOP_TEST_FIXTURE with exact App OS grants; opens its own GUI fixture"]
+async fn a_real_desktop_fixture_uses_runtime_images_approval_and_pending_cancel() {
+    use serde_json::{json, Value};
+    tokio::time::resume(); // Actual native App, filesystem and MCP I/O.
+    let env = env();
+    let backend = std::env::var_os("ATOMCODE_DESKTOP_TEST_BACKEND").expect("explicit backend");
+    let fixture = std::env::var_os("ATOMCODE_DESKTOP_TEST_FIXTURE").expect("explicit fixture");
+    assert!(std::path::Path::new(&backend).is_absolute());
+    assert!(std::path::Path::new(&fixture).is_absolute());
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    atomcode::computer_cmd::execute(
+        &dirs,
+        atomcode::computer_cmd::ComputerCli::Enable {
+            executable: Some(backend.into()),
+            scope: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let state_file = env.project.path().join("fixture-state.json");
+    let gate = env.project.path().join("release-gate");
+    let mut target = tokio::process::Command::new(fixture)
+        .args([
+            "--state-file",
+            state_file.to_str().unwrap(),
+            "--release-gate",
+            gate.to_str().unwrap(),
+        ])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let state = || -> Value {
+        std::fs::read(&state_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null)
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state()["process_id"].as_u64() != target.id().map(u64::from) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (mut connection, _) = started(&env, SubagentPolicy::Disabled, None, vec![], true).await;
+    let session = connection.session.clone();
+    assert!(tools_on_the_model(&connection, &session, "computer-use")
+        .await
+        .iter()
+        .any(|name| name.ends_with("get_window_state")));
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session,
+            mode: atomcode_host_api::Mode::Ask,
+        })
+        .await
+        .unwrap();
+    async fn invoke(
+        connection: &mut HostConnection,
+        tool: &str,
+        args: Value,
+        decision: &str,
+    ) -> atomcode_kernel::tool::ToolResult {
+        connection
+            .commands
+            .send(message(&format!(
+                "desktop fixture {}",
+                json!({"tool":tool,"arguments":args})
+            )))
+            .unwrap();
+        let mut result = None;
+        let mut started = 0;
+        let mut approvals = 0;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match connection.events.recv().await.expect("runtime events") {
+                    AgentEvent::Request { id, kind, .. } => {
+                        assert_eq!(kind, "approval");
+                        approvals += 1;
+                        if decision == "cancel" {
+                            connection.commands.send(AgentCommand::Cancel).unwrap();
+                        } else {
+                            connection
+                                .commands
+                                .send(AgentCommand::Respond {
+                                    id,
+                                    value: json!({"decision":decision}),
+                                })
+                                .unwrap();
+                        }
+                    }
+                    AgentEvent::ToolStarted { .. } => started += 1,
+                    AgentEvent::ToolResult { result: value } => result = Some(value),
+                    AgentEvent::TurnComplete { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            approvals,
+            usize::from(!matches!(tool, "list_windows" | "get_window_state")),
+            "read-only observations are safe; mutations require per-call approval"
+        );
+        assert_eq!(started, usize::from(decision == "allow"));
+        result.expect("one terminal tool result")
+    }
+    let listed = invoke(&mut connection, "list_windows", json!({}), "allow").await;
+    assert!(!listed.is_error);
+    let windows: Value = serde_json::from_str(&listed.content).unwrap();
+    let window = windows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|window| {
+            window["title"] == "AtomCode CU Acceptance" && window["id"] == state()["window_id"]
+        })
+        .expect("only the owned fixture window")
+        .clone();
+    let screenshot = invoke(
+        &mut connection,
+        "get_window_state",
+        json!({"window":window,"include_screenshot":true,"include_text":true}),
+        "allow",
+    )
+    .await;
+    assert!(!screenshot.is_error);
+    assert_eq!(screenshot.images.len(), 1);
+    assert_eq!(screenshot.images[0].media_type, "image/png");
+    let observation: Value = serde_json::Deserializer::from_str(&screenshot.content)
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+    let index = |tree: &str, label: &str| -> String {
+        let rows: Vec<_> = tree
+            .lines()
+            .filter(|line| {
+                line.contains(label) && (label != "Acceptance message" || line.contains("field"))
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "fresh target must be unambiguous");
+        rows[0].split_whitespace().next().unwrap().to_string()
+    };
+    let field = index(
+        observation["accessibility"]["tree"].as_str().unwrap(),
+        "Acceptance message",
+    );
+    let args = json!({"window":window,"element_index":field,"value":"atomcode-runtime-desktop"});
+    assert!(
+        invoke(&mut connection, "set_value", args.clone(), "deny")
+            .await
+            .is_error
+    );
+    assert_eq!(state()["message"], "");
+    let _ = invoke(&mut connection, "set_value", args.clone(), "cancel").await;
+    assert_eq!(state()["message"], "");
+    assert!(
+        !invoke(&mut connection, "set_value", args, "allow")
+            .await
+            .is_error
+    );
+    let fresh = invoke(
+        &mut connection,
+        "get_window_state",
+        json!({"window":window,"include_screenshot":true}),
+        "allow",
+    )
+    .await;
+    let observation: Value = serde_json::Deserializer::from_str(&fresh.content)
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+    let button = index(
+        observation["accessibility"]["tree"].as_str().unwrap(),
+        "Record once",
+    );
+    assert!(!invoke(&mut connection, "click", json!({"window":window,"element_index":button,"click_method":"accessibility","screenshotId":observation["screenshots"][0]["id"]}), "allow").await.is_error);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state()["submissions"] != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state()["message"], "atomcode-runtime-desktop");
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
+    target.start_kill().unwrap();
+    target.wait().await.unwrap();
 }

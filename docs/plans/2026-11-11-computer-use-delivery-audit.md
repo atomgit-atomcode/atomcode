@@ -2,7 +2,7 @@
 
 This table checks the approved design, distinguishing implementation, protocol tests and actual GUI effects. Local Codex remains 806d9732c9. Its configuration types describe policy vocabulary, not proof of a reusable execution backend.
 
-Basic installed-backend GUI evidence is now recorded in [general desktop acceptance](2026-11-12-general-computer-use-basic-acceptance.md): actual fixture-only PNG, field assignment and one button action passed. This does not establish experimental leases, scoped enforcement or the AtomCode runtime workflow.
+Basic installed-backend GUI and native runtime evidence is now recorded in [general desktop acceptance](2026-11-12-general-computer-use-basic-acceptance.md): actual fixture-only PNG, field assignment and one button action passed. The production Host/CodingRuntime path also passes native image/metadata delivery, mutation approval denial, pending-approval cancellation with no ToolStarted/effects, and allowed fill/click with one independently witnessed submission. A duplicated-base64 text truncation issue was corrected at MCP result conversion. This does not establish literal key typing/scrolling, in-flight GUI cancellation, real-model desktop reasoning, experimental leases or scoped enforcement.
 
 ## Delivery priority after scope review
 
