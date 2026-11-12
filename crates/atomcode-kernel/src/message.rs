@@ -17,16 +17,15 @@ pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
     "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
 
 /// Stable provenance for the synthetic user message written at an authoritative
-/// user-cancel terminal. Consumers such as the coding todo reducer use this as a
-/// history boundary: work recorded before it remains available for reference but
-/// is no longer active unless a later real user message explicitly resumes it.
+/// user-cancel terminal. It records a stopped execution without discarding
+/// previously recorded progress; the next user instruction controls continuation.
 pub const USER_INTERRUPTION_ORIGIN: &str = "atomcode.user_interruption";
 
 /// Wire-visible text paired with [`USER_INTERRUPTION_ORIGIN`]. A user-role marker
 /// is accepted by OpenAI-compatible and Anthropic adapters in the middle of a
 /// conversation, unlike a non-leading system message.
 pub const USER_INTERRUPTION_MARKER: &str =
-    "[The previous turn was interrupted by the user. Treat any unfinished plan or task list from before this marker as inactive. Follow the next real user message as a new instruction; resume earlier work only if that message explicitly asks to continue it.]";
+    "[The previous turn was interrupted by the user. Preserve recorded progress. Wait for the next real user instruction before taking further action; follow it to continue, redirect or abandon the earlier work.]";
 
 /// Extract the bare cold-summary strings from a kernel message list: the
 /// synthetic messages tagged [`LEGACY_COLD_SUMMARY_ORIGIN`], with their

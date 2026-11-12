@@ -255,16 +255,14 @@ impl SessionManager {
         if follow_sidecar
             && events.iter().any(|logged| match &logged.event {
                 SessionEvent::Rewound { scope, .. } => scope.takes_back_conversation(),
-                // A standing cancel retires the active plan too: the fold starts
-                // after the newest interruption, so every interruption moves it.
+                // Reconcile settled calls on interruption; undone cancellation
+                // also removes the interrupted turn from the projection.
                 SessionEvent::Interrupted { .. } => true,
                 _ => false,
             })
         {
-            // A rewind, a cancel or a cancelled-and-undone turn takes its todo
-            // calls out of the projection; the list the model reads is the log's
-            // standing turns, rebuilt so the sidecar cannot keep offering work
-            // the fold no longer contains.
+            // Rebuild from standing turns so undo removes reverted changes,
+            // while an ordinary interruption preserves the committed plan.
             if let Err(error) = self.rebuild_todo_sidecar_after_undo(id) {
                 // The append itself stands: a stale sidecar is a cache problem,
                 // not a reason to report the committed fact as failed.
@@ -480,24 +478,7 @@ impl SessionManager {
         let events = self.load_events(id)?;
         let undone = atomcode_kernel::session::undone_turns(&events);
 
-        // A person's cancel retires the plan without deleting its calls. Match
-        // the transcript fold's boundary (`active_todo_calls`): only calls after
-        // the most recent standing interruption shape the list. The split is by
-        // event order, the order the message projection keeps — a sequence
-        // number is an identity, not a position.
-        let boundary = events
-            .iter()
-            .enumerate()
-            .filter(|(_, logged)| !undone.contains(&logged.event.turn()))
-            .filter_map(|(index, logged)| match &logged.event {
-                SessionEvent::Interrupted {
-                    turn,
-                    undone: false,
-                } => Some((index, *turn)),
-                _ => None,
-            })
-            .next_back();
-
+        // Interruptions preserve standing plans. Only rewound turns are excluded.
         // A result answers the nearest earlier call with its id that no earlier
         // result has settled — the same association the transcript fold makes by
         // message order. A result never reaches back past the last call its id
@@ -514,11 +495,8 @@ impl SessionManager {
             std::collections::HashMap::new();
         let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut candidate = 0usize;
-        for (index, logged) in events.iter().enumerate() {
+        for logged in &events {
             if undone.contains(&logged.event.turn()) {
-                continue;
-            }
-            if boundary.is_some_and(|(at, _)| index <= at) {
                 continue;
             }
             match &logged.event {
@@ -603,21 +581,12 @@ impl SessionManager {
             Err(_) if !has_plan => return Ok(()),
             Err(_) => None,
         };
-        // Whether the sidecar is still the baseline the log has not retired.
-        // A plan the log cannot source at all (a converted or compacted
-        // session) is its only copy: only an undone increment can retire it,
-        // and an undo takes a suffix of turns, so the last reflected turn says
-        // whether one was. A plan the log does hold stands only while its
-        // through turn was not undone and is newer than the last standing cancel.
-        let stands = existing
-            .as_ref()
-            .is_some_and(|sidecar| match sidecar.through {
-                Some(through) if undone.contains(&through.turn) => false,
-                Some(through) => {
-                    !had_plan_in_log || boundary.is_none_or(|(_, turn)| through.turn > turn)
-                }
-                None => true,
-            });
+        // A sidecar remains a valid baseline unless its reflected turn was undone.
+        let stands = existing.as_ref().is_some_and(|sidecar| {
+            sidecar
+                .through
+                .is_none_or(|through| !undone.contains(&through.turn))
+        });
 
         let to_items = |items: &[super::manager::TodoSidecarItem]| -> Vec<TodoItem> {
             items
@@ -637,8 +606,7 @@ impl SessionManager {
         let mut legacy_baseline = false;
         let mut sources: Vec<u64> = Vec::new();
         if has_plan {
-            // A full plan in the log is authoritative for the calls after the
-            // boundary; fold them from empty.
+            // A full plan in the standing log is authoritative; fold from empty.
             items = reduce_todos(
                 calls
                     .iter()
@@ -835,7 +803,7 @@ impl SessionManager {
                 return Ok(());
             }
             // The log holds the plan this sidecar cached and took it back
-            // (an undone through turn or a cancel boundary); write the empty
+            // (an undone through turn); write the empty
             // list so the cache agrees.
         }
 
@@ -7490,12 +7458,10 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
-    fn a_standing_cancel_rebuilds_the_todo_sidecar() {
+    fn a_standing_cancel_preserves_the_todo_sidecar() {
         let (_dir, manager) = store();
         let lease = todo_session(&manager, "cancel-rebuilds-todos");
-        // A person's cancel retires the active plan in the projection — the fold
-        // starts after the newest interruption — so the cache must follow it
-        // even though nothing was undone.
+        // A plain interruption preserves the standing plan and its progress.
         manager
             .append_events(
                 &lease,
@@ -7514,8 +7480,18 @@ mod tests {
             .read_todo_sidecar("cancel-rebuilds-todos")
             .unwrap()
             .expect("the sidecar is rewritten, not left stale");
-        assert!(sidecar.todos.is_empty(), "{:?}", sidecar.todos);
-        assert_eq!(sidecar.through, None);
+        assert_eq!(sidecar.todos.len(), 2);
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.todos[0].status, "pending");
+        assert_eq!(sidecar.todos[1].content, "b");
+        assert_eq!(sidecar.todos[1].status, "completed");
+        assert!(sidecar.through.is_some());
+        let messages = atomcode_kernel::session::derive_messages(
+            &manager.load_events("cancel-rebuilds-todos").unwrap(),
+        );
+        let resumed = crate::tools::todo::derive_current_todos(&messages);
+        assert_eq!(resumed.len(), 2);
+        assert_eq!(resumed[1].status, crate::tools::todo::TodoStatus::Completed);
     }
 
     #[cfg(feature = "tools")]
@@ -8399,7 +8375,7 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
-    fn a_cancelled_plan_does_not_return_through_a_later_rebuild() {
+    fn an_interrupted_plan_survives_a_later_rebuild() {
         use atomcode_kernel::tool::ToolCall;
 
         let (_dir, manager) = store();
@@ -8524,11 +8500,9 @@ mod tests {
             .read_todo_sidecar(id)
             .unwrap()
             .expect("the update after the cancel writes the current list");
-        assert!(
-            sidecar.todos.is_empty(),
-            "the plan before the cancel must not come back: {:?}",
-            sidecar.todos
-        );
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "cancelled");
+        assert_eq!(sidecar.todos[0].status, "completed");
     }
 
     #[cfg(feature = "tools")]
@@ -8610,8 +8584,8 @@ mod tests {
             .unwrap();
         assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
 
-        // A standing cancel retires the plan too: cutting it back would restore
-        // the plan, so the probe must say the boundary moved.
+        // Interruption can reconcile a sidecar, so truncation conservatively
+        // rebuilds it too (including cancelled-and-undone interruptions).
         let id = "truncate-tail-cancel";
         let lease = created(&manager, id);
         manager.append_events(&lease, &a_turn()).unwrap();

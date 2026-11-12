@@ -411,7 +411,7 @@ atomcode --prompt-file task.md
 | `Ctrl+J` | 换行（终端能区分该组合键时） |
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
-| `Esc` | 清空输入 / 取消流式输出 |
+| `Esc` | 清空输入 / 停止流式输出，保留 Todo 清单 |
 | `Esc` ×2 | 撤销上一轮 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受斜杠命令、Skill 或文件补全 |
@@ -453,7 +453,7 @@ atomcode --prompt-file task.md
 | `Ctrl+Up/Down`      | 跳到上一条 / 下一条用户消息  |
 | 空输入时 `Home/End` | 跳到对话顶部 / 底部          |
 | `Ctrl+Shift+C`      | 复制选中内容                 |
-| `Ctrl+C`            | 取消当前操作（连按两次退出） |
+| `Ctrl+C`            | 停止执行，保留 Todo 清单（连按两次退出） |
 
 ### 新界面（`atomcode --tui`）
 
@@ -554,7 +554,10 @@ atomcode --prompt-file task.md
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |
 | `/help` | 查看命令与快捷键 |
+| `/todo clear` | 显式清空 Todo 清单；中断保留已记录的进度，发送后续指令可继续或调整任务。 |
 | `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
+
+默认 `keep_interrupted_context = true` 时，中断保留已记录的任务进度；设为 `false` 仍会撤销被中断回合，包括该回合的 Todo 改动。
 
 > **AtomGit Issue**：`/issue` 已移除。执行 `/login` 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”，AtomCode 会调用内置的 `atomgit_issue` 工具。读取 Issue 可直接执行；创建 Issue，以及新增、编辑或删除评论仍需权限确认。
 >

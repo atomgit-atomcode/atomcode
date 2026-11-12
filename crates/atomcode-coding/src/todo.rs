@@ -826,13 +826,7 @@ fn current_todos(
                     status: parse_todo_status(&item.status),
                 })
                 .collect();
-            let sources = if messages.iter().any(Message::is_user_interruption) {
-                // A source belongs to a plan, not to cached tasks revived after
-                // the person cancelled it. A later full plan may explicitly relink.
-                Vec::new()
-            } else {
-                sidecar.source_seqs
-            };
+            let sources = sidecar.source_seqs;
             (
                 items,
                 sidecar.through,
@@ -1346,10 +1340,8 @@ mod tests {
         cancelled_cache.source_seqs = vec![7, 12];
         let cancelled =
             current_todos(&[Message::user_interruption()], || Some(cancelled_cache)).unwrap();
-        assert!(
-            cancelled.source_seqs.is_empty(),
-            "a cancelled batch cannot be revived from its cache"
-        );
+        assert_eq!(cancelled.source_seqs, vec![7, 12]);
+        assert_eq!(cancelled.items[0].status, TodoStatus::InProgress);
         let replaced = current_todos(
             &[todowrite_msg(
                 r#"{"todos":[{"content":"new work","status":"pending"}]}"#,

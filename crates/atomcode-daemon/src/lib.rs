@@ -984,8 +984,8 @@ impl MessageInfo {
                 .map(|call| (call.name.as_str(), call.arguments.as_str())),
         );
         // A user-interruption message is a lifecycle boundary, not user-facing
-        // copy. Keep its provenance on the wire so clients can retire derived
-        // state, but never expose the internal continuation instruction.
+        // copy. Keep its provenance on the wire, but never expose the internal
+        // continuation instruction.
         let user_interruption = msg.is_user_interruption();
         let mut content = if user_interruption {
             String::new()
@@ -3140,8 +3140,7 @@ fn merge_catalog_session_messages_for_display(
         // Compressing this iterator before applying `index + 1` moves presentation rows to
         // the wrong turn.
         // Preserve the synthetic user-cancel boundary on the wire. UI clients
-        // still hide its text, but state projections (notably TodoWrite) need
-        // the provenance to retire work before this point. `/live` snapshots
+        // still hide its text while preserving recorded task progress. `/live` snapshots
         // already expose this exact marker through `MessageInfo::from_kernel`;
         // keeping it here makes HTTP history and live replay equivalent.
         let user_interruption = message.is_user_interruption();

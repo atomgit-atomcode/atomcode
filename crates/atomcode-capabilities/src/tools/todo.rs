@@ -370,18 +370,11 @@ pub struct ActiveTodoCall<'a> {
     pub index: usize,
 }
 
-/// The todo calls that still shape the list, in order: after the most recent user
-/// interruption and without the ones that came back an error. The input
-/// [`derive_current_todos`] folds, exposed so a caller that folds over a baseline of
-/// its own (the session's todo sidecar) reads the same calls.
+/// The todo calls that still shape the list, in order, excluding failed calls.
+/// Interrupting execution preserves the plan; only an explicit todo update or
+/// conversation rewind changes it. Exposed so sidecar folds read the same calls.
 pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
-    // A user cancel retires the active plan without deleting its history. Fold
-    // only calls after the most recent authoritative interruption boundary; an
-    // explicit later "continue" can create a fresh full-list plan from history.
-    let active_messages = messages
-        .iter()
-        .rposition(Message::is_user_interruption)
-        .map_or(messages, |index| &messages[index + 1..]);
+    let active_messages = messages;
     // A result settles only the latest call with this id, once. Keep even
     // non-todo calls in the map so a reused id cannot reach an older todo.
     // Removing the entry on settlement ignores duplicate results without
@@ -967,17 +960,21 @@ mod tests {
     }
 
     #[test]
-    fn user_interruption_retires_prior_plan_but_allows_a_new_plan() {
+    fn user_interruption_preserves_prior_plan_until_explicit_replacement() {
         let mut msgs = vec![todo_call(
             "old",
-            r#"{"todos":[{"content":"old task","status":"in_progress"}]}"#,
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"old task","status":"in_progress"},{"content":"next","status":"pending"}]}"#,
         )];
         msgs.push(Message::user_interruption());
         msgs.push(Message::user("do something unrelated"));
-        assert!(
-            derive_current_todos(&msgs).is_empty(),
-            "a cancelled plan remains historical, not active"
-        );
+        let preserved = derive_current_todos(&msgs);
+        assert_eq!(preserved.len(), 3);
+        assert_eq!(preserved[0].content, "done");
+        assert_eq!(preserved[0].status, TodoStatus::Completed);
+        assert_eq!(preserved[1].content, "old task");
+        assert_eq!(preserved[1].status, TodoStatus::InProgress);
+        assert_eq!(preserved[2].content, "next");
+        assert_eq!(preserved[2].status, TodoStatus::Pending);
 
         msgs.push(todo_call(
             "new",
@@ -986,10 +983,13 @@ mod tests {
         let active = derive_current_todos(&msgs);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].content, "new task");
+        msgs.push(Message::user_interruption());
+        msgs.push(todo_call("clear", r#"{"todos":[]}"#));
+        assert!(derive_current_todos(&msgs).is_empty());
     }
 
     #[test]
-    fn legacy_interruption_marker_also_retires_prior_plan() {
+    fn legacy_interruption_marker_preserves_prior_plan() {
         let marker = Message::synthetic_user(
             "[The previous response was interrupted by the user before completing. Reconsider.]",
         );
@@ -1000,7 +1000,7 @@ mod tests {
             ),
             marker,
         ];
-        assert!(derive_current_todos(&msgs).is_empty());
+        assert_eq!(derive_current_todos(&msgs)[0].content, "old task");
     }
 
     #[test]

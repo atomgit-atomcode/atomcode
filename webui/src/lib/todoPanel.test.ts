@@ -18,9 +18,16 @@ test('a later TodoWrite reveals the card while a failed call does not', () => {
   assert.equal(visible, true);
 });
 
-test('user cancellation retires the visible task card', () => {
+test('user interruption preserves the visible task card', () => {
   assert.equal(
     reduceTodoPanelVisibility(true, { type: 'user_cancel' }),
-    false,
+    true,
   );
+});
+
+
+test('continuing an unfinished plan keeps the task card visible', () => {
+  const visible = reduceTodoPanelVisibility(true, { type: 'user_cancel' });
+  assert.equal(reduceTodoPanelVisibility(visible, { type: 'user_input', hasOpenItems: true }), true);
+  assert.equal(reduceTodoPanelVisibility(false, { type: 'user_cancel' }), false);
 });

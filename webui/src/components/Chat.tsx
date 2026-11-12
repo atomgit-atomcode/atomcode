@@ -894,11 +894,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     }
   }
 
-  function finishTodoTurn(cancelled: boolean) {
-    if (cancelled) {
-      resetTodoBatch(true);
-      return;
-    }
+  function finishTodoTurn() {
     const batch = todoBatchRef.current;
     if (batch.calls.length > 0) {
       replaceTodoItems(projectTodoCalls(batch.base, batch.calls).committed);
@@ -923,7 +919,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     let visibilityItems: TodoItem[] = [];
     for (const message of messages) {
       if (message.role === 'user') {
-        restoredVisible = reduceTodoPanelVisibility(restoredVisible, { type: 'user_input' });
+        restoredVisible = reduceTodoPanelVisibility(restoredVisible, {
+          type: 'user_input', hasOpenItems: visibilityItems.some((item) => item.status !== 'completed'),
+        });
       }
       for (const part of message.parts) {
         if (part.kind === 'tool' && part.tool.status === 'done' && isTodoTool(part.tool.name)) {
@@ -1646,10 +1644,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     for (const msg of msgs) {
       if (msg.role === 'user') {
         if (isUserInterruptionMessage(msg)) {
-          orderedTodoCalls.length = 0;
-          pendingTodoCalls.clear();
-          todoCallEpochs.clear();
-          inputEpoch += 1;
           continue;
         }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
@@ -1719,10 +1713,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       (call) => todoCallEpochs.get(call.id) === inputEpoch,
     );
     const priorTodoItems = projectTodoCalls([], priorTodoCalls).committed;
-    const restoredTodoVisible = projectTodoCalls(
-      priorTodoItems,
-      currentTodoCalls,
-    ).hasApplicable;
+    const restoredTodoVisible = restoredTodoItems.some((item) => item.status !== 'completed')
+      || projectTodoCalls(priorTodoItems, currentTodoCalls).hasApplicable;
     todoTitlesRef.current = new Map(
       restoredTodoItems.map((item, index) => [index + 1, item.content]),
     );
@@ -1982,7 +1974,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           setTurnStats(null);
           setTodoPanelVisible(reduceTodoPanelVisibility(
             todoPanelVisibleRef.current,
-            { type: 'user_input' },
+            { type: 'user_input', hasOpenItems: todoItemsRef.current.some((item) => item.status !== 'completed') },
           ));
         }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
@@ -2030,7 +2022,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         if (terminal) {
           setSessionSwitchNotice(current => current === t('browse.switchBusy') ? null : current);
           stampLastAssistantCompletion();
-          finishTodoTurn(e.stop_reason === 'cancelled');
+          finishTodoTurn();
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
             // buffer (agent.rs Cancel/Shutdown), so a leftover steer is NOT
@@ -2797,10 +2789,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
       case 'done': {
         setCompacting(false);
-        // A normal terminal keeps only successful calls; a user cancellation
-        // retires the active plan at the same boundary as kernel/TUI.
+        // Every terminal keeps successful todo changes and drops unresolved previews.
         stampLastAssistantCompletion();
-        finishTodoTurn(event.stop_reason === 'cancelled');
+        finishTodoTurn();
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
@@ -2842,10 +2833,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
       case 'stopped':
         setCompacting(false);
-        // User cancellation is an authoritative interruption boundary: the
-        // previous plan remains historical but is no longer active.
+        // Stop execution without discarding the committed plan.
         stampLastAssistantCompletion();
-        resetTodoBatch(true);
+        finishTodoTurn();
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
@@ -2989,7 +2979,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     if (startsNewTurn) {
       setTodoPanelVisible(reduceTodoPanelVisibility(
         todoPanelVisibleRef.current,
-        { type: 'user_input' },
+        { type: 'user_input', hasOpenItems: todoItemsRef.current.some((item) => item.status !== 'completed') },
       ));
     }
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，

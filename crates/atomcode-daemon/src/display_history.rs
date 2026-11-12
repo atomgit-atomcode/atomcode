@@ -75,16 +75,7 @@ pub(crate) fn state_seed(messages: &[MessageInfo]) -> Vec<serde_json::Value> {
     let mut human_boundary = false;
     for m in messages {
         if m.role == "user" {
-            let interrupted = m.internal_origin.as_deref() == Some("atomcode.user_interruption")
-                || (m.synthetic
-                    && m.content
-                        .contains("interrupted by the user before completing"));
-            if interrupted {
-                seed.clear();
-                ids.clear();
-                human_boundary = false;
-                seed.push(serde_json::json!({"role":"user", "content":"interrupted by the user before completing", "synthetic":true, "internal_origin":"atomcode.user_interruption"}));
-            } else if !m.synthetic {
+            if !m.synthetic {
                 human_boundary = true;
             }
         } else if m.role == "assistant" {
@@ -120,6 +111,28 @@ pub(crate) fn state_seed(messages: &[MessageInfo]) -> Vec<serde_json::Value> {
 mod tests {
     use super::*;
     use atomcode_kernel::message::Message;
+    #[test]
+    fn state_seed_keeps_todos_across_interruption() {
+        let messages = [
+            Message::assistant(
+                "",
+                vec![atomcode_kernel::tool::ToolCall {
+                    id: "plan".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
+                }],
+            ),
+            Message::user_interruption(),
+            Message::user("continue"),
+        ]
+        .iter()
+        .map(MessageInfo::from_kernel)
+        .collect::<Vec<_>>();
+        let seed = state_seed(&messages);
+        assert_eq!(seed[0]["tool_calls"][0]["id"], "plan");
+        assert_eq!(seed.len(), 2);
+    }
+
     #[test]
     fn paging_preserves_turns_and_rejects_changed_prefixes() {
         let make = || {

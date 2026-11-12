@@ -445,7 +445,7 @@ Then just type what you want:
 | `Ctrl+J` | New line (when the terminal distinguishes the chord) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
-| `Esc` | Clear input / Cancel stream |
+| `Esc` | Clear input / Stop streaming while preserving the Todo List |
 | `Esc` ×2 | Undo the previous turn |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept slash-command, skill, or file completion |
@@ -487,7 +487,7 @@ Then just type what you want:
 | `Ctrl+Up/Down`           | Jump to previous / next user message  |
 | Empty input + `Home/End` | Jump to top / bottom of conversation  |
 | `Ctrl+Shift+C`           | Copy selection                        |
-| `Ctrl+C`                 | Cancel operation (double-tap to exit) |
+| `Ctrl+C`                 | Stop execution; keep the Todo List (double-tap to exit) |
 
 ### New screen (`atomcode --tui`)
 
@@ -588,7 +588,10 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |
 | `/help` | Show commands & shortcuts |
+| `/todo clear` | Explicitly clear the Todo List; interruption preserves its recorded progress. Send a follow-up instruction to continue or redirect work. |
 | `/quit`, `/exit` | Exit AtomCode (or Ctrl+C ×2) |
+
+With the default `keep_interrupted_context = true`, interruption keeps recorded task progress. Setting it to `false` still undoes the interrupted turn, including that turn's Todo changes.
 
 > **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
 > language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses
