@@ -24,7 +24,7 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
-## v5.2.7 (2016-11-12)
+## v5.2.7 (2026-11-12)
 
 ### Overview
 
