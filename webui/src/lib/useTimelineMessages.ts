@@ -67,9 +67,9 @@ export function useTimelineMessages<T extends TimelineMessage>(resident: number,
 }
 
 /** Keep only the current page's hydrated payloads, even while live output arrives. */
-export function useTimelinePage<T extends TimelineMessage>(messages: T[], start: number, end: number,
+export function useTimelinePage<T extends TimelineMessage>(messages: T[], positions: readonly number[],
   read: (message: T) => Promise<T>) {
-  const page = messages.slice(start, end);
+  const page = positions.map(index => messages[index]);
   const signature = page.filter(message => message.archiveKey).map(message => message.archiveKey).join('|');
   const latest = useRef({ page, read }); latest.current = { page, read };
   const [loaded, setLoaded] = useState<Map<string, T>>(new Map());
@@ -87,7 +87,7 @@ export function useTimelinePage<T extends TimelineMessage>(messages: T[], start:
       .catch(reason => { if (!cancelled) setError(String(reason)); });
     return () => { cancelled = true; };
   }, [signature, retry]);
-  const items = page.map((message, offset) => ({ origIdx: start + offset,
+  const items = page.map((message, offset) => ({ origIdx: positions[offset],
     msg: message.archiveKey ? loaded.get(message.archiveKey) : message }));
   return { items, error, loading: items.some(item => !item.msg), retry: () => setRetry(value => value + 1) };
 }

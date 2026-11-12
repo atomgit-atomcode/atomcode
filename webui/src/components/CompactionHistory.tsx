@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { getSessionTranscript, type TranscriptTurn } from '../api';
-import { historyBoundary, historyWindow, type HistoryMessage } from '../lib/inlineHistory';
+import { historyBoundary, historyWindow, hasHistoryPage, type HistoryMessage } from '../lib/inlineHistory';
 import { useT } from '../settings';
 
 /** Display-only paging. The runtime conversation and composer are never replaced. */
@@ -35,6 +35,7 @@ export function CompactionHistory(props: {
   function cancel() { epoch.current += 1; pending.current?.abort(); pending.current = null; }
   function reset() {
     cancel(); setBusy(false); setError(''); setWindow(null); windowRef.current = null;
+    index.current = null; setBounds(null);
     latest.current.onWindow(false, true, 0);
   }
   useLayoutEffect(() => { reset(); return cancel; }, [props.reset]);
@@ -55,6 +56,12 @@ export function CompactionHistory(props: {
 
   async function load(direction: 'before' | 'after' | 'target', target?: number) {
     if (pending.current && direction !== 'target') return;
+    if (direction !== 'target' && index.current) {
+      const current = windowRef.current;
+      const boundary = historyBoundary(index.current, latest.current.messages);
+      const end = current && current.end > boundary.end ? index.current.length : boundary.end;
+      if (!hasHistoryPage(current, end, direction)) return;
+    }
     cancel();
     const run = epoch.current;
     const controller = new AbortController(); pending.current = controller;
@@ -191,8 +198,5 @@ export function CompactionHistory(props: {
       {turn.undone && <div class="timeline-history-status">{t('chat.historyUndone')}</div>}
       {props.renderTurn(turn, (before, after) => { if (before || after) innerEdges.current.set(turn.turn_id, { before, after }); else innerEdges.current.delete(turn.turn_id); })}
     </div>)}
-    {window && bounds && window.end < bounds.end && !busy && <div class="timeline-history-status">
-      <button onClick={() => void load('after')}>{t('chat.historyLoadNext')}</button>
-    </div>}
   </>;
 }

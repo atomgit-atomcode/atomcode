@@ -33,6 +33,13 @@ export function historyWindow(end: number, target?: number, batch = HISTORY_BATC
   return { start, end: Math.min(end, start + batch) };
 }
 
+/** Stop at known history edges before starting a request or showing a spinner. */
+export function hasHistoryPage(current: { start: number; end: number } | null, end: number,
+  direction: 'before' | 'after'): boolean {
+  return direction === 'before' ? (current ? current.start > 0 : end > 0)
+    : current != null && current.end < end;
+}
+
 export function historyMessages(turn: TranscriptTurn): HistoryMessage[] {
   const parts: MsgPart[] = [];
   if (turn.steps) {

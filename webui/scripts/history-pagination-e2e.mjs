@@ -16,6 +16,7 @@ const browseFull = full.map(message=>({...message,content:message.content.replac
 const cursor = before => before > 0 ? {session:`fixture/${id}`,before,digest:`fixture-${before}`} : undefined;
 let clients = new Set();
 let pages = [];
+let transcriptReads = 0;
 let hold = null;
 let pending = null;
 const snapshot = () => ({type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full.slice(34),history_older:cursor(34)});
@@ -50,7 +51,7 @@ const server = createServer(async (req,res) => {
   if(path==='/config')return json({providers:[],notifications:{enabled:false}});
   if(path==='/models')return json([{name:'fixture',model:'fixture',provider:'fixture',effort_levels:[]}]);
   if(path.startsWith('/sessions/resolve/'))return json(path.endsWith(browse.id)?browse:meta);
-  if(path.endsWith('/transcript'))return json({session_id:id,turns:[]});
+  if(path.endsWith('/transcript')){transcriptReads++;return json({session_id:id,turns:[]});}
   if(path==='/live/mode')return json({mode:'build'});
   if(path==='/live/session')return json({success:true,session_id:id});
   if(path==='/chat/active')return json([]);
@@ -76,7 +77,10 @@ try {
   assert.equal(pages.length,0,'no eager older-page fetch');
   // Hold the old page, append a live reply, then release. It must survive.
   let requested;const waiting=new Promise(resolve=>requested=resolve);hold=requested;
-  await page.getByRole('button',{name:'Load earlier messages',exact:true}).click();
+  for (let attempt=0;attempt<20 && !pending;attempt++) {
+    await page.locator('.messages-container').last().evaluate(el=>{el.scrollTop=0;el.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,bubbles:true}));});
+    await page.waitForTimeout(100);
+  }
   await waiting;
   emit({type:'user',text:'LIVE_PROMPT'});emit({type:'state',running:true});emit({type:'text',content:'LIVE_REPLY_SURVIVES'});
   await page.getByText('LIVE_REPLY_SURVIVES',{exact:true}).waitFor();
@@ -92,6 +96,17 @@ try {
   await page.getByText('PAGE_PROMPT_0',{exact:true}).waitFor();
   assert.deepEqual(pages,[34,18,2]);
   assert.equal(await page.getByText('PAGE_PROMPT_0',{exact:true}).count(),1);
+  const exhaustedPages=pages.length;
+  for(let i=0;i<3;i++) {
+    await page.locator('.messages-container').last().evaluate(el=>{el.scrollTop=0;el.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,bubbles:true}));});
+    await page.waitForTimeout(150);
+  }
+  const exhaustedReads=transcriptReads;
+  await page.locator('.messages-container').last().evaluate(el=>el.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,bubbles:true})));
+  await page.waitForTimeout(200);
+  assert.equal(pages.length,exhaustedPages,'no native reads after oldest page');
+  assert.equal(transcriptReads,exhaustedReads,'empty transcript index is not fetched repeatedly');
+  assert.equal(await page.getByRole('button',{name:'Load earlier messages',exact:true}).count(),0);
   emit(snapshot());
   await page.waitForTimeout(300);
   assert.equal(await page.getByText('PAGE_PROMPT_0',{exact:true}).count(),1,'reconnect retained already fetched pages');
@@ -100,7 +115,10 @@ try {
   await page.reload();
   await page.getByText('PAGE_ANSWER_24',{exact:true}).waitFor();
   let started;const oldRead=new Promise(resolve=>started=resolve);hold=started;
-  await page.getByRole('button',{name:'Load earlier messages',exact:true}).click();
+  for (let attempt=0;attempt<20 && !pending;attempt++) {
+    await page.locator('.messages-container').last().evaluate(el=>{el.scrollTop=0;el.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,bubbles:true}));});
+    await page.waitForTimeout(100);
+  }
   await oldRead;
   emit(snapshot());
   await page.waitForTimeout(250);

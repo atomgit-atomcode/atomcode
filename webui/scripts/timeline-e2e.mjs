@@ -118,7 +118,8 @@ try {
     await page.locator('.messages-container').hover(); await page.mouse.wheel(0, -300);
     await until(async () => (await page.locator('.tool-name-secondary').first().innerText()) !== initialCommand);
     for (let i = 0; i < 6; i++) {
-      await page.getByRole('button', { name: /加载更早的消息|Load earlier messages/ }).click();
+      await page.locator('.messages-container').evaluate(node => { node.scrollTop=0;node.dispatchEvent(new WheelEvent('wheel',{deltaY:-300,bubbles:true})); });
+      await page.waitForTimeout(550);
       await until(() => page.evaluate(() => !document.querySelector('.timeline-history-status[role="status"]')));
     }
     assert.ok(await page.locator('.tool-body').count() <= bound);
@@ -140,7 +141,7 @@ try {
     await page.getByText(/needle-5/).first().waitFor();
     assert.ok(await page.locator('.tool-body').count() <= bound);
     await page.locator('.msg-search-close').click();
-    await page.getByRole('button', { name: /回到最新消息|Back to latest messages/ }).click();
+    await page.locator('.jump-to-bottom').click();
     await page.evaluate(() => navigator.clipboard.writeText('before-copy'));
     await page.locator('.msg-copy-btn').last().click();
     await until(() => page.evaluate(async () => { const text = await navigator.clipboard.readText(); return text.includes('output-0') && text.includes('needle-5') && text.includes('output-999'); }));

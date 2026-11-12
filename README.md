@@ -596,6 +596,8 @@ With the default `keep_interrupted_context = true`, interruption keeps recorded 
 
 WebUI shows progress during execution, then collapses completed process details while keeping the final answer visible. Click “Process” to expand them. Search reveals the process; interrupted or failed turns stay expanded. Folding does not delete history or change Todo state.
 
+WebUI automatically pages history near the top or bottom and stops at the history boundary, without paging buttons. Completed history keeps each user prompt, collapsed process and final answer together; expanded long processes remain paged internally. Click an image thumbnail to enlarge it; Escape, the backdrop or the close button dismisses the preview. Redundant trailing image markers are hidden when thumbnails are available; missing-image markers remain visible.
+
 > **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
 > language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses
 > its built-in `atomgit_issue` tool. Reading issues is automatic; creating an

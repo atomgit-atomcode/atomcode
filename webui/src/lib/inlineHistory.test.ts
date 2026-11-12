@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { historyBoundary, historyMessages, historyWindow } from './inlineHistory.ts';
+import { historyBoundary, historyMessages, historyWindow, hasHistoryPage } from './inlineHistory.ts';
 import type { TranscriptTurn } from '../api.ts';
 const turn = (id: number, user = 'repeat'): TranscriptTurn => ({ turn_id: id, user, assistant: 'reply', undone: false, started_at: id * 1000, ts: id * 1000 + 500 });
 const user = (text: string, ts?: number, retainedHistory = false) => ({ role: 'user' as const, ts, retainedHistory, parts: [{ kind: 'text' as const, text }] });
@@ -67,4 +67,15 @@ test('inline history keeps actual attachments and supports English VL records', 
   assert.deepEqual(shown.parts, [{ kind: 'text', text: 'look' }]);
   assert.deepEqual(shown.images, images);
   assert.deepEqual(historyMessages({ ...turn(2, 'native image'), user_images: images })[0].images, images);
+});
+
+
+test('empty and exhausted history stops paging in both directions', () => {
+  assert.equal(hasHistoryPage(null, 0, 'before'), false);
+  assert.equal(hasHistoryPage(null, 0, 'after'), false);
+  assert.equal(hasHistoryPage(null, 3, 'before'), true);
+  assert.equal(hasHistoryPage({ start: 0, end: 3 }, 3, 'before'), false);
+  assert.equal(hasHistoryPage({ start: 0, end: 3 }, 3, 'after'), false);
+  assert.equal(hasHistoryPage({ start: 1, end: 2 }, 3, 'before'), true);
+  assert.equal(hasHistoryPage({ start: 1, end: 2 }, 3, 'after'), true);
 });

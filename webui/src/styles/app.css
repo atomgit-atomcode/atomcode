@@ -4307,18 +4307,6 @@ body {
 .input-cwd-branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 480px) { .input-cwd-branch { max-width: 12ch; } }
 
-.history-load-more {
-  display: block;
-  margin: 8px auto 16px;
-  padding: 6px 12px;
-  color: var(--app-secondary-foreground);
-  background: transparent;
-  border: 1px solid var(--app-input-border);
-  border-radius: 8px;
-  cursor: pointer;
-}
-.history-load-more:disabled { opacity: .6; cursor: default; }
-
 /* Workspace actions remain reachable by keyboard and on touch screens. */
 .sidebar-project-row:focus-within .sidebar-project-new { opacity: 1; visibility: visible; }
 .sidebar-project-pinned { flex: 0 0 auto; font-size: 0.7rem; }
@@ -4386,3 +4374,21 @@ body {
 .turn-process-toggle:focus-visible { outline: 2px solid var(--app-primary-foreground); outline-offset: 3px; }
 .turn-process-chevron { width: 12px; flex-shrink: 0; }
 .turn-process-duration { color: var(--app-tertiary-foreground); }
+
+
+.msg-image-button { display: inline-flex; padding: 0; border: 0; border-radius: 6px; background: transparent; cursor: zoom-in; }
+.msg-image-button:focus-visible { outline: 2px solid var(--app-accent-color); outline-offset: 3px; }
+.message-image-preview[open] {
+  display: flex; align-items: center; justify-content: center;
+  width: 100vw; height: 100vh; height: 100dvh; max-width: none; max-height: none;
+  margin: 0; padding: 48px 24px 24px; border: 0; box-sizing: border-box;
+  background: rgba(0, 0, 0, .85); cursor: zoom-out;
+}
+.message-image-preview::backdrop { background: transparent; }
+.message-image-preview > img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: default; }
+.message-image-close {
+  position: absolute; right: 16px; top: 12px; width: 36px; height: 36px;
+  border: 1px solid rgba(255, 255, 255, .5); border-radius: 50%;
+  color: white; background: rgba(0, 0, 0, .4); font-size: 25px; cursor: pointer;
+}
+.message-image-close:focus-visible { outline: 2px solid white; outline-offset: 3px; }

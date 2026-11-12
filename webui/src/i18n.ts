@@ -10,6 +10,8 @@ export type Lang = 'zh' | 'en';
 
 const zh = {
   'chat.loadEarlierHistory': '加载更早的记录',
+  'chat.previewImage': '放大查看图片 {n}',
+  'chat.closeImagePreview': '关闭图片预览',
   'hooks.title': "Hooks 配置",
   'hooks.note': "展示当前磁盘配置，编辑后需 /reload 或重开会话。测试使用模拟事件载荷，但会实际执行脚本，最多等待 30 秒。",
   'hooks.close': "关闭 Hooks",
@@ -823,6 +825,8 @@ export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
   'chat.loadEarlierHistory': 'Load earlier messages',
+  'chat.previewImage': 'Enlarge image {n}',
+  'chat.closeImagePreview': 'Close image preview',
   'hooks.title': "Hooks configuration",
   'hooks.note': "Current disk configuration; use /reload or reopen the session after editing. Tests use synthetic event payloads but really execute scripts, with a 30-second cap.",
   'hooks.close': "Close hooks",

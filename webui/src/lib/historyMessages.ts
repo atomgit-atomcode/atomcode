@@ -115,3 +115,15 @@ export function displayHistoryUser(text: string, images?: ImageData[]): { text: 
   }
   return { text: prompt, images: actual?.length ? actual : undefined };
 }
+
+/** Hide only a redundant trailing attachment list, never inline image references
+ * or markers whose corresponding payload is unavailable. Source text stays intact. */
+export function displayImageMarkers(text: string, images?: readonly ImageData[]): string {
+  const count = images?.length ?? 0;
+  if (!count || images?.some(image => image.missing || !image.data.length)) return text;
+  const suffix = text.match(/(?:\s*\[Image #\d+\])+\s*$/i);
+  if (!suffix) return text;
+  const markers = [...suffix[0].matchAll(/\[Image #(\d+)\]/gi)].map(match => Number(match[1]));
+  if (markers.length !== count || markers.some((number, index) => number !== index + 1)) return text;
+  return text.slice(0, suffix.index).trimEnd();
+}

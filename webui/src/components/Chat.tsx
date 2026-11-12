@@ -1,4 +1,5 @@
-import { displayHistoryUser } from '../lib/historyMessages';
+import { MessageImages } from './MessageImages';
+import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
 import { GoalRecoveryStatus } from './GoalRecoveryStatus';
 import { GitBranch } from './GitBranch';
@@ -7,10 +8,11 @@ import { TaskSpecifications } from './TaskSpecifications';
 import { importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
-import { turnProcesses, type TurnProcess } from '../lib/turnProcess';
+import { processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
+import { groupedTimelinePage } from '../lib/groupedTimeline.ts';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
 import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/useTimelineMessages';
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
@@ -144,6 +146,7 @@ interface Message {
   archiveKey?: string;
   archiveBytes?: number;
   archiveArtifacts?: TurnArtifact[];
+  processSummary?: ReturnType<typeof processSummary>;
   retainedHistory?: boolean;
   role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
@@ -487,7 +490,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
   const { messages, setMessages, read: readTimelineMessage, hold: holdTimelineMessages } = useTimelineMessages<Message>(limits.resident, (message, key) => ({
-    ...archivedMessage(message, key), archiveArtifacts: artifactsByAssistantIndex([message]).get(0),
+    ...archivedMessage(message, key), processSummary: processSummary(message), archiveArtifacts: artifactsByAssistantIndex([message]).get(0),
   }), limits.residentBytes);
   type ServerHistory = { session: string; cursor?: DisplayHistoryCursor; baseline?: DisplayHistoryCursor };
   const [serverHistory, setServerHistoryState] = useState<ServerHistory>({ session: '' });
@@ -3613,9 +3616,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const searchTrim = search.trim().toLowerCase();
   // 不过滤时间线，而是展示完整消息流
   const liveFrom = historyDisplay.active ? historyDisplay.liveStart : 0;
-  const range = boundedTimelineRange(messages, limits.mounted, timelineStart, limits.pageBytes);
-  const page = useTimelinePage(messages, historyDisplay.showLive ? Math.max(liveFrom, range.start) : 0,
-    historyDisplay.showLive ? range.end : 0, readTimelineMessage);
+  const processes = turnProcesses(messages, busy);
+  const timeline = groupedTimelinePage(messages, limits.mounted, timelineStart, limits.pageBytes, processes,
+    process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true);
+  const range = timeline.range;
+  const page = useTimelinePage(messages,
+    historyDisplay.showLive ? timeline.indexes.filter(index => index >= liveFrom) : [], readTimelineMessage);
   const visibleMessages = page.items.filter((item): item is { msg: Message; origIdx: number } => item.msg !== undefined);
   function showTimelinePage(start: number | null, preserve = false) {
     if (historyDisplay.active) {
@@ -3632,7 +3638,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           && item.node.getBoundingClientRect().top < line + viewport.clientHeight);
       const anchor = before ? candidates[0] : candidates[candidates.length - 1];
       if (anchor?.node) timelineAnchorRef.current = { index: anchor.index, top: anchor.node.getBoundingClientRect().top,
-        start: start ?? Math.max(0, messages.length - limits.mounted), before };
+        start: groupedTimelinePage(messages, limits.mounted, start, limits.pageBytes, processes,
+          process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true).range.start, before };
     } else timelineAnchorRef.current = null;
     timelineIgnoreScrollRef.current = performance.now() + 500;
     setTimelineStart(start);
@@ -3648,7 +3655,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     timelineScrollRef.current = viewport.scrollTop;
     timelineIgnoreScrollRef.current = performance.now() + 500;
     timelineAnchorRef.current = null;
-  }, [range.start, page.loading]);
+  }, [range.start, range.end, timelineStart, page.loading]);
   async function loadServerHistory() {
     const id = activeIdRef.current;
     const cursor = serverHistory.cursor;
@@ -3690,7 +3697,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     } else if (direction < 0 && viewport.scrollTop <= 80 && range.start === 0) {
       void loadServerHistory();
     } else if (direction > 0 && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 80 && range.end < messages.length) {
-      showTimelinePage(adjacentTimelineStart(messages, range, 1, limits.mounted, limits.pageBytes), true);
+      let next = adjacentTimelineStart(messages, range, 1, limits.mounted, limits.pageBytes);
+      const candidate = groupedTimelinePage(messages, limits.mounted, next, limits.pageBytes, processes,
+        process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true);
+      // An overlap inside the same collapsed group cannot advance the page.
+      if (candidate.range.end <= range.end && candidate.range.start <= range.start) next = range.end;
+      showTimelinePage(next, true);
     }
   }
   function onTimelineScroll() {
@@ -4374,10 +4386,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         onPointerDown={interactWithTimeline}
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
-        {serverHistory.session === sessionId && serverHistory.cursor && range.start === 0 &&
-          <button type="button" class="history-load-more" disabled={serverHistoryLoading} onClick={() => void loadServerHistory()}>
-            {serverHistoryLoading ? '…' : t('chat.loadEarlierHistory')}
-          </button>}
+        {serverHistoryLoading && <div class="timeline-history-status is-loading" role="status">
+          {t('chat.historyLoading')}
+        </div>}
 
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
@@ -4394,9 +4405,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onEdges={onEdges} />}
 
         />}
-        {historyDisplay.showLive && range.start > liveFrom && <div class="timeline-history-status">
-          <button onClick={() => showTimelinePage(Math.max(liveFrom, boundedTimelineRange(messages.slice(0, range.start), limits.mounted, null, limits.pageBytes).start))}>{t('chat.historyLoadPrevious')}</button>
-        </div>}
+
         {page.loading && <div class="timeline-history-status" role="status">{t('chat.historyLoading')}</div>}
         {(page.error || timelineSearch.error) && <div class="timeline-history-status" role="alert">{t('chat.historyFailed')}<button onClick={page.retry}>{t('chat.historyRetry')}</button></div>}
         {messages.length === 0 && !historyHint && awaitingConversation && (
@@ -4419,7 +4428,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         {(() => {
           const assistantTurnEnds = assistantTurnEndFlags(messages.map((message) => message.role));
           const turnArtifacts = artifactsByAssistantIndex(messages);
-          const processes = turnProcesses(messages, busy);
           const firstVisible = new Map<string, number>();
           const visibleIndexes = new Set(visibleMessages.map(item => item.origIdx));
           for (const { origIdx } of visibleMessages) {
@@ -4480,7 +4488,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             if (!expanded && process && origIdx !== process.last) {
               return <Fragment key={origIdx}>{toggle}</Fragment>;
             }
-            const displayMessage = !expanded && process ? { ...msg, parts: process.finalParts } : msg;
+            const finalOnly = process && (!expanded || (origIdx === process.last && !timeline.processIndexes.has(origIdx)));
+            const summary = finalOnly ? processSummary(msg) : undefined;
+            const displayMessage = summary ? { ...msg, parts: summary.hasAnswer ? msg.parts.slice(summary.finalStart) : [] } : msg;
             return (
               <Fragment key={origIdx}>{toggle}<AssistantMessageView
                 msg={displayMessage}
@@ -4502,10 +4512,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         })()}
 
         {historyDisplay.showLive && compacting && <div class="msg-notice context-summary-note" role="status">{t('context.summarizing')}</div>}
-        {historyDisplay.showLive && range.end < messages.length && <div class="timeline-history-status">
-          <button onClick={() => showTimelinePage(range.end)}>{t('chat.historyLoadNext')}</button>
-          <button onClick={() => showTimelinePage(null)}>{t('chat.timelineLatest')}</button>
-        </div>}
+
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
         {historyDisplay.showLive && queued.map((q) => (
           <div
@@ -4515,13 +4522,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             aria-label={t('chat.queued')}
           >
             <div class="user-message-bubble">
-              {q.images && q.images.length > 0 && (
-                <div class="msg-images">
-                  {q.images.map((img, i) => (
-                    <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
-                  ))}
-                </div>
-              )}
+              <MessageImages images={q.images} />
               <div class="queued-head">
                 <span class="queued-tag">{t('chat.queued')}</span>
                 <button
@@ -4533,7 +4534,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                   ×
                 </button>
               </div>
-              {q.text}
+              {displayImageMarkers(q.text, q.images)}
             </div>
           </div>
         ))}
@@ -4822,7 +4823,6 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
     <UserMessageView msg={messages[0]} timeLabel={formatMsgTime(messages[0].ts)} search={search} isActiveSearchMatch={false} />
     {process?.foldable && !search.trim() && <TurnProcessToggle process={process} expanded={!folded}
       onToggle={() => setProcessOpen(value => !value)} />}
-    {!folded && range.start > 0 && <div class="timeline-history-status"><button onClick={() => move(-1)}>{t('chat.historyLoadPrevious')}</button></div>}
     {folded && process ? <>
       <AssistantMessageView msg={{ ...messages[process.last], parts: process.finalParts }} isLast={false} busy={false} lastIdx={-1}
         isLastInTurn={true} copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
@@ -4835,7 +4835,6 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
             copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
             artifacts={[]} sessionId={sessionId} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />}
     </div>)}
-    {!folded && range.end < messages.length && <div class="timeline-history-status"><button onClick={() => move(1)}>{t('chat.historyLoadNext')}</button></div>}
   </div>;
 }
 
@@ -5113,7 +5112,7 @@ function UserMessageView({
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
-  const text = messageText(msg);
+  const text = displayImageMarkers(messageText(msg), msg.images);
   const skillTitle = detectSkillContent(text);
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -5125,13 +5124,7 @@ function UserMessageView({
     }).catch(() => {});
   }
 
-  const images = msg.images && msg.images.length > 0 && (
-    <div class="msg-images">
-      {msg.images.map((img, i) => (
-        <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
-      ))}
-    </div>
-  );
+  const images = <MessageImages images={msg.images} />;
 
   const copyBtn = (
     <button
@@ -5426,10 +5419,7 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
             Boolean(call.images?.length) && (
               <div key={`${call.id}-images`} class="tool-body-row">
                 <div class="tool-body-row-label">{t('tool.images', { n: call.images!.length })}</div>
-                <div class="msg-images">
-                  {call.images!.map((image, index) => <img key={index} class="msg-image" loading="lazy" decoding="async"
-                    src={imageDataUrl(image)} alt={t('tool.image', { n: index + 1 })} />)}
-                </div>
+                <MessageImages images={call.images} />
               </div>
             ),
           ])}

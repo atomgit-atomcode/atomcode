@@ -9,6 +9,23 @@ export interface ProcessMessage {
   turnStop?: string;
   archiveKey?: string;
   retainedHistory?: boolean;
+  processSummary?: ReturnType<typeof processSummary>;
+}
+/** Small, browser-only archive metadata. Never use preview text as an answer. */
+export function processSummary(message: ProcessMessage) {
+  let finalStart = 0;
+  let tools = 0;
+  let firstTool: string | undefined;
+  let unsafe = Boolean(message.turnStop && !['finished', 'stopped', 'completed', 'end_turn', 'stop'].includes(message.turnStop));
+  message.parts.forEach((part, index) => {
+    if (part.kind !== 'text') finalStart = index + 1;
+    if (part.kind === 'tool') {
+      tools++; firstTool ??= part.tool.id;
+      if (['pending', 'waiting_approval', 'incomplete'].includes(part.tool.status)) unsafe = true;
+    } else if (part.kind !== 'text' || /\[(?:错误|连接错误|Error|Connection error):/.test(part.text)) unsafe = true;
+  });
+  return { tools, firstTool, unsafe, finalStart, parts: message.parts.length,
+    hasAnswer: message.parts.slice(finalStart).some(part => part.kind === 'text' && Boolean(part.text.trim())) };
 }
 export interface TurnProcess {
   key: string;
@@ -37,30 +54,26 @@ export function turnProcesses(messages: readonly ProcessMessage[], running = fal
       const message = messages[i];
       if (message.role !== 'assistant') continue;
       indexes.push(i);
-      if (message.turnStop && !['finished', 'stopped', 'completed', 'end_turn', 'stop'].includes(message.turnStop)) unsafe = true;
-      for (const part of message.parts) {
-        if (part.kind === 'tool') {
-          tools++;
-          firstTool ??= part.tool.id;
-          if (['pending', 'waiting_approval', 'incomplete'].includes(part.tool.status)) unsafe = true;
-        } else if (part.kind !== 'text' || /\[(?:错误|连接错误|Error|Connection error):/.test(part.text)) unsafe = true;
-      }
+      const summary = message.processSummary ?? processSummary(message);
+      tools += summary.tools;
+      firstTool ??= summary.firstTool;
+      unsafe ||= summary.unsafe;
     }
     const last = indexes[indexes.length - 1];
     if (last != null) {
       const tail = messages[last];
-      let finalStart = 0;
-      tail.parts.forEach((part, index) => { if (part.kind !== 'text') finalStart = index + 1; });
-      const finalParts = tail.parts.slice(finalStart);
-      const hasAnswer = finalParts.some(part => part.kind === 'text' && part.text.trim());
+      const summary = tail.processSummary ?? processSummary(tail);
+      const finalStart = summary.finalStart;
+      const finalParts = tail.archiveKey ? [] : tail.parts.slice(finalStart);
+      const hasAnswer = summary.hasAnswer && (!tail.archiveKey || Boolean(tail.processSummary));
       const hasProcess = indexes.length > 1 || finalStart > 0;
       if (hasProcess) {
         const user = messages[start].role === 'user' ? messages[start] : undefined;
         const group: TurnProcess = {
           key: `${user?.sourceSeq ?? user?.turnAnchorId ?? user?.ts ?? start}/${firstTool ?? 'text'}`,
-          first: indexes[0], last, finalParts, tools, steps: indexes.reduce((count, index) => count + (index === last ? finalStart : messages[index].parts.length), 0),
+          first: indexes[0], last, finalParts, tools, steps: indexes.reduce((count, index) => count + (index === last ? finalStart : (messages[index].processSummary?.parts ?? messages[index].parts.length)), 0),
           duration: user?.ts != null && tail.ts != null ? Math.max(0, tail.ts - user.ts) : undefined,
-          foldable: hasAnswer && !tail.archiveKey && !unsafe && !(running && (end === messages.length || tail.ts == null)),
+          foldable: hasAnswer && !unsafe && !(running && (end === messages.length || tail.ts == null)),
         };
         for (const index of indexes) result.set(index, group);
       }
