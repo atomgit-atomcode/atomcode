@@ -1633,7 +1633,7 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &atomcode_coding::config::product_dirs_from_env(),
     );
-    let (session_name, session_meta, turn_timestamps) = {
+    let (session_name, catalog_session, turn_timestamps) = {
         match crate::legacy_convert::load_catalog_session_view_in_project(
             &project_hash,
             &join.binding.session_id,
@@ -1641,7 +1641,7 @@ pub(crate) async fn live_stream(
             Ok(Some(session)) => {
                 let timestamps =
                     crate::load_turn_timestamps(&project_hash, &join.binding.session_id).await;
-                (session.meta.name.clone(), Some(session.meta), timestamps)
+                (session.meta.name.clone(), Some(session), timestamps)
             }
             Ok(None) => (String::new(), None, crate::TurnTimestamps::new()),
             Err(error) => {
@@ -1658,67 +1658,87 @@ pub(crate) async fn live_stream(
     // projector can update its session after a SessionChanged event, so the id
     // must be captured at the exact point where each event is projected.
     let (tx, out_rx) = mpsc::unbounded_channel::<(String, LiveWireEvent)>();
-    let mut snapshot_messages: Vec<crate::MessageInfo> = join
-        .snapshot
-        .messages
-        .iter()
-        .map(crate::MessageInfo::from_kernel)
-        .collect();
-    let sources = crate::snapshot_spec_sources(
-        &join.snapshot,
-        std::path::Path::new(&join.binding.working_dir),
-        &join.binding.session_id,
-    );
     let display_manager = crate::NativeSessionManager::for_project(
         &snapshot_wd,
         &atomcode_coding::config::product_dirs_from_env(),
     );
-    let tool_images = display_manager
-        .load_events(&join.binding.session_id)
-        .ok()
-        .map(|events| crate::tool_images::from_events(&join.snapshot, &events))
-        .unwrap_or_default();
-    for (index, ((info, (seq, pinned)), raw)) in snapshot_messages
-        .iter_mut()
-        .zip(sources)
-        .zip(&join.snapshot.messages)
-        .enumerate()
-    {
-        if let (Some(result), Some(images)) = (info.tool_result.as_mut(), tool_images.get(index)) {
-            result.images = images.clone();
-        }
-        info.source_seq = seq;
-        info.task_spec_pinned = pinned;
-        crate::attach_native_display_images(
-            info,
-            &display_manager,
-            &join.binding.session_id,
-            &raw.text,
-        );
-    }
-    if let Some(meta) = session_meta.as_ref() {
-        crate::attach_snapshot_message_timestamps(
-            &mut snapshot_messages,
+    // Only issue HTTP paging cursors over the HTTP display projection. A live
+    // snapshot may contain request-only system context, or an uncommitted tail.
+    // In the latter case retain the complete live view with no paging cursor.
+    let canonical = catalog_session.as_ref().and_then(|session| {
+        crate::live_session_messages_for_display(
             &join.snapshot,
-            meta,
+            session,
             &turn_timestamps,
+            &display_manager,
+        )
+        .ok()
+        .flatten()
+    });
+    let (mut snapshot_messages, pageable) = if let Some(messages) = canonical {
+        (messages, true)
+    } else {
+        let mut snapshot_messages: Vec<crate::MessageInfo> = join
+            .snapshot
+            .messages
+            .iter()
+            .map(crate::MessageInfo::from_kernel)
+            .collect();
+        let sources = crate::snapshot_spec_sources(
+            &join.snapshot,
+            std::path::Path::new(&join.binding.working_dir),
+            &join.binding.session_id,
         );
-    }
-    // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
-    // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
-    // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
-    crate::attach_display_images(
-        &mut snapshot_messages,
-        &snapshot_wd,
-        &join.binding.session_id,
-    );
+        let tool_images = display_manager
+            .load_events(&join.binding.session_id)
+            .ok()
+            .map(|events| crate::tool_images::from_events(&join.snapshot, &events))
+            .unwrap_or_default();
+        for (index, ((info, (seq, pinned)), raw)) in snapshot_messages
+            .iter_mut()
+            .zip(sources)
+            .zip(&join.snapshot.messages)
+            .enumerate()
+        {
+            if let (Some(result), Some(images)) =
+                (info.tool_result.as_mut(), tool_images.get(index))
+            {
+                result.images = images.clone();
+            }
+            info.source_seq = seq;
+            info.task_spec_pinned = pinned;
+            crate::attach_native_display_images(
+                info,
+                &display_manager,
+                &join.binding.session_id,
+                &raw.text,
+            );
+        }
+        if let Some(meta) = catalog_session.as_ref().map(|session| &session.meta) {
+            crate::attach_snapshot_message_timestamps(
+                &mut snapshot_messages,
+                &join.snapshot,
+                meta,
+                &turn_timestamps,
+            );
+        }
+        // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
+        // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
+        // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
+        crate::attach_display_images(
+            &mut snapshot_messages,
+            &snapshot_wd,
+            &join.binding.session_id,
+        );
+        (snapshot_messages, false)
+    };
     let summary_count = crate::context_summary_count(&snapshot_wd, &join.binding.session_id);
     let history_seed = if q.recent {
         crate::display_history::state_seed(&snapshot_messages)
     } else {
         Vec::new()
     };
-    let history_older = if q.recent {
+    let history_older = if q.recent && pageable {
         crate::display_history::window(
             &format!("{project_hash}/{}", join.binding.session_id),
             &mut snapshot_messages,

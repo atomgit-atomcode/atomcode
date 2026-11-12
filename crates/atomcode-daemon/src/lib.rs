@@ -2546,7 +2546,15 @@ async fn get_session_detail(
                     cursor.as_ref(),
                 ) {
                     Ok(older) => older,
-                    Err(error) => return (StatusCode::CONFLICT, Json(error)).into_response(),
+                    Err(error) => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "code": "history_changed", "error": error,
+                            })),
+                        )
+                            .into_response()
+                    }
                 }
             } else {
                 None
@@ -3054,6 +3062,20 @@ fn spec_sources_from_events(
         }
     }
     result
+}
+
+/// A live cursor must address exactly the same projection as HTTP history.
+/// A divergent live tail is retained by the caller, never replaced from disk.
+fn live_session_messages_for_display(
+    live: &atomcode_kernel::message::SessionSnapshot,
+    session: &crate::legacy_convert::CatalogSessionView,
+    timestamps: &TurnTimestamps,
+    storage: &NativeSessionManager,
+) -> anyhow::Result<Option<Vec<MessageInfo>>> {
+    if !display_history::matches_snapshot(live, &session.snapshot) {
+        return Ok(None);
+    }
+    merge_catalog_session_messages_for_display(session, timestamps, Some(storage)).map(Some)
 }
 
 fn merge_catalog_session_messages_for_display(
@@ -8561,6 +8583,49 @@ mod tests {
             [ChatEvent::Warning { message }]
                 if message == "output limit reached; automatically continuing (1/2)"
         ));
+    }
+
+    #[test]
+    fn live_cursor_reads_http_projection_with_internal_preamble() {
+        use atomcode_capabilities::session::{PresentationFile, SessionMeta};
+        use atomcode_kernel::message::{Message, SessionSnapshot};
+        let temp = tempfile::tempdir().unwrap();
+        let storage = NativeSessionManager::with_root(temp.path().to_path_buf());
+        let mut raw = vec![atomcode_capabilities::reminder::synthetic_system_reminder(
+            "internal",
+        )];
+        for i in 0..20 {
+            raw.push(Message::user(format!("question {i}")));
+            raw.push(Message::assistant(format!("answer {i}"), vec![]));
+        }
+        let session = crate::legacy_convert::CatalogSessionView {
+            snapshot: SessionSnapshot::new(raw),
+            meta: SessionMeta::new("live-paging", "/project", 1),
+            presentation: PresentationFile::default(),
+        };
+        let mut live = session.snapshot.clone();
+        live.messages
+            .insert(0, Message::system("request-only context"));
+        let timestamps = TurnTimestamps::new();
+        let mut recent = live_session_messages_for_display(&live, &session, &timestamps, &storage)
+            .unwrap()
+            .unwrap();
+        let cursor = display_history::window("project/live-paging", &mut recent, None)
+            .unwrap()
+            .unwrap();
+        let mut http =
+            merge_catalog_session_messages_for_display(&session, &timestamps, Some(&storage))
+                .unwrap();
+        display_history::window("project/live-paging", &mut http, Some(&cursor)).unwrap();
+        assert_eq!(recent[0].content, "question 12");
+        assert_eq!(http.last().unwrap().content, "answer 11");
+        live.messages
+            .push(Message::assistant("still generating", vec![]));
+        assert!(
+            live_session_messages_for_display(&live, &session, &timestamps, &storage)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

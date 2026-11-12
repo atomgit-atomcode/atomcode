@@ -19,6 +19,7 @@ let pages = [];
 let transcriptReads = 0;
 let hold = null;
 let pending = null;
+let expire = false;
 const snapshot = () => ({type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full.slice(34),history_older:cursor(34)});
 const server = createServer(async (req,res) => {
   const url = new URL(req.url,'http://localhost');
@@ -40,6 +41,7 @@ const server = createServer(async (req,res) => {
     const before = url.searchParams.get('before');
     if(before) {
       const c=JSON.parse(before);assert.equal(c.session,`fixture/${id}`);pages.push(c.before);
+      if(expire) { res.statusCode=409;return json({code:"history_changed",error:"History changed; reopen the session to refresh its history"}); }
       const start=Math.max(0,c.before-16);
       const answer=()=>json({...meta,messages:full.slice(start,c.before),history_older:cursor(start)});
       if(hold) {pending=answer;hold();return;} return answer();
@@ -133,6 +135,27 @@ try {
   pending();pending=null;hold=null;
   await page.waitForTimeout(550);
   assert.equal(await page.getByText('PAGE_PROMPT_9',{exact:true}).count(),0,'late page was ignored');
+  // A rejected cursor is a paging status, never a chat message or retry loop.
+  expire=true;
+  for(let i=0;i<15 && !await page.locator('.history-page-error').count();i++) {
+    await page.locator('.messages-container').last().evaluate(el=>{el.scrollTop=0;el.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,bubbles:true}));});
+    await page.waitForTimeout(150);
+  }
+  await page.getByRole('button',{name:'Refresh history',exact:true}).waitFor();
+  assert.equal(await page.getByText('Error: History changed; reopen the session to refresh its history',{exact:true}).count(),0);
+  const failedRequests=pages.length;
+  for(let i=0;i<3;i++) {
+    await page.locator('.messages-container').last().evaluate(el=>el.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,bubbles:true})));
+    await page.waitForTimeout(150);
+  }
+  assert.equal(pages.length,failedRequests,'invalid cursor is not retried on every scroll');
+  emit({type:'user',text:'LIVE_AFTER_CONFLICT'});
+  emit({type:'text',content:'CONFLICT_REPLY_SURVIVES'});
+  await page.getByText('CONFLICT_REPLY_SURVIVES',{exact:true}).waitFor();
+  expire=false;
+  await page.getByRole('button',{name:'Refresh history',exact:true}).click();
+  await page.getByText('PAGE_ANSWER_24',{exact:true}).waitFor();
+  assert.equal(await page.locator('.history-page-error').count(),0,'fresh snapshot clears paging error');
   emit({type:'state',running:true});
   await page.waitForTimeout(200);
   await page.locator('.session-item-main').filter({hasText:browse.name}).click();

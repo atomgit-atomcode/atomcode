@@ -4396,3 +4396,5 @@ body {
   color: white; background: rgba(0, 0, 0, .4); font-size: 25px; cursor: pointer;
 }
 .message-image-close:focus-visible { outline: 2px solid white; outline-offset: 3px; }
+
+.history-page-error { display: flex; justify-content: center; align-items: center; gap: 8px; padding: 12px; color: var(--app-secondary-foreground); font-size: 13px; }

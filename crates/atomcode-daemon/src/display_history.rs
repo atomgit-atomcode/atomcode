@@ -24,6 +24,31 @@ fn digest(messages: &[MessageInfo]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+/// Runtime-only system context may precede the persisted conversation. Nothing
+/// else may differ: an in-flight tail must remain in the live snapshot.
+pub(crate) fn matches_snapshot(
+    live: &atomcode_kernel::message::SessionSnapshot,
+    stored: &atomcode_kernel::message::SessionSnapshot,
+) -> bool {
+    let Some(head) = live.messages.len().checked_sub(stored.messages.len()) else {
+        return false;
+    };
+    live.messages[..head]
+        .iter()
+        .all(|m| m.role == atomcode_kernel::message::Role::System)
+        && live.messages[head..]
+            .iter()
+            .zip(&stored.messages)
+            .all(|(a, b)| {
+                a.role == b.role
+                    && a.display_text() == b.display_text()
+                    && a.tool_calls == b.tool_calls
+                    && a.tool_call_id == b.tool_call_id
+                    && a.synthetic == b.synthetic
+                    && a.internal_origin == b.internal_origin
+            })
+}
+
 pub(crate) fn window(
     session: &str,
     messages: &mut Vec<MessageInfo>,
@@ -57,11 +82,15 @@ pub(crate) fn window(
             }
         }
     }
-    let older = (start > 0).then(|| Cursor {
-        session: session.into(),
-        before: start,
-        digest: digest(&messages[..start]),
-    });
+    // An internal preamble is not an older conversation page.
+    let older = messages[..start]
+        .iter()
+        .any(|m| m.role == "user" && !m.synthetic)
+        .then(|| Cursor {
+            session: session.into(),
+            before: start,
+            digest: digest(&messages[..start]),
+        });
     messages.truncate(end);
     messages.drain(..start);
     Ok(older)
@@ -131,6 +160,42 @@ mod tests {
         let seed = state_seed(&messages);
         assert_eq!(seed[0]["tool_calls"][0]["id"], "plan");
         assert_eq!(seed.len(), 2);
+    }
+
+    #[test]
+    fn runtime_context_matches_but_live_changes_never_get_replaced() {
+        use atomcode_kernel::message::SessionSnapshot;
+        let stored = SessionSnapshot::new(vec![
+            Message::user("question"),
+            Message::assistant("answer", vec![]),
+        ]);
+        let mut live = stored.clone();
+        live.messages.insert(0, Message::system("runtime context"));
+        assert!(matches_snapshot(&live, &stored));
+        live.messages.push(Message::user("in flight"));
+        assert!(!matches_snapshot(&live, &stored));
+        live.messages.pop();
+        live.messages[2].text = "changed answer".into();
+        assert!(!matches_snapshot(&live, &stored));
+        live.messages[0] = Message::user("different conversation");
+        assert!(!matches_snapshot(&live, &stored));
+    }
+
+    #[test]
+    fn internal_preamble_does_not_create_an_older_page() {
+        let mut reminder = Message::user("internal reminder");
+        reminder.synthetic = true;
+        let mut messages = [
+            Message::system("context"),
+            reminder,
+            Message::user("question"),
+            Message::assistant("answer", vec![]),
+        ]
+        .iter()
+        .map(MessageInfo::from_kernel)
+        .collect();
+        assert!(window("one", &mut messages, None).unwrap().is_none());
+        assert_eq!(messages[0].content, "question");
     }
 
     #[test]

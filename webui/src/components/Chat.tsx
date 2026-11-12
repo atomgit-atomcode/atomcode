@@ -6,7 +6,7 @@ import { GoalRecoveryStatus } from './GoalRecoveryStatus';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
-import { importPatchFile, taskSpecs } from '../api';
+import { ApiCallError, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
 import { processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
@@ -499,8 +499,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   function setServerHistory(value: ServerHistory) {
     serverHistoryRef.current = value;
     setServerHistoryState(value);
+    setServerHistoryError(null);
   }
   const [serverHistoryLoading, setServerHistoryLoading] = useState(false);
+  const [serverHistoryError, setServerHistoryError] = useState<{ session: string; expired: boolean } | null>(null);
   const serverHistoryRequest = useRef<AbortController | null>(null);
   const [timelineStart, setTimelineStart] = useState<number | null>(null);
   useEffect(() => {
@@ -3680,11 +3682,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     timelineIgnoreScrollRef.current = performance.now() + 500;
     timelineAnchorRef.current = null;
   }, [range.start, range.end, timelineStart, page.loading]);
-  async function loadServerHistory() {
+  async function loadServerHistory(retry = false) {
     const id = activeIdRef.current;
     const cursor = serverHistory.cursor;
     const project = activeSession?.project_hash;
-    if (!id || id !== serverHistory.session || !cursor || !project || serverHistoryRequest.current) return;
+    if (!id || id !== serverHistory.session || !cursor || !project || serverHistoryRequest.current
+      || (!retry && serverHistoryError?.session === id)) return;
+    setServerHistoryError(null);
     const generation = sessionGenerationRef.current;
     const controller = new AbortController();
     serverHistoryRequest.current = controller;
@@ -3704,7 +3708,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       setMessages(current => [...older, ...current]);
       setServerHistory({ session: id, cursor: detail.history_older, baseline: serverHistoryRef.current.baseline });
     } catch (error) {
-      if (!controller.signal.aborted && generation === sessionGenerationRef.current) pushCommandNotice(String(error));
+      if (!controller.signal.aborted && generation === sessionGenerationRef.current && activeIdRef.current === id) {
+        setServerHistoryError({ session: id, expired: error instanceof ApiCallError && error.status === 409 });
+      }
     } finally {
       if (serverHistoryRequest.current === controller) {
         serverHistoryRequest.current = null;
@@ -4414,6 +4420,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
         <HistoryLoading active={serverHistoryLoading} />
+        {serverHistoryError?.session === serverHistory.session && <div class="history-page-error" role="status">
+          <span>{t(serverHistoryError.expired ? 'chat.historyChanged' : 'chat.historyPageFailed')}</span>
+          <button onClick={() => serverHistoryError.expired ? window.location.reload() : void loadServerHistory(true)}>
+            {t(serverHistoryError.expired ? 'chat.historyRefresh' : 'chat.historyRetry')}
+          </button>
+        </div>}
 
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
