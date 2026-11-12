@@ -559,6 +559,8 @@ atomcode --prompt-file task.md
 
 默认 `keep_interrupted_context = true` 时，中断保留已记录的任务进度；设为 `false` 仍会撤销被中断回合，包括该回合的 Todo 改动。
 
+WebUI 在执行时实时展示过程；回合完成且有最终正文后，会默认收起过程，点击“执行过程”可展开。搜索时自动展开，中断或失败时保持过程可见；折叠不删除历史，也不影响 Todo。
+
 > **AtomGit Issue**：`/issue` 已移除。执行 `/login` 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”，AtomCode 会调用内置的 `atomgit_issue` 工具。读取 Issue 可直接执行；创建 Issue，以及新增、编辑或删除评论仍需权限确认。
 >
 > **插件命令**：除了上面的内置命令，插件还能注册自己的斜杠命令。例如安装官方频道插件后即可使用 `/wechat`（显示 AtomCode 微信用户群二维码）：

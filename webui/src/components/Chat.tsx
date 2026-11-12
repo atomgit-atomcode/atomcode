@@ -6,7 +6,8 @@ import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
 import { importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
-import type { ComponentChildren } from 'preact';
+import { Fragment, type ComponentChildren } from 'preact';
+import { turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
@@ -136,6 +137,7 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  turnStop?: string;
   sourceSeq?: number;
   specPinned?: boolean;
   contextSummary?: boolean;
@@ -618,6 +620,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
 
   const latestSummaryIndex = messages.map(message => message.contextSummary === true).lastIndexOf(true);
+  const [processExpanded, setProcessExpanded] = useState<Record<string, boolean>>({});
+  const processReadIntent = useRef(false);
   const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // Auxiliary persistence failures belong to application chrome, not the
@@ -1644,6 +1648,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     for (const msg of msgs) {
       if (msg.role === 'user') {
         if (isUserInterruptionMessage(msg)) {
+          const previous = [...loaded].reverse().find(message => message.role === 'assistant');
+          if (previous) previous.turnStop = 'cancelled';
           continue;
         }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
@@ -2021,7 +2027,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
           setSessionSwitchNotice(current => current === t('browse.switchBusy') ? null : current);
-          stampLastAssistantCompletion();
+          stampLastAssistantCompletion(Date.now(), e.stop_reason);
           finishTodoTurn();
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
@@ -2205,12 +2211,21 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   /** Stamp the assistant when the turn actually finishes. The optimistic
    *  placeholder intentionally has no clock, keeping reply completion distinct
    *  from the user's submission time. */
-  function stampLastAssistantCompletion(ts = Date.now()) {
+  function stampLastAssistantCompletion(ts = Date.now(), stopReason?: string, scope = activeIdRef.current) {
+    const viewport = scrollRef.current;
+    const readingProcess = processReadIntent.current && viewport
+      && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > BOTTOM_SLACK;
+    if (!atBottomRef.current || readingProcess) {
+      const groups = turnProcesses(messagesRef.current);
+      const group = groups.get(messagesRef.current.length - 1);
+      if (group) setProcessExpanded(prev => ({ ...prev, [`${scope}/${group.key}`]: true }));
+    }
+    processReadIntent.current = false;
     setMessages((prev) => {
       for (let index = prev.length - 1; index >= 0; index -= 1) {
         if (prev[index].role !== 'assistant') continue;
         const next = prev.slice();
-        next[index] = { ...next[index], ts, parts: settlePendingToolParts(next[index].parts) };
+        next[index] = { ...next[index], ts: next[index].ts ?? ts, turnStop: stopReason ?? next[index].turnStop, parts: settlePendingToolParts(next[index].parts) };
         return next;
       }
       return prev;
@@ -2790,7 +2805,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       case 'done': {
         setCompacting(false);
         // Every terminal keeps successful todo changes and drops unresolved previews.
-        stampLastAssistantCompletion();
+        stampLastAssistantCompletion(Date.now(), event.stop_reason, event.session_id);
         finishTodoTurn();
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -2834,7 +2849,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       case 'stopped':
         setCompacting(false);
         // Stop execution without discarding the committed plan.
-        stampLastAssistantCompletion();
+        stampLastAssistantCompletion(Date.now(), 'cancelled');
         finishTodoTurn();
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
@@ -2849,7 +2864,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
       case 'error':
         setCompacting(false);
-        stampLastAssistantCompletion();
+        stampLastAssistantCompletion(Date.now(), 'error');
         resetTodoBatch(false);
         // A session another atomcode holds says so in words, with what to do —
         // not the session store's own line about leases.
@@ -3729,6 +3744,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     setActiveNavIndex(previous => previous === index ? previous : index);
   }
   function interactWithTimeline(event: Event) {
+    processReadIntent.current = true;
     if (timelineStart === null && !atBottomRef.current) setTimelineStart(range.start);
     if (event.type === 'wheel') pageTimeline((event as WheelEvent).deltaY);
     if (event.type === 'touchstart') timelineTouchRef.current = (event as TouchEvent).touches[0]?.clientY ?? null;
@@ -4403,6 +4419,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         {(() => {
           const assistantTurnEnds = assistantTurnEndFlags(messages.map((message) => message.role));
           const turnArtifacts = artifactsByAssistantIndex(messages);
+          const processes = turnProcesses(messages, busy);
+          const firstVisible = new Map<string, number>();
+          const visibleIndexes = new Set(visibleMessages.map(item => item.origIdx));
+          for (const { origIdx } of visibleMessages) {
+            const process = processes.get(origIdx);
+            if (process && !firstVisible.has(process.key)) firstVisible.set(process.key, origIdx);
+          }
 
           return visibleMessages.map(({ msg, origIdx }) => {
             const isLast = origIdx === lastIdx;
@@ -4447,10 +4470,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             // copy/time controls and system notices remain transparent.
             const isLastInTurn = assistantTurnEnds[origIdx] === true;
 
+            const process = processes.get(origIdx);
+            const processKey = process ? `${activeIdRef.current ?? sessionId}/${process.key}` : '';
+            const canFold = process?.foldable && visibleIndexes.has(process.last) && !searchTrim;
+            const expanded = !canFold || processExpanded[processKey] === true;
+            const toggle = process && canFold && firstVisible.get(process.key) === origIdx
+              ? <TurnProcessToggle process={process} expanded={expanded}
+                  onToggle={() => setProcessExpanded(prev => ({ ...prev, [processKey]: !expanded }))} /> : null;
+            if (!expanded && process && origIdx !== process.last) {
+              return <Fragment key={origIdx}>{toggle}</Fragment>;
+            }
+            const displayMessage = !expanded && process ? { ...msg, parts: process.finalParts } : msg;
             return (
-              <AssistantMessageView
-                key={origIdx}
-                msg={msg}
+              <Fragment key={origIdx}>{toggle}<AssistantMessageView
+                msg={displayMessage}
                 isLast={isLast}
                 busy={busy}
                 lastIdx={lastIdx}
@@ -4463,7 +4496,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
                 pollGroups={pollGroups}
-              />
+              /></Fragment>
             );
           });
         })()}
@@ -4731,12 +4764,16 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
   const t = useT();
   const messages = useMemo(() => segmentMessages(historyMessages(turn)), [turn]);
   const [start, setStart] = useState<number | null>(null);
+  const [processOpen, setProcessOpen] = useState(false);
+  const process = useMemo(() => turnProcesses(messages).get(messages.length - 1), [messages]);
+  const folded = Boolean(process?.foldable && !processOpen && !search.trim());
   const limits = timelineLimits(compact);
   const range = boundedTimelineRange(messages, limits.mounted, start, limits.pageBytes);
   const root = useRef<HTMLDivElement>(null);
   const ignoreUntil = useRef(0);
   const anchor = useRef<{ index: number; top: number; before: boolean } | null>(null);
   function move(direction: number, automatic = false) {
+    if (folded) return;
     if ((direction < 0 && range.start === 0) || (direction > 0 && range.end === messages.length)) return;
     if (automatic && performance.now() < ignoreUntil.current) return;
     const el = viewport(); const node = root.current;
@@ -4755,7 +4792,7 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
   }
   const moveRef = useRef(move); moveRef.current = move;
   useLayoutEffect(() => {
-    onEdges(range.start > 0, range.end < messages.length);
+    onEdges(!folded && range.start > 0, !folded && range.end < messages.length);
     const el = viewport(); const saved = anchor.current; const node = root.current;
     if (el && saved && node) {
       const keep = node.querySelector<HTMLElement>(`[data-history-segment="${saved.index}"]`);
@@ -4764,7 +4801,7 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
           : node.getBoundingClientRect().top - el.getBoundingClientRect().top);
       anchor.current = null;
     }
-  }, [range.start, range.end, messages.length]);
+  }, [range.start, range.end, messages.length, folded]);
   useEffect(() => {
     const el = viewport(); if (!el) return;
     let top = el.scrollTop; let touch: number | null = null;
@@ -4782,17 +4819,35 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
       el.removeEventListener('touchstart', touchStart); el.removeEventListener('touchmove', touchMove); onEdges(false, false); };
   }, []);
   return <div ref={root}>
-    {range.start > 0 && <div class="timeline-history-status"><button onClick={() => move(-1)}>{t('chat.historyLoadPrevious')}</button></div>}
-    {messages.slice(range.start, range.end).map((msg, offset) => <div key={range.start + offset} data-history-segment={range.start + offset}>
+    <UserMessageView msg={messages[0]} timeLabel={formatMsgTime(messages[0].ts)} search={search} isActiveSearchMatch={false} />
+    {process?.foldable && !search.trim() && <TurnProcessToggle process={process} expanded={!folded}
+      onToggle={() => setProcessOpen(value => !value)} />}
+    {!folded && range.start > 0 && <div class="timeline-history-status"><button onClick={() => move(-1)}>{t('chat.historyLoadPrevious')}</button></div>}
+    {folded && process ? <>
+      <AssistantMessageView msg={{ ...messages[process.last], parts: process.finalParts }} isLast={false} busy={false} lastIdx={-1}
+        isLastInTurn={true} copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
+        artifacts={[]} sessionId={sessionId} timeLabel={formatMsgTime(messages[process.last].ts)} search={search} isActiveSearchMatch={false} />
+    </> : messages.slice(range.start, range.end).map((msg, offset) => <div key={range.start + offset} data-history-segment={range.start + offset}>
       {msg.role === 'user'
-        ? <UserMessageView msg={msg} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />
+        ? null
         : <AssistantMessageView msg={msg} isLast={false} busy={false} lastIdx={-1}
             isLastInTurn={range.start + offset === messages.length - 1}
             copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
             artifacts={[]} sessionId={sessionId} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />}
     </div>)}
-    {range.end < messages.length && <div class="timeline-history-status"><button onClick={() => move(1)}>{t('chat.historyLoadNext')}</button></div>}
+    {!folded && range.end < messages.length && <div class="timeline-history-status"><button onClick={() => move(1)}>{t('chat.historyLoadNext')}</button></div>}
   </div>;
+}
+
+function TurnProcessToggle({ process, expanded, onToggle }: {
+  process: TurnProcess; expanded: boolean; onToggle: () => void;
+}) {
+  const t = useT();
+  return <button type="button" class="turn-process-toggle" aria-expanded={expanded} onClick={onToggle}>
+    <span class="turn-process-chevron" aria-hidden="true">{expanded ? '⌄' : '›'}</span>
+    <span>{t('chat.processSummary', { steps: process.steps, tools: process.tools })}</span>
+    {process.duration != null && <span class="turn-process-duration">{t('stats.duration', { duration: formatTurnDuration(process.duration) })}</span>}
+  </button>;
 }
 
 function AssistantMessageView({

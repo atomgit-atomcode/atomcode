@@ -27,7 +27,7 @@ test('live assistant timestamps are assigned at the terminal boundary', () => {
   const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
 
   assert.doesNotMatch(chat, /role: 'assistant', parts: \[\], ts: now/);
-  assert.match(chat, /function stampLastAssistantCompletion\(ts = Date\.now\(\)\)/);
-  assert.match(chat, /case 'done': \{[\s\S]*?stampLastAssistantCompletion\(\)/);
-  assert.match(chat, /if \(terminal\) \{[\s\S]*?stampLastAssistantCompletion\(\)/);
+  assert.match(chat, /function stampLastAssistantCompletion\(ts = Date\.now\(\), stopReason\?: string, scope = activeIdRef\.current\)/);
+  assert.match(chat, /case 'done': \{[\s\S]*?stampLastAssistantCompletion\(Date\.now\(\),/);
+  assert.match(chat, /if \(terminal\) \{[\s\S]*?stampLastAssistantCompletion\(Date\.now\(\),/);
 });

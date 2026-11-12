@@ -98,12 +98,20 @@ try {
     await page.mouse.wheel(0, -25);
     await page.waitForTimeout(100);
     const up = await page.locator('.messages-container').evaluate(node => ({top: node.scrollTop, gap:node.scrollHeight-node.clientHeight-node.scrollTop}));
+    const readingAnchor = await page.locator('.tool-body').evaluateAll(nodes => {
+      const viewport = document.querySelector('.messages-container').getBoundingClientRect();
+      const index = nodes.findIndex(node => { const rect = node.getBoundingClientRect(); return rect.bottom > viewport.top + 2 && rect.top < viewport.bottom; });
+      return { index, top: nodes[index].getBoundingClientRect().top };
+    });
     for (const client of clients) for (const event of [{type:'state',running:true},{type:'text',content:'scroll-repro-chunk'},{type:'state',running:false}]) client.write(`data: ${JSON.stringify(event)}\n\n`);
     await page.waitForTimeout(200);
     const streamed = await page.locator('.messages-container').evaluate(node => ({top: node.scrollTop, gap:node.scrollHeight-node.clientHeight-node.scrollTop}));
     assert.ok(up.gap > 2);
     assert.ok(streamed.gap > 2, 'WebUI small upward scroll stays away from latest');
-    assert.equal(streamed.top, up.top, 'stream updates preserve the small-scroll reading position');
+    // Completion can add a process disclosure above the reader. Preserve the
+    // visible content anchor, rather than the absolute scroll offset.
+    const anchorTop = await page.locator('.tool-body').nth(readingAnchor.index).evaluate(node => node.getBoundingClientRect().top);
+    assert.ok(Math.abs(anchorTop - readingAnchor.top) <= 2, 'stream updates preserve the visible reading position');
     const initialCommand = await page.locator('.tool-name-secondary').first().innerText();
     await page.locator('.messages-container').evaluate(node => { node.scrollTop = 0; });
     await new Promise(resolve => setTimeout(resolve, 550));

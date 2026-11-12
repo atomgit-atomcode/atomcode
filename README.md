@@ -593,6 +593,8 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 With the default `keep_interrupted_context = true`, interruption keeps recorded task progress. Setting it to `false` still undoes the interrupted turn, including that turn's Todo changes.
 
+WebUI shows progress during execution, then collapses completed process details while keeping the final answer visible. Click “Process” to expand them. Search reveals the process; interrupted or failed turns stay expanded. Folding does not delete history or change Todo state.
+
 > **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
 > language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses
 > its built-in `atomgit_issue` tool. Reading issues is automatic; creating an

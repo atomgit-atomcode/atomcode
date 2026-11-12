@@ -4361,3 +4361,28 @@ body {
 }
 .session-hover-card-directory svg { flex-shrink: 0; margin-top: 3px; }
 .session-hover-card-directory span { overflow-wrap: anywhere; min-width: 0; }
+
+
+/* A completed turn keeps its answer visible; its transcript stays expandable. */
+.turn-process-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  margin: 12px 0 8px;
+  padding: 8px 2px;
+  border: 0;
+  border-bottom: 1px solid var(--app-border-subtle);
+  border-radius: 0;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  font: inherit;
+  font-size: 0.8125rem;
+  text-align: left;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.turn-process-toggle:hover { color: var(--app-primary-foreground); }
+.turn-process-toggle:focus-visible { outline: 2px solid var(--app-primary-foreground); outline-offset: 3px; }
+.turn-process-chevron { width: 12px; flex-shrink: 0; }
+.turn-process-duration { color: var(--app-tertiary-foreground); }

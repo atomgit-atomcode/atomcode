@@ -16,6 +16,7 @@
     "test:todo-sources": "node scripts/todo-sources-e2e.mjs",
     "test:workspace-actions": "node scripts/workspace-actions-e2e.mjs",
     "test:session-browse": "node scripts/session-browse-e2e.mjs",
+    "test:turn-process": "node scripts/turn-process-e2e.mjs",
     "test:history-pagination": "node scripts/history-pagination-e2e.mjs",
     "test:context": "node scripts/context-summary-e2e.mjs",
     "test:workbench": "node scripts/workbench-e2e.mjs",
