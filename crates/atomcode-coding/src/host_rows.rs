@@ -1929,10 +1929,13 @@ impl Plugin for McpHostPlugin {
                 )
             })
         {
-            if let Some(prompts) = &ctx.service::<SystemPromptSvc>() {
-                let (id, rank) = crate::mcp_instructions::STARTUP_FRAGMENT;
-                prompts.contribute(id, rank, crate::mcp_instructions::STARTUP_GUIDANCE);
-            }
+            let (id, rank) = crate::mcp_instructions::STARTUP_FRAGMENT;
+            atomcode_harness::plugins::tools::contribute_prompt(
+                ctx,
+                id,
+                rank,
+                crate::mcp_instructions::STARTUP_GUIDANCE,
+            );
         }
         // Withdrawal happens from the runtime, not from here, and it has to
         // reach this catalog or the model keeps being offered what was revoked.
