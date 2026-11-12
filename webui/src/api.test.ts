@@ -942,3 +942,20 @@ test('chat permission answers echo tool and one-shot approval identities', async
     assert.deepEqual(body, {session_id:'session',decision:'allow',tool_name:'mcp__browser-use__browser_click',call_id:'call',approval_id:'approval'});
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('live approval answers carry the one-shot request identity', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(url), '/live/permission');
+    body = JSON.parse(String(init?.body));
+    return new Response('{"accepted":false}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { postLivePermission } = await import('./api.ts');
+    assert.deepEqual(await postLivePermission('allow_persist', 'mcp__s__tool', 'call-1', 'approval-1'), { accepted: false });
+    assert.deepEqual(body, { decision: 'allow_persist', tool_name: 'mcp__s__tool', call_id: 'call-1', approval_id: 'approval-1' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

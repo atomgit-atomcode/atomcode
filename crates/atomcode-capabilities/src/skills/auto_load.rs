@@ -11,6 +11,10 @@ pub enum Selection {
 /// Exclude quoted examples, code and blockquotes: a report embedded in a
 /// translation/documentation request is not itself a debugging instruction.
 fn task_text(prompt: &str) -> String {
+    task_text_inner(prompt, false)
+}
+
+fn task_text_inner(prompt: &str, preserve_urls: bool) -> String {
     let mut out = String::new();
     let mut fence = None;
     for line in prompt.lines() {
@@ -29,10 +33,20 @@ fn task_text(prompt: &str) -> String {
         }
         let mut quote = None;
         let mut previous = ' ';
+        let mut quoted = String::new();
         for ch in line.chars() {
             if let Some(end) = quote {
                 if ch == end {
                     quote = None;
+                    if preserve_urls
+                        && (quoted.starts_with("https://") || quoted.starts_with("http://"))
+                        && !quoted.chars().any(char::is_whitespace)
+                    {
+                        out.push_str(&quoted.to_lowercase());
+                    }
+                    quoted.clear();
+                } else {
+                    quoted.push(ch);
                 }
             } else if matches!(ch, '"' | '`' | '“' | '‘')
                 || (ch == '\'' && !previous.is_alphanumeric())
@@ -92,7 +106,7 @@ pub fn browser_task_reason(prompt: &str) -> Result<(), &'static str> {
     if prompt.len() > 32 * 1024 {
         return Err("prompt_budget");
     }
-    let text = task_text(prompt);
+    let text = task_text_inner(prompt, true);
     if opted_out(&text) {
         return Err("user_opt_out");
     }
@@ -175,8 +189,6 @@ pub fn browser_task_reason(prompt: &str) -> Result<(), &'static str> {
             && ["功能", "支持", "逻辑", "组件", "测试", "事件"]
                 .iter()
                 .any(|word| text.contains(word)))
-        || text.contains('?')
-        || text.contains('？')
         || [
             "代码",
             "源码",
@@ -550,6 +562,10 @@ mod tests {
             "Take a screenshot of the current browser page",
             "在浏览器中打开文档并滚动到页面底部",
             "打开 https://example.test 并截图",
+            "打开 `https://example.com` 并截图",
+            "打开 “https://example.com/search?q=rust” 并截图",
+            "Could you open https://example.com and take a screenshot?",
+            "请打开网页并截图？",
             "打开网页并填写表单，不要提交",
         ] {
             assert_eq!(browser_task_reason(prompt), Ok(()), "{prompt}");

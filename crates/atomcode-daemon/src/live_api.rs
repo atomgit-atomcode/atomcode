@@ -863,6 +863,7 @@ pub(crate) enum LiveWireEvent {
     PersistenceWarning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
+        approval_id: String,
         tool_name: String,
         reason: String,
         call_id: String,
@@ -1169,8 +1170,10 @@ impl NativeLiveWireProjector {
                         .get("project_rule")
                         .cloned()
                         .and_then(|v| serde_json::from_value(v).ok());
+                    let approval_id = request.payload.get("approval_id")?.as_str()?.to_owned();
                     let approval: ApprovalRequest = serde_json::from_value(request.payload).ok()?;
                     LiveWireEvent::PermissionRequest {
+                        approval_id,
                         tool_name: approval.tool,
                         reason: approval
                             .reason
@@ -2738,12 +2741,15 @@ pub(crate) async fn live_reasoning_effort(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct LivePermissionReq {
+    #[serde(default)]
+    pub approval_id: Option<String>,
     pub decision: String, // "allow" | "deny" | "always_allow" | "allow_persist"
     /// Full MCP tool name (`mcp__{server}__{tool}`) the client believes it is
     /// answering. Informational only: `allow_persist` grants the tool named by
     /// the pending approval itself, never this field.
     #[serde(default)]
-    pub tool_name: Option<String>,
+    #[serde(rename = "tool_name")]
+    pub _tool_name: Option<String>,
     #[serde(default)]
     pub call_id: Option<String>,
 }
@@ -2765,7 +2771,10 @@ pub(crate) async fn persist_mcp_tool_approval(
     }
 }
 
-fn report_mcp_tool_approval(alias: &str, approval: Option<atomcode_coding::McpToolApproval>) {
+pub(crate) fn report_mcp_tool_approval(
+    alias: &str,
+    approval: Option<atomcode_coding::McpToolApproval>,
+) {
     match approval {
         None => tracing::warn!(
             target: "atomcode::mcp",
@@ -2796,7 +2805,7 @@ fn report_mcp_tool_approval(alias: &str, approval: Option<atomcode_coding::McpTo
 ///   anything else  → PermissionDecision::Deny
 pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl IntoResponse {
     use atomcode_capabilities::tools::{
-        parse_permission_decision, ApprovalRequest, PermissionDecision, APPROVAL_KIND,
+        parse_permission_decision, PermissionDecision, APPROVAL_KIND,
     };
     // Answer the approval the runtime is actually waiting on — nothing pending,
     // nothing to answer and nothing to grant. A stale tab replaying an answer
@@ -2812,35 +2821,6 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
         return Json(serde_json::json!({"accepted": false}));
     }
     let decision = if req.decision == "allow_persist" {
-        // "Always allow this MCP tool" names the tool the request is for, not
-        // whatever the client sent alongside its answer (same as /chat).
-        let asked = serde_json::from_value::<ApprovalRequest>(payload)
-            .ok()
-            .map(|approval| approval.tool)
-            .filter(|tool| tool.starts_with("mcp__"));
-        if let Some(full) = asked {
-            if req
-                .tool_name
-                .as_deref()
-                .is_some_and(|claimed| claimed != full)
-            {
-                tracing::warn!(
-                    target: "atomcode::mcp",
-                    tool = %full,
-                    claimed = ?req.tool_name,
-                    "\"always allow\" names a different tool than the pending approval; using the pending one"
-                );
-            }
-            match crate::native_live::approve_mcp_tool(full.clone()).await {
-                Ok(approval) => report_mcp_tool_approval(&full, approval),
-                Err(error) => tracing::warn!(
-                    target: "atomcode::mcp",
-                    tool = %full,
-                    error = ?error,
-                    "\"always allow\" not applied: no live runtime to apply it"
-                ),
-            }
-        }
         PermissionDecision::AllowOnce
     } else {
         parse_permission_decision(&req.decision)
@@ -2859,9 +2839,18 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
     if req.decision == "allow_project" {
         value = serde_json::json!({"decision":"allow", "save_project_rule":true});
     }
-    let ok = crate::native_live::respond_confirmed(id, value)
-        .await
-        .is_ok();
+    let (Some(token), Some(call_id)) = (req.approval_id.as_deref(), req.call_id.as_deref()) else {
+        return Json(serde_json::json!({"accepted": false}));
+    };
+    let ok = crate::native_live::respond_approval_confirmed(
+        id,
+        token,
+        call_id,
+        value,
+        req.decision == "allow_persist",
+    )
+    .await
+    .is_ok();
     Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -3236,9 +3225,10 @@ mod tests {
         let mut projector = super::NativeLiveWireProjector::default();
         let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(atomcode_coding::CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
             id:42, kind:atomcode_capabilities::tools::APPROVAL_KIND.into(), snapshot:None,
-            payload:serde_json::json!({"call_id":"call-42","tool":"bash","args":"{}","reason":"specific safety reason","project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}}),
+            payload:serde_json::json!({"approval_id":"approval-42","call_id":"call-42","tool":"bash","args":"{}","reason":"specific safety reason","project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}}),
         }))).unwrap();
         let value = serde_json::to_value(wire).unwrap();
+        assert_eq!(value["approval_id"], "approval-42");
         assert_eq!(value["reason"], "specific safety reason");
         assert_eq!(value["project_rule"]["rule"], "Bash(rm -rf scratch)");
     }

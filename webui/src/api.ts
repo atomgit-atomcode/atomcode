@@ -1135,7 +1135,7 @@ export type LiveWireEvent =
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
+  | { type: 'permission_request'; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
   | PolicyInterventionEvent
@@ -1392,11 +1392,12 @@ export async function postLivePermission(
   decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
   callId?: string,
+  approvalId?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await apiFetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision, tool_name: toolName, call_id: callId }),
+    body: JSON.stringify({ decision, tool_name: toolName, call_id: callId, approval_id: approvalId }),
   });
   return readJson(resp);
 }

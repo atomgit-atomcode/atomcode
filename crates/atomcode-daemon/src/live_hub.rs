@@ -129,8 +129,51 @@ struct BoundRuntime {
 /// kept so an answer can act on what was actually asked (e.g. which tool an
 /// approval is for) rather than on what a client claims alongside its answer.
 struct PendingRequest {
+    approval_id: Option<String>,
     kind: String,
     payload: serde_json::Value,
+}
+
+impl PendingRequest {
+    fn claim_approval(&mut self, token: &str, call_id: &str) -> Result<Option<String>, ()> {
+        if self.kind != atomcode_capabilities::tools::APPROVAL_KIND
+            || self.approval_id.as_deref() != Some(token)
+            || self
+                .payload
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(call_id)
+        {
+            return Err(());
+        }
+        self.approval_id = None;
+        Ok(self
+            .payload
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn approval_claim_requires_the_exact_single_use_token() {
+    let mut pending = PendingRequest {
+        approval_id: Some("new-request".into()),
+        kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+        payload: serde_json::json!({"call_id":"reused-call", "tool":"mcp__server__tool"}),
+    };
+    assert!(pending
+        .claim_approval("old-request", "reused-call")
+        .is_err());
+    assert!(pending.claim_approval("new-request", "other-call").is_err());
+    assert_eq!(
+        pending.claim_approval("new-request", "reused-call"),
+        Ok(Some("mcp__server__tool".into()))
+    );
+    assert!(pending
+        .claim_approval("new-request", "reused-call")
+        .is_err());
 }
 
 #[derive(Default)]
@@ -1197,6 +1240,61 @@ impl LiveViewHub {
         Ok(())
     }
 
+    /// Claim one exact approval before awaiting the runtime. Tokens are single use
+    /// and survive replay, but never survive replacement of the pending request.
+    pub async fn respond_approval_confirmed(
+        &self,
+        id: RequestId,
+        token: &str,
+        call_id: &str,
+        value: serde_json::Value,
+        persist: bool,
+    ) -> Result<(), HubError> {
+        let (binding, handle, tool) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let bound = state.binding.as_ref().ok_or(HubError::Unbound)?;
+            let binding = bound.identity.clone();
+            let handle = bound.control.handle().ok_or(HubError::RuntimeUnavailable)?;
+            let pending = state
+                .pending_requests
+                .get_mut(&id)
+                .ok_or(HubError::UnknownRequest(id))?;
+            let tool = pending
+                .claim_approval(token, call_id)
+                .map_err(|()| HubError::UnknownRequest(id))?;
+            (binding, handle, tool)
+        };
+        handle
+            .respond_at_generation(binding.generation, id, value)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        let same_binding = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let same = state
+                .binding
+                .as_ref()
+                .is_some_and(|current| current.identity == binding);
+            if same && state.pending_requests.contains_key(&id) {
+                self.resolve_request_locked(&mut state, id)?;
+            }
+            same
+        };
+        if persist && same_binding {
+            if let Some(tool) = tool.filter(|tool| tool.starts_with("mcp__")) {
+                match handle
+                    .approve_mcp_tool_at_generation(binding.generation, tool.clone())
+                    .await
+                {
+                    Ok(approval) => crate::live_api::report_mcp_tool_approval(&tool, approval),
+                    Err(error) => {
+                        tracing::warn!(?error, "MCP approval persistence was not applied")
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn respond_pending_kind(
         &self,
         kind: &str,
@@ -1396,6 +1494,8 @@ impl LiveViewHub {
                 state.pending_requests.insert(
                     request.id,
                     PendingRequest {
+                        approval_id: (request.kind == atomcode_capabilities::tools::APPROVAL_KIND)
+                            .then(|| uuid::Uuid::new_v4().to_string()),
                         kind: request.kind.clone(),
                         payload: request.payload.clone(),
                     },
@@ -1777,7 +1877,16 @@ impl LiveViewHub {
         Ok(())
     }
 
-    fn publish_view_locked(&self, state: &mut HubState, event: LiveViewEvent, replay: bool) {
+    fn publish_view_locked(&self, state: &mut HubState, mut event: LiveViewEvent, replay: bool) {
+        if let LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) = &mut event {
+            if let Some(token) = state
+                .pending_requests
+                .get(&request.id)
+                .and_then(|p| p.approval_id.as_ref())
+            {
+                request.payload["approval_id"] = serde_json::json!(token);
+            }
+        }
         let Some(binding) = state.binding.as_ref() else {
             return;
         };
@@ -2646,6 +2755,54 @@ mod tests {
             Some((42, serde_json::json!({ "tool": "mcp__fs__read" })))
         );
         assert_eq!(hub.pending_of_kind("request_user_input"), None);
+        let token = |hub: &LiveViewHub| {
+            let replay = hub.join().unwrap().replay;
+            replay
+                .iter()
+                .find_map(|item| match &item.event {
+                    LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) => request
+                        .payload
+                        .get("approval_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .expect("approval replay has a token")
+        };
+        let first = token(&hub);
+        assert_eq!(
+            token(&hub),
+            first,
+            "reconnect keeps the same request identity"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({"tool":"mcp__fs__read"}),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        let newest = hub
+            .state
+            .lock()
+            .unwrap()
+            .pending_requests
+            .get(&42)
+            .unwrap()
+            .approval_id
+            .clone()
+            .unwrap();
+        assert_ne!(
+            first, newest,
+            "reused runtime IDs must not reuse approval identities"
+        );
         hub.respond(42, serde_json::json!({ "decision": "allow" }))
             .unwrap();
         assert_eq!(

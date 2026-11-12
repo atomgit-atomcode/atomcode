@@ -3829,6 +3829,25 @@ async fn always_allowing_an_mcp_tool_holds_for_the_session_and_is_written() {
     let asked = turn_answering(&mut runtime, "mcp echo", Some(allow)).await;
     assert_eq!(asked, 1, "an untrusted MCP tool is asked about");
 
+    let wrong_generation = runtime.handle.status().generation + 1;
+    assert!(runtime
+        .handle
+        .respond_at_generation(
+            wrong_generation,
+            42,
+            serde_json::json!({"decision":"allow"})
+        )
+        .await
+        .is_err());
+    assert!(runtime
+        .handle
+        .approve_mcp_tool_at_generation(wrong_generation, "mcp__t__echo".into())
+        .await
+        .is_err());
+    assert!(
+        !env._home.path().join("mcp.json").exists(),
+        "a stale grant must not write configuration"
+    );
     let approval = runtime
         .handle
         .approve_mcp_tool("mcp__t__echo".into())

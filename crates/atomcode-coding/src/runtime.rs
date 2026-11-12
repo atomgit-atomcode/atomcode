@@ -2536,11 +2536,21 @@ impl CodingRuntimeHandle {
         id: RequestId,
         value: serde_json::Value,
     ) -> Result<(), RuntimeError> {
-        let state = self.state.load(Ordering::Acquire);
+        self.respond_at_generation(self.status().generation, id, value)
+            .await
+    }
+
+    /// Answer only in the generation that raised the original request.
+    pub async fn respond_at_generation(
+        &self,
+        generation: u64,
+        id: RequestId,
+        value: serde_json::Value,
+    ) -> Result<(), RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Respond {
-                generation: runtime_state_generation(state),
+                generation,
                 id,
                 value,
                 done,
@@ -2827,11 +2837,20 @@ impl CodingRuntimeHandle {
         &self,
         alias: String,
     ) -> Result<Option<McpToolApproval>, RuntimeError> {
-        let state = self.state.load(Ordering::Acquire);
+        self.approve_mcp_tool_at_generation(self.status().generation, alias)
+            .await
+    }
+
+    /// Persist a grant only in the generation that raised the approval.
+    pub async fn approve_mcp_tool_at_generation(
+        &self,
+        generation: u64,
+        alias: String,
+    ) -> Result<Option<McpToolApproval>, RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ApproveMcpTool {
-                generation: runtime_state_generation(state),
+                generation,
                 alias,
                 done,
             })

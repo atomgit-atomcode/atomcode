@@ -974,3 +974,15 @@ pub async fn follow_up(
 pub async fn quality(session: String, args: String) -> Result<String, HubError> {
     hub().quality(session, args).await
 }
+
+pub async fn respond_approval_confirmed(
+    id: u64,
+    token: &str,
+    call_id: &str,
+    value: serde_json::Value,
+    persist: bool,
+) -> Result<(), crate::live_hub::HubError> {
+    hub()
+        .respond_approval_confirmed(id, token, call_id, value, persist)
+        .await
+}
