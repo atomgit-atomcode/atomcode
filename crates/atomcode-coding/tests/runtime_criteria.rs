@@ -7966,8 +7966,14 @@ async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_sessi
     let spawns = scratch.path().join("spawns");
     let calls = scratch.path().join("calls");
     let gate = scratch.path().join("release");
+    let pid_file = scratch.path().join("pid");
     let script = write_mcp_server(scratch.path(), &spawns);
     let text = std::fs::read_to_string(&script).unwrap();
+    let text = text.replacen(
+        "#!/bin/sh",
+        "#!/bin/sh\nprintf '%s' $$ > \"$ATOMCODE_TEST_MCP_PID\"",
+        1,
+    );
     let text = text.replace("*'\"method\":\"tools/call\"'*)", "*'\"method\":\"tools/call\"'*)\n      printf 'call\\n' >> \"$ATOMCODE_TEST_MCP_CALLS\"\n      while [ ! -f \"$ATOMCODE_TEST_MCP_GATE\" ]; do sleep 0.01; done");
     std::fs::write(&script, text).unwrap();
     let recorder = Arc::new(Recorder::default());
@@ -7983,9 +7989,14 @@ async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_sessi
             "ATOMCODE_TEST_MCP_GATE".into(),
             gate.to_string_lossy().into_owned(),
         );
+        env.insert(
+            "ATOMCODE_TEST_MCP_PID".into(),
+            pid_file.to_string_lossy().into_owned(),
+        );
     }
-    // The external handshake's startup idle-drain needs real time. Cancellation
-    // assertions below run with the clock paused and no arbitrary delay gate.
+    // This intentionally uncooperative server cannot read EOF while its tool
+    // is held. Keep real time for its bounded kill/reap; cancellation receipt
+    // remains prompt, but the turn terminal now awaits owned cleanup.
     tokio::time::resume();
     let mut runtime = CodingRuntime::start(input).await.unwrap();
     runtime
@@ -7993,7 +8004,6 @@ async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_sessi
         .wait_mcp_ready(std::time::Duration::from_secs(10))
         .await
         .unwrap();
-    tokio::time::pause();
     let session = runtime.session.as_ref().unwrap().id.clone();
     runtime
         .handle
@@ -8012,8 +8022,12 @@ async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_sessi
     .unwrap();
     let cancelled_at = tokio::time::Instant::now();
     runtime.handle.cancel().await.unwrap();
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(1),
+        "cancel receipt must not await backend cleanup"
+    );
     loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), runtime.events.recv())
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), runtime.events.recv())
             .await
             .unwrap()
             .unwrap();
@@ -8021,17 +8035,25 @@ async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_sessi
             break;
         }
     }
-    assert_eq!(
-        cancelled_at.elapsed(),
-        std::time::Duration::ZERO,
-        "cancel does not wait for the external response or RPC deadline"
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(5),
+        "the terminal is bounded by owned teardown, not the ten-second RPC deadline"
+    );
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(
+        !std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "cancelled owned backend must be reaped before the native terminal"
     );
     assert_eq!(runtime.session.as_ref().unwrap().id, session);
     let statuses = runtime.handle.mcp_status().await.unwrap();
     assert!(statuses.servers.iter().any(|(name, status)| name == "t" && matches!(status, atomcode_capabilities::mcp::ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))));
     assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
     std::fs::write(gate, "release old response").unwrap();
-    tokio::time::resume();
     runtime
         .handle
         .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
