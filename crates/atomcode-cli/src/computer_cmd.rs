@@ -216,7 +216,7 @@ impl Probe {
     }
     fn require_ready(&self) -> Result<()> {
         if !self.permissions.accessibility || !self.permissions.screen_recording {
-            bail!("Computer Use permissions incomplete: Accessibility={}, Screen Recording={}.\n{}\nGrant the identified backend App access in macOS settings, then retry; another App's grant does not apply.", self.permissions.accessibility, self.permissions.screen_recording, self.permission_identity());
+            bail!("Computer Use permissions incomplete: Accessibility={}, Screen Recording={}.\n{}\nGrant the identified backend App access in macOS settings, then retry; another App's grant does not apply. If this App is already enabled after a rebuild, remove its old permission entry and add the current App again: macOS may retain the previous signing requirement.", self.permissions.accessibility, self.permissions.screen_recording, self.permission_identity());
         }
         Ok(())
     }
@@ -896,6 +896,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("permissions incomplete") && error.contains("Accessibility=false"));
+        assert!(error.contains("previous signing requirement"));
         assert!(error.contains(&app.to_string_lossy().escape_debug().to_string()));
         assert!(!error.contains("do-not-print-this"));
         assert!(Probe::parse(READY.as_bytes())
