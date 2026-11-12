@@ -623,6 +623,9 @@ struct StreamRow {
     /// Ask before restarting a reasoning-only stream stopped by the host.
     #[serde(default)]
     reasoning_checkpoint: bool,
+    /// Opt-in absolute duration for one automatic lower-effort recovery per turn.
+    #[serde(default)]
+    reasoning_recovery_ms: u64,
 }
 
 impl Default for StreamRow {
@@ -630,6 +633,7 @@ impl Default for StreamRow {
         Self {
             max_recoveries: default_recoveries(),
             reasoning_checkpoint: false,
+            reasoning_recovery_ms: 0,
         }
     }
 }
@@ -653,11 +657,14 @@ repeat tool calls that already completed, and do not restart the task.";
 /// So the partial output is committed as a real assistant message, a nudge
 /// explains the situation, and the turn continues from there. Bounded, because
 /// a connection that keeps breaking is not something to keep absorbing.
+pub(super) const REASONING_RECOVERY_EXHAUSTED_CODE: &str = "reasoning_recovery_exhausted";
+
 struct StreamRecovery {
     ctx: Context,
     max_recoveries: u32,
     progress: Arc<Progress>,
     reasoning_checkpoint: bool,
+    reasoning_recovery: Duration,
 }
 
 #[async_trait]
@@ -670,8 +677,35 @@ impl Waterfall<AgentRequest> for StreamRecovery {
         let mut recovered = false;
         let mut original_effort = req.options.reasoning_effort;
         let mut temporary_effort = false;
+        let mut automatic = false;
         loop {
-            let result = next.run(req).await;
+            let result = if automatic {
+                let result = tokio::time::timeout(self.reasoning_recovery, next.run(req)).await;
+                if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
+                    self.progress.end_reasoning_recovery(&session);
+                }
+                match result {
+                    Ok(Ok(response)) if !response.truncated => Ok(response),
+                    failed => {
+                        let (partial, unexecuted_tool_output) = match failed {
+                            Ok(Ok(response)) => {
+                                let unsafe_tools = !response.tool_calls.is_empty();
+                                (Some(Box::new(response)), unsafe_tools)
+                            }
+                            Ok(Err(e)) => (e.partial, e.unexecuted_tool_output),
+                            Err(_) => (None, false),
+                        };
+                        Err(RequestError {
+                            code: Some(REASONING_RECOVERY_EXHAUSTED_CODE.into()),
+                            partial,
+                            unexecuted_tool_output,
+                            ..RequestError::message("单次自动降档恢复未完成，已停止自动请求。已保留进度，可手动继续或切换模型。")
+                        })
+                    }
+                }
+            } else {
+                next.run(req).await
+            };
             // Preserve defaults resolved below us; a person's override applies
             // only to the next resumed request, never the session default.
             if temporary_effort {
@@ -749,23 +783,42 @@ impl Waterfall<AgentRequest> for StreamRecovery {
             if error.code.as_deref() == Some(atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE)
             {
                 // The existing partial-stream commit above is the only writer.
-                // Local spending limits never authorize automatic recovery.
-                if !self.reasoning_checkpoint || error.unexecuted_tool_output || has_text {
+                if error.unexecuted_tool_output || has_text {
                     return Err(error);
                 }
                 let scoped = crate::agent::scoped(&self.ctx);
                 let lower = scoped.service::<LlmSvc>().and_then(|provider| {
                     super::truncation::lower_effort(original_effort, &provider.effort_levels())
                 });
+                let automatic_lower = !automatic
+                    && !self.reasoning_recovery.is_zero()
+                    && lower.is_some()
+                    && self.progress.begin_reasoning_recovery(&session, confirmed);
+                if !automatic_lower && !self.reasoning_checkpoint {
+                    return Err(error);
+                }
                 let requester = scoped
                     .service::<crate::seams::ToolDriverSvc>()
                     .and_then(|driver| driver.requester(session.id()));
-                let answer = match requester {
+                let answer = if automatic_lower {
+                    automatic = true;
+                    notice(
+                        &self.ctx,
+                        NoticeKind::ProviderRetry,
+                        format!(
+                            "持续思考未产生正文；单次降低思考强度恢复，最多等待 {} 秒。",
+                            self.reasoning_recovery.as_secs()
+                        ),
+                    );
+                    serde_json::json!({"continue":true,"lower_effort":true})
+                } else {
+                    match requester {
                     Some(requester) => requester.request(
                         atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND,
                         serde_json::json!({"reasoning_only":true, "lower_effort":lower.map(|e| e.as_str()), "message":error.message}),
                     ).await,
                     None => Value::Null,
+                }
                 };
                 let wants_lower = answer.get("lower_effort").and_then(Value::as_bool) == Some(true);
                 if answer.get("continue").and_then(Value::as_bool) != Some(true)
@@ -884,6 +937,12 @@ impl Plugin for StreamRecoveryPlugin {
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: StreamRow = parse(config)?;
+        if tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(row.reasoning_recovery_ms))
+            .is_none()
+        {
+            return Err("reasoning recovery duration exceeds monotonic clock range".into());
+        }
         let progress = Arc::new(Progress::default());
         let _ = ctx
             .provide::<Progress>(progress.clone())
@@ -905,6 +964,7 @@ impl Plugin for StreamRecoveryPlugin {
                 ctx: ctx.clone(),
                 max_recoveries: row.max_recoveries,
                 reasoning_checkpoint: row.reasoning_checkpoint,
+                reasoning_recovery: Duration::from_millis(row.reasoning_recovery_ms),
                 progress,
             }),
             false,

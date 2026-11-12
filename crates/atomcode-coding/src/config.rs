@@ -96,6 +96,9 @@ pub struct CodingAgentConfig {
     /// Continuous reasoning before any answer/tool output. Default 120s;
     /// ATOMCODE_REASONING_TIMEOUT_SECS overrides it, 0 disables it. Prefill excluded.
     pub reasoning_timeout: Duration,
+    /// Opt-in single lower-effort recovery cap; 0 disables automatic recovery.
+    /// ATOMCODE_REASONING_RECOVERY_TIMEOUT_SECS accepts 1..=3600 seconds.
+    pub reasoning_recovery_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -535,6 +538,7 @@ pub fn describe_config_file_for(
          `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
          highest the capable one.\n\
+         - Host environment `ATOMCODE_REASONING_RECOVERY_TIMEOUT_SECS=60` opts into one automatic lower-effort recovery per turn after a reasoning-only timeout, with a 60-second total recovery limit including prefill. Unset/0 disables automatic recovery; accepted values are 1..3600. This never changes the model's configured effort.\n\
          - `[skills]` `extra_dirs`: additional trusted skill roots, e.g. [`~/shared-skills`]. \
          Relative paths use the session working directory; `~` uses the user home. Standard \
          roots take precedence over extra roots; later extra roots win among themselves. \
@@ -1329,6 +1333,11 @@ impl CodingAgentConfig {
             stream_timeout: default_stream_timeout(),
             first_token_timeout: default_first_token_timeout(),
             reasoning_timeout: default_reasoning_timeout(),
+            reasoning_recovery_timeout: env_duration_secs(
+                "ATOMCODE_REASONING_RECOVERY_TIMEOUT_SECS",
+            )
+            .filter(|d| d.as_secs() <= 3600)
+            .unwrap_or(Duration::ZERO),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
@@ -2163,6 +2172,10 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("stream_timeout", &self.stream_timeout)
             .field("first_token_timeout", &self.first_token_timeout)
             .field("reasoning_timeout", &self.reasoning_timeout)
+            .field(
+                "reasoning_recovery_timeout",
+                &self.reasoning_recovery_timeout,
+            )
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

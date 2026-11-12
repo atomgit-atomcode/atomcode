@@ -21,6 +21,8 @@ fn isolate_home() {
 
 struct Fixture {
     streams: Mutex<VecDeque<Vec<(u64, StreamEvent)>>>,
+    levels: Vec<String>,
+    metadata_ready: tokio::sync::Notify,
     calls: Mutex<Vec<(Vec<Message>, ChatOptions)>>,
     answers: Mutex<VecDeque<Value>>,
     asked: Mutex<Vec<Value>>,
@@ -29,6 +31,8 @@ impl Fixture {
     fn new(streams: Vec<Vec<(u64, StreamEvent)>>, answers: Vec<Value>) -> Arc<Self> {
         Arc::new(Self {
             streams: Mutex::new(streams.into()),
+            levels: vec!["low".into(), "medium".into(), "high".into()],
+            metadata_ready: tokio::sync::Notify::new(),
             calls: Mutex::new(vec![]),
             answers: Mutex::new(answers.into()),
             asked: Mutex::new(vec![]),
@@ -41,7 +45,7 @@ impl LlmProvider for Fixture {
         "deadline-fixture"
     }
     fn effort_levels(&self) -> Vec<String> {
-        vec!["low".into(), "medium".into(), "high".into()]
+        self.levels.clone()
     }
     async fn chat_stream(
         &self,
@@ -60,6 +64,12 @@ impl LlmProvider for Fixture {
             .pop_front()
             .expect("unwanted automatic request")
             .into_iter();
+        if events.len() == 0 {
+            self.metadata_ready.notify_one();
+            return Ok(Box::pin(futures::stream::repeat(StreamEvent::Usage(
+                Default::default(),
+            ))));
+        }
         Ok(Box::pin(futures::stream::unfold(
             events,
             |mut events| async move {
@@ -121,6 +131,9 @@ impl Plugin for Row {
     }
 }
 async fn app(f: Arc<Fixture>, checkpoint: bool, limit: u64) -> App {
+    app_with_recovery(f, checkpoint, limit, 0).await
+}
+async fn app_with_recovery(f: Arc<Fixture>, checkpoint: bool, limit: u64, recovery: u64) -> App {
     let patch = format!(
         r#"
 [[patch]]
@@ -132,7 +145,7 @@ id="agent-loop"
 config={{reasoning_timeout_ms={limit},stream_idle_ms=5000,stream_first_content_ms=10000}}
 [[patch]]
 id="llm-stream-recovery"
-config={{reasoning_checkpoint={checkpoint}}}
+config={{reasoning_checkpoint={checkpoint},reasoning_recovery_ms={recovery}}}
 [[patch]]
 id="reasoning-effort"
 config={{level="high"}}
@@ -297,6 +310,169 @@ async fn cancellation_while_the_timeout_question_is_open_never_retries() {
     let (result, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), cancel);
     assert_eq!(result.unwrap().stop, StopReason::Cancelled);
     assert_eq!(f.asked.lock().unwrap().len(), 1);
+    assert_eq!(f.calls.lock().unwrap().len(), 1);
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn opted_in_recovery_lowers_once_and_restores_the_next_turn() {
+    let f = Fixture::new(
+        vec![thinking(), answer("recovered"), thinking(), answer("again")],
+        vec![],
+    );
+    let mut app = app_with_recovery(f.clone(), false, 1000, 2000).await;
+    assert_eq!(run_turn(&app, "go").await.unwrap().text, "recovered");
+    assert_eq!(run_turn(&app, "next").await.unwrap().text, "again");
+    let calls = f.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(_, o)| o.reasoning_effort)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Medium)
+        ]
+    );
+    assert!(calls[1].0.iter().any(|m| m
+        .reasoning
+        .as_deref()
+        .is_some_and(|r| r.contains("retained thought"))));
+    assert!(f.asked.lock().unwrap().is_empty());
+    drop(calls);
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn automatic_recovery_caps_prefill_and_never_starts_a_third_request() {
+    let f = Fixture::new(vec![thinking(), thinking()], vec![]);
+    let mut app = app_with_recovery(f.clone(), true, 1000, 700).await;
+    let began = tokio::time::Instant::now();
+    let result = run_turn(&app, "go").await.unwrap();
+    assert_eq!(f.calls.lock().unwrap().len(), 2);
+    assert!((Duration::from_millis(4700)..Duration::from_millis(4800)).contains(&began.elapsed()));
+    assert_eq!(
+        result.provider_error.unwrap().code.as_deref(),
+        Some("reasoning_recovery_exhausted")
+    );
+    assert!(f.asked.lock().unwrap().is_empty());
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn automatic_timeout_keeps_the_final_partial_chunk_in_the_existing_log() {
+    let f = Fixture::new(
+        vec![
+            thinking(),
+            vec![
+                (0, StreamEvent::TextDelta("partial answer".into())),
+                (2000, StreamEvent::Done { truncated: false }),
+            ],
+        ],
+        vec![],
+    );
+    let mut app = app_with_recovery(f.clone(), false, 1000, 700).await;
+    let result = run_turn(&app, "go").await.unwrap();
+    assert!(result.error.is_some());
+    let session = app.context().only_session().unwrap();
+    assert!(session.events().iter().any(|e|matches!(&e.event,SessionEvent::ReplyCheckpoint{text,reset:false,..} if text=="partial answer")));
+    assert_eq!(f.calls.lock().unwrap().len(), 2);
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn automatic_recovery_cancellation_never_becomes_a_retry_or_timeout() {
+    let f = Fixture::new(vec![thinking(), thinking()], vec![]);
+    let mut app = app_with_recovery(f.clone(), false, 1000, 5000).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    agent.send("go");
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        agent.cancel();
+    };
+    let (result, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), cancel);
+    assert_eq!(result.unwrap().stop, StopReason::Cancelled);
+    assert_eq!(f.calls.lock().unwrap().len(), 2);
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn no_supported_lower_effort_means_no_automatic_request() {
+    let mut f = Fixture::new(vec![thinking()], vec![]);
+    Arc::get_mut(&mut f).unwrap().levels = vec!["high".into()];
+    let mut app = app_with_recovery(f.clone(), false, 1000, 2000).await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Timeout
+    );
+    assert_eq!(f.calls.lock().unwrap().len(), 1);
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn continuously_ready_metadata_cannot_starve_the_automatic_deadline() {
+    let f = Fixture::new(vec![thinking(), vec![]], vec![]);
+    let mut app = app_with_recovery(f.clone(), false, 1000, 700).await;
+    let advance = async {
+        f.metadata_ready.notified().await;
+        tokio::time::advance(Duration::from_millis(701)).await;
+    };
+    let (result, ()) = tokio::join!(run_turn(&app, "go"), advance);
+    assert_eq!(result.unwrap().stop, StopReason::Timeout);
+    assert_eq!(f.calls.lock().unwrap().len(), 2);
+    app.stop();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn truncated_automatic_output_and_provider_errors_do_not_authorize_more_attempts() {
+    for failed in [
+        vec![
+            (0, StreamEvent::Reasoning("more thought".into())),
+            (0, StreamEvent::Done { truncated: true }),
+        ],
+        vec![(
+            0,
+            StreamEvent::Error(ProviderError {
+                http_status: Some(429),
+                retryable: true,
+                retry_after_secs: Some(1),
+                ..Default::default()
+            }),
+        )],
+    ] {
+        let f = Fixture::new(vec![thinking(), failed, answer("must not run")], vec![]);
+        let mut app = app_with_recovery(f.clone(), true, 1000, 2000).await;
+        assert_eq!(
+            run_turn(&app, "go").await.unwrap().stop,
+            StopReason::Timeout
+        );
+        assert_eq!(f.calls.lock().unwrap().len(), 2);
+        app.stop();
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn incomplete_tool_output_does_not_authorize_reasoning_recovery() {
+    let f = Fixture::new(
+        vec![vec![
+            (0, StreamEvent::Reasoning("first".into())),
+            (
+                100,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: Some("write_file".into()),
+                    arguments: "{".into(),
+                },
+            ),
+            (6000, StreamEvent::Done { truncated: false }),
+        ]],
+        vec![],
+    );
+    let mut app = app_with_recovery(f.clone(), false, 1000, 2000).await;
+    assert!(run_turn(&app, "go").await.unwrap().error.is_some());
     assert_eq!(f.calls.lock().unwrap().len(), 1);
     app.stop();
 }

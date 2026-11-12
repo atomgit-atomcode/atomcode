@@ -334,6 +334,15 @@ struct ReplyCheckpointBuffer<'a> {
     text: String,
     reasoning: String,
     deadline: tokio::time::Instant,
+    flush_on_drop: bool,
+}
+
+impl Drop for ReplyCheckpointBuffer<'_> {
+    fn drop(&mut self) {
+        if self.flush_on_drop {
+            self.flush();
+        }
+    }
 }
 
 impl<'a> ReplyCheckpointBuffer<'a> {
@@ -357,6 +366,9 @@ impl<'a> ReplyCheckpointBuffer<'a> {
             text: String::new(),
             reasoning: String::new(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            flush_on_drop: crate::agent::scoped(ctx)
+                .service::<super::recovery::Progress>()
+                .is_some_and(|progress| progress.reasoning_active(session)),
         }
     }
 
@@ -683,6 +695,11 @@ async fn stream_attempt(
             }
             StreamEvent::Done { truncated } => out.truncated = truncated,
             _ => {}
+        }
+        if checkpoint.flush_on_drop {
+            // The bounded recovery's deadline/cancellation must run even if a
+            // provider yields continuously ready metadata or text.
+            tokio::task::yield_now().await;
         }
     }
     // A truncated response is not empty even when it looks it: the model was
@@ -1062,6 +1079,7 @@ impl PluginAgentLoop {
                         Some(
                             STREAM_IDLE_CODE
                                 | atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE
+                                | super::recovery::REASONING_RECOVERY_EXHAUSTED_CODE
                         )
                     ) {
                         StopReason::Timeout

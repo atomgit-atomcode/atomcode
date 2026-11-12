@@ -34,6 +34,8 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     cfg.first_token_timeout = std::time::Duration::from_secs(600);
     cfg.stream_timeout = std::time::Duration::from_secs(120);
     cfg.reasoning_timeout = std::time::Duration::from_secs(90);
+    cfg.reasoning_recovery_timeout = std::time::Duration::from_secs(60);
+    cfg.round_cap_checkpoint = true;
     let dump = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
         .await
         .dump();
@@ -43,6 +45,9 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     );
     assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
     assert!(dump.contains("\"reasoning_timeout_ms\": 90000"), "{dump}");
+    assert!(dump.contains("\"reasoning_recovery_ms\": 60000"), "{dump}");
+    assert!(dump.contains("\"reasoning_checkpoint\": true"), "{dump}");
+    assert!(dump.contains("\"max_recoveries\": 3"), "{dump}");
 }
 
 #[tokio::test]
