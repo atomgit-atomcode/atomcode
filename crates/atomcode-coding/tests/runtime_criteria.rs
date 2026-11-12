@@ -7118,6 +7118,7 @@ mod criteria {
 /// Sharing can initialize while the provider is still running; the strong
 /// snapshot API continues to wait for a complete turn.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn a_live_view_is_available_before_the_running_turn_finishes() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -7214,6 +7215,7 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn a_model_only_runtime_keeps_an_empty_catalog_across_rebuilds() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
@@ -7348,6 +7350,7 @@ async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_g
 // Real runtime + recorded provider input: neither a UI marker nor a successful
 // command acknowledgement is evidence that the model received a picture.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() {
     struct VisionFallback;
     #[async_trait::async_trait]
@@ -7462,6 +7465,7 @@ async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() 
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
     struct WaitingVision(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
@@ -7520,6 +7524,7 @@ async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() {
     #[derive(Debug)]
     struct Meter(Arc<AtomicUsize>);
@@ -7563,6 +7568,7 @@ async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() 
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn recap_uses_the_compacted_task_list_without_a_model_call() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -7601,6 +7607,7 @@ async fn recap_uses_the_compacted_task_list_without_a_model_call() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn a_session_without_a_task_list_keeps_model_generated_recap() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -7620,6 +7627,7 @@ async fn a_session_without_a_task_list_keeps_model_generated_recap() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn disabling_automatic_review_keeps_explicit_reviews_and_survives_reload() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -7670,6 +7678,7 @@ async fn disabling_automatic_review_keeps_explicit_reviews_and_survives_reload()
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn dap_debugging_is_default_on_and_obeys_disable_and_model_only_tool_closures() {
     use atomcode_capabilities::tools::debug::{Adapter, Settings};
     let configured = || Settings {
@@ -7708,6 +7717,7 @@ async fn dap_debugging_is_default_on_and_obeys_disable_and_model_only_tool_closu
 // auto-advance would race the fixture's Python startup and Tokio's reaper.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::serial(engine)]
 async fn dap_processes_follow_the_production_runtime_lifecycle() {
     use atomcode_capabilities::tools::{debug::Adapter, PermissionRules};
     let env = env();
@@ -7812,6 +7822,7 @@ async fn dap_processes_follow_the_production_runtime_lifecycle() {
 /// calls' 3 s page budget and still answers. The Stats tab used to read the
 /// shared budget's timeout ("deadline has elapsed") on every open.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn a_slow_spend_query_is_not_cut_off_by_the_page_budget() {
     #[derive(Debug)]
     struct SlowSpend;
@@ -7849,6 +7860,7 @@ async fn a_slow_spend_query_is_not_cut_off_by_the_page_budget() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn vl_originals_are_saved_for_other_clients_without_reentering_model_context() {
     struct Caption;
     #[async_trait::async_trait]
