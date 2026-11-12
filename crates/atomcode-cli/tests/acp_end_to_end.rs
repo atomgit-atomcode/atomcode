@@ -2548,3 +2548,198 @@ async fn v2_disconnect_finishes_inflight_native_turn_and_releases_lease() {
         .acquire_lease(native)
         .expect("serve_over must release native lease");
 }
+
+/// Raw line EOF, with no SDK request-drop cancellation or permission response.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial]
+async fn v1_pending_permission_eof_fails_closed_and_releases_native_session() {
+    pending_permission_eof(1).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial]
+async fn v2_pending_permission_eof_fails_closed_and_releases_native_session() {
+    pending_permission_eof(2).await;
+}
+
+async fn pending_permission_eof(version: u64) {
+    use atomcode_kernel::session::SessionEvent;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::json;
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let cwd = tempfile::tempdir().unwrap();
+    let sentinel = cwd.path().join("permission-eof-sentinel");
+    std::fs::write(&sentinel, "MUST_SURVIVE").unwrap();
+    let stub = MockProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                id: "pending-permission-eof".into(),
+                name: "bash".into(),
+                arguments: json!({"command":"rm -rf ./permission-eof-sentinel"}).to_string(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("denied".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ])
+    .with_ctx_window(200_000);
+    // Each side owns only raw JSON lines, not a protocol Client or SentRequest.
+    // Dropping input is a true half-close; output remains available throughout.
+    let (input, incoming) = futures::channel::mpsc::unbounded::<String>();
+    let (outgoing, mut output) = futures::channel::mpsc::unbounded::<String>();
+    let transport = agent_client_protocol::Lines::new(
+        outgoing.sink_map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture output closed")
+        }),
+        incoming.map(Ok::<_, std::io::Error>),
+    );
+    let agent_task = tokio::spawn(serve_over(
+        AcpServeOptions {
+            engine: Some(dummy_engine()),
+            provider_factory: Some(Arc::new(StubProviderFactory(Arc::new(stub)))),
+            auto_approve: false,
+            ..Default::default()
+        },
+        transport,
+    ));
+    let mut wire = Vec::<serde_json::Value>::new();
+    let initialize = if version == 1 {
+        json!({"protocolVersion":1,"clientInfo":{"name":"raw-permission-eof","version":"1"},"clientCapabilities":{}})
+    } else {
+        json!({"protocolVersion":2,"info":{"name":"raw-permission-eof","version":"1"},"capabilities":{}})
+    };
+    input
+        .unbounded_send(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":initialize}).to_string(),
+        )
+        .unwrap();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(15), output.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let done = msg["id"] == 1 && msg.get("method").is_none();
+        assert!(msg.get("error").is_none(), "{msg}");
+        wire.push(msg);
+        if done {
+            break;
+        }
+    }
+    input
+        .unbounded_send(
+            json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{
+                "cwd":cwd.path(),"mcpServers":[]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    let id = loop {
+        let line = tokio::time::timeout(Duration::from_secs(15), output.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(msg.get("error").is_none(), "{msg}");
+        let id = if msg["id"] == 2 && msg.get("method").is_none() {
+            Some(msg["result"]["sessionId"].as_str().unwrap().to_owned())
+        } else {
+            None
+        };
+        wire.push(msg);
+        if let Some(id) = id {
+            break id;
+        }
+    };
+    input
+        .unbounded_send(
+            json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
+                "sessionId":id,"prompt":[{"type":"text","text":"remove the local sentinel"}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(15), output.next())
+            .await
+            .unwrap_or_else(|error| panic!("no permission before EOF: {error}; wire={wire:#?}"))
+            .unwrap();
+        let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let permission = msg["method"] == "session/request_permission";
+        assert!(msg.get("error").is_none(), "{msg}");
+        if permission {
+            assert!(msg.get("id").is_some());
+            assert!(serde_json::to_string(&msg["params"])
+                .unwrap()
+                .contains("permission-eof-sentinel"));
+        }
+        wire.push(msg);
+        if permission {
+            break;
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "MUST_SURVIVE");
+    drop(input); // No approval answer, cancel, close or delete request.
+    tokio::time::timeout(Duration::from_secs(6), agent_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    while let Some(line) = output.next().await {
+        wire.push(serde_json::from_str(&line).unwrap());
+    }
+    assert_eq!(
+        wire.iter()
+            .filter(|msg| msg["method"] == "session/request_permission")
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "MUST_SURVIVE");
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let manager = atomcode_capabilities::session::SessionManager::for_project(cwd.path(), &dirs);
+    let native = id.strip_prefix("acp-").unwrap();
+    let events = manager.load_events(native).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|fact| matches!(fact.event, SessionEvent::ToolStarted { .. })),
+        "unanswered approval dispatched a tool"
+    );
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|fact| match &fact.event {
+            SessionEvent::ToolResultLogged {
+                call_id,
+                is_error,
+                content,
+                ..
+            } if call_id == "pending-permission-eof" => Some((*is_error, content)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "pending call must have one terminal result: {events:#?}"
+    );
+    assert!(
+        results[0].0,
+        "unanswered approval must fail closed: {results:?}"
+    );
+    let terminals: Vec<_> = events
+        .iter()
+        .filter_map(|fact| match &fact.event {
+            SessionEvent::TurnEnd { stop, .. } => Some(stop),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "one native turn terminal: {events:#?}");
+    assert_eq!(*terminals[0], atomcode_kernel::event::StopReason::Cancelled);
+    let _lease = manager
+        .acquire_lease(native)
+        .expect("EOF must release pending-approval session lease");
+}
