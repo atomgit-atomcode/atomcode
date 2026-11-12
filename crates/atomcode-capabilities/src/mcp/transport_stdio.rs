@@ -803,6 +803,18 @@ impl McpClient for StdioClient {
     }
 
     async fn finish_scope(&self, scope: &super::McpScope) -> Result<()> {
+        if !self.scoped_turns.load(Ordering::SeqCst)
+            && self.abandoned_generation.load(Ordering::SeqCst) != 0
+        {
+            // The kernel may drop execute as its cancellation backstop. Its
+            // guard already fenced this exact client; the existing awaited
+            // turn-end seam must also stop its owned work before the terminal.
+            // Keep the uncertainty marker: disposal does not reconcile effects
+            // and must not make this client usable or reconnect it implicitly.
+            let _reconnect = self.reconnect_lock.lock().await;
+            self.clear_transport().await;
+            return Ok(());
+        }
         let relevant = {
             let state = self.scope_state()?;
             state.owner.as_ref() == Some(scope) || state.attempted.as_ref() == Some(scope)
@@ -1367,6 +1379,48 @@ mod tests {
         client.start().await.unwrap();
         drop(client);
         wait_for_cleanup_marker(marker).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn turn_end_retires_abandoned_unscoped_work_but_preserves_healthy_transport() {
+        tokio::time::resume(); // Real subprocess EOF, not a virtual timeout assertion.
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("retired");
+        let client = StdioClient::new(
+            "turn-cleanup".into(),
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "cat >/dev/null; printf eof > \"$1\"".into(),
+                "cleanup-test".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            BTreeMap::new(),
+            None,
+        );
+        client.start().await.unwrap();
+        let scope = super::super::McpScope::from_identity("fixture", 1);
+        client.finish_scope(&scope).await.unwrap();
+        assert!(
+            client.process.lock().await.is_some(),
+            "healthy unscoped process was retired"
+        );
+        assert!(!marker.exists());
+        // This is the same synchronous fence armed by a dispatched future drop.
+        client.abandoned_generation.store(1, Ordering::SeqCst);
+        client.finish_scope(&scope).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "eof");
+        assert!(client.process.lock().await.is_none());
+        assert!(
+            matches!(client.status(), ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))
+        );
+        assert!(client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .is_err());
+        client.finish_scope(&scope).await.unwrap(); // Idempotent; no implicit respawn.
+        assert!(client.process.lock().await.is_none());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

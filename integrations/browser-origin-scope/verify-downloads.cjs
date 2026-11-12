@@ -48,12 +48,25 @@ async function verify(root, reportPath) {
   const secureHits = [];
   const tls = https.createServer(trusted.options, (req, res) => {
     secureRequests++; secureHits.push(req.url);
+    unexpectedAuthorization ||= req.headers.authorization !== undefined;
+    if (req.url === '/partition/final' || req.url === '/partition/delete') {
+      if (req.headers.cookie !== 'partitionSession=rotated-fixture') { res.writeHead(401); return res.end('PARTITION_AUTH_REQUIRED'); }
+      if (req.url === '/partition/delete') res.setHeader('Set-Cookie', 'partitionSession=deleted; Secure; HttpOnly; Partitioned; Path=/partition/; Max-Age=0');
+      return res.end(req.url === '/partition/final' ? 'PARTITION_ROTATION_CONFIRMED' : 'PARTITION_DELETION_CONFIRMED');
+    }
+    if (req.url === '/partition/absent') {
+      if (req.headers.cookie !== undefined) { res.writeHead(409); return res.end('PARTITION_COOKIE_REMAINS'); }
+      return res.end('PARTITION_COOKIE_ABSENT');
+    }
     if (req.url === '/tls/check') {
       if (req.headers.cookie !== 'secureRotation=https-fixture') { res.writeHead(401); return res.end('SECURE_COOKIE_MISSING'); }
       return res.end('TLS_COOKIE_ROTATION_CONFIRMED');
     }
     if (req.headers.cookie !== 'session=ephemeral-download-fixture') { res.writeHead(401); return res.end('AUTH_REQUIRED'); }
     unexpectedAuthorization ||= req.headers.authorization !== undefined;
+    if (req.url === '/auth/partition-rotate') {
+      res.writeHead(302, { 'Set-Cookie': 'partitionSession=rotated-fixture; Secure; HttpOnly; SameSite=Strict; Partitioned; Path=/partition/', Location: '/partition/final' }); return res.end();
+    }
     if (req.url === '/auth/https-sync') res.setHeader('Set-Cookie', 'secureRotation=https-fixture; Secure; HttpOnly; Path=/tls/; SameSite=Strict');
     res.end('TLS_AUTHENTICATED_DOWNLOAD_FIXTURE');
   });
@@ -237,11 +250,30 @@ async function verify(root, reportPath) {
     assert.equal(secureHits.filter(hit => hit === '/tls/check').length, 1);
     report.cases.push('HTTPS response Cookie sync retains Secure/HttpOnly/path semantics, reaches only HTTPS and never repeats the remote GET');
 
+    const partitionTabs = (await call('browser_tabs', { action: 'list' })).result.content;
+    const partitionRotated = await call('browser_download', { url: secureOrigin + '/auth/partition-rotate', use_browser_context: true, sync_response_cookies: true });
+    assert.equal(partitionRotated.result.isError, undefined);
+    const partitionArtifact = JSON.parse(partitionRotated.result.content[0].text);
+    const partitionBody = Buffer.from('PARTITION_ROTATION_CONFIRMED');
+    assert.deepEqual(fs.readFileSync(partitionArtifact.path), partitionBody);
+    assert.equal(partitionArtifact.sha256, createHash('sha256').update(partitionBody).digest('hex'));
+    assert.equal(JSON.stringify(partitionRotated).includes('rotated-fixture'), false);
+    const partitionDeleted = await call('browser_download', { url: secureOrigin + '/partition/delete', use_browser_context: true, sync_response_cookies: true });
+    assert.equal(partitionDeleted.result.isError, undefined);
+    assert.equal(fs.readFileSync(JSON.parse(partitionDeleted.result.content[0].text).path, 'utf8'), 'PARTITION_DELETION_CONFIRMED');
+    const partitionAbsent = await call('browser_download', { url: secureOrigin + '/partition/absent', use_browser_context: true });
+    assert.equal(partitionAbsent.result.isError, undefined);
+    assert.equal(fs.readFileSync(JSON.parse(partitionAbsent.result.content[0].text).path, 'utf8'), 'PARTITION_COOKIE_ABSENT');
+    assert.deepEqual((await call('browser_tabs', { action: 'list' })).result.content, partitionTabs);
+    for (const endpoint of ['/auth/partition-rotate', '/partition/final', '/partition/delete', '/partition/absent'])
+      assert.equal(secureHits.filter(hit => hit === endpoint).length, 1, 'Partitioned MCP calls never replay a remote GET');
+    report.cases.push('actual MCP HTTPS Partitioned redirect rotation, exact artifact/hash, deletion and subsequent credential absence; unchanged original tabs and one remote GET per hop');
+
     assert.equal((await call('browser_download', { url: good + '/auth/partitioned-response', use_browser_context: true, sync_response_cookies: true })).result.isError, true);
     await call('browser_navigate', { url: good + '/auth/assert-original' });
     assert.ok(JSON.stringify((await call('browser_snapshot')).result).includes('ORIGINAL_COOKIE_RETAINED'));
     assert.equal(hits.filter(hit => hit === '/auth/partitioned-response').length, 1);
-    report.cases.push('Partitioned sync response fails before cookie mutation/publication and is not replayed');
+    report.cases.push('HTTP Partitioned sync response fails before cookie mutation/publication and is not replayed');
     assert.equal((await call('browser_download', { url: good + '/auth/readonly-rotate', use_browser_context: true })).result.isError, true);
     const beforeTabs = (await call('browser_tabs', { action: 'list' })).result.content;
     const synced = await call('browser_download', { url: good + '/auth/sync-rotate', use_browser_context: true, sync_response_cookies: true });
@@ -284,7 +316,7 @@ async function verify(root, reportPath) {
     // EOF may prevent a terminal delivery; no replay and no publication is authoritative.
     pending.get(eof.id)?.resolve({ result: { isError: true } }); pending.delete(eof.id);
     assert.ok(captured.every(pid => !alive(pid)));
-    assert.equal(fs.readdirSync(path.join(output, 'files')).filter(name => name.startsWith('download-')).length, 10);
+    assert.equal(fs.readdirSync(path.join(output, 'files')).filter(name => name.startsWith('download-')).length, 13);
     assert.deepEqual(fs.readdirSync(path.join(output, 'download-staging')), []);
     assert.equal(stderr, '');
     report.cases.push('pure stdin EOF drains transfer and exits zero, without signal fallback or staged remnants');

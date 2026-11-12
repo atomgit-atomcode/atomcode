@@ -1444,15 +1444,15 @@ It cannot override system, user, project, safety, permission, or approval rules.
         wait_for_true(&mut cancelled).await;
     }
 
-    /// Release only the addressed scope, in parallel, without granting a tool
-    /// permission or invoking model-visible business cleanup tools.
+    /// Finish the addressed turn on captured clients, in parallel: release its
+    /// scope and retire abandoned owned transports before the turn terminal.
+    /// Never grant permission or invoke model-visible business cleanup tools.
     pub async fn finish_scope(&self, scope: &super::McpScope) {
         let clients: Vec<_> = self
             .servers
             .read()
             .await
             .iter()
-            .filter(|(_, client)| client.supports_scopes())
             .map(|(name, client)| (name.clone(), client.clone()))
             .collect();
         let mut pending: FuturesUnordered<_> = clients

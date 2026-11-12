@@ -110,6 +110,13 @@ impl LlmProvider for Scripted {
                     arguments: serde_json::json!({"url": &m.text[17..]}).to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text.starts_with("browser download ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "mcp__browser-use__browser_download".into(),
+                    arguments: serde_json::json!({"url": &m.text[17..]}).to_string(),
+                })
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -4298,4 +4305,160 @@ async fn browser_origin_setup_is_host_local_and_never_implicitly_reloads() {
             "no implicit runtime rebuild"
         );
     }
+}
+
+/// Download acceptance at the real runtime boundary, with a scripted provider
+/// and an independently observed local HTTP effect. No credentials or GUI.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires ATOMCODE_BROWSER_ORIGIN_TEST_ROOT and pinned Node backend; actual runtime download cancellation"]
+async fn a_scoped_download_is_denied_before_dispatch_and_cancelled_without_publication() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::resume(); // Actual subprocess and socket I/O.
+    let env = env();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let held = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = {
+        let hits = hits.clone();
+        let held = held.clone();
+        let release = release.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(bytes[..n].starts_with(b"GET /held "));
+            hits.fetch_add(1, Ordering::SeqCst);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+            held.notify_one();
+            release.notified().await;
+            // Cancellation may already have closed the socket. Never retry it.
+            let _ = socket.write_all(b"-late").await;
+            drop(socket);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "automatic download replay"
+            );
+        })
+    };
+    let policy_file = env._home.path().join("download-policy.json");
+    std::fs::write(&policy_file, serde_json::json!({"version":2,"origins":{origin.clone():{"access":"allow","downloads":"allow"}}}).to_string()).unwrap();
+    atomcode::browser_cmd::execute(
+        &dirs,
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: None,
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../integrations/browser-origin-scope/backend.cjs")
+                        .canonicalize()
+                        .unwrap(),
+                ),
+                backend_root: Some(
+                    std::env::var_os("ATOMCODE_BROWSER_ORIGIN_TEST_ROOT")
+                        .expect("explicit pinned backend")
+                        .into(),
+                ),
+                origin_policy_file: Some(policy_file),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let (mut connection, _) = started(&env, SubagentPolicy::Disabled, None, vec![], true).await;
+    let session = connection.session.clone();
+    assert!(tools_on_the_model(&connection, &session, "browser-use")
+        .await
+        .iter()
+        .any(|name| name.contains("browser_download")));
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session,
+            mode: atomcode_host_api::Mode::Ask,
+        })
+        .await
+        .unwrap();
+    for decision in ["deny", "allow"] {
+        connection
+            .commands
+            .send(message(&format!("browser download {origin}/held")))
+            .unwrap();
+        let id = loop {
+            match tokio::time::timeout(Duration::from_secs(15), connection.events.recv()).await {
+                Ok(Some(AgentEvent::Request { id, kind, .. })) => {
+                    assert_eq!(kind, "approval");
+                    break id;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("no download approval: {other:?}"),
+            }
+        };
+        connection
+            .commands
+            .send(AgentCommand::Respond {
+                id,
+                value: serde_json::json!({"decision":decision}),
+            })
+            .unwrap();
+        if decision == "deny" {
+            let ended = through_turn(&mut connection).await;
+            assert!(!ended
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolStarted { .. })));
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        tokio::time::timeout(Duration::from_secs(10), held.notified())
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        connection.commands.send(AgentCommand::Cancel).unwrap();
+        let ended = through_turn(&mut connection).await;
+        assert!(
+            ended
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled)),
+            "{ended:#?}"
+        );
+        assert_eq!(
+            ended
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnComplete { .. }))
+                .count(),
+            1
+        );
+        release.notify_one();
+        server.await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let artifacts = dirs
+            .user()
+            .join("integrations/browser-use/origin-artifacts");
+        assert_eq!(
+            std::fs::read_dir(artifacts.join("files")).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(artifacts.join("download-staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        break;
+    }
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
 }

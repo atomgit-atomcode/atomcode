@@ -49,6 +49,8 @@ pub trait McpClient: Send + Sync {
     }
 
     /// Addressed, transport-owned cleanup on the existing host turn-end seam.
+    /// Unscoped owned transports also retire abandoned dispatched work here;
+    /// a healthy unscoped or stateless client needs no cleanup.
     async fn finish_scope(&self, _scope: &super::McpScope) -> Result<()> {
         Ok(())
     }
