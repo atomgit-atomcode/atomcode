@@ -1293,7 +1293,10 @@ mod tests {
             "the session path must be scrubbed: {data}"
         );
         assert!(data.contains("<CWD>"), "expected the path marker: {data}");
-        assert!(data.chars().count() <= 200, "the cap still applies: {data}");
+        assert!(
+            data.chars().count() <= atomcode_telemetry::scrub::HEAD_MAX,
+            "the cap still applies: {data}"
+        );
     }
 
     #[test]
