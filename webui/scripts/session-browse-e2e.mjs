@@ -66,7 +66,7 @@ const server = createServer(async (req, res) => {
   if (path === '/project') return json({ working_dir: '/fixture', project_hash: 'fixture' });
   if (path === '/config') return json({ providers: [], notifications: { enabled: false } });
   if (path === '/models') return json([{ name: 'fixture', model: 'fixture', provider: 'fixture', effort_levels: [] }]);
-  if (path.startsWith('/sessions/resolve/')) return json(meta);
+  if (path.startsWith('/sessions/resolve/')) return json([meta,other,third].find(session=>session.id===path.split('/').pop())??meta);
   if (path === '/projects/fixture/sessions/' + id) return json({ ...meta, messages, summary_count: baseline });
   if (path.endsWith('/transcript')) return json({ session_id: id, turns: [] });
   if (path === '/live/mode') return json({ mode: 'build' });
@@ -384,6 +384,8 @@ try {
   for (const refusal of [
     {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn'},
     {ok:false,active_turn:false,error:'session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")'},
+    {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn',idleReplay:true},
+    {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn',retry:true},
   ]) {
     const page=await browser.newPage({viewport:{width:1200,height:900}});
     await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
@@ -392,12 +394,23 @@ try {
     await page.getByText('The resource read boundary is ready.',{exact:false}).waitFor();
     switchRejection=refusal;
     await page.locator('.session-item-main').filter({hasText:other.name}).click();
-    await page.locator('.session-switch-notice').filter({hasText:'The current task is running, finishing, or switching.'}).waitFor();
+    await page.locator('.session-switch-notice').filter({hasText:'Session switch was deferred because the runtime is busy.'}).waitFor();
     assert.equal(await page.locator('.session-switch-notice').innerText().then(t=>t.includes('RuntimeRejected')),false);
     await page.waitForFunction(name=>document.querySelector('.session-item.active .session-item-name')?.textContent===name,meta.name);
     assert.equal(await page.locator('.session-item.active .session-item-name').innerText(),meta.name);
     await page.locator('.message-input').waitFor();
-    if (refusal.active_turn) {
+    if (refusal.retry) {
+      switchRejection=null;
+      await page.getByRole('button',{name:'Retry switch',exact:true}).click();
+      await page.getByText('Historical answer',{exact:true}).waitFor();
+      await page.waitForFunction(() => !document.querySelector('.session-switch-notice'));
+      await page.close();
+      continue;
+    }
+    if (refusal.idleReplay) {
+      // No locally observed turn/terminal: an idle replay still clears Busy.
+      emit({type:'state',running:false});
+    } else if (refusal.active_turn) {
       emit({type:"state",running:true});
       await page.waitForTimeout(100);
       emit({type:"state",running:false,stop_reason:"end_turn"});

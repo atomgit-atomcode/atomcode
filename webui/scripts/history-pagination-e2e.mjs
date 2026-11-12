@@ -82,11 +82,19 @@ try {
     await page.waitForTimeout(100);
   }
   await waiting;
+  await page.waitForTimeout(400);
+  const loading=page.locator('.history-loading').first();
+  await loading.waitFor();
+  assert.equal((await loading.textContent()).trim(),'','loading has no floating text');
+  const loadingBox=await loading.boundingBox();
+  const firstUserBox=await page.locator('.user-message-wrapper').first().boundingBox();
+  assert.ok(loadingBox && firstUserBox && loadingBox.y+loadingBox.height<=firstUserBox.y+1,'loading owns a row and does not cover the prompt');
   emit({type:'user',text:'LIVE_PROMPT'});emit({type:'state',running:true});emit({type:'text',content:'LIVE_REPLY_SURVIVES'});
   await page.getByText('LIVE_REPLY_SURVIVES',{exact:true}).waitFor();
   pending();pending=null;hold=null;
   await page.waitForTimeout(600);
   assert.equal(pages.length,1,'one request in flight');
+  assert.equal(await page.locator('.history-loading').count(),0,'loading ends when the request completes');
   assert.equal(await page.getByText('LIVE_REPLY_SURVIVES',{exact:true}).count(),1);
   // Scroll through local mounted windows and server pages to the oldest turn.
   for(let i=0;i<25 && !await page.getByText('PAGE_PROMPT_0',{exact:true}).count();i++) {

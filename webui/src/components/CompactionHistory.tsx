@@ -1,3 +1,4 @@
+import { HistoryLoading } from './HistoryLoading';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { getSessionTranscript, type TranscriptTurn } from '../api';
@@ -190,7 +191,7 @@ export function CompactionHistory(props: {
   }, []);
 
   return <>
-    {busy && <div class="timeline-history-status is-loading" role="status"><span>{t('chat.historyLoading')}</span></div>}
+    <HistoryLoading active={busy} />
     {error && <div class="timeline-history-status" role="alert">{t('chat.historyFailed')} {error} <button onClick={() => retry.current()}>{t('chat.historyRetry')}</button></div>}
     {window?.turns.map(turn => <div key={turn.turn_id} data-history-turn={turn.turn_id}
       class={turn.undone ? 'timeline-history-turn is-undone' : 'timeline-history-turn'}

@@ -89,7 +89,7 @@ export function useTimelinePage<T extends TimelineMessage>(messages: T[], positi
   }, [signature, retry]);
   const items = page.map((message, offset) => ({ origIdx: positions[offset],
     msg: message.archiveKey ? loaded.get(message.archiveKey) : message }));
-  return { items, error, loading: items.some(item => !item.msg), retry: () => setRetry(value => value + 1) };
+  return { items, error, loading: !error && items.some(item => !item.msg), retry: () => setRetry(value => value + 1) };
 }
 
 /** Search immutable archived entries once per query; live tokens must not keep

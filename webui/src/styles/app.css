@@ -4218,8 +4218,9 @@ body {
 .timeline-history-status { padding: 12px 0; color: var(--app-secondary-foreground); font-size: .85rem; text-align: center; }
 .timeline-history-status button { cursor: pointer; color: inherit; text-decoration: underline; }
 
-.timeline-history-status.is-loading { position: sticky; top: 0; z-index: 4; height: 0; min-height: 0; flex: 0 0 0; padding: 0; pointer-events: none; }
-.timeline-history-status.is-loading > span { display: inline-block; padding: 4px 10px; border-radius: 8px; background: var(--app-primary-background); }
+.history-loading { display: flex; justify-content: center; align-items: center; min-height: 24px; padding: 4px 0; color: var(--app-secondary-foreground); }
+.history-loading-spinner { width: 14px; height: 14px; border: 2px solid var(--app-input-border); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .history-loading-spinner { animation: none; } }
 
 .todo-guidance-sources { padding: 6px 12px 12px; border-top: 1px solid var(--app-input-border); }
 .todo-source-hint { color: var(--app-secondary-foreground); font-size: 0.75rem; }
@@ -4271,6 +4272,9 @@ body {
 .msg-copy-btn:disabled { cursor: default; opacity: .4; }
 
 .session-switch-notice {
+  /* Keep actions out of the floating turn-navigation gutter without
+     raising this banner over the search controls. */
+  padding-inline-end: 56px;
   flex-wrap: nowrap;
   align-items: flex-start;
   flex-shrink: 0;

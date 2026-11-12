@@ -14,11 +14,13 @@ const full=[
   {role:'assistant',content:'HISTORY_FINAL',created_at:1700000004000},
 ];
 const clients=new Set();
+let connections=0;
 const snapshot=()=>({type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full});
 const server=createServer(async(req,res)=>{
   const path=new URL(req.url,'http://localhost').pathname;
   const json=data=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(data));};
   if(path==='/live'){
+    connections++;
     res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store'});
     res.write(`data: ${JSON.stringify(snapshot())}\n\ndata: {"type":"state","running":false}\n\n`);
     clients.add(res);req.on('close',()=>clients.delete(res));return;
@@ -59,9 +61,14 @@ try {
   await page.locator('.msg-search-input').fill('HISTORY_PROCESS');
   await page.getByText('HISTORY_PROCESS',{exact:true}).waitFor();
   await page.locator('.msg-search-input').press('Escape');
+  const beforeReload=connections;
   await page.reload(); await page.getByText('HISTORY_FINAL',{exact:true}).waitFor();
+  for(let attempt=0;attempt<100 && (connections<=beforeReload || !clients.size);attempt++) await page.waitForTimeout(20);
+  assert.ok(connections>beforeReload && clients.size,'reload established a new live subscriber');
   assert.equal(await page.getByText('HISTORY_PROCESS',{exact:true}).count(),0);
-  emit({type:'user',text:'LIVE_REQUEST'});emit({type:'state',running:true});
+  emit({type:'user',text:'LIVE_REQUEST'});
+  await page.getByText('LIVE_REQUEST',{exact:true}).waitFor();
+  emit({type:'state',running:true});
   emit({type:'text',content:'LIVE_PROCESS'});
   emit({type:'tool_start',id:'read-live',name:'read',arguments:'{}'});
   emit({type:'tool_result',id:'read-live',name:'read',output:'ok',success:true,duration_ms:100});

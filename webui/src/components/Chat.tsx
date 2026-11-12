@@ -1,3 +1,4 @@
+import { HistoryLoading } from './HistoryLoading';
 import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
@@ -799,6 +800,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // transcript state so history replacement cannot erase it.
   const noticeAfterSwitchRef = useRef<{ sessionId: string; text: string } | null>(null);
   const [sessionSwitchNotice, setSessionSwitchNotice] = useState<string | null>(null);
+  const [switchRetryTarget, setSwitchRetryTarget] = useState<string | null>(null);
+  const liveSessionObservationRef = useRef(0);
   // Mirror of messages state to read the latest value without dependency tracking.
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => {
@@ -1044,6 +1047,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         ? noticeAfterSwitchRef.current.text : null;
       noticeAfterSwitchRef.current = null;
       setSessionSwitchNotice(carried);
+      if (carried !== t('browse.switchBusy')) setSwitchRetryTarget(null);
 
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
@@ -1063,6 +1067,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
         if (!carried) setSessionSwitchNotice(t('sync.switching'));
+        const observedBeforeSwitch = liveSessionObservationRef.current;
         const ready = postLiveSwitchSession(sessionId)
           .then((result) => {
             if (sessionGenerationRef.current !== switchGeneration) return false;
@@ -1078,7 +1083,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               if (!carried) setSessionSwitchNotice(null);
               return true;
             }
+            if (result.activeTurn && liveSessionObservationRef.current > observedBeforeSwitch
+                && liveSessionIdRef.current === sessionId) {
+              // The runtime already acknowledged this destination over SSE.
+              // A delayed Busy reply cannot roll that authoritative handover back.
+              setSessionSwitchNotice(null);
+              setSwitchRetryTarget(null);
+              return true;
+            }
             if (result.activeTurn && prevId) {
+              setSwitchRetryTarget(sessionId);
               noticeAfterSwitchRef.current = { sessionId: prevId, text: t('browse.switchBusy') };
               setSessionSwitchNotice(noticeAfterSwitchRef.current.text);
               onSessionId(prevId);
@@ -1781,6 +1795,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      liveSessionObservationRef.current++;
       historyAbortRef.current?.abort();
       serverHistoryRequest.current?.abort();
       serverHistoryRequest.current = null;
@@ -1926,11 +1941,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
     // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
+      liveSessionObservationRef.current++;
       if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) {
         noticeAfterSwitchRef.current = null;
       }
       setSessionSwitchNotice(current =>
         current === t('browse.switchBusy') || current === t('sync.switching') ? null : current);
+      setSwitchRetryTarget(null);
       liveSessionIdRef.current = e.session_id;
       // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
       // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
@@ -2025,11 +2042,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         liveLifecycleRef.current = lifecycle.state;
         const terminal = lifecycle.terminal;
         setBusy(lifecycle.state.running);
-        if (!e.running) setCompacting(false);
+        if (!e.running) {
+          setCompacting(false);
+          // A replayed idle state need not close a locally observed turn.
+          // It still invalidates an earlier Busy rejection; clear its carried
+          // copy too, or the rollback effect could resurrect it later.
+          if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) noticeAfterSwitchRef.current = null;
+          setSessionSwitchNotice(current => current === t('browse.switchBusy') ? null : current);
+          setSwitchRetryTarget(null);
+        }
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
-          setSessionSwitchNotice(current => current === t('browse.switchBusy') ? null : current);
           stampLastAssistantCompletion(Date.now(), e.stop_reason);
           finishTodoTurn();
           if (terminal.discardQueued) {
@@ -4277,7 +4301,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return <>
       {sessionSwitchNotice && <div class="session-browse-notice session-switch-notice" role="status">
         <span>{sessionSwitchNotice}</span>
-        <button onClick={() => setSessionSwitchNotice(null)} aria-label={t('attach.dismissError')}>×</button>
+        {switchRetryTarget && sessionSwitchNotice === t('browse.switchBusy') && <button
+          disabled={busy || blockingInteraction != null}
+          onClick={() => onSessionId(switchRetryTarget)}>{t('browse.retrySwitch')}</button>}
+        <button onClick={() => { setSessionSwitchNotice(null); setSwitchRetryTarget(null); }} aria-label={t('attach.dismissError')}>×</button>
       </div>}
       {view}{createPortal(blockingInteraction, interactionHost)}
     </>;
@@ -4386,9 +4413,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         onPointerDown={interactWithTimeline}
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
-        {serverHistoryLoading && <div class="timeline-history-status is-loading" role="status">
-          {t('chat.historyLoading')}
-        </div>}
+        <HistoryLoading active={serverHistoryLoading} />
 
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
@@ -4406,7 +4431,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
         />}
 
-        {page.loading && <div class="timeline-history-status" role="status">{t('chat.historyLoading')}</div>}
+        <HistoryLoading active={page.loading} />
         {(page.error || timelineSearch.error) && <div class="timeline-history-status" role="alert">{t('chat.historyFailed')}<button onClick={page.retry}>{t('chat.historyRetry')}</button></div>}
         {messages.length === 0 && !historyHint && awaitingConversation && (
           <div class="messages-empty">
