@@ -3366,10 +3366,11 @@ impl UserInterface for Tui {
                 // before anything else — above a modal, because it is not one:
                 // it is the field, it is one key from being refused, and a
                 // `sudo` is holding the turn open until it is. Everything else
-                // is swallowed rather than passed on, so a key cannot act on a
-                // screen whose field is showing something else.
+                // is swallowed rather than passed on, except explicit mouse
+                // handoff/selection copy and text paste into this same field.
+                // Ordinary composer actions must never receive these keys.
                 Wake::Input(Input::Key(press)) if self.host.secret_waiting() => {
-                    self.host.secret_key(press);
+                    self.run_secret_key(press, &client);
                     stale = true;
                 }
                 // A modal has the keyboard while it is open, then the
@@ -10287,7 +10288,25 @@ impl Tui {
         }
     }
 
-    /// Paste the clipboard's text into the composer: the menu's `粘贴`, the
+    fn run_secret_key(&self, press: crate::surface::KeyPress, client: &AgentClient) {
+        // These presentation actions do not edit the draft or answer the
+        // waiting process. Resolve the mounted bindings rather than hard-code
+        // Ctrl+G, so configured shortcuts retain the same focus semantics.
+        match self.keys.resolve(press) {
+            Some(action @ (Action::ToggleMouse | Action::CopySelection)) => {
+                self.act(action, client);
+            }
+            Some(Action::AttachImage) => {
+                // In a password field Ctrl+V pastes text, never an attachment.
+                self.paste_clipboard_text(client);
+            }
+            _ => {
+                self.host.secret_key(press);
+            }
+        }
+    }
+
+    /// Paste the clipboard's text into the focused field: the menu's `粘贴`, the
     /// middle button, and Ctrl+V with no picture to attach. Returns `true` to
     /// quit, as `act` does.
     fn paste_clipboard_text(&self, client: &AgentClient) -> bool {
@@ -10305,6 +10324,13 @@ impl Tui {
                 .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
             return false;
         };
+        if self.host.secret_waiting() {
+            use zeroize::Zeroize;
+            let mut text = text;
+            self.host.secret_paste(&text);
+            text.zeroize();
+            return false;
+        }
         self.act(Action::Paste(text), client)
     }
 
@@ -15796,6 +15822,127 @@ mod paste_habit_tests {
             >::new()))
             .unwrap();
         (host, tui)
+    }
+
+    #[test]
+    fn password_focus_keeps_mouse_handoff_without_answering_or_changing_the_draft() {
+        let (host, tui) = screen();
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        host.moment.write().unwrap().input = "keep draft".into();
+        host.moment.write().unwrap().turn_open = true;
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        host.ask_secret("SSH password:", reply);
+        host.secret_paste("private");
+        assert!(tui.surface.mouse());
+        tui.run_secret_key(crate::surface::KeyPress::ctrl('g'), &tui.client);
+        assert!(
+            !tui.surface.mouse(),
+            "Ctrl+G reaches the mouse even during askpass"
+        );
+        assert!(host.secret_waiting());
+        assert_eq!(host.secrets.asking().unwrap().typed, 7);
+        assert!(matches!(
+            answered.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(typed(&host), "keep draft");
+        assert!(host.moment.read().unwrap().turn_open);
+        assert!(!host.moment.read().unwrap().stopping);
+        tui.run_secret_key(crate::surface::KeyPress::ctrl('c'), &tui.client);
+        assert_eq!(
+            answered.try_recv().unwrap(),
+            None,
+            "Ctrl+C still refuses only the password"
+        );
+        assert_eq!(typed(&host), "keep draft");
+    }
+
+    #[test]
+    fn password_paste_gestures_never_edit_the_composer_or_attach_images() {
+        for gesture in ["middle", "menu", "ctrl-v"] {
+            let (host, tui) = screen();
+            tui.keys.add(&crate::keymap::Default_).unwrap();
+            host.moment.write().unwrap().input = "keep draft".into();
+            let before = host.stream.read().unwrap().len();
+            let (reply, mut answered) = tokio::sync::oneshot::channel();
+            host.ask_secret("password:", reply);
+            tui.surface.copy("private");
+            match gesture {
+                "middle" => {
+                    tui.paste_clipboard_text(&tui.client);
+                }
+                "menu" => {
+                    tui.run_menu_item("paste", &tui.client);
+                }
+                _ => tui.run_secret_key(crate::surface::KeyPress::ctrl('v'), &tui.client),
+            }
+            assert!(host.secret_waiting(), "{gesture}");
+            assert_eq!(host.secrets.asking().unwrap().typed, 7, "{gesture}");
+            assert_eq!(typed(&host), "keep draft", "{gesture}");
+            assert!(host.moment.read().unwrap().attachments.is_empty());
+            assert_eq!(host.stream.read().unwrap().len(), before);
+            tui.run_secret_key(
+                crate::surface::KeyPress::plain(crate::surface::Key::Enter),
+                &tui.client,
+            );
+            assert_eq!(answered.try_recv().unwrap().as_deref(), Some("private"));
+        }
+    }
+
+    #[test]
+    fn password_copy_shortcut_copies_only_the_masked_screen_selection() {
+        let (host, tui) = screen();
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        host.moment.write().unwrap().input = "keep draft".into();
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        host.ask_secret("password:", reply);
+        host.secret_paste("private");
+        host.compose((60, 24));
+        let field = host.field_rect().unwrap();
+        let mut selection = crate::moment::Selection::at(field.x, field.y + 1);
+        selection.head = (field.x + field.w - 1, field.y + 1);
+        host.moment.write().unwrap().selection = Some(selection);
+        tui.run_secret_key(
+            crate::surface::KeyPress::new(
+                crate::surface::Key::Char('c'),
+                crate::surface::Mods {
+                    cmd: true,
+                    ..crate::surface::Mods::NONE
+                },
+            ),
+            &tui.client,
+        );
+        let copied = tui.surface.clipboard_text().expect("selection was copied");
+        assert!(copied.contains("password:"), "{copied:?}");
+        assert!(!copied.contains("private"));
+        assert!(!copied.contains("keep draft"));
+        assert!(host.secret_waiting());
+        assert!(matches!(
+            answered.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(typed(&host), "keep draft");
+    }
+
+    #[test]
+    fn password_ctrl_v_over_ssh_does_not_read_the_server_clipboard() {
+        let (host, tui) = assemble(Arc::new(RemotePasteSurface));
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        host.ask_secret("password:", reply);
+        tui.run_secret_key(crate::surface::KeyPress::ctrl('v'), &tui.client);
+        assert!(host.secret_waiting());
+        assert_eq!(host.secrets.asking().unwrap().typed, 0);
+        host.secret_paste("client paste");
+        tui.run_secret_key(
+            crate::surface::KeyPress::plain(crate::surface::Key::Enter),
+            &tui.client,
+        );
+        assert_eq!(
+            answered.try_recv().unwrap().as_deref(),
+            Some("client paste")
+        );
+        assert!(typed(&host).is_empty());
     }
 
     #[test]
