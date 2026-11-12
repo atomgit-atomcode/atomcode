@@ -57,9 +57,3 @@ export function mergeOptimisticSession<T extends SessionLike>(
     ? sessions
     : [optimistic, ...sessions];
 }
-
-/** Display selection first without changing server timestamps or peer order. */
-export function prioritizeActiveSession<T extends { id: string }>(sessions: T[], activeId: string | null): T[] {
-  const at = activeId ? sessions.findIndex(s => s.id === activeId) : -1;
-  return at > 0 ? [sessions[at], ...sessions.slice(0, at), ...sessions.slice(at + 1)] : sessions;
-}

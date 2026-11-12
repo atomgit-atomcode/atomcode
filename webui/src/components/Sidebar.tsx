@@ -15,7 +15,7 @@ import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
-import { mergeOptimisticSession, prioritizeActiveSession } from '../lib/sessionList';
+import { mergeOptimisticSession } from '../lib/sessionList';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { sidebarRelativeTime } from '../lib/sidebarTime';
 import {
@@ -1306,7 +1306,8 @@ export function Sidebar({
       || (dir === cwdNorm ? projectHash || '' : '');
   };
 
-  const filtered = prioritizeActiveSession(merged, activeSessionId);
+  // Selection only highlights a row; only a newly created optimistic row is prepended.
+  const filtered = merged;
 
   const sessionsByProject = new Map<string, SessionMetaWithProject[]>();
   for (const session of filtered) {
