@@ -149,6 +149,7 @@ fn start(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
 async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -343,6 +344,7 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
 /// with `/language en` written to the configuration, the heading on screen is
 /// the English one.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_welcome_block_reads_the_language_the_launcher_knows() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -440,6 +442,7 @@ async fn the_welcome_block_reads_the_language_the_launcher_knows() {
 /// but that is an invariant two files apart, and getting it wrong trades a
 /// silent notice for a silent welcome.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -531,6 +534,7 @@ async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
 
 /// Invalid upgrade arguments are handled locally, without model or network work.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn invalid_upgrade_arguments_are_reported_on_the_screen() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -602,6 +606,7 @@ async fn invalid_upgrade_arguments_are_reported_on_the_screen() {
 /// walkthrough — opens this screen's walkthrough rather than meeting "no such
 /// command" after the default moved.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_classic_name_for_the_walkthrough_still_opens_it() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -711,6 +716,7 @@ async fn the_classic_name_for_the_walkthrough_still_opens_it() {
 /// written to the config file (so the next launch keeps it), and a bare `/proxy`
 /// offers the three modes with the current one marked.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -809,6 +815,7 @@ async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
 /// `/schedule` opens the shared task manager without starting a model turn.
 /// Creation can be inspected and cancelled entirely from the keyboard.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn scheduled_tasks_are_listed_here() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -912,6 +919,7 @@ async fn until_text(
 /// harness writes a `todowrite` call and its result into the log between turns,
 /// and the panel folds the list from there — nothing is sent as a prompt.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn a_person_edits_the_plan_with_todo_add_and_clear() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1033,6 +1041,7 @@ async fn a_person_edits_the_plan_with_todo_add_and_clear() {
 /// criterion for all of them, because the way any of these rows breaks is the
 /// same: the row stops being mounted and nothing says so.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_launchers_own_commands_are_in_the_menu() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1094,6 +1103,7 @@ async fn the_launchers_own_commands_are_in_the_menu() {
 /// The retired screen's command table is a frozen input, not a second catalog.
 /// Run the event loop: runtime-owned commands arrive through Described events.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
 async fn every_retired_command_has_a_live_replacement() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1171,6 +1181,7 @@ async fn every_retired_command_has_a_live_replacement() {
 /// middle of the run, and the part a build could get wrong while both ends look
 /// right.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
 async fn the_menu_is_described_in_the_language_language_is_set_to() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1310,6 +1321,7 @@ fn has_cjk(text: &str) -> bool {
 /// the same panel, drawn as markdown — and Esc comes back to the list, with the
 /// cursor where it was, so reading one release leads to the next.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_changelog_is_picked_from_a_list_read_in_the_panel_and_left_back_to_it() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1441,6 +1453,7 @@ async fn until_shown(term: &atomcode_tui::surface::Headless, what: &str) -> Stri
 /// waits for the turn and that Esc stops it — not the runtime's "busy" — and
 /// `/compact` says it comes after the turn. Neither stops the turn.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn commands_typed_mid_turn_say_what_they_wait_for() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
