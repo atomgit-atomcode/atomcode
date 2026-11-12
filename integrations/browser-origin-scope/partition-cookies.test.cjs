@@ -22,7 +22,7 @@ function fixture(options = {}) {
     async cookies() { return [{ name: probeCookie.name, partitionKey: options.site || site }]; },
     async close() { events.push('probe-close'); },
   };
-  const page = { async close() { events.push('page-close'); } };
+  const page = { isClosed: () => false, async close() { events.push('page-close'); } };
   const browser = {
     async newContext(settings) { assert.deepEqual(settings, { acceptDownloads: false, serviceWorkers: 'block', permissions: [] }); events.push('probe-open'); return options.open ? options.open() : probe; },
     async newBrowserCDPSession() { return {
@@ -37,6 +37,7 @@ function fixture(options = {}) {
   };
   const context = {
     browser: () => browser,
+    pages: () => [],
     async newPage() { events.push('page-open'); return page; },
     async newCDPSession(target) { assert.equal(target, page); return {
       async send(method) { commands.push({ method }); assert.equal(method, 'Target.getTargetInfo'); return { targetInfo: { browserContextId: options.invalidId ? '' : 'captured-context' } }; },
@@ -44,7 +45,7 @@ function fixture(options = {}) {
     }; },
   };
   const close = async () => { events.push('owner-close'); options.onClose?.(probe); };
-  return { context, events, commands, close, cookies, site };
+  return { context, events, commands, close, cookies, site, page };
 }
 
 test('first-party lookup binds the original context ID and returns only scoped ordinary/matching keys', async () => {
@@ -82,4 +83,12 @@ test('cancelled probe creation awaits resource disposal and never reads original
   await ready; controller.abort(); await assert.rejects(pending);
   assert.deepEqual(f.commands, []); assert.ok(f.events.includes('probe-close'));
   assert.equal(f.events.filter(event => event === 'owner-close').length, 1);
+});
+
+
+test('metadata lookup borrows an existing tab without closing or navigating it', async () => {
+  const f = fixture(); f.context.pages = () => [f.page];
+  const result = await firstPartyCookieHeader(f.context, new URL('https://download.example.test/'), new AbortController().signal, f.close);
+  assert.ok(result.includes('first=first-fixture'));
+  assert.ok(!f.events.includes('page-open')); assert.ok(!f.events.includes('page-close'));
 });

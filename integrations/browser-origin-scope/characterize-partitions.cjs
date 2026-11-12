@@ -8,7 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const https = require('node:https');
 const tls = require('node:tls');
-const { firstPartyCookieHeader } = require('./partition-cookies.cjs');
+const { firstPartyCookieHeader, synchronizeBrowserCookies } = require('./partition-cookies.cjs');
 const { ControlledDownloads } = require('./transfers.cjs');
 const { spawnSync } = require('node:child_process');
 const { once } = require('node:events');
@@ -50,6 +50,11 @@ async function characterize(root, output) {
     observations.push({ path: req.url, ordinary: cookie.includes('chips=ordinary-fixture'),
       first: cookie.includes('chips=first-fixture'), ancestor: cookie.includes('chips=ancestor-fixture'), foreign: cookie.includes('chips=foreign-fixture'),
       direct: cookie.includes('chips=direct-fixture') });
+    if (req.url === '/publisher-partition-rotate') {
+      res.writeHead(302, { 'Set-Cookie': 'chips=publisher-fixture; Secure; HttpOnly; SameSite=Strict; Partitioned; Path=/', Location: '/publisher-partition-final' }); return res.end();
+    }
+    if (req.url === '/publisher-partition-final' && !cookie.includes('chips=publisher-fixture')) { res.writeHead(401); return res.end('PARTITION_AUTH_FAILED'); }
+    if (req.url === '/publisher-partition-delete') res.setHeader('Set-Cookie', 'chips=deleted; Secure; HttpOnly; Partitioned; Path=/; Max-Age=0');
     if (req.url === '/direct-set') res.setHeader('Set-Cookie', 'chips=direct-fixture; Secure; HttpOnly; SameSite=None; Partitioned; Path=/');
     res.setHeader('Content-Type', 'text/plain'); res.end('PARTITION_FIXTURE');
   });
@@ -143,6 +148,49 @@ async function characterize(root, output) {
       assert.equal(context.pages().length, 1); assert.equal(browser.contexts().length, 1);
     } finally { await reordered.close(); }
     report.cases.push('matching native Cookie header ordering with ordinary/partitioned creation order reversed');
+    await context.addCookies([{ name: 'chips', value: 'ancestor-fixture', url: origin + '/', secure: true, httpOnly: true, sameSite: 'None', partitionKey: origin }]);
+    await storage.send('Storage.setCookies', { browserContextId: info.browserContextId, cookies: [
+      { ...first, value: 'foreign-fixture', partitionKey: { topLevelSite: 'https://foreign.test', hasCrossSiteAncestor: false } }] });
+    const sync = headers => synchronizeBrowserCookies(context, new URL(origin + '/writer/rotate'), headers,
+      new AbortController().signal, () => owner.closeCaptured(context));
+    const currentCookies = async () => (await storage.send('Storage.getCookies', { browserContextId: info.browserContextId })).cookies;
+    const selected = cookie => cookie.name === 'chips' && cookie.partitionKey?.topLevelSite === report.canonical_site && cookie.partitionKey.hasCrossSiteAncestor === false;
+    const protectedBefore = JSON.stringify((await currentCookies()).filter(cookie => !selected(cookie)));
+    await sync(['chips=writer-fixture; Secure; HttpOnly; SameSite=Strict; Priority=High; Partitioned; Path=/']);
+    let changed = (await currentCookies()).find(selected);
+    assert.equal(changed.value, 'writer-fixture'); assert.equal(changed.sameSite, 'Strict'); assert.equal(changed.priority, 'High');
+    assert.equal(JSON.stringify((await currentCookies()).filter(cookie => !selected(cookie))), protectedBefore);
+    await page.goto(origin + '/writer-check');
+    assert.ok(privateHeaders.get('/writer-check').includes('chips=writer-fixture'));
+    await sync(['chips=invalid; HttpOnly; Partitioned; Path=/', 'chips=invalid; Domain=foreign.test; Secure; Partitioned; Path=/',
+      'chips=' + 'x'.repeat(5000) + '; Secure; Partitioned; Max-Age=0; Path=/']);
+    assert.equal((await currentCookies()).find(selected).value, 'writer-fixture');
+    await sync(['chips=deleted; Secure; HttpOnly; Partitioned; Path=/; Max-Age=0; Expires=Wed, 01 Jan 2031 00:00:00 GMT']);
+    assert.ok(!(await currentCookies()).some(selected));
+    assert.equal(JSON.stringify((await currentCookies()).filter(cookie => !selected(cookie))), protectedBefore);
+    assert.equal(context.pages().length, 1); assert.equal(browser.contexts().length, 1);
+    report.cases.push('validated Partitioned writer rotates exact first-party key, preserves native attributes, ignores invalid cookies and deletes only that key without touching other partitions');
+    await storage.send('Storage.setCookies', { browserContextId: info.browserContextId, cookies: [first] });
+    const stateful = new ControlledDownloads({ files, authorize: candidate => candidate === origin,
+      getContext: () => owner.existing(), closeContext: capturedContext => owner.closeCaptured(capturedContext) });
+    try {
+      const rotated = await stateful.execute('partition-redirect', { url: origin + '/publisher-partition-rotate', use_browser_context: true, sync_response_cookies: true });
+      assert.equal(fs.readFileSync(rotated.path, 'utf8'), 'PARTITION_FIXTURE');
+      assert.ok(privateHeaders.get('/publisher-partition-final').includes('chips=publisher-fixture'));
+      assert.ok(!privateHeaders.get('/publisher-partition-final').includes('ancestor-fixture'));
+      assert.ok(!privateHeaders.get('/publisher-partition-final').includes('foreign-fixture'));
+      await page.goto(origin + '/publisher-state-check');
+      assert.ok(privateHeaders.get('/publisher-state-check').includes('chips=publisher-fixture'));
+      await stateful.execute('partition-delete', { url: origin + '/publisher-partition-delete', use_browser_context: true, sync_response_cookies: true });
+      assert.ok(!(await currentCookies()).some(selected));
+      assert.equal(JSON.stringify((await currentCookies()).filter(cookie => !selected(cookie))), protectedBefore);
+      for (const label of ['/publisher-partition-rotate', '/publisher-partition-final', '/publisher-partition-delete'])
+        assert.equal(observations.filter(item => item.path === label).length, 1, 'no remote GET replay');
+      assert.equal(context.pages().length, 1); assert.equal(browser.contexts().length, 1);
+    } finally { await stateful.close(); }
+    report.cases.push('actual HTTPS publisher follows a Partitioned session rotation, re-reads the new key, publishes exact bytes once and deletes only that key with native browser visibility');
+
+
     captured = [...new Set([...captured, ...owned(processes())])];
 
     await storage.detach(); await pageSession.detach();

@@ -7,8 +7,8 @@ const https = require('node:https');
 const { randomUUID, createHash } = require('node:crypto');
 const { Transform, Writable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { synchronizeResponseCookies, cookieHeader } = require('./cookies.cjs');
-const { firstPartyCookieHeader } = require('./partition-cookies.cjs');
+const { cookieHeader } = require('./cookies.cjs');
+const { firstPartyCookieHeader, synchronizeBrowserCookies } = require('./partition-cookies.cjs');
 
 // Backend-owned publication boundary. Transport cancellation and shutdown
 // must drain jobs here before disposing the owned browser.
@@ -125,7 +125,7 @@ class ControlledDownloads {
         // Install immediately, including while headers are inspected.
         response.on('error', () => {});
         if (synchronizeCookies) {
-          await synchronizeResponseCookies(context, url, response.headers['set-cookie'], signal, () => this.closeContext(context));
+          await synchronizeBrowserCookies(context, url, response.headers['set-cookie'], signal, () => this.closeContext(context));
           signal.throwIfAborted();
         }
         if ([301, 302, 303, 307, 308].includes(response.statusCode)) {

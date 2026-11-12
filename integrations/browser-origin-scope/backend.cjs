@@ -187,7 +187,7 @@ async function main() {
   if (config.doctor) {
     console.log(JSON.stringify({ version: policyDetails(origins).version, kind: 'doctor', browser_launched: false,
       mcp: MCP_VERSION, playwright: CORE_VERSION, capability: CAPABILITY,
-      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny', response_cookie_sync: policyDetails(origins).downloads.size ? 'explicit-native-interception' : 'deny', first_party_partitioned_cookie_reads: policyDetails(origins).downloads.size ? 'native-storage-on-request' : 'deny' }));
+      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny', response_cookie_sync: policyDetails(origins).downloads.size ? 'explicit-native-interception' : 'deny', first_party_partitioned_cookie_reads: policyDetails(origins).downloads.size ? 'native-storage-on-request' : 'deny', partitioned_response_cookie_sync: policyDetails(origins).downloads.size ? 'validated-first-party-storage-on-request' : 'deny' }));
     return;
   }
   if (!config.outputDir) throw new Error('--output-dir is required');

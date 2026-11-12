@@ -8,6 +8,7 @@ const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { loadBackend, ownedBrowser } = require('./backend.cjs');
 const { synchronizeResponseCookies } = require('./cookies.cjs');
+const { synchronizeBrowserCookies } = require('./partition-cookies.cjs');
 
 function children(pid) {
   const result = spawnSync('ps', ['-ax', '-o', 'pid=,ppid='], { encoding: 'utf8' });
@@ -84,6 +85,47 @@ async function verify(root, output) {
     await owner.closeCaptured(context);
     assert.equal(await owner.existing(), replacement);
     report.cases.push('actual native-navigation cancellation disposes the captured context; explicit replacement is empty and late old cleanup cannot close it');
+
+    // Inject cancellation through public browser/session seams after one
+    // original-context commit, while parsing the next header in a scratch jar.
+    const identityPage = await replacement.newPage();
+    const identitySession = await replacement.newCDPSession(identityPage);
+    const replacementId = (await identitySession.send('Target.getTargetInfo')).targetInfo.browserContextId;
+    await identitySession.detach();
+    const browser = replacement.browser();
+    const newContext = browser.newContext.bind(browser);
+    const newStorage = browser.newBrowserCDPSession.bind(browser);
+    const partitionCancel = new AbortController();
+    let nativeRequests = 0, originalCommits = 0;
+    browser.newContext = async (...args) => {
+      const temporary = await newContext(...args);
+      temporary.on('page', page => page.on('request', () => {
+        captured = [...new Set([...captured, ...children(process.pid)])];
+        if (++nativeRequests === 3) partitionCancel.abort();
+      }));
+      return temporary;
+    };
+    browser.newBrowserCDPSession = async (...args) => {
+      const session = await newStorage(...args);
+      const send = session.send.bind(session);
+      session.send = async (method, params) => {
+        if (method === 'Storage.setCookies' && params.browserContextId === replacementId) originalCommits++;
+        return send(method, params);
+      };
+      return session;
+    };
+    await assert.rejects(synchronizeBrowserCookies(replacement, new URL(source), [
+      'first=fixture; Secure; HttpOnly; Partitioned; Path=/',
+      'second=fixture; Secure; HttpOnly; Partitioned; Path=/',
+    ], partitionCancel.signal, () => owner.closeCaptured(replacement)));
+    assert.equal(nativeRequests, 3); assert.equal(originalCommits, 1);
+    await assert.rejects(owner.existing());
+    const afterPartial = await owner.get();
+    captured = [...new Set([...captured, ...children(process.pid)])];
+    assert.equal((await afterPartial.cookies()).length, 0);
+    await owner.closeCaptured(replacement);
+    assert.equal(await owner.existing(), afterPartial);
+    report.cases.push('Partitioned batch cancellation after exactly one native commit closes captured credentials without retry; explicit replacement stays empty and survives late cleanup');
 
     report.passed = true;
   } finally {
