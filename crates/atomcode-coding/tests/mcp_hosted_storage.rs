@@ -926,3 +926,91 @@ async fn run_mcp_discovery(schema_chars: usize) {
     runtime.task.await.unwrap();
     env.user_file_untouched();
 }
+
+/// Background discovery must not be mistaken for missing configuration on the
+/// first interactive request; its transient prompt leaves when tools publish.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn first_request_distinguishes_pending_mcp_discovery_from_unconfigured_tools() {
+    tokio::time::resume(); // A real subprocess waits on the fixture's file gate.
+    for withdraw in [false, true] {
+        let env = Env::new();
+        let recorder = Arc::new(Recorder::default());
+        let user_config = Sealed::holding(&env.user_config());
+        let tokens = Sealed::holding("");
+        let entered = env.scratch.path().join("listing-entered");
+        let release = env.scratch.path().join("release-listing");
+        let script = env.scratch.path().join("server.sh");
+        let source = std::fs::read_to_string(&script).unwrap();
+        let held_listing = format!(
+            "*'\"method\":\"tools/list\"'*)\n\
+             touch '{}'\n\
+             while [ ! -f '{}' ]; do sleep 0.01; done",
+            entered.display(),
+            release.display(),
+        );
+        std::fs::write(
+            &script,
+            source.replace("*'\"method\":\"tools/list\"'*)", &held_listing),
+        )
+        .unwrap();
+        let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !entered.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real MCP tools/list must enter the held fixture");
+        turn(&mut runtime, "use my configured external tool").await;
+        let system = || {
+            recorder
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .iter()
+                .filter(|message| message.role == atomcode_kernel::message::Role::System)
+                .map(|message| message.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!recorder
+            .last_offered()
+            .iter()
+            .any(|name| name == "mcp__u__echo"));
+        assert!(
+            system().contains("MCP startup discovery is still in progress"),
+            "pending discovery must be visible before schemas exist"
+        );
+        assert!(!system().contains("s3cret"));
+        if withdraw {
+            // A reload can fail after withdrawal and leave the same tree mounted.
+            runtime.handle.withdraw_mcp_tools().await.unwrap();
+        }
+        std::fs::write(&release, "explicit fixture release").unwrap();
+        if !withdraw {
+            runtime
+                .handle
+                .wait_mcp_ready(std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+        }
+        turn(&mut runtime, "inspect the current tool catalog").await;
+        assert_eq!(
+            recorder
+                .last_offered()
+                .iter()
+                .any(|name| name == "mcp__u__echo"),
+            !withdraw
+        );
+        assert!(
+            !system().contains("MCP startup discovery is still in progress"),
+            "settled discovery must not retain stale startup guidance"
+        );
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+        env.user_file_untouched();
+    }
+}

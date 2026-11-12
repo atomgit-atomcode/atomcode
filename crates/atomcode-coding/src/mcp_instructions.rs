@@ -24,6 +24,11 @@ use atomcode_harness::seams::PromptRegistry;
 /// its instructions under (it is swapped out for `mcp-host` in this product).
 pub(crate) const FRAGMENT: (&str, i32) = ("mcp", 62);
 
+/// Trusted runtime startup state, separate from untrusted server guidance.
+/// Removed once initial catalog reconciliation finishes or this row withdraws.
+pub(crate) const STARTUP_FRAGMENT: (&str, i32) = ("mcp-startup", 61);
+pub(crate) const STARTUP_GUIDANCE: &str = "MCP startup discovery is still in progress. Configured servers may not yet have published their tool schemas. Missing MCP schemas in this request do not mean no servers are configured. Use only tools currently offered; do not guess tool calls, bypass approval or substitute another interface. Tools may become available in a later request after discovery settles. The person can inspect connection state with /mcp.";
+
 /// Wrap the aggregated guidance in its untrusted boundary — the one the persona
 /// tells the model how to read.
 pub(crate) fn render_block(instructions: &str) -> String {

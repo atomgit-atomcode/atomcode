@@ -1756,6 +1756,7 @@ impl CodingParts {
             .as_ref()
         {
             prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+            prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
         }
     }
 

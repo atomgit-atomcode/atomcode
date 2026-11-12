@@ -1915,6 +1915,25 @@ impl Plugin for McpHostPlugin {
         let toolbox = ctx
             .require::<atomcode_harness::seams::ToolsSvc>()
             .map_err(|e| e.to_string())?;
+        // Session transitions stay nonblocking. Until the initial catalog is
+        // reconciled, tell the first request why configured schemas may be
+        // absent; no connection names, config values or server text enter here.
+        let startup_pending = !*catalog_ready.borrow();
+        if startup_pending
+            && publication_enabled.load(Ordering::Acquire)
+            && registry.server_statuses().await.iter().any(|(_, status)| {
+                matches!(
+                    status,
+                    atomcode_capabilities::mcp::ServerStatus::Connecting
+                        | atomcode_capabilities::mcp::ServerStatus::Connected
+                )
+            })
+        {
+            if let Some(prompts) = &ctx.service::<SystemPromptSvc>() {
+                let (id, rank) = crate::mcp_instructions::STARTUP_FRAGMENT;
+                prompts.contribute(id, rank, crate::mcp_instructions::STARTUP_GUIDANCE);
+            }
+        }
         // Withdrawal happens from the runtime, not from here, and it has to
         // reach this catalog or the model keeps being offered what was revoked.
         *toolbox_slot.write().unwrap_or_else(|e| e.into_inner()) = Some(toolbox.clone());
@@ -1975,12 +1994,16 @@ impl Plugin for McpHostPlugin {
                             }
                             if let Some(prompts) = &shared.prompts {
                                 prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+                                prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
                             }
                             break;
                         }
                         _ = &mut initial => {
                             let all = registry.list_all_tools().await;
                             publish_mcp(&toolbox, &registry, all, &shared, true).await;
+                            if let Some(prompts) = &shared.prompts {
+                                prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
+                            }
                             catalog_ready.send_replace(true);
                             break;
                         }
@@ -2018,6 +2041,7 @@ impl Plugin for McpHostPlugin {
             }
             if let Some(prompts) = &shared.prompts {
                 prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+                prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
             }
         });
         Ok(())
