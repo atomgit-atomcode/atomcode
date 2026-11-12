@@ -23,7 +23,7 @@ pub struct OriginArgs {
     /// Allow an exact HTTP(S) origin (repeatable); requires the optional backend.
     #[arg(long = "allow-origin", conflicts_with_all = ["deny_all_origins", "unrestricted_origins"])]
     pub allowed_origins: Vec<String>,
-    /// Absolute trusted JSON policy file (v1 or v2); validated contents are saved.
+    /// Absolute trusted JSON policy file (v1, v2 or v3); validated contents are saved.
     #[arg(long, conflicts_with_all = ["allowed_origins", "deny_all_origins", "unrestricted_origins"])]
     pub origin_policy_file: Option<PathBuf>,
     /// Explicitly deny all origins.
@@ -78,6 +78,7 @@ struct Permissions {
 enum Policy {
     V1(Vec<String>),
     V2(BTreeMap<String, Permissions>),
+    V3(BTreeMap<String, Permissions>),
 }
 
 impl Policy {
@@ -85,12 +86,13 @@ impl Policy {
         match self {
             Self::V1(_) => 1,
             Self::V2(_) => 2,
+            Self::V3(_) => 3,
         }
     }
     fn origins(&self) -> Vec<String> {
         match self {
             Self::V1(origins) => origins.clone(),
-            Self::V2(origins) => origins
+            Self::V2(origins) | Self::V3(origins) => origins
                 .iter()
                 .filter(|(_, p)| p.access == Some(Permission::Allow))
                 .map(|(origin, _)| origin.clone())
@@ -100,16 +102,26 @@ impl Policy {
     fn downloads(&self) -> usize {
         match self {
             Self::V1(_) => 0,
-            Self::V2(origins) => origins
+            Self::V2(origins) | Self::V3(origins) => origins
                 .values()
                 .filter(|p| p.downloads == Some(Permission::Allow))
                 .count(),
+        }
+    }
+    fn uploads(&self) -> usize {
+        match self {
+            Self::V3(origins) => origins
+                .values()
+                .filter(|p| p.uploads == Some(Permission::Allow))
+                .count(),
+            _ => 0,
         }
     }
     fn json(&self) -> Result<String> {
         Ok(serde_json::to_string(&match self {
             Self::V1(origins) => json!({"version":1,"origins":origins}),
             Self::V2(origins) => json!({"version":2,"origins":origins}),
+            Self::V3(origins) => json!({"version":3,"origins":origins}),
         })?)
     }
     fn summary(&self) -> String {
@@ -121,6 +133,8 @@ impl Policy {
         };
         if self.version() == 1 {
             scope
+        } else if self.version() == 3 {
+            format!("{scope}; controlled unauthenticated HTTP(S) downloads: {} origin(s); staged uploads: {} origin(s); file-input/CDP denied", self.downloads(), self.uploads())
         } else {
             format!("{scope}; controlled unauthenticated HTTP(S) downloads: {} origin(s); uploads/CDP denied", self.downloads())
         }
@@ -176,7 +190,7 @@ fn parse_policy(raw: &str) -> Result<Policy> {
         1 => Ok(Policy::V1(normalize(
             serde_json::from_value(input.origins).context("invalid v1 browser origins")?,
         )?)),
-        2 => {
+        2 | 3 => {
             if input.origins.as_object().is_some_and(|origins| {
                 origins.values().any(|p| {
                     p.as_object()
@@ -185,16 +199,17 @@ fn parse_policy(raw: &str) -> Result<Policy> {
             }) {
                 bail!("browser permission values must be allow or deny");
             }
-            let map: BTreeMap<String, Permissions> =
-                serde_json::from_value(input.origins).context("invalid v2 browser permissions")?;
+            let map: BTreeMap<String, Permissions> = serde_json::from_value(input.origins)
+                .context("invalid versioned browser permissions")?;
             if map.len() > 256 {
                 bail!("at most 256 browser origins are permitted");
             }
             let mut canonical = BTreeMap::new();
             for (raw, permissions) in map {
-                if permissions.uploads == Some(Permission::Allow)
+                if (input.version != 3 && permissions.uploads == Some(Permission::Allow))
                     || permissions.full_cdp_access == Some(Permission::Allow)
-                    || (permissions.downloads == Some(Permission::Allow)
+                    || ((permissions.downloads == Some(Permission::Allow)
+                        || permissions.uploads == Some(Permission::Allow))
                         && permissions.access != Some(Permission::Allow))
                 {
                     bail!("unsupported or inconsistent browser origin permissions");
@@ -204,7 +219,11 @@ fn parse_policy(raw: &str) -> Result<Policy> {
                     bail!("duplicate canonical browser origin");
                 }
             }
-            let policy = Policy::V2(canonical);
+            let policy = if input.version == 3 {
+                Policy::V3(canonical)
+            } else {
+                Policy::V2(canonical)
+            };
             if policy.json()?.len() > 65536 {
                 bail!("browser origin policy exceeds 64 KiB");
             }
@@ -294,7 +313,7 @@ fn saved(
     let version = entry["originScope"]
         .as_u64()
         .context("invalid managed origin scope version")?;
-    if ![1, 2].contains(&version) {
+    if ![1, 2, 3].contains(&version) {
         bail!("unsupported managed origin scope version");
     }
     if requirements(Some(entry))?.get(CAPABILITY) != Some(&version) {
@@ -433,6 +452,9 @@ impl Prepared {
             _ => None,
         }
     }
+    pub(super) fn uploads_enabled(&self) -> bool {
+        matches!(&self.kind, Kind::Scoped(scope) if scope.policy.uploads() > 0)
+    }
     pub(super) fn downloads_enabled(&self) -> bool {
         matches!(&self.kind, Kind::Scoped(scope) if scope.policy.downloads() > 0)
     }
@@ -512,7 +534,12 @@ impl Prepared {
                         } else {
                             "deny-artifacts"
                         }
-                    || report["uploads"] != "deny"
+                    || report["uploads"]
+                        != if scope.policy.uploads() > 0 {
+                            "controlled-staged-http-unauthenticated"
+                        } else {
+                            "deny"
+                        }
                     || report["full_cdp_access"] != "deny"
                 {
                     bail!(
@@ -567,6 +594,30 @@ mod tests {
         )
         .is_err());
         assert!(parse_policy(r#"{"version":2,"origins":{"https://a.test/path":{}}}"#).is_err());
-        assert!(parse_policy(r#"{"version":3,"origins":{}}"#).is_err());
+        assert!(parse_policy(r#"{"version":4,"origins":{}}"#).is_err());
+    }
+    #[test]
+    fn v3_upload_policy_roundtrips_and_still_refuses_cdp_or_missing_access() {
+        let policy = parse_policy(r#"{"version":3,"origins":{"https://EXAMPLE.test:443/":{"access":"allow","uploads":"allow"},"https://read.test":{"access":"allow"}}}"#).unwrap();
+        assert_eq!(policy.version(), 3);
+        assert_eq!(policy.uploads(), 1);
+        assert_eq!(policy.downloads(), 0);
+        assert_eq!(
+            parse_policy(&policy.json().unwrap())
+                .unwrap()
+                .json()
+                .unwrap(),
+            policy.json().unwrap()
+        );
+        for permissions in [
+            json!({"uploads":"allow"}),
+            json!({"access":"deny","uploads":"allow"}),
+            json!({"access":"allow","full_cdp_access":"allow"}),
+        ] {
+            assert!(parse_policy(
+                &json!({"version":3,"origins":{"https://a.test":permissions}}).to_string()
+            )
+            .is_err());
+        }
     }
 }

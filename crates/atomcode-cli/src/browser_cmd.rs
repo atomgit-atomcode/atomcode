@@ -402,18 +402,25 @@ fn enable_prepared(
         Some(value) if !value.is_null() => serde_json::from_value::<Vec<String>>(value.clone())
             .context("invalid saved browser tool restrictions")?
             .into_iter()
-            .filter(|name| ALLOWED_TOOLS.contains(&name.as_str()) || name == "browser_download")
+            .filter(|name| {
+                ALLOWED_TOOLS.contains(&name.as_str())
+                    || matches!(name.as_str(), "browser_download" | "browser_upload")
+            })
             .collect(),
         _ => ALLOWED_TOOLS
             .iter()
             .copied()
             .chain(plan.downloads_enabled().then_some("browser_download"))
+            .chain(plan.uploads_enabled().then_some("browser_upload"))
             .map(String::from)
             .collect(),
     };
     let tools: Vec<_> = tools
         .into_iter()
-        .filter(|name: &String| name != "browser_download" || plan.downloads_enabled())
+        .filter(|name: &String| {
+            (name != "browser_download" || plan.downloads_enabled())
+                && (name != "browser_upload" || plan.uploads_enabled())
+        })
         .collect();
     entry["allowedTools"] = json!(tools);
     entry
@@ -670,6 +677,89 @@ mod tests {
             .unwrap()
             .contains("downloads: 1 origin(s)"));
         // A v1 doctor cannot satisfy the saved v2 connection contract.
+        fake_node(temp.path(), &scope_report(1), 22);
+        let before = read_optional(&config_path(&dirs)).unwrap();
+        assert!(execute(
+            &dirs,
+            BrowserCli::Enable {
+                server: None,
+                node: None,
+                scope: Default::default()
+            }
+        )
+        .await
+        .is_err());
+        assert_eq!(read_optional(&config_path(&dirs)).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn policy_file_v3_is_saved_with_exact_contract_and_survives_file_removal() {
+        tokio::time::resume(); // Real subprocess diagnostics.
+        let (temp, dirs) = tree();
+        let (script, root) = scope_paths(temp.path());
+        let mut report = scope_report(1);
+        report["version"] = json!(3);
+        report["uploads"] = json!("controlled-staged-http-unauthenticated");
+        let node = fake_node(temp.path(), &report, 22);
+        let policy_file = temp.path().join("trusted policy.json");
+        std::fs::write(&policy_file, r#"{"version":3,"origins":{"https://EXAMPLE.test:443/":{"access":"allow","uploads":"allow"}}}"#).unwrap();
+        execute(
+            &dirs,
+            BrowserCli::Enable {
+                server: None,
+                node: Some(node),
+                scope: OriginArgs {
+                    origin_backend: Some(script),
+                    backend_root: Some(root),
+                    origin_policy_file: Some(policy_file.clone()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let mut saved: Value =
+            serde_json::from_str(&read_optional(&config_path(&dirs)).unwrap().unwrap()).unwrap();
+        let entry = &mut saved["mcpServers"][SERVER];
+        assert_eq!(entry["originScope"], 3);
+        assert_eq!(
+            entry["requiredExperimentalCapabilities"][origin::CAPABILITY],
+            3
+        );
+        assert!(entry["allowedTools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("browser_upload")));
+        assert_eq!(entry["trust"], false);
+        assert_eq!(entry["autoApprove"], json!([]));
+        let policy = entry["env"][origin::ENV].clone();
+        entry["allowedTools"] = json!(["browser_snapshot"]);
+        put(&config_path(&dirs), &saved.to_string());
+        std::fs::remove_file(policy_file).unwrap();
+        execute(&dirs, BrowserCli::Disable).await.unwrap();
+        execute(
+            &dirs,
+            BrowserCli::Enable {
+                server: None,
+                node: None,
+                scope: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let saved: Value =
+            serde_json::from_str(&read_optional(&config_path(&dirs)).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["mcpServers"][SERVER]["env"][origin::ENV], policy);
+        assert_eq!(
+            saved["mcpServers"][SERVER]["allowedTools"],
+            json!(["browser_snapshot"])
+        );
+        assert!(execute(&dirs, BrowserCli::Status)
+            .await
+            .unwrap()
+            .contains("staged uploads: 1 origin(s)"));
+        // A v1 doctor cannot satisfy the saved v3 connection contract.
         fake_node(temp.path(), &scope_report(1), 22);
         let before = read_optional(&config_path(&dirs)).unwrap();
         assert!(execute(

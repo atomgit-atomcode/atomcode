@@ -14,15 +14,14 @@ const { createHash } = require('node:crypto');
 const { prepareOutput, loadBackend } = require('./backend.cjs');
 const { stageFile } = require('./upload-store.cjs');
 const { CAPABILITY, POLICY_ENV } = require('./policy.cjs');
-async function verify(root, output) {
+async function verify(root, output, cli) {
   assert.ok(path.isAbsolute(root) && path.isAbsolute(output)); assert.equal(fs.existsSync(output), false);
   const external = loadBackend(root), temp = fs.mkdtempSync(path.join(os.tmpdir(), 'atomcode-upload-mcp-'));
   const report = { passed: false, platform: process.platform, source_hashes: external.sourceHashes, cases: [], integration_hashes: {} };
   for (const name of ['backend.cjs', 'policy.cjs', 'uploads.cjs', 'upload-store.cjs', 'verify-uploads.cjs'])
     report.integration_hashes[name] = createHash('sha256').update(fs.readFileSync(path.join(__dirname, name))).digest('hex');
-  const artifacts = path.join(temp, 'artifacts'); prepareOutput(artifacts);
+  let artifacts = path.join(temp, 'artifacts'), selected;
   const source = path.join(temp, 'fixture.bin'), body = Buffer.from('SYNTHETIC_UPLOAD_MCP_FIXTURE\0\xff', 'latin1'); fs.writeFileSync(source, body);
-  const selected = await stageFile(path.join(artifacts, 'uploads'), source);
   function certificate(name) {
     const key = path.join(temp, name + '.key'), cert = path.join(temp, name + '.pem');
     assert.equal(spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1',
@@ -68,9 +67,31 @@ async function verify(root, output) {
       [origin]: { access: 'allow', uploads: 'allow' }, [secure]: { access: 'allow', uploads: 'allow' },
       [badSecure]: { access: 'allow', uploads: 'allow' }, [forbidden]: { access: 'allow', uploads: 'deny' },
     } };
-    child = spawn(process.execPath, [path.join(__dirname, 'backend.cjs'), '--backend-root', root, '--output-dir', artifacts], {
-      env: { ...process.env, NODE_EXTRA_CA_CERTS: trusted.cert, [POLICY_ENV]: JSON.stringify(policy) }, stdio: ['pipe', 'pipe', 'pipe'],
-    }); exited = once(child, 'exit'); child.stderr.on('data', chunk => { stderr += chunk; }); child.stdin.on('error', () => {});
+    let command = process.execPath, commandArgs = [path.join(__dirname, 'backend.cjs'), '--backend-root', root, '--output-dir', artifacts];
+    let environment = { ...process.env, NODE_EXTRA_CA_CERTS: trusted.cert, [POLICY_ENV]: JSON.stringify(policy) };
+    if (cli) {
+      assert.ok(path.isAbsolute(cli));
+      const home = path.join(temp, 'user'), policyFile = path.join(temp, 'trusted-policy.json');
+      const cliEnv = { ...process.env, ATOMCODE_HOME: home };
+      fs.writeFileSync(policyFile, JSON.stringify(policy));
+      const invoke = args => {
+        const result = spawnSync(cli, ['browser', ...args], { env: cliEnv, cwd: temp, encoding: 'utf8', timeout: 20000 });
+        assert.equal(result.status, 0, result.stderr); return result;
+      };
+      invoke(['enable', '--origin-backend', path.join(__dirname, 'backend.cjs'), '--backend-root', root, '--origin-policy-file', policyFile]);
+      let entry = JSON.parse(fs.readFileSync(path.join(home, 'mcp.json'), 'utf8')).mcpServers['browser-use'];
+      assert.equal(entry.originScope, 3); assert.equal(entry.requiredExperimentalCapabilities[CAPABILITY], 3);
+      assert.equal(entry.trust, false); assert.deepEqual(entry.autoApprove, []); assert.ok(entry.allowedTools.includes('browser_upload'));
+      const savedPolicy = entry.env[POLICY_ENV]; fs.unlinkSync(policyFile);
+      invoke(['disable']); invoke(['enable']); invoke(['doctor']);
+      entry = JSON.parse(fs.readFileSync(path.join(home, 'mcp.json'), 'utf8')).mcpServers['browser-use'];
+      assert.equal(entry.env[POLICY_ENV], savedPolicy); assert.equal(entry.disabled, false);
+      command = entry.command; commandArgs = entry.args; artifacts = entry.args[4];
+      environment = { ...cliEnv, ...entry.env, NODE_EXTRA_CA_CERTS: trusted.cert };
+      report.cases.push('actual isolated CLI saves exact v3 capability/grants/filter, preserves approval, survives policy removal and disable/re-enable/doctor');
+    }
+    prepareOutput(artifacts); selected = await stageFile(path.join(artifacts, 'uploads'), source);
+    child = spawn(command, commandArgs, { env: environment, stdio: ['pipe', 'pipe', 'pipe'] }); exited = once(child, 'exit'); child.stderr.on('data', chunk => { stderr += chunk; }); child.stdin.on('error', () => {});
     readline.createInterface({ input: child.stdout }).on('line', line => {
       const message = JSON.parse(line), waiter = pending.get(message.id);
       if (waiter && !message.method) { pending.delete(message.id); waiter.resolve(message); }
@@ -115,6 +136,6 @@ async function verify(root, output) {
   assert.equal(report.passed, true); console.log(JSON.stringify(report));
 }
 if (require.main === module) {
-  const args = process.argv.slice(2); assert.equal(args.length, 4); assert.equal(args[0], '--backend-root'); assert.equal(args[2], '--report');
-  verify(args[1], args[3]).catch(error => { console.error(error); process.exitCode = 1; });
+  const args = process.argv.slice(2); assert.ok([4, 6].includes(args.length)); if (args.length === 6) assert.equal(args[4], '--atomcode-bin'); assert.equal(args[0], '--backend-root'); assert.equal(args[2], '--report');
+  verify(args[1], args[3], args[5]).catch(error => { console.error(error); process.exitCode = 1; });
 }

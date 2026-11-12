@@ -1,0 +1,13 @@
+# General Computer Use: installed backend basic GUI acceptance
+
+Following the scope review, prioritize a basic usable desktop workflow rather than extending upload/authentication policy. This acceptance uses the existing installed Open Computer Use 1.3.0 App at `/Users/theo/Applications/Open Computer Use.app`, upstream commit `e551c13e7082ce4c097234137582fbf4a1bc647a`. It does not replace, patch, terminate or grant permissions to that App.
+
+Its actual `doctor --no-ui` returned schema version 1 with Accessibility and Screen Recording both true. Actual MCP initialize/discovery returned the fifteen expected desktop tools. This stock diagnostic lacks the experimental permission-App identity and lease capabilities; its grants do not establish readiness of a separately built experimental App.
+
+The repository's `gui-fixture/Fixture.swift` was built and ad-hoc signed into a separate temporary App using installed Swift 6.1.3. The default Command Line Tools compiler failed because its Swift 5.10 and selected SDK were incompatible; the fixture source and SDK configuration were not changed to conceal that failure.
+
+A host-only temporary harness launched that fixture, waited for its own PID's ready state, discovered its exact window from the backend list, captured only that window, set its labeled text field through `set_value`, re-observed, and clicked `Record once` through accessibility using the fresh screenshot ID. Independent fixture state confirmed the exact synthetic message and one submission. The final PNG was visually inspected: the field contains `atomcode-general-cu-acceptance` and the counter reads `Submissions: 1`. The harness closed its MCP connection and terminated only its own fixture process. Global pointer and foreground input fallbacks were disabled. No unrelated window contents or full-display screenshot were requested.
+
+Evidence: `/tmp/atomcode-general-cu-basic/report.json`, `before.png`, `filled.png`, `after.png`, and `/tmp/atomcode-general-cu-basic-run.log`; harness `/tmp/atomcode-general-cu-basic.py`. The first attempt found no unique fixture window and performed no input; the next run discovered it and completed. These temporary artifacts are local evidence, not permanent release artifacts or an automatically repeatable product acceptance suite.
+
+Accepted here: actual installed-backend discovery, window PNG/AX observation, background field assignment and one witnessed button action. Still unaccepted: literal typing/key input, actual scrolling, AtomCode CodingRuntime/model/approval integration for this desktop workflow, denial/cancellation/reload, experimental lease handover/freshness, scoped allowed-window enforcement, and other operating systems. Do not call overall Computer Use complete on this evidence.
