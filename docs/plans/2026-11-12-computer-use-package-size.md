@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Computer Use package-size measurement
 
 Measured production revision: `75c9c8c71` on release/v5.2.7. This is a macOS Apple Silicon default-feature public-source measurement, not a publisher-signed/notarized or private-crypto release. The workspace still declares 5.2.6; no version/release configuration is changed by this audit. [Machine-readable results](2026-11-12-computer-use-package-size.json) preserve binary/package hashes, fingerprints, package members and comparisons. Private logs, binaries and full frontend manifests are under `/tmp/atomcode-computer-use-final-size`.

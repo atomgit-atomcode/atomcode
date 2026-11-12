@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Computer Use cancellation boundary
 
 Baseline: release/v5.2.7 committed 97910188c; work runs in the isolated /tmp/atomcode-browser-delivery worktree. The previous goal turn delivered browser setup and real-model acceptance; this turn addresses the remaining lifecycle boundary, not a second agent owner.

@@ -644,15 +644,6 @@ pub enum Msg<'a> {
     CmdAboutCost,
     CmdAboutUsage,
     CmdAboutMcp,
-    CmdAboutComputer,
-    CmdTakesComputer,
-    ComputerHelp,
-    ComputerStatusAbout,
-    ComputerDoctorAbout,
-    ComputerEnableAbout,
-    ComputerDisableAbout,
-    ComputerReloadAbout,
-    ComputerHelpAbout,
     CmdAboutBrowser,
     CmdTakesBrowser,
     BrowserHelp,
@@ -1759,9 +1750,6 @@ pub enum Msg<'a> {
         count: usize,
     },
     BrowserActions {
-        count: usize,
-    },
-    ComputerActions {
         count: usize,
     },
     ToolsFailed {

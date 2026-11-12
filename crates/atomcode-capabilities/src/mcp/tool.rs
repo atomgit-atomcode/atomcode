@@ -78,7 +78,6 @@ pub struct McpToolAdapter {
     /// Server-declared `annotations.readOnlyHint` — a read-only tool has no side
     /// effects, so it is `Safe` (no approval) and allowed during plan mode.
     read_only: bool,
-    scope: Option<Arc<dyn Fn() -> Option<super::McpScope> + Send + Sync>>,
 }
 
 impl McpToolAdapter {
@@ -105,18 +104,7 @@ impl McpToolAdapter {
             description,
             schema: info.input_schema,
             read_only: info.read_only,
-            scope: None,
         })
-    }
-
-    /// Resolve identity when the tool executes, so delegated agents cannot
-    /// inherit the publication-time identity of their lead.
-    pub fn with_scope_provider(
-        mut self,
-        provider: Arc<dyn Fn() -> Option<super::McpScope> + Send + Sync>,
-    ) -> Self {
-        self.scope = Some(provider);
-        self
     }
 
     /// The mounted name (`mcp__{server}__{tool}`).
@@ -196,7 +184,6 @@ impl Tool for McpToolAdapter {
             }
         };
 
-        let scope = self.scope.as_ref().and_then(|provider| provider());
         let response = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
@@ -206,7 +193,7 @@ impl Tool for McpToolAdapter {
                     ..ToolResult::default()
                 };
             }
-            response = self.registry.call_tool_scoped(&self.server, &self.tool, arguments, scope.as_ref()) => response,
+            response = self.registry.call_tool(&self.server, &self.tool, arguments) => response,
         };
         match response {
             Ok(result) => {

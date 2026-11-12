@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Computer activity presentation
 
 Baseline: eeafc349f, clean isolated worktree. Reference: local Codex history_cell/mcp.rs and thread_transcript/computer_groups.rs.

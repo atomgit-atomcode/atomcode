@@ -318,10 +318,10 @@ async fn a_shared_registry_does_not_share_another_agents_loaded_state() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn desktop_tasks_load_static_guidance_without_granting_its_allowed_tools() {
+async fn browser_tasks_load_static_guidance_without_granting_its_allowed_tools() {
     for risky in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let (cfg, opts) = setup(root.path(), "auto-load: computer-use");
+        let (cfg, opts) = setup(root.path(), "auto-load: browser-use");
         let provider = Arc::new(RecordingProvider::new(vec![action(), done()]));
         let mut mounted = support::mount(&cfg, opts, provider.clone()).await;
         let count = Arc::new(AtomicUsize::new(0));
@@ -334,8 +334,7 @@ async fn desktop_tasks_load_static_guidance_without_granting_its_allowed_tools()
                 risky,
             }))
             .unwrap();
-        let result =
-            support::turn(&mut mounted.handle, "帮我在 Safari 窗口点击搜索按钮", None).await;
+        let result = support::turn(&mut mounted.handle, "帮我在浏览器网页点击搜索按钮", None).await;
         assert!(provider
             .recorded()
             .iter()
@@ -343,7 +342,7 @@ async fn desktop_tasks_load_static_guidance_without_granting_its_allowed_tools()
         if risky {
             assert!(
                 !result.asked.is_empty(),
-                "desktop context must preserve approval: {result:?}"
+                "browser context must preserve approval: {result:?}"
             );
             assert_eq!(count.load(Ordering::SeqCst), 0);
         } else {

@@ -15,7 +15,7 @@ pub enum AutoLoad {
     #[default]
     Unspecified,
     Debugging,
-    ComputerUse,
+    BrowserUse,
     Never,
 }
 
@@ -501,10 +501,10 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
                     .as_str()
                 {
                     "debugging" => AutoLoad::Debugging,
-                    "computer-use" => AutoLoad::ComputerUse,
+                    "browser-use" => AutoLoad::BrowserUse,
                     "off" | "never" | "false" => AutoLoad::Never,
                     _ => {
-                        fm.auto_load_error = Some("invalid auto-load value (expected debugging, computer-use or off); automatic loading disabled".into());
+                        fm.auto_load_error = Some("invalid auto-load value (expected debugging, browser-use or off); automatic loading disabled".into());
                         AutoLoad::Never
                     }
                 };

@@ -32,16 +32,6 @@ pub fn initialize_params() -> serde_json::Value {
     })
 }
 
-/// Stdio hosts can supply an execution scope; ordinary HTTP clients do not
-/// negotiate this extension. No server/tool capability is advertised as client
-/// authority, and no resource is acquired during initialization.
-pub fn scoped_initialize_params() -> serde_json::Value {
-    let mut params = initialize_params();
-    params["capabilities"]["experimental"] =
-        serde_json::json!({"atomcode/turn-scopes": {"version": 1}});
-    params
-}
-
 /// JSON-RPC request wrapper.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcRequest {

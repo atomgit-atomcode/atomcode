@@ -1187,7 +1187,6 @@ pub struct ToolCallBlock {
 pub(crate) enum ToolActivity {
     Ordinary,
     Browser,
-    Computer,
 }
 
 impl ToolCallBlock {
@@ -1198,12 +1197,6 @@ impl ToolCallBlock {
             .is_some_and(|tool| !tool.is_empty())
         {
             ToolActivity::Browser
-        } else if self
-            .name
-            .strip_prefix("mcp__computer-use__")
-            .is_some_and(|tool| !tool.is_empty())
-        {
-            ToolActivity::Computer
         } else {
             ToolActivity::Ordinary
         }
@@ -1697,7 +1690,6 @@ impl ToolCallBlock {
                 t(match last.activity() {
                     ToolActivity::Ordinary => Msg::ToolsRun { count },
                     ToolActivity::Browser => Msg::BrowserActions { count },
-                    ToolActivity::Computer => Msg::ComputerActions { count },
                 })
                 .into_owned(),
                 muted(),

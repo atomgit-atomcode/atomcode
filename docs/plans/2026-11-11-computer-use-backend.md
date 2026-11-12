@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # macOS computer-use backend integration plan
 
 **Goal:** Give the CLI an explicit, reversible way to connect a local desktop MCP executor and its usage skill, using the image pipeline from phase one.

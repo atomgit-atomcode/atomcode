@@ -537,6 +537,7 @@ atomcode --prompt-file task.md
 | 命令      | 动作                                                         |
 | --------- | ------------------------------------------------------------ |
 | `/mcp`    | MCP 服务状态（子命令：`reload`、`tools`、`login`、`logout`） |
+| `/browser` | 一次配置外部浏览器后端；直接描述网页任务即可自动加载指引并使用已连接的 MCP 工具，沿用原有审批 |
 | `/plugin` | 插件市场（`marketplace` / `install` / `uninstall` / `trust` / `untrust` / `list`） |
 | `/skills` | 浏览已加载的 skills                                          |
 

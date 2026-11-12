@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Computer Use session commands and automatic skill context
 
 Baseline: release/v5.2.7 at 1d946853286c98d2e7ec05b3b19b22ef18edb5bb; existing uncommitted image/backend work is preserved. Recent command, MCP pause/resume and skill selection history and their current callers were checked before changes.

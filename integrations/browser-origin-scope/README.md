@@ -84,7 +84,7 @@ For an explicit experimental MCP entry, use resolved absolute paths in the ordin
 }
 ```
 
-The required capability is checked by AtomCode on every initialize/recovery. It does not activate policy on the stock backend. This prototype requires its own script and policy together. It remains subject to normal MCP approvals and explicit reload. Another unrestricted browser MCP entry is a different interface with different permissions. The managed `/browser` commands manage only their own `browser-use` entry, not this separately named manual entry. The browser-use skill remains explicitly selected rather than automatically loaded. `--headed` is an explicit optional launch flag; acceptance below uses headless Chrome.
+The required capability is checked by AtomCode on every initialize/recovery. It does not activate policy on the stock backend. This prototype requires its own script and policy together. It remains subject to normal MCP approvals and explicit reload. Another unrestricted browser MCP entry is a different interface with different permissions. The managed `/browser` commands manage only their own `browser-use` entry, not this separately named manual entry. After managed browser setup, browser-use guidance automatically loads for explicit webpage tasks; users may still select it explicitly. Existing skill opt-out settings and paused MCP remain respected. `--headed` is an explicit optional launch flag; acceptance below uses headless Chrome.
 
 ## Remote execution and approvals
 

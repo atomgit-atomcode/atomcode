@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Computer doctor permission identity
 
 Baseline 29650ce32, clean isolated worktree. The local setup service currently deserializes only macOS permission flags and drops the experimental backend's runtime.permission_app/bundle_identifier. This hides the exact grant target on both CLI and TUI and contributes to granting a different computer-use App.

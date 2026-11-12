@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Experimental native application scope
 
 Baseline 7b38a628e, clean isolated product checkout; native development overlay remains separately owned at pinned e551c13. State owner remains the backend connection/service; trusted host environment supplies policy outside model arguments. Existing App-agent environment serialization already isolates OPEN_COMPUTER_USE_* overrides between requests. No second runtime/session owner.

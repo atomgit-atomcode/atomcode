@@ -2438,42 +2438,6 @@ impl HostControl for RuntimeControl {
                 *self.fingerprint.lock().expect("fingerprint poisoned") = source.fingerprint();
                 Ok(reply)
             }
-            HostCommand::Computer { session, action } => {
-                self.addressed(&session)?;
-                use crate::computer_cmd::ComputerCli;
-                use atomcode_host_api::ComputerAction;
-                let command = match action {
-                    ComputerAction::Status => ComputerCli::Status,
-                    ComputerAction::Doctor => ComputerCli::Doctor { executable: None },
-                    ComputerAction::Enable => ComputerCli::Enable {
-                        executable: None,
-                        scope: Default::default(),
-                    },
-                    ComputerAction::EnableScoped { bundle_ids } => ComputerCli::Enable {
-                        executable: None,
-                        scope: crate::computer_cmd::ApplicationScopeArgs {
-                            deny_all_apps: bundle_ids.is_empty(),
-                            allowed_apps: bundle_ids,
-                            unrestricted_apps: false,
-                        },
-                    },
-                    ComputerAction::EnableUnrestricted => ComputerCli::Enable {
-                        executable: None,
-                        scope: crate::computer_cmd::ApplicationScopeArgs {
-                            unrestricted_apps: true,
-                            ..Default::default()
-                        },
-                    },
-                    ComputerAction::Disable => ComputerCli::Disable,
-                };
-                let dirs = self.config.lock().expect("config poisoned").dirs.clone();
-                let note = crate::computer_cmd::execute(&dirs, command)
-                    .await
-                    .map_err(|error| HostError::Failed {
-                        message: format!("{error:#}"),
-                    })?;
-                Ok(HostReply::DoneWithNote { note })
-            }
             HostCommand::Browser { session, action } => {
                 self.addressed(&session)?;
                 use crate::browser_cmd::BrowserCli;

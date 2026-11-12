@@ -12,12 +12,6 @@ fn main() -> io::Result<()> {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
     let mut initialized = false;
-    let scope_mode = std::env::var_os("MCP_TEST_TURN_SCOPES").is_some()
-        && !std::env::var_os("MCP_TEST_SCOPE_DISABLE_MARKER")
-            .is_some_and(|path| std::path::Path::new(&path).exists());
-    let mut scoped = false;
-    let mut scope_owner: Option<String> = None;
-
     if std::env::var_os("MCP_TEST_OVERSIZED_STARTUP_LENGTH").is_some() {
         writer.write_all(b"Content-Length: 999999999999\r\n\r\n")?;
         writer.flush()?;
@@ -49,65 +43,6 @@ fn main() -> io::Result<()> {
         };
 
         let id = request.get("id").cloned();
-        if method == "initialize" {
-            scoped = scope_mode
-                && request
-                    .pointer("/params/capabilities/experimental/atomcode~1turn-scopes/version")
-                    .and_then(serde_json::Value::as_u64)
-                    == Some(1);
-        }
-        if scoped
-            && matches!(
-                method,
-                "atomcode/desktop/acquire" | "atomcode/desktop/release" | "tools/call"
-            )
-        {
-            let owner = request
-                .pointer("/params/_meta/atomcode~1turn")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            append_event_from_env(
-                "MCP_TEST_SCOPE_LOG",
-                &serde_json::json!({"method":method,"scope":owner}).to_string(),
-            )?;
-            let denied = serde_json::json!({"isError":true,"content":[{"type":"text","text":"Desktop is busy with another turn or missing host scope"}]});
-            if method != "tools/call" {
-                let result = if owner.is_none()
-                    || scope_owner
-                        .as_ref()
-                        .is_some_and(|active| Some(active) != owner.as_ref())
-                {
-                    denied
-                } else if method == "atomcode/desktop/acquire" {
-                    scope_owner = owner;
-                    wait_for_gate("MCP_TEST_SCOPE_ACQUIRE_GATE")?;
-                    match std::env::var("MCP_TEST_SCOPE_BAD_ACQUIRE_ACK") {
-                        Ok(value) => serde_json::from_str(&value).map_err(io::Error::other)?,
-                        Err(_) => serde_json::json!({"acquired":true}),
-                    }
-                } else {
-                    wait_for_gate("MCP_TEST_SCOPE_RELEASE_GATE")?;
-                    let released = scope_owner.take().is_some();
-                    serde_json::json!({"released":released})
-                };
-                if let Some(id) = id {
-                    write_frame(
-                        &mut writer,
-                        &serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
-                    )?;
-                }
-                continue;
-            }
-            if owner.is_none() || scope_owner != owner {
-                if let Some(id) = id {
-                    write_frame(
-                        &mut writer,
-                        &serde_json::json!({"jsonrpc":"2.0","id":id,"result":denied}),
-                    )?;
-                }
-                continue;
-            }
-        }
         let mut response = match method {
             "initialize" => {
                 append_event_from_env("MCP_TEST_INITIALIZE_STARTED", "initialize")?;
@@ -299,16 +234,6 @@ fn main() -> io::Result<()> {
             }),
         };
 
-        if method == "initialize" && scope_mode {
-            if let Some(response) = response.as_mut() {
-                let version = std::env::var("MCP_TEST_SCOPE_VERSION")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(1);
-                response["result"]["capabilities"]["experimental"] =
-                    serde_json::json!({"atomcode/desktop-turn-lease":{"version":version}});
-            }
-        }
         if method == "initialize"
             && !std::env::var_os("MCP_TEST_CAPABILITIES_DISABLE_MARKER")
                 .is_some_and(|path| std::path::Path::new(&path).exists())

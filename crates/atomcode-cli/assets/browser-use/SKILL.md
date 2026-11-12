@@ -1,10 +1,12 @@
 ---
 name: browser-use
-auto-load: off
+auto-load: browser-use
 description: Use the explicitly configured external browser-use MCP to inspect and operate an isolated browser session.
 ---
 
 Use only the configured `browser-use` MCP tools for this workflow. A loaded skill is not proof of a connected backend. If tools are missing, explain `/mcp`, `/browser doctor`, and `/browser enable`; do not install software, enable a paused server, or grant permissions implicitly. A paused server needs Resume in `/mcp`, not reinstallation or `/browser enable`. Initial terminal setup requires `atomcode browser enable --server <absolute-path-to-installed-cli.js>`.
+
+For a clear webpage task, use the connected tools without requiring the user to type a slash command or name this skill. Keep every constraint in the task; automatic guidance does not authorize additional actions.
 
 1. Work in the backend's isolated browser. Do not attach the user's personal browser, import profiles, copy cookies, read browser history, or connect to CDP. The browser runs on the MCP host machine, which may differ from the user's client.
 2. Observe the selected tab before acting. Call `browser_snapshot` explicitly to obtain current inline page contents; action responses may contain only a snapshot file link. Do not assume a file link contains the observation or read arbitrary linked files as a substitute. Use current snapshot references for element actions; obtain a fresh snapshot after navigation, actions, errors or changed page state. Visual validation needs a current screenshot and a vision-capable model. Structured snapshots can support non-visual tasks without vision.

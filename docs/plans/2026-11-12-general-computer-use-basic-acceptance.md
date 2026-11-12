@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # General Computer Use: installed backend basic GUI acceptance
 
 Current checkpoint: installed-backend basic operations and production Host/CodingRuntime image/approval/pending-cancel paths are accepted on the recorded macOS fixture. Literal input, a space key and scrolling also passed. Stock in-flight AX clicking failed the exact-once counterexample. The corrected source overlay is built, packaged and now accepted for actual native-runtime in-flight cancellation and real GUI lease handover/freshness after exact-App grants were repaired. The sections below retain the preceding trials and their failures as evidence, not competing claims of current completion.

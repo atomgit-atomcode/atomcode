@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Computer Use integration review and acceptance
 
 Review baseline: release/v5.2.7, `1d946853286c98d2e7ec05b3b19b22ef18edb5bb`. Reviewed the retained image adapter, result DTOs, feature isolation, setup/probe/config ownership, skill classifier/static injection, addressed host control, TUI commands and their tests. Existing feature edits were preserved. The user's continuation follows the proposed review/commit and real-acceptance sequence; commits stay local unless pushing is separately requested.

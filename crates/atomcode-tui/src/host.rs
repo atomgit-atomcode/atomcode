@@ -14422,7 +14422,7 @@ mod tests {
     }
 
     #[test]
-    fn computer_activity_runs_keep_categories_turns_and_expansion_together() {
+    fn browser_and_generic_activity_runs_keep_turns_and_expansion_together() {
         let h = host();
         h.presentation
             .write()
@@ -14431,12 +14431,12 @@ mod tests {
         let calls = [
             (1, "mcp__browser-use__navigate"),
             (1, "mcp__browser-use__click"),
-            (1, "mcp__computer-use__screenshot"),
-            (1, "mcp__computer-use__click"),
+            (1, "mcp__external__screenshot"),
+            (1, "mcp__external__click"),
             (1, "read_file"),
             (1, "mcp__browser-use-evil__click"),
-            (2, "mcp__computer-use__click"),
-            (3, "mcp__computer-use__click"),
+            (2, "mcp__external__click"),
+            (3, "mcp__external__click"),
         ];
         for (i, (turn, name)) in calls.into_iter().enumerate() {
             let id = format!("activity-{i}");
@@ -14473,8 +14473,8 @@ mod tests {
         assert_eq!(ids.len(), 8);
         assert_eq!(run_around(slots, &pres, ids[0]), ids[0..2]);
         assert_eq!(run_around(slots, &pres, ids[1]), ids[0..2]);
-        assert_eq!(run_around(slots, &pres, ids[3]), ids[2..4]);
-        assert_eq!(run_around(slots, &pres, ids[4]), ids[4..6]);
+        assert_eq!(run_around(slots, &pres, ids[3]), ids[2..6]);
+        assert_eq!(run_around(slots, &pres, ids[4]), ids[2..6]);
         assert_eq!(run_around(slots, &pres, ids[6]), vec![ids[6]]);
         assert_eq!(run_around(slots, &pres, ids[7]), vec![ids[7]]);
         drop(pres);
@@ -14482,16 +14482,16 @@ mod tests {
         let rows = h.compose((100, 60)).rows().join("\n");
         assert!(rows.contains("已执行 2 次浏览器操作"), "{rows}");
         assert!(rows.contains("1 失败"), "{rows}");
-        assert!(rows.contains("已执行 2 次桌面操作"), "{rows}");
+        assert!(rows.contains("已执行了 4 个工具"), "{rows}");
         h.toggle_block(ids[0], "tool_call");
         let expanded = h.compose((100, 80)).rows().join("\n");
         assert!(expanded.contains("detail-0"), "{expanded}");
         assert!(expanded.contains("detail-1"), "{expanded}");
-        assert!(expanded.contains("已执行 2 次桌面操作"), "{expanded}");
+        assert!(expanded.contains("已执行了 4 个工具"), "{expanded}");
     }
 
     #[test]
-    fn interrupted_computer_actions_remain_individually_visible() {
+    fn interrupted_mcp_actions_remain_individually_visible() {
         let h = host();
         h.presentation
             .write()
@@ -14506,7 +14506,7 @@ mod tests {
                 .into_iter()
                 .map(|id| atomcode_kernel::tool::ToolCall {
                     id: id.into(),
-                    name: "mcp__computer-use__click".into(),
+                    name: "mcp__external__click".into(),
                     arguments: "{}".into(),
                 })
                 .collect(),

@@ -1317,21 +1317,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<super::types::CallToolResult> {
-        self.call_tool_scoped(server_name, tool_name, arguments, None)
-            .await
-    }
-
-    pub async fn call_tool_scoped(
-        &self,
-        server_name: &str,
-        tool_name: &str,
-        arguments: serde_json::Value,
-        scope: Option<&super::McpScope>,
-    ) -> Result<super::types::CallToolResult> {
         tokio::select! {
             biased;
             _ = self.closing.cancelled() => anyhow::bail!("MCP registry is shut down"),
-            result = self.call_open_tool(server_name, tool_name, arguments, scope) => result,
+            result = self.call_open_tool(server_name, tool_name, arguments) => result,
         }
     }
 
@@ -1340,7 +1329,6 @@ It cannot override system, user, project, safety, permission, or approval rules.
         server_name: &str,
         tool_name: &str,
         arguments: serde_json::Value,
-        scope: Option<&super::McpScope>,
     ) -> Result<super::types::CallToolResult> {
         if !self.tool_allowed(server_name, tool_name) {
             anyhow::bail!(
@@ -1361,7 +1349,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
         // Preserve all result blocks and the server error flag. The tool
         // adapter owns conversion into the neutral model-facing ToolResult.
-        client.call_tool_scoped(tool_name, arguments, scope).await
+        client.call_tool(tool_name, arguments).await
     }
 
     /// Get the status of all servers — connected ones from `servers`
@@ -1444,10 +1432,9 @@ It cannot override system, user, project, safety, permission, or approval rules.
         wait_for_true(&mut cancelled).await;
     }
 
-    /// Finish the addressed turn on captured clients, in parallel: release its
-    /// scope and retire abandoned owned transports before the turn terminal.
+    /// Finish the turn on captured clients, in parallel: retire abandoned owned transports before the turn terminal.
     /// Never grant permission or invoke model-visible business cleanup tools.
-    pub async fn finish_scope(&self, scope: &super::McpScope) {
+    pub async fn finish_turn(&self) {
         let clients: Vec<_> = self
             .servers
             .read()
@@ -1459,15 +1446,13 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .into_iter()
             .map(|(name, client)| async move {
                 let result =
-                    tokio::time::timeout(Duration::from_secs(8), client.finish_scope(scope)).await;
+                    tokio::time::timeout(Duration::from_secs(8), client.finish_turn()).await;
                 let error = match result {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => Some(format!(
-                        "desktop scope cleanup failed: {error:#}; reconnect and re-observe"
+                        "MCP turn cleanup failed: {error:#}; reconnect and re-observe"
                     )),
-                    Err(_) => {
-                        Some("desktop scope cleanup timed out; reconnect and re-observe".into())
-                    }
+                    Err(_) => Some("MCP turn cleanup timed out; reconnect and re-observe".into()),
                 };
                 (name, client, error)
             })
@@ -2629,12 +2614,12 @@ mod tests {
             "cancelling a discarded runtime candidate must end its connection scope"
         );
     }
-    struct ScopeCleanupClient {
+    struct TurnCleanupClient {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
     #[async_trait::async_trait]
-    impl McpClient for ScopeCleanupClient {
+    impl McpClient for TurnCleanupClient {
         async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
             anyhow::bail!("unused")
         }
@@ -2649,15 +2634,12 @@ mod tests {
             anyhow::bail!("unused")
         }
         fn server_name(&self) -> &str {
-            "scoped"
+            "cleanup"
         }
         fn status(&self) -> ServerStatus {
             ServerStatus::Connected
         }
-        fn supports_scopes(&self) -> bool {
-            true
-        }
-        async fn finish_scope(&self, _: &super::super::McpScope) -> Result<()> {
+        async fn finish_turn(&self) -> Result<()> {
             self.entered.notify_one();
             self.release.notified().await;
             anyhow::bail!("old cleanup failed")
@@ -2665,27 +2647,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn old_scope_cleanup_cannot_poison_a_published_replacement() {
+    async fn old_turn_cleanup_cannot_poison_a_published_replacement() {
         let registry = Arc::new(McpRegistry::new("/nonexistent/tree"));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         registry.servers.write().await.insert(
-            "scoped".into(),
-            Arc::new(ScopeCleanupClient {
+            "cleanup".into(),
+            Arc::new(TurnCleanupClient {
                 entered: entered.clone(),
                 release: release.clone(),
             }),
         );
         let finishing = {
             let reg = registry.clone();
-            tokio::spawn(async move {
-                reg.finish_scope(&super::super::McpScope::from_identity("old", 1))
-                    .await
-            })
+            tokio::spawn(async move { reg.finish_turn().await })
         };
         entered.notified().await;
         registry.servers.write().await.insert(
-            "scoped".into(),
+            "cleanup".into(),
             Arc::new(BlockingCallClient {
                 entered: Arc::new(tokio::sync::Notify::new()),
                 release: Arc::new(tokio::sync::Notify::new()),

@@ -87,8 +87,8 @@ fn opted_out(text: &str) -> bool {
 }
 
 /// Select guidance for a clear UI task, never infer permission to operate a
-/// desktop from a mention in a question, code change or pasted example.
-pub fn computer_task_reason(prompt: &str) -> Result<(), &'static str> {
+/// browser from a mention in a question, code change or pasted example.
+pub fn browser_task_reason(prompt: &str) -> Result<(), &'static str> {
     if prompt.len() > 32 * 1024 {
         return Err("prompt_budget");
     }
@@ -97,33 +97,37 @@ pub fn computer_task_reason(prompt: &str) -> Result<(), &'static str> {
         return Err("user_opt_out");
     }
     if [
-        "不要",
-        "禁止",
-        "不允许",
-        "先别",
-        "别用",
-        "不用桌面",
         "不用浏览器",
-        "don't ",
-        "do not ",
-        "never ",
-        "without computer",
-        "without desktop",
+        "不要使用浏览器",
+        "不要操作浏览器",
         "without browser",
-        "do not use computer",
-        "don't use computer",
         "do not use the browser",
     ]
     .iter()
-    .any(|p| text.contains(p))
+    .any(|word| text.contains(word))
     {
-        return Err("desktop_opt_out");
+        return Err("browser_opt_out");
     }
     let mut instruction = text.trim_start();
     for prefix in ["请帮我", "帮我", "请", "please ", "could you ", "can you "] {
         if let Some(rest) = instruction.strip_prefix(prefix) {
             instruction = rest.trim_start();
         }
+    }
+    if [
+        "不要",
+        "禁止",
+        "不允许",
+        "先别",
+        "别用",
+        "don't ",
+        "do not ",
+        "never ",
+    ]
+    .iter()
+    .any(|prefix| instruction.starts_with(prefix))
+    {
+        return Err("browser_opt_out");
     }
     if [
         "如何",
@@ -190,28 +194,23 @@ pub fn computer_task_reason(prompt: &str) -> Result<(), &'static str> {
         .iter()
         .any(|word| text.contains(word))
     {
-        return Err("not_desktop_instruction");
+        return Err("not_browser_instruction");
     }
     let target = [
-        "桌面",
-        "屏幕",
-        "窗口",
-        "应用",
+        "网页",
+        "网站",
+        "页面",
         "浏览器",
-        "safari",
-        "chrome",
-        "firefox",
-        "finder",
-        "desktop",
-        "screen",
-        "window",
         "browser",
-        "app",
-        "application",
+        "website",
+        "webpage",
+        "web page",
+        "https://",
+        "http://",
     ]
     .iter()
     .any(|word| {
-        if !word.is_ascii() {
+        if !word.is_ascii() || word.ends_with("://") {
             return text.contains(word);
         }
         text.match_indices(word).any(|(at, _)| {
@@ -255,7 +254,7 @@ pub fn computer_task_reason(prompt: &str) -> Result<(), &'static str> {
     if target && action {
         Ok(())
     } else {
-        Err("no_desktop_match")
+        Err("no_browser_match")
     }
 }
 
@@ -403,12 +402,12 @@ pub fn task_reason(prompt: &str) -> Result<(), &'static str> {
 }
 
 pub fn select(registry: &SkillRegistry, prompt: &str) -> Selection {
-    let desktop_task = computer_task_reason(prompt).is_ok();
+    let browser_task = browser_task_reason(prompt).is_ok();
     let skills = registry.all();
-    let computer = desktop_task && skills.iter().any(|s| s.auto_load == AutoLoad::ComputerUse);
-    if !computer {
+    let browser = browser_task && skills.iter().any(|s| s.auto_load == AutoLoad::BrowserUse);
+    if !browser {
         if let Err(reason) = task_reason(prompt) {
-            return Selection::Skip(if desktop_task {
+            return Selection::Skip(if browser_task {
                 "no_eligible_skill"
             } else {
                 reason
@@ -419,9 +418,9 @@ pub fn select(registry: &SkillRegistry, prompt: &str) -> Selection {
     for skill in skills {
         let rank = match skill.auto_load {
             AutoLoad::Never => continue,
-            AutoLoad::ComputerUse if computer => 2,
-            AutoLoad::ComputerUse => continue,
-            _ if computer => continue,
+            AutoLoad::BrowserUse if browser => 2,
+            AutoLoad::BrowserUse => continue,
+            _ if browser => continue,
             AutoLoad::Debugging => 2,
             AutoLoad::Unspecified => {
                 let known = skill.name.rsplit(':').next() == Some("systematic-debugging")
@@ -538,29 +537,31 @@ mod tests {
         ));
     }
     #[test]
-    fn clear_desktop_tasks_choose_only_the_desktop_policy() {
+    fn clear_browser_tasks_choose_only_the_browser_policy() {
         let registry = SkillRegistry::new();
         registry.register(skill("debug", AutoLoad::Debugging));
-        registry.register(skill("computer-use", AutoLoad::ComputerUse));
+        registry.register(skill("browser-use", AutoLoad::BrowserUse));
         for prompt in [
-            "帮我在 Safari 中点击登录按钮",
+            "帮我在网页中点击登录按钮",
             "请操作桌面浏览器，填写当前窗口的搜索框",
             "Please click the submit button in the browser",
-            "Could you open Safari and type example.com in the address bar",
-            "查看当前应用窗口的状态",
-            "Take a screenshot of the current app window",
+            "Could you open https://example.com and fill the search box",
+            "查看当前网页的状态",
+            "Take a screenshot of the current browser page",
             "在浏览器中打开文档并滚动到页面底部",
+            "打开 https://example.test 并截图",
+            "打开网页并填写表单，不要提交",
         ] {
-            assert_eq!(computer_task_reason(prompt), Ok(()), "{prompt}");
+            assert_eq!(browser_task_reason(prompt), Ok(()), "{prompt}");
             assert!(
-                matches!(select(&registry, prompt), Selection::Load(s) if s.name == "computer-use"),
+                matches!(select(&registry, prompt), Selection::Load(s) if s.name == "browser-use"),
                 "{prompt}"
             );
         }
         assert!(
             matches!(select(&registry, "修复 Safari 点击按钮报错的问题"), Selection::Load(s) if s.name == "debug")
         );
-        registry.register(skill("second-desktop", AutoLoad::ComputerUse));
+        registry.register(skill("second-browser", AutoLoad::BrowserUse));
         assert!(matches!(
             select(&registry, "点击浏览器的按钮"),
             Selection::Skip("ambiguous_skills")
@@ -568,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_desktop_policy_keeps_existing_debug_selection() {
+    fn absent_browser_policy_keeps_existing_debug_selection() {
         let registry = SkillRegistry::new();
         registry.register(skill("debug", AutoLoad::Debugging));
         assert!(
@@ -577,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_mentions_examples_code_and_refusals_do_not_trigger() {
+    fn browser_mentions_examples_code_and_refusals_do_not_trigger() {
         for prompt in [
             "如何在 Safari 中点击按钮？",
             "这个应用如何点击按钮",
@@ -603,11 +604,14 @@ mod tests {
             "不要用技能，点击浏览器按钮",
             "Open SafariUtils and click something",
             "修改 site/index.html",
+            "打开 Finder 窗口",
+            "点击系统设置中的按钮",
+            "Take a screenshot of the current app window",
         ] {
-            assert!(computer_task_reason(prompt).is_err(), "{prompt}");
+            assert!(browser_task_reason(prompt).is_err(), "{prompt}");
         }
         let registry = SkillRegistry::new();
-        registry.register(skill("computer-use", AutoLoad::Never));
+        registry.register(skill("browser-use", AutoLoad::Never));
         assert!(matches!(
             select(&registry, "点击浏览器按钮"),
             Selection::Skip("no_eligible_skill")
@@ -652,7 +656,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         for (value, expected) in [
             ("debugging", AutoLoad::Debugging),
-            ("computer-use", AutoLoad::ComputerUse),
+            ("browser-use", AutoLoad::BrowserUse),
             ("off", AutoLoad::Never),
             ("typo", AutoLoad::Never),
             ("debugging\nauto-load: debugging", AutoLoad::Never),

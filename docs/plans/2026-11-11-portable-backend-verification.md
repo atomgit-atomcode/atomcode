@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Portable backend build verification
 
 Baseline AtomCode 505882784, isolated clean worktree. Backend source is pinned upstream e551c13e7082ce4c097234137582fbf4a1bc647a. It contains distinct Go Windows/Linux runtimes. Both doctor commands print prose rather than the JSON permission schema expected by the macOS setup. Their MCP initialize does not advertise negotiated desktop-turn leases. Do not relax ComputerCli platform checks or invent equivalent safety capabilities.

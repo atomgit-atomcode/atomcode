@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Host wiring for negotiated desktop turn scopes
 
 Baseline: release/v5.2.7 99fd18f2e, clean isolated worktree. The backend protocol prototype is separately verified; App/socket isolation and real GUI acceptance remain incomplete.

@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Managed browser origin scope plan
 
 Baseline release/v5.2.7 a14897248, clean main and isolated worktree. Reviewed browser_cmd, its host/TUI/CLI consumers, current integration backend and recent setup history. Existing enable replaces the whole managed entry and loses any saved required-capability policy; new setup must preserve restrictions deliberately. The pinned external playwright-core package requires Node 20 even though current setup text/check says 18.

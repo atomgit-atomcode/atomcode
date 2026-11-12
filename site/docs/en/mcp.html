@@ -207,14 +207,14 @@ atomcode</code></pre>
       <pre><code>/browser status
 /browser doctor
 /browser reload
-$browser-use Open the local test page, fill the authorized form and verify the result.
+Open the local test page, fill the authorized form and verify the result.
 /browser disable
 /browser reload</code></pre>
       <p>The first setup requires a terminal server path. Once configured, <code>/browser enable</code> reuses it. Configuration changes need an explicit reload or restart. <code>status</code> reads saved configuration; use <code>/mcp</code> for live connections, project overrides and pause/resume. Custom same-name configuration and edited skills are preserved rather than overwritten.</p>
       <p>The managed backend uses an isolated profile and disables page-provided WebMCP. It does not attach your personal Chrome profile or import cookies. Native MCP approvals remain in place (<code>trust: false</code>, empty <code>autoApprove</code>); read-only annotations and tool-wide Always grants still apply. These approvals are <strong>not site-scoped access control</strong>. The stock backend has no enforced origin allowlist; the optional origin-scope backend below supplies an explicit execution boundary. The browser runs on the MCP host, which may differ from your client computer.</p>
       <p>The managed <code>allowedTools</code> list exposes reviewed navigation, observation, form, interaction and close tools. Code evaluation, unsafe scripts, file upload and browser-install tools are excluded. Generic MCP configurations may also use <code>allowedTools</code> with exact raw tool names: omitted permits all, an empty array permits none. This filter is checked for discovery, cached tools and execution; it grants no approval and is not an operating-system or network sandbox.</p>
       <p>Generated snapshots and screenshots are stored under <code>&lt;user tree&gt;/integrations/browser-use/artifacts</code>, outside the project. Setup restricts that directory to the owner on Unix; Windows inherits directory ACLs. The backend receives a 16 MiB output eviction target, not a hard disk quota. Disabling preserves these files; remove them yourself when no longer needed.</p>
-      <p>The skill is invoked explicitly using <code>$browser-use</code>; installing it does not automatically select it. Screenshots require a vision-capable model, while structured page snapshots can support text-only models. Cancellation and disabling configuration cannot undo dispatched external actions. Re-observe unknown outcomes before retrying; close only browser resources owned by your workflow.</p>
+      <p>After one-time setup and reload, describe a webpage task to automatically load browser guidance and let the model use connected tools; no per-task slash command is required. Explicit <code>$browser-use</code> remains available. <code>[no-auto-skills]</code>, <code>auto-load: off</code> and disabled host auto-loading remain respected; paused MCP connections are not resumed implicitly. Screenshots require a vision-capable model, while structured page snapshots can support text-only models. Cancellation and disabling configuration cannot undo dispatched external actions. Re-observe unknown outcomes before retrying; close only browser resources owned by your workflow.</p>
 
       <h3 id="browser-origin-scope">Exact-origin scope (optional backend)</h3>
       <p>First setup requires an explicitly installed origin-scope <code>backend.cjs</code> and the pinned package directory; nothing is downloaded or copied automatically. This backend checks actual HTTP(S)/WS(S) destinations, including redirects, frames and subresources, rather than relying on Playwright's convenience <code>allowed-origins</code> flag.</p>
@@ -228,45 +228,6 @@ $browser-use Open the local test page, fill the authorized form and verify the r
 /browser reload</code></pre>
       <p>Origins must be exact HTTP(S) scheme/host/port values: no credentials, paths, queries or wildcards. <code>--deny-all-origins</code> saves an empty allow-list. Setup validates a no-browser doctor report and stores both policy and a required <code>atomcode/browser-origin-scope</code> v1 capability; every real initialization/recovery independently checks that capability. Other required capabilities and narrower tool restrictions are retained. Invalid saved scope is refused instead of silently removed. <code>doctor</code>/<code>status</code> understand saved scope but do not inspect a live connection; project overrides and explicit reload still apply.</p>
       <p>Scoped screenshots/snapshots use <code>&lt;user tree&gt;/integrations/browser-use/origin-artifacts/files</code>, with an ownership marker outside the retention directory. The backend refuses foreign nonempty roots and leaf symlinks. This version denies accepted download artifacts, local-file upload and full-CDP tools; it does not yet implement per-origin transfer/CDP allow settings. HTTPS response bytes can still enter Chrome. This is not an OS sandbox or global restriction on shell tools, other browser servers, clients or effects at allowed sites. macOS Chrome is locally tested; other-platform execution and the full policy matrix remain unaccepted.</p>
-
-      <h2 id="computer-use">Operate macOS apps from the CLI</h2>
-      <p>Connect the local <a href="https://github.com/opensymph/open-computer-use">Open Computer Use</a> MCP backend on macOS 14 or later. Screenshot tasks require a vision-capable selected model. AtomCode does not install the backend automatically or launch a separate model agent.</p>
-      <pre><code># Explicitly install the pinned backend (requires Node.js / npm)
-npm install -g @opensymph/open-computer-use@1.3.0
-
-# Open the backend's permission onboarding yourself
-open-computer-use doctor
-
-# Non-interactive check; configure only after permissions are ready
-atomcode computer doctor
-atomcode computer enable
-# Both commands accept --executable /absolute/path/to/executable</code></pre>
-      <p>Grant Accessibility and Screen Recording to the backend app in macOS settings. AtomCode's <code>doctor</code> has a deadline and requests neither permissions nor screenshots. Missing permissions prevent <code>enable</code> from writing MCP configuration or the skill. Setup preserves other servers, refuses custom same-name server/skill collisions, and disables known foreground-input and global-pointer fallback flags.</p>
-      <p>If the backend reports its permission App, both <code>computer doctor</code> and permission failures show that exact path and bundle identifier. Grant that App access; a grant for Codex Computer Use or another copy does not transfer. Older backends without this information explicitly report that the App is unidentified; use their local doctor to identify it.</p>
-      <h3 id="application-scope">Application scope (optional patched backend)</h3>
-      <p>With a backend implementing <code>atomcode/application-scope</code> version 1, restrict access by exact bundle ID. The stock pinned npm release does not include this AtomCode extension; use the optional patched backend and pass its executable path. Names, paths and wildcards are rejected.</p>
-      <pre><code>atomcode computer enable --executable /path/to/patched/backend --allow-app com.apple.TextEdit
-# Repeat --allow-app to permit additional applications
-/computer enable --allow-app com.apple.TextEdit
-/computer enable --deny-all-apps
-# Explicitly remove the saved application restriction
-/computer enable --unrestricted-apps
-/computer reload</code></pre>
-      <p>Plain <code>enable</code> preserves the saved scope, including deny-all. Setup requires OS permissions and a version-1 scope report, then records both the policy and a required MCP capability. Every actual connection/recovery checks that requirement before tools become usable. Configuration status is not live-session status: inspect <code>/mcp</code>, and reload explicitly. Setup does not change current connections or interrupt dispatched operations. Other required capabilities and tool restrictions are preserved.</p>
-      <p>The backend checks resolved application/window identities and cached observations; scoped mode refuses full-display capture and global-pointer fallback. This is not an OS sandbox: shell tools, other clients/processes and effects inside permitted applications remain separate boundaries. Host environment restrictions and the backend's built-in denials still apply after removing the managed restriction.</p>
-      <p>Restart AtomCode or run <code>/computer reload</code>. Clear desktop requests, such as “Click the search button in the Safari window”, automatically load the installed <code>computer-use</code> static guidance. You can also explicitly enter <code>$computer-use Complete this task in the specified app</code>. Automatic context neither executes tools nor grants permissions; the model chooses calls under existing MCP approvals. Documentation, quoted examples, code implementation and requests declining desktop operations do not trigger this rule. Use an explicit skill when matching is uncertain. Disable automatic loading with <code>[no-auto-skills]</code>, the skill's <code>auto-load: off</code>, or the host's <code>skills-host.auto_load: false</code> setting.</p>
-      <pre><code>/computer help
-/computer status
-/computer doctor
-/computer enable
-/computer disable
-/computer reload</code></pre>
-      <p>These session slash commands delegate to the host and share the terminal's setup implementation. Enable/disable save configuration; reload separately applies it through the existing lifecycle and refuses while busy. Custom executable paths remain a terminal <code>--executable</code> option; slash arguments are never shell commands.</p>
-      <pre><code>atomcode computer status
-atomcode computer disable</code></pre>
-      <p><code>status</code> reads user configuration, not a running session's connection. A same-name project MCP entry still takes precedence; check <code>/mcp</code>. <code>disable</code> changes only this integration's managed user entry and removes its unmodified bundled skill. Running sessions need a reload. It is not an emergency stop and cannot guarantee interruption of dispatched desktop operations. The stock backend lacks AtomCode's optional scope/lease extensions. Real GUI effects and cross-agent/remote cancellation guarantees still require acceptance on the execution host; code rewind cannot undo external GUI effects.</p>
-
-      <p>After updating AtomCode, run <code>atomcode computer enable</code> again (or <code>/computer enable</code> in a session) and reload to adopt updated bundled guidance. Only an exact recognized bundled skill is upgraded; local edits, including <code>auto-load: off</code>, are preserved and reported instead of overwritten. The guidance distinguishes display-escaped newlines from actual text and requires fresh observations after saving; ambiguous UI status is reported as unverified.</p>
 
       <h2 id="tool-naming">Tool naming</h2>
       <p>Each remote tool is registered as <code>mcp__&lt;server-key&gt;__&lt;remote-tool-name&gt;</code>.</p>

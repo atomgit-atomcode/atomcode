@@ -16,7 +16,6 @@ use clap_complete::Shell;
 
 mod cloud_cmd;
 use atomcode::browser_cmd;
-use atomcode::computer_cmd;
 mod grape_cmd;
 mod headless_json;
 mod lsp_cmd;
@@ -770,9 +769,6 @@ enum HeadlessOutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Configure or diagnose the opt-in local desktop MCP (macOS 14+).
-    #[command(subcommand)]
-    Computer(computer_cmd::ComputerCli),
     /// Configure an externally installed isolated browser MCP.
     #[command(subcommand)]
     Browser(browser_cmd::BrowserCli),
@@ -1372,7 +1368,6 @@ async fn async_main(process_start: std::time::Instant) {
     // that could also be a prompt or an option value.
     if let Ok(cli) = Cli::try_parse() {
         let local_result = match cli.command {
-            Some(Commands::Computer(command)) => Some(computer_cmd::handle(command).await),
             Some(Commands::Browser(command)) => Some(browser_cmd::handle(command).await),
             _ => None,
         };
@@ -4145,7 +4140,6 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Setup is handled inline in run() before handle_command")
         }
         Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
-        Commands::Computer(sub) => computer_cmd::handle(sub).await,
         Commands::Browser(sub) => browser_cmd::handle(sub).await,
         Commands::Cloud(sub) => cloud_cmd::handle(sub),
         Commands::Grape(sub) => tokio::task::spawn_blocking(move || grape_cmd::handle(sub)).await?,

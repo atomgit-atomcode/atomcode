@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Managed application scope implementation plan
 
 **Goal:** Let people explicitly configure exact native application access from CLI and /computer, without weakening saved policy on ordinary enable.

@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Isolated macOS lease App activation
 
 Baseline: AtomCode host-scope integration 70d0db025; isolated delivery rebased onto 3f6957ed5 to retain the independently delivered auxiliary-response fixes; OpenComputerUse v1.3.0 e551c13e7082ce4c097234137582fbf4a1bc647a plus the separately verified lease patch. This is the next delivery phase, not a completed implementation.

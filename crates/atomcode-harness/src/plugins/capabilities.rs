@@ -196,7 +196,7 @@ impl Plugin for SkillsPlugin {
                  row's `dirs` config adds. To add one, drop a markdown file in \
                  a skill directory and restart; nothing needs recompiling. \
                  `list_skills` shows what is loaded now. Static task workflows can be \
-                 loaded before a user turn; auto-load: debugging opts into debugging tasks, auto-load: computer-use into explicit desktop tasks; auto-load: off opts out. \
+                 loaded before a user turn; auto-load: debugging opts into debugging tasks, auto-load: browser-use into explicit browser tasks; auto-load: off opts out. \
                  The skills row auto_load:false or user [no-auto-skills] disables auto-loading. \
                  Automatic loading executes no embedded commands and grants no allowed-tools."
             ),
@@ -1500,21 +1500,9 @@ impl Plugin for MemoryPlugin {
     }
 }
 
-/// Resolve the actual executing realm, never the publication tree or a tool
-/// call ID. Missing context is an unavailable scope, not the lead's identity.
-pub fn current_mcp_scope() -> Option<atomcode_capabilities::mcp::McpScope> {
-    let here = crate::agent::current()?;
-    let session = here.service::<SessionSvc>()?;
-    let (_, sequence) = session.current_turn_start()?;
-    Some(atomcode_capabilities::mcp::McpScope::from_identity(
-        session.id(),
-        sequence,
-    ))
-}
-
-struct McpScopeFinish(Arc<McpRegistry>);
+struct McpTurnFinish(Arc<McpRegistry>);
 #[async_trait]
-impl atomcode_plexus::Listener<crate::events::TurnFinishing> for McpScopeFinish {
+impl atomcode_plexus::Listener<crate::events::TurnFinishing> for McpTurnFinish {
     async fn call(&self, outcome: &crate::seams::TurnOutcome) -> Option<()> {
         let here = crate::agent::current()?;
         let session = here.service::<SessionSvc>()?;
@@ -1522,15 +1510,15 @@ impl atomcode_plexus::Listener<crate::events::TurnFinishing> for McpScopeFinish 
         if session.id() != outcome.session_id || turn != outcome.turn {
             return None;
         }
-        self.0.finish_scope(&current_mcp_scope()?).await;
+        self.0.finish_turn().await;
         Some(())
     }
 }
 
 /// Both the generic harness row and coding's replacement use this existing
 /// awaited seam; no driver-owned or model-visible cleanup tool is added.
-pub fn mount_mcp_scope_lifecycle(ctx: &Context, registry: Arc<McpRegistry>) {
-    let _ = ctx.on_parallel::<crate::events::TurnFinishing>(Arc::new(McpScopeFinish(registry)));
+pub fn mount_mcp_turn_lifecycle(ctx: &Context, registry: Arc<McpRegistry>) {
+    let _ = ctx.on_parallel::<crate::events::TurnFinishing>(Arc::new(McpTurnFinish(registry)));
 }
 
 // ---- mcp ----------------------------------------------------------------
@@ -1591,7 +1579,7 @@ impl Plugin for McpPlugin {
             .wait_for_initial_connections(std::time::Duration::from_millis(row.connect_timeout_ms))
             .await;
 
-        mount_mcp_scope_lifecycle(ctx, registry.clone());
+        mount_mcp_turn_lifecycle(ctx, registry.clone());
         let infos = registry.list_all_tools().await;
         let mut mounted = Vec::new();
         let mut adapters: Vec<Arc<dyn Tool>> = Vec::new();
@@ -1601,9 +1589,7 @@ impl Plugin for McpPlugin {
             match McpToolAdapter::new(registry.clone(), info) {
                 Ok(adapter) => {
                     mounted.push(adapter.name().to_string());
-                    adapters.push(Arc::new(
-                        adapter.with_scope_provider(Arc::new(current_mcp_scope)),
-                    ));
+                    adapters.push(Arc::new(adapter));
                 }
                 Err(reason) => eprintln!("mcp: skipping a tool: {reason}"),
             }

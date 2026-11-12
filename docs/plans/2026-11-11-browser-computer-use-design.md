@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 > Current delivery status: [completion audit](2026-11-11-computer-use-delivery-audit.md). Progress paragraphs below preserve their historical baseline. Host scope wiring, isolated App/socket construction, activity grouping and clickable result pictures were implemented afterward; GUI and execution-policy acceptance remain incomplete.
 
 # 浏览器与跨平台 Computer Use 设计

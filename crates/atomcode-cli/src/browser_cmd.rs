@@ -13,11 +13,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
-use crate::computer_cmd::{lock_mcp_setup, read_optional, write_checked};
+use crate::mcp_setup::{lock_mcp_setup, read_optional, write_checked};
 
 mod origin;
 pub use origin::OriginArgs;
 
+const PREVIOUS_SKILL_SHA256: &str =
+    "7e4c6d091a8ede3c74a1ca27ff367810ad3bd71a06adfa1ff2741c943e77fba7";
 const OLD_SKILL_SHA256: &str = "5057170a3cb358850ae77794f1596bf3e995e39dd0c6eb0b78adef864316196d";
 
 const SERVER: &str = "browser-use";
@@ -222,7 +224,7 @@ pub async fn execute(dirs: &ProductDirs, command: BrowserCli) -> Result<String> 
             )?;
             plan.check(dirs).await?;
             enable_prepared(dirs, &plan, &before)?;
-            Ok(format!("{}\nBrowser Use configured with native MCP approvals and an isolated profile. Restart or /browser reload, then use $browser-use with your task. No browser was launched or installed by setup. Configuration is not live activation; read-only hints and Always grants do not replace backend origin policy.", plan.summary()))
+            Ok(format!("{}\nBrowser Use configured with native MCP approvals and an isolated profile. Restart or /browser reload, then describe a webpage task; browser guidance loads automatically. $browser-use remains available explicitly. No browser was launched or installed by setup. Configuration is not live activation; read-only hints and Always grants do not replace backend origin policy.", plan.summary()))
         }
         BrowserCli::Doctor { server, node } => {
             let before = read_optional(&config_path(dirs))?;
@@ -268,8 +270,7 @@ async fn diagnostic_with_deadline(
         .spawn()
         .context("could not start browser diagnostic")?;
     #[cfg(unix)]
-    let mut group =
-        crate::computer_cmd::ProbeGroup(child.id().and_then(|id| i32::try_from(id).ok()));
+    let mut group = crate::mcp_setup::ProbeGroup(child.id().and_then(|id| i32::try_from(id).ok()));
     let mut stdout = child.stdout.take().context("missing diagnostic stdout")?;
     let result = tokio::time::timeout(deadline, async {
         let mut bytes = Vec::new();
@@ -335,7 +336,9 @@ async fn check_stock(node: &Path, server: &Path) -> Result<()> {
 }
 
 fn bundled_skill(text: &str) -> bool {
-    text == SKILL || format!("{:x}", Sha256::digest(text.as_bytes())) == OLD_SKILL_SHA256
+    text == SKILL
+        || [OLD_SKILL_SHA256, PREVIOUS_SKILL_SHA256]
+            .contains(&format!("{:x}", Sha256::digest(text.as_bytes())).as_str())
 }
 
 #[cfg(test)]
@@ -542,11 +545,16 @@ mod tests {
     #[test]
     fn old_bundled_browser_guidance_upgrades_but_local_edits_do_not() {
         let old = include_str!("../tests/fixtures/browser-use-v1.md");
+        let previous = include_str!("../tests/fixtures/browser-use-v2.md");
+        assert!(bundled_skill(previous));
+        assert!(SKILL.contains("auto-load: browser-use"));
         assert!(bundled_skill(old));
         assert_ne!(old, SKILL);
         let (_temp, dirs) = tree();
         setup(&dirs);
         put(&skill_path(&dirs), old);
+        setup(&dirs);
+        put(&skill_path(&dirs), previous);
         setup(&dirs);
         assert_eq!(
             read_optional(&skill_path(&dirs)).unwrap().as_deref(),
@@ -557,6 +565,17 @@ mod tests {
         put(&skill_path(&dirs), old);
         disable(&dirs).unwrap();
         assert!(!skill_path(&dirs).exists());
+        let opted_out = SKILL.replace("auto-load: browser-use", "auto-load: off");
+        assert!(!bundled_skill(&opted_out));
+        put(&skill_path(&dirs), &opted_out);
+        assert!(enable(&dirs, Path::new("/node"), Path::new("/server"))
+            .unwrap_err()
+            .to_string()
+            .contains("local changes"));
+        assert_eq!(
+            read_optional(&skill_path(&dirs)).unwrap().as_deref(),
+            Some(opted_out.as_str())
+        );
     }
 
     #[test]
@@ -1209,24 +1228,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn desktop_and_browser_setup_share_the_same_document_lock() {
+    #[test]
+    fn browser_setup_respects_the_document_lock() {
         let (_t, dirs) = tree();
         setup(&dirs);
-        let mut root: Value =
-            serde_json::from_str(&read_optional(&config_path(&dirs)).unwrap().unwrap()).unwrap();
-        root["mcpServers"]["computer-use"] =
-            json!({"command":"unused", "managedBy":"atomcode-computer-use-v1"});
-        put(&config_path(&dirs), &root.to_string());
         let before = read_optional(&config_path(&dirs)).unwrap();
         let lock = lock_mcp_setup(&dirs).unwrap();
         assert!(enable(&dirs, Path::new("node"), Path::new("server")).is_err());
         assert!(disable(&dirs).is_err());
-        assert!(
-            crate::computer_cmd::execute(&dirs, crate::computer_cmd::ComputerCli::Disable)
-                .await
-                .is_err()
-        );
         assert_eq!(read_optional(&config_path(&dirs)).unwrap(), before);
         drop(lock);
         disable(&dirs).unwrap();

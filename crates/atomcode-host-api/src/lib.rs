@@ -25,21 +25,6 @@ use tokio::sync::mpsc;
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::SeqNo;
 
-/// Explicit user intents for the host-local desktop integration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ComputerAction {
-    Status,
-    Doctor,
-    Enable,
-    /// Explicit exact application policy; an empty list denies all.
-    EnableScoped {
-        bundle_ids: Vec<String>,
-    },
-    /// Explicitly remove only the saved application restriction.
-    EnableUnrestricted,
-    Disable,
-}
-
 /// Explicit user intents for the host-local browser integration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrowserAction {
@@ -63,12 +48,6 @@ pub enum BrowserAction {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
-    /// Local desktop MCP setup/diagnosis. This changes configuration only;
-    /// Reload applies it to a live session. Never grants OS or tool permissions.
-    Computer {
-        session: String,
-        action: ComputerAction,
-    },
     /// Host-local browser MCP configuration; Reload applies it to live sessions.
     Browser {
         session: String,
@@ -408,7 +387,6 @@ impl HostCommand {
     pub fn addressed(&self) -> Option<&str> {
         match self {
             Self::Browser { session, .. }
-            | Self::Computer { session, .. }
             | Self::DisplayHistory { session, .. }
             | Self::NewSession { session }
             | Self::Resume { session, .. }
@@ -1681,36 +1659,6 @@ mod tests {
                 session: "a".into(),
                 args: "list".into(),
             },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::Status,
-            },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::Doctor,
-            },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::Enable,
-            },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::Disable,
-            },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::EnableScoped {
-                    bundle_ids: vec!["com.apple.TextEdit".into()],
-                },
-            },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::EnableScoped { bundle_ids: vec![] },
-            },
-            HostCommand::Computer {
-                session: "a".into(),
-                action: ComputerAction::EnableUnrestricted,
-            },
             HostCommand::Browser {
                 session: "a".into(),
                 action: BrowserAction::Status,
@@ -1925,7 +1873,6 @@ mod tests {
         for c in &all {
             match c {
                 HostCommand::Browser { .. }
-                | HostCommand::Computer { .. }
                 | HostCommand::DisplayHistory { .. }
                 | HostCommand::NewSession { .. }
                 | HostCommand::Resume { .. }

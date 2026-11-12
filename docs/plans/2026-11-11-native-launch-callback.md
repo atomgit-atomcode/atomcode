@@ -1,3 +1,5 @@
+> Historical: the built-in `/computer` integration described here has been removed. Current browser setup and automatic use are tracked in `docs/plans/2026-11-12-browser-default-and-computer-retirement.md`.
+
 # Native App launch callback correction
 
 Baseline AtomCode 6c99543ef, clean isolated checkout. Exact experimental App doctor cold start reproducibly emits a MainActor data-race warning at MacOSAppAgentProxy.swift:102. The installed SDK declares the NSWorkspace completion handler nullable. Existing startup already waits for and verifies the exact App/socket/executable identity. Replace the unused actor-inheriting empty closure with nil, keeping that identity handshake and timeout authoritative. No new task, continuation, lifecycle owner, installed App replacement or permission change.
