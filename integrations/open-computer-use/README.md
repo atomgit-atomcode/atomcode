@@ -111,3 +111,20 @@ python3 integrations/open-computer-use/verify_application_scope.py \
 ```
 
 Native smoke uses synthetic window descriptors to prove denied/unknown bundles are refused before AX liveness reads, allowed descriptors proceed, and the actual cached window reader refuses a tightened scope. The real App/proxy harness covers all 15 tools under malformed policy, empty catalogs, model-argument override refusal, three client environments sharing one helper, and valid lease ownership failing to override full-display denial. It requests no screenshots or GUI input. An older lease-only App is rejected at capability validation before tool dispatch.
+
+## General desktop runtime acceptance and AX unknown effects
+
+The [native runtime acceptance record](../../docs/plans/2026-11-12-general-computer-use-basic-acceptance.md) now includes actual stock-App screenshots, field assignment, literal typing, a space key, scrolling, approvals and pending cancellation. These are exercised against a separate synthetic fixture through production Host/CodingRuntime with a scripted provider. A model's general desktop reasoning ability is a separate question.
+
+The installed pinned stock v1.3.0 is a recorded counterexample for an in-flight blocked AX click: one runtime call produced two external button actions after cancellation/release. Its click engine permits fallback after ambiguous AX errors. The source overlay now throws an unknown-effect/do-not-retry error instead of trying another action/candidate after such a result; partial multi-click effects also prevent fallback. The correction builds and passes native result-classification and no-GUI protocol checks. Actual corrected GUI acceptance remains required; do not describe it as accepted on stock evidence.
+
+Build a fresh fixture with the existing builder, then run only the explicitly selected local test:
+
+```sh
+ATOMCODE_DESKTOP_TEST_BACKEND='/absolute/granted/App.app/Contents/MacOS/OpenComputerUse' \
+ATOMCODE_DESKTOP_TEST_FIXTURE='/absolute/fixture.app/Contents/MacOS/AtomCodeCUFixture' \
+  cargo nextest run -p atomcode --test host --run-ignored only \
+  a_real_desktop_fixture_uses_runtime_images_approval_and_pending_cancel
+```
+
+The separate `a_real_desktop_inflight_cancel_does_not_repeat_an_unknown_action` criterion additionally operates its bounded gated callback and requires the corrected backend. Stock v1.3.0 is expected to fail this counterexample criterion. The corrected separately packaged App needs its own Accessibility and Screen Recording grants; the installed stock App's or Codex's grants do not transfer. Neither test grants permissions, captures a full display or shuts down the installed shared App. All input is addressed to the PID/window of the owned disposable fixture.

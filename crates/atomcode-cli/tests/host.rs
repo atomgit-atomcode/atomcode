@@ -105,10 +105,27 @@ impl LlmProvider for Scripted {
             }
             Some(m) if m.role == Role::User && m.text.starts_with("desktop fixture ") => {
                 let request: serde_json::Value = serde_json::from_str(&m.text[16..]).unwrap();
+                let observe = request["arguments"].get("window").is_some()
+                    && request["tool"] != "get_window_state";
                 StreamEvent::ToolCall(ToolCall {
-                    id: format!("call-{n}"),
-                    name: format!("mcp__computer-use__{}", request["tool"].as_str().unwrap()),
-                    arguments: request["arguments"].to_string(),
+                    id: if observe {
+                        format!("call-{n}-desktop-observe")
+                    } else {
+                        format!("call-{n}")
+                    },
+                    name: format!(
+                        "mcp__computer-use__{}",
+                        if observe {
+                            "get_window_state"
+                        } else {
+                            request["tool"].as_str().unwrap()
+                        }
+                    ),
+                    arguments: if observe {
+                        serde_json::json!({"window":request["arguments"]["window"],"include_screenshot":true}).to_string()
+                    } else {
+                        request["arguments"].to_string()
+                    },
                 })
             }
             Some(m) if m.role == Role::User && m.text.starts_with("browser navigate ") => {
@@ -133,6 +150,39 @@ impl LlmProvider for Scripted {
             // 不是对话里的一轮,认得出来是因为它带着自己的那段说明。
             Some(m) if m.text.starts_with("Predict the short message") => {
                 StreamEvent::TextDelta("接着把登录那条补上".into())
+            }
+            Some(m)
+                if m.role == Role::Tool
+                    && m.tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| id.ends_with("-desktop-observe")) =>
+            {
+                let user = messages
+                    .iter()
+                    .rev()
+                    .find(|m| {
+                        m.role == Role::User
+                            && !m.synthetic
+                            && m.text.starts_with("desktop fixture ")
+                    })
+                    .unwrap();
+                let mut request: serde_json::Value =
+                    serde_json::from_str(&user.text[16..]).unwrap();
+                let observation: serde_json::Value = serde_json::Deserializer::from_str(&m.text)
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                request["arguments"]["window"] = observation["window"].clone();
+                if request["arguments"].get("screenshotId").is_some() {
+                    request["arguments"]["screenshotId"] =
+                        observation["screenshots"][0]["id"].clone();
+                }
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: format!("mcp__computer-use__{}", request["tool"].as_str().unwrap()),
+                    arguments: request["arguments"].to_string(),
+                })
             }
             Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
             _ => StreamEvent::TextDelta(format!("answer {n}")),
@@ -4511,6 +4561,19 @@ async fn a_scoped_download_is_denied_before_dispatch_and_cancelled_without_publi
 #[serial_test::serial(atomcode_home)]
 #[ignore = "requires explicit ATOMCODE_DESKTOP_TEST_BACKEND and ATOMCODE_DESKTOP_TEST_FIXTURE with exact App OS grants; opens its own GUI fixture"]
 async fn a_real_desktop_fixture_uses_runtime_images_approval_and_pending_cancel() {
+    desktop_fixture_acceptance(false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires explicitly built corrected backend App and fixture with exact OS grants; stock v1.3.0 is a known duplicate-action counterexample"]
+async fn a_real_desktop_inflight_cancel_does_not_repeat_an_unknown_action() {
+    desktop_fixture_acceptance(true).await;
+}
+
+#[cfg(target_os = "macos")]
+async fn desktop_fixture_acceptance(in_flight: bool) {
     use serde_json::{json, Value};
     tokio::time::resume(); // Actual native App, filesystem and MCP I/O.
     let env = env();
@@ -4603,7 +4666,11 @@ async fn a_real_desktop_fixture_uses_runtime_images_approval_and_pending_cancel(
                                 .unwrap();
                         }
                     }
-                    AgentEvent::ToolStarted { .. } => started += 1,
+                    AgentEvent::ToolStarted { call }
+                        if call.name == format!("mcp__computer-use__{tool}") =>
+                    {
+                        started += 1
+                    }
                     AgentEvent::ToolResult { result: value } => result = Some(value),
                     AgentEvent::TurnComplete { .. } => break,
                     _ => {}
@@ -4618,7 +4685,11 @@ async fn a_real_desktop_fixture_uses_runtime_images_approval_and_pending_cancel(
             "read-only observations are safe; mutations require per-call approval"
         );
         assert_eq!(started, usize::from(decision == "allow"));
-        result.expect("one terminal tool result")
+        let result = result.expect("one terminal tool result");
+        if decision == "allow" {
+            assert!(!result.is_error, "{tool} failed: {}", result.content);
+        }
+        result
     }
     let listed = invoke(&mut connection, "list_windows", json!({}), "allow").await;
     assert!(!listed.is_error);
@@ -4700,6 +4771,200 @@ async fn a_real_desktop_fixture_uses_runtime_images_approval_and_pending_cancel(
     .await
     .unwrap();
     assert_eq!(state()["message"], "atomcode-runtime-desktop");
+    // Literal text entry uses the backend tool, independently witnessed on submit.
+    let _ = invoke(
+        &mut connection,
+        "get_window_state",
+        json!({"window":window,"include_screenshot":true}),
+        "allow",
+    )
+    .await;
+    assert!(
+        !invoke(
+            &mut connection,
+            "type_text",
+            json!({"window":window,"text":"atomcode-literal-input"}),
+            "allow"
+        )
+        .await
+        .is_error
+    );
+    assert!(
+        !invoke(
+            &mut connection,
+            "press_key",
+            json!({"window":window,"key":"space"}),
+            "allow"
+        )
+        .await
+        .is_error
+    );
+    let fresh = invoke(
+        &mut connection,
+        "get_window_state",
+        json!({"window":window,"include_screenshot":true}),
+        "allow",
+    )
+    .await;
+    let observation: Value = serde_json::Deserializer::from_str(&fresh.content)
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+    let button = index(
+        observation["accessibility"]["tree"].as_str().unwrap(),
+        "Record once",
+    );
+    assert!(!invoke(&mut connection, "click", json!({"window":window,"element_index":button,"click_method":"accessibility","screenshotId":observation["screenshots"][0]["id"]}), "allow").await.is_error);
+    assert_eq!(state()["submissions"], 2);
+    assert!(
+        state()["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("atomcode-literal-input "),
+        "literal text must arrive in the owned field: {}",
+        state()["message"]
+    );
+    let scroll_before = state()["scroll_y"].as_f64().unwrap();
+    let scroll = index(
+        observation["accessibility"]["tree"].as_str().unwrap(),
+        "Acceptance scroll area",
+    );
+    let fresh = invoke(
+        &mut connection,
+        "get_window_state",
+        json!({"window":window,"include_screenshot":true}),
+        "allow",
+    )
+    .await;
+    let observation: Value = serde_json::Deserializer::from_str(&fresh.content)
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(!invoke(&mut connection, "scroll", json!({"window":window,"element_index":scroll,"direction":"up","pages":1,"screenshotId":observation["screenshots"][0]["id"]}), "allow").await.is_error);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state()["scroll_y"].as_f64().unwrap() == scroll_before {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if in_flight {
+        // Cancel only after the independent application witnesses the action in flight.
+        let fresh = invoke(
+            &mut connection,
+            "get_window_state",
+            json!({"window":window,"include_screenshot":true}),
+            "allow",
+        )
+        .await;
+        let observation: Value = serde_json::Deserializer::from_str(&fresh.content)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        let button = index(
+            observation["accessibility"]["tree"].as_str().unwrap(),
+            "Gated record",
+        );
+        let arguments = json!({"window":window,"element_index":button,"click_method":"accessibility","screenshotId":observation["screenshots"][0]["id"]});
+        connection
+            .commands
+            .send(message(&format!(
+                "desktop fixture {}",
+                json!({"tool":"click","arguments":arguments})
+            )))
+            .unwrap();
+        let mut dispatched = 0;
+        let mut dispatched_id = None;
+        let mut cancelled = false;
+        let mut cancel_sent = None;
+        let mut results = 0;
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                match connection
+                    .events
+                    .recv()
+                    .await
+                    .expect("in-flight desktop events")
+                {
+                    AgentEvent::Request { id, kind, .. } => {
+                        assert_eq!(kind, "approval");
+                        connection
+                            .commands
+                            .send(AgentCommand::Respond {
+                                id,
+                                value: json!({"decision":"allow"}),
+                            })
+                            .unwrap();
+                    }
+                    AgentEvent::ToolStarted { call } if call.name == "mcp__computer-use__click" => {
+                        dispatched_id = Some(call.id);
+                        dispatched += 1;
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while state()["stage"] != "entered-gated-action" {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(state()["submissions"], 2);
+                        cancel_sent = Some(tokio::time::Instant::now());
+                        connection.commands.send(AgentCommand::Cancel).unwrap();
+                    }
+                    AgentEvent::ToolResult { result }
+                        if dispatched_id.as_deref() == Some(result.call_id.as_str()) =>
+                    {
+                        results += 1;
+                        assert!(
+                            result.is_error,
+                            "an interrupted dispatched action is not a successful acknowledgement"
+                        );
+                    }
+                    AgentEvent::Cancelled => cancelled = true,
+                    AgentEvent::TurnComplete { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(dispatched, 1);
+        assert_eq!(results, 1);
+        assert!(cancelled);
+        assert!(cancel_sent.unwrap().elapsed() < Duration::from_secs(5));
+        assert_eq!(state()["stage"], "entered-gated-action");
+        assert_eq!(state()["submissions"], 2);
+        // Cancelling a transport cannot roll back an accepted external GUI action.
+        // Let this owned callback finish only after the runtime terminal was observed.
+        std::fs::write(&gate, b"release owned callback").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state()["submissions"] != 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "owned callback did not finish: state={}, process={:?}, gate={}",
+                state(),
+                target.try_wait(),
+                gate.exists()
+            )
+        });
+        let late = quiet(&mut connection).await;
+        assert!(
+            !late.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolStarted { .. }
+                    | AgentEvent::ToolResult { .. }
+                    | AgentEvent::TurnComplete { .. }
+            )),
+            "late backend completion must not replay or add another terminal"
+        );
+        assert_eq!(state()["submissions"], 3);
+    }
     connection.commands.send(AgentCommand::Shutdown).unwrap();
     target.start_kill().unwrap();
     target.wait().await.unwrap();

@@ -667,12 +667,27 @@ index 0000000..cfaf729
 +    }
 +}
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
-index 9d96b02..9aa6607 100644
+index 9d96b02..c0fe3a2 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
 +++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseService.swift
-@@ -177,0 +178 @@ func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
+@@ -5,0 +6,14 @@ import ImageIO
++// An issued AX request can take effect even when its reply times out. Only a
++// definite unsupported first action permits trying another implementation.
++func knownAccessibilityActionResult(_ result: AXError, previousSuccesses: Int) throws -> Bool {
++    switch result {
++    case .success:
++        return true
++    case .actionUnsupported, .attributeUnsupported, .illegalArgument:
++        if previousSuccesses == 0 { return false }
++        fallthrough
++    default:
++        throw ComputerUseError.message("Accessibility action result is unknown (\(result.rawValue)); do not automatically retry or fall back. Re-observe before deciding what to do next.")
++    }
++}
++
+@@ -177,0 +192 @@ func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
 +    guard let scope = try? ApplicationScope(environment: environment), !scope.isRestricted else { return false }
-@@ -456,0 +458,11 @@ public final class ComputerUseService {
+@@ -456,0 +472,11 @@ public final class ComputerUseService {
 +    var requiresExplicitTurnObservations = false {
 +        didSet {
 +            if requiresExplicitTurnObservations && scopedObservationNamespace == nil {
@@ -684,11 +699,11 @@ index 9d96b02..9aa6607 100644
 +        }
 +    }
 +    private var scopedObservationNamespace: String?
-@@ -466 +478,2 @@ public final class ComputerUseService {
+@@ -466 +492,2 @@ public final class ComputerUseService {
 -    // must be unique per service instance, not per window.
 +    // must be unique per service instance, not per window. Negotiated services
 +    // also have a random instance namespace, so reconnects cannot reissue IDs.
-@@ -470,0 +484,8 @@ public final class ComputerUseService {
+@@ -470,0 +498,8 @@ public final class ComputerUseService {
 +    // A matching host-turn release invalidates observations, but must not reset
 +    // the screenshot sequence and accidentally reissue a prior owner's IDs.
 +    func clearTurnObservations() {
@@ -697,35 +712,53 @@ index 9d96b02..9aa6607 100644
 +        windowScreenshotMeta.removeAll()
 +    }
 +
-@@ -474 +495,2 @@ public final class ComputerUseService {
+@@ -474 +509,2 @@ public final class ComputerUseService {
 -        "shot-\(windowID)-\(counter)"
 +        let prefix = scopedObservationNamespace.map { "shot-\($0)" } ?? "shot"
 +        return "\(prefix)-\(windowID)-\(counter)"
-@@ -560 +582,5 @@ public final class ComputerUseService {
+@@ -560 +596,5 @@ public final class ComputerUseService {
 -        ToolCallResult.text(
 +        guard let scope = try? ApplicationScope.current() else {
 +            return ToolCallResult.text("Invalid application scope.", isError: true)
 +        }
 +        if scope.deniesAll { return ToolCallResult.text("") }
 +        return ToolCallResult.text(
-@@ -606,0 +633 @@ public final class ComputerUseService {
+@@ -606,0 +647 @@ public final class ComputerUseService {
 +        if try ApplicationScope.current().deniesAll { return ToolCallResult.text("[]") }
-@@ -648,0 +676 @@ public final class ComputerUseService {
+@@ -648,0 +690 @@ public final class ComputerUseService {
 +        try ApplicationScope.current().requireUnrestrictedDisplay()
-@@ -858 +886 @@ public final class ComputerUseService {
+@@ -858 +900 @@ public final class ComputerUseService {
 -    private func cacheWindowSnapshot(_ snapshot: AppSnapshot, windowID: CGWindowID) {
 +    func cacheWindowSnapshot(_ snapshot: AppSnapshot, windowID: CGWindowID) {
-@@ -871 +899 @@ public final class ComputerUseService {
+@@ -871 +913 @@ public final class ComputerUseService {
 -    private func windowSnapshot(for windowID: CGWindowID) throws -> AppSnapshot {
 +    func windowSnapshot(for windowID: CGWindowID) throws -> AppSnapshot {
-@@ -872,0 +901 @@ public final class ComputerUseService {
+@@ -872,0 +915 @@ public final class ComputerUseService {
 +            try AppSafetyPolicy.requireAllowed(bundleIdentifier: snapshot.app.bundleIdentifier)
-@@ -1543,0 +1573 @@ public final class ComputerUseService {
+@@ -1543,0 +1587 @@ public final class ComputerUseService {
 +            try AppSafetyPolicy.requireAllowed(bundleIdentifier: snapshot.app.bundleIdentifier)
-@@ -1546,0 +1577,3 @@ public final class ComputerUseService {
+@@ -1546,0 +1591,3 @@ public final class ComputerUseService {
 +        if requiresExplicitTurnObservations {
 +            throw ComputerUseError.message("No app state is available for this turn. Observe the selected target before action tools.")
 +        }
+@@ -1831,6 +1878 @@ public final class ComputerUseService {
+-            switch result {
+-            case .success:
+-                if index < attempts - 1 {
+-                    Thread.sleep(forTimeInterval: 0.05)
+-                }
+-            case .attributeUnsupported where action.caseInsensitiveCompare("AXOpen") == .orderedSame:
++            if result == .attributeUnsupported && action.caseInsensitiveCompare("AXOpen") == .orderedSame {
+@@ -1838 +1880,2 @@ public final class ComputerUseService {
+-            case .failure, .actionUnsupported, .attributeUnsupported, .cannotComplete, .noValue, .invalidUIElement, .illegalArgument:
++            }
++            guard try knownAccessibilityActionResult(result, previousSuccesses: index) else {
+@@ -1840,2 +1883,3 @@ public final class ComputerUseService {
+-            default:
+-                throw ComputerUseError.message("AXUIElementPerformAction(\(action)) failed with \(result.rawValue)")
++            }
++            if index < attempts - 1 {
++                Thread.sleep(forTimeInterval: 0.05)
 diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
 index d15220f..bfc5ec9 100644
 --- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/ComputerUseToolDispatcher.swift
@@ -938,12 +971,13 @@ index 352c7b8..4daffdb 100644
 +        try AppSafetyPolicy.requireAllowed(bundleIdentifier: descriptor.bundleIdentifier)
 diff --git a/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
 new file mode 100644
-index 0000000..1fb71f6
+index 0000000..b7a6ef3
 --- /dev/null
 +++ b/packages/OpenComputerUseKit/Tests/DesktopLeaseSmoke/main.swift
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,166 @@
 +import Foundation
 +import AppKit
++import ApplicationServices
 +@testable import OpenComputerUseKit
 +
 +struct LeaseSmokeFailure: Error {
@@ -1093,6 +1127,20 @@ index 0000000..1fb71f6
 +try require(staleScopeDenied, "the actual cached snapshot reader rejects tightened app scope")
 +if let previousScope { setenv(scopeKey, previousScope, 1) } else { unsetenv(scopeKey) }
 +print("Passed native application-scope parsing/identity/deny/cache/global-capture checks; no GUI actions.")
++
++// Pure production-result classification: no AX requests or GUI effects.
++try require(try knownAccessibilityActionResult(.success, previousSuccesses: 0), "successful action remains successful")
++for code: AXError in [.actionUnsupported, .attributeUnsupported, .illegalArgument] {
++    try require(try !knownAccessibilityActionResult(code, previousSuccesses: 0), "definite first-action refusal may fall back")
++    var refused = false
++    do { _ = try knownAccessibilityActionResult(code, previousSuccesses: 1) } catch { refused = true }
++    try require(refused, "partial multi-click cannot fall back and repeat prior effects")
++}
++for code: AXError in [.cannotComplete, .failure, .noValue, .invalidUIElement] {
++    var refused = false
++    do { _ = try knownAccessibilityActionResult(code, previousSuccesses: 0) } catch { refused = true }
++    try require(refused, "unknown issued action must not trigger another action")
++}
 diff --git a/tests/AppAgentNamespaceSmoke/main.swift b/tests/AppAgentNamespaceSmoke/main.swift
 new file mode 100644
 index 0000000..047d64b

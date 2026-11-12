@@ -11,6 +11,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
     let message = NSTextField(string: "")
     let count = NSTextField(labelWithString: "Submissions: 0")
     var submissions = 0
+    let scroll = NSScrollView()
 
     init(state: URL, gate: URL) {
         self.state = state
@@ -18,7 +19,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window = NSWindow(contentRect: NSRect(x: 300, y: 300, width: 480, height: 230),
+        window = NSWindow(contentRect: NSRect(x: 300, y: 300, width: 480, height: 430),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "AtomCode CU Acceptance"
         let content = window.contentView!
@@ -37,10 +38,27 @@ final class Fixture: NSObject, NSApplicationDelegate {
         }
         count.frame = NSRect(x: 24, y: 30, width: 420, height: 24)
         content.addSubview(count)
+        scroll.frame = NSRect(x: 24, y: 230, width: 420, height: 170)
+        scroll.hasVerticalScroller = true
+        scroll.setAccessibilityLabel("Acceptance scroll area")
+        let document = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 1200))
+        for row in 0..<24 {
+            let label = NSTextField(labelWithString: "Synthetic scroll row \(row)")
+            label.frame = NSRect(x: 12, y: CGFloat(row * 48), width: 360, height: 24)
+            document.addSubview(label)
+        }
+        scroll.documentView = document
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(scrolled),
+            name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+        content.addSubview(scroll)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: false)
+        window.makeFirstResponder(message)
         save("ready")
     }
+
+    @objc func scrolled() { save("scrolled") }
 
     @objc func record() {
         submissions += 1
@@ -65,6 +83,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
     func save(_ stage: String) {
         let value: [String: Any] = ["stage": stage, "submissions": submissions,
                                   "message": message.stringValue,
+                                  "scroll_y": scroll.contentView.bounds.origin.y,
                                   "window_id": window.windowNumber,
                                   "process_id": Int(ProcessInfo.processInfo.processIdentifier)]
         do {
