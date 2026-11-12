@@ -1087,6 +1087,26 @@ impl LiveViewHub {
     /// Move an idle runtime to a fresh staged session. CodingRuntime owns the
     /// transition and releases the previous session lease before returning the
     /// terminal, which lets callers safely delete the old aggregate afterwards.
+    pub async fn fork_session(
+        &self,
+        expected: &LiveBinding,
+    ) -> Result<FreshSessionOutcome, HubError> {
+        let handle = self.bound_handle_for(expected)?;
+        let changed = handle
+            .fork_session(&expected.session_id)
+            .await
+            .map_err(map_session_transition_error)?;
+        let projection_error = self
+            .commit_changed_snapshot(expected, &handle, &changed)
+            .await
+            .err();
+        wait_mcp_ready_after_transition(&handle).await;
+        Ok(FreshSessionOutcome {
+            changed,
+            projection_error,
+        })
+    }
+
     pub async fn fresh_session(
         &self,
         expected: &LiveBinding,

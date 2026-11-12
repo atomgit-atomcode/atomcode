@@ -8145,3 +8145,232 @@ async fn runtime_shutdown_awaits_mcp_eof_cleanup_before_its_terminal() {
     drop(keep_clock);
     clock.await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn an_explicit_fork_compacts_independently_and_keeps_the_original_resumable() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    for n in 0..6 {
+        turn(
+            &mut runtime,
+            &format!("original {n} {}", "context ".repeat(500)),
+        )
+        .await;
+    }
+    let source = runtime.session.as_ref().unwrap().id.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let original = manager.load_events(&source).unwrap();
+    let before = runtime.handle.snapshot().await.unwrap();
+    let cwd = runtime.handle.context_stats().await.unwrap().working_dir;
+    let branch = runtime
+        .handle
+        .fork_session(&source)
+        .await
+        .unwrap()
+        .session_id
+        .unwrap();
+    assert_ne!(branch, source);
+    assert!(
+        runtime.handle.fork_session(&source).await.is_err(),
+        "a late fork must not copy the replacement session"
+    );
+    assert_eq!(manager.list().len(), 2);
+    assert_eq!(
+        manager
+            .read_event_header(&branch)
+            .unwrap()
+            .parent
+            .as_deref(),
+        Some(source.as_str())
+    );
+    assert_eq!(
+        runtime.handle.snapshot().await.unwrap().messages,
+        before.messages
+    );
+    assert_eq!(
+        runtime.handle.context_stats().await.unwrap().working_dir,
+        cwd
+    );
+    assert_eq!(manager.load_events(&source).unwrap(), original);
+    assert!(
+        manager
+            .load_native_session(&branch)
+            .unwrap()
+            .meta
+            .fork_info
+            .is_none(),
+        "manual branches must not be collapsed or garbage collected as automatic forks"
+    );
+    assert!(
+        manager.acquire_lease(&branch).is_err(),
+        "replacement owns the branch lease"
+    );
+    assert!(
+        manager.acquire_lease(&source).is_ok(),
+        "the original is released"
+    );
+    compact_and_wait(&mut runtime).await;
+    turn(&mut runtime, "branch only").await;
+    assert_eq!(
+        manager.load_events(&source).unwrap(),
+        original,
+        "compaction and new turns must only append to the branch"
+    );
+    let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
+    let mut entries = scan.entries;
+    SessionManager::collapse_fork_lineages(&mut entries);
+    assert!(entries.iter().any(|entry| entry.id == source));
+    assert!(entries.iter().any(|entry| entry.id == branch));
+    runtime.handle.resume_session(&source).await.unwrap();
+    assert_eq!(
+        runtime.handle.snapshot().await.unwrap().messages,
+        before.messages
+    );
+    turn(&mut runtime, "back in original").await;
+    assert!(!user_texts(&recorder.last_request())
+        .iter()
+        .any(|text| text == "branch only"));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_failed_explicit_fork_removes_its_candidate_and_keeps_the_original() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "keep this").await;
+    let source = runtime.session.as_ref().unwrap().id.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let original = manager.load_events(&source).unwrap();
+    let mut ids = manager.list().into_iter().map(|m| m.id).collect::<Vec<_>>();
+    ids.sort();
+    recorder.build_fails.store(true, Ordering::SeqCst);
+    assert!(runtime.handle.fork_session(&source).await.is_err());
+    assert_eq!(runtime.session.as_ref().unwrap().id, source);
+    assert_eq!(manager.load_events(&source).unwrap(), original);
+    let mut after = manager.list().into_iter().map(|m| m.id).collect::<Vec<_>>();
+    after.sort();
+    assert_eq!(
+        after, ids,
+        "failed candidate must not remain in the catalog"
+    );
+    recorder.build_fails.store(false, Ordering::SeqCst);
+    turn(&mut runtime, "original still usable").await;
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn an_explicit_fork_refuses_running_turns_and_pending_questions_before_copying() {
+    for text in ["hang", "ask me"] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut runtime = CodingRuntime::start(start_attended(
+            env.project.path(),
+            &recorder,
+            SessionMode::Fresh,
+        ))
+        .await
+        .unwrap();
+        turn(&mut runtime, "seed").await;
+        let source = runtime.session.as_ref().unwrap().id.clone();
+        let manager = SessionManager::for_project(
+            env.project.path(),
+            &atomcode_coding::config::product_dirs_from_env(),
+        );
+        runtime.handle.submit(UserInput::from(text)).await.unwrap();
+        if text == "ask me" {
+            loop {
+                let envelope =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if matches!(envelope.event, CodingRuntimeEvent::Request(_)) {
+                    break;
+                }
+            }
+        }
+        assert!(matches!(
+            runtime.handle.fork_session(&source).await,
+            Err(atomcode_coding::RuntimeError::Busy)
+        ));
+        assert_eq!(runtime.session.as_ref().unwrap().id, source);
+        assert_eq!(
+            manager.list().len(),
+            1,
+            "busy refusal must not publish a candidate"
+        );
+        runtime.handle.cancel().await.unwrap();
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn an_explicit_fork_keeps_an_automatic_fork_as_a_durable_return_point() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "original context").await;
+    let root = runtime.session.as_ref().unwrap().id.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let (_, lease) = manager
+        .fork_native_session(&root, "automatic", atomcode_capabilities::session::now_ms())
+        .unwrap();
+    drop(lease);
+    runtime.handle.resume_session("automatic").await.unwrap();
+    let branch = runtime
+        .handle
+        .fork_session("automatic")
+        .await
+        .unwrap()
+        .session_id
+        .unwrap();
+    assert!(manager
+        .load_native_session("automatic")
+        .unwrap()
+        .meta
+        .fork_info
+        .is_none());
+    runtime.handle.resume_session(&root).await.unwrap();
+    let (_, lease) = manager
+        .fork_native_session(
+            &root,
+            "another-automatic",
+            atomcode_capabilities::session::now_ms(),
+        )
+        .unwrap();
+    let mut entries =
+        SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user()).entries;
+    SessionManager::collapse_fork_lineages(&mut entries);
+    assert!(entries.iter().any(|entry| entry.id == "automatic"));
+    assert!(entries.iter().any(|entry| entry.id == branch));
+    assert!(
+        manager.load_native_session("automatic").is_ok(),
+        "automatic GC must retain the explicit return point"
+    );
+    drop(lease);
+    runtime.handle.shutdown().await.unwrap();
+}

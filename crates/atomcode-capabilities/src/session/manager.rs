@@ -2956,8 +2956,39 @@ impl SessionManager {
         destination_id: &str,
         now_ms: i64,
     ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.copy_native_session(source_id, destination_id, now_ms, false)
+    }
+
+    /// Explicit user branch: retain provenance in the event header, but keep an
+    /// independent catalog identity instead of automatic busy-fork collapse/GC.
+    pub fn branch_native_session(
+        &self,
+        source: &SessionLease,
+        destination_id: &str,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.validate_lease(source)?;
+        let copied = self.copy_native_session(source.id(), destination_id, now_ms, true)?;
+        // An intentional branch also keeps its chosen return point. Otherwise
+        // an unused automatic busy-session fork could still be collapsed/reaped.
+        if let Err(error) = self.update_meta(source.id(), |meta| meta.fork_info = None) {
+            self.delete(&copied.1)?;
+            return Err(error);
+        }
+        Ok(copied)
+    }
+
+    fn copy_native_session(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        now_ms: i64,
+        explicit: bool,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
         let source = self.load_native_session(source_id)?;
-        self.reap_abandoned_forks(&source);
+        if !explicit {
+            self.reap_abandoned_forks(&source);
+        }
         let destination_lease = self.acquire_lease(destination_id)?;
         let source_name_was_placeholder =
             SessionMeta::name_needs_fallback(&source.meta.name, source_id);
@@ -2985,6 +3016,11 @@ impl SessionManager {
             base_message_count: source.meta.message_count,
             base_turn_count: source.meta.turn_count,
         });
+        if explicit {
+            meta.fork_info = None;
+            meta.origin = SessionOrigin::Manual;
+            meta.name = format!("{} (fork)", source.meta.name);
+        }
         if self.is_event_session(source_id) {
             self.fork_event_session(
                 source_id,
@@ -2993,7 +3029,13 @@ impl SessionManager {
                 &source.presentation,
                 now_ms,
             )?;
-            let forked = self.load_native_session(destination_id)?;
+            let forked = match self.load_native_session(destination_id) {
+                Ok(forked) => forked,
+                Err(error) => {
+                    self.delete(&destination_lease)?;
+                    return Err(error);
+                }
+            };
             return Ok((forked, destination_lease));
         }
         let forked = LoadedSession {

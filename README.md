@@ -510,6 +510,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 | Command              | Action                                                                                     |
 | -------------------- | ------------------------------------------------------------------------------------------ |
+| `/fork`              | Copy the current conversation and switch to it; use `/compact` in the copy or `/resume <original-id>` to return (working files remain shared) |
 | `/resume`            | Resume or switch session                                                                   |
 | `/session`           | Start a new session                                                                        |
 | `/rename <name>`     | Rename the current session                                                                 |

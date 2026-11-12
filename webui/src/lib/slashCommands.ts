@@ -75,6 +75,7 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
       return h.changeDir(a);
     },
   },
+  { name: 'fork', descKey: 'cmd.fork.desc', run: (a, h) => h.execServerCommand('fork', a) },
   { name: 'resume', descKey: 'cmd.resume.desc', run: (_a, h) => h.openSessionSidebar() },
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
   { name: 'skills', descKey: 'cmd.skills.desc', run: (a, h) => h.openSlashSkillsMenu(a) },

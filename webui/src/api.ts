@@ -1292,6 +1292,7 @@ export async function postLiveProvider(
 // --- /command endpoint ---
 
 export type CommandResult =
+  | { kind: 'fork'; session_id: string; source_id: string; warning?: string | null }
   | { kind: 'quality'; text: string }
   | { kind: 'undo'; undone: number }
   | { kind: 'remember'; scope: 'global' | 'project' | 'local'; text?: string }

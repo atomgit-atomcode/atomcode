@@ -2095,6 +2095,19 @@ impl HostControl for RuntimeControl {
                 let changed = self.handle.fresh_session().await.map_err(refused)?;
                 self.changed(changed.session_id)
             }
+            HostCommand::ForkSession { session } => {
+                self.addressed(&session)?;
+                let changed = self.handle.fork_session(&session).await.map_err(refused)?;
+                let id = changed.session_id.clone().ok_or(HostError::Unavailable)?;
+                self.changed(changed.session_id)?;
+                Ok(HostReply::DoneWithNote {
+                    note: tr(SMsg::SessionForked {
+                        source: &session,
+                        id: &id,
+                    })
+                    .into_owned(),
+                })
+            }
             HostCommand::Resume { session, target } => {
                 use atomcode_capabilities::session::SessionManager;
                 self.addressed(&session)?;

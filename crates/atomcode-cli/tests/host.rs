@@ -4475,3 +4475,45 @@ async fn a_scoped_download_is_denied_before_dispatch_and_cancelled_without_publi
     }
     connection.commands.send(AgentCommand::Shutdown).unwrap();
 }
+
+#[tokio::test]
+async fn an_explicit_fork_changes_the_host_session_and_keeps_source_addressing_strict() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let source = connection.session.clone();
+    connection
+        .commands
+        .send(message("remember this before forking"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let mut watching = connection.control.subscribe();
+    let result = connection
+        .control
+        .call(HostCommand::ForkSession {
+            session: source.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, HostReply::DoneWithNote { .. }));
+    let Some(HostEvent::SessionChanged {
+        session: branch,
+        previous,
+    }) = tokio::time::timeout(Duration::from_secs(5), watching.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected session change");
+    };
+    assert_ne!(branch, source);
+    assert_eq!(previous, Some(source.clone()));
+    assert!(connection
+        .control
+        .call(HostCommand::ForkSession { session: source })
+        .await
+        .is_err());
+    connection
+        .commands
+        .send(message("continue the branch"))
+        .unwrap();
+    through_turn(&mut connection).await;
+}

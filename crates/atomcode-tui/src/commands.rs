@@ -953,6 +953,7 @@ fn session_catalogue() -> Vec<Command> {
         Command::said("clear", t(Msg::CmdAboutClear)),
         // `/session` is the same fresh start, named the way the reference does,
         // with `/new` as its memorable alias — one row, not two.
+        Command::said("fork", t(Msg::CmdAboutFork)),
         Command::said("session", t(Msg::CmdAboutSession)).with_aliases(&["new"]),
         Command::said_taking("resume", t(Msg::CmdTakesSessionId), t(Msg::CmdAboutResume)),
         // One command for everything about background sessions: bare, it moves
@@ -1784,6 +1785,30 @@ impl CommandSet for SessionCommands {
                 Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
                     crate::sheet::List::new("agents", t(Msg::AgentsPickerHint), rows),
                 )))
+            }
+            "fork" => {
+                if !args.trim().is_empty() {
+                    return Outcome::Refused("Usage: /fork".into());
+                }
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::ForkLeadOnly).into_owned());
+                }
+                if let Some(refused) = waits_for_the_turn(name) {
+                    return refused;
+                }
+                let Some(control) = control else {
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
+                };
+                match control
+                    .call(HostCommand::ForkSession {
+                        session: root.clone(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
+                    Ok(_) => Outcome::Quiet,
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
             }
             "resume" => {
                 let Some(control) = control else {
@@ -4532,6 +4557,32 @@ mod tests {
             "asked: {:?}",
             host.asked.lock().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn fork_is_discoverable_and_dispatched_as_an_explicit_host_operation() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::DoneWithNote {
+                note: "forked; original retained".into(),
+            }));
+        assert!(matches!(
+            all.dispatch("/fork", &app.context()).await,
+            Outcome::Said(_)
+        ));
+        assert!(host
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, HostCommand::ForkSession { .. })));
+        assert!(matches!(
+            all.dispatch("/fork unexpected", &app.context()).await,
+            Outcome::Refused(_)
+        ));
     }
 
     /// A successful busy resume carries the source/fork notice. It belongs on

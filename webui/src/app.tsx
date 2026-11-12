@@ -12,7 +12,7 @@ import { ModelConfigDialog } from './components/ModelProviders';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
+import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, postCommand, SessionMetaWithProject } from './api';
 import { useT, useSettings, SettingsSection } from './settings';
 import { applyConfigDefaults, initNotificationPermissionPrompt } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
@@ -67,6 +67,11 @@ export function App() {
   }, []);
   // Bound runtime identity; history browsing never changes this value.
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const sessionIdentityRef = useRef(sessionId);
+  sessionIdentityRef.current = sessionId;
+  const forkingRef = useRef(false);
+  const [forking, setForking] = useState(false);
+  const [forkNotice, setForkNotice] = useState<{id:string;text:string}|null>(null);
   const [workbenchFile, setWorkbenchFile] = useState<{session:string;path:string;seq:number}|null>(null);
   useEffect(() => {
     const open = (event: Event) => {
@@ -387,6 +392,7 @@ export function App() {
   }
 
   function activateSession(session: SessionMetaWithProject) {
+    sessionIdentityRef.current = session.id;
     setBrowseSession(null);
     setOptimisticSession(null);
     setSessionId(session.id);
@@ -460,6 +466,27 @@ export function App() {
     if (id === sessionId) {
       setActiveSession((prev) => (prev ? { ...prev, name } : prev));
     }
+  }
+
+  async function handleForkSession() {
+    if (!activeSession || !sessionId || browseSession || executionActiveRef.current || forkingRef.current) throw new Error(t('cmd.fork.unavailable'));
+    const source = activeSession;
+    forkingRef.current = true;
+    setForking(true);
+    setHeaderMenuOpen(false);
+    try {
+      const result = await postCommand({command:'fork', arg:'', session_id:source.id, working_dir:source.working_dir, project_hash:source.project_hash});
+      if (result.kind === 'error') throw new Error(result.message);
+      if (result.kind !== 'fork') throw new Error(t('cmd.fork.failed'));
+      // Creation/transition already committed. Metadata lookup failure must not
+      // turn this into a failed operation that the person retries.
+      const record = await resolveSession(result.session_id).catch(() => null);
+      if (sessionIdentityRef.current === source.id || sessionIdentityRef.current === result.session_id) {
+        activateSession(record ?? {...source,id:result.session_id,name:`${source.name} (fork)`});
+        setSessionListVersion(value => value + 1);
+        setForkNotice({id:result.session_id,text:t('cmd.fork.done',{source:result.source_id}) + (result.warning ? ` ${result.warning}` : '')});
+      }
+    } finally { forkingRef.current = false; setForking(false); }
   }
 
   /** Export the active session's conversation as a Markdown file. */
@@ -599,6 +626,10 @@ export function App() {
                 >
                   <span>{t('sidebar.rename')}</span>
                 </button>
+                <button class="item-menu-row" disabled={forking || executionActive || !!browseSession}
+                  onClick={() => void handleForkSession().catch(error => alert(String(error)))}>
+                  <span>{t(forking ? 'cmd.fork.pending' : 'cmd.fork.desc')}</span>
+                </button>
                 <button
                   class="item-menu-row"
                   onClick={handleExportMarkdown}
@@ -622,6 +653,7 @@ export function App() {
 
         <div class="session-body app-sidebar">
           <div class="session-chat-column">
+          {forkNotice?.id === sessionId && <div class="session-fork-notice" role="status"><span>{forkNotice.text}</span></div>}
           <Chat
             browseSession={browseSession}
             onExecutionState={reportExecution}
@@ -645,6 +677,7 @@ export function App() {
             onLanding={setIsLanding}
             skillInsert={skillInsert}
             composerInsert={composerInsert}
+            onForkSession={handleForkSession}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
           </div>

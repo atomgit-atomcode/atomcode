@@ -286,3 +286,12 @@ test('/quality dispatches to the server without changing approval mode', async (
   assert.deepEqual(result, { handled: true });
   assert.deepEqual(calls, ['exec:quality:status']);
 });
+
+
+test('/fork is in help and routes to the explicit server operation', async () => {
+  const { h, calls } = fakeHandlers();
+  assert(FRONTEND_COMMANDS.some(command => command.name === 'fork'));
+  assert(buildHelpText(h.t).includes('/fork'));
+  await dispatchSlashCommand('/fork', buildCommandMap(FRONTEND_COMMANDS), h);
+  assert.deepEqual(calls, ['exec:fork:']);
+});

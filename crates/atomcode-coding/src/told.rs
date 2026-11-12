@@ -233,7 +233,8 @@ mod tests {
                 ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_) | ReprepareTarget::McpSessionPaused { .. } => Heard::Told,
                 // A new session: its prompt says where it is, and there is no
                 // conversation above it to be told about.
-                ReprepareTarget::Fresh
+                ReprepareTarget::Fork { .. }
+                | ReprepareTarget::Fresh
                 | ReprepareTarget::Resume(_)
                 | ReprepareTarget::ResumeWithLease { .. }
                 | ReprepareTarget::ChangeDirectory(_) => Heard::AlreadyAFact,

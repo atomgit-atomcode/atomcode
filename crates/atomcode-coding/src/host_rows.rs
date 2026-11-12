@@ -164,7 +164,11 @@ impl SessionNativePlugin {
                  and nothing else; `<id>.index` holds its name, working directory \
                  and per-turn statistics.\n\
                  Continuing a session is the person's to do, never yours, and never \
-                 by editing these files or any configuration: `/resume` in the \
+                 by editing these files or any configuration: `/fork` copies the current \
+                 conversation into an independent session and switches to it; it does not \
+                 copy working-tree files or compact automatically. `/compact` can then \
+                 compress the copy, while `/resume <original-id>` returns to the original. \
+                 `/resume` in the \
                  terminal UI, `atomcode --continue` (the latest) or `atomcode \
                  --resume <id-or-name>` when starting — `atomcode -p \"…\" --resume \
                  <id>` for a one-shot run — or picking it from the session list in \

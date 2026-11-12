@@ -3300,3 +3300,44 @@ async fn a_background_failure_reaches_its_parent_without_a_conclusion() {
     assert_eq!(rig.client.root(), parent);
     rig.quit().await;
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn a_browser_fork_keeps_the_terminal_host_in_sync_and_the_original_resumable() {
+    let rig = Rig::new().await;
+    let source = rig.client.root();
+    rig.term.type_line("source for browser fork");
+    rig.until_screen("answer 1").await;
+    rig.until("source idle", |rig| rig.client.root_settled())
+        .await;
+    share(&rig).await;
+    let binding = atomcode_daemon::native_live::binding().unwrap();
+    let result = atomcode_daemon::native_live::fork_session(&binding)
+        .await
+        .unwrap();
+    assert!(result.projection_error.is_none());
+    let branch = result.changed.session_id.unwrap();
+    rig.until("terminal follows browser fork", |rig| {
+        rig.client.root() == branch
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        branch
+    );
+    rig.term.type_line("continue browser fork in terminal");
+    rig.until_screen("answer 2").await;
+    rig.until("branch idle", |rig| rig.client.root_settled())
+        .await;
+    rig.term.type_line(&format!("/resume {source}"));
+    rig.until("original resumes after browser fork", |rig| {
+        rig.client.root() == source
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        source
+    );
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}

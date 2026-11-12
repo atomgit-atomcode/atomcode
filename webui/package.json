@@ -15,6 +15,7 @@
     "test:permission": "node scripts/permission-e2e.mjs",
     "test:todo-sources": "node scripts/todo-sources-e2e.mjs",
     "test:workspace-actions": "node scripts/workspace-actions-e2e.mjs",
+    "test:session-fork": "node scripts/session-fork-e2e.mjs",
     "test:session-browse": "node scripts/session-browse-e2e.mjs",
     "test:message-images": "node scripts/message-images-e2e.mjs",
     "test:grouped-history": "node scripts/grouped-history-e2e.mjs",

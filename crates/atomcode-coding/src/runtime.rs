@@ -3112,6 +3112,19 @@ impl CodingRuntimeHandle {
             .await
     }
 
+    /// Copy the committed conversation and switch through the existing runtime
+    /// replacement transaction. No worktree copy or implicit compaction.
+    pub async fn fork_session(
+        &self,
+        source: impl Into<String>,
+    ) -> Result<SessionChanged, RuntimeError> {
+        self.reprepare_target(ReprepareTarget::Fork {
+            source: source.into(),
+            id: uuid::Uuid::new_v4().to_string(),
+        })
+        .await
+    }
+
     pub async fn resume_session(
         &self,
         id: impl Into<String>,
@@ -4449,6 +4462,10 @@ pub enum ReprepareTarget {
     },
     ReloadConfig(CodingAgentConfig),
     Fresh,
+    Fork {
+        source: String,
+        id: String,
+    },
     Resume(String),
     ResumeWithLease {
         id: String,
@@ -8682,6 +8699,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        let forking = matches!(&target, ReprepareTarget::Fork { .. });
+                        if forking && (active_turn.is_some() || !pending_requests.is_empty() || held_turn.is_some()
+                            || pending_mcp_reconnect.is_some() || background_jobs.pending() || background_jobs.uncollected()
+                            || goal.as_ref().is_some_and(|g| g.active) || loop_state.as_ref().is_some_and(|l| l.active)) {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
                         let Some(mut runtime) = resources.take() else {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
@@ -8782,6 +8806,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Ok(unchanged));
                             continue;
                         };
+                        let mut fork_cleanup = UncommittedFork(if forking {
+                            runtime.parts.session.as_ref().zip(prepared_lease.as_ref()).map(|(source, lease)| (source.manager.clone(), lease.clone()))
+                        } else { None });
                         let operation = input.operation;
                         let reuses_current_session = runtime
                             .parts
@@ -9052,6 +9079,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
                             }
                         }
+                        drop(fork_cleanup.0.take());
                         runtime = candidate;
                         if matches!(operation, ReconfigureKind::ResumeSession)
                             && !reuses_current_session
@@ -11501,6 +11529,24 @@ async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEve
     }
 }
 
+/// Keep failed explicit branches out of the catalog. The guard owns only a
+/// disk lease, never an agent lifecycle; the runtime disarms it at commit.
+struct UncommittedFork(
+    Option<(
+        Arc<atomcode_capabilities::session::SessionManager>,
+        SessionLease,
+    )>,
+);
+impl Drop for UncommittedFork {
+    fn drop(&mut self) {
+        if let Some((manager, lease)) = self.0.take() {
+            if let Err(error) = manager.delete(&lease) {
+                tracing::warn!(%error, "failed to discard uncommitted fork");
+            }
+        }
+    }
+}
+
 fn resolve_reprepare_input(
     runtime: &RuntimeResources,
     target: ReprepareTarget,
@@ -11613,6 +11659,37 @@ fn resolve_reprepare_input(
                     operation: ReconfigureKind::FreshSession,
                 },
                 None,
+                None,
+            )))
+        }
+        ReprepareTarget::Fork { source, id } => {
+            let binding = runtime.parts.session.as_ref().ok_or_else(|| {
+                RuntimeError::ReconfigureFailed("fork requires a persisted session".into())
+            })?;
+            if binding.id != source {
+                return Err(RuntimeError::ReconfigureFailed(
+                    "fork source is no longer the current session".into(),
+                ));
+            }
+            let (_, lease) = binding
+                .manager
+                .branch_native_session(
+                    &binding.lease,
+                    &id,
+                    atomcode_capabilities::session::now_ms(),
+                )
+                .map_err(|error| {
+                    RuntimeError::ReconfigureFailed(format!("cannot fork session: {error}"))
+                })?;
+            let mut prepare = runtime.prepare.clone();
+            prepare.session = crate::SessionMode::Resume(id);
+            Ok(Some((
+                ReprepareInput {
+                    config: runtime.config.clone(),
+                    prepare,
+                    operation: ReconfigureKind::ResumeSession,
+                },
+                Some(lease),
                 None,
             )))
         }

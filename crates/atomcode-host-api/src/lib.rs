@@ -64,6 +64,8 @@ pub enum HostCommand {
     /// Put an empty session in place of `session`, in the same working
     /// directory.
     NewSession { session: String },
+    /// Copy the current conversation and switch to the independent session.
+    ForkSession { session: String },
     /// Put the stored session `target` in place of `session`.
     Resume { session: String, target: String },
     /// The thinking level `session`'s requests carry from now on. `None` is no
@@ -389,6 +391,7 @@ impl HostCommand {
             Self::Browser { session, .. }
             | Self::DisplayHistory { session, .. }
             | Self::NewSession { session }
+            | Self::ForkSession { session }
             | Self::Resume { session, .. }
             | Self::TaskSpecs { session, .. }
             | Self::FollowUp { session, .. }
@@ -1702,6 +1705,9 @@ mod tests {
             HostCommand::NewSession {
                 session: "a".into(),
             },
+            HostCommand::ForkSession {
+                session: "a".into(),
+            },
             HostCommand::Resume {
                 session: "a".into(),
                 target: "b".into(),
@@ -1875,6 +1881,7 @@ mod tests {
                 HostCommand::Browser { .. }
                 | HostCommand::DisplayHistory { .. }
                 | HostCommand::NewSession { .. }
+                | HostCommand::ForkSession { .. }
                 | HostCommand::Resume { .. }
                 | HostCommand::SetReasoningEffort { .. }
                 | HostCommand::ListSessions { .. }

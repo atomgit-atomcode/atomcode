@@ -495,6 +495,12 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
 /// Move the bound runtime to a fresh staged session. This is the only safe way
 /// for the daemon to release the current idle session's lease before deleting
 /// that session from disk.
+pub async fn fork_session(
+    expected: &LiveBinding,
+) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {
+    hub().fork_session(expected).await
+}
+
 pub async fn fresh_session(
     expected: &LiveBinding,
 ) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {

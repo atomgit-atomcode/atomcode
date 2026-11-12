@@ -302,6 +302,7 @@ interface ChatProps {
   onExecutionState?: (active: boolean) => void;
   sessionId: string | null;
   onSessionId: (id: string) => void;
+  onForkSession?: () => Promise<void>;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
   /** App-owned `/chat` approval projected into this component's composer seat. */
@@ -487,7 +488,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, onForkSession, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
@@ -2512,6 +2513,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
+        if (command === 'fork') {
+          if (arg.trim()) { pushCommandNotice('Usage: /fork'); return; }
+          try { if (!onForkSession) throw new Error(t('cmd.fork.unavailable')); await onForkSession(); } catch (error) { pushCommandNotice(String(error)); }
+          return;
+        }
         if (command === 'followup') {
           if (!sessionId) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
           const generation = sessionGenerationRef.current;
@@ -2653,7 +2659,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, slashOpen, sessionId, cwd, activeSession, provider, messages.length],
+    [t, modeState, sync, onCwdChanged, onForkSession, slashSkills, slashLoading, slashOpen, sessionId, cwd, activeSession, provider, messages.length],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,

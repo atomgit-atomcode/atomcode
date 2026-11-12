@@ -628,6 +628,12 @@ pub enum Msg<'a> {
     CmdAboutClear,
     CmdAboutSession,
     CmdAboutResume,
+    CmdAboutFork,
+    ForkLeadOnly,
+    SessionForked {
+        source: &'a str,
+        id: &'a str,
+    },
     CmdAboutEffort,
     CmdAboutUndo,
     CmdAboutRewind,
