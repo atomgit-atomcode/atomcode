@@ -77,6 +77,35 @@ try {
   await page.getByText('PAGE_ANSWER_24',{exact:true}).waitFor();
   assert.equal(await page.getByText('PAGE_PROMPT_0',{exact:true}).count(),0);
   assert.equal(pages.length,0,'no eager older-page fetch');
+  // Composer arrows recall the loaded user turns without submitting anything.
+  const input=page.locator('.message-input');
+  const value=async expected=>{await page.waitForFunction(expected=>document.querySelector('.message-input')?.value===expected,expected);};
+  await input.fill('UNSENT_DRAFT');
+  await input.press('ArrowUp');await value('PAGE_PROMPT_24');
+  await page.waitForFunction(()=>document.querySelector('.message-input')?.selectionStart==='PAGE_PROMPT_24'.length);
+  await input.press('ArrowUp');await value('PAGE_PROMPT_23');
+  await input.press('ArrowDown');await value('PAGE_PROMPT_24');
+  await input.press('ArrowDown');await value('UNSENT_DRAFT');
+  // Returning to the draft must start a fresh browse on the next Up.
+  await input.press('ArrowUp');await value('PAGE_PROMPT_24');
+  await input.fill('EDITED_DRAFT');
+  await input.press('ArrowDown');await value('EDITED_DRAFT');
+  await input.fill('first line\nsecond line');
+  await input.evaluate(el=>el.setSelectionRange(el.value.length,el.value.length));
+  await input.press('ArrowUp');await value('first line\nsecond line');
+  await input.evaluate(el=>el.setSelectionRange(0,0));
+  await input.press('ArrowUp');await value('PAGE_PROMPT_24');
+  await input.press('ArrowDown');await value('first line\nsecond line');
+  await input.fill('IME_DRAFT');
+  await input.evaluate(el=>el.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',isComposing:true,bubbles:true,cancelable:true})));
+  assert.equal(await input.inputValue(),'IME_DRAFT');
+  await input.fill('/mo');
+  await page.locator('.slash-popover').waitFor();
+  await input.press('ArrowUp');assert.equal(await input.inputValue(),'/mo');
+  await input.press('Escape');
+  await input.fill('');
+  assert.equal(pages.length,0,'recall never fetches or submits a turn');
+
   // Hold the old page, append a live reply, then release. It must survive.
   let requested;const waiting=new Promise(resolve=>requested=resolve);hold=requested;
   for (let attempt=0;attempt<20 && !pending;attempt++) {
@@ -91,8 +120,15 @@ try {
   const loadingBox=await loading.boundingBox();
   const firstUserBox=await page.locator('.user-message-wrapper').first().boundingBox();
   assert.ok(loadingBox && firstUserBox && loadingBox.y+loadingBox.height<=firstUserBox.y+1,'loading owns a row and does not cover the prompt');
-  emit({type:'user',text:'LIVE_PROMPT'});emit({type:'state',running:true});emit({type:'text',content:'LIVE_REPLY_SURVIVES'});
+  emit({type:'user',text:'LIVE_PROMPT\nSECOND_LINE'});emit({type:'state',running:true});emit({type:'text',content:'LIVE_REPLY_SURVIVES'});
   await page.getByText('LIVE_REPLY_SURVIVES',{exact:true}).waitFor();
+  await input.fill('RUNNING_DRAFT');
+  await input.press('ArrowUp');await value('LIVE_PROMPT\nSECOND_LINE');
+  await page.waitForFunction(()=>document.querySelector('.message-input')?.selectionStart===0);
+  await input.evaluate(el=>el.setSelectionRange(el.value.length,el.value.length));
+  await input.press('ArrowDown');await value('RUNNING_DRAFT');
+  await page.waitForFunction(()=>document.querySelector('.message-input')?.selectionStart==='RUNNING_DRAFT'.length);
+  await input.fill('');
   pending();pending=null;hold=null;
   await page.waitForTimeout(600);
   assert.equal(pages.length,1,'one request in flight');

@@ -1,3 +1,4 @@
+import { PromptHistory, promptHistoryDirection } from '../lib/promptHistory';
 import { HistoryLoading } from './HistoryLoading';
 import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
@@ -512,6 +513,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return () => media.removeEventListener('change', update);
   }, []);
   const [input, setInput] = useState('');
+  const promptHistoryRef = useRef(new PromptHistory<Message>());
+  const promptHistoryReading = useRef(false);
+  const promptHistoryRevision = useRef(0);
+  useEffect(() => {
+    promptHistoryRef.current.reset();
+    promptHistoryRevision.current++;
+  }, [sessionId]);
   // 组合期标记：仅用于 handleKeyDown 的守卫（菜单导航 / Enter 发送不得窃取
   // IME 候选窗的按键）。输入值本身始终受控同步，见 handleInput。
   const composingRef = useRef(false);
@@ -1797,6 +1805,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      promptHistoryRef.current.reset();
+      promptHistoryRevision.current++;
       liveSessionObservationRef.current++;
       historyAbortRef.current?.abort();
       serverHistoryRequest.current?.abort();
@@ -3226,6 +3236,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
 
   function sendMessage() {
+    promptHistoryRef.current.reset();
+    promptHistoryRevision.current++;
     const text = input.trim();
     const images = pendingImages;
     if (!text && images.length === 0) return;
@@ -3368,9 +3380,58 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       }
     }
 
+    const ta = textareaRef.current;
+    const direction = ta && promptHistoryDirection(e, ta.value, ta.selectionStart, ta.selectionEnd);
+    if (direction) {
+      if (promptHistoryReading.current) { e.preventDefault(); return; }
+      const candidates = messagesRef.current.filter(message => message.role === 'user' && !message.retainedHistory
+        && (message.archiveKey || displayImageMarkers(message.parts.filter(part => part.kind === 'text')
+          .map(part => part.text).join('\n'), message.images).trim()));
+      const scope = `${activeIdRef.current ?? ''}/${sessionGenerationRef.current}`;
+      const step = promptHistoryRef.current.move(scope, candidates, ta.value, direction);
+      if (step) {
+        e.preventDefault();
+        void recallPrompt(step, scope, ta.value, direction);
+        return;
+      }
+    }
+
     if (shouldSendComposerOnEnter(e, coarsePointer)) {
       e.preventDefault();
       sendMessage();
+    }
+  }
+
+  async function recallPrompt(step: { entry: Message } | { text: string }, scope: string, draft: string, direction: -1 | 1) {
+    const revision = promptHistoryRevision.current;
+    const release = 'entry' in step ? holdTimelineMessages([step.entry]) : () => {};
+    promptHistoryReading.current = true;
+    try {
+      const message = 'entry' in step ? await readTimelineMessage(step.entry) : null;
+      const text = message ? displayImageMarkers(message.parts.filter(part => part.kind === 'text')
+        .map(part => part.text).join('\n'), message.images) : ('text' in step ? step.text : '');
+      const ta = textareaRef.current;
+      if (!ta || composingRef.current || revision !== promptHistoryRevision.current || ta.value !== draft
+        || scope !== `${activeIdRef.current ?? ''}/${sessionGenerationRef.current}`) return;
+      if ('entry' in step) promptHistoryRef.current.accept(text);
+      setInput(text);
+      setSlashOpen(false);
+      setAtOpen(false);
+      requestAnimationFrame(() => {
+        if (ta.value !== text || revision !== promptHistoryRevision.current
+          || scope !== `${activeIdRef.current ?? ''}/${sessionGenerationRef.current}`) return;
+        // Stay at the appropriate boundary so repeated arrows can keep browsing.
+        const position = direction < 0 && text.includes('\n') ? 0 : text.length;
+        ta.setSelectionRange(position, position);
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+      });
+    } catch {
+      // Never recall an archive preview as if it were the person's full prompt.
+      promptHistoryRef.current.reset();
+    } finally {
+      release();
+      promptHistoryReading.current = false;
     }
   }
 
@@ -3496,6 +3557,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // input event (composition drafts included) so state always mirrors the DOM;
   // Preact's equal-value check then never writes the pre-edit buffer back.
   function commitComposerInput(ta: HTMLTextAreaElement) {
+    promptHistoryRef.current.reset();
+    promptHistoryRevision.current++;
     const val = ta.value;
     setInput(val);
     ta.style.height = 'auto';
