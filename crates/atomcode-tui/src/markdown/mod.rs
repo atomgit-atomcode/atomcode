@@ -72,6 +72,34 @@ pub struct Rendered {
     pub settled_lines: usize,
 }
 
+#[derive(Clone, Copy)]
+struct CodeFence {
+    marker: u8,
+    length: usize,
+}
+
+impl CodeFence {
+    fn parse(line: &str) -> Option<(Self, &str)> {
+        let marker = *line.as_bytes().first()?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let length = line.bytes().take_while(|byte| *byte == marker).count();
+        if length < 3 {
+            return None;
+        }
+        // The run is ASCII, so it always ends at a UTF-8 character boundary.
+        let rest = line.get(length..)?;
+        Some((Self { marker, length }, rest))
+    }
+
+    fn closes(self, line: &str) -> bool {
+        Self::parse(line).is_some_and(|(end, rest)| {
+            end.marker == self.marker && end.length >= self.length && rest.trim().is_empty()
+        })
+    }
+}
+
 /// Render `text`, and report the point past which it is settled.
 ///
 /// The streaming answer is one block whose text only grows, and re-rendering
@@ -100,7 +128,7 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
         };
     }
     let mut out = Vec::new();
-    let mut in_code: Option<String> = None;
+    let mut in_code: Option<(CodeFence, String)> = None;
     let mut code_lines: Vec<String> = Vec::new();
     // Rows of a table block that has not ended yet. See `settled` above.
     let mut table_rows: Vec<String> = Vec::new();
@@ -119,17 +147,22 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
         let body = trimmed.trim_start();
         let indent = trimmed.len() - body.len();
         // Fences first: inside a block, nothing else is markdown.
-        if let Some(rest) = body.strip_prefix("```") {
-            flush_table(&mut table_rows, &mut out, w, base);
-            match in_code.take() {
-                Some(lang) => {
-                    out.extend(code_block(&code_lines, &lang, w, base));
-                    code_lines.clear();
-                }
-                None => in_code = Some(rest.trim().to_string()),
+        if let Some((opener, lang)) = in_code.as_ref() {
+            if opener.closes(body) {
+                out.extend(code_block(&code_lines, lang, w, base));
+                code_lines.clear();
+                in_code = None;
+            } else {
+                code_lines.push(trimmed.to_string());
             }
-        } else if in_code.is_some() {
-            code_lines.push(trimmed.to_string());
+        } else if let Some((opener, rest)) = CodeFence::parse(body)
+            .filter(|(fence, rest)| fence.marker != b'`' || !rest.contains('`'))
+        {
+            flush_table(&mut table_rows, &mut out, w, base);
+            in_code = Some((
+                opener,
+                rest.split_whitespace().next().unwrap_or("").to_string(),
+            ));
         } else {
             match table_row(body) {
                 Some(row) => table_rows.push(row),
@@ -148,7 +181,7 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
     // An unterminated fence is common in a stream that is still arriving; show
     // what there is rather than swallowing it. A table block that never got its
     // closing blank line is the same case.
-    if let Some(lang) = in_code.filter(|_| !code_lines.is_empty()) {
+    if let Some((_, lang)) = in_code.filter(|_| !code_lines.is_empty()) {
         let visible_lang = if is_plaintext(&lang) {
             lang.as_str()
         } else {
@@ -1628,6 +1661,57 @@ mod tests {
                 strings.contains("SELECT asin"),
                 "highlight survives wrapping"
             );
+        }
+    }
+
+    #[test]
+    fn outer_fences_preserve_nested_markdown_as_one_surface() {
+        for marker in ["````", "~~~~"] {
+            let source = "# literal heading\n```bash\necho hello\n```\n~~~text\nliteral\n~~~";
+            let text = format!("{marker}markdown\n{source}\n{marker}");
+            let out = render(&text, 80, Style::new());
+            assert_eq!(out[0].plain(), "markdown");
+            assert_eq!(
+                out[1..]
+                    .iter()
+                    .map(Line::plain)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                source
+            );
+            assert!(out
+                .iter()
+                .all(|line| line.background == Some(Color::role(Role::PanelBg))));
+        }
+    }
+
+    #[test]
+    fn closing_fences_require_matching_marker_length_and_no_info() {
+        let source = "```\n~~~~\n````rust\n```` trailing\n正文";
+        let text = format!("````markdown\n{source}\n`````   \n# Heading");
+        let out = plain(&text, 80);
+        assert_eq!(out[1..out.len() - 1].join("\n"), source);
+        assert_eq!(out.last().unwrap(), "Heading");
+        assert_eq!(plain("~~~text\n# literal\n~~~", 80), ["# literal"]);
+        assert_eq!(
+            plain("```rust extra-info\nfn main() {}\n```", 80)[0],
+            "rust"
+        );
+    }
+
+    #[test]
+    fn nested_fence_streaming_keeps_the_open_block_unsettled() {
+        let text = "before\n````markdown\n# literal\n```bash\necho hello\n```\n~~~~\n";
+        for width in [20, 80] {
+            let r = render_settled(text, width, Style::new());
+            assert_eq!(r.settled, "before\n".len());
+            assert_eq!(
+                render(&text[r.settled..], width, Style::new()),
+                r.lines[r.settled_lines..]
+            );
+            let closed = format!("{text}````\n");
+            let r = render_settled(&closed, width, Style::new());
+            assert_eq!(r.settled, closed.len());
         }
     }
 
