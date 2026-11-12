@@ -248,8 +248,22 @@ The verifier requires Chrome, `ps`, `openssl req -addext`, and Node exposing `tl
 
 This evidence also rules out the earlier launch-flag hypothesis: the unchanged default runtime can create/send real CHIPS despite disabling `ThirdPartyStoragePartitioning`; removing that disable did not repair intercepted response writes. No startup flags are changed. The validated storage bridge supports first-party reads and explicit HTTPS response writes. Broader embedded/authentication workflows remain unfinished.
 
-### Explicit host upload staging (network upload not yet enabled)
+### Explicit host upload staging
 
 `stage-upload.cjs --output-dir /absolute/backend-owned-output --file /absolute/selected-file` snapshots one explicitly selected regular file into private storage and returns an opaque ID, name, byte count, digest and fifteen-minute validity. It neither uploads bytes nor registers an MCP tool. Files over 64 MiB, nonregular/final-symlink sources, invalid or expired selections and integrity mismatches are refused. Only metadata is printed; later source edits do not alter selected bytes. Expiry refuses future API use but does not delete private stored copies.
 
-An ID identifies integrity-checked bytes and grants no transmission permission. The store is not a filesystem sandbox against other processes running as the same user. Managed staging, retention/revocation, the HTTP sender, upload policy negotiation and real transport/runtime acceptance are still incomplete; [the upload delivery plan](../../docs/plans/2026-11-12-controlled-browser-uploads.md) tracks these. Current policies continue to reject `uploads: allow`; browser file-input upload and full CDP remain denied.
+An ID identifies integrity-checked bytes and grants no transmission permission. The store is not a filesystem sandbox against other processes running as the same user. Managed staging, retention/revocation and full runtime acceptance are still incomplete; [the upload delivery plan](../../docs/plans/2026-11-12-controlled-browser-uploads.md) tracks these. V1/v2 policies continue to reject `uploads: allow`; browser file-input upload and full CDP remain denied.
+
+### Experimental v3 controlled HTTP uploads
+
+The source backend additionally accepts version 3 policy maps with `access: allow` and `uploads: allow` on the exact destination origin. Such an entry advertises `browser_upload`. V1/v2 continue to refuse upload allows; full CDP and browser file-input attachment remain blocked. The managed `atomcode browser enable --origin-policy-file` and slash setup currently support v1/v2 only; do not label this manual v3 configuration as managed support.
+
+An explicit manual MCP entry uses the same absolute backend/package/output paths as above, `requiredExperimentalCapabilities: {"atomcode/browser-origin-scope":3}`, `trust:false`, `autoApprove:[]`, and `ATOMCODE_BROWSER_ORIGIN_POLICY` containing:
+
+```json
+{"version":3,"origins":{"https://explicit-destination.example":{"access":"allow","uploads":"allow"}}}
+```
+
+Keep its tool filter narrow (for example `browser_upload` and `browser_close`). Select a file with the host utility above, then supply the returned `artifact_id`, `name`, `bytes` and `sha256`, plus the explicit `url`; optional `field_name` defaults to `file`. All selected identity fields must match, and the normal per-call approval remains required. The tool sends one multipart POST, with no cookies/Authorization or caller headers, does not follow redirects or retry, and returns only identity and HTTP status. A rejected, cancelled or disconnected upload may already have taken effect: re-observe rather than replay. A 2xx status is not proof of durable remote storage.
+
+Run `node integrations/browser-origin-scope/verify-uploads.cjs --backend-root /absolute/installed/node_modules/@playwright/mcp --report /absolute/new-report.json` for actual isolated MCP HTTP(S), denial, redirect, cancellation and EOF acceptance. It uploads only synthetic local fixtures. Managed CLI/slash integration, retention/revocation, other authentication, native runtime/remote fault and other-platform acceptance still need completion; this is not full browser upload/CDP support.

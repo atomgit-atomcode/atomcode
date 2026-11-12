@@ -14,7 +14,7 @@ const TOOLS = new Set([
 
 const policyMetadata = new WeakMap();
 function policyDetails(origins) {
-  return policyMetadata.get(origins) || { version: 1, downloads: new Set() };
+  return policyMetadata.get(origins) || { version: 1, downloads: new Set(), uploads: new Set() };
 }
 
 function parsePolicy(raw) {
@@ -22,7 +22,7 @@ function parsePolicy(raw) {
     throw new Error('A bounded explicit browser origin policy is required');
   let policy;
   try { policy = JSON.parse(raw); } catch { throw new Error('Invalid browser origin policy JSON'); }
-  if (policy?.version === 2) return parseTransferPolicy(policy);
+  if ([2, 3].includes(policy?.version)) return parseTransferPolicy(policy);
   if (!policy || Array.isArray(policy) || policy.version !== 1 ||
       Object.keys(policy).some(key => !['version', 'origins'].includes(key)) ||
       !Array.isArray(policy.origins) || policy.origins.length > 256)
@@ -47,7 +47,7 @@ function parseTransferPolicy(policy) {
       !policy.origins || typeof policy.origins !== 'object' || Array.isArray(policy.origins) ||
       Object.keys(policy.origins).length > 256)
     throw new Error('Expected a bounded exact-origin permission map');
-  const origins = new Set(), downloads = new Set(), seen = new Set();
+  const origins = new Set(), downloads = new Set(), uploads = new Set(), seen = new Set();
   for (const [value, permissions] of Object.entries(policy.origins)) {
     const [origin] = parsePolicy(JSON.stringify({ version: 1, origins: [value] }));
     if (seen.has(origin)) throw new Error('Duplicate canonical browser origin');
@@ -55,13 +55,14 @@ function parseTransferPolicy(policy) {
     if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions) ||
         Object.keys(permissions).some(key => !['access', 'downloads', 'uploads', 'full_cdp_access'].includes(key)) ||
         Object.values(permissions).some(value => !['allow', 'deny'].includes(value)) ||
-        permissions.uploads === 'allow' || permissions.full_cdp_access === 'allow' ||
-        (permissions.downloads === 'allow' && permissions.access !== 'allow'))
+        (permissions.uploads === 'allow' && policy.version !== 3) || permissions.full_cdp_access === 'allow' ||
+        ((permissions.downloads === 'allow' || permissions.uploads === 'allow') && permissions.access !== 'allow'))
       throw new Error('Unsupported or inconsistent browser origin permissions');
     if (permissions.access === 'allow') origins.add(origin);
     if (permissions.downloads === 'allow') downloads.add(origin);
+    if (permissions.uploads === 'allow') uploads.add(origin);
   }
-  policyMetadata.set(origins, { version: 2, downloads });
+  policyMetadata.set(origins, { version: policy.version, downloads, uploads });
   return origins;
 }
 
@@ -69,6 +70,17 @@ const DOWNLOAD_TOOL = {
   name: 'browser_download',
   description: 'Download an explicit HTTP(S) URL using the backend controlled publisher. Requires access and download grants at every redirect. Default is unauthenticated. Set use_browser_context:true explicitly to read cookies from the existing owned isolated browser; login there first. Cookies are scoped anew for every target, never imported from a personal profile, returned as metadata, or forwarded across unrelated hosts. Cookies stay read-only by default. Also set sync_response_cookies:true to apply response Set-Cookie to that captured browser through native cookie validation, including redirect session rotation/logout. Cookie effects can commit before a later body failure; uncertain native credential lookup or sync/cancellation closes that browser and must not replay the request. HTTPS reads include only the matching first-party Partitioned key from context-bound native storage; foreign-site, cross-site-ancestor and opaque keys are excluded. The caller cannot choose a partition site or context ID. HTTPS Partitioned responses are validated in an empty native context, then written to the exact first-party key and verified by reading it back. HTTP Partitioned sync and HTTP Authorization authentication remain unsupported; HTTP Partitioned batches fail before cookie mutation. Cookie/auth failures must not be retried automatically. Browser implicit downloads remain disabled. Use this tool initially for a known download link; never automatically retry an uncertain or previously dispatched download. Returns a generated artifact path, byte count and SHA-256; no caller filename, blob URL, upload or CDP access.',
   inputSchema: { type: 'object', properties: { url: { type: 'string' }, use_browser_context: { type: 'boolean', default: false, description: 'Explicitly use existing isolated browser cookies; no personal profile import.' }, sync_response_cookies: { type: 'boolean', default: false, description: 'Requires use_browser_context:true. Update or clear browser login cookies from responses; may log out the session. Failures are uncertain and never retried automatically.' } }, required: ['url'], additionalProperties: false },
+  annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: true },
+};
+
+const UPLOAD_TOOL = {
+  name: 'browser_upload',
+  description: 'Send one previously host-selected upload snapshot as multipart POST to an explicitly approved HTTP(S) URL. Requires v3 access and upload grants. The host must first run stage-upload.cjs with an explicit local file; this tool never reads a caller-selected path. Copy artifact_id, name, bytes and sha256 from that selection so approval shows the exact file identity. Selections expire after fifteen minutes. Default field_name is file. This sender is unauthenticated: no cookies, Authorization or personal browser profile. Caller headers, paths, raw bytes, methods and browser file-input attachment are unsupported. Never follows redirects or automatically retries: a dispatched request can have remote effects even if rejected, disconnected or cancelled. Re-observe the target before any new action. Returns only selected identity and HTTP status, never response body; HTTP acceptance is not proof of durable remote storage.',
+  inputSchema: { type: 'object', properties: {
+    url: { type: 'string' }, artifact_id: { type: 'string' }, name: { type: 'string' },
+    bytes: { type: 'integer', minimum: 0, maximum: 67108864 }, sha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+    field_name: { type: 'string', default: 'file', pattern: '^[A-Za-z0-9_.\\[\\]-]{1,64}$' },
+  }, required: ['url', 'artifact_id', 'name', 'bytes', 'sha256'], additionalProperties: false },
   annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: true },
 };
 
@@ -225,21 +237,27 @@ async function createProxy(origins) {
 
 // Public MCP Transport interface; no private SDK handlers/state are changed.
 class PolicyTransport {
-  constructor(inner, origins, closeBrowser, downloads) {
-    this.inner = inner; this.origins = origins; this.closeBrowser = closeBrowser; this.downloads = downloads;
+  constructor(inner, origins, closeBrowser, downloads, uploads) {
+    this.inner = inner; this.origins = origins; this.closeBrowser = closeBrowser; this.downloads = downloads; this.uploads = uploads;
   }
   async start() {
     this.inner.onmessage = (message, extra) => {
-      if (message.method === 'tools/call' && !Object.hasOwn(message, 'id')) return;
-      if (message.method === 'notifications/cancelled' && this.downloads?.has(message.params?.requestId)) {
-        this.downloads.cancel(message.params.requestId);
+      if (message.method === 'tools/call' && (!Object.hasOwn(message, 'id') ||
+          !(typeof message.id === 'string' || Number.isSafeInteger(message.id)))) return;
+      const transfers = [this.downloads, this.uploads].filter(Boolean);
+      if (message.method === 'notifications/cancelled' && transfers.some(transfer => transfer.has(message.params?.requestId))) {
+        for (const transfer of transfers) transfer.cancel(message.params.requestId);
         return;
       }
-      if (message.method === 'tools/call' && message.params?.name === DOWNLOAD_TOOL.name && this.downloads) {
-        void this.downloads.execute(message.id, message.params.arguments).then(artifact =>
+      const transfer = message.params?.name === DOWNLOAD_TOOL.name ? this.downloads
+        : message.params?.name === UPLOAD_TOOL.name ? this.uploads : undefined;
+      if (message.method === 'tools/call' && transfer) {
+        const duplicate = transfers.some(candidate => candidate.has(message.id));
+        const work = duplicate ? Promise.reject(new Error('Request already active')) : transfer.execute(message.id, message.params.arguments);
+        void work.then(artifact =>
           this.inner.send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: JSON.stringify(artifact) }] } }),
           () => this.inner.send({ jsonrpc: '2.0', id: message.id, result: { isError: true, content: [{ type: 'text',
-            text: 'Download failed or cancelled; do not automatically retry: the request may have had effects' }] } }))
+            text: 'Transfer failed or cancelled; do not automatically retry: the request may have had effects' }] } }))
           .catch(error => this.onerror?.(error));
         return;
       }
@@ -276,6 +294,7 @@ class PolicyTransport {
         return { ...tool, inputSchema };
       });
       if (this.downloads) tools.push(structuredClone(DOWNLOAD_TOOL));
+      if (this.uploads) tools.push(structuredClone(UPLOAD_TOOL));
       message = { ...message, result: { ...message.result, tools } };
     }
     return this.inner.send(message, options);

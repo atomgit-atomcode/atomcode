@@ -8,6 +8,7 @@ const { createRequire } = require('node:module');
 const { CAPABILITY, POLICY_ENV, parsePolicy, policyDetails, createProxy, PolicyTransport } = require('./policy.cjs');
 
 const { ControlledDownloads } = require('./transfers.cjs');
+const { ControlledUploads } = require('./uploads.cjs');
 
 const MCP_VERSION = '0.0.85';
 const CORE_VERSION = '1.66.0-alpha-2026-11-09';
@@ -136,10 +137,13 @@ async function serve({ root, outputDir, origins, headed = false }) {
   const downloads = policy.downloads.size ? new ControlledDownloads({
     files, authorize: origin => origins.has(origin) && policy.downloads.has(origin), getContext: owner.existing, closeContext: context => owner.closeCaptured(context),
   }) : undefined;
+  const uploads = policy.uploads.size ? new ControlledUploads({
+    directory: path.join(outputDir, 'uploads'), authorize: origin => origins.has(origin) && policy.uploads.has(origin),
+  }) : undefined;
   const closeOwned = permanent => {
     // Fence browser launches synchronously, before awaiting transfer teardown.
     const closing = owner.close(permanent);
-    return downloads ? downloads.drain(() => closing, permanent) : closing;
+    return Promise.all([closing, ...[downloads, uploads].filter(Boolean).map(transfer => transfer.drain(async () => {}, permanent))]).then(() => {});
   };
   const server = await external.createConnection({ browser: { isolated: false },
     webmcp: false, extension: false, capabilities: [], ignoreRoots: true,
@@ -161,7 +165,7 @@ async function serve({ root, outputDir, origins, headed = false }) {
     const deadline = setTimeout(() => process.exit(1), 5000);
     void closeOwned(true).then(() => clearTimeout(deadline), () => process.exit(1));
   };
-  await server.connect(new PolicyTransport(new external.StdioServerTransport(), origins, () => closeOwned(false), downloads));
+  await server.connect(new PolicyTransport(new external.StdioServerTransport(), origins, () => closeOwned(false), downloads, uploads));
   return { stop };
 }
 
@@ -187,7 +191,7 @@ async function main() {
   if (config.doctor) {
     console.log(JSON.stringify({ version: policyDetails(origins).version, kind: 'doctor', browser_launched: false,
       mcp: MCP_VERSION, playwright: CORE_VERSION, capability: CAPABILITY,
-      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny', response_cookie_sync: policyDetails(origins).downloads.size ? 'explicit-native-interception' : 'deny', first_party_partitioned_cookie_reads: policyDetails(origins).downloads.size ? 'native-storage-on-request' : 'deny', partitioned_response_cookie_sync: policyDetails(origins).downloads.size ? 'validated-first-party-storage-on-request' : 'deny' }));
+      allowed_origin_count: origins.size, source_hashes: external.sourceHashes, downloads: policyDetails(origins).downloads.size ? 'controlled-http-unauthenticated' : 'deny-artifacts', uploads: policyDetails(origins).uploads.size ? 'controlled-staged-http-unauthenticated' : 'deny', full_cdp_access: 'deny', download_authentication: policyDetails(origins).downloads.size ? 'explicit-owned-context-readonly-cookies' : 'deny', response_cookie_sync: policyDetails(origins).downloads.size ? 'explicit-native-interception' : 'deny', first_party_partitioned_cookie_reads: policyDetails(origins).downloads.size ? 'native-storage-on-request' : 'deny', partitioned_response_cookie_sync: policyDetails(origins).downloads.size ? 'validated-first-party-storage-on-request' : 'deny' }));
     return;
   }
   if (!config.outputDir) throw new Error('--output-dir is required');

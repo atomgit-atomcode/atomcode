@@ -334,3 +334,50 @@ test('late cookie cleanup closes its captured generation without disposing a rep
   await assert.rejects(owner.existing());
   await owner.close(true);
 });
+
+test('v3 upload grants require access, preserve v2 refusal and keep file-input/CDP tools blocked', () => {
+  const { policyDetails } = require('./policy.cjs');
+  const origins = parsePolicy(JSON.stringify({ version: 3, origins: {
+    'https://send.test': { access: 'allow', uploads: 'allow' },
+    'https://read.test': { access: 'allow' },
+  } }));
+  assert.equal(policyDetails(origins).version, 3);
+  assert.deepEqual([...policyDetails(origins).uploads], ['https://send.test']);
+  assert.deepEqual([...policyDetails(origins).downloads], []);
+  for (const permissions of [{ uploads: 'allow' }, { access: 'deny', uploads: 'allow' }, { access: 'allow', full_cdp_access: 'allow' }])
+    assert.throws(() => parsePolicy(JSON.stringify({ version: 3, origins: { 'https://send.test': permissions } })));
+  assert.throws(() => parsePolicy(JSON.stringify({ version: 2, origins: { 'https://send.test': { access: 'allow', uploads: 'allow' } } })));
+  assert.equal(allowedCall({ name: 'browser_file_upload', arguments: {} }, origins), false);
+  assert.equal(allowedCall({ name: 'browser_cdp', arguments: {} }, origins), false);
+});
+test('upload transport advertises exact file identity and routes cancellation without SDK dispatch', async () => {
+  const sent = [], delivered = []; let active = false, reject;
+  const uploads = {
+    has: id => active && id === 5,
+    cancel(id) { assert.equal(id, 5); active = false; reject(new Error('cancelled')); },
+    execute(id) { assert.equal(id, 5); active = true; return new Promise((_resolve, fail) => { reject = fail; }); },
+  };
+  const inner = { async start() {}, async send(message) { sent.push(message); } };
+  const transport = new PolicyTransport(inner, new Set(), undefined, undefined, uploads);
+  transport.onmessage = message => delivered.push(message); await transport.start();
+  await transport.send({ jsonrpc: '2.0', id: 1, result: { tools: [] } });
+  const tool = sent[0].result.tools[0]; assert.equal(tool.name, 'browser_upload');
+  assert.deepEqual(tool.inputSchema.required, ['url', 'artifact_id', 'name', 'bytes', 'sha256']);
+  assert.equal(tool.annotations.readOnlyHint, false); assert.equal(tool.annotations.idempotentHint, false);
+  const pattern = new RegExp(tool.inputSchema.properties.field_name.pattern);
+  assert.ok(pattern.test('attachments[]')); assert.ok(!pattern.test('bad\r\nheader'));
+  inner.onmessage({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'browser_upload', arguments: {} } });
+  inner.onmessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 5 } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(delivered.length, 0); assert.equal(sent.filter(message => message.id === 5).length, 1);
+  assert.equal(sent.find(message => message.id === 5).result.isError, true);
+});
+
+test('malformed request identities cannot bypass the SDK gate through a controlled transfer', async () => {
+  let dispatched = 0;
+  const inner = { async start() {}, async send() {} };
+  const uploads = { has: () => false, execute: async () => { dispatched++; return {}; } };
+  const gate = new PolicyTransport(inner, new Set(), undefined, undefined, uploads); await gate.start();
+  for (const id of [null, {}, [], 1.5, NaN]) inner.onmessage({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'browser_upload', arguments: {} } });
+  assert.equal(dispatched, 0);
+});
