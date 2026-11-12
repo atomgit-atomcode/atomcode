@@ -11,6 +11,7 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -55,6 +56,14 @@ struct Args {
     path: Option<String>,
     #[serde(default)]
     regex: bool,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    preview_token: Option<String>,
+    #[serde(default)]
+    expected_files: Option<usize>,
+    #[serde(default)]
+    expected_replacements: Option<usize>,
 }
 
 #[async_trait]
@@ -70,7 +79,14 @@ impl Tool for SearchReplaceTool {
          `${1}` when the number is followed by name characters, e.g. `${1}_DONE` — \
          `$1_DONE` is read as the group name `1_DONE` and is now rejected); the \
          default is literal matching. `glob` limits scope (e.g. \"*.rs\", \"src/**/*.ts\"); \
-         `path` sets the search root (default: working directory)."
+         `path` sets the search root (default: working directory). Cross-file syntax deletion, or \
+         changes exceeding 20 files or 1000 matches, return a PREVIEW without writing. \
+         Inspect its counts and before/after samples; narrow an overbroad pattern rather than \
+         blindly applying it. To apply the reviewed plan, repeat identical arguments with its \
+         `preview_token`, `expected_files` and `expected_replacements` from the preview. \
+         Any changed target file or scope invalidates the token. `dry_run:true` \
+         previews any replacement. This is text matching, NOT syntax-aware editing: a regex \
+         deleting empty parentheses also deletes function calls and declarations."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -80,7 +96,11 @@ impl Tool for SearchReplaceTool {
                 "replace": { "type": "string", "description": "Replacement text (use $1, $2 for regex captures; use ${1} when a digit is followed by name characters — $${1}_DONE, not $1_DONE)" },
                 "glob": { "type": "string", "description": "File pattern to limit scope, e.g. \"*.rs\", \"src/**/*.ts\" (default: all files)" },
                 "path": { "type": "string", "description": "Directory to search in (default: working directory)" },
-                "regex": { "type": "boolean", "description": "Use regex matching (default: false = literal)" }
+                "regex": { "type": "boolean", "description": "Use regex matching (default: false = literal)" },
+                "dry_run": { "type": "boolean", "description": "Preview affected files, counts and samples without writing (default: false)" },
+                "preview_token": { "type": "string", "description": "Token from a reviewed preview; apply with identical search/replace/path/glob/regex and dry_run:false" },
+                "expected_files": { "type": "integer", "minimum": 0, "description": "Exact expected number of changed files; mismatch refuses all writes. Required when applying a guarded preview." },
+                "expected_replacements": { "type": "integer", "minimum": 0, "description": "Exact expected replacement count; mismatch refuses all writes. Required when applying a guarded preview." }
             },
             "required": ["search", "replace"]
         })
@@ -162,14 +182,57 @@ impl Tool for SearchReplaceTool {
             Err(e) => return err(format!("search_replace: {e}")),
         };
 
+        let total: usize = modified.iter().map(|edit| edit.count).sum();
+        if !a.dry_run
+            && (a.expected_files.is_some_and(|n| n != modified.len())
+                || a.expected_replacements.is_some_and(|n| n != total))
+        {
+            return err(format!("search_replace: expected scope does not match: {} files, {total} replacements actually planned. No files written. Narrow the search or review a fresh dry_run preview.", modified.len()));
+        }
+        // Conservative bulk-operation heuristics, not syntax validation. Small
+        // regex edits retain the direct path; cross-file punctuation removal
+        // needs review even below the ordinary bulk-size thresholds.
+        let needs_preview =
+            modified.len() > 20 || total > 1000 || generic_syntax_deletion(&modified);
+        if a.dry_run || needs_preview || a.preview_token.is_some() {
+            let token = preview_token(&a, &root, &modified);
+            if let Some(supplied) = a.preview_token.as_deref().filter(|_| !a.dry_run) {
+                if supplied != token {
+                    return err("search_replace: preview is stale or arguments changed. No files written. Run dry_run:true again and review the new plan.");
+                }
+            }
+            if !modified.is_empty() && (a.dry_run || a.preview_token.is_none()) {
+                return ok(preview_report(&a, &root, &modified, total, &token));
+            }
+        }
+
+        if needs_preview && (a.expected_files.is_none() || a.expected_replacements.is_none()) {
+            return err("search_replace: applying this preview requires expected_files and expected_replacements from the reviewed plan. No files written.");
+        }
+
+        // Validate every original before the first write, including small literal
+        // replacements. Refuse changes observed after the scan, before writing.
+        for edit in &modified {
+            match self.world.read_text(&edit.path).await {
+                Ok(current) if current == edit.before => {},
+                _ => return err(format!("search_replace: {} changed or became unreadable during planning. No files written; preview again.", crate::pathnorm::to_display(&edit.path))),
+            }
+        }
+
         // Phase 2: write the changed files.
         let mut total = 0usize;
         let mut report = Vec::new();
-        for (path, new_content, count) in modified {
+        for PlannedEdit {
+            path,
+            after: new_content,
+            count,
+            ..
+        } in modified
+        {
             if let Err(e) = self.world.write_text(&path, &new_content).await {
                 return err(format!(
-                    "search_replace: failed to write {}: {e}",
-                    crate::pathnorm::to_display(&path)
+                    "search_replace: failed to write {}: {e}; {} files were already written. Inspect those changes before retrying.",
+                    crate::pathnorm::to_display(&path), report.len()
                 ));
             }
             total += count;
@@ -196,8 +259,91 @@ impl Tool for SearchReplaceTool {
     }
 }
 
+struct PlannedEdit {
+    path: PathBuf,
+    before: String,
+    after: String,
+    count: usize,
+}
+
+fn generic_syntax_deletion(edits: &[PlannedEdit]) -> bool {
+    if edits.len() < 2 {
+        return false;
+    }
+    let syntax = |ch: char| "()[]{};,:".contains(ch);
+    edits.iter().any(|edit| {
+        // Compare actual results, not the spelling of the regex or replacement:
+        // `$1` can preserve a function name while deleting its parentheses too.
+        let significant = |ch: &char| !ch.is_whitespace() && !syntax(*ch);
+        edit.before
+            .chars()
+            .filter(significant)
+            .eq(edit.after.chars().filter(significant))
+            && edit.before.chars().filter(|ch| syntax(*ch)).count()
+                > edit.after.chars().filter(|ch| syntax(*ch)).count()
+    })
+}
+
+fn preview_token(args: &Args, root: &Path, edits: &[PlannedEdit]) -> String {
+    let mut hash = Sha256::new();
+    // Length-delimit fields so neither text nor path boundaries can alias.
+    let mut field = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    field(root.as_os_str().as_encoded_bytes());
+    field(args.search.as_bytes());
+    field(args.replace.as_bytes());
+    field(&[u8::from(args.regex)]);
+    field(args.glob.as_deref().unwrap_or_default().as_bytes());
+    for edit in edits {
+        field(edit.path.as_os_str().as_encoded_bytes());
+        field(edit.before.as_bytes());
+        field(edit.after.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn preview_report(
+    args: &Args,
+    root: &Path,
+    edits: &[PlannedEdit],
+    total: usize,
+    token: &str,
+) -> String {
+    let mut report = format!("PREVIEW ONLY — no files written. {total} replacements across {} files.\nReview the scope and samples; narrow the pattern if it touches unrelated code.\nApply the reviewed plan with identical arguments, dry_run:false and preview_token:\n{token}\nSamples (first change in up to 5 files; not the full diff):\n", edits.len());
+    report.push_str(&format!(
+        "Root: {}\nGlob: {}\nApply counts: expected_files={}, expected_replacements={total}\n",
+        crate::pathnorm::to_display(root),
+        args.glob.as_deref().unwrap_or("(all eligible files)"),
+        edits.len()
+    ));
+    for edit in edits.iter().take(5) {
+        let prefix = edit
+            .before
+            .chars()
+            .zip(edit.after.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let sample = |text: &str| {
+            text.chars()
+                .skip(prefix.saturating_sub(60))
+                .take(180)
+                .collect::<String>()
+        };
+        report.push_str(&format!(
+            "{} ({} replacements)\n  before: {:?}\n  after:  {:?}\n",
+            crate::pathnorm::to_display(&edit.path),
+            edit.count,
+            sample(&edit.before),
+            sample(&edit.after)
+        ));
+    }
+    report
+}
+
 /// Walk + read + replace computation, through the world. Does NOT write — returns
-/// `(path, new_content, replacement_count)` per changed file plus the count of files
+/// the original, replacement and match count per changed file plus the count of files
 /// scanned. `re.is_some()` ⇒ regex mode (capture-group `replace`); else literal mode
 /// (verbatim `search`/`replace`, with per-file CRLF/LF tolerance).
 async fn sr_scan(
@@ -208,7 +354,7 @@ async fn sr_scan(
     search: &str,
     replace: &str,
     glob_filter: Option<&FileGlob>,
-) -> Result<(Vec<(PathBuf, String, usize)>, usize), crate::world::FsError> {
+) -> Result<(Vec<PlannedEdit>, usize), crate::world::FsError> {
     let mut modified = Vec::new();
     let mut scanned = 0usize;
     // Not the turn's stop: this walk decides which files get rewritten, and one
@@ -227,9 +373,15 @@ async fn sr_scan(
         };
         scanned += 1;
         if let Some((new_content, count)) = replace_in(&content, re, search, replace) {
-            modified.push((path, new_content, count));
+            modified.push(PlannedEdit {
+                path,
+                before: content,
+                after: new_content,
+                count,
+            });
         }
     }
+    modified.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((modified, scanned))
 }
 
@@ -480,18 +632,195 @@ mod tests {
             Arc::new(LocalFs::new(d.path())),
             crate::product_dirs::test_dirs(),
         );
-        let r = tool
-            .execute(
-                r#"{"search":"(SMOKE)_OK","replace":"${1}_DONE","path":".","glob":"sr.txt","regex":true}"#,
-                &ctx(d.path()),
-            )
-            .await;
+        let r = apply_reviewed(&tool,
+            r#"{"search":"(SMOKE)_OK","replace":"${1}_DONE","path":".","glob":"sr.txt","regex":true}"#,
+            &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "SMOKE_DONE\n",
             "braced group expands to the captured text"
         );
+    }
+
+    async fn apply_reviewed(tool: &SearchReplaceTool, args: &str, ctx: &ToolContext) -> ToolResult {
+        let mut args: serde_json::Value = serde_json::from_str(args).unwrap();
+        args["dry_run"] = json!(true);
+        let preview = tool.execute(&args.to_string(), ctx).await;
+        assert!(!preview.is_error, "{}", preview.content);
+        args["dry_run"] = json!(false);
+        args["preview_token"] = json!(token_from(&preview));
+        tool.execute(&args.to_string(), ctx).await
+    }
+
+    fn token_from(result: &ToolResult) -> &str {
+        result
+            .content
+            .lines()
+            .find(|line| line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit()))
+            .expect("preview token")
+    }
+
+    #[tokio::test]
+    async fn deleting_parentheses_across_a_project_previews_instead_of_corrupting_code() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "fn new() { Vec::new() }\n";
+        for n in 0..151 {
+            std::fs::write(d.path().join(format!("{n}.rs")), original).unwrap();
+        }
+        let result = SearchReplaceTool::default()
+            .execute(
+                &json!({"search":r"\(\s*\)|\(\s*/[^()]*\)","replace":"","regex":true}).to_string(),
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("PREVIEW ONLY"));
+        assert!(
+            result.content.contains("302 replacements across 151 files"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("fn new()"),
+            "show the code being damaged: {}",
+            result.content
+        );
+        for n in 0..151 {
+            assert_eq!(
+                std::fs::read_to_string(d.path().join(format!("{n}.rs"))).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_file_syntax_deletion_requires_review_and_exact_counts() {
+        for (search, replace, regex) in [
+            ("()", "", false),
+            (r"\(\s*\)", "", true),
+            (r"(\w+)\(\)", "$1", true),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            for file in ["a.rs", "b.rs"] {
+                std::fs::write(d.path().join(file), "fn new() { Vec::new() }").unwrap();
+            }
+            let tool = SearchReplaceTool::default();
+            let mut args = json!({"search": search, "replace":replace, "regex":regex});
+            let preview = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert!(
+                preview.content.contains("PREVIEW ONLY"),
+                "{}",
+                preview.content
+            );
+            args["preview_token"] = json!(token_from(&preview));
+            assert!(
+                tool.execute(&args.to_string(), &ctx(d.path()))
+                    .await
+                    .is_error,
+                "counts must be explicit"
+            );
+            args["expected_files"] = json!(2);
+            args["expected_replacements"] = json!(3);
+            let refused = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert!(refused.is_error, "incorrect match count must be refused");
+            for file in ["a.rs", "b.rs"] {
+                assert_eq!(
+                    std::fs::read_to_string(d.path().join(file)).unwrap(),
+                    "fn new() { Vec::new() }"
+                );
+            }
+            args["expected_replacements"] = json!(4);
+            let applied = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert!(!applied.is_error, "{}", applied.content);
+            assert!(applied.content.contains("4 replacements across 2 files"));
+        }
+    }
+
+    #[tokio::test]
+    async fn small_regex_cleanup_does_not_require_a_preview() {
+        let d = tempfile::tempdir().unwrap();
+        for file in ["a.rs", "b.rs"] {
+            std::fs::write(d.path().join(file), "fn new() {}  \n").unwrap();
+        }
+        let result = SearchReplaceTool::default().execute(
+            &json!({"search":r"(?m) +$", "replace":"", "regex":true, "glob":"*.rs", "expected_files":2, "expected_replacements":2}).to_string(), &ctx(d.path())
+        ).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.starts_with("Replaced"), "{}", result.content);
+        for file in ["a.rs", "b.rs"] {
+            assert_eq!(
+                std::fs::read_to_string(d.path().join(file)).unwrap(),
+                "fn new() {}\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn broad_literal_replacements_require_a_preview_too() {
+        for (files, content) in [(21, "foo".to_owned()), (1, "foo ".repeat(1001))] {
+            let d = tempfile::tempdir().unwrap();
+            for n in 0..files {
+                std::fs::write(d.path().join(format!("{n}.txt")), &content).unwrap();
+            }
+            let result = SearchReplaceTool::default()
+                .execute(r#"{"search":"foo","replace":"bar"}"#, &ctx(d.path()))
+                .await;
+            assert!(
+                result.content.contains("PREVIEW ONLY"),
+                "{}",
+                result.content
+            );
+            for n in 0..files {
+                assert_eq!(
+                    std::fs::read_to_string(d.path().join(format!("{n}.txt"))).unwrap(),
+                    content
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_previews_refuse_every_write_including_newly_matching_files() {
+        for change in ["content", "new_file", "arguments", "all_matches_removed"] {
+            let d = tempfile::tempdir().unwrap();
+            let file = d.path().join("a.txt");
+            std::fs::write(&file, "foo").unwrap();
+            let tool = SearchReplaceTool::default();
+            let mut args = json!({"search":"foo","replace":"bar","dry_run":true});
+            let preview = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "foo");
+            args["preview_token"] = json!(token_from(&preview));
+            args["dry_run"] = json!(false);
+            match change {
+                "content" => std::fs::write(&file, "foo changed").unwrap(),
+                "new_file" => std::fs::write(d.path().join("b.txt"), "foo").unwrap(),
+                "all_matches_removed" => std::fs::write(&file, "unrelated content").unwrap(),
+                _ => args["replace"] = json!("baz"),
+            }
+            let before = std::fs::read_to_string(&file).unwrap();
+            let result = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert!(result.is_error, "{change}: {}", result.content);
+            assert!(
+                result.content.contains("No files written"),
+                "{}",
+                result.content
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+            // Refresh must work with stale apply parameters still attached.
+            args["dry_run"] = json!(true);
+            args["expected_files"] = json!(999);
+            args["expected_replacements"] = json!(999);
+            let refreshed = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert!(!refreshed.is_error, "{change}: {}", refreshed.content);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+            if change == "new_file" {
+                assert_eq!(
+                    std::fs::read_to_string(d.path().join("b.txt")).unwrap(),
+                    "foo"
+                );
+            }
+        }
     }
 
     fn ctx(dir: &Path) -> ToolContext {
@@ -631,12 +960,12 @@ mod tests {
     async fn regex_with_capture_groups() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("v.rs"), "let v1 = 1; let v2 = 2;").unwrap();
-        let r = SearchReplaceTool::default()
-            .execute(
-                r#"{"search":"v(\\d)","replace":"w$1","regex":true}"#,
-                &ctx(d.path()),
-            )
-            .await;
+        let r = apply_reviewed(
+            &SearchReplaceTool::default(),
+            r#"{"search":"v(\\d)","replace":"w$1","regex":true}"#,
+            &ctx(d.path()),
+        )
+        .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(
             std::fs::read_to_string(d.path().join("v.rs")).unwrap(),
