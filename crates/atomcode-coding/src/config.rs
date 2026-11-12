@@ -93,7 +93,7 @@ pub struct CodingAgentConfig {
     /// inter-token budget. Once the first content arrives, `stream_timeout` takes over.
     /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
     pub first_token_timeout: Duration,
-    /// Continuous reasoning before any answer/tool output. Default 120s;
+    /// Continuous reasoning before any answer/tool output. Default 300s;
     /// ATOMCODE_REASONING_TIMEOUT_SECS overrides it, 0 disables it. Prefill excluded.
     pub reasoning_timeout: Duration,
     /// Opt-in single lower-effort recovery cap; 0 disables automatic recovery.
@@ -334,6 +334,8 @@ pub struct CodingRuntimeConfig {
     pub quality: atomcode_config::config::QualityConfig,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Per-model continuous reasoning budget; environment overrides it, 0 disables it.
+    pub reasoning_timeout_secs: Option<u64>,
     /// The effort levels this endpoint exposes (server-advertised or folded builtin).
     /// Carried so `agent_config` can derive `supports_reasoning_effort` from CONFIG
     /// (via `endpoint_supports_reasoning_effort`) instead of a hardcoded model name.
@@ -723,6 +725,7 @@ impl CodingRuntimeConfig {
             quality: config.quality.clone(),
             reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
             reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
+            reasoning_timeout_secs: r.and_then(|r| r.reasoning_timeout_secs),
             reasoning_effort_levels: r.and_then(|r| r.reasoning_effort_levels.clone()),
             provider_type: r
                 .map(|r| r.provider_type.clone())
@@ -824,6 +827,7 @@ impl CodingRuntimeConfig {
         config.datalog = self.datalog.clone();
         config.quality = self.quality.clone();
         config.reasoning_history = self.reasoning_history.clone();
+        config.reasoning_timeout = model_reasoning_timeout(self.reasoning_timeout_secs);
         config.chat_options.reasoning_effort =
             atomcode_kernel::provider::ReasoningEffort::from_config(
                 self.reasoning_effort.as_deref(),
@@ -1137,11 +1141,24 @@ fn default_stream_timeout() -> Duration {
 }
 /// Limit only reasoning before useful output, independently of prefill/idle.
 fn default_reasoning_timeout() -> Duration {
-    std::env::var("ATOMCODE_REASONING_TIMEOUT_SECS")
-        .ok()
+    model_reasoning_timeout(None)
+}
+
+pub(crate) fn model_reasoning_timeout(model_seconds: Option<u64>) -> Duration {
+    resolve_reasoning_timeout(
+        std::env::var("ATOMCODE_REASONING_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+        model_seconds,
+    )
+}
+
+fn resolve_reasoning_timeout(value: Option<&str>, model_seconds: Option<u64>) -> Duration {
+    value
         .and_then(|s| s.trim().parse::<u64>().ok())
+        .or(model_seconds)
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(120))
+        .unwrap_or(Duration::from_secs(300))
 }
 
 /// The default first-token (prefill / TTFB) timeout. An explicit
@@ -1387,6 +1404,38 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reasoning_budget_defaults_to_five_minutes_and_preserves_overrides() {
+        use std::time::Duration;
+
+        for value in [None, Some(""), Some("invalid"), Some("-1")] {
+            assert_eq!(
+                super::resolve_reasoning_timeout(value, None),
+                Duration::from_secs(300)
+            );
+        }
+        assert_eq!(
+            super::resolve_reasoning_timeout(Some(" 600 "), None),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            super::resolve_reasoning_timeout(Some("0"), Some(600)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::resolve_reasoning_timeout(None, Some(0)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::resolve_reasoning_timeout(Some("900"), Some(600)),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            super::resolve_reasoning_timeout(Some("invalid"), Some(600)),
+            Duration::from_secs(600)
+        );
+    }
+
     #[test]
     fn auto_review_environment_policy_is_independent() {
         for configured in [true, false] {

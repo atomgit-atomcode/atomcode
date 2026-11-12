@@ -361,6 +361,7 @@ pub(crate) fn chat_runtime_config(
         headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
+        reasoning_timeout_secs: p.and_then(|p| p.reasoning_timeout_secs),
         upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
             config.loop_config.max_rounds,

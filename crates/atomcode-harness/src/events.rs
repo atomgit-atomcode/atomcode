@@ -50,6 +50,16 @@ pub struct ModelRequest {
     pub answering_a_nudge: bool,
 }
 
+/// Attempt-local evidence from the request/execution boundary, not inferred
+/// from error text or from the mere presence of a partial tool call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolDispatchProof {
+    #[default]
+    Unknown,
+    /// No local call collected in this failed attempt reached ToolExec.
+    NotDispatched,
+}
+
 /// Why a model request failed, with the structure a recovery policy needs.
 ///
 /// The provider already classifies its own failures — `retryable`, an HTTP
@@ -86,8 +96,10 @@ pub struct RequestError {
     /// already describe work worth keeping, and discarding them means the retry
     /// starts from nothing. Carried here so a recovery policy can preserve it.
     pub partial: Option<Box<ModelResponse>>,
-    /// Any tool call or argument fragment in the failed stream is unexecuted.
+    /// The failed stream contains tool calls or argument fragments. This flag
+    /// alone does not prove whether a custom request row dispatched them.
     pub unexecuted_tool_output: bool,
+    pub tool_dispatch: ToolDispatchProof,
 }
 
 impl RequestError {
@@ -103,6 +115,7 @@ impl RequestError {
             rate_limit_pause: None,
             partial: None,
             unexecuted_tool_output: false,
+            tool_dispatch: ToolDispatchProof::Unknown,
             policy_denied: false,
         }
     }
@@ -120,6 +133,7 @@ impl RequestError {
             rate_limit_pause: None,
             partial: None,
             unexecuted_tool_output: false,
+            tool_dispatch: ToolDispatchProof::Unknown,
             policy_denied: false,
         }
     }

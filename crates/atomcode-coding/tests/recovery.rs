@@ -1135,7 +1135,7 @@ async fn shipping_rows_continue_after_confirmed_tools_without_repeating_mutation
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn shipping_rows_refuse_unexecuted_calls_and_preserve_safe_text() {
+async fn shipping_rows_continue_proven_undispatched_calls_without_repeating_prior_mutations() {
     use atomcode_kernel::{stream::StreamEvent, tool::ToolCall};
     for pending in [
         StreamEvent::ToolCall(ToolCall {
@@ -1158,6 +1158,7 @@ async fn shipping_rows_refuse_unexecuted_calls_and_preserve_safe_text() {
                     pending,
                     transport(),
                 ],
+                completed_call("new", "count"),
                 finished(),
             ],
             &[],
@@ -1165,10 +1166,24 @@ async fn shipping_rows_refuse_unexecuted_calls_and_preserve_safe_text() {
         .await;
         assert_eq!(
             run_turn(&app, "go").await.unwrap().stop,
-            StopReason::ProviderError
+            StopReason::Stopped
         );
-        assert_eq!(provider.recorded().len(), 2);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.recorded().len(), 4);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the previously completed identical mutation must be reused, not executed twice"
+        );
+        let recorded = provider.recorded();
+        let retry = &recorded[2].0;
+        assert!(
+            !retry
+                .iter()
+                .flat_map(|m| &m.tool_calls)
+                .any(|call| call.id == "new"),
+            "unexecuted calls must not enter replay history"
+        );
+        assert!(retry.iter().any(|m| m.text.contains("did not execute")));
         assert!(app
             .context()
             .only_session()
@@ -1455,7 +1470,7 @@ async fn shipping_provider_idle_continues_saved_text_and_confirmed_tools() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn shipping_provider_idle_refuses_pending_tools_and_bounds_continuation() {
+async fn shipping_provider_idle_recovers_undispatched_tools_and_bounds_continuation() {
     use atomcode_kernel::stream::StreamEvent;
     let (app, provider, count) = streamed_app(
         vec![
@@ -1477,9 +1492,9 @@ async fn shipping_provider_idle_refuses_pending_tools_and_bounds_continuation() 
     .await;
     assert_eq!(
         run_turn(&app, "go").await.unwrap().stop,
-        StopReason::Timeout
+        StopReason::Stopped
     );
-    assert_eq!(provider.recorded().len(), 2);
+    assert_eq!(provider.recorded().len(), 3);
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert!(app
         .context()
@@ -1901,45 +1916,48 @@ async fn cancelling_an_ordinary_retry_backoff_never_opens_another_request() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancelling_stream_recovery_backoff_never_opens_another_request() {
     use atomcode_kernel::stream::StreamEvent;
-    let (app, provider, _) = streamed_app(
-        vec![
-            vec![
-                StreamEvent::TextDelta("saved before cancellation".into()),
-                transport(),
-            ],
-            finished(),
-        ],
-        &[],
-    )
-    .await;
-    let agent = atomcode_harness::create_agent(&app).await.unwrap();
-    agent.send("go");
-    let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
-        loop {
-            let noticed = app
-                .context()
-                .only_session()
-                .unwrap()
-                .events()
-                .iter()
-                .any(|e| {
-                    matches!(
-                        &e.event,
-                        SessionEvent::Notice {
-                            notice: atomcode_harness::session::NoticeKind::ProviderRetry,
-                            ..
-                        }
-                    )
-                });
-            if noticed {
-                agent.interrupt();
-                break;
-            }
-            tokio::task::yield_now().await;
+    for with_tool in [false, true] {
+        let mut broken = vec![StreamEvent::TextDelta("saved before cancellation".into())];
+        if with_tool {
+            broken.push(StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("unrun".into()),
+                name: Some("count".into()),
+                arguments: "{".into(),
+            });
         }
-    });
-    assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
-    assert_eq!(provider.recorded().len(), 1);
+        broken.push(transport());
+        let (app, provider, count) = streamed_app(vec![broken, finished()], &[]).await;
+        let agent = atomcode_harness::create_agent(&app).await.unwrap();
+        agent.send("go");
+        let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
+            loop {
+                let noticed = app
+                    .context()
+                    .only_session()
+                    .unwrap()
+                    .events()
+                    .iter()
+                    .any(|e| {
+                        matches!(
+                            &e.event,
+                            SessionEvent::Notice {
+                                notice: atomcode_harness::session::NoticeKind::ProviderRetry,
+                                ..
+                            }
+                        )
+                    });
+                if noticed {
+                    agent.interrupt();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
+        assert_eq!(provider.recorded().len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1995,8 +2013,8 @@ async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
                 },
                 transport(),
             ],
-            None,
-            Msg::StreamRecoveryUnsafeTools,
+            Some("[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 0 }"),
+            Msg::StreamRecoveryExhausted { max_recoveries: 0 },
         ),
     ];
     for (script, patch, reason) in cases {
@@ -2296,4 +2314,118 @@ async fn a_partial_tool_fold_keeps_the_summary_failure_when_the_ladder_is_exhaus
             .any(|m| m.text.len() == 250_000),
         "the partial savings were actually applied"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tool_only_transport_failure_recovers_without_dispatching_the_partial_call() {
+    use atomcode_kernel::{stream::StreamEvent, tool::ToolCall};
+    for partial in [
+        StreamEvent::ToolCall(ToolCall {
+            id: "unrun".into(),
+            name: "count".into(),
+            arguments: "{}".into(),
+        }),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("unrun".into()),
+            name: Some("count".into()),
+            arguments: "{".into(),
+        },
+    ] {
+        let (app, provider, count) = streamed_app(
+            vec![
+                vec![partial, transport()],
+                completed_call("retry", "count"),
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            run_turn(&app, "go").await.unwrap().stop,
+            StopReason::Stopped
+        );
+        assert_eq!(provider.recorded().len(), 3);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let messages = app.context().only_session().unwrap().derive_messages();
+        assert!(!messages
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .any(|call| call.id == "unrun"));
+        assert!(messages.iter().any(|m| m.text.contains("did not execute")));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unknown_tool_dispatch_and_nontransport_failures_remain_terminal() {
+    use atomcode_harness::events::ToolDispatchProof;
+    use atomcode_kernel::tool::ToolCall;
+    for (proof, status, code) in [
+        (
+            ToolDispatchProof::Unknown,
+            None,
+            atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE,
+        ),
+        (
+            ToolDispatchProof::NotDispatched,
+            Some(401),
+            atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE,
+        ),
+        (ToolDispatchProof::NotDispatched, None, "logical_failure"),
+    ] {
+        let dir = scratch("tool-proof-refusal");
+        let app = start(tree(&dir, &[])).await;
+        let error = RequestError {
+            retryable: false,
+            http_status: status,
+            code: Some(code.into()),
+            tool_dispatch: proof,
+            ..RequestError::message("failed tool stream")
+        }
+        .with_partial(ModelResponse {
+            text: "safe partial".into(),
+            tool_calls: vec![ToolCall {
+                id: "unknown".into(),
+                name: "count".into(),
+                arguments: "{}".into(),
+            }],
+            ..Default::default()
+        });
+        let result = run_with(&app, 1, error).await;
+        assert_eq!(result.stop, StopReason::ProviderError);
+        assert_eq!(result.attempts, 1);
+        if proof == ToolDispatchProof::Unknown {
+            assert!(result.error.as_deref().unwrap().contains(
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryUnsafeTools)
+                    .as_ref()
+            ));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn undispatched_tool_only_recovery_is_bounded_without_execution() {
+    use atomcode_kernel::stream::StreamEvent;
+    let partial = || {
+        vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("unrun".into()),
+                name: Some("count".into()),
+                arguments: "{".into(),
+            },
+            transport(),
+        ]
+    };
+    let (app, provider, count) = streamed_app(
+        vec![partial(), partial(), finished()],
+        &["[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }"],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::ProviderError
+    );
+    assert_eq!(provider.recorded().len(), 2);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
 }

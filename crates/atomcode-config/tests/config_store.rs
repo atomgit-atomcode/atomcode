@@ -25,6 +25,7 @@ fn provider(model: &str) -> ProviderConfig {
         ephemeral: false,
         capable_model: None,
         retry_max_attempts: None,
+        reasoning_timeout_secs: None,
     }
 }
 

@@ -1578,6 +1578,7 @@ impl Config {
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
             retry_max_attempts: model.retry_max_attempts,
+            reasoning_timeout_secs: model.reasoning_timeout_secs,
         })
     }
 
@@ -2085,6 +2086,7 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
         retry_max_attempts: p.retry_max_attempts,
+        reasoning_timeout_secs: p.reasoning_timeout_secs,
         origin: None,
         rank: None,
     }
@@ -4111,6 +4113,7 @@ model = "missing-type"
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                reasoning_timeout_secs: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -4335,6 +4338,7 @@ model = "missing-type"
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                reasoning_timeout_secs: None,
             },
         );
         cfg.save(&target).unwrap();
@@ -4436,6 +4440,7 @@ model = "missing-type"
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                reasoning_timeout_secs: None,
             },
         );
         Config {
@@ -4572,6 +4577,7 @@ model = "missing-type"
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                reasoning_timeout_secs: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -4832,6 +4838,7 @@ capable_model = 5
                 capable_model: None,
                 note: None,
                 retry_max_attempts: None,
+                reasoning_timeout_secs: None,
                 origin: None,
                 rank: None,
                 thinking_type: None,
@@ -4886,6 +4893,7 @@ capable_model = 5
                 capable_model: None,
                 note: None,
                 retry_max_attempts: None,
+                reasoning_timeout_secs: None,
                 origin: None,
                 rank: None,
                 thinking_type: None,

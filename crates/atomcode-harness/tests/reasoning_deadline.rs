@@ -194,7 +194,13 @@ async fn first_reasoning_deadline_preserves_work_without_prefill_or_automatic_re
     let result = run_turn(&app, "go").await.unwrap();
     assert_eq!(result.stop, StopReason::Timeout);
     assert!((Duration::from_secs(4)..Duration::from_millis(4050)).contains(&began.elapsed()));
-    assert!(result.error.unwrap().contains("客户端等待上限"));
+    let error = result.error.unwrap();
+    assert!(error.contains("连续思考预算耗尽"), "{error}");
+    assert!(error.contains("这不是网络空闲超时"), "{error}");
+    assert!(
+        error.contains("ATOMCODE_REASONING_TIMEOUT_SECS（0 关闭）"),
+        "{error}"
+    );
     assert_eq!(
         result.provider_error.unwrap().code.as_deref(),
         Some(atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE)
@@ -454,25 +460,39 @@ async fn truncated_automatic_output_and_provider_errors_do_not_authorize_more_at
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn incomplete_tool_output_does_not_authorize_reasoning_recovery() {
+async fn incomplete_tool_output_uses_stream_recovery_without_lowering_effort() {
     let f = Fixture::new(
-        vec![vec![
-            (0, StreamEvent::Reasoning("first".into())),
-            (
-                100,
-                StreamEvent::ToolCallDelta {
-                    index: 0,
-                    id: None,
-                    name: Some("write_file".into()),
-                    arguments: "{".into(),
-                },
-            ),
-            (6000, StreamEvent::Done { truncated: false }),
-        ]],
+        vec![
+            vec![
+                (0, StreamEvent::Reasoning("first".into())),
+                (
+                    100,
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        name: Some("write_file".into()),
+                        arguments: "{".into(),
+                    },
+                ),
+                (6000, StreamEvent::Done { truncated: false }),
+            ],
+            answer("continued without lowering effort"),
+        ],
         vec![],
     );
     let mut app = app_with_recovery(f.clone(), false, 1000, 2000).await;
-    assert!(run_turn(&app, "go").await.unwrap().error.is_some());
-    assert_eq!(f.calls.lock().unwrap().len(), 1);
+    let result = run_turn(&app, "go").await.unwrap();
+    assert_eq!(result.stop, StopReason::Stopped);
+    assert!(result.error.is_none());
+    let calls = f.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|(_, options)| options.reasoning_effort == Some(ReasoningEffort::High)));
+    assert!(calls[1]
+        .0
+        .iter()
+        .all(|message| message.tool_calls.is_empty()));
+    assert!(f.asked.lock().unwrap().is_empty());
     app.stop();
 }

@@ -647,6 +647,12 @@ The previous response was cut off mid-stream. The preserved assistant message an
 interrupted tool results above are authoritative — continue from that saved progress. Do not \
 repeat tool calls that already completed, and do not restart the task.";
 
+const UNDISPATCHED_RESUME_NUDGE: &str = "\
+The previous model response was interrupted before any local tool call from that attempt \
+was dispatched. Its incomplete tool calls were discarded and did not execute. Continue \
+from the preserved conversation and reissue any still-needed unexecuted calls. Do not \
+repeat earlier tool calls whose results are already recorded.";
+
 /// Keeps what a broken stream produced, instead of discarding it.
 ///
 /// The failure this addresses is quiet: a stream drops after the model has
@@ -741,10 +747,12 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 .partial
                 .as_ref()
                 .is_some_and(|p| !p.text.trim().is_empty());
+            let proven_undispatched = error.unexecuted_tool_output
+                && error.tool_dispatch == crate::events::ToolDispatchProof::NotDispatched;
             let eligible = error.http_status.is_none()
                 && (transport || idle)
-                && !error.unexecuted_tool_output
-                && (has_text || confirmed);
+                && (!error.unexecuted_tool_output || proven_undispatched)
+                && (has_text || confirmed || proven_undispatched);
             let turn = session.current_turn();
             // Each failed attempt is preserved once, including the final failure.
             if let Some(partial) = &error.partial {
@@ -857,9 +865,9 @@ impl Waterfall<AgentRequest> for StreamRecovery {
             let Some(attempt) = attempt else {
                 if error.http_status.is_none() && (transport || idle) {
                     use atomcode_config::i18n::{t, Msg};
-                    let why = if error.unexecuted_tool_output {
+                    let why = if error.unexecuted_tool_output && !proven_undispatched {
                         Msg::StreamRecoveryUnsafeTools
-                    } else if !has_text && !confirmed {
+                    } else if !has_text && !confirmed && !proven_undispatched {
                         Msg::StreamRecoveryNoProgress
                     } else {
                         Msg::StreamRecoveryExhausted {
@@ -871,6 +879,7 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                         max_recoveries = self.max_recoveries,
                         eligible,
                         unexecuted_tool_output = error.unexecuted_tool_output,
+                        tool_dispatch = ?error.tool_dispatch,
                         "stream continuation stopped"
                     );
                     error.message = format!("{}\n{}", t(why), error.message);
@@ -902,7 +911,12 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 &session,
                 SessionEvent::Injected {
                     turn,
-                    text: RESUME_NUDGE.to_string(),
+                    text: if proven_undispatched {
+                        UNDISPATCHED_RESUME_NUDGE
+                    } else {
+                        RESUME_NUDGE
+                    }
+                    .to_string(),
                     origin: crate::session::InjectionOrigin::Continuation,
                 },
             );

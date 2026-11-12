@@ -22,6 +22,52 @@ fn _isolate_atomcode_home() {
 }
 
 #[tokio::test]
+async fn selected_model_reasoning_budget_reaches_the_watchdog_without_changing_effort() {
+    let project = tempfile::tempdir().unwrap();
+    let source: atomcode_config::Config = toml::from_str(
+        r#"
+default_model = "custom/slow"
+[provider_accounts.custom]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+[models."custom/slow"]
+account = "custom"
+model = "slow"
+reasoning_timeout_secs = 900
+[models."custom/unlimited"]
+account = "custom"
+model = "unlimited"
+reasoning_timeout_secs = 0
+"#,
+    )
+    .unwrap();
+    for (selection, seconds) in [("custom/slow", 900), ("custom/unlimited", 0)] {
+        let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+            &source,
+            project.path(),
+            atomcode_coding::config::product_dirs_from_env(),
+            Some(selection),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.reasoning_timeout_secs, Some(seconds));
+        let cfg = runtime.agent_config();
+        assert_eq!(
+            cfg.reasoning_timeout,
+            std::time::Duration::from_secs(seconds)
+        );
+        assert!(cfg.chat_options.reasoning_effort.is_none());
+        assert!(cfg.reasoning_recovery_timeout.is_zero());
+        let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+        assert!(mounted
+            .dump()
+            .contains(&format!("\"reasoning_timeout_ms\": {}", seconds * 1000)));
+        mounted.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     let project = tempfile::tempdir().unwrap();
     let mut cfg = atomcode_coding::CodingAgentConfig::new(

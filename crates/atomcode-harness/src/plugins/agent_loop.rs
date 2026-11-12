@@ -587,11 +587,14 @@ async fn stream_attempt(
                 return Err(RequestError {
                     retryable: !reasoning_timeout && !saw_tool_stream,
                     unexecuted_tool_output: saw_tool_stream,
+                    // ToolExec is downstream of a successful AgentRequest. No
+                    // call from this failed collection attempt was dispatched.
+                    tool_dispatch: crate::events::ToolDispatchProof::NotDispatched,
                     code: Some(if reasoning_timeout {
                         atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE
                     } else { STREAM_IDLE_CODE }.to_string()),
                     ..RequestError::message(if reasoning_timeout {
-                        format!("模型持续思考 {} 秒，尚未生成正文或工具调用，已达到客户端等待上限。可继续、单次降低思考强度，或设置 ATOMCODE_REASONING_TIMEOUT_SECS（0 关闭）。", budget_ms / 1000)
+                        format!("连续思考预算耗尽：模型已思考 {} 秒，尚未生成正文或工具调用；这不是网络空闲超时。可继续、单次降低思考强度，或设置 ATOMCODE_REASONING_TIMEOUT_SECS（0 关闭）。", budget_ms / 1000)
                     } else { format!(
                         "stream idle timeout ({}): no content for {}ms",
                         watchdog.phase(),
@@ -688,6 +691,7 @@ async fn stream_attempt(
             StreamEvent::Error(err) => {
                 let mut error = RequestError::from_provider(&err).with_partial(out);
                 error.unexecuted_tool_output |= saw_tool_stream;
+                error.tool_dispatch = crate::events::ToolDispatchProof::NotDispatched;
                 if saw_tool_stream {
                     error.retryable = false;
                 }
@@ -1697,6 +1701,10 @@ mod content_deadline_tests {
         .await
         .unwrap_err();
         assert!(error.unexecuted_tool_output);
+        assert_eq!(
+            error.tool_dispatch,
+            crate::events::ToolDispatchProof::NotDispatched
+        );
         assert!(!error.retryable);
         assert!(
             error.partial.is_none(),
