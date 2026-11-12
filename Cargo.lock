@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-auth"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "atomcode-codingplan-crypto",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-capabilities"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-coding"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-codingplan"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "atomcode-auth",
@@ -516,7 +516,7 @@ version = "0.1.0"
 
 [[package]]
 name = "atomcode-config"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "atomcode-i18n",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-harness"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-host-api"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-trait",
  "atomcode-kernel",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-i18n"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-kernel"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-plexus"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-review"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-schedule"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "atomcode-capabilities",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-telemetry"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tree-host"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "async-trait",
  "atomcode-harness",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tui"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "arboard",
  "async-trait",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-updater"
-version = "5.2.6"
+version = "5.2.7"
 dependencies = [
  "anyhow",
  "atomcode-config",
