@@ -20,11 +20,45 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+/// Points `$ATOMCODE_HOME` at a temporary tree for one test and puts the
+/// previous value back on drop.
+///
+/// The variable is process-wide and `isolate_home` only sets it once, so a test
+/// that overwrites it without restoring hands every later test in this binary a
+/// path whose directory has already been deleted — the mechanism `#1621`
+/// reported on the library side. `serial(atomcode_home)` keeps the writers
+/// apart; this keeps the last one from leaking.
+struct ScopedAtomcodeHome {
+    previous: Option<std::ffi::OsString>,
+    _dir: tempfile::TempDir,
+}
+
+impl ScopedAtomcodeHome {
+    fn new() -> Self {
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", dir.path());
+        Self {
+            previous,
+            _dir: dir,
+        }
+    }
+}
+
+impl Drop for ScopedAtomcodeHome {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("ATOMCODE_HOME", value),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+}
+
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
-    let home = tempfile::tempdir().unwrap();
+    let _home = ScopedAtomcodeHome::new();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("ATOMCODE_HOME", home.path());
 
     let mut cfg = CodingAgentConfig::new(
         "k",
@@ -115,6 +149,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
 /// What must hold: the person is asked first, and when they refuse, the key never
 /// reaches the provider and no event carries it.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_config_file_api_keys_never_reach_the_provider_unasked() {
     let user_home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

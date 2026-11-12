@@ -10525,6 +10525,10 @@ mod tests {
         use atomcode_kernel::hook::LifecycleHooks;
         use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
+        // `SnapshotHook` below resolves its sidecar root from `$ATOMCODE_HOME`,
+        // which is process-wide: without the guard this test would read whatever
+        // another test left behind, or write into a tree that test then deletes.
+        let _home = ScopedChatHome::new();
         let tmp = tempfile::tempdir().unwrap();
         let project_bucket = "0123456789abcdef";
         let session_id = "running-first-turn";
