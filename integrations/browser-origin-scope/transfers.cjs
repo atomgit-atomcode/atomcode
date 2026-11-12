@@ -7,7 +7,8 @@ const https = require('node:https');
 const { randomUUID, createHash } = require('node:crypto');
 const { Transform, Writable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { synchronizeResponseCookies } = require('./cookies.cjs');
+const { synchronizeResponseCookies, cookieHeader } = require('./cookies.cjs');
+const { firstPartyCookieHeader } = require('./partition-cookies.cjs');
 
 // Backend-owned publication boundary. Transport cancellation and shutdown
 // must drain jobs here before disposing the owned browser.
@@ -104,9 +105,15 @@ class ControlledDownloads {
         visited.add(url.href);
         const headers = { 'Accept-Encoding': 'identity' };
         if (context) {
-          const cookies = await abortable(() => context.cookies(url.href), signal);
+          let cookie;
+          if (url.protocol === 'https:') {
+            if (typeof this.closeContext !== 'function') throw new Error('Missing owned-context cleanup');
+            cookie = await firstPartyCookieHeader(context, url, signal, () => this.closeContext(context));
+          } else {
+            const cookies = await abortable(() => context.cookies(url.href), signal);
+            cookie = cookieHeader(cookies, url);
+          }
           signal.throwIfAborted();
-          const cookie = cookieHeader(cookies, url);
           if (cookie) headers.Cookie = cookie;
         }
         response = await new Promise((resolve, reject) => {
@@ -183,35 +190,6 @@ function abortable(read, signal) {
     Promise.resolve().then(() => { signal.throwIfAborted(); return read(); }).then(resolve, reject)
       .finally(() => signal.removeEventListener('abort', aborted));
   });
-}
-
-// BrowserContext.cookies(url) already scopes cookies. Recheck before building
-// a header, and never infer the top-level partition for CHIPS cookies.
-function cookieHeader(cookies, url, now = Date.now() / 1000) {
-  if (!Array.isArray(cookies)) throw new Error('Invalid browser cookie response');
-  const applicable = cookies.filter(cookie => {
-    if (!cookie || typeof cookie.domain !== 'string' || typeof cookie.path !== 'string') return false;
-    const domain = cookie.domain.toLowerCase();
-    const host = url.hostname.toLowerCase();
-    const domainMatches = domain.startsWith('.') ? host === domain.slice(1) || host.endsWith(domain) : host === domain;
-    return domainMatches && cookie.path.startsWith('/') &&
-      (url.pathname === cookie.path || url.pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : cookie.path + '/')) &&
-      (!cookie.secure || url.protocol === 'https:') &&
-      (cookie.expires === -1 || (typeof cookie.expires === 'number' && cookie.expires > now)) &&
-      cookie.partitionKey === undefined;
-  });
-  // Most specific paths first, retaining the browser's order for ties.
-  applicable.sort((a, b) => b.path.length - a.path.length);
-  const values = applicable.map(cookie => {
-    if (typeof cookie.name !== 'string' || typeof cookie.value !== 'string' ||
-        !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(cookie.name) ||
-        !/^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*$/.test(cookie.value))
-      throw new Error('Unsupported browser cookie encoding');
-    return cookie.name + '=' + cookie.value;
-  });
-  const result = values.join('; ');
-  if (Buffer.byteLength(result) > 16384) throw new Error('Browser cookie header exceeds limit');
-  return result;
 }
 
 module.exports = { ControlledDownloads, cookieHeader };

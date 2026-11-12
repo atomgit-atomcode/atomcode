@@ -184,7 +184,7 @@ node integrations/browser-origin-scope/verify-downloads.cjs \
   --report /absolute/new-controlled-download-report.json
 ```
 
-The verifier requires Chrome, Node 20+, `ps`, `openssl req -addext` and loopback IPv6; it uses synthetic loopback HTTP(S) fixtures and a private temporary output tree. It checks bytes/hash, denied redirects before dispatch, argument refusal, cancellation without replay, browser implicit download denial, close/reuse and pure EOF. The current verifier additionally covers explicit HttpOnly cookie authentication, cross-host cookie isolation, HTTPS with a generated fixture-only CA, untrusted certificate refusal and authenticated cancellation/close. Ordinary response-cookie rotation/deletion and original-tab preservation are additionally verified. Partitioned-cookie support, other authentication methods, blob/compression, native runtime turn cancellation of the new tool and the complete upload/CDP matrix still require further implementation/acceptance. It does not open a personal profile or change OS grants.
+The verifier requires Chrome, Node 20+, `ps`, `openssl req -addext` and loopback IPv6; it uses synthetic loopback HTTP(S) fixtures and a private temporary output tree. It checks bytes/hash, denied redirects before dispatch, argument refusal, cancellation without replay, browser implicit download denial, close/reuse and pure EOF. The current verifier additionally covers explicit HttpOnly cookie authentication, cross-host cookie isolation, HTTPS with a generated fixture-only CA, untrusted certificate refusal and authenticated cancellation/close. Ordinary response-cookie rotation/deletion and original-tab preservation are additionally verified. Partitioned response-cookie writing, embedded partition contexts, other authentication methods, blob/compression, native runtime turn cancellation of the new tool and the complete upload/CDP matrix still require further implementation/acceptance. It does not open a personal profile or change OS grants.
 
 
 ### Explicit browser-cookie downloads
@@ -195,9 +195,9 @@ Login through the backend's isolated browser first, then call:
 {"url":"https://example.test/private/report","use_browser_context":true}
 ```
 
-The argument is explicit and visible in normal MCP approval previews. It never imports a personal profile, launches a missing browser or adopts a replacement context. Access and download grants must hold before any credential lookup and at every redirect. The existing context's public `cookies(url)` API selects each destination's cookies anew; the publisher additionally checks domain, path, expiration and Secure rules, excludes partitioned cookies whose top-level context is unknown, and refuses malformed or oversized headers. Cookie values and authentication headers are not returned as tool metadata or diagnostics. HTTPS explicitly requires certificate validation, including when a host environment has disabled its default; fixture trust is injected only into the verifier child, never a system trust store.
+The argument is explicit and visible in normal MCP approval previews. It never imports a personal profile, launches a missing browser or adopts a replacement context. Access and download grants must hold before any credential lookup and at every redirect. The existing context's public `cookies(url)` API selects each destination's cookies anew; the publisher additionally checks domain, path, expiration and Secure rules, uses explicit first-party native storage selection for HTTPS partitioned cookies, excluding foreign-site, cross-site-ancestor and opaque keys, and refuses malformed or oversized headers. Cookie values and authentication headers are not returned as tool metadata or diagnostics. HTTPS explicitly requires certificate validation, including when a host environment has disabled its default; fixture trust is injected only into the verifier child, never a system trust store.
 
-This is an explicit first-party cookie request, not a replay of page JavaScript with its initiator, service workers, referrer or HTTP authentication cache. Cookie headers may legitimately apply across ports or subdomains according to the browser's cookie rules, but grants remain exact scheme/host/port checks. Caller headers, Authorization authentication, partitioned-cookie reads and imported storage remain unsupported. Cookies are read-only unless the separate synchronization argument below is enabled; a read-only request to a server that rotates its session may require a new explicit browser authentication workflow. A failed or uncertain request is never retried automatically.
+This is an explicit first-party cookie request, not a replay of page JavaScript with its initiator, service workers, referrer or HTTP authentication cache. Cookie headers may legitimately apply across ports or subdomains according to the browser's cookie rules, but grants remain exact scheme/host/port checks. Caller headers, Authorization authentication, arbitrary embedded/foreign partition selection and imported storage remain unsupported. HTTPS reads can use the matching first-party partition as described below. Cookies are read-only unless the separate synchronization argument below is enabled; a read-only request to a server that rotates its session may require a new explicit browser authentication workflow. A failed or uncertain request is never retried automatically.
 
 Cancellation during an existing-context or cookie lookup stops the job without waiting for a late read to resume dispatch. Closing the owned browser invalidates this authentication source; a later authenticated call fails until a browser context exists again. Default unauthenticated downloads continue to work after an explicit close. The doctor's existing `downloads` value describes the default mode; its separate `download_authentication` field reports whether the explicit cookie mode is available under the saved grants. CLI scope summaries likewise describe the default mode.
 
@@ -221,10 +221,29 @@ An uncertain synchronization failure or cancellation during the native operation
 Run the native-cookie and lifecycle checks explicitly (all URLs are synthetic local fulfillments):
 
 ```sh
-node --test integrations/browser-origin-scope/policy.test.cjs integrations/browser-origin-scope/transfers.test.cjs integrations/browser-origin-scope/cookies.test.cjs
+node --test integrations/browser-origin-scope/policy.test.cjs integrations/browser-origin-scope/transfers.test.cjs integrations/browser-origin-scope/cookies.test.cjs integrations/browser-origin-scope/partition-cookies.test.cjs
 node integrations/browser-origin-scope/verify-cookie-sync.cjs \
   --backend-root /absolute/installed/node_modules/@playwright/mcp \
   --report /absolute/new-native-cookie-report.json
 ```
 
 This verifier records native cookie behavior, source/dependency hashes, proxy request/CONNECT counters, actual cancellation, explicit empty replacement and observed descendant disposal. The separate `verify-downloads.cjs` checks real loopback HTTP(S) rotation/deletion, one remote GET per hop, denied redirect effects, Secure cookie isolation, unchanged tabs and Partitioned refusal through MCP. Neither suite establishes other-platform GUI acceptance or the complete upload/CDP matrix.
+
+
+### First-party partitioned-cookie reads
+
+With `use_browser_context:true`, HTTPS downloads now include only the matching first-party partition in addition to applicable ordinary cookies. Chromium canonicalizes the approved target URL's schemeful site in a separate empty probe context, which receives no existing credentials. Fixed public protocol calls obtain the captured original context's cookie metadata. Domain, path, Secure, expiry, exact canonical site, `hasCrossSiteAncestor:false` and non-opaque metadata are checked before a header is returned. The caller cannot choose a site/context ID or send protocol commands; model-facing full CDP remains blocked.
+
+Temporary probe contexts, blank identity pages and protocol sessions are closed before dispatch. No helper navigation or additional remote GET is needed, and the original login cookie jar is not mutated. Unknown identity, unavailable metadata, cleanup failure or cancellation closes only the captured browser; a late cleanup cannot act on its replacement. This lookup is a direct first-party request, not selection of an arbitrary iframe's parent partition. HTTP retains its ordinary-cookie/Secure restrictions; Partitioned response sync remains refused.
+
+Characterize the pinned behavior and test the actual first-party publisher explicitly:
+
+```sh
+node integrations/browser-origin-scope/characterize-partitions.cjs \
+  --backend-root /absolute/installed/node_modules/@playwright/mcp \
+  --report /absolute/new-partition-characterization.json
+```
+
+The verifier requires Chrome, `ps`, `openssl req -addext`, and Node exposing `tls.setDefaultCACertificates` (recorded Node 22.22.0). Production modules still use Node 20+ APIs. It changes fixture CA trust only inside its own process and restores it afterward; no system trust store or personal browser is changed. All server/cookie data are disposable local fixtures. It compares real HTTPS cookie behavior, the intentionally unsafe interception negative control, explicit context-bound Storage identities and expiry, exact published bytes, no duplicate GET, helper disposal and header ordering in both creation orders. Cookie/header values are not included in the report.
+
+This evidence also rules out the earlier launch-flag hypothesis: the unchanged default runtime can create/send real CHIPS despite disabling `ThirdPartyStoragePartitioning`; removing that disable did not repair intercepted response writes. No startup flags are changed. The safe validated storage bridge is currently used for **reads**; a complete validated Partitioned response writer and broader embedded/authentication workflows remain unfinished.

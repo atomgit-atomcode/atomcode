@@ -61,4 +61,35 @@ async function synchronizeResponseCookies(context, url, headers, signal, closeBr
   if (failure || signal.aborted) throw new Error('Response cookie synchronization failed or cancelled; do not retry automatically');
 }
 
-module.exports = { synchronizeResponseCookies };
+// Scope every header. A partition site is supplied only by native canonicalization;
+// public cookie strings without ancestry metadata are never guessed.
+function cookieHeader(cookies, url, now = Date.now() / 1000, partitionSite) {
+  if (!Array.isArray(cookies)) throw new Error('Invalid browser cookie response');
+  const applicable = cookies.filter(cookie => {
+    if (!cookie || typeof cookie.domain !== 'string' || typeof cookie.path !== 'string') return false;
+    const domain = cookie.domain.toLowerCase();
+    const host = url.hostname.toLowerCase();
+    const domainMatches = domain.startsWith('.') ? host === domain.slice(1) || host.endsWith(domain) : host === domain;
+    return domainMatches && cookie.path.startsWith('/') &&
+      (url.pathname === cookie.path || url.pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : cookie.path + '/')) &&
+      (!cookie.secure || url.protocol === 'https:') &&
+      (cookie.expires === -1 || (typeof cookie.expires === 'number' && cookie.expires > now)) &&
+      (cookie.partitionKeyOpaque === undefined || cookie.partitionKeyOpaque === false) &&
+      (cookie.partitionKey === undefined || (url.protocol === 'https:' && typeof cookie.partitionKey === 'object' && cookie.partitionKey !== null &&
+        partitionSite !== undefined && cookie.partitionKey.topLevelSite === partitionSite && cookie.partitionKey.hasCrossSiteAncestor === false));
+  });
+  // Most specific paths first, retaining the browser's order for ties.
+  applicable.sort((a, b) => b.path.length - a.path.length);
+  const values = applicable.map(cookie => {
+    if (typeof cookie.name !== 'string' || typeof cookie.value !== 'string' ||
+        !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(cookie.name) ||
+        !/^[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*$/.test(cookie.value))
+      throw new Error('Unsupported browser cookie encoding');
+    return cookie.name + '=' + cookie.value;
+  });
+  const result = values.join('; ');
+  if (Buffer.byteLength(result) > 16384) throw new Error('Browser cookie header exceeds limit');
+  return result;
+}
+
+module.exports = { synchronizeResponseCookies, cookieHeader };
