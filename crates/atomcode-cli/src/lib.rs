@@ -29,6 +29,7 @@ fn _tests_assert_in_chinese() {
 pub mod askpass;
 pub mod browser_cmd;
 pub mod desktop;
+pub mod git_auth_cmd;
 pub mod grape_connect;
 mod mcp_setup;
 pub mod project_setup;
@@ -36,6 +37,7 @@ pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
 pub mod tui_command_meter;
+pub mod tui_git_auth;
 pub mod tui_grape;
 pub mod tui_login;
 pub mod tui_mcp;
@@ -292,6 +294,7 @@ pub mod tui_front {
             crate::tui_bg::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
+            crate::tui_git_auth::row_layer(),
             // Grape consent is not deployed on the public cloud yet. Keep its
             // TUI command unmounted until the service is ready.
             crate::tui_welcome_words::row_layer(),
@@ -330,6 +333,11 @@ pub mod tui_front {
             Arc::new(crate::tui_login::LoginRow {
                 config_path: config_path.clone(),
                 telemetry: telemetry.clone(),
+            }),
+            Arc::new(crate::tui_git_auth::GitAuthRow {
+                user_dir: atomcode_coding::config::product_dirs_from_env()
+                    .user()
+                    .to_path_buf(),
             }),
             Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
             Arc::new(crate::tui_opening::OpeningRow {

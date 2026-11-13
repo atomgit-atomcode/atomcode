@@ -10673,6 +10673,42 @@ impl Tui {
     }
 }
 
+/// A TUI-only password field: no kernel question, tool parameter or session fact.
+#[async_trait]
+pub trait SecretInput: Send + Sync {
+    async fn read(&self, prompt: &str) -> Option<zeroize::Zeroizing<String>>;
+}
+plexus_service!(SecretInputSvc => dyn SecretInput, "tui-secret-input", Seam, "Host-only masked input that is never recorded as a conversation fact");
+struct ScreenSecretInput {
+    host: Arc<Host>,
+    repaint: Arc<dyn Repaint>,
+}
+struct SecretFlight {
+    host: Arc<Host>,
+    repaint: Arc<dyn Repaint>,
+    id: u64,
+}
+impl Drop for SecretFlight {
+    fn drop(&mut self) {
+        self.host.refuse_owned_secret(self.id);
+        self.repaint.now();
+    }
+}
+#[async_trait]
+impl SecretInput for ScreenSecretInput {
+    async fn read(&self, prompt: &str) -> Option<zeroize::Zeroizing<String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = self.host.try_ask_protected_secret(prompt, tx)?;
+        let _flight = SecretFlight {
+            host: self.host.clone(),
+            repaint: self.repaint.clone(),
+            id,
+        };
+        self.repaint.now();
+        rx.await.ok().flatten()
+    }
+}
+
 /// Ask for a frame.
 ///
 /// The loop paints when something wakes it, and everything that wakes it today
@@ -11685,6 +11721,7 @@ impl Plugin for TuiUiPlugin {
             // launcher's audit is for.
             "tui-team-roster",
             "tui-repaint",
+            "tui-secret-input",
             "tui-mcp-phase",
         ]
     }
@@ -11746,6 +11783,12 @@ impl Plugin for TuiUiPlugin {
         // starts.
         let _ = ctx
             .provide::<RepaintSvc>(Arc::new(Waker(tui.clone())) as Arc<dyn Repaint>)
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<SecretInputSvc>(Arc::new(ScreenSecretInput {
+                host: tui.host.clone(),
+                repaint: Arc::new(Waker(tui.clone())),
+            }) as Arc<dyn SecretInput>)
             .map_err(|e| e.to_string())?;
         let _ = ctx.provide::<UiSvc>(tui).map_err(|e| e.to_string())?;
         Ok(())

@@ -28,7 +28,14 @@ pub struct UninstallManifest {
 
 pub fn uninstall_manifest() -> UninstallManifest {
     UninstallManifest {
-        credential_files: &["auth.toml", "mcp.json", "config.toml", "ATOMCODE.md"],
+        credential_files: &[
+            "auth.toml",
+            "mcp.json",
+            "config.toml",
+            "ATOMCODE.md",
+            "auth/ssh-keys.json",
+            "auth/ssh-keys.lock",
+        ],
         state_files: &[
             "history",
             "input_history.txt",

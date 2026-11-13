@@ -73,6 +73,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `/app` 的中继客户端:下载时读流、校验 sha256(随 relay.rs 从 tuix 搬来)。
 futures = "0.3"
 sha2 = "0.10"
+rpassword = "7"
+zeroize = "1"
 # Resolve executables for the project capability setup service.
 which = "7"
 # Run confirmed installers outside project-local package-manager configuration.

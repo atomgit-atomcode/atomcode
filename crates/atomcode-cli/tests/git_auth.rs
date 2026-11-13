@@ -59,3 +59,45 @@ fn status_distinguishes_empty_and_unreachable_agents_and_missing_helpers() {
         assert_eq!(value["credential_helper"], "no_setting");
     }
 }
+
+#[test]
+fn remember_refuses_piped_secrets_and_unlock_without_registrations_is_side_effect_free() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("profile");
+    let output = assert_cmd::Command::cargo_bin("atomcode")
+        .unwrap()
+        .args(["git-auth", "remember", "--key", "nonexistent-key"])
+        .env("ATOMCODE_HOME", &profile)
+        .write_stdin("test-only-secret\n")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("test-only-secret"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("external terminal"));
+    assert!(!profile.exists());
+    let output = assert_cmd::Command::cargo_bin("atomcode")
+        .unwrap()
+        .args(["git-auth", "unlock"])
+        .env("ATOMCODE_HOME", &profile)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!profile.exists());
+}
+
+#[test]
+fn an_invalid_worker_request_never_creates_a_profile_or_prints_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("profile");
+    let output = assert_cmd::Command::cargo_bin("atomcode")
+        .unwrap()
+        .arg("__ssh-key-worker")
+        .arg(&profile)
+        .arg("0")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert!(!profile.exists());
+}

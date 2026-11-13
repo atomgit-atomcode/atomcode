@@ -24,7 +24,10 @@
 //! answering it, a `sudo` inside a tool call waits for a tty that this UI owns
 //! — which is the hang this closes.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use tokio::sync::oneshot;
 use zeroize::{Zeroize, Zeroizing};
@@ -83,20 +86,34 @@ impl Asking {
 struct Waiting {
     prompt: String,
     typed: Zeroizing<String>,
-    reply: oneshot::Sender<Option<String>>,
+    reply: Reply,
+    id: u64,
 }
 
+enum Reply {
+    Legacy(oneshot::Sender<Option<String>>),
+    Protected(oneshot::Sender<Option<Zeroizing<String>>>),
+}
 impl Waiting {
-    /// Hand over what was typed.
     fn answer(self) {
-        let _ = self.reply.send(Some(self.typed.to_string()));
+        match self.reply {
+            Reply::Legacy(reply) => {
+                let _ = reply.send(Some(self.typed.to_string()));
+            }
+            Reply::Protected(reply) => {
+                let _ = reply.send(Some(self.typed));
+            }
+        }
     }
-
-    /// `None` downstream, and every reader must take it as a refusal — never as
-    /// an empty password. The difference matters: `sudo` given an empty one
-    /// *tries* it and burns an attempt.
     fn refuse(self) {
-        let _ = self.reply.send(None);
+        match self.reply {
+            Reply::Legacy(reply) => {
+                let _ = reply.send(None);
+            }
+            Reply::Protected(reply) => {
+                let _ = reply.send(None);
+            }
+        }
     }
 }
 
@@ -107,6 +124,7 @@ impl Waiting {
 /// the same keystrokes.
 #[derive(Default)]
 pub struct Secrets {
+    next: AtomicU64,
     waiting: Mutex<Option<Waiting>>,
 }
 
@@ -126,10 +144,40 @@ impl Secrets {
                 // paragraph must not turn the composer into a page.
                 prompt: crate::ask::one_line(prompt),
                 typed: Zeroizing::new(String::new()),
-                reply,
+                reply: Reply::Legacy(reply),
+                id: self.next.fetch_add(1, Ordering::Relaxed),
             });
         if let Some(previous) = previous {
             previous.refuse();
+        }
+    }
+
+    /// Host-only protected input. Never displace another password prompt.
+    pub fn try_ask_protected(
+        &self,
+        prompt: &str,
+        reply: oneshot::Sender<Option<Zeroizing<String>>>,
+    ) -> Option<u64> {
+        let mut waiting = self.waiting.lock().expect("secret poisoned");
+        if waiting.is_some() {
+            return None;
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        *waiting = Some(Waiting {
+            prompt: crate::ask::one_line(prompt),
+            typed: Zeroizing::new(String::new()),
+            reply: Reply::Protected(reply),
+            id,
+        });
+        Some(id)
+    }
+    /// Cancel only the field owned by this request, never a newer askpass field.
+    pub fn refuse_owned(&self, id: u64) {
+        let mut waiting = self.waiting.lock().expect("secret poisoned");
+        if waiting.as_ref().is_some_and(|w| w.id == id) {
+            if let Some(waiting) = waiting.take() {
+                waiting.refuse();
+            }
         }
     }
 
@@ -415,5 +463,41 @@ mod tests {
         assert!(!secrets.key(press(Key::Enter)));
         assert!(!secrets.paste("text"));
         assert_eq!(secrets.asking(), None);
+    }
+    #[tokio::test]
+    async fn protected_input_is_masked_and_owned_cancellation_cannot_close_a_new_prompt() {
+        let secrets = Secrets::default();
+        let (reply, answer) = oneshot::channel();
+        let id = secrets.try_ask_protected("save:", reply).unwrap();
+        typed(&secrets, "private-sentinel");
+        assert_eq!(asking(&secrets).typed, 16);
+        assert!(!format!("{:?}", asking(&secrets)).contains("private-sentinel"));
+        let (busy, _) = oneshot::channel();
+        assert!(secrets.try_ask_protected("other:", busy).is_none());
+        let (replacement, replacement_answer) = oneshot::channel();
+        secrets.ask("ssh:", replacement);
+        assert!(answer.await.unwrap().is_none());
+        secrets.refuse_owned(id);
+        assert!(secrets.is_waiting());
+        typed(&secrets, "new");
+        secrets.key(press(Key::Enter));
+        assert_eq!(replacement_answer.await.unwrap().as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn protected_input_delivers_a_zeroizing_value_and_escape_refuses() {
+        let secrets = Secrets::default();
+        let (reply, answer) = oneshot::channel();
+        secrets.try_ask_protected("save:", reply).unwrap();
+        typed(&secrets, "sentinel");
+        secrets.key(press(Key::Enter));
+        let value: Zeroizing<String> = answer.await.unwrap().unwrap();
+        assert_eq!(value.as_str(), "sentinel");
+        assert!(!secrets.is_waiting());
+        let (reply, answer) = oneshot::channel();
+        secrets.try_ask_protected("save:", reply).unwrap();
+        typed(&secrets, "discard");
+        secrets.key(press(Key::Esc));
+        assert!(answer.await.unwrap().is_none());
     }
 }

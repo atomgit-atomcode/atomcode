@@ -135,6 +135,9 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode, bool) {
 
 #[tokio::main]
 async fn main() {
+    if let Some(code) = atomcode_auth::git_ssh::worker_exit_code() {
+        std::process::exit(code);
+    }
     // Before any config read. The daemon is launched by the VS Code extension
     // rather than by the CLI, so it resolves the tree on its own.
     atomcode_config::distribution::bootstrap_home();

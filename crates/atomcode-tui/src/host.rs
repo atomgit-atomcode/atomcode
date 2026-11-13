@@ -2996,6 +2996,20 @@ impl Host {
         self.sync_secret();
     }
 
+    pub(crate) fn try_ask_protected_secret(
+        &self,
+        prompt: &str,
+        reply: tokio::sync::oneshot::Sender<Option<zeroize::Zeroizing<String>>>,
+    ) -> Option<u64> {
+        let id = self.secrets.try_ask_protected(prompt, reply);
+        self.sync_secret();
+        id
+    }
+    pub(crate) fn refuse_owned_secret(&self, id: u64) {
+        self.secrets.refuse_owned(id);
+        self.sync_secret();
+    }
+
     /// Whether a password is being asked for. Read by the one place focus is
     /// decided, so that "who has the keyboard" and "what the field is showing"
     /// cannot be two different answers.

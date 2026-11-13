@@ -7860,6 +7860,17 @@ fn daemon_bind_failure_message(addr: &str, port: u16, err: &std::io::Error) -> S
 }
 
 pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
+    let root = atomcode_coding::config::product_dirs_from_env()
+        .user()
+        .to_path_buf();
+    let executable = std::env::current_exe()?;
+    let loaded = tokio::task::spawn_blocking(move || {
+        atomcode_auth::git_ssh::unlock_registered(&root, &executable)
+    })
+    .await;
+    if !matches!(loaded, Ok(Ok(_))) {
+        eprintln!("SSH automatic key loading failed. Use `atomcode git-auth unlock` in the daemon's environment to diagnose; no interactive fallback was attempted.");
+    }
     use axum::routing::patch;
 
     let ServerOpts {

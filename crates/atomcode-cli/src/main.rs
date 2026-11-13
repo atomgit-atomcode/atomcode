@@ -16,7 +16,7 @@ use clap_complete::Shell;
 
 mod cloud_cmd;
 use atomcode::browser_cmd;
-mod git_auth_cmd;
+use atomcode::git_auth_cmd;
 mod grape_cmd;
 mod headless_json;
 mod lsp_cmd;
@@ -1365,7 +1365,26 @@ fn merge_startup_notices(
     }
 }
 
+/// Host bootstrap only; local diagnostic/setup commands never call this.
+async fn load_saved_git_auth() -> Result<()> {
+    let root = atomcode_coding::config::product_dirs_from_env()
+        .user()
+        .to_path_buf();
+    let executable = std::env::current_exe()?;
+    let loaded = tokio::task::spawn_blocking(move || {
+        atomcode_auth::git_ssh::unlock_registered(&root, &executable)
+    })
+    .await;
+    if !matches!(loaded, Ok(Ok(_))) {
+        eprintln!("SSH automatic key loading failed. Run `atomcode git-auth unlock` externally to diagnose; no password prompt or retry was attempted.");
+    }
+    Ok(())
+}
+
 async fn async_main(process_start: std::time::Instant) {
+    if let Some(code) = atomcode_auth::git_ssh::worker_exit_code() {
+        std::process::exit(code);
+    }
     // Local desktop setup/diagnosis must precede logging, install bookkeeping
     // and pending upgrades. In particular, status and a failed permission probe
     // must not create a product tree. Parse the full CLI, not an argv substring
@@ -1639,6 +1658,12 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    if matches!(
+        &cli.command,
+        None | Some(Commands::Resume { .. } | Commands::Acp)
+    ) {
+        load_saved_git_auth().await?;
+    }
     if let Some(Commands::Cloud(cloud_cmd::CloudCli::Prepare { user_dir })) = &cli.command {
         return cloud_cmd::handle(cloud_cmd::CloudCli::Prepare {
             user_dir: user_dir.clone(),

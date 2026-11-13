@@ -706,6 +706,10 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
         None => None,
     };
 
+    // The lease, configuration and session binding are validated before loading
+    // optional host credentials. No runtime or second agent lifecycle is created.
+    crate::load_saved_git_auth().await?;
+
     // 6. First run is fresh; subsequent runs restore the same native log.
     // Headless path always uses ProviderBootstrap::Required so it fails fast
     // when no provider is configured, mirroring the `-p` / `--prompt` flow.

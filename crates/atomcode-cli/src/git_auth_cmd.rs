@@ -1,5 +1,9 @@
-//! Local authentication diagnostics. Never retrieve credentials or contact a remote.
-use std::{path::Path, process::Stdio, time::Duration};
+//! User-owned Git authentication setup and safe local diagnostics.
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use clap::Subcommand;
 use serde::Serialize;
@@ -7,6 +11,21 @@ use tokio::process::Command;
 
 #[derive(Subcommand)]
 pub enum GitAuthCli {
+    /// Save a key passphrase in the OS keyring after loading it into the existing agent.
+    Remember {
+        #[arg(long)]
+        key: PathBuf,
+        /// Optional agent lifetime in seconds; omitted follows the agent default.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(60..=86400))]
+        lifetime: Option<u32>,
+    },
+    /// Load all registered keys from an already-unlocked OS keyring; never ask for passwords.
+    Unlock,
+    /// Disable automatic loading and delete the saved passphrase (loaded agent keys remain).
+    Forget {
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Inspect this process's SSH agent and Git helper settings without authenticating.
     Status {
         #[arg(long)]
@@ -37,6 +56,8 @@ struct Report {
     ssh_agent: AgentStatus,
     credential_helper: HelperStatus,
     remote_authentication_verified: bool,
+    registered_keys: usize,
+    pending_cleanup: usize,
 }
 
 // Discard BOTH streams: helper configuration can contain embedded secrets and
@@ -90,17 +111,59 @@ async fn inspect(cwd: &Path) -> Report {
         ssh_agent: agent_status(agent),
         credential_helper: helper_status(helper),
         remote_authentication_verified: false,
+        registered_keys: 0,
+        pending_cleanup: 0,
     }
 }
 
+pub(crate) async fn status_text(root: &Path) -> anyhow::Result<String> {
+    let report = inspect(&std::env::current_dir()?).await;
+    let (active, pending) = atomcode_auth::git_ssh::registration_status(root)?;
+    Ok(format!("SSH agent: {:?}\nGit helper: {:?}\n已登记密钥：{active}；待清理：{pending}\n仅检查本地设置，未验证远端认证或 push 权限。", report.ssh_agent, report.credential_helper))
+}
+
 pub async fn handle(command: GitAuthCli) -> anyhow::Result<()> {
+    let root = atomcode_coding::config::product_dirs_from_env()
+        .user()
+        .to_path_buf();
     match command {
+        GitAuthCli::Remember { key, lifetime } => {
+            use std::io::IsTerminal;
+            anyhow::ensure!(std::io::stdin().is_terminal() && std::io::stderr().is_terminal(), "Run remember yourself in an external terminal; passphrases are never accepted through arguments or piped stdin");
+            let secret = zeroize::Zeroizing::new(rpassword::prompt_password(
+                "SSH key passphrase (hidden): ",
+            )?);
+            tokio::task::spawn_blocking(move || {
+                atomcode_auth::git_ssh::remember(&root, &key, lifetime, secret)
+            })
+            .await??;
+            println!("Passphrase saved in the OS keyring. The key is loaded in the current agent with the requested lifetime; future hosts will attempt automatic loading.");
+        }
+        GitAuthCli::Unlock => {
+            let executable = std::env::current_exe()?;
+            let count = tokio::task::spawn_blocking(move || {
+                atomcode_auth::git_ssh::unlock_registered(&root, &executable)
+            })
+            .await??;
+            println!("Loaded {count} registered SSH keys into the existing agent.");
+        }
+        GitAuthCli::Forget { key } => {
+            tokio::task::spawn_blocking(move || atomcode_auth::git_ssh::forget(&root, &key))
+                .await??;
+            println!("Saved passphrase removed and automatic loading disabled. Already-loaded keys remain usable until removed from each agent or their lifetime expires; remove this identity externally for immediate revocation.");
+        }
         GitAuthCli::Status { json } => {
-            let report = inspect(&std::env::current_dir()?).await;
+            let mut report = inspect(&std::env::current_dir()?).await;
+            (report.registered_keys, report.pending_cleanup) =
+                atomcode_auth::git_ssh::registration_status(&root)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("SSH agent: {:?}", report.ssh_agent);
+                println!(
+                    "Registered keys: {}; disabled registrations awaiting cleanup: {}",
+                    report.registered_keys, report.pending_cleanup
+                );
                 println!(
                     "SSH_AUTH_SOCK inherited: {}",
                     report.ssh_auth_sock_inherited
@@ -162,6 +225,8 @@ mod tests {
             ssh_agent: AgentStatus::IdentitiesLoaded,
             credential_helper: HelperStatus::SettingPresent,
             remote_authentication_verified: false,
+            registered_keys: 0,
+            pending_cleanup: 0,
         };
         let value = serde_json::to_value(report).unwrap();
         assert_eq!(value["remote_authentication_verified"], false);

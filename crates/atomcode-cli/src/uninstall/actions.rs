@@ -597,6 +597,22 @@ mod execute_tests {
     }
 
     #[test]
+    fn purge_keeps_ssh_registrations_when_credential_cleanup_cannot_be_verified() {
+        let tmp = TempDir::new().unwrap();
+        let (exe, data) = fake_install(&tmp);
+        std::fs::create_dir(data.join("auth")).unwrap();
+        let registrations = data.join("auth/ssh-keys.json");
+        std::fs::write(&registrations, r#"{"version":99,"keys":[]}"#).unwrap();
+        let plan = scan::scan(&exe, &data).unwrap();
+        let outcome = execute(&plan, Decisions::PURGE, &NoopSelfDelete, None).unwrap();
+        assert!(registrations.exists());
+        assert!(outcome
+            .failed
+            .iter()
+            .any(|(path, _)| path == &registrations));
+    }
+
+    #[test]
     fn keep_data_only_removes_binary() {
         let tmp = TempDir::new().unwrap();
         let (exe, data) = fake_install(&tmp);

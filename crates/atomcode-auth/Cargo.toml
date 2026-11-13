@@ -3,7 +3,7 @@ name = "atomcode-auth"
 version.workspace = true
 edition = "2021"
 license.workspace = true
-description = "atomcode OAuth login flow + secure (chmod-600) auth-token file. Leaf crate: depends only on atomcode-config + atomcode-telemetry + reqwest, so any stack layer can authenticate without an atomcode-core dependency."
+description = "Shared OAuth and host-owned OS credentials; core-free authentication leaf."
 publish = false
 
 [dependencies]
@@ -22,6 +22,9 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
 sha2 = "0.10"
 base64 = "0.22"
+portable-pty = "0.9"
+zeroize = "1"
+tempfile = "3"
 rand = "0.8"
 
 [features]
@@ -36,7 +39,7 @@ libc = "0.2"
 # `ShellExecuteW` (Win32_UI_Shell) + `SW_SHOWNORMAL` (Win32_UI_WindowsAndMessaging) to open
 # the sign-in URL in the default browser without a console flash. `Win32_Foundation` is
 # required for the `HWND`/`HINSTANCE` types in ShellExecuteW's signature.
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_Services", "Win32_Security"] }
 # Same-directory atomic credential replacement on Windows.
 tempfile = "3"
 # Windows: enable reqwest's native-tls backend (SChannel). Some networks RST the
@@ -47,3 +50,11 @@ reqwest = { version = "0.12", features = ["native-tls"], default-features = fals
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+security-framework = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies.keyring]
+version = "3.6"
+features = ["windows-native"]
