@@ -284,10 +284,10 @@ fn cases() -> Vec<(String, Record)> {
             success: false,
             duration_ms: Some(20),
             error_kind: Some(McpErrorKind::ExecutionFailed),
-            // `<CWD>` rather than the path itself: the reporter scrubs before
-            // it truncates, which is the one place this build deliberately
-            // sends less than the retired engine did. See
-            // `atomcode-coding/src/telemetry.rs`, `McpTelemetry::safe_message`.
+            // `<CWD>` rather than the path itself: the shared scrubber runs
+            // before truncation, so this build deliberately sends less than
+            // the retired engine did. See `atomcode-coding/src/telemetry.rs`,
+            // `safe_message` (used by both the MCP reporter and the turn hook).
             error_data: Some(
                 r#"{"config_source":"driver","duration_ms":20,"message":"Failed to spawn MCP server: <CWD>/no-such-server","server_name":"t","transport":"stdio"}"#
                     .into(),

@@ -228,6 +228,16 @@ impl LlmProvider for RecordingProvider {
                             .to_string(),
                 })
             }
+            // A provider refusal that quotes the path the prompt named.
+            Some(m) if m.role == Role::User && m.text.starts_with("fail at ") => {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: format!("HTTP 400: {}", &m.text[8..]),
+                    http_status: Some(400),
+                    code: Some("invalid_request".into()),
+                    retry_after_secs: None,
+                });
+            }
             // A provider-side failure the retry tier is meant to ride out.
             Some(m) if m.role == Role::User && m.text == "fail every time" => {
                 return Err(ProviderError {
@@ -1657,6 +1667,58 @@ async fn a_turn_is_transcribed_and_metered() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(chats > 0, "no model call was metered");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// The runtime assembly hands the session's working directory to the
+/// telemetry hook: a provider error quoting a path inside it is scrubbed to
+/// `<CWD>`. The hook's own unit test starts with a directory; this one proves
+/// the runtime actually passes the one the session runs in.
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn a_provider_error_is_scrubbed_with_the_session_working_dir() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    let path = env.project.path().join("src/main.rs");
+    turn(
+        &mut runtime,
+        &format!("fail at cannot open {}", path.display()),
+    )
+    .await;
+
+    let raw = env.project.path().display().to_string();
+    let mut reason = None;
+    for _ in 0..100 {
+        for record in captured.lock().await.iter() {
+            if let atomcode_telemetry::Event::LlmChat {
+                had_error: true,
+                error_data: Some(data),
+                ..
+            } = &record.event
+            {
+                reason = Some(data.clone());
+            }
+        }
+        if reason.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let reason = reason.expect("a failed LlmChat carries its reason");
+    let normalized = reason.replace('\\', "/");
+    assert!(
+        normalized.contains("<CWD>/src/main.rs"),
+        "the session path was not scrubbed relative to its working directory: {reason}"
+    );
+    assert!(
+        !reason.contains(&raw),
+        "the raw working directory leaked: {reason}"
+    );
     runtime.handle.shutdown().await.unwrap();
 }
 

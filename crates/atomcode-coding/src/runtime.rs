@@ -12194,6 +12194,7 @@ fn harness_host_state(
                 &config.model,
                 session_id,
                 Arc::clone(&position),
+                config.working_dir.clone(),
             )),
         );
         middleware.insert(
