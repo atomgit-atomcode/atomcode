@@ -580,11 +580,10 @@ pub async fn summarize_span(
     // Leave 20% of the remaining window for tokenizer/catalog estimation error.
     // Cap each input at 64k estimated tokens so a very large model still folds
     // long histories in manageable windows. Unknown windows use a 128k fallback.
-    let input_budget = ((window - max_output) as usize * 4 / 5).min(64_000);
+    let mut input_budget = ((window - max_output) as usize * 4 / 5).min(64_000);
     let transcript = render_transcript(span);
     let mut previous = find_prior_anchor(span).map(str::to_owned);
     let mut remaining = transcript.as_str();
-    let mut transcript_cap = usize::MAX;
     let mut first = true;
     while first || !remaining.is_empty() {
         first = false;
@@ -596,7 +595,7 @@ pub async fn summarize_span(
         let available = input_budget
             .checked_sub(overhead + 16)
             .ok_or(SummaryError::InputTooLarge)?;
-        let cap = available.saturating_mul(4).min(transcript_cap);
+        let cap = available.saturating_mul(4);
         if cap < 4 {
             return Err(SummaryError::InputTooLarge);
         }
@@ -620,8 +619,10 @@ pub async fn summarize_span(
                 remaining = &remaining[end..];
             }
             Err(SummaryError::Provider(e)) if e.is_context_overflow() && end > 1_024 => {
-                // Shrink what was actually rejected, not an optimistic catalog size.
-                transcript_cap = end / 2;
+                // Halve the actual new transcript, then remember the WHOLE request
+                // budget. Future windows must subtract their growing carried summary
+                // from this learned budget too, or each can overflow all over again.
+                input_budget = overhead + 16 + end / 8;
                 first = true;
             }
             Err(error) => return Err(error),

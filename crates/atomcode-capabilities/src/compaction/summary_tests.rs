@@ -133,6 +133,52 @@ async fn context_rejection_halves_the_actual_input_and_still_covers_the_whole_tr
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_learned_window_includes_the_growing_summary_not_only_new_transcript() {
+    let provider = Probe {
+        window: 512_000,
+        max_prompt_bytes: Some(40_000),
+        replies: Mutex::new(
+            (0..100)
+                .map(|i| answer(&"saved decision ".repeat(((i + 1) * 200).min(800))))
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let span = vec![Message::user("dialogue detail\n".repeat(20_000))];
+    summarize_span(&provider, &span, None).await.unwrap();
+    let sent = provider.sent.lock().unwrap();
+    let size = |prompt: &Vec<Message>| prompt.iter().map(|m| m.text.len()).sum::<usize>();
+    let first_success = sent
+        .iter()
+        .position(|prompt| size(prompt) <= 40_000)
+        .unwrap();
+    assert!(
+        first_success > 0,
+        "the catalog initially overstates the window"
+    );
+    let mut accepted = String::new();
+    for prompt in &sent[first_success..] {
+        assert!(
+            size(prompt) <= 40_000,
+            "the carried summary must fit within the learned total budget, got {} bytes",
+            size(prompt)
+        );
+        accepted.push_str(
+            prompt[1]
+                .text
+                .split_once("Conversation history to summarize:\n\n")
+                .unwrap()
+                .1,
+        );
+    }
+    assert_eq!(
+        accepted,
+        render_transcript(&span),
+        "shrinking cannot omit or duplicate dialogue"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn transient_partial_output_is_discarded_before_one_bounded_retry() {
     let provider = Probe {
         replies: Mutex::new(VecDeque::from([
