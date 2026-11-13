@@ -1821,6 +1821,9 @@ pub enum Msg<'a> {
     // ── /compact ──
     CompactSummaryFailed,
     CompactSummaryTimedOut,
+    CompactSummaryContextExceeded,
+    CompactSummaryIncomplete,
+    CompactSummaryRequestFailed,
     CompactNotSmaller,
     CompactDiagnosticRetained {
         reason: &'a str,

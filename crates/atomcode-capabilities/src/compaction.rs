@@ -27,8 +27,13 @@ use async_trait::async_trait;
 use atomcode_kernel::message::{
     CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
-use atomcode_kernel::provider::{ChatOptions, LlmProvider};
-use atomcode_kernel::stream::StreamEvent;
+use atomcode_kernel::provider::{
+    ChatOptions, LlmProvider, RateLimitRetryOwner, RequestRecoveryBudget,
+};
+use atomcode_kernel::stream::{
+    ProviderError, StreamEvent, OPEN_TIMEOUT_CODE, STREAM_IDLE_TIMEOUT_CODE,
+    STREAM_TRANSPORT_INTERRUPTED_CODE,
+};
 use futures::StreamExt;
 
 /// Tool results at or below this byte size are left alone. A produced stub is far under
@@ -201,20 +206,10 @@ const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Soft cap forwarded to the summary provider (≈ `MAX_SUMMARY_BYTES`/4). Stops a runaway
 /// generation early; the byte cap above is the backstop if the gateway ignores it.
 const MAX_SUMMARY_TOKENS: u32 = 16_000;
-/// Wall-clock ceiling on the summary LLM call (shared by auto / manual `/compact` /
-/// emergency overflow). The provider's stream timeout is BYTE-IDLE only (300s of silence):
-/// a thinking model (e.g. GLM-5.2) trickles hidden-reasoning bytes for many minutes, so the
-/// idle timer never fires and the summary could hang 20+ min. This hard cap bounds it — on
-/// expiry we fall back to the gentle in-place stub (manual/auto) or a plain drain (overflow).
-/// 180s (up from 120s): gives a slow model more room now that the summary INPUT is
-/// bounded — per-item tool caps plus the whole-transcript ceiling
-/// (`SUMMARY_TRANSCRIPT_MAX_CHARS`) — so a legit slow-but-progressing summary
-/// isn't cut early, while still bounding a genuinely hung call.
-pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
-/// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
-/// fall back to stub compaction, so the user understands why they got a lighter compaction.
+/// Summary calls use the provider's configured first-content and idle watchdogs.
+/// Active reasoning or text can continue indefinitely; there is no total deadline.
 const SUMMARY_TIMEOUT_NOTE: &str =
-    "[系统] 本次上下文压缩的 AI 摘要超时（模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后手动压缩（/compact），或切换更快的模型。";
+    "[系统] 本次 AI 摘要等待首响应或后续内容超时，已保留对话，仅精简较大的工具输出。可稍后重试 /compact。";
 
 const SUMMARY_FAILURE_NOTE: &str =
     "[系统] 本次 AI 摘要失败或未返回有效内容，已保留对话，仅精简较大的工具输出。可稍后重试 /compact 或检查模型访问权限。";
@@ -325,9 +320,7 @@ impl OverflowCompaction {
     /// Hard-truncate any single message in `[from, len)` whose text exceeds `budget_chars`.
     /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe). With a summary
     /// provider, this tier leaves dialogue alone (`tool_results_only`) so the span
-    /// reaches the summarizer intact; only the summarizer transcript's positional
-    /// whole-input ceiling ([`SUMMARY_TRANSCRIPT_MAX_CHARS`]) may cut dialogue
-    /// after this tier.
+    /// reaches the summarizer intact; the summarizer folds the complete dialogue in bounded windows.
     fn truncate_rewrites(
         msgs: &[Message],
         from: usize,
@@ -438,39 +431,20 @@ impl OverflowCompaction {
                 // A configured summarizer failing cannot authorize losing dialogue,
                 // even in emergency recovery. Keep any tool-result savings; the
                 // bounded overflow ladder reports failure if that still cannot fit.
-                let summary = match tokio::time::timeout(
-                    SUMMARY_TIMEOUT,
-                    self.summarize(&msgs[floor..drain_to], None),
-                )
-                .await
-                {
-                    Ok(Some(summary)) => Some(summary),
-                    Ok(None) if self.summary_provider.is_none() => None,
-                    unavailable => {
-                        let timed_out = unavailable.is_err();
+                let summary = match self.summarize(&msgs[floor..drain_to], None).await {
+                    Ok(summary) => summary,
+                    Err(error) => {
                         tracing::warn!(
-                            timed_out,
+                            diagnostic = error.diagnostic().code(),
                             "overflow summary unavailable; retaining conversation history"
                         );
-                        let resume_note = (!rewrites.is_empty()).then(|| {
-                            if timed_out {
-                                SUMMARY_TIMEOUT_NOTE
-                            } else {
-                                SUMMARY_FAILURE_NOTE
-                            }
-                            .to_string()
-                        });
                         return CompactionPlan {
-                            diagnostic: Some(if timed_out {
-                                atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut
-                            } else {
-                                atomcode_kernel::message::CompactionDiagnostic::SummaryFailed
-                            }),
+                            diagnostic: Some(error.diagnostic()),
                             drain_from: 0,
                             drain_to: 0,
                             summary: None,
+                            resume_note: (!rewrites.is_empty()).then(|| error.note().to_owned()),
                             rewrites,
-                            resume_note,
                         };
                     }
                 };
@@ -508,44 +482,20 @@ impl OverflowCompaction {
             // to the gentle stub policy.
             return self.inner.plan(view).await;
         }
-        // Failed, empty, or timed-out summaries must not authorize draining history.
-        // Fall back to the gentle in-place stub policy (`self.inner`) — the same fallback used above
-        // when there's nothing drainable — so a hung thinking model degrades `/compact` to a
-        // lighter compaction instead of freezing it. A note tells the user what happened.
-        let summary = match tokio::time::timeout(
-            SUMMARY_TIMEOUT,
-            self.summarize(&msgs[floor..drain_to], focus),
-        )
-        .await
-        {
-            Ok(Some(summary)) => Some(summary),
-            // An explicitly model-free strategy keeps its historical fallback. A
-            // configured provider failing is different: a request-only list cannot
-            // preserve the assistant's design decisions in the drained history.
-            Ok(None) if self.summary_provider.is_none() => None,
-            unavailable => {
-                let timed_out = unavailable.is_err();
+        // A configured summarizer failing never authorizes draining dialogue.
+        let summary = match self.summarize(&msgs[floor..drain_to], focus).await {
+            Ok(summary) => summary,
+            Err(error) => {
                 tracing::warn!(
-                    timed_out,
+                    diagnostic = error.diagnostic().code(),
                     "compaction summary unavailable; retaining conversation history"
                 );
-                let note = if timed_out {
-                    SUMMARY_TIMEOUT_NOTE
-                } else {
-                    SUMMARY_FAILURE_NOTE
-                };
                 let mut plan = self.inner.plan(view).await;
-                plan.diagnostic = Some(if timed_out {
-                    atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut
-                } else {
-                    atomcode_kernel::message::CompactionDiagnostic::SummaryFailed
-                });
-                // Only annotate a plan that actually shrinks; adding a note to a noop plan
-                // would grow it and get (correctly) refused by the net-loss guard for nothing.
+                plan.diagnostic = Some(error.diagnostic());
                 if !plan.rewrites.is_empty() {
                     plan.resume_note = Some(match plan.resume_note.take() {
-                        Some(n) => format!("{n}\n{note}"),
-                        None => note.to_string(),
+                        Some(n) => format!("{n}\n{}", error.note()),
+                        None => error.note().to_owned(),
                     });
                 }
                 return plan;
@@ -561,106 +511,227 @@ impl OverflowCompaction {
         }
     }
 
-    /// Summarize a drained span into one paragraph via the configured provider. `None` if
-    /// no provider, the call fails, or the result is empty/incomplete. Manual and
-    /// automatic compaction retain conversation history on a configured provider's failure.
-    /// One-shot, no tools; operates on the already-stubbed span so its input is small.
-    /// `focus` (from `/compact <focus>`) steers the summary toward a topic when present.
-    async fn summarize(&self, span: &[Message], focus: Option<&str>) -> Option<String> {
-        let provider = self.summary_provider.as_ref()?;
-        summarize_span(provider.as_ref(), span, focus).await
+    /// Only an explicitly model-free strategy may return `Ok(None)`.
+    async fn summarize(
+        &self,
+        span: &[Message],
+        focus: Option<&str>,
+    ) -> Result<Option<String>, SummaryError> {
+        let Some(provider) = self.summary_provider.as_ref() else {
+            return Ok(None);
+        };
+        summarize_span(provider.as_ref(), span, focus)
+            .await
+            .map(Some)
     }
 }
 
-/// Summarize a span of conversation with `provider`, the way a manual `/compact`
-/// does: the prior summary (if the span holds one) is the base being updated,
-/// the rest is folded in, `focus` steers it, and the result is framed so the next
-/// compaction recognizes it. `None` when the call fails or says nothing.
-///
-/// No timeout of its own — callers bound it with [`SUMMARY_TIMEOUT`] and fall
-/// back to something model-free. Only a normally completed, non-truncated answer
-/// within the byte limit can become an anchor.
-///
-/// The rendered transcript is capped by [`SUMMARY_TRANSCRIPT_MAX_CHARS`]; the
-/// prompt also carries the system prompt, the summary template, a prior anchor
-/// (itself bounded by [`MAX_SUMMARY_BYTES`]) and focus, which sit outside that
-/// transcript cap.
+/// Failures retain their provider classification until the strategy decides how to recover.
+/// Partial or intermediate summaries are never returned as a successful plan.
+#[derive(Debug)]
+pub enum SummaryError {
+    Provider(ProviderError),
+    Incomplete,
+    InputTooLarge,
+}
+
+impl SummaryError {
+    fn diagnostic(&self) -> atomcode_kernel::message::CompactionDiagnostic {
+        use atomcode_kernel::message::CompactionDiagnostic as D;
+        match self {
+            Self::Provider(e) if e.is_context_overflow() => D::SummaryContextExceeded,
+            Self::Provider(e)
+                if matches!(
+                    e.code.as_deref(),
+                    Some(OPEN_TIMEOUT_CODE | STREAM_IDLE_TIMEOUT_CODE)
+                ) =>
+            {
+                D::SummaryTimedOut
+            }
+            Self::Provider(e) if summary_retryable(e) => D::SummaryRequestFailed,
+            Self::Provider(_) => D::SummaryFailed,
+            Self::Incomplete => D::SummaryIncomplete,
+            Self::InputTooLarge => D::SummaryContextExceeded,
+        }
+    }
+
+    fn note(&self) -> &'static str {
+        if self.diagnostic() == atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut {
+            SUMMARY_TIMEOUT_NOTE
+        } else {
+            SUMMARY_FAILURE_NOTE
+        }
+    }
+}
+
+/// Rolling, bounded-input summarization. All windows must succeed before the caller
+/// receives an anchor. Dropping this future cancels the stream/backoff and discards
+/// intermediate summaries. Provider watchdogs own first-content and idle timeouts.
 pub async fn summarize_span(
     provider: &dyn LlmProvider,
     span: &[Message],
     focus: Option<&str>,
-) -> Option<String> {
-    {
-        // Split: the prior anchor (if any) is the UPDATE base; everything else is the new
-        // transcript to fold in. The anchor is NEVER re-rendered as transcript (erosion fix).
-        let previous_anchor = find_prior_anchor(span);
-        // Render borrowed messages: cloning this span would duplicate large
-        // bodies, arguments, and image data before the input caps are applied.
-        let transcript = render_transcript(span);
-        let prompt = vec![
-            Message::system(SUMMARY_SYSTEM_PROMPT),
-            Message::user(build_summary_prompt(previous_anchor, &transcript, focus)),
-        ];
-        // Soft-cap the generation (`max_tokens`); the byte loop below is the hard backstop.
-        let opts = ChatOptions {
-            max_tokens: Some(MAX_SUMMARY_TOKENS),
-            ..ChatOptions::default()
-        };
-        let mut stream = provider.chat_stream(&prompt, &[], &opts).await.ok()?;
-        let mut out = String::new();
-        let mut completed = false;
-        // Reserve room for the sentinel + framing + their newlines prepended below, so the FINAL
-        // summary still respects MAX_SUMMARY_BYTES (the #747 hard guarantee).
-        let body_budget =
-            MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2);
-        while let Some(ev) = stream.next().await {
-            // Never commit a partial summary after a transport/provider failure.
-            match ev {
-                StreamEvent::Error(_) | StreamEvent::Done { truncated: true } => return None,
-                StreamEvent::Done { truncated: false } => completed = true,
-                _ => {}
-            }
-            if let StreamEvent::TextDelta(t) = ev {
-                let remaining = body_budget.saturating_sub(out.len());
-                if t.len() <= remaining {
-                    out.push_str(&t);
-                } else {
-                    // A locally cut summary is incomplete too: never use its prefix
-                    // to replace the full design history.
-                    return None;
+) -> Result<String, SummaryError> {
+    let window = match provider.context_window() {
+        0 => 128_000,
+        n => n,
+    };
+    let max_output = (window / 8).clamp(1, MAX_SUMMARY_TOKENS);
+    // Leave 20% of the remaining window for tokenizer/catalog estimation error.
+    // Cap each input at 64k estimated tokens so a very large model still folds
+    // long histories in manageable windows. Unknown windows use a 128k fallback.
+    let input_budget = ((window - max_output) as usize * 4 / 5).min(64_000);
+    let transcript = render_transcript(span);
+    let mut previous = find_prior_anchor(span).map(str::to_owned);
+    let mut remaining = transcript.as_str();
+    let mut transcript_cap = usize::MAX;
+    let mut first = true;
+    while first || !remaining.is_empty() {
+        first = false;
+        let empty_prompt = summary_prompt(previous.as_deref(), "", focus);
+        let overhead: usize = empty_prompt
+            .iter()
+            .map(|m| m.estimate_tokens() as usize)
+            .sum();
+        let available = input_budget
+            .checked_sub(overhead + 16)
+            .ok_or(SummaryError::InputTooLarge)?;
+        let cap = available.saturating_mul(4).min(transcript_cap);
+        if cap < 4 {
+            return Err(SummaryError::InputTooLarge);
+        }
+        let mut end = remaining.len().min(cap);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        // Prefer message/line boundaries, but split even a single huge message
+        // without dropping its middle. Already escaped transcript bytes stay intact.
+        if end < remaining.len() {
+            if let Some(newline) = remaining[..end].rfind('\n') {
+                if newline >= end / 2 {
+                    end = newline + 1;
                 }
             }
         }
-        if !completed {
-            return None;
-        }
-        // Strip any leading sentinel/framing the model may have echoed, then stamp exactly ONE
-        // sentinel + the framing so the NEXT compaction recognizes the anchor and the model that
-        // READS this block is told it's reference context, not instructions.
-        let body = out.trim();
-        let body = body
-            .strip_prefix(ANCHOR_SENTINEL)
-            .map(str::trim_start)
-            .unwrap_or(body);
-        let body = body
-            .strip_prefix(SUMMARY_FRAMING)
-            .map(str::trim_start)
-            .unwrap_or(body);
-        if body.is_empty() {
-            None
-        } else {
-            Some(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"))
+        let prompt = summary_prompt(previous.as_deref(), &remaining[..end], focus);
+        match summarize_window(provider, &prompt, max_output).await {
+            Ok(summary) => {
+                previous = Some(summary);
+                remaining = &remaining[end..];
+            }
+            Err(SummaryError::Provider(e)) if e.is_context_overflow() && end > 1_024 => {
+                // Shrink what was actually rejected, not an optimistic catalog size.
+                transcript_cap = end / 2;
+                first = true;
+            }
+            Err(error) => return Err(error),
         }
     }
+    let body = previous.ok_or(SummaryError::Incomplete)?;
+    Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"))
+}
+
+fn summary_prompt(previous: Option<&str>, transcript: &str, focus: Option<&str>) -> Vec<Message> {
+    vec![
+        Message::system(SUMMARY_SYSTEM_PROMPT),
+        Message::user(build_summary_prompt(previous, transcript, focus)),
+    ]
+}
+
+// Provider retryable=false can mean partial content was already delivered. A
+// summary has no user-visible deltas or dispatched tools, so these typed transport
+// failures may replay once after discarding the partial summary (and may be billed again).
+fn summary_retryable(error: &ProviderError) -> bool {
+    error.retryable
+        || matches!(
+            error.code.as_deref(),
+            Some(OPEN_TIMEOUT_CODE | STREAM_IDLE_TIMEOUT_CODE | STREAM_TRANSPORT_INTERRUPTED_CODE)
+        )
+}
+
+async fn summarize_window(
+    provider: &dyn LlmProvider,
+    prompt: &[Message],
+    max_output: u32,
+) -> Result<String, SummaryError> {
+    // One owner for transient retries, including adapter authentication replays.
+    // A completed window starts a fresh allowance; inference time is not a wait budget.
+    let budget = RequestRecoveryBudget::new(2, Duration::from_secs(30));
+    let options = ChatOptions {
+        max_tokens: Some(max_output),
+        request_recovery: Some(budget.clone()),
+        rate_limit_retry_owner: RateLimitRetryOwner::Kernel,
+        ..ChatOptions::default()
+    };
+    loop {
+        budget.try_attempt().map_err(|_| SummaryError::Incomplete)?;
+        let result = collect_summary(provider, prompt, &options).await;
+        if let Err(SummaryError::Provider(error)) = &result {
+            // Replaying a summary has no tool side effects. Never replay auth,
+            // malformed/truncated output, or an unchanged oversized request.
+            if summary_retryable(error) && !error.is_context_overflow() {
+                let wait = Duration::from_secs(error.retry_after_secs.unwrap_or(1));
+                if budget.reserve_wait(wait).is_ok() {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+        }
+        return result;
+    }
+}
+
+async fn collect_summary(
+    provider: &dyn LlmProvider,
+    prompt: &[Message],
+    options: &ChatOptions,
+) -> Result<String, SummaryError> {
+    let mut stream = provider
+        .chat_stream(prompt, &[], options)
+        .await
+        .map_err(SummaryError::Provider)?;
+    let mut out = String::new();
+    let mut completed = false;
+    let body_budget =
+        MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2);
+    while let Some(event) = stream.next().await {
+        match event {
+            StreamEvent::Error(error) => return Err(SummaryError::Provider(error)),
+            StreamEvent::Done { truncated: true } => return Err(SummaryError::Incomplete),
+            StreamEvent::Done { truncated: false } => completed = true,
+            StreamEvent::TextDelta(text) => {
+                if text.len() > body_budget.saturating_sub(out.len()) {
+                    return Err(SummaryError::Incomplete);
+                }
+                out.push_str(&text);
+            }
+            _ => {}
+        }
+    }
+    if !completed {
+        return Err(SummaryError::Incomplete);
+    }
+    let body = out.trim();
+    let body = body
+        .strip_prefix(ANCHOR_SENTINEL)
+        .map(str::trim_start)
+        .unwrap_or(body);
+    let body = body
+        .strip_prefix(SUMMARY_FRAMING)
+        .map(str::trim_start)
+        .unwrap_or(body);
+    if body.is_empty() {
+        return Err(SummaryError::Incomplete);
+    }
+    Ok(body.to_owned())
 }
 
 /// Cap on a single TOOL result's length when rendering the summary INPUT (mirrors
 /// opencode's `TOOL_OUTPUT_MAX_CHARS`). A 50 KB bash dump or a whole-file read being
 /// summarized away doesn't need full fidelity — its head captures what ran, and RECENT
 /// tool outputs stay verbatim (they're outside the drained span). Bounding the summary
-/// input is what keeps the summary LLM call fast + cheap regardless of session size —
-/// an UNBOUNDED input (500k+ tokens on a long 1M session) is the real reason a summary
-/// could crawl toward the wall-clock timeout, not the timeout value itself.
+/// input reduces the cost of each rolling summary window; dialogue is kept
+/// complete and split into further windows when needed.
 /// The bounded body and truncation marker stay at or under this cap; structural
 /// escaping in the consumer may add one leading space per escaped line.
 const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
@@ -675,20 +746,9 @@ const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
 /// summary can name the action without re-reading a whole file; the truncation
 /// marker is included in the cap. The cap applies before the call line's bracket
 /// escaping, which can add one backslash per `[`/`]` (up to doubling the rendered
-/// field); the whole-transcript ceiling counts the escaped text.
+/// field); summary window sizing counts the escaped text.
 const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
 const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
-/// Whole-input ceiling for the transcript, marker line included. This is the
-/// transcript ceiling, not the whole summarizer prompt: the system prompt,
-/// summary template, an optional prior anchor (bounded by `MAX_SUMMARY_BYTES`)
-/// and focus sit outside it. It is the only bound on dialogue text (messages
-/// have no per-message cap) and is positional, not role-aware: an over-budget
-/// span can lose dialogue from its middle, which the marker reports. Tool
-/// results and call arguments have per-item caps, which keeps one item from
-/// spending the span; many items can still reach this ceiling together (tier1
-/// already allows cutting tool data).
-const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
-const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
 /// Decimal digits in `usize::MAX`; 20 covers the supported platforms.
 const MAX_USIZE_DIGITS: usize = 20;
 
@@ -1185,8 +1245,7 @@ fn push_call_field(into: &mut String, text: &str) {
 /// logs) is what the summary needs. Only continuation lines can start a line:
 /// the first is inline after the `ROLE: ` prefix, so it is left unpadded.
 /// Escaping runs after a per-item cap and can add one leading space per escaped
-/// continuation line; the whole-span cap is applied to the final transcript, so
-/// those spaces are included there. A line that already carries visible ASCII
+/// continuation line; summary window sizing includes those spaces. A line that already carries visible ASCII
 /// indentation keeps it: the indent is the pad, and another space would shift
 /// a code or log block.
 fn push_transcript_text(into: &mut String, text: &str) {
@@ -1233,8 +1292,7 @@ fn render_transcript(span: &[Message]) -> String {
             let body = render_tool_body(&m.text);
             push_transcript_text(&mut s, &body);
         } else {
-            // Dialogue has no per-message bound: only the whole-input ceiling
-            // can cut it, positionally rather than by role. Its line shape
+            // Dialogue has no per-message bound: it is split across summary windows. Its line shape
             // stays, but a pasted role or marker line must not become structure.
             push_transcript_text(&mut s, &m.text);
         }
@@ -1284,27 +1342,7 @@ fn render_transcript(span: &[Message]) -> String {
         }
         s.push('\n');
     }
-    // A byte length at or under the cap proves the char count is too, so the
-    // common case returns the built string untouched. Multibyte text can
-    // exceed the cap in bytes while fitting in chars, so count before the cut;
-    // that count is handed to the cut, which then scans the string only once.
-    if s.len() <= SUMMARY_TRANSCRIPT_MAX_CHARS {
-        return s;
-    }
-    let total = s.chars().count();
-    if total <= SUMMARY_TRANSCRIPT_MAX_CHARS {
-        return s;
-    }
-    // cut_body reserves the marker line, so the final transcript (marker
-    // included) stays within the declared ceiling.
-    cut_body(
-        &s,
-        total,
-        SUMMARY_TRANSCRIPT_MAX_CHARS,
-        SUMMARY_TRANSCRIPT_TAIL_CHARS,
-        "conversation truncated",
-        true,
-    )
+    s
 }
 
 /// Sentinel first line stamped on every anchored compaction summary. Used to find the
@@ -2407,9 +2445,7 @@ mod tests {
         );
     }
 
-    /// Opens the stream fine, then never yields a byte — models a thinking model (e.g.
-    /// GLM-5.2) stuck in hidden reasoning on a huge prompt, where the provider's byte-idle
-    /// stream timeout never fires. The manual `/compact` wall-clock cap must fire instead.
+    /// Simulate the provider's content watchdog, which also guards direct callers.
     struct HangingSummaryProvider;
     #[async_trait]
     impl LlmProvider for HangingSummaryProvider {
@@ -2425,7 +2461,14 @@ mod tests {
             futures::stream::BoxStream<'static, StreamEvent>,
             atomcode_kernel::stream::ProviderError,
         > {
-            Ok(Box::pin(futures::stream::pending::<StreamEvent>()))
+            Ok(Box::pin(futures::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                StreamEvent::Error(ProviderError {
+                    code: Some(STREAM_IDLE_TIMEOUT_CODE.into()),
+                    retryable: true,
+                    ..Default::default()
+                })
+            })))
         }
     }
 
@@ -2449,7 +2492,7 @@ mod tests {
             StubCompaction::default(),
             Some(Arc::new(HangingSummaryProvider)),
         );
-        // start_paused auto-advances virtual time to the 180s cap while the provider hangs.
+        // Virtual time advances through provider idle timeouts and one bounded retry.
         let plan = strat.plan(&manual_view(&conv.messages, floor, None)).await;
         // Timeout → C fallback: the gentle in-place stub policy (no drain, no LLM summary),
         // so every message survives and old tool results are folded to reclaim tokens.
@@ -3066,7 +3109,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn overflow_tier2_summary_timeout_preserves_history() {
-        // The cap must bound emergency recovery without authorizing a lossy drain.
+        // A provider idle failure must stop recovery without authorizing a lossy drain.
         let msgs = vec![
             Message::system("p"),
             Message::user("u1"),
@@ -3258,7 +3301,8 @@ mod tests {
         let out = strat
             .summarize(&span, Some("errors"))
             .await
-            .expect("returns a summary");
+            .expect("summary request succeeds")
+            .expect("configured provider returns a summary");
 
         // Output is anchored.
         assert!(
@@ -3893,7 +3937,7 @@ mod tests {
     #[test]
     fn render_transcript_keeps_dialogue_intact_under_the_budget() {
         // A pasted spec larger than a tool result must still reach the summarizer
-        // whole: only the whole-input ceiling may cut dialogue.
+        // whole: windowing must preserve dialogue beyond the tool-data cap.
         let text = "u".repeat(20_000);
         let out = render_transcript(&[Message::user(text.clone())]);
         assert!(out.contains(&text), "the message must not be cut");
@@ -3901,19 +3945,10 @@ mod tests {
     }
 
     #[test]
-    fn render_transcript_counts_the_cap_in_chars_not_bytes() {
-        // Three bytes per char: this body exceeds the cap in bytes and fits in
-        // chars, so it must be kept whole.
-        let under = "字".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS - 1_000);
-        let out = render_transcript(&[Message::user(under.clone())]);
-        assert!(out.contains(&under), "the cap counts chars, not bytes");
-        assert!(!out.contains("[truncated "), "nothing was cut");
-
-        // The same unit decides the cut: over the cap in chars is cut.
-        let over = "字".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS + 1_000);
-        let out = render_transcript(&[Message::user(over.clone())]);
-        assert!(!out.contains(&over), "an over-cap body is cut");
-        assert!(out.contains("[conversation truncated "), "and says so");
+    fn render_transcript_preserves_large_multibyte_dialogue_for_windowing() {
+        let text = "字".repeat(121_000);
+        let out = render_transcript(&[Message::user(text.clone())]);
+        assert_eq!(out, format!("USER: {text}\n"));
     }
 
     #[test]
@@ -3964,41 +3999,24 @@ mod tests {
     }
 
     #[test]
-    fn render_transcript_bounds_a_message_that_alone_exceeds_the_budget() {
-        let big = "u".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS + 1_000);
-        let out = render_transcript(&[Message::user(big.clone())]);
-        assert!(!out.contains(&big), "the full user message must not appear");
+    fn render_transcript_preserves_a_message_larger_than_one_summary_window() {
+        let text = "u".repeat(300_000);
         assert_eq!(
-            out.matches("[conversation truncated ").count(),
-            1,
-            "one message is cut once, so the marker reports the whole drop"
+            render_transcript(&[Message::user(text.clone())]),
+            format!("USER: {text}\n")
         );
     }
 
     #[test]
-    fn the_two_truncation_markers_are_distinct() {
-        // A clipped item says `[truncated N chars]`; a span whose middle was
-        // dropped says `[conversation truncated N chars]`, so the summarizer
-        // can tell a clipped tool body from a lost part of the exchange.
-        let mut span = vec![Message::tool_result(
-            "c0",
-            "z".repeat(SUMMARY_TOOL_OUTPUT_MAX_CHARS + 100),
-            false,
-        )];
-        for i in 0..80 {
-            span.push(Message::tool_result(
-                format!("c{i}"),
-                "x".repeat(1_900),
-                false,
-            ));
-        }
-
+    fn render_transcript_only_truncates_individual_tool_data() {
+        let span = vec![
+            Message::tool_result("c", "z".repeat(3_000), false),
+            Message::user("decision".repeat(40_000)),
+        ];
         let out = render_transcript(&span);
-        assert!(out.contains("[truncated "), "the tool body is clipped");
-        assert!(
-            out.contains("[conversation truncated "),
-            "the whole span is clipped"
-        );
+        assert!(out.contains("[truncated "));
+        assert!(!out.contains("[conversation truncated "));
+        assert!(out.contains(&span[1].text));
     }
 
     #[test]
@@ -4115,11 +4133,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_data_without_a_total_budget_can_crowd_out_dialogue() {
-        // Known boundary: the tool caps are per item, not a total budget. Many
-        // results can reach the whole-input ceiling, and the positional cut then
-        // drops the middle of the span — dialogue included. This pins the
-        // tradeoff until an aggregate tool-data budget exists.
+    fn tool_data_cannot_crowd_out_middle_dialogue() {
+        // Per-item tool limits bound logs; rolling summary windows keep every
+        // dialogue message even when many tool results surround it.
         let mut span = vec![Message::user("HEAD-USER")];
         for i in 0..100 {
             span.push(Message::tool_result(
@@ -4137,22 +4153,17 @@ mod tests {
         assert!(out.contains("HEAD-USER"), "the head is kept");
         assert!(out.contains("TAIL-USER"), "the tail is kept");
         assert!(
-            !out.contains("MIDDLE-USER"),
-            "tool data can fill the span and push middle dialogue out"
+            out.contains("MIDDLE-USER"),
+            "tool data cannot push middle dialogue out"
         );
         assert_eq!(
             out.matches("[conversation truncated ").count(),
-            1,
-            "only the whole-input cut leaves a marker"
+            0,
+            "dialogue is windowed rather than cut"
         );
         assert!(
             !out.contains("[truncated "),
             "each tool body fits its cap, so none is clipped"
-        );
-        assert!(
-            out.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS,
-            "the whole summary input stays under the ceiling (marker included): {} chars",
-            out.chars().count()
         );
     }
 
@@ -4393,27 +4404,15 @@ mod tests {
     }
 
     #[test]
-    fn render_transcript_caps_the_whole_input() {
-        let mut span: Vec<Message> = (0..20)
-            .map(|i| Message::user(format!("{i}{}", "z".repeat(20_000))))
+    fn render_transcript_preserves_every_dialogue_message() {
+        let span: Vec<_> = (0..20)
+            .map(|i| Message::user(format!("MARK-{i}{}", "z".repeat(20_000))))
             .collect();
-        // Distinct ends: the cut keeps a head and a tail, so both must survive.
-        // A head-only cut, or head and tail swapped, would drop the other mark.
-        span[0] = Message::user(format!("HEADMARK{}", "z".repeat(20_000)));
-        let last = span.len() - 1;
-        span[last] = Message::user(format!("{}TAILMARK", "z".repeat(20_000)));
         let out = render_transcript(&span);
-        assert!(
-            out.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS,
-            "the whole summary input stays under the ceiling (marker included): {} chars",
-            out.chars().count()
-        );
-        assert!(
-            out.contains("[conversation truncated "),
-            "the cap leaves a marker"
-        );
-        assert!(out.contains("HEADMARK"), "the head is kept");
-        assert!(out.contains("TAILMARK"), "the tail is kept");
+        for message in &span {
+            assert!(out.contains(&message.text));
+        }
+        assert!(!out.contains("[conversation truncated "));
     }
 
     #[test]
@@ -4555,3 +4554,6 @@ impl AlsoCalls for Message {
         self
     }
 }
+
+#[cfg(test)]
+mod summary_tests;

@@ -2308,6 +2308,24 @@ async fn a_partial_tool_fold_keeps_the_summary_failure_when_the_ladder_is_exhaus
     );
     assert!(error.contains("AI summary failed"), "{error}");
     assert!(error.contains("context_window=30000"), "{error}");
+    let notice = log
+        .events()
+        .into_iter()
+        .find_map(|event| match event.event {
+            SessionEvent::Notice {
+                notice: atomcode_harness::session::NoticeKind::OverflowCompacted,
+                detail,
+                ..
+            } => Some(detail),
+            _ => None,
+        })
+        .expect("tool reduction is visible");
+    assert!(notice.contains("tool output reduced"), "{notice}");
+    assert!(notice.contains("estimated tokens; step 1/1"), "{notice}");
+    assert!(
+        !notice.contains("summary completed"),
+        "a tool fold must not claim summary success"
+    );
     assert!(
         log.derive_messages()
             .iter()

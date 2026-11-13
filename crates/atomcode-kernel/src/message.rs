@@ -955,6 +955,9 @@ pub struct CompactionView<'a> {
 pub enum CompactionDiagnostic {
     SummaryFailed,
     SummaryTimedOut,
+    SummaryContextExceeded,
+    SummaryIncomplete,
+    SummaryRequestFailed,
     NotSmaller,
 }
 
@@ -963,6 +966,9 @@ impl CompactionDiagnostic {
         match self {
             Self::SummaryFailed => "summary_failed",
             Self::SummaryTimedOut => "summary_timed_out",
+            Self::SummaryContextExceeded => "summary_context_exceeded",
+            Self::SummaryIncomplete => "summary_incomplete",
+            Self::SummaryRequestFailed => "summary_request_failed",
             Self::NotSmaller => "not_smaller",
         }
     }

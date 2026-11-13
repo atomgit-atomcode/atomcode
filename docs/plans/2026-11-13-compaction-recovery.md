@@ -1,0 +1,22 @@
+# 长会话摘要恢复实现计划
+
+**目标：** 持续产生有效内容的摘要不因累计耗时终止；超长对话分段总结，失败保留原会话。
+
+**基线：** release/v5.2.8，8bc42a55b8d14fe5a41d51556fd77d392b6cbc3a。已有 Web UI 修改与本任务无关，保留。
+
+**边界：** capabilities 的 OverflowCompaction 只产生方案，harness/CodingRuntime 继续拥有会话与事件提交。已检查 LifecycleHooks::turn_complete 和 kernel finish_turn，不新增生命周期 hook。摘要中间结果只存在于当前 future 中，取消即丢弃；所有分段完成后才返回可提交方案。
+
+1. 删除摘要 180 秒总时限，复用 provider 已有首响应/内容空闲 watchdog。保留结构化错误，统一手动、自动与溢出路径的失败诊断。
+2. 摘要按模型窗口、输出预留与完整提示开销规划输入。使用现有 byte/token 估算，超限时对实际发送的分段减半；保留原有单工具内容限制，取消对整个对话中间部分的截断。
+3. 分段滚动更新摘要，瞬时失败最多重试一次，使用现有 RequestRecoveryBudget 避免嵌套重试。鉴权、无效摘要和截断不盲目重试。完整成功才返回计划，失败不提交任何中间摘要。
+4. 区分工具折叠与摘要完成的进度文案，并显示缩减前后估算量；新增诊断通过已有共享 i18n 到所有 driver。
+5. 回归：虚拟长思考、provider 空闲失败、分段覆盖中间文本、输入超限缩窗、有限重试、中间失败与取消不改变历史。运行相关 crate nextest、cargo fmt 和 gates/compile.sh。
+
+不改会话持久化格式、provider/model 选择、思考强度、版本与发布配置。
+
+## 验证结果
+
+- capabilities、kernel、harness、i18n、coding 的 nextest：4,658 通过，13 跳过；最后调整的压缩测试复跑 105 通过。
+- `cargo fmt --all`、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- `bash gates/compile.sh` 最终通过。首次执行遇到另一组并行 TUI 文案修改暂未同步的枚举；文件补齐后复验通过，未修改那组代码。
+- 使用模拟 provider 与虚拟时钟验证；未调用真实模型重放原始长会话。

@@ -318,12 +318,23 @@ impl OverflowLadder {
                     // tool-only savings do not prove the summarizer recovered.
                     *diagnostic = result.diagnostic;
                 }
+                let action = if decision.through != 0 {
+                    "summary completed"
+                } else {
+                    "tool output reduced"
+                };
+                let before = estimate(&req.messages);
                 crate::session::apply_compaction(&self.ctx, &session, decision);
                 super::loop_policy::reproject(req, &session);
                 notice(
                     &self.ctx,
                     NoticeKind::OverflowCompacted,
-                    format!("{what}; compacted ({}/{})", *attempt, self.max_attempts),
+                    format!(
+                        "{what}; {action} ({before} → {} estimated tokens; step {}/{})",
+                        estimate(&req.messages),
+                        *attempt,
+                        self.max_attempts
+                    ),
                 );
                 return Ok(());
             }
@@ -333,7 +344,16 @@ impl OverflowLadder {
                 "AI summary failed or returned invalid/incomplete content; conversation retained"
             }
             Some(atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut) => {
-                "AI summary timed out; conversation retained"
+                "AI summary first-response or idle timeout; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryContextExceeded) => {
+                "AI summary input cannot fit the model window; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryIncomplete) => {
+                "AI summary was empty, truncated, or incomplete; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRequestFailed) => {
+                "AI summary request failed after bounded retries; conversation retained"
             }
             Some(atomcode_kernel::message::CompactionDiagnostic::NotSmaller) => {
                 "compaction did not reduce context; conversation retained"
