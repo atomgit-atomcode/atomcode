@@ -16,6 +16,7 @@ use clap_complete::Shell;
 
 mod cloud_cmd;
 use atomcode::browser_cmd;
+mod git_auth_cmd;
 mod grape_cmd;
 mod headless_json;
 mod lsp_cmd;
@@ -778,6 +779,9 @@ enum Commands {
     /// Connect Grape once, then query and hand off tasks through native tools.
     #[command(subcommand)]
     Grape(grape_cmd::GrapeCli),
+    /// Diagnose local Git authentication without retrieving credentials or contacting a remote.
+    #[command(subcommand)]
+    GitAuth(git_auth_cmd::GitAuthCli),
     /// Sign in with AtomGit OAuth and claim CodingPlan models in one
     /// flow: OAuth (if needed) → claim → fetch models → register
     /// providers → fetch status. Reports each step and exits.
@@ -1369,6 +1373,7 @@ async fn async_main(process_start: std::time::Instant) {
     if let Ok(cli) = Cli::try_parse() {
         let local_result = match cli.command {
             Some(Commands::Browser(command)) => Some(browser_cmd::handle(command).await),
+            Some(Commands::GitAuth(command)) => Some(git_auth_cmd::handle(command).await),
             _ => None,
         };
         if let Some(result) = local_result {
@@ -4142,6 +4147,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
         Commands::Browser(sub) => browser_cmd::handle(sub).await,
         Commands::Cloud(sub) => cloud_cmd::handle(sub),
+        Commands::GitAuth(sub) => git_auth_cmd::handle(sub).await,
         Commands::Grape(sub) => tokio::task::spawn_blocking(move || grape_cmd::handle(sub)).await?,
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {

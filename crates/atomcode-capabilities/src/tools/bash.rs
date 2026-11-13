@@ -68,6 +68,22 @@ fn apply_non_interactive_env(cmd: &mut tokio::process::Command) {
     for (key, value) in non_interactive_env_vars() {
         cmd.env(key, value);
     }
+    #[cfg(unix)]
+    let interactive = crate::askpass::current_env().is_some();
+    #[cfg(not(unix))]
+    let interactive = false;
+    apply_auth_prompt_policy(cmd, interactive);
+}
+
+// Keep agent sockets and credential helpers intact. Without a human askpass
+// consumer, OpenSSH and GCM must not open a GUI to ask for missing credentials.
+// Custom helpers can implement their own UI; the existing process timeout remains
+// the bound for those. Do not override GIT_SSH_COMMAND or core.sshCommand.
+fn apply_auth_prompt_policy(cmd: &mut tokio::process::Command, interactive: bool) {
+    if !interactive {
+        cmd.env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GCM_INTERACTIVE", "never");
+    }
 }
 
 /// Detach the just-forked child from the controlling terminal. Called from BOTH
@@ -1643,10 +1659,22 @@ fn format_output(stdout: &str, stderr: &str, code: Option<i32>) -> ToolResult {
     ok(s)
 }
 
-/// Match Git's fatal HTTP credential diagnostics, not arbitrary programs'
+/// Match Git's fatal HTTP diagnostics or SSH failures paired with Git's remote error, not arbitrary programs'
 /// "Authentication failed" messages. This remains a diagnostic heuristic, not
 /// proof of why credentials are unavailable or a request to refresh AtomCode login.
 fn is_git_auth_failure(stderr: &str) -> bool {
+    let ssh_failure = stderr.lines().any(|line| {
+        line.contains("Permission denied (publickey")
+            || line.contains("Permission denied (password")
+            || line.contains("Host key verification failed.")
+    });
+    if ssh_failure
+        && stderr
+            .lines()
+            .any(|line| line.trim() == "fatal: Could not read from remote repository.")
+    {
+        return true;
+    }
     stderr.lines().any(|line| {
         let Some(message) = line.trim_start().strip_prefix("fatal: ") else {
             return false;
@@ -1675,7 +1703,7 @@ fn append_git_auth_hint(output: &mut String, code: Option<i32>, auth_failure: bo
     if !output.is_empty() && !output.ends_with('\n') {
         output.push('\n');
     }
-    output.push_str("[hint] Git reported a credential failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. Check or refresh this remote's Git credential helper/PAT in an external terminal before retrying.");
+    output.push_str("[hint] Git reported an authentication or host-key verification failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. For SSH, check the agent inherited by this process and unlock/load the intended key in an external terminal; verify the server host key there if needed. For HTTPS, check or refresh this remote's Git credential helper/PAT externally. `atomcode git-auth status` reports local agent/helper setup only, not remote access. Never provide passwords or tokens in chat; do not retry authentication failures blindly.");
 }
 
 /// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
@@ -4487,6 +4515,51 @@ mod tests {
     /// A git auth failure on a non-zero exit gets the explanatory hint, so the
     /// model can diagnose `could not read Username` instead of retrying blindly
     /// (issue #1645).
+    #[test]
+    fn unattended_auth_preserves_agent_and_helper_configuration() {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .env("SSH_AUTH_SOCK", "test-agent")
+            .env("GIT_ASKPASS", "existing-helper");
+        apply_auth_prompt_policy(&mut command, false);
+        let env: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(env["SSH_AUTH_SOCK"], "test-agent");
+        assert_eq!(env["GIT_ASKPASS"], "existing-helper");
+        assert_eq!(env["SSH_ASKPASS_REQUIRE"], "never");
+        assert_eq!(env["GCM_INTERACTIVE"], "never");
+        let mut interactive = tokio::process::Command::new("git");
+        apply_auth_prompt_policy(&mut interactive, true);
+        assert_eq!(interactive.as_std().get_envs().count(), 0);
+    }
+
+    #[test]
+    fn ssh_auth_hint_requires_the_git_remote_failure_and_preserves_exit_status() {
+        for message in [
+            "git@example.com: Permission denied (publickey).",
+            "Host key verification failed.",
+        ] {
+            assert!(!format_output("", message, Some(255))
+                .content
+                .contains("[hint]"));
+            let stderr = format!("{message}\nfatal: Could not read from remote repository.\n");
+            let result = format_output("", &stderr, Some(128));
+            assert!(result.content.contains("git-auth status"));
+            assert!(result.content.contains("[exit code 128]"));
+            assert!(!format_output("", &stderr, Some(0))
+                .content
+                .contains("[hint]"));
+        }
+    }
+
     #[test]
     fn format_output_appends_hint_on_git_auth_failure() {
         let stderr =

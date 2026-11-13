@@ -1873,6 +1873,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ssh_auth_hint_survives_split_background_stderr() {
+        use crate::world::Chunk;
+        let (id, process) = auth_job(
+            vec![
+                Chunk::Stderr(b"git@example.com: Permission denied (public".to_vec()),
+                Chunk::Stderr(b"key).\nfatal: Could not read from remote ".to_vec()),
+                Chunk::Stderr(b"repository.\n".to_vec()),
+            ],
+            Exit {
+                code: Some(128),
+                signal: None,
+            },
+        )
+        .await;
+        process.finish.cancel();
+        let (text, status) = drain(&id).await;
+        assert_eq!(status, Status::Exited(128));
+        assert_eq!(text.matches("[hint]").count(), 1);
+        assert!(text.contains("git-auth status"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn background_git_auth_hints_require_stderr_and_a_known_failed_exit() {
         use crate::world::Chunk;
         let diagnostic = b"fatal: Authentication failed for 'https://example.com/repo.git'\n";
