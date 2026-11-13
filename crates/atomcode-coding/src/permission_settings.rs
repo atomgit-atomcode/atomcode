@@ -78,16 +78,14 @@ impl atomcode_capabilities::tools::approval::ProjectRuleStore for ProjectRules {
             return None;
         }
         let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
-        let command = args.get("command")?.as_str()?.trim();
-        if command.is_empty() || command.len() > 8192 || command.contains(['*', '?']) {
+        let command = args.get("command")?.as_str()?;
+        if command.trim().is_empty() || command.len() > 8192 {
             return None;
         }
         // The capabilities parser validates eligibility through the normal rule
         // matcher; no second shell parser or project directory lookup is introduced.
-        let rule = format!(
-            "Bash({})",
-            atomcode_capabilities::tools::normalize_command_for_grant(command)
-        );
+        // JSON preserves quotes, backslashes and wildcard characters as literal command bytes.
+        let rule = format!("BashExact({})", serde_json::to_string(command).ok()?);
         let (candidate, invalid) = PermissionRules::parse(std::slice::from_ref(&rule), &[]);
         if !invalid.is_empty() {
             return None;
@@ -199,12 +197,23 @@ fn save_exact_rule(
         if !invalid.is_empty() {
             return Err("settings contain malformed permission rules".into());
         }
-        let command = rule
-            .strip_prefix("Bash(")
+        let command: String = if let Some(encoded) = rule
+            .strip_prefix("BashExact(")
             .and_then(|s| s.strip_suffix(')'))
-            .ok_or("expected an exact Bash rule")?;
-        if command.contains(['*', '?']) {
-            return Err("project save cannot broaden a command into a wildcard".into());
+        {
+            serde_json::from_str(encoded)?
+        } else {
+            let command = rule
+                .strip_prefix("Bash(")
+                .and_then(|s| s.strip_suffix(')'))
+                .ok_or("expected an exact Bash rule")?;
+            if command.contains(['*', '?']) {
+                return Err("project save cannot broaden a command into a wildcard".into());
+            }
+            command.to_owned()
+        };
+        if command.trim().is_empty() {
+            return Err("empty command".into());
         }
         if rules.decide(
             sensitive,
@@ -541,6 +550,49 @@ mod tests {
         assert!(store.save(&call, &proposal).await.is_err());
         assert!(!dirs.project(&old).join("settings.local.json").exists());
         assert!(!dirs.project(&next).join("settings.local.json").exists());
+    }
+
+    #[tokio::test]
+    async fn windows_literal_rule_can_be_proposed_saved_and_reloaded() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let dirs = ProductDirs::new(root.path().join("user"), ".ours");
+        let baseline = Arc::new(PermissionRules::default());
+        let store = project_rule_store(
+            Arc::new(std::sync::RwLock::new(project.clone())),
+            project.clone(),
+            dirs.clone(),
+            baseline.clone(),
+            baseline.clone(),
+        );
+        let command = r#"rm '\\?\C:\repo\GUARD_TARGET'"#;
+        let call = atomcode_kernel::tool::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command":command}).to_string(),
+        };
+        let proposal = store
+            .propose(&call)
+            .await
+            .expect("Windows prefix must not hide save option");
+        assert!(proposal.rule.starts_with("BashExact("));
+        store.save(&call, &proposal).await.unwrap();
+        let loaded = load(&baseline, &dirs, &project).unwrap();
+        let sensitive = SensitivePaths::of(&dirs);
+        assert_eq!(
+            loaded
+                .rules
+                .decide(&sensitive, "bash", &call.arguments, &project),
+            RuleDecision::Allow
+        );
+        let different = serde_json::json!({"command":command.replace('?', "X")}).to_string();
+        assert_eq!(
+            loaded
+                .rules
+                .decide(&sensitive, "bash", &different, &project),
+            RuleDecision::NoMatch
+        );
     }
 
     fn write(path: &Path, value: serde_json::Value) {

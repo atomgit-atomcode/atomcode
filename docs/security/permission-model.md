@@ -447,3 +447,12 @@ It protects:
 It intentionally does not attempt to analyze interpreter code or become a full shell security engine.
 
 This keeps the model strong on common cases, explicit in code, and maintainable enough to evolve.
+
+### Exact saved Bash commands
+
+Automatically saved project approvals use `BashExact(<JSON string>)`, for example
+`BashExact("rm scratch")`. The JSON string preserves quotes and Windows backslashes.
+The complete command must match byte for byte; `*` and
+`?` have no wildcard meaning. Existing `Bash(pattern)` rules retain wildcard semantics.
+Exact rules do not bypass deny rules, sensitive-path checks, or shell eligibility checks.
+Older builds do not recognize this spelling as a Bash grant.
