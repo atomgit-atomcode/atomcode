@@ -113,6 +113,13 @@ try {
     const anchorTop = await page.locator('.tool-body').nth(readingAnchor.index).evaluate(node => node.getBoundingClientRect().top);
     assert.ok(Math.abs(anchorTop - readingAnchor.top) <= 2, 'stream updates preserve the visible reading position');
     const initialCommand = await page.locator('.tool-name-secondary').first().innerText();
+    await page.evaluate(() => {
+      window.blankTimelineFrames = 0;
+      window.timelineObserver = new MutationObserver(() => {
+        if (!document.querySelector('.tool-body')) window.blankTimelineFrames++;
+      });
+      window.timelineObserver.observe(document.querySelector('.timeline-inner'), { childList: true, subtree: true });
+    });
     await page.locator('.messages-container').evaluate(node => { node.scrollTop = 0; });
     await new Promise(resolve => setTimeout(resolve, 550));
     await page.locator('.messages-container').hover(); await page.mouse.wheel(0, -300);
@@ -122,6 +129,7 @@ try {
       await page.waitForTimeout(550);
       await until(() => page.evaluate(() => !document.querySelector('.timeline-history-status[role="status"]')));
     }
+    assert.equal(await page.evaluate(() => { window.timelineObserver.disconnect(); return window.blankTimelineFrames; }), 0, 'archive hydration must keep the previous page visible');
     assert.ok(await page.locator('.tool-body').count() <= bound);
     const reading = await page.locator('.tool-name-secondary').first().innerText();
     for (const client of clients) {

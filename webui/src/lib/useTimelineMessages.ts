@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { createTimelineArchive } from './timelineArchive';
 import { archiveCandidates, archivedMessage, replaceArchived, residentStart, segmentMessages, type TimelineMessage } from './timelineMemory';
 import { randomId } from './randomId';
@@ -68,7 +68,7 @@ export function useTimelineMessages<T extends TimelineMessage>(resident: number,
 
 /** Keep only the current page's hydrated payloads, even while live output arrives. */
 export function useTimelinePage<T extends TimelineMessage>(messages: T[], positions: readonly number[],
-  read: (message: T) => Promise<T>) {
+  read: (message: T) => Promise<T>, scope = '') {
   const page = positions.map(index => messages[index]);
   const signature = page.filter(message => message.archiveKey).map(message => message.archiveKey).join('|');
   const latest = useRef({ page, read }); latest.current = { page, read };
@@ -89,7 +89,15 @@ export function useTimelinePage<T extends TimelineMessage>(messages: T[], positi
   }, [signature, retry]);
   const items = page.map((message, offset) => ({ origIdx: positions[offset],
     msg: message.archiveKey ? loaded.get(message.archiveKey) : message }));
-  return { items, error, loading: !error && items.some(item => !item.msg), retry: () => setRetry(value => value + 1) };
+  const loading = !error && items.some(item => !item.msg);
+  const committed = useRef<{ scope: string; items: typeof items } | null>(null);
+  useLayoutEffect(() => {
+    if (!loading && !error) committed.current = { scope, items };
+  });
+  // Preserve a complete DOM page while its replacement hydrates from IndexedDB.
+  // Session scope prevents showing the previous conversation during navigation.
+  const visible = loading && committed.current?.scope === scope ? committed.current.items : items;
+  return { items: visible, error, loading, retry: () => setRetry(value => value + 1) };
 }
 
 /** Search immutable archived entries once per query; live tokens must not keep

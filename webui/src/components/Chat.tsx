@@ -1170,13 +1170,50 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const pendingSwitch = switchReadyRef.current;
     const accepted = pendingSwitch?.id === loadId && pendingSwitch.generation === loadGeneration
       ? pendingSwitch.ready : undefined;
+    // Live snapshots replace history and abort its fetch. Detached-operation
+    // discovery must survive that replacement or the composer stays checking.
+    void loadAfterSessionSwitch(accepted,
+      () => activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration,
+      () => Promise.allSettled([getActiveChatSessions()]))
+      .then(results => {
+        if (!results || activeIdRef.current !== loadId || sessionGenerationRef.current !== loadGeneration) return;
+        const [activeResult] = results;
+        let nextHint: string | null = null;
+        if (activeResult.status === 'fulfilled') {
+          const active = activeResult.value.includes(loadId);
+          transitionChatRecovery({ type: 'active_check_succeeded', active });
+          if (active) {
+            requestIdRef.current = loadId;
+            if (!syncRef.current) setBusy(false);
+            setQueued([]);
+            nextHint = t('chat.detachedActive');
+            pushCommandNotice(t('chat.detachedActive'));
+          } else if (requestIdRef.current === loadId) {
+            requestIdRef.current = null;
+          }
+        } else {
+          // `/chat` has no stream reattach endpoint. The registry is authoritative
+          // when available; if discovery fails, keep the canonical stop alias and
+          // fail closed instead of allowing a possibly concurrent send.
+          requestIdRef.current = loadId;
+          transitionChatRecovery({ type: 'active_check_failed' });
+          if (!syncRef.current) setBusy(false);
+          setQueued([]);
+          nextHint = t('chat.activeCheckFailed', { error: String(activeResult.reason) });
+          pushCommandNotice(nextHint);
+          // Allow a later metadata/session refresh to retry discovery.
+          loadedForRef.current = null;
+        }
+
+        if (nextHint) setHistoryHint(nextHint);
+      });
     loadAfterSessionSwitch(accepted,
       () => !historyController.signal.aborted && activeIdRef.current === loadId
         && sessionGenerationRef.current === loadGeneration,
-      () => Promise.allSettled([getSessionPage(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
+      () => Promise.allSettled([getSessionPage(projectHash, loadId, historyController.signal)]))
       .then((results) => {
         if (!results || historyController.signal.aborted) return;
-        const [sessionResult, activeResult] = results;
+        const [sessionResult] = results;
         // Generation also covers A -> B -> A; id equality alone is insufficient.
         if (
           activeIdRef.current !== loadId ||
@@ -1223,31 +1260,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
         }
 
-        if (activeResult.status === 'fulfilled') {
-          const active = activeResult.value.includes(loadId);
-          transitionChatRecovery({ type: 'active_check_succeeded', active });
-          if (active) {
-            requestIdRef.current = loadId;
-            if (!syncRef.current) setBusy(false);
-            setQueued([]);
-            nextHint = t('chat.detachedActive');
-            pushCommandNotice(t('chat.detachedActive'));
-          } else if (requestIdRef.current === loadId) {
-            requestIdRef.current = null;
-          }
-        } else {
-          // `/chat` has no stream reattach endpoint. The registry is authoritative
-          // when available; if discovery fails, keep the canonical stop alias and
-          // fail closed instead of allowing a possibly concurrent send.
-          requestIdRef.current = loadId;
-          transitionChatRecovery({ type: 'active_check_failed' });
-          if (!syncRef.current) setBusy(false);
-          setQueued([]);
-          nextHint = t('chat.activeCheckFailed', { error: String(activeResult.reason) });
-          pushCommandNotice(nextHint);
-          // Allow a later metadata/session refresh to retry discovery.
-          loadedForRef.current = null;
-        }
 
         setHistoryHint(nextHint);
         setLoading(false);
@@ -3716,7 +3728,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true);
   const range = timeline.range;
   const page = useTimelinePage(messages,
-    historyDisplay.showLive ? timeline.indexes.filter(index => index >= liveFrom) : [], readTimelineMessage);
+    historyDisplay.showLive ? timeline.indexes.filter(index => index >= liveFrom) : [], readTimelineMessage,
+    `${sessionId}/${sessionGenerationRef.current}`);
   const visibleMessages = page.items.filter((item): item is { msg: Message; origIdx: number } => item.msg !== undefined);
   function showTimelinePage(start: number | null, preserve = false) {
     if (historyDisplay.active) {

@@ -14,6 +14,7 @@ const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conve
 let releaseSlowHistory = null;
 let switchRejection = null;
 let switches = 0;
+let refreshOnConnect = true;
 let specificationPinned = false;
 const patchUploads = [];
 let patchReplyMode = 'ok';
@@ -61,7 +62,10 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
     res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
     res.write('data: {"type":"state","running":false}\n\n');
-    clients.add(res); req.on('close', () => clients.delete(res)); return;
+    // Reconnect snapshot replaces an in-flight history load before active discovery resolves.
+    const refresh = refreshOnConnect ? setTimeout(() => res.write(`data: ${JSON.stringify(snapshot())}\n\n`), 80) : undefined;
+    refreshOnConnect = false;
+    clients.add(res); req.on('close', () => { clearTimeout(refresh); clients.delete(res); }); return;
   }
   if (path === '/project') return json({ working_dir: '/fixture', project_hash: 'fixture' });
   if (path === '/config') return json({ providers: [], notifications: { enabled: false } });
@@ -71,7 +75,7 @@ const server = createServer(async (req, res) => {
   if (path.endsWith('/transcript')) return json({ session_id: id, turns: [] });
   if (path === '/live/mode') return json({ mode: 'build' });
   if (path === '/live/session') return json({ success: true, session_id: id });
-  if (path === '/chat/active') return json([]);
+  if (path === '/chat/active') { setTimeout(() => json([]), 200); return; }
   if (path === '/sessions' || path === '/projects/fixture/sessions') return json([meta, other, third]);
   if (path === '/projects' || path === '/skills') return json([]);
   try {
@@ -95,6 +99,9 @@ try {
   await page.locator('.message-input').waitFor();
   await page.waitForTimeout(1000);
   assert(clients.size > 0);
+  await page.locator('.message-input').fill('composer remains available after snapshot');
+  assert.equal(await page.locator('.btn-send').isEnabled(), true);
+  await page.locator('.message-input').fill('');
   if (width === 1200) {
     const sidebar = page.locator('.session-list');
     const handle = page.locator('.sidebar-resize-handle');
