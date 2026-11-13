@@ -530,6 +530,9 @@ pub fn headless_patch() -> atomcode_plexus::Layer {
 /// Public for the same reason [`CODING_DEFAULTS`] is: a host with its own front
 /// end stacks this list instead of restating it.
 pub const CODING_ROWS: &str = r#"
+[[insert]]
+name = "tool-git-index-review"
+
 # Approval gates that the chain mounted as kernel `ToolMiddleware`s.
 # Same judgements — each row calls the same L1 function the middleware does —
 # reached through the `approval` seam instead of a private `PermissionStore`.
@@ -1535,6 +1538,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(crate::policy_rows::CredentialShellPlugin),
         Arc::new(crate::policy_rows::WriteApprovalPlugin),
         Arc::new(crate::policy_rows::BashWorkspacePlugin),
+        Arc::new(crate::git_index_policy::GitIndexPlugin),
         // Every tool call states its reason in one line, for the person reading
         // the transcript. This product's call, not the mechanism's: what a tool
         // call should say about itself is a presentation decision

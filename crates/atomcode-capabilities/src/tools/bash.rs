@@ -2032,6 +2032,9 @@ pub(super) fn normalize_invocation_for_grant(invocation: BashInvocation) -> Stri
 /// normalizes simple quoting, strips wrappers, and recurses into subshells / eval /
 /// compound parts / pipe-to-shell so a destructive command cannot hide one layer down.
 pub fn check_destructive_command(command: &str) -> Option<String> {
+    if super::git_index::risky(command) {
+        return Some("Git index mutation requires review of the staging/commit scope".into());
+    }
     // Strip comments first — the classifier is substring-based, so a `# rm -rf everything` note
     // would otherwise read as a destructive command.
     let command = strip_bash_comments(command);
@@ -2557,7 +2560,7 @@ const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
 /// Parse `command` as bash with tree-sitter. `None` on parser-load failure or a
 /// completely unparseable input. The caller must still reject trees containing
 /// ERROR/MISSING nodes (a partial parse) — see `is_read_only_bash`.
-fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
+pub(crate) fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
     use std::cell::RefCell;
     thread_local! {
         static PARSER: RefCell<Option<tree_sitter::Parser>> = RefCell::new(None);
@@ -3216,6 +3219,23 @@ async fn pump<R>(
 
 #[async_trait]
 impl crate::world::Shell for LocalShell {
+    fn dialect(&self) -> crate::world::ShellDialect {
+        if cfg!(windows) && !windows_bash_active() {
+            crate::world::ShellDialect::Cmd
+        } else {
+            crate::world::ShellDialect::Bash
+        }
+    }
+
+    async fn spawn_program(
+        &self,
+        program: &str,
+        arguments: &[String],
+        options: &crate::world::SpawnOptions,
+    ) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+        spawn_local_program(program, arguments, options).await
+    }
+
     fn describe(&self) -> String {
         if cfg!(target_os = "windows") {
             format!(
@@ -3262,6 +3282,18 @@ impl crate::world::Shell for LocalShell {
             build_command(&effective_command).map_err(crate::world::SpawnError::Unsupported)?;
         spawn_local_command(cmd, options).await
     }
+}
+
+/// Direct native execution, sharing the shell's cwd/env/output/kill ownership.
+/// No shell discovery, quoting, script generation, or platform-specific fallback.
+pub(crate) async fn spawn_local_program(
+    program: &str,
+    arguments: &[String],
+    options: &crate::world::SpawnOptions,
+) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(arguments);
+    spawn_local_command(command, options).await
 }
 
 /// Shared process ownership, output pumps and tree cancellation for local shells.
@@ -5110,6 +5142,14 @@ mod tests {
     }
 
     #[test]
+    fn staging_and_commits_require_scope_review() {
+        for command in ["git add -A", "git add .", "git commit -m wip"] {
+            assert_eq!(risk_of(command), RiskLevel::Risky, "{command}");
+        }
+        assert_eq!(risk_of("git add -- src/main.rs"), RiskLevel::Safe);
+    }
+
+    #[test]
     fn safe_commands_are_safe() {
         for c in [
             "ls -la",
@@ -5118,7 +5158,6 @@ mod tests {
             "grep -rn TODO .",
             "cargo build",
             "git status",
-            "git commit -m wip",
             "rm -rf node_modules",
             "rm -rf target dist",
             "cd if=/dev/foo", // dd false-positive must NOT fire (not a dd command)

@@ -47,6 +47,7 @@ pub mod credential_bash_gate;
 pub mod debug;
 pub mod edit;
 pub mod encoding;
+pub mod git_index;
 pub mod glob;
 #[cfg(feature = "grape")]
 pub mod grape;

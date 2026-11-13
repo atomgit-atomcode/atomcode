@@ -56,6 +56,7 @@ pub mod discipline;
 mod display_images;
 mod follow_up;
 pub mod front_end;
+mod git_index_policy;
 pub mod host;
 pub mod on_harness;
 pub mod parts;

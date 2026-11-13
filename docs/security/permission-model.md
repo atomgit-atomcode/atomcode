@@ -456,3 +456,41 @@ The complete command must match byte for byte; `*` and
 `?` have no wildcard meaning. Existing `Bash(pattern)` rules retain wildcard semantics.
 Exact rules do not bypass deny rules, sensitive-path checks, or shell eligibility checks.
 Older builds do not recognize this spelling as a Bash grant.
+
+### Git staging and commit scope
+
+Coding runtimes review broad staging (`git add -A`, `--all`, `.`, directory or
+wildcard pathspecs) and standalone `git commit` calls through the existing approval
+policy. Precise staging such as `git add -- src/main.rs` keeps the ordinary
+permission behavior. Before committing, the review lists the actual staged paths,
+including changes staged before the current task. This is a scope check, not a
+secret scanner or proof that each file belongs to the task.
+
+Use separate calls for staging and committing. Compound commands such as
+`git add . && git commit -m fix`, index-changing commit flags (`-a`, `--only`,
+`--include`, `--patch`), interactive staging, and unsupported repository overrides
+are refused with an instruction to split the operation. Abbreviated or unknown
+Git options are refused; use full supported option names. Use `git -C <directory>`
+instead of `cd ... && git ...`. Bulk forced staging is not supported; force-add
+only explicit files when intended.
+
+Inspection uses the same execution world as the tool and passes Git's executable
+and argument vector directly to the native process runner. It does not quote a
+shell script or require Git Bash on Windows. Bash, literal cmd.exe commands, and
+literal PowerShell commands share the same bounded read-only Git probes. Inspection
+never resets, unstages, commits, or rewrites the index. Approval
+cannot be remembered as an “always allow Bash” grant for these reviews. The index
+is inspected again after approval; changes invalidate that review. Explicit
+Auto/bypass policies still follow their configured bypass behavior. Without an
+approval policy or a successful inspection, the reviewed operation is refused.
+
+This prevents common accidental bulk submissions; it is not an OS sandbox for
+arbitrary programs, Git aliases, interpreter scripts, or dynamically generated
+commands. Preview lists are bounded and indicate omissions; very large inspections
+fail closed. External processes may still change a repository after the final
+check: the check and Git's eventual index lock are not one atomic transaction.
+Remote worlds must explicitly implement direct program execution; unsupported
+worlds fail closed without falling back to the local machine. Cmd/PowerShell
+support covers standalone literal invocations, not arbitrary scripts: expansions,
+compound mutations and ambiguous native quoting must be split or rephrased.
+Windows still needs Git itself installed, but not a particular shell.

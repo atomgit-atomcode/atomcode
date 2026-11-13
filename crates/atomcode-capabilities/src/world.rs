@@ -757,15 +757,39 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-/// Shell execution for one world.
-///
-/// Deliberately *not* "spawn this argv": which shell exists, where it lives and
-/// how it is invoked is a property of the world, and discovering it is the local
-/// implementation's private business rather than an interface every remote world
-/// has to reimplement.
+/// Syntax the world's string-based shell executor understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellDialect {
+    Bash,
+    Cmd,
+    PowerShell,
+}
+
+/// Shell execution for one world. Shell discovery and process ownership belong
+/// to that world. Trusted probes may opt into direct argv execution through
+/// `spawn_program`; unsupported worlds never fall back to the local machine.
 #[async_trait]
 pub trait Shell: Send + Sync {
     fn describe(&self) -> String;
+
+    /// Existing non-local worlds historically speak Bash unless declared otherwise.
+    fn dialect(&self) -> ShellDialect {
+        ShellDialect::Bash
+    }
+
+    /// Execute a program directly, without interpreting its arguments as shell
+    /// source. A world must implement this itself; quoting into `spawn` or
+    /// running a remote world's command on the local host is not a fallback.
+    async fn spawn_program(
+        &self,
+        _program: &str,
+        _arguments: &[String],
+        _options: &SpawnOptions,
+    ) -> Result<Arc<dyn Process>, SpawnError> {
+        Err(SpawnError::Unsupported(
+            "This execution world does not support direct program execution".into(),
+        ))
+    }
 
     /// Optional PowerShell executor in THIS world. Remote worlds must opt in;
     /// absence must never cause execution on the local host instead.
