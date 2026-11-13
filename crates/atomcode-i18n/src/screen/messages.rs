@@ -230,8 +230,6 @@ pub enum Msg<'a> {
     AskStepLimitTitle,
     AskTruncatedQuestion,
     AskReasoningTruncatedQuestion,
-    AskReasoningTimeoutQuestion,
-    AskReasoningTimeoutTitle,
     AskNoProgressTruncatedQuestion,
     AskLowerEffortOnce,
     AskTruncatedTitle,

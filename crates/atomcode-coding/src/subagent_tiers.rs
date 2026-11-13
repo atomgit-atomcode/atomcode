@@ -70,7 +70,6 @@ mod tests {
             ephemeral: false,
             capable_model: capable,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
         }
     }
 

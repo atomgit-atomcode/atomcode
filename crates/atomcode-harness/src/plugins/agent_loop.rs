@@ -66,9 +66,6 @@ struct LoopRow {
     /// First content budget; omitted keeps the old single-budget behavior.
     #[serde(default)]
     stream_first_content_ms: Option<u64>,
-    /// Continuous reasoning before answer/tool output; 0 disables. Prefill excluded.
-    #[serde(default)]
-    reasoning_timeout_ms: u64,
 }
 
 impl Default for LoopRow {
@@ -80,7 +77,6 @@ impl Default for LoopRow {
             undo_cancelled: false,
             stream_idle_ms: 0,
             stream_first_content_ms: None,
-            reasoning_timeout_ms: 0,
         }
     }
 }
@@ -107,7 +103,6 @@ struct PluginAgentLoop {
     undo_cancelled: bool,
     stream_idle: Option<std::time::Duration>,
     stream_first_content: Option<std::time::Duration>,
-    reasoning_timeout: Option<std::time::Duration>,
 }
 
 impl PluginAgentLoop {
@@ -205,7 +200,6 @@ impl PluginAgentLoop {
                 }
                 let idle = self.stream_idle;
                 let first_content = self.stream_first_content;
-                let reasoning_timeout = self.reasoning_timeout;
                 let loop_retried = loop_retried.clone();
                 Box::pin(async move {
                     let retained_bytes=atomcode_kernel::session::retention::validate_request(&session.events(), &messages)
@@ -224,7 +218,6 @@ impl PluginAgentLoop {
                         options,
                         idle,
                         first_content,
-                        reasoning_timeout,
                         &loop_retried,
                     )
                     .await
@@ -334,15 +327,6 @@ struct ReplyCheckpointBuffer<'a> {
     text: String,
     reasoning: String,
     deadline: tokio::time::Instant,
-    flush_on_drop: bool,
-}
-
-impl Drop for ReplyCheckpointBuffer<'_> {
-    fn drop(&mut self) {
-        if self.flush_on_drop {
-            self.flush();
-        }
-    }
 }
 
 impl<'a> ReplyCheckpointBuffer<'a> {
@@ -366,9 +350,6 @@ impl<'a> ReplyCheckpointBuffer<'a> {
             text: String::new(),
             reasoning: String::new(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-            flush_on_drop: crate::agent::scoped(ctx)
-                .service::<super::recovery::Progress>()
-                .is_some_and(|progress| progress.reasoning_active(session)),
         }
     }
 
@@ -426,7 +407,6 @@ async fn stream_once(
     options: ChatOptions,
     idle: Option<std::time::Duration>,
     first_content: Option<std::time::Duration>,
-    reasoning_timeout: Option<std::time::Duration>,
     loop_retried: &std::sync::atomic::AtomicBool,
 ) -> Result<ModelResponse, RequestError> {
     use atomcode_kernel::reasoning_loop::{REASONING_LOOP_CODE, RETRY_NOTICE, STOP_NOTICE};
@@ -442,7 +422,6 @@ async fn stream_once(
             options.clone(),
             idle,
             first_content,
-            reasoning_timeout,
         )
         .await;
         let discarded = match result {
@@ -526,7 +505,6 @@ async fn stream_attempt(
     options: ChatOptions,
     idle: Option<std::time::Duration>,
     first_content: Option<std::time::Duration>,
-    reasoning_timeout: Option<std::time::Duration>,
 ) -> Result<ModelResponse, StreamAttemptError> {
     if let Some(budget) = &options.request_recovery {
         let state = budget.try_attempt().map_err(|limit| RequestError {
@@ -556,8 +534,7 @@ async fn stream_attempt(
     let mut guard = atomcode_kernel::reasoning_loop::ReasoningLoopDetector::new(
         options.reasoning_loop_guard.clone().unwrap_or_default(),
     );
-    let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle)
-        .with_reasoning_limit(reasoning_timeout);
+    let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle);
     loop {
         let next = tokio::select! {
             result = watchdog.next(&mut stream) => result,
@@ -572,7 +549,6 @@ async fn stream_attempt(
             // streamed, so recovery can keep it.
             Err(_) => {
                 let budget_ms = watchdog.budget().unwrap().as_millis();
-                let reasoning_timeout = watchdog.reasoning_expired();
                 tracing::warn!(
                     phase = watchdog.phase(),
                     budget_ms = budget_ms as u64,
@@ -585,21 +561,17 @@ async fn stream_attempt(
                     "harness content deadline exceeded"
                 );
                 return Err(RequestError {
-                    retryable: !reasoning_timeout && !saw_tool_stream,
+                    retryable: !saw_tool_stream,
                     unexecuted_tool_output: saw_tool_stream,
                     // ToolExec is downstream of a successful AgentRequest. No
                     // call from this failed collection attempt was dispatched.
                     tool_dispatch: crate::events::ToolDispatchProof::NotDispatched,
-                    code: Some(if reasoning_timeout {
-                        atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE
-                    } else { STREAM_IDLE_CODE }.to_string()),
-                    ..RequestError::message(if reasoning_timeout {
-                        format!("连续思考预算耗尽：模型已思考 {} 秒，尚未生成正文或工具调用；这不是网络空闲超时。可继续、单次降低思考强度，或设置 ATOMCODE_REASONING_TIMEOUT_SECS（0 关闭）。", budget_ms / 1000)
-                    } else { format!(
+                    code: Some(STREAM_IDLE_CODE.into()),
+                    ..RequestError::message(format!(
                         "stream idle timeout ({}): no content for {}ms",
                         watchdog.phase(),
                         budget_ms
-                    ) })
+                    ))
                 }
                 .with_partial(out)
                 .into());
@@ -699,11 +671,6 @@ async fn stream_attempt(
             }
             StreamEvent::Done { truncated } => out.truncated = truncated,
             _ => {}
-        }
-        if checkpoint.flush_on_drop {
-            // The bounded recovery's deadline/cancellation must run even if a
-            // provider yields continuously ready metadata or text.
-            tokio::task::yield_now().await;
         }
     }
     // A truncated response is not empty even when it looks it: the model was
@@ -1078,14 +1045,7 @@ impl PluginAgentLoop {
                         outcome.stop = StopReason::RateLimited;
                         break;
                     }
-                    outcome.stop = if matches!(
-                        error.code.as_deref(),
-                        Some(
-                            STREAM_IDLE_CODE
-                                | atomcode_kernel::stream::REASONING_OUTPUT_TIMEOUT_CODE
-                                | super::recovery::REASONING_RECOVERY_EXHAUSTED_CODE
-                        )
-                    ) {
+                    outcome.stop = if matches!(error.code.as_deref(), Some(STREAM_IDLE_CODE)) {
                         StopReason::Timeout
                     } else {
                         StopReason::ProviderError
@@ -1491,8 +1451,6 @@ impl Plugin for AgentLoopPlugin {
                 .or(Some(row.stream_idle_ms))
                 .filter(|ms| *ms > 0)
                 .map(std::time::Duration::from_millis),
-            reasoning_timeout: (row.reasoning_timeout_ms > 0)
-                .then(|| std::time::Duration::from_millis(row.reasoning_timeout_ms)),
             stream_idle: (row.stream_idle_ms > 0)
                 .then(|| std::time::Duration::from_millis(row.stream_idle_ms)),
         };
@@ -1552,7 +1510,6 @@ mod content_deadline_tests {
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
-            None,
             &std::sync::atomic::AtomicBool::new(false),
         )
         .await
@@ -1580,7 +1537,6 @@ mod content_deadline_tests {
             vec![],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
-            None,
             None,
             &retried,
         );
@@ -1773,7 +1729,6 @@ mod content_deadline_tests {
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
-            None,
             &std::sync::atomic::AtomicBool::new(false),
         )
         .await
@@ -1828,7 +1783,6 @@ mod content_deadline_tests {
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
-            None,
             &std::sync::atomic::AtomicBool::new(false),
         )
         .await
@@ -1869,7 +1823,6 @@ mod content_deadline_tests {
             options,
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(600)),
-            None,
             &std::sync::atomic::AtomicBool::new(false),
         )
         .await
@@ -1906,7 +1859,6 @@ mod content_deadline_tests {
             vec![],
             vec![],
             options,
-            None,
             None,
             None,
             retried,

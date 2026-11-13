@@ -320,8 +320,6 @@ pub fn derive_tier_config(
     tier.headers = provider.headers.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
     tier.retry_max_attempts = provider.retry_max_attempts;
-    tier.reasoning_timeout =
-        crate::config::model_reasoning_timeout(provider.reasoning_timeout_secs);
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_model_providers = None;
@@ -383,8 +381,6 @@ pub fn derive_tier_config_from_resolved(
     tier.headers = resolved.headers.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
     tier.retry_max_attempts = resolved.retry_max_attempts;
-    tier.reasoning_timeout =
-        crate::config::model_reasoning_timeout(resolved.reasoning_timeout_secs);
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_model_providers = None;
@@ -660,7 +656,6 @@ mod tests {
             Some(atomcode_kernel::provider::ReasoningEffort::Medium)
         );
         assert_eq!(tier.retry_max_attempts, Some(7));
-        assert_eq!(tier.reasoning_timeout, std::time::Duration::from_secs(900));
     }
 
     #[test]
@@ -704,6 +699,5 @@ mod tests {
 
         let tier = derive_tier_config(&config("openai"), "tier-provider", &provider);
         assert_eq!(tier.retry_max_attempts, Some(6));
-        assert!(tier.reasoning_timeout.is_zero());
     }
 }

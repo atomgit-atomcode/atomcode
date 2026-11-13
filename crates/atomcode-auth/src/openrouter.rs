@@ -565,7 +565,6 @@ pub fn provision_with_listed(
                         thinking_enabled: None,
                         thinking_budget: None,
                         retry_max_attempts: None,
-                        reasoning_timeout_secs: None,
                         origin: Some(OPENROUTER_FREE_ORIGIN.to_string()),
                         rank,
                     },

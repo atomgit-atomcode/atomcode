@@ -10,10 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// (model-initiated, in atomcode-capabilities).
 pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
 
-/// Ask before another request after a local reasoning-without-output deadline.
-/// Unknown or unattended drivers stop; this never reports provider truncation.
-pub const REASONING_TIMEOUT_CHECKPOINT_KIND: &str = "reasoning_timeout_checkpoint";
-
 /// Driver round-trip `kind` emitted after the bounded automatic recovery for an
 /// output-token truncation has been exhausted. Interactive drivers may offer a
 /// continue/stop choice; unknown or unattended drivers must answer fail-closed.

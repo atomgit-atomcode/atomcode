@@ -720,15 +720,9 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
         // screen that says nothing means downstream is "stop", so a turn simply
         // ended and nobody was told why.
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
-        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-        | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND => {
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
             let (prompt, asker) = if kind == atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND {
                 (t(Msg::AskStepLimitQuestion), t(Msg::AskStepLimitTitle))
-            } else if kind == atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND {
-                (
-                    t(Msg::AskReasoningTimeoutQuestion),
-                    t(Msg::AskReasoningTimeoutTitle),
-                )
             } else {
                 (
                     t(
@@ -752,7 +746,6 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
             if matches!(
                 kind,
                 atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-                    | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND
             ) && (payload.get("reasoning_only").and_then(Value::as_bool) == Some(true)
                 || payload.get("no_visible_progress").and_then(Value::as_bool) == Some(true))
                 && payload
@@ -932,12 +925,10 @@ pub fn response_for(kind: &str, reply: Option<Reply>) -> Value {
         // going" is a stop — the kernel degrades a missing or malformed answer
         // to `false`, and this agrees with it rather than hoping.
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
-        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-        | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND => {
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
             if matches!(
                 kind,
                 atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-                    | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND
             ) && answer.as_deref() == Some("lower_effort")
             {
                 serde_json::json!({ "continue": true, "lower_effort": true })
@@ -1767,30 +1758,6 @@ mod tests {
     /// Answered on the web page: the one question up in that session comes
     /// down. Answered here: nothing does — the panel is already gone, and the
     /// fact is the screen's own answer coming back.
-    #[test]
-    fn reasoning_timeout_has_its_own_title_and_all_explicit_choices() {
-        let kind = atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND;
-        let question = q(
-            kind,
-            &serde_json::json!({"reasoning_only":true,"lower_effort":"medium"}),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(question.prompt, t(Msg::AskReasoningTimeoutQuestion));
-        assert_eq!(
-            question.asker.as_deref(),
-            Some(t(Msg::AskReasoningTimeoutTitle).as_ref())
-        );
-        assert_eq!(nth(&question, 2).as_deref(), Some("lower_effort"));
-        assert_eq!(
-            response_for(kind, Some(Reply::from("lower_effort"))),
-            serde_json::json!({"continue":true,"lower_effort":true})
-        );
-        assert_eq!(
-            response_for(kind, None),
-            serde_json::json!({"continue":false})
-        );
-    }
     #[test]
     fn a_ledger_takes_down_what_closed_elsewhere_and_nothing_it_answered() {
         let mut l = Ledger::default();

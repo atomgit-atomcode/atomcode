@@ -1491,7 +1491,6 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // participating). Threaded verbatim so re-ranking models needs no client release.
         capable_model: entry.capable_model,
         retry_max_attempts: None,
-        reasoning_timeout_secs: None,
     }
 }
 

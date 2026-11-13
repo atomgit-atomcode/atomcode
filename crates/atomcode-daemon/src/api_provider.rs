@@ -542,7 +542,6 @@ fn insert_account_models(
                 thinking_enabled: None,
                 thinking_budget: None,
                 retry_max_attempts: None,
-                reasoning_timeout_secs: None,
                 origin: None,
                 rank: None,
             },
@@ -788,7 +787,6 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         ephemeral: false,
         capable_model: None,
         retry_max_attempts: None,
-        reasoning_timeout_secs: None,
     };
 
     let mut is_new = false;

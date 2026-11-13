@@ -174,8 +174,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskStepLimitQuestion => "这一轮已经跑了很多步。继续吗?".into(),
         Msg::AskStepLimitTitle => "步数上限".into(),
         Msg::AskTruncatedQuestion => "输出连续被截断，自动恢复已停止。继续吗？".into(),
-        Msg::AskReasoningTimeoutQuestion => "模型持续思考，尚未生成正文，已达到客户端等待上限。继续尝试吗？".into(),
-        Msg::AskReasoningTimeoutTitle => "思考等待上限".into(),
         Msg::AskReasoningTruncatedQuestion => "模型连续思考达到输出上限，尚未生成正文。自动恢复已停止，继续尝试吗？".into(),
         Msg::AskNoProgressTruncatedQuestion => "输出达到上限，仍无正文或完整工具调用。自动恢复已停止，继续尝试吗？".into(),
         Msg::AskLowerEffortOnce => "以较低思考强度重试一次".into(),

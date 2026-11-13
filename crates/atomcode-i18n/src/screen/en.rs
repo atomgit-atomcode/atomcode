@@ -193,8 +193,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Output was repeatedly cut off; automatic recovery has stopped. Go on?"
                 .into()
         }
-        Msg::AskReasoningTimeoutQuestion => "The model is still reasoning without an answer and reached the client waiting limit. Continue?".into(),
-        Msg::AskReasoningTimeoutTitle => "reasoning waiting limit".into(),
         Msg::AskReasoningTruncatedQuestion => "The model repeatedly exhausted its output budget during reasoning without an answer. Try again?".into(),
         Msg::AskNoProgressTruncatedQuestion => "The output limit was reached without an answer or a complete tool call. Automatic recovery has stopped. Try again?".into(),
         Msg::AskLowerEffortOnce => "Retry once with lower reasoning effort".into(),

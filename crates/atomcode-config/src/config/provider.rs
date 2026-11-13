@@ -100,9 +100,6 @@ pub struct ProviderConfig {
     /// standalone adapters apply it to OPEN retries. `1` disables retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
-    /// Continuous reasoning budget in seconds; 0 disables it. Host environment overrides this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_timeout_secs: Option<u64>,
 }
 
 /// A provider *account*: a reusable connection + credential identity (new schema,
@@ -193,9 +190,6 @@ pub struct ModelProfileConfig {
     /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
-    /// Continuous reasoning budget in seconds; 0 disables it. Host environment overrides this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_timeout_secs: Option<u64>,
     /// Who put this entry here, when it was not the person: a command that
     /// manages a set of entries it may later replace — `/openrouter` writes
     /// [`OPENROUTER_FREE_ORIGIN`] on the free models it adds and swaps that set
@@ -277,7 +271,6 @@ pub struct ResolvedModelConfig {
     /// across request recovery unless overridden by the upstream retry setting;
     /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     pub retry_max_attempts: Option<u32>,
-    pub reasoning_timeout_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for ResolvedModelConfig {
@@ -325,7 +318,6 @@ impl ResolvedModelConfig {
             ephemeral: false,
             capable_model: self.capable_model,
             retry_max_attempts: self.retry_max_attempts,
-            reasoning_timeout_secs: self.reasoning_timeout_secs,
         }
     }
 }
@@ -638,7 +630,6 @@ mod tests {
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -671,7 +662,6 @@ mod tests {
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -698,7 +688,6 @@ mod tests {
         let none_cfg = ProviderConfig {
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -753,7 +742,6 @@ mod tests {
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -785,7 +773,6 @@ mod tests {
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -817,7 +804,6 @@ mod tests {
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));

@@ -922,13 +922,12 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     if names_sessions_with_a_model(cfg) {
         out = out.swap("session-title-first-prompt", "session-title-model");
     }
-    // A positive host budget opts into a single bounded lower-effort attempt.
-    out = out.patch("llm-stream-recovery", serde_json::json!({
-        "max_recoveries":3,
-        "reasoning_checkpoint":cfg.round_cap_checkpoint,
-        "reasoning_recovery_ms":cfg.reasoning_recovery_timeout.as_millis().min(u64::MAX as u128) as u64
-    })).map_err(|e| e.to_string())?;
-    // Interactive checkpoints remain available when automatic recovery is off.
+    out = out
+        .patch(
+            "llm-stream-recovery",
+            serde_json::json!({"max_recoveries": 3}),
+        )
+        .map_err(|e| e.to_string())?;
     if cfg.round_cap_checkpoint {
         out = out
             .patch(
