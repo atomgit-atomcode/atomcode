@@ -1201,6 +1201,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCheckRequest => "Check the error details and model configuration, or contact the service provider.".into(),
         Msg::ProviderCheckConnection => "Check the network connection and model service URL, then try again.".into(),
         Msg::ProviderNoFallback => "No available fallback route was found for this model; automatic switching failed.".into(),
+        Msg::ProviderRetryProlonged => "The model service is temporarily unstable; retrying automatically. Keep waiting or cancel. Details: /errors".into(),
         Msg::ProviderRetryDetailsHint => "details: /errors".into(),
         Msg::ProviderErrorDetails => "Original error details · click to expand/collapse, or /errors show".into(),
         Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),

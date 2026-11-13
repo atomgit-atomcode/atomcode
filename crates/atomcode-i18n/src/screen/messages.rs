@@ -1825,6 +1825,7 @@ pub enum Msg<'a> {
     ProviderNoFallback,
     ProviderErrorDetails,
     ProviderRetryDetailsHint,
+    ProviderRetryProlonged,
     TeamPanelEmpty,
     TeamPanelExpanded,
     TeamPanelCollapsed,

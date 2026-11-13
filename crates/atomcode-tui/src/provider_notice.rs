@@ -122,6 +122,46 @@ pub(crate) fn advice(error: &str) -> String {
     text
 }
 
+/// One expandable diagnostic group per provider request. Routine retries have
+/// no folded rows; /errors still exposes every original failure.
+#[derive(Debug)]
+pub(crate) struct RetryBlock {
+    pub prolonged: bool,
+    pub detail: String,
+}
+impl Content for RetryBlock {
+    fn kind(&self) -> &'static str {
+        "provider_diagnostic"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "retry_group",
+            if self.prolonged { "long" } else { "quiet" },
+            &self.detail,
+        ])
+    }
+    fn summary_lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        if self.prolonged {
+            NoticeBlock {
+                detail: t(Msg::ProviderRetryProlonged).into_owned(),
+            }
+            .lines(ctx)
+        } else {
+            Vec::new()
+        }
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let mut lines = self.summary_lines(ctx);
+        lines.extend(
+            NoticeBlock {
+                detail: self.detail.clone(),
+            }
+            .lines(ctx),
+        );
+        lines
+    }
+}
+
 /// The summary is localized on replay; the full diagnostic stays byte-for-byte intact.
 #[derive(Debug)]
 pub(crate) struct DiagnosticBlock {

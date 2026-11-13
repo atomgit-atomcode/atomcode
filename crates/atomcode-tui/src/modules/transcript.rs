@@ -24,6 +24,10 @@ pub const ID: &str = "transcript";
 
 #[derive(Default)]
 struct Open {
+    retry_started_at: Option<u64>,
+    retry_block: Option<BlockId>,
+    retry_details: String,
+    retry_prolonged: bool,
     /// The assistant text block currently accumulating chunks.
     text: Option<(BlockId, String)>,
     /// The reasoning block currently accumulating chunks.
@@ -239,6 +243,35 @@ impl Producer for Transcript {
         let mut open = self.open.lock().expect("transcript poisoned");
         let at = Coord::new(fact.turn(), 0);
         open.plan.absorb(fact);
+        // Request headers can repeat across attempts. A successful response or
+        // new turn ends the group; timestamps come from the log for replay.
+        match fact {
+            SessionEvent::TurnStart { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::TurnEnd { .. }
+            | SessionEvent::Interrupted { .. } => {
+                open.retry_started_at = None;
+                if let Some(id) = open.retry_block.take() {
+                    // This request is over; a "retrying" hint must not outlive
+                    // it. Keep the group's complete diagnostics expandable.
+                    out.amend(
+                        id,
+                        Arc::new(crate::provider_notice::RetryBlock {
+                            prolonged: false,
+                            detail: open.retry_details.clone(),
+                        }),
+                    );
+                    out.settle(id);
+                }
+                open.retry_details.clear();
+                open.retry_prolonged = false;
+            }
+            SessionEvent::RequestHeader { .. } => {
+                open.retry_started_at.get_or_insert(logged.at);
+            }
+            _ => {}
+        }
+
         // Read before this fact is folded in, so a `Rewound` is judged by the
         // turns before it.
         let silent_undo = match fact {
@@ -558,6 +591,32 @@ impl Producer for Transcript {
                 retry,
                 ..
             } => {
+                if let (atomcode_harness::session::NoticeKind::ProviderRetry, Some(retry)) =
+                    (notice, retry)
+                {
+                    let started = *open.retry_started_at.get_or_insert(logged.at);
+                    open.retry_prolonged |= logged.at.saturating_sub(started) >= 60_000;
+                    if !open.retry_details.is_empty() {
+                        open.retry_details.push('\n');
+                    }
+                    open.retry_details
+                        .push_str(&t(Msg::TranscriptProviderRetry {
+                            reason: detail,
+                            seconds: retry.backoff_secs,
+                            attempt: retry.attempt,
+                            max: retry.max_attempts,
+                        }));
+                    let block = Arc::new(crate::provider_notice::RetryBlock {
+                        prolonged: open.retry_prolonged,
+                        detail: open.retry_details.clone(),
+                    });
+                    if let Some(id) = open.retry_block {
+                        out.amend(id, block);
+                    } else {
+                        open.retry_block = Some(out.open(at, block));
+                    }
+                    return;
+                }
                 // The runtime writes its rate-limit wait as an English sentence
                 // (`host_rows::RateLimitCoding`); said here in the person's
                 // language, as the classic screen says it. A provider retry
@@ -1333,18 +1392,154 @@ mod tests {
             },
         ]);
         let drawn = said(&s);
-        let said_once = t(Msg::TranscriptProviderRetry {
-            reason: &crate::provider_notice::reason("connection refused"),
-            seconds: 3,
-            attempt: 1,
-            max: 2,
-        })
-        .into_owned();
-        assert!(drawn.contains(&said_once), "{drawn}");
+        assert!(
+            drawn.contains("connection refused"),
+            "raw diagnostics remain available: {drawn}"
+        );
+        let folded = s
+            .slots()
+            .iter()
+            .flat_map(|slot| {
+                slot.block()
+                    .content
+                    .summary_lines(&crate::block::RenderCtx::bare(100))
+            })
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !folded.contains("connection refused"),
+            "routine structured retries are folded away: {folded}"
+        );
         assert!(
             drawn.contains("gateway reset; retrying in 6s (2/2)"),
             "{drawn}"
         );
+    }
+
+    #[test]
+    fn repeated_failures_update_one_group_and_warn_once_after_a_minute() {
+        use atomcode_harness::session::{HeaderReason, NoticeKind, RetryAttempt};
+        let t = Transcript::default();
+        let mut s = Stream::new();
+        let mut events = vec![
+            (0, SessionEvent::TurnStart { turn: 1 }),
+            (
+                0,
+                SessionEvent::RequestHeader {
+                    turn: 1,
+                    round: 1,
+                    model: "model".into(),
+                    reason: HeaderReason::Append,
+                },
+            ),
+        ];
+        for (attempt, at) in [(1, 10_000), (2, 30_000), (3, 65_000), (4, 90_000)] {
+            events.push((
+                at,
+                SessionEvent::Notice {
+                    turn: 1,
+                    notice: NoticeKind::ProviderRetry,
+                    detail: format!("original-{attempt}"),
+                    retry: Some(RetryAttempt {
+                        attempt,
+                        max_attempts: 5,
+                        backoff_secs: 3,
+                    }),
+                },
+            ));
+        }
+        for (i, (at, event)) in events.iter().enumerate() {
+            let mut logged = conformance::logged(i, event);
+            logged.at = *at;
+            t.absorb(&logged, &mut s.writer(ID));
+            if i == 3 {
+                assert!(s.slots().iter().all(|slot| slot
+                    .block()
+                    .content
+                    .summary_lines(&crate::block::RenderCtx::bare(100))
+                    .is_empty()));
+            }
+        }
+        let groups: Vec<_> = s
+            .slots()
+            .iter()
+            .filter(|slot| slot.block().content.kind() == "provider_diagnostic")
+            .collect();
+        assert_eq!(groups.len(), 1);
+        let hint = groups[0]
+            .block()
+            .content
+            .summary_lines(&crate::block::RenderCtx::bare(100))
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            hint.contains(&*crate::i18n::t(Msg::ProviderRetryProlonged)),
+            "{hint}"
+        );
+        let details = said(&s);
+        for n in 1..=4 {
+            assert!(details.contains(&format!("original-{n}")));
+        }
+        let response = conformance::logged(
+            9,
+            &SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: "recovered".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+        );
+        t.absorb(&response, &mut s.writer(ID));
+        assert!(
+            s.slots()
+                .iter()
+                .filter(|slot| slot.block().content.kind() == "provider_diagnostic")
+                .all(|slot| slot
+                    .block()
+                    .content
+                    .summary_lines(&crate::block::RenderCtx::bare(100))
+                    .is_empty()),
+            "a completed request must not still claim it is retrying"
+        );
+        assert!(
+            said(&s).contains("original-4"),
+            "successful recovery keeps diagnostics"
+        );
+        // A new request after a completed response starts a fresh quiet group.
+        let next = conformance::logged(10, &SessionEvent::TurnStart { turn: 2 });
+        t.absorb(&next, &mut s.writer(ID));
+        let mut retry = conformance::logged(
+            11,
+            &SessionEvent::Notice {
+                turn: 2,
+                notice: NoticeKind::ProviderRetry,
+                detail: "new-request".into(),
+                retry: Some(RetryAttempt {
+                    attempt: 1,
+                    max_attempts: 5,
+                    backoff_secs: 3,
+                }),
+            },
+        );
+        retry.at = 200_000;
+        t.absorb(&retry, &mut s.writer(ID));
+        let groups: Vec<_> = s
+            .slots()
+            .iter()
+            .filter(|slot| slot.block().content.kind() == "provider_diagnostic")
+            .collect();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[1]
+            .block()
+            .content
+            .summary_lines(&crate::block::RenderCtx::bare(100))
+            .is_empty());
     }
 
     /// A pause is on screen with the time it ends, because the screen is

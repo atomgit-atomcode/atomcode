@@ -1138,6 +1138,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCheckRequest => "请查看错误详情，检查模型配置或联系服务提供方。".into(),
         Msg::ProviderCheckConnection => "请检查网络连接和模型服务地址，然后重试。".into(),
         Msg::ProviderNoFallback => "当前模型未找到可用的备用路由，无法自动切换。".into(),
+        Msg::ProviderRetryProlonged => "模型服务暂时不稳定，正在自动重试。可继续等待或取消。详情：/errors".into(),
         Msg::ProviderRetryDetailsHint => "详情：/errors".into(),
         Msg::ProviderErrorDetails => "原始错误详情 · 点击展开/收起，或 /errors show".into(),
         Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),
