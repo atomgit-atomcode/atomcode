@@ -28,7 +28,8 @@ atomcode-auth = { path = "../atomcode-auth" }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["plugin", "mcp", "atomgit", "tools", "memory"] }
 # Unified native runtime used by daemon live/chat/session paths.
 atomcode-kernel = { path = "../atomcode-kernel" }
-atomcode-coding = { path = "../atomcode-coding", features = ["atomgit", "grape"] }
+# Grape tools are temporarily excluded from the product's model-facing catalog.
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # HTTP

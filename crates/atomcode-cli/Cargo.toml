@@ -60,7 +60,8 @@ atomcode-host-api = { path = "../atomcode-host-api" }
 # Direct now that the host-control adapter lives here: it speaks the feed and
 # the plugin tree itself, rather than reaching them through `atomcode-coding`.
 atomcode-harness = { path = "../atomcode-harness" }
-atomcode-coding = { path = "../atomcode-coding", features = ["atomgit", "grape"] }
+# Grape tools are temporarily excluded from the product's model-facing catalog.
+atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
 atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
