@@ -1979,9 +1979,11 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
             HubError::RuntimeRejected(message)
         }
         // A bare variant name ("NotFound", ...) told a remote client nothing
-        // it could act on. Name the state instead (issue #1740).
+        // it could act on. Name the state instead, without asserting one
+        // specific cause — this variant reaches here from the catalog lookup,
+        // the slot table, and the commit-time front check alike (issue #1740).
         HostError::NotFound => HubError::RuntimeRejected(
-            "Session not found: it may have been deleted. Refresh the session list and try again."
+            "Session not found: the target session is no longer available. Refresh the session list and try again."
                 .into(),
         ),
         HostError::SessionInUse { id } => HubError::RuntimeRejected(format!(
