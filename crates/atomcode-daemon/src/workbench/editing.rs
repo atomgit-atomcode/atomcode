@@ -163,6 +163,7 @@ async fn git(root: &Path, configs: &[String], args: &[&str]) -> Result<(bool, Ve
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("LC_ALL", "C")
         .env("GIT_LITERAL_PATHSPECS", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
@@ -210,9 +211,21 @@ struct GitWorkspace {
     repo: PathBuf,
     configs: Vec<String>,
 }
+const NOT_GIT_REPOSITORY: &str = "workspace_not_git_repository";
+
+fn is_missing_repository(error: &str) -> bool {
+    error.starts_with("fatal: not a git repository (or any of the parent directories):")
+        || error.starts_with("fatal: not a git repository (or any parent up to mount point ")
+}
+
 async fn git_workspace(root: PathBuf) -> Result<GitWorkspace, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let (ok, repo) = git(&root, &[], &["rev-parse", "--show-toplevel"]).await?;
+    let (ok, repo) = match git(&root, &[], &["rev-parse", "--show-toplevel"]).await {
+        Err(error) if is_missing_repository(&error) => {
+            return Err(NOT_GIT_REPOSITORY.into());
+        }
+        result => result?,
+    };
     if !ok {
         return Err("This workspace is not a Git repository".into());
     }
@@ -346,6 +359,13 @@ pub(super) async fn git_status(
     .await;
     match result {
         Ok(changes) => Json(changes).into_response(),
+        Err(e) if e == NOT_GIT_REPOSITORY => crate::coded_json_error(
+            StatusCode::BAD_REQUEST,
+            NOT_GIT_REPOSITORY,
+            "This workspace is not a Git repository",
+            false,
+        )
+        .into_response(),
         Err(e) => bad(e),
     }
 }
@@ -420,6 +440,36 @@ pub(super) async fn git_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_repository_diagnostics_do_not_hide_other_git_errors() {
+        assert!(is_missing_repository(
+            "fatal: not a git repository (or any of the parent directories): .git"
+        ));
+        assert!(is_missing_repository("fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."));
+        assert!(!is_missing_repository(
+            "fatal: detected dubious ownership in repository"
+        ));
+        assert!(!is_missing_repository(
+            "fatal: invalid gitfile format: .git"
+        ));
+    }
+
+    #[tokio::test]
+    async fn uninitialized_directory_is_distinct_from_git_query_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = git_workspace(dir.path().to_path_buf()).await.err().unwrap();
+        assert_eq!(error, NOT_GIT_REPOSITORY);
+        assert!(!dir.path().join(".git").exists());
+        let error = git_workspace(dir.path().join("missing"))
+            .await
+            .err()
+            .unwrap();
+        assert_ne!(error, NOT_GIT_REPOSITORY);
+        std::fs::write(dir.path().join(".git"), "invalid gitfile").unwrap();
+        let error = git_workspace(dir.path().to_path_buf()).await.err().unwrap();
+        assert_ne!(error, NOT_GIT_REPOSITORY);
+    }
+
     #[test]
     fn optimistic_saves_preserve_external_changes_and_permissions() {
         let dir = tempfile::tempdir().unwrap();

@@ -102,6 +102,21 @@ try {
   pending.splice(0).forEach(resolve => resolve());
   await page.waitForTimeout(80);
   assert.equal(await tree.getByRole('button', { name: 'child.txt', exact: false }).count(), 0);
+  let gitState = 'absent';
+  await page.route('**/workbench/git?*', route => gitState === 'absent'
+    ? route.fulfill({ status: 400, json: { error: 'This workspace is not a Git repository', code: 'workspace_not_git_repository' } })
+    : gitState === 'failure'
+      ? route.fulfill({ status: 400, json: { error: 'Git permission denied' } })
+      : route.fulfill({ json: [] }));
+  await page.getByRole('button', { name: 'Git', exact: true }).click();
+  await page.getByText('This directory is not a Git repository. No version changes to show.', { exact: true }).waitFor();
+  assert.equal(await page.locator('.workbench-error').count(), 0);
+  gitState = 'clean';
+  await page.getByTitle('Refresh files', { exact: true }).click();
+  await page.getByText('No changed files', { exact: true }).waitFor();
+  gitState = 'failure';
+  await page.getByTitle('Refresh files', { exact: true }).click();
+  await page.getByRole('alert').filter({ hasText: 'Git permission denied' }).waitFor();
   assert.deepEqual(errors, []);
   console.log('Mobile focus/timer refresh preserves rows, scroll and preview; new files, refresh failures and stale navigation responses behave correctly');
 } finally { await browser?.close(); await server.close(); }

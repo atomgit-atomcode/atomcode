@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { workbenchRequest } from "../api";
+import { ApiCallError, workbenchRequest } from "../api";
 import { useSettings } from "../settings";
 type Change = {
   path: string;
@@ -30,11 +30,13 @@ export function WorkbenchGit({
   const [staged, setStaged] = useState(false);
   const [diff, setDiff] = useState("");
   const [error, setError] = useState("");
+  const [notRepository, setNotRepository] = useState(false);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     let cancelled = false;
     setError("");
     setLoading(true);
+    setNotRepository(false);
     workbenchRequest<Change[]>(
       "git?" + new URLSearchParams({ session_id: session }),
     )
@@ -48,7 +50,9 @@ export function WorkbenchGit({
       })
       .catch((e) => {
         if (!cancelled) {
-          setError(String(e));
+          const absent = e instanceof ApiCallError && e.code === "workspace_not_git_repository";
+          setNotRepository(absent);
+          setError(absent ? "" : String(e));
           setChanges([]);
           setSelected(null);
         }
@@ -127,6 +131,10 @@ export function WorkbenchGit({
             ? zh
               ? "正在读取变更…"
               : "Loading changes…"
+            : notRepository
+              ? zh
+                ? "当前目录尚未初始化 Git，暂无版本变更"
+                : "This directory is not a Git repository. No version changes to show."
             : zh
               ? "工作区没有文件变更"
               : "No changed files"}
