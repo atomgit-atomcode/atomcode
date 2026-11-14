@@ -1979,11 +1979,12 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
             HubError::RuntimeRejected(message)
         }
         // A bare variant name ("NotFound", ...) told a remote client nothing
-        // it could act on. Name the state instead, without asserting one
-        // specific cause — this variant reaches here from the catalog lookup,
-        // the slot table, and the commit-time front check alike (issue #1740).
+        // it could act on. Name the state instead, without asserting which
+        // session is gone — the variant reaches here from the target lookup
+        // AND from the source/front checks, where the session exists but the
+        // front moved on (issue #1740).
         HostError::NotFound => HubError::RuntimeRejected(
-            "Session not found: the target session is no longer available. Refresh the session list and try again."
+            "Session not found: one of the sessions involved in this switch is no longer available. Refresh the session list and try again."
                 .into(),
         ),
         HostError::SessionInUse { id } => HubError::RuntimeRejected(format!(
@@ -2027,6 +2028,9 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
         // remove (issue #1740), and it must stay removed when
         // #[non_exhaustive] grows the enum — and its diagnostic in the log.
         error => {
+            // warn, not debug: the CLI file-log filter defaults to info, and
+            // this is the only place the unmapped variant and its payload are
+            // kept at all.
             tracing::warn!(?error, "embedded navigation: unmapped host error");
             HubError::RuntimeRejected(
                 "The switch was rejected for an unexpected reason. Try again; if it persists, open a new session."

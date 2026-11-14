@@ -2088,8 +2088,10 @@ pub(crate) fn update_project_state(project: &mut ProjectState, new_path: &std::p
 fn format_navigation_rejection(error: &crate::live_hub::HubError, action: &str) -> String {
     use crate::live_hub::HubError;
     let (verdict, reason) = match error {
+        // "not applied", not "deferred": nothing queues the switch — the
+        // client must issue it again once the turn is done.
         HubError::ActiveTurn => (
-            "deferred",
+            "not applied",
             "The current session is still working on its turn. Try again in a moment.",
         ),
         HubError::RuntimeRejected(reason) => ("rejected", reason.as_str()),
@@ -2110,7 +2112,13 @@ fn format_navigation_rejection(error: &crate::live_hub::HubError, action: &str) 
             "The runtime state changed while this request was in flight. Try again.",
         ),
         HubError::SnapshotUnavailable(reason) => ("rejected", reason.as_str()),
-        other => return format!("Runtime rejected navigation: {other:?}"),
+        // Keep the shape out of the client message, as on the
+        // embedded-navigation side (issue #1740); the diagnostic goes to the
+        // log. Only variants that cannot reach the /cd paths land here.
+        other => {
+            tracing::warn!(?other, "live navigation: unmapped hub error");
+            return format!("{action} rejected: the runtime could not perform the request. Try again.");
+        }
     };
     format!("{action} {verdict}: {reason}")
 }
@@ -2133,18 +2141,15 @@ mod navigation_rejection_tests {
             "Session switch rejected: Session not found: the target session is no longer available."
         );
         assert!(!rejected.contains("RuntimeRejected"));
-        let deferred = format_navigation_rejection(&HubError::ActiveTurn, "Session switch");
-        assert!(deferred.contains("deferred"), "{deferred}");
+        let busy = format_navigation_rejection(&HubError::ActiveTurn, "Session switch");
+        assert!(busy.contains("not applied"), "{busy}");
     }
 
     #[test]
     fn plain_directory_change_is_not_labeled_as_session_switch() {
         use crate::live_hub::HubError;
-        let deferred = format_navigation_rejection(&HubError::ActiveTurn, "Directory change");
-        assert!(
-            deferred.starts_with("Directory change deferred"),
-            "{deferred}"
-        );
+        let busy = format_navigation_rejection(&HubError::ActiveTurn, "Directory change");
+        assert!(busy.starts_with("Directory change not applied"), "{busy}");
         let unbound = format_navigation_rejection(&HubError::Unbound, "Directory change");
         assert!(!unbound.contains("Unbound"), "{unbound}");
         let generation = format_navigation_rejection(
@@ -2256,10 +2261,15 @@ async fn change_dir(
                     opened_session = changed.session_id;
                 }
                 Err(error) => {
-                    // Name the action the client actually asked for: with a
-                    // session_id this was a session switch, without one a plain
-                    // directory change — the message must not mislabel it.
-                    let action = if req.session_id.is_some() {
+                    // Name the action the client actually asked for, using the
+                    // SAME criterion native_live::navigate applies — a
+                    // blank session_id takes the directory-change path there,
+                    // so it must not be labelled a session switch here either.
+                    let action = if req
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty())
+                    {
                         "Session switch"
                     } else {
                         "Directory change"
