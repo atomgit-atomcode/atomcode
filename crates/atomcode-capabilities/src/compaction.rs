@@ -436,6 +436,7 @@ impl OverflowCompaction {
                     Err(error) => {
                         tracing::warn!(
                             diagnostic = error.diagnostic().code(),
+                            http_status = error.http_status(),
                             "overflow summary unavailable; retaining conversation history"
                         );
                         return CompactionPlan {
@@ -488,6 +489,7 @@ impl OverflowCompaction {
             Err(error) => {
                 tracing::warn!(
                     diagnostic = error.diagnostic().code(),
+                    http_status = error.http_status(),
                     "compaction summary unavailable; retaining conversation history"
                 );
                 let mut plan = self.inner.plan(view).await;
@@ -540,6 +542,12 @@ impl SummaryError {
         use atomcode_kernel::message::CompactionDiagnostic as D;
         match self {
             Self::Provider(e) if e.is_context_overflow() => D::SummaryContextExceeded,
+            Self::Provider(e) if matches!(e.http_status, Some(401 | 403)) => {
+                D::SummaryAuthenticationFailed
+            }
+            Self::Provider(e) if e.http_status == Some(429) => D::SummaryRateLimited,
+            Self::Provider(e) if summary_request_rejected(e) => D::SummaryRequestRejected,
+
             Self::Provider(e)
                 if matches!(
                     e.code.as_deref(),
@@ -552,6 +560,15 @@ impl SummaryError {
             Self::Provider(_) => D::SummaryFailed,
             Self::Incomplete => D::SummaryIncomplete,
             Self::InputTooLarge => D::SummaryContextExceeded,
+        }
+    }
+
+    // Do not log response bodies or provider messages: they can contain URLs,
+    // credentials or conversation text. The numeric status is safe to record.
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Provider(e) => e.http_status,
+            _ => None,
         }
     }
 
@@ -642,7 +659,14 @@ fn summary_prompt(previous: Option<&str>, transcript: &str, focus: Option<&str>)
 // Provider retryable=false can mean partial content was already delivered. A
 // summary has no user-visible deltas or dispatched tools, so these typed transport
 // failures may replay once after discarding the partial summary (and may be billed again).
+fn summary_request_rejected(error: &ProviderError) -> bool {
+    matches!(error.http_status, Some(400 | 402 | 404 | 405 | 415 | 422))
+}
+
 fn summary_retryable(error: &ProviderError) -> bool {
+    if matches!(error.http_status, Some(401 | 403)) || summary_request_rejected(error) {
+        return false;
+    }
     error.retryable
         || matches!(
             error.code.as_deref(),
@@ -2423,7 +2447,7 @@ mod tests {
             let plan = strategy.plan(&view).await;
             assert_eq!(
                 plan.diagnostic,
-                Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed)
+                Some(atomcode_kernel::message::CompactionDiagnostic::SummaryAuthenticationFailed)
             );
             let report = conv.apply_plan(plan, floor);
             assert!(

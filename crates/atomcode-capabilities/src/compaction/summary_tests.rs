@@ -220,6 +220,37 @@ async fn repeated_transient_failure_stops_after_two_calls_and_preserves_the_reas
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn summary_http_failures_are_actionable_and_terminal_rejections_never_retry() {
+    use atomcode_kernel::message::CompactionDiagnostic as D;
+    for (status, diagnostic) in [
+        (401, D::SummaryAuthenticationFailed),
+        (403, D::SummaryAuthenticationFailed),
+        (400, D::SummaryRequestRejected),
+        (402, D::SummaryRequestRejected),
+        (404, D::SummaryRequestRejected),
+        (422, D::SummaryRequestRejected),
+        (429, D::SummaryRateLimited),
+    ] {
+        let provider = Probe {
+            replies: Mutex::new(VecDeque::from([Err(ProviderError {
+                http_status: Some(status),
+                retryable: true,
+                retry_after_secs: Some(60),
+                message: "private provider response must not become UI advice".into(),
+                ..Default::default()
+            })])),
+            ..Default::default()
+        };
+        let error = summarize_span(&provider, &[Message::user("retained history")], None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.diagnostic(), diagnostic);
+        assert_eq!(error.http_status(), Some(status));
+        assert_eq!(provider.sent.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn terminal_failures_are_not_retried() {
     for reply in [
         Err(failure("unauthorized", false)),

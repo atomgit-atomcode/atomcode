@@ -355,6 +355,15 @@ impl OverflowLadder {
             Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRequestFailed) => {
                 "AI summary request failed after bounded retries; conversation retained"
             }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryAuthenticationFailed) => {
+                "AI summary authentication or access denied; check credentials and model access; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRequestRejected) => {
+                "AI summary request rejected; check model, parameters and service restrictions; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRateLimited) => {
+                "AI summary rate limited; wait before retrying; conversation retained"
+            }
             Some(atomcode_kernel::message::CompactionDiagnostic::NotSmaller) => {
                 "compaction did not reduce context; conversation retained"
             }

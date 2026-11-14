@@ -958,6 +958,9 @@ pub enum CompactionDiagnostic {
     SummaryContextExceeded,
     SummaryIncomplete,
     SummaryRequestFailed,
+    SummaryAuthenticationFailed,
+    SummaryRequestRejected,
+    SummaryRateLimited,
     NotSmaller,
 }
 
@@ -969,6 +972,9 @@ impl CompactionDiagnostic {
             Self::SummaryContextExceeded => "summary_context_exceeded",
             Self::SummaryIncomplete => "summary_incomplete",
             Self::SummaryRequestFailed => "summary_request_failed",
+            Self::SummaryAuthenticationFailed => "summary_authentication_failed",
+            Self::SummaryRequestRejected => "summary_request_rejected",
+            Self::SummaryRateLimited => "summary_rate_limited",
             Self::NotSmaller => "not_smaller",
         }
     }

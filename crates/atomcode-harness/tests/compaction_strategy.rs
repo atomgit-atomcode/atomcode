@@ -701,7 +701,10 @@ async fn a_failed_summary_keeps_its_reason_after_switching_to_a_larger_window() 
         )
         .await;
         assert!(result.decision.is_none());
-        assert_eq!(result.diagnostic, Some(CompactionDiagnostic::SummaryFailed));
+        assert_eq!(
+            result.diagnostic,
+            Some(CompactionDiagnostic::SummaryAuthenticationFailed)
+        );
         assert_eq!(
             writer.log.events(),
             before,
