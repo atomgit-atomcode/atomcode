@@ -27,7 +27,7 @@ use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
 use atomcode_host_api::{
     BackgroundSession, BackgroundState, BackgroundStats, HostCommand, HostConnection, HostControl,
-    HostError, HostEvent, HostReply, LoggedFact,
+    HostError, HostEvent, HostReply, LoggedFact, ProviderUnavailableReason,
 };
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::session::{LoggedEvent, SessionEvent};
@@ -1995,7 +1995,44 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
         HostError::Cancelled => HubError::RuntimeRejected(
             "The session switch was cancelled before it finished.".into(),
         ),
-        error => HubError::RuntimeRejected(format!("{error:?}")),
+        HostError::ProviderUnavailable { reason } => {
+            let message = match reason {
+                ProviderUnavailableReason::NotConfigured => {
+                    "No model provider is configured. Configure one, then try the switch again."
+                }
+                ProviderUnavailableReason::AuthenticationRequired => {
+                    "The model provider needs authentication. Sign in or set its credentials, then try again."
+                }
+                ProviderUnavailableReason::UnsupportedBuild => {
+                    "The configured model provider is not supported on this build."
+                }
+                _ => "The model provider is unavailable. Check the provider setup and try again.",
+            };
+            HubError::RuntimeRejected(message.into())
+        }
+        HostError::UndoOutOfRange { requested, available } => {
+            let reason = format!(
+                "Undo history does not extend that far: {requested} requested, {available} available. Try again with a smaller step."
+            );
+            HubError::RuntimeRejected(reason)
+        }
+        // The session moved on since the switch was started (it changed in
+        // another window); acting on the stale view would clobber it.
+        HostError::Stale { .. } => HubError::RuntimeRejected(
+            "The session changed in another window since this switch was started. Refresh and try again."
+                .into(),
+        ),
+        // A variant this mapper does not name: keep its shape out of the
+        // client message — that is the symptom this function exists to
+        // remove (issue #1740), and it must stay removed when
+        // #[non_exhaustive] grows the enum — and its diagnostic in the log.
+        error => {
+            tracing::debug!(?error, "embedded navigation: unmapped host error");
+            HubError::RuntimeRejected(
+                "The switch was rejected for an unexpected reason. Try again; if it persists, open a new session."
+                    .into(),
+            )
+        }
     }
 }
 
@@ -2109,6 +2146,35 @@ mod tests {
             embedded_navigation_error(HostError::Busy { reason: "x".into() }),
             HubError::ActiveTurn
         );
+    }
+
+    #[test]
+    fn embedded_navigation_never_leaks_the_variant_shape() {
+        use atomcode_daemon::live_hub::HubError;
+        let reason = |error: HostError| match embedded_navigation_error(error) {
+            HubError::RuntimeRejected(reason) => reason,
+            other => panic!("expected RuntimeRejected, got {other:?}"),
+        };
+        let provider = reason(HostError::ProviderUnavailable {
+            reason: ProviderUnavailableReason::NotConfigured,
+        });
+        assert!(provider.contains("No model"), "{provider}");
+        assert!(!provider.contains("ProviderUnavailable"), "{provider}");
+        let undo = reason(HostError::UndoOutOfRange {
+            requested: 5,
+            available: 2,
+        });
+        assert!(undo.contains("5"), "{undo}");
+        assert!(!undo.contains("UndoOutOfRange"), "{undo}");
+        let stale = reason(HostError::Stale { current: 7 });
+        assert!(!stale.contains("Stale"), "{stale}");
+        // The fallback names nothing it does not know, and keeps even the
+        // payload out of the client message.
+        let fallback = reason(HostError::CodeRewindUnavailable {
+            message: "internal detail".into(),
+        });
+        assert!(!fallback.contains("CodeRewindUnavailable"), "{fallback}");
+        assert!(!fallback.contains("internal detail"), "{fallback}");
     }
 
     #[test]
