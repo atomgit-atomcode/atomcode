@@ -1990,9 +1990,9 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
         HostError::SessionInUse { id } => HubError::RuntimeRejected(format!(
             "Session {id} is already open in another AtomCode window; close it there before switching."
         )),
-        HostError::Unavailable => {
-            HubError::RuntimeRejected("The coding runtime is unavailable.".into())
-        }
+        // Typed, so /cd renders the shared RuntimeUnavailable wording (with
+        // the restart action) instead of a shorter second copy living here.
+        HostError::Unavailable => HubError::RuntimeUnavailable,
         HostError::Cancelled => HubError::RuntimeRejected(
             "The session switch was cancelled before it finished.".into(),
         ),
@@ -2017,12 +2017,10 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
             );
             HubError::RuntimeRejected(reason)
         }
-        // The session moved on since the switch was started (it changed in
-        // another window); acting on the stale view would clobber it.
-        HostError::Stale { .. } => HubError::RuntimeRejected(
-            "The session changed in another window since this switch was started. Refresh and try again."
-                .into(),
-        ),
+        // The session moved on since the switch was started. Typed, so /cd
+        // renders the shared StaleBinding wording instead of a second copy of
+        // the same "refresh and retry" sentence.
+        HostError::Stale { .. } => HubError::StaleBinding,
         // A variant this mapper does not name: keep its shape out of the
         // client message — that is the symptom this function exists to
         // remove (issue #1740), and it must stay removed when
@@ -2170,8 +2168,15 @@ mod tests {
         });
         assert!(undo.contains("5"), "{undo}");
         assert!(!undo.contains("UndoOutOfRange"), "{undo}");
-        let stale = reason(HostError::Stale { current: 7 });
-        assert!(!stale.contains("Stale"), "{stale}");
+        // Unavailable/Stale stay typed: /cd renders their shared wording.
+        assert_eq!(
+            embedded_navigation_error(HostError::Unavailable),
+            HubError::RuntimeUnavailable
+        );
+        assert_eq!(
+            embedded_navigation_error(HostError::Stale { current: 7 }),
+            HubError::StaleBinding
+        );
         // The fallback names nothing it does not know, and keeps even the
         // payload out of the client message.
         let fallback = reason(HostError::CodeRewindUnavailable {
