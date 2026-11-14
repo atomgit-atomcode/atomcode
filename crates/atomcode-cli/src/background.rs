@@ -1568,11 +1568,7 @@ impl Background {
             use atomcode_capabilities::session::SessionManager;
             let dirs = atomcode_coding::config::product_dirs_from_env();
             let scan = SessionManager::scan_all(dirs.user());
-            let entry = scan
-                .entries
-                .iter()
-                .find(|entry| entry.id == target && entry.message_count > 0)
-                .ok_or(HostError::NotFound)?;
+            let entry = find_switchable_entry(&scan.entries, &target)?;
             if entry.needs_newer_version {
                 return Err(HostError::Failed {
                     message: "Update AtomCode before opening this session.".into(),
@@ -1956,11 +1952,47 @@ impl HostControl for Background {
     }
 }
 
+/// The destination of a shared project switch, looked up in the catalog. A
+/// session with no messages is found but not switchable: say so, instead of
+/// answering "not found" for a session that exists.
+fn find_switchable_entry<'a>(
+    entries: &'a [atomcode_capabilities::session::CatalogEntry],
+    target: &str,
+) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
+    match entries.iter().find(|entry| entry.id == target) {
+        Some(entry) if entry.message_count > 0 => Ok(entry),
+        Some(_) => Err(HostError::Failed {
+            message: "That session has no messages yet, so there is nothing to switch to.".into(),
+        }),
+        None => Err(HostError::NotFound),
+    }
+}
+
 // Keep actionable refusals typed across the embedded-driver boundary.
 fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::HubError {
     use atomcode_daemon::live_hub::HubError;
     match error {
         HostError::Busy { .. } => HubError::ActiveTurn,
+        // The host already wrote a person-readable reason: surface it,
+        // instead of re-wrapping it in the variant's Debug shape.
+        HostError::Failed { message } | HostError::InvalidWorkingDirectory { message } => {
+            HubError::RuntimeRejected(message)
+        }
+        // A bare variant name ("NotFound", ...) told a remote client nothing
+        // it could act on. Name the state instead (issue #1740).
+        HostError::NotFound => HubError::RuntimeRejected(
+            "Session not found: it may have been deleted. Refresh the session list and try again."
+                .into(),
+        ),
+        HostError::SessionInUse { id } => HubError::RuntimeRejected(format!(
+            "Session {id} is already open in another AtomCode window; close it there before switching."
+        )),
+        HostError::Unavailable => {
+            HubError::RuntimeRejected("The coding runtime is unavailable.".into())
+        }
+        HostError::Cancelled => HubError::RuntimeRejected(
+            "The session switch was cancelled before it finished.".into(),
+        ),
         error => HubError::RuntimeRejected(format!("{error:?}")),
     }
 }
@@ -2051,6 +2083,62 @@ mod tests {
             embedded_navigation_error(HostError::NotFound),
             HubError::RuntimeRejected(_)
         ));
+    }
+
+    #[test]
+    fn embedded_navigation_names_the_refusal_instead_of_the_variant() {
+        use atomcode_daemon::live_hub::HubError;
+        let reason = |error: HostError| match embedded_navigation_error(error) {
+            HubError::RuntimeRejected(reason) => reason,
+            other => panic!("expected RuntimeRejected, got {other:?}"),
+        };
+        let not_found = reason(HostError::NotFound);
+        assert_ne!(not_found, "NotFound");
+        assert!(not_found.contains("not found"), "{not_found}");
+        assert_eq!(
+            reason(HostError::Failed {
+                message: "hold on".into()
+            }),
+            "hold on"
+        );
+        let in_use = reason(HostError::SessionInUse { id: "abc".into() });
+        assert!(in_use.contains("abc"), "{in_use}");
+        assert_eq!(
+            embedded_navigation_error(HostError::Busy { reason: "x".into() }),
+            HubError::ActiveTurn
+        );
+    }
+
+    #[test]
+    fn find_switchable_entry_tells_missing_from_empty() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+        fn entry(id: &str, message_count: usize) -> CatalogEntry {
+            CatalogEntry {
+                id: id.into(),
+                name: String::new(),
+                fork_root_id: None,
+                project_bucket: "bucket".into(),
+                working_dir: std::path::PathBuf::from("/tmp"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                message_count,
+                turn_count: 0,
+                presence: CatalogPresence::NativeOnly,
+                needs_newer_version: false,
+                origin: atomcode_capabilities::session::manager::SessionOrigin::Manual,
+            }
+        }
+        let entries = vec![entry("empty", 0), entry("full", 2)];
+        assert!(matches!(
+            find_switchable_entry(&entries, "ghost"),
+            Err(HostError::NotFound)
+        ));
+        assert!(matches!(
+            find_switchable_entry(&entries, "empty"),
+            Err(HostError::Failed { message }) if message.contains("no messages")
+        ));
+        let found = find_switchable_entry(&entries, "full").expect("switchable");
+        assert_eq!(found.id, "full");
     }
 
     /// 范围里有几个文件在变,是真的去问 git。

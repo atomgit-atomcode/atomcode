@@ -2078,6 +2078,41 @@ pub(crate) fn update_project_state(project: &mut ProjectState, new_path: &std::p
     }
 }
 
+/// The /cd refusal shown to a remote client. A deferred switch (ActiveTurn)
+/// is not a failure; a RuntimeRejected reason is already a person-readable
+/// sentence — surface it, not the variant's Debug shape (issue #1740).
+fn format_navigation_rejection(error: &crate::live_hub::HubError) -> String {
+    use crate::live_hub::HubError;
+    match error {
+        HubError::ActiveTurn => {
+            "Session switch deferred: the current session is still working on its turn. Try again in a moment."
+                .to_string()
+        }
+        HubError::RuntimeRejected(reason) => format!("Session switch rejected: {reason}"),
+        other => format!("Runtime rejected navigation: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod navigation_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn cd_refusal_names_the_reason_not_the_variant() {
+        use crate::live_hub::HubError;
+        let rejected = format_navigation_rejection(&HubError::RuntimeRejected(
+            "Session not found: it may have been deleted.".into(),
+        ));
+        assert_eq!(
+            rejected,
+            "Session switch rejected: Session not found: it may have been deleted."
+        );
+        assert!(!rejected.contains("RuntimeRejected"));
+        let deferred = format_navigation_rejection(&HubError::ActiveTurn);
+        assert!(deferred.contains("deferred"), "{deferred}");
+    }
+}
+
 /// POST /cd - Change working directory (like /cd command)
 async fn change_dir(
     State(state): State<AppState>,
@@ -2176,7 +2211,7 @@ async fn change_dir(
                     return Json(ChangeDirResponse {
                         session_id: None,
                         success: false,
-                        message: format!("Runtime rejected navigation: {error:?}"),
+                        message: format_navigation_rejection(&error),
                         current_dir: project.working_dir.clone(),
                         project_hash: hash_path(&project.working_dir),
                     });
