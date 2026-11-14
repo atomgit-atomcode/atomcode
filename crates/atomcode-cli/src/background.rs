@@ -2027,7 +2027,7 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
         // remove (issue #1740), and it must stay removed when
         // #[non_exhaustive] grows the enum — and its diagnostic in the log.
         error => {
-            tracing::debug!(?error, "embedded navigation: unmapped host error");
+            tracing::warn!(?error, "embedded navigation: unmapped host error");
             HubError::RuntimeRejected(
                 "The switch was rejected for an unexpected reason. Try again; if it persists, open a new session."
                     .into(),
