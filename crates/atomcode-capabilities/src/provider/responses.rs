@@ -468,9 +468,10 @@ impl ResponsesSseDecoder {
         self
     }
 
-    /// Stream ended WITHOUT a `response.completed`: flush buffered tool calls +
-    /// usage, then emit `Done`. A truncated stream is reported as truncated so
-    /// the kernel's "partial response" warning path fires.
+    /// Stream ended WITHOUT a `response.completed`: flush buffered tool calls,
+    /// then emit `Done`. A truncated stream is reported as truncated so the
+    /// kernel's "partial response" warning path fires. Usage is not flushed:
+    /// Responses reports it only on `response.completed`.
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if self.done {
@@ -1295,6 +1296,37 @@ mod tests {
             "{evs:?}"
         );
         assert!(dec.finish().is_empty());
+    }
+
+    #[test]
+    fn sse_line_exactly_at_cap_is_accepted() {
+        // The check refuses a line LONGER than the cap, not one equal to it.
+        // Cover both sides of the boundary: whole lines that are exactly the
+        // cap, and a held tail that fills the cap before its newline arrives.
+        let event_line = "event: response.output_text.delta";
+        let cap = event_line.len();
+        let mut body = String::from("data: {\"delta\":\"a\"}");
+        body.push_str(&" ".repeat(cap - body.len())); // padding is trimmed
+
+        // Whole lines in one chunk: `part.len() == cap`, `buf` empty.
+        let mut whole = ResponsesSseDecoder::new().with_line_cap(cap);
+        let evs = whole.feed(format!("{event_line}\n{body}\n\n").as_bytes());
+        assert!(
+            matches!(evs.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{evs:?}"
+        );
+
+        // Each tail fills the cap exactly (`rest.len() == cap`), then its
+        // newline completes the line from a full buffer.
+        let mut split = ResponsesSseDecoder::new().with_line_cap(cap);
+        assert!(split.feed(event_line.as_bytes()).is_empty());
+        assert!(split.feed(b"\n").is_empty());
+        assert!(split.feed(body.as_bytes()).is_empty());
+        let evs = split.feed(b"\n");
+        assert!(
+            matches!(evs.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{evs:?}"
+        );
     }
 
     #[test]

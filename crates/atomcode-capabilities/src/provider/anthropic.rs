@@ -2831,6 +2831,36 @@ mod tests {
     }
 
     #[test]
+    fn sse_line_exactly_at_cap_is_accepted() {
+        // The check refuses a line LONGER than the cap, not one equal to it.
+        // Cover both sides of the boundary: a whole line that is exactly the
+        // cap, and a held tail that fills the cap before its newline arrives.
+        let body = format!(
+            "data: {}",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}})
+        );
+        let cap = body.len();
+
+        // Whole line in one chunk: `part.len() == cap`, `buf` empty.
+        let mut whole = AnthropicSseDecoder::new().with_line_cap(cap);
+        let ev = whole.feed(format!("{body}\n").as_bytes());
+        assert!(
+            matches!(ev.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{ev:?}"
+        );
+
+        // Tail fills the cap exactly (`rest.len() == cap`), then its newline
+        // completes the line from a full buffer.
+        let mut split = AnthropicSseDecoder::new().with_line_cap(cap);
+        assert!(split.feed(body.as_bytes()).is_empty());
+        let ev = split.feed(b"\n");
+        assert!(
+            matches!(ev.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
     fn sse_line_over_cap_still_reports_usage() {
         let mut d = AnthropicSseDecoder::new().with_line_cap(128);
         let start = line(
