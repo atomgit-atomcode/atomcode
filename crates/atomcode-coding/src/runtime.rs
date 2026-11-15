@@ -3669,6 +3669,9 @@ impl CodingRuntimeHandle {
             return Ok(exit);
         }
 
+        // Like cancel, shutdown must wake cancellable work being awaited inside
+        // the owner loop before its queued command can be read.
+        self.stop.lock().expect("stop poisoned").cancel();
         let state = self.state.load(Ordering::Acquire);
         let sent = self.tx.send(CodingRuntimeControl::Shutdown {
             generation: runtime_state_generation(state),
@@ -19642,6 +19645,66 @@ mod tests {
             "{terminals:?}"
         );
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_signals_stop_before_waiting_for_the_owner_terminal() {
+        let (handle, mut controls) = coding_runtime_control_channel();
+        let stop = handle.stop.lock().unwrap().clone();
+        let shutdown = handle.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(
+            stop.is_cancelled(),
+            "wake in-owner work before reading Shutdown"
+        );
+        assert!(matches!(
+            controls.rx.recv().await,
+            Some(CodingRuntimeControl::Shutdown { .. })
+        ));
+        assert!(!handle.is_stopped(), "a signal is not a cleanup terminal");
+        let exit = RuntimeExit {
+            reason: RuntimeExitReason::ShutdownRequested,
+            forced: false,
+        };
+        controls.terminal_tx.send_replace(Some(exit));
+        assert_eq!(shutdown.await.unwrap(), exit);
+        assert_eq!(handle.shutdown().await.unwrap(), exit);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_interrupts_an_in_owner_image_read_without_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let reading = Arc::new(testkit::ReadingThatNeverEnds::new());
+        let runtime = testkit::runtime_with_a_fake_agent(dir.path(), Some(reading.clone())).await;
+        let submit = runtime.handle.submit(UserInput {
+            text: "read picture".into(),
+            images: vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "x".into(),
+            }],
+        });
+        tokio::pin!(submit);
+        tokio::select! {
+            result = &mut submit => panic!("image read unexpectedly completed: {result:?}"),
+            () = async { while reading.entered() == 0 { tokio::task::yield_now().await; } } => {}
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runtime.handle.shutdown(),
+        )
+        .await
+        .expect("shutdown must interrupt the image read")
+        .unwrap();
+        assert!(runtime.handle.is_stopped());
+        assert!(
+            matches!(submit.await.unwrap(), SubmitReceipt::NotSent { .. }),
+            "the interrupted submit must report that it never reached the agent"
+        );
     }
 
     /// A picture being read is not a reason esc cannot be heard.

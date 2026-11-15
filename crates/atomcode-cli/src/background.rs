@@ -937,9 +937,22 @@ async fn stop(live: Live) {
     let handle = live.control.runtime().clone();
     if in_turn(&live) {
         // 取消失败不挡停:停本身也会把回合带走,取消只是让它以「被打断」落盘。
-        let _ = handle.cancel().await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.cancel()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "background cancel failed; proceeding to runtime shutdown")
+            }
+            Err(_) => tracing::warn!(
+                "background cancel exceeded five seconds; proceeding to runtime shutdown"
+            ),
+        }
     }
-    let _ = handle.shutdown().await;
+    // Keep awaiting the owner's terminal: it is published only after kernel,
+    // transport and session-lease cleanup. Dropping this wait on a timer would
+    // allow an editor to outlive its slot and a replacement to race its lease.
+    if let Err(error) = handle.shutdown().await {
+        tracing::warn!(%error, "background runtime shutdown unavailable");
+    }
 }
 
 impl Background {
