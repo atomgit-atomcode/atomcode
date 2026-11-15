@@ -1306,7 +1306,12 @@ mod tests {
         let event_line = "event: response.output_text.delta";
         let cap = event_line.len();
         let mut body = String::from("data: {\"delta\":\"a\"}");
-        body.push_str(&" ".repeat(cap - body.len())); // padding is trimmed
+        // The pad makes the data line exactly `cap` bytes, so the test needs the
+        // event line to stay at least as long. Fail on the real problem if not.
+        let pad = cap
+            .checked_sub(body.len())
+            .expect("event_line must be at least as long as the data line");
+        body.push_str(&" ".repeat(pad)); // padding is trimmed
 
         // Whole lines in one chunk: `part.len() == cap`, `buf` empty.
         let mut whole = ResponsesSseDecoder::new().with_line_cap(cap);
