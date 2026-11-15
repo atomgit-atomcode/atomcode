@@ -577,6 +577,12 @@ fn truncate_msg(s: &str) -> String {
 // NDJSON decoding (unit-testable, no network)
 // ---------------------------------------------------------------------------
 
+/// Upper bound on one NDJSON line, and on the unterminated tail kept between
+/// chunks. Same defensive limit as `openai_compat::MAX_SSE_LINE_BYTES`: an
+/// endpoint that never sends `\n` must not grow [`OllamaNdjsonDecoder::buf`]
+/// until the process is OOM-killed.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Stateful NDJSON decoder. Feed raw byte chunks; get whole kernel `StreamEvent`s. Each
 /// complete line is one JSON object; tool calls arrive whole (no buffering needed).
 struct OllamaNdjsonDecoder {
@@ -589,6 +595,9 @@ struct OllamaNdjsonDecoder {
     /// the parsed path, and this is the unparsed one. Per decoder, so an
     /// unclosed block cannot reach the next response.
     think: super::reasoning::InlineThink,
+    /// Largest one line (or its unterminated tail) may grow before the decoder
+    /// refuses the stream. See [`MAX_LINE_BYTES`].
+    max_line_bytes: usize,
 }
 
 impl OllamaNdjsonDecoder {
@@ -599,30 +608,103 @@ impl OllamaNdjsonDecoder {
             truncated: false,
             done: false,
             think: super::reasoning::InlineThink::new(),
+            max_line_bytes: MAX_LINE_BYTES,
         }
     }
 
+    /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced.
+    ///
+    /// Framing is linear in received bytes, including lines fragmented across
+    /// chunks: only new bytes are scanned, and a complete line already in the
+    /// chunk is borrowed instead of copied into `buf`.
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let raw: Vec<u8> = self.buf.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&raw);
-            let text = text.trim();
-            if !text.is_empty() {
-                self.process_line(text, &mut out);
+        if self.done {
+            return out;
+        }
+        let mut start = 0;
+        while let Some(offset) = chunk[start..].iter().position(|&b| b == b'\n') {
+            let end = start + offset;
+            let part = &chunk[start..end];
+            // Check before appending, so an oversized chunk is never copied
+            // into the line buffer just to be rejected afterwards.
+            if part.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+                out.extend(self.line_too_large());
+                return out;
+            }
+            if self.buf.is_empty() {
+                let text = String::from_utf8_lossy(part);
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.process_line(text, &mut out);
+                }
+            } else {
+                self.buf.extend_from_slice(part);
+                let mut line = std::mem::take(&mut self.buf);
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.process_line(text, &mut out);
+                }
+                line.clear();
+                if !self.done {
+                    // Reuse storage for the next fragmented line.
+                    self.buf = line;
+                }
             }
             if self.done {
-                break;
+                self.buf = Vec::new();
+                return out;
             }
+            start = end + 1;
         }
+        let rest = &chunk[start..];
+        if rest.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+            out.extend(self.line_too_large());
+            return out;
+        }
+        self.buf.extend_from_slice(rest);
         out
+    }
+
+    /// Refuse a line the endpoint never terminated (or sent longer than the
+    /// cap) instead of growing `buf` without bound. The stream is terminal:
+    /// there is no safe point to resume a line whose start was dropped.
+    fn line_too_large(&mut self) -> Vec<StreamEvent> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        self.buf = Vec::new();
+        vec![StreamEvent::Error(ProviderError {
+            retryable: false,
+            message: format!(
+                "provider stream line exceeded the {}-byte limit; the response was \
+                 refused instead of buffering it without bound",
+                self.max_line_bytes
+            ),
+            http_status: None,
+            code: Some("ndjson_line_too_large".into()),
+            retry_after_secs: None,
+        })]
+    }
+
+    /// Test-only override for the line cap, so the boundary can be exercised
+    /// without allocating a production-sized (16 MiB) line.
+    #[cfg(test)]
+    fn with_line_cap(mut self, cap: usize) -> Self {
+        self.max_line_bytes = cap;
+        self
     }
 
     /// Stream EOF: if a final `done:true` line was never seen, flush a `Done`.
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.done {
+            // `feed` already bounds the tail; re-check for a cap lowered (tests).
+            if self.buf.len() > self.max_line_bytes {
+                return self.line_too_large();
+            }
             out.extend(self.held_back());
             out.push(StreamEvent::Done {
                 truncated: self.truncated,
@@ -1035,6 +1117,68 @@ mod tests {
             ev.last().unwrap(),
             StreamEvent::Done { truncated: false }
         ));
+    }
+
+    // ---- line cap (untrusted provider input) ----
+
+    #[test]
+    fn ndjson_complete_line_over_cap_is_refused() {
+        let mut d = OllamaNdjsonDecoder::new().with_line_cap(32);
+        let mut chunk = vec![b'x'; 33];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("ndjson_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        assert!(d.finish().is_empty());
+        assert!(d.feed(b"{}\n").is_empty());
+    }
+
+    #[test]
+    fn ndjson_unterminated_line_over_cap_is_refused() {
+        let mut d = OllamaNdjsonDecoder::new().with_line_cap(32);
+        assert!(d.feed(b"{\"message\":").is_empty());
+        let mut ev = Vec::new();
+        for _ in 0..4 {
+            ev.extend(d.feed(&[b'x'; 10]));
+        }
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("ndjson_line_too_large")
+            ),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn ndjson_small_cap_keeps_fragmented_and_multi_line_chunks() {
+        let one = nd(json!({"message":{"role":"assistant","content":"a"},"done":false}));
+        let two = nd(json!({"message":{"role":"assistant","content":"b"},"done":false}));
+        let payload = [one.as_bytes(), two.as_bytes()].concat();
+        let cap = one.len() + two.len();
+        let texts = |ev: &[StreamEvent]| -> String {
+            ev.iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut whole = OllamaNdjsonDecoder::new().with_line_cap(cap);
+        let ev = whole.feed(&payload);
+        let mut split = OllamaNdjsonDecoder::new().with_line_cap(cap);
+        let mut split_ev = Vec::new();
+        for chunk in payload.chunks(5) {
+            split_ev.extend(split.feed(chunk));
+        }
+        assert_eq!(texts(&ev), "ab");
+        assert_eq!(format!("{ev:?}"), format!("{split_ev:?}"));
     }
 
     #[test]
