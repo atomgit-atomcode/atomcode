@@ -52,6 +52,7 @@ const MAX_BACKGROUND_JOBS: usize = 64;
 
 const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
 const MAX_POLL_WAIT_MS: u64 = 60_000;
+static NEXT_POLL_WAIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// After the tracked shell exits, how long its pipes get to close before the job counts as
 /// having left something running. A grandchild that inherited stdout (`some-daemon &`)
@@ -372,12 +373,22 @@ async fn wait_for_poll(
     };
     // Construct only after looking up an internal job id: arbitrary caller input
     // from an invalid id must not be copied into diagnostic logs.
+    let wait_id = NEXT_POLL_WAIT_ID.fetch_add(1, Ordering::Relaxed);
     let mut timing = PollWaitTiming {
+        wait_id,
         job_id,
         started_at: wait_started,
         requested_wait_ms: wait_ms,
         outcome: "abandoned",
     };
+    tracing::info!(
+        pid = std::process::id(),
+        wait_id,
+        job_id,
+        requested_wait_ms = wait_ms,
+        effective_wait_ms = wait_ms.min(MAX_POLL_WAIT_MS),
+        "background_poll_wait_started"
+    );
     let initial_status = shared.status.lock().unwrap().clone();
     let initial_left_running = shared.left_running();
     let deadline =
@@ -426,6 +437,7 @@ async fn wait_for_poll(
 
 /// Observability only. Dropping a caller's wait never owns or stops its process.
 struct PollWaitTiming<'a> {
+    wait_id: u64,
     job_id: &'a str,
     started_at: tokio::time::Instant,
     requested_wait_ms: u64,
@@ -434,8 +446,9 @@ struct PollWaitTiming<'a> {
 
 impl Drop for PollWaitTiming<'_> {
     fn drop(&mut self) {
-        tracing::debug!(
+        tracing::info!(
             pid = std::process::id(),
+            wait_id = self.wait_id,
             job_id = self.job_id,
             requested_wait_ms = self.requested_wait_ms,
             effective_wait_ms = self.requested_wait_ms.min(MAX_POLL_WAIT_MS),
@@ -1560,6 +1573,17 @@ mod tests {
             .filter(|e| e["message"] == "background_poll_wait_finished")
             .collect();
         assert_eq!(polls.len(), 2);
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_started")
+            .collect();
+        assert_eq!(starts.len(), polls.len());
+        for (start, end) in starts.iter().zip(&polls) {
+            assert_eq!(start["level"], "INFO");
+            assert_eq!(start["wait_id"], end["wait_id"]);
+            assert_eq!(end["level"], "INFO");
+        }
+
         assert_eq!(polls[0]["outcome"], "output");
         assert_eq!(polls[0]["waited_ms"], 200);
         assert_eq!(polls[1]["outcome"], "finished");
@@ -1683,13 +1707,64 @@ mod tests {
             (polls[1], "cancelled", 100),
             (polls[2], "abandoned", 75),
         ] {
-            assert_eq!(event["level"], "DEBUG");
+            assert_eq!(event["level"], "INFO");
             assert_eq!(event["outcome"], reason);
             assert_eq!(event["waited_ms"], elapsed);
         }
         assert!(!serde_json::to_string(&*events)
             .unwrap()
             .contains("PRIVATE_INVALID_JOB"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn concurrent_poll_waits_are_clamped_and_have_paired_info_records() {
+        let capture = TimingCapture::default();
+        async {
+            let mut jobs = Vec::new();
+            for _ in 0..4 {
+                jobs.push(poll_job().await);
+            }
+            let started = tokio::time::Instant::now();
+            let waits = jobs.iter().map(|(id, _, _)| async move {
+                let context = ctx(Path::new("PRIVATE_CWD"));
+                wait_for_poll(id, MAX_POLL_WAIT_MS * 2, PollWaitUntil::Exit, &context)
+                    .await
+                    .unwrap();
+            });
+            futures::future::join_all(waits).await;
+            assert_eq!(started.elapsed(), Duration::from_millis(MAX_POLL_WAIT_MS));
+            for (id, _, _) in jobs {
+                kill(&id).unwrap();
+                let _ = drain(&id).await;
+            }
+        }
+        .with_subscriber(capture.clone())
+        .await;
+        let events = capture.0.lock().unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_started")
+            .collect();
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_finished")
+            .collect();
+        assert_eq!(starts.len(), 4);
+        assert_eq!(ends.len(), 4);
+        for start in starts {
+            let end = ends
+                .iter()
+                .find(|end| end["wait_id"] == start["wait_id"])
+                .unwrap();
+            assert_eq!(start["effective_wait_ms"], MAX_POLL_WAIT_MS);
+            assert_eq!(start["requested_wait_ms"], MAX_POLL_WAIT_MS * 2);
+            assert_eq!(end["outcome"], "deadline");
+            assert_eq!(end["waited_ms"], MAX_POLL_WAIT_MS);
+            assert_eq!(end["level"], "INFO");
+        }
+        assert!(!serde_json::to_string(&*events)
+            .unwrap()
+            .contains("PRIVATE_"));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2161,3 +2236,6 @@ mod tests {
         assert!(bytes.is_empty());
     }
 }
+
+#[cfg(all(test, unix))]
+mod output_experiment;

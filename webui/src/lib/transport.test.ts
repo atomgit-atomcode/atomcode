@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createApiFetch, loadRelayCredentials, relayRequest, relayPairingSaved } from './transport.ts';
+import { ApiTransportError, createApiFetch, loadRelayCredentials, relayRequest, relayPairingSaved } from './transport.ts';
 const credentials = { route: 'route-01234567890123456789', token: 'webui-01234567890123456789' };
 
 test('relay HTTP and SSE preserve body/signal and separate both credentials', () => {
@@ -89,5 +89,32 @@ test('malformed or mixed compact links fail closed instead of reusing stored cre
   const storage = { getItem: () => JSON.stringify(credentials), removeItem: () => {} };
   for (const hash of ['#r=bad&t=bad', '#t=-j6oJKXvkTNio_VS_eocuQ', '#r=AAAAAAAAAAA&t=AAAAAAAAAAB', '#r=AAAAAAAAAAA&t=AAAAAAAAAAA&relay=old', '#r=AAAAAAAAAAA&t=AAAAAAAAAAA&token=old']) {
     assert.equal(loadRelayCredentials(hash, storage), null, hash);
+  }
+});
+
+
+test('network failures identify the WebUI endpoint without disclosing request URLs or credentials', async () => {
+  const failing: typeof fetch = async () => { throw new TypeError('Failed to fetch PRIVATE_SECRET'); };
+  for (const remote of [false, true]) {
+    const request = createApiFetch(remote, remote ? credentials : null, failing);
+    await assert.rejects(request('/models?token=PRIVATE_TOKEN'), (error: unknown) => {
+      assert.ok(error instanceof ApiTransportError);
+      assert.equal(error.endpoint, remote ? 'relay' : 'local');
+      assert.ok(error.message.includes(remote ? 'WebUI 中继' : 'AtomCode 本地服务'));
+      assert.ok(!error.message.includes('PRIVATE'));
+      assert.ok(!error.message.includes(credentials.token));
+      return true;
+    });
+  }
+});
+
+test('abort and HTTP errors retain their original semantics and never unlock a turn', async () => {
+  const aborted = new DOMException('cancelled', 'AbortError');
+  const request = createApiFetch(false, null, async () => { throw aborted; });
+  await assert.rejects(request('/chat'), error => error === aborted);
+  for (const status of [401, 429, 500]) {
+    const response = new Response('provider or server diagnostic', { status });
+    const request = createApiFetch(false, null, async () => response);
+    assert.equal(await request('/chat'), response);
   }
 });
