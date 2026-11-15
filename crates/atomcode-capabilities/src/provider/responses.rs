@@ -334,7 +334,6 @@ struct ResponsesSseDecoder {
     /// emitted as whole `ToolCall`s when the item completes — the kernel contract
     /// has no partial-tool-call variant.
     tool_calls: Vec<(String, String, String)>,
-    last_usage: Option<TokenUsage>,
     truncated: bool,
     done: bool,
     response_id_seen: bool,
@@ -350,7 +349,6 @@ impl ResponsesSseDecoder {
             buf: Vec::new(),
             current_event: None,
             tool_calls: Vec::new(),
-            last_usage: None,
             truncated: false,
             done: false,
             response_id_seen: false,
@@ -441,12 +439,15 @@ impl ResponsesSseDecoder {
         }
         self.done = true;
         self.buf = Vec::new();
-        let mut out = Vec::new();
-        // A failed response still consumed the usage the provider reported.
-        if let Some(u) = self.last_usage.take() {
-            out.push(StreamEvent::Usage(u));
-        }
-        out.push(StreamEvent::Error(ProviderError {
+        // Never silently dropped: a refused line is traced so a provider that
+        // batched its SSE stays distinguishable from a transport truncation.
+        tracing::warn!(
+            error_origin = "sse_line_too_large",
+            "provider stream diagnostic"
+        );
+        // Responses reports usage only on `response.completed`, which also ends
+        // the stream; a refused line therefore has no usage to deliver.
+        vec![StreamEvent::Error(ProviderError {
             retryable: false,
             message: format!(
                 "provider stream line exceeded the {}-byte limit; the response was \
@@ -456,8 +457,7 @@ impl ResponsesSseDecoder {
             http_status: None,
             code: Some("sse_line_too_large".into()),
             retry_after_secs: None,
-        }));
-        out
+        })]
     }
 
     /// Test-only override for the line cap, so the boundary can be exercised
@@ -476,14 +476,9 @@ impl ResponsesSseDecoder {
         if self.done {
             return out;
         }
-        // `feed` already bounds the tail; re-check for a cap lowered (tests).
-        if self.buf.len() > self.max_line_bytes {
-            return self.line_too_large();
-        }
+        // `feed` keeps the tail at or below `max_line_bytes`, and a tail above
+        // it was refused there, so there is nothing left to reject here.
         out.extend(self.flush_tool_calls());
-        if let Some(u) = self.last_usage.take() {
-            out.push(StreamEvent::Usage(u));
-        }
         out.push(StreamEvent::Done {
             truncated: true, // never saw response.completed ⇒ cut short
         });
@@ -721,9 +716,12 @@ impl ResponsesSseDecoder {
                 }
             }
             "response.completed" => {
+                // Usage arrives only on this terminal event, so it stays local:
+                // no other path can hold a usage value to report.
+                let mut usage = None;
                 if let Some(resp) = payload.get("response") {
                     if let Some(u) = resp.get("usage") {
-                        self.last_usage = Some(map_responses_usage(u));
+                        usage = Some(map_responses_usage(u));
                     }
                     if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
                         if status == "incomplete" {
@@ -732,7 +730,7 @@ impl ResponsesSseDecoder {
                     }
                 }
                 out.extend(self.flush_tool_calls());
-                if let Some(u) = self.last_usage.take() {
+                if let Some(u) = usage {
                     out.push(StreamEvent::Usage(u));
                 }
                 out.push(StreamEvent::Done {
@@ -1278,6 +1276,25 @@ mod tests {
             ),
             "{evs:?}"
         );
+    }
+
+    #[test]
+    fn sse_fragmented_line_over_cap_is_refused() {
+        // The cap covers the WHOLE line: a tail already held in `buf` plus this
+        // chunk is refused even though this chunk alone stays under the cap.
+        let mut dec = ResponsesSseDecoder::new().with_line_cap(32);
+        assert!(dec.feed(&[b'x'; 20]).is_empty());
+        let mut chunk = vec![b'x'; 20];
+        chunk.push(b'\n');
+        let evs = dec.feed(&chunk);
+        assert!(
+            matches!(
+                evs.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{evs:?}"
+        );
+        assert!(dec.finish().is_empty());
     }
 
     #[test]

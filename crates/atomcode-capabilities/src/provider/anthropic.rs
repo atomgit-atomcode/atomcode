@@ -1215,6 +1215,12 @@ impl AnthropicSseDecoder {
         }
         self.done = true;
         self.buf = Vec::new();
+        // Never silently dropped: a refused line is traced so a provider that
+        // batched its SSE stays distinguishable from a transport truncation.
+        tracing::warn!(
+            error_origin = "sse_line_too_large",
+            "provider stream diagnostic"
+        );
         let mut out = Vec::new();
         // A failed response still consumed the usage the provider reported.
         if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
@@ -1254,11 +1260,8 @@ impl AnthropicSseDecoder {
         if self.done {
             return out;
         }
-        // The tail `feed` keeps between chunks is already bounded there; this
-        // re-check covers a cap lowered at runtime (tests) before the stream ended.
-        if self.buf.len() > self.max_line_bytes {
-            return self.line_too_large();
-        }
+        // `feed` keeps the tail at or below `max_line_bytes`, and a tail above
+        // it was refused there, so there is nothing left to reject here.
         if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
             out.push(StreamEvent::Usage(self.usage()));
         }
@@ -2806,6 +2809,25 @@ mod tests {
             ),
             "{ev:?}"
         );
+    }
+
+    #[test]
+    fn sse_fragmented_line_over_cap_is_refused() {
+        // The cap covers the WHOLE line: a tail already held in `buf` plus this
+        // chunk is refused even though this chunk alone stays under the cap.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        assert!(d.feed(&[b'x'; 20]).is_empty());
+        let mut chunk = vec![b'x'; 20];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        assert!(d.finish().is_empty());
     }
 
     #[test]

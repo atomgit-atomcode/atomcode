@@ -676,6 +676,12 @@ impl OllamaNdjsonDecoder {
         }
         self.done = true;
         self.buf = Vec::new();
+        // Never silently dropped: a refused line is traced so a provider that
+        // batched its NDJSON stays distinguishable from a transport truncation.
+        tracing::warn!(
+            error_origin = "ndjson_line_too_large",
+            "provider stream diagnostic"
+        );
         vec![StreamEvent::Error(ProviderError {
             retryable: false,
             message: format!(
@@ -701,10 +707,8 @@ impl OllamaNdjsonDecoder {
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.done {
-            // `feed` already bounds the tail; re-check for a cap lowered (tests).
-            if self.buf.len() > self.max_line_bytes {
-                return self.line_too_large();
-            }
+            // `feed` keeps the tail at or below `max_line_bytes`, and a tail
+            // above it was refused there, so there is nothing to reject here.
             out.extend(self.held_back());
             out.push(StreamEvent::Done {
                 truncated: self.truncated,
@@ -1153,6 +1157,25 @@ mod tests {
             ),
             "{ev:?}"
         );
+    }
+
+    #[test]
+    fn ndjson_fragmented_line_over_cap_is_refused() {
+        // The cap covers the WHOLE line: a tail already held in `buf` plus this
+        // chunk is refused even though this chunk alone stays under the cap.
+        let mut d = OllamaNdjsonDecoder::new().with_line_cap(32);
+        assert!(d.feed(&[b'x'; 20]).is_empty());
+        let mut chunk = vec![b'x'; 20];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("ndjson_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        assert!(d.finish().is_empty());
     }
 
     #[test]
