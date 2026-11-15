@@ -76,7 +76,8 @@ fn clock(time: &str) -> Result<(u32, u32)> {
     Ok((h, m))
 }
 
-pub(crate) fn normalized_schedule(rule: &Schedule) -> Result<Schedule> {
+/// Normalize supported calendar clock spellings using the shared validator.
+pub fn normalized_schedule(rule: &Schedule) -> Result<Schedule> {
     let mut normalized = rule.clone();
     match &mut normalized {
         Schedule::Daily { time } | Schedule::Weekly { time, .. } => {
