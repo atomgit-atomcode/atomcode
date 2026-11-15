@@ -217,8 +217,9 @@ struct Track {
 /// `None` = 这里问不出来(不在 git 仓库里、没有那个 base、或 git 不在):那就不说数,
 /// 而不是说一个谁都没量过的 0。`scope` 就是 `/review` 自己的词汇 —— 一行说"范围是
 /// 未提交的改动",另一行说"X 个文件",两处不能各算一半。
-fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
-    let mut git = std::process::Command::new("git");
+async fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
+    let mut git = tokio::process::Command::new("git");
+    git.kill_on_drop(true);
     git.current_dir(dir);
     match scope {
         "staged" => {
@@ -226,7 +227,7 @@ fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
         }
         "working_tree" => {
             // `status`,不是 `diff`:这次还没提交的包括还没被 git 看见的那些新文件。
-            git.args(["status", "--porcelain"]);
+            git.args(["status", "--porcelain", "-uall"]);
         }
         // `-` 开头的是 git 的选项,不是 ref:`/review --output=x` 会让 git 写一个
         // 文件。TUI 已经不把它当范围,这里再挡一次 —— 这条命令收的是任何宿主。
@@ -238,7 +239,10 @@ fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
             git.args(["diff", "--name-only", &range]);
         }
     }
-    let out = git.output().ok()?;
+    let out = tokio::time::timeout(std::time::Duration::from_secs(3), git.output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -315,6 +319,11 @@ impl Track {
     /// 记下一件事。返回面板要不要重画。
     fn saw(&mut self, event: &AgentEvent) -> bool {
         match event {
+            AgentEvent::TurnStarted { .. } => {
+                self.error = None;
+                self.ended = None;
+                true
+            }
             AgentEvent::Request { .. } => {
                 self.pending = Some(event.clone());
                 true
@@ -1038,6 +1047,11 @@ impl Background {
                                 came_home_now(&mark, &sender);
                                 return;
                             }
+                            // Never mark an unconfirmed delivery as received. A retired
+                            // home cannot add another fact; leave the result recoverable.
+                            if home.runtime().is_stopped() || home.front_end().app().is_none() {
+                                return;
+                            }
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                         return;
@@ -1178,10 +1192,9 @@ impl Background {
                     if lead {
                         state.gate = true;
                     }
-                    let waiting = lead
-                        && state.front.control.runtime().status().phase
-                            == RuntimePhase::WaitingApproval;
-                    let pending = waiting
+                    // Request publication can precede the phase watch update.
+                    // Track is the authority for an unanswered live request.
+                    let pending = lead
                         .then(|| {
                             state
                                 .front
@@ -1244,6 +1257,7 @@ impl Background {
                 // Which session is in front, read **before** the stop goes out:
                 // after it the App is gone and its log with it.
                 self.record_exit_front();
+                self.settle_before_exit();
                 let front = self.front_commands();
                 let _ = front.send(command);
                 if let Some(me) = self.me.upgrade() {
@@ -1745,9 +1759,10 @@ impl Background {
                 .map_err(crate::host::refused)?
         };
         // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
-        let files = scope
-            .as_deref()
-            .and_then(|scope| changed_files(&working_dir, scope));
+        let files = match scope.as_deref() {
+            Some(scope) => changed_files(&working_dir, scope).await,
+            None => None,
+        };
         let mut live = self.spawn_at(working_dir.clone()).await?;
         // Configure before publishing the slot or submitting any work. Failure
         // retires the candidate and never runs it with a fallback permission.
@@ -2056,8 +2071,8 @@ mod tests {
     /// 范围里有几个文件在变,是真的去问 git。
     ///
     /// 三种范围各过一遍:这个数是给人读的("这次有 2 个文件在变"),编不出来。
-    #[test]
-    fn a_scope_counts_the_files_it_touches() {
+    #[tokio::test]
+    async fn a_scope_counts_the_files_it_touches() {
         if std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -2082,28 +2097,32 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one").expect("write");
         std::fs::write(dir.join("b.txt"), "two").expect("write");
         assert_eq!(
-            changed_files(&dir, "working_tree"),
+            changed_files(&dir, "working_tree").await,
             Some(2),
             "两个还没提交的文件,包括 git 还没看见的那个"
         );
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/c.txt"), "three").unwrap();
+        std::fs::write(dir.join("nested/d.txt"), "four").unwrap();
+        assert_eq!(changed_files(&dir, "working_tree").await, Some(4));
         git(&["add", "a.txt"]);
-        assert_eq!(changed_files(&dir, "staged"), Some(1));
+        assert_eq!(changed_files(&dir, "staged").await, Some(1));
         git(&["add", "b.txt"]);
         git(&["commit", "-qm", "one"]);
         std::fs::write(dir.join("b.txt"), "two again").expect("write");
         git(&["add", "b.txt"]);
         git(&["commit", "-qm", "two"]);
         assert_eq!(
-            changed_files(&dir, "HEAD~1"),
+            changed_files(&dir, "HEAD~1").await,
             Some(1),
             "已提交的那一段:HEAD~1..HEAD 只动了 b.txt"
         );
         // 一个选项不是 ref:交给 git 就成了 `--output=…`,它会去写那个文件。
-        assert_eq!(changed_files(&dir, "--output=written"), None);
+        assert_eq!(changed_files(&dir, "--output=written").await, None);
         assert!(!dir.join("written..HEAD").exists(), "git 没把它当选项");
         // 问不出来的地方说"问不出来",而不是一个谁都没量过的零。
         assert_eq!(
-            changed_files(std::path::Path::new("/"), "working_tree"),
+            changed_files(std::path::Path::new("/"), "working_tree").await,
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2248,6 +2267,23 @@ mod tests {
         assert!(failed.contains("review budget exhausted"));
         assert!(failed.contains("补充:第三处也要改"));
         assert!(failed.contains("不是成功结论") || failed.contains("not a successful conclusion"));
+    }
+
+    #[test]
+    fn a_new_turn_forgets_the_previous_error() {
+        let mut track = Track {
+            error: Some("previous failure".into()),
+            ended: Some(BackgroundState::Failed),
+            ..Track::default()
+        };
+        track.saw(&AgentEvent::TurnStarted { turn: Some(2) });
+        track.saw(&AgentEvent::TurnComplete {
+            turn: Some(2),
+            reason: StopReason::MaxRounds,
+            provider_failure: None,
+        });
+        assert!(track.error.is_none());
+        assert_eq!(track.ended, Some(BackgroundState::Failed));
     }
 
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。

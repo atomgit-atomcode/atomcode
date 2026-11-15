@@ -3341,3 +3341,81 @@ async fn a_browser_fork_keeps_the_terminal_host_in_sync_and_the_original_resumab
     atomcode::tui_share::detach().unwrap();
     rig.quit().await;
 }
+
+/// Reproduce the publication window deterministically: a request has reached
+/// the host pump while the runtime phase still says Idle. Resubscription must
+/// replay it rather than consulting the lagging phase watch.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resubscribe_replays_a_request_before_the_phase_watch_catches_up() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let (_gate, open) = watch::channel(false);
+    let script = Script {
+        gate: open,
+        started: Arc::new(AtomicUsize::new(0)),
+        finished: Arc::new(AtomicUsize::new(0)),
+        count: Arc::new(AtomicUsize::new(0)),
+    };
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &script,
+        front_end.clone(),
+        &ReviewHome::new(),
+    );
+    let runtime = CodingRuntime::start(start).await.unwrap();
+    let handle = runtime.handle.clone();
+    let spawn: Spawn = Arc::new(|_| Box::pin(async { Err("unused spawn".into()) }));
+    let (mut connection, background) =
+        atomcode::background::connect(runtime, front_end.clone(), config, None, spawn).unwrap();
+    let request = AgentEvent::Request {
+        id: 812,
+        kind: "approval".into(),
+        payload: serde_json::json!({"prompt": "continue?"}),
+    };
+    front_end.events().send(request.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                connection.events.recv().await,
+                Some(AgentEvent::Request { id: 812, .. })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the pump observed and tracked the request");
+    assert_ne!(
+        handle.status().phase,
+        atomcode_coding::runtime::RuntimePhase::WaitingApproval
+    );
+    connection
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: connection.session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(AgentEvent::Request {
+                id: 812,
+                kind,
+                payload,
+            }) = connection.events.recv().await
+            {
+                assert_eq!(kind, "approval");
+                assert_eq!(payload, serde_json::json!({"prompt": "continue?"}));
+                break;
+            }
+        }
+    })
+    .await
+    .expect("resubscribe replays the request despite the lagging phase");
+    background.shutdown_all().await;
+    handle.shutdown().await.unwrap();
+}
