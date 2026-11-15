@@ -2030,6 +2030,10 @@ impl SessionManager {
             notes.push(format!(
                 "the previous run of session {id} stopped mid-turn: its unfinished activity \
                  was cleared, and the conversation resumes from its last completed turn"
+            notes.push(format!(
+                "the previous run of session {} stopped mid-turn: its unfinished activity \
+                 was cleared, and the conversation resumes from its last completed turn",
+                lease.id()
             ));
             Ok((loaded, None))
         }
