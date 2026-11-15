@@ -1942,6 +1942,26 @@ pub(crate) fn unterminated_turn(events: &[LoggedEvent]) -> Option<u64> {
         matches!(logged.event, SessionEvent::TurnEnd { turn: ended, .. } if *ended == turn)
     });
     (!ended).then_some(turn)
+pub(crate) fn unterminated_turn(events: &[LoggedEvent]) -> Option<u64> {
+    let (position, turn) = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, logged)| match logged.event {
+            SessionEvent::TurnStart { turn } => Some((position, turn)),
+            _ => None,
+        })?;
+    let mut closed = false;
+    for logged in &events[position + 1..] {
+        match logged.event {
+            SessionEvent::TurnEnd { turn: ended, .. } if ended == turn => closed = true,
+            // A rewind that takes the conversation back means the person
+            // withdrew the turn; it did not die part way through.
+            SessionEvent::Rewound { scope, .. } if scope.takes_back_conversation() => closed = true,
+            _ => {}
+        }
+    }
+    (!closed).then_some(turn)
 }
 
 /// The prompt of the turn at `start` when that turn is still accepted and
