@@ -39,7 +39,7 @@ const server=createServer(async(req,res)=>{
   }catch{res.writeHead(404);res.end();}
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-const browser=await chromium.launch({executablePath:process.env.CONTEXT_BROWSER??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
+const browser=await chromium.launch({executablePath:process.env.CONTEXT_BROWSER??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true,ignoreDefaultArgs:['--hide-scrollbars']});
 const emit=event=>{for(const client of clients)client.write(`data: ${JSON.stringify(event)}\n\n`);};
 const errors=[];
 try {
@@ -50,7 +50,7 @@ try {
     {role:'assistant',content:`GROUP_FINAL_${group}`,created_at:1700000004000+group*10000},
   ]).flat());
   for(const width of [1200,390]) {
-    const page=await browser.newPage({viewport:{width,height:900}});
+    const page=await browser.newPage({viewport:{width,height:900},hasTouch:width<600});
     page.on('pageerror',error=>errors.push(error.message));
     await page.addInitScript(()=>{localStorage.setItem('atomcode.sidebar.view.v1','flat');localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');});
     await page.goto(`http://127.0.0.1:${server.address().port}/?sync=1&session=${id}`);
@@ -58,6 +58,19 @@ try {
     await page.getByText('GROUP_REQUEST_2',{exact:true}).waitFor();
     assert.equal(await page.locator('.tool-body').count(),0);
     const viewport=page.locator('.messages-container');
+    // Browser/layout corrections must not navigate to another history page.
+    const beforeLayout = await page.locator('.user-message-wrapper').first().innerText();
+    await viewport.evaluate(el => {
+      const spacer = document.createElement('div');
+      spacer.id = 'layout-correction-fixture'; spacer.style.height = '2000px';
+      el.querySelector('.timeline-inner').append(spacer);
+      el.scrollTop = el.scrollHeight;
+    });
+    await page.waitForTimeout(650);
+    await viewport.evaluate(el => { el.querySelector('#layout-correction-fixture').remove(); });
+    await page.waitForTimeout(650);
+    assert.equal(await page.locator('.user-message-wrapper').first().innerText(), beforeLayout,
+      'layout shrink must not silently page to an earlier conversation');
     for(let attempt=0;attempt<20 && await page.getByText('GROUP_FINAL_0',{exact:true}).count()===0;attempt++) {
       await viewport.evaluate(el=>el.scrollTop=0);
       await viewport.hover(); await page.mouse.wheel(0,-1000); await page.waitForTimeout(600);
@@ -80,8 +93,63 @@ try {
     }
     await page.getByText('GROUP_REQUEST_2',{exact:true}).waitFor();
     await page.getByText('GROUP_FINAL_2',{exact:true}).waitFor();
+    // Keyboard navigation works, but an editor inside the timeline cannot page it.
+    await viewport.evaluate(el => {
+      el.tabIndex = 0;
+      const input = document.createElement('textarea');
+      input.id = 'timeline-editor-fixture'; el.append(input); input.focus();
+    });
+    await page.keyboard.press('PageUp'); await page.waitForTimeout(650);
+    await page.getByText('GROUP_REQUEST_2',{exact:true}).waitFor();
+    await viewport.evaluate(el => { el.querySelector('#timeline-editor-fixture').remove(); el.focus(); });
+    for(let attempt=0;attempt<20 && await page.getByText('GROUP_REQUEST_1',{exact:true}).count()===0;attempt++) {
+      await viewport.evaluate(el=>el.scrollTop=0);
+      await page.keyboard.press('PageUp'); await page.waitForTimeout(650);
+    }
+    await page.getByText('GROUP_REQUEST_1',{exact:true}).waitFor();
+    await viewport.focus(); await page.keyboard.press('PageDown'); await page.waitForTimeout(650);
+    await page.getByText('GROUP_REQUEST_2',{exact:true}).waitFor();
+    if (width < 600) {
+      const cdp = await page.context().newCDPSession(page);
+      const box = await viewport.boundingBox();
+      const point = {x:box.x+box.width/2,y:box.y+80};
+      for(let attempt=0;attempt<20 && await page.getByText('GROUP_REQUEST_1',{exact:true}).count()===0;attempt++) {
+        await viewport.evaluate(el=>el.scrollTop=0);
+        await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[point]});
+        await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{...point,y:point.y+200}]});
+        await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+        await page.waitForTimeout(650);
+      }
+      await page.getByText('GROUP_REQUEST_1',{exact:true}).waitFor();
+      await cdp.detach();
+    } else {
+      // Exercise the browser's native scrollbar, including mouse release.
+      await page.addStyleTag({content:'.messages-container{scrollbar-gutter:stable;scrollbar-width:auto;scrollbar-color:auto}.messages-container::-webkit-scrollbar{width:16px;display:block}.messages-container::-webkit-scrollbar-thumb{background:#999}'});
+      await viewport.evaluate(el => {
+        const space = document.createElement('div');
+        space.id = 'scrollbar-fixture'; space.style.height = '2000px';
+        el.querySelector('.timeline-inner').append(space); el.scrollTop = el.scrollHeight;
+      });
+      await page.waitForTimeout(650);
+      const box = await viewport.boundingBox();
+      for(let attempt=0;attempt<2 && await page.getByText('GROUP_REQUEST_1',{exact:true}).count()===0;attempt++) {
+        await viewport.evaluate(el=>el.scrollTop=el.scrollHeight);
+        await page.waitForTimeout(100);
+        await page.mouse.move(box.x+box.width-8,box.y+box.height-30);
+        await page.mouse.down();
+        await page.mouse.move(box.x+box.width-8,box.y+5,{steps:30});
+        await page.waitForTimeout(100);
+        await page.mouse.up(); await page.waitForTimeout(650);
+      }
+      await page.getByText('GROUP_REQUEST_1',{exact:true}).waitFor();
+      const beforeRelease = await page.locator('.user-message-wrapper').first().innerText();
+      await viewport.evaluate(el => el.querySelector('#scrollbar-fixture')?.remove());
+      await page.waitForTimeout(650);
+      assert.equal(await page.locator('.user-message-wrapper').first().innerText(),beforeRelease,
+        'releasing the scrollbar must stop gesture-driven pagination');
+    }
     await page.close();
   }
   assert.deepEqual(errors,[]);
-  console.log('PASS: mobile/desktop whole conversation groups, archived collapse, bounded expansion');
+  console.log('PASS: mobile/desktop groups, stable layout, bounded expansion, wheel/keyboard/touch/scrollbar pagination');
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

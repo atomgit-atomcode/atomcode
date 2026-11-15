@@ -63,18 +63,20 @@ try {
   await page.locator('[data-turn-anchor]').waitFor();
   const metrics=()=>page.locator('.messages-container').evaluate(el=>{
     const anchor=el.querySelector('[data-turn-anchor]');
-    return {offset:anchor.getBoundingClientRect().top-el.getBoundingClientRect().top,top:el.scrollTop,gap:el.scrollHeight-el.clientHeight-el.scrollTop,padding:parseFloat(getComputedStyle(el).paddingTop),space:el.querySelector('.turn-reply-space').getBoundingClientRect().height};
+    return {offset:anchor.getBoundingClientRect().top-el.getBoundingClientRect().top,top:el.scrollTop,gap:el.scrollHeight-el.clientHeight-el.scrollTop,padding:parseFloat(getComputedStyle(el).paddingTop),space:el.querySelector('.turn-reply-space')?.getBoundingClientRect().height ?? 0};
   });
   await page.waitForTimeout(200);
   let m=await metrics();
-  assert.ok(Math.abs(m.offset-m.padding)<4,JSON.stringify({viewport,m}));
+  assert.equal(m.space,0,'short turns must not create a viewport-sized blank spacer');
+  assert.ok(m.gap <= 2,JSON.stringify({viewport,m}));
   emit({type:'text',content:'Short reply.'});
   await page.waitForTimeout(100);
   await page.getByText('Short reply.', {exact:true}).waitFor();
-  m=await metrics();assert.ok((m.space === 0 && m.gap <= 2) || Math.abs(m.offset-m.padding)<4,JSON.stringify({viewport,m}));
+  m=await metrics();assert.ok(m.space === 0 && m.gap <= 2,JSON.stringify({viewport,m}));
+  await page.screenshot({path:'/tmp/atomcode-short-turn-'+sync+'-'+viewport.width+'.png'});
   await page.setViewportSize({width:viewport.width,height:Math.max(320,viewport.height-220)});
   await page.waitForTimeout(150);
-  m=await metrics();assert.ok((m.space === 0 && m.gap <= 2) || Math.abs(m.offset-m.padding)<4,JSON.stringify({viewport,m}));
+  m=await metrics();assert.ok(m.space === 0 && m.gap <= 2,JSON.stringify({viewport,m}));
   const el=page.locator('.messages-container');
   await el.hover();await page.mouse.wheel(0,-120);await page.waitForTimeout(100);
   const before=await metrics();

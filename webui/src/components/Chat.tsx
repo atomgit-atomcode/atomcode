@@ -760,10 +760,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
   const turnAnchorRef = useRef<string | null>(null);
-  const turnSpaceRef = useRef<HTMLDivElement>(null);
   const positionedTurnRef = useRef<string | null>(null);
   const atBottomRef = useRef(true);
   const timelineScrollRef = useRef(0);
+  const timelineScrollbarDragRef = useRef(false);
   const timelineIgnoreScrollRef = useRef(0);
   const timelineTouchRef = useRef<number | null>(null);
   const timelineAnchorRef = useRef<{ index: number; top: number; start: number; before: boolean } | null>(null);
@@ -1324,18 +1324,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   useEffect(() => {
     const restore = createScrollRestoration({
       viewport: () => scrollRef.current,
-      prepareLayout: () => {
-        const viewport = scrollRef.current;
-        const space = turnSpaceRef.current;
-        if (!viewport || !space || viewport.clientHeight <= 0) return;
-        const anchor = Array.from(viewport.querySelectorAll<HTMLElement>('[data-turn-anchor]'))
-          .find(node => node.dataset.turnAnchor === turnAnchorRef.current);
-        const padding = getComputedStyle(viewport);
-        const available = viewport.clientHeight - parseFloat(padding.paddingTop) - parseFloat(padding.paddingBottom);
-        const content = anchor ? space.getBoundingClientRect().top - anchor.getBoundingClientRect().top : available;
-        const height = Math.max(0, Math.ceil(available - content));
-        if (space.style.height !== `${height}px`) space.style.height = `${height}px`;
-      },
       followingTop: bottom => {
         const viewport = scrollRef.current;
         if (!viewport || positionedTurnRef.current === turnAnchorRef.current) return bottom;
@@ -1384,6 +1372,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       window.removeEventListener('pageshow', pageshow);
       window.removeEventListener('resize', layout);
       window.visualViewport?.removeEventListener('resize', layout);
+    };
+  }, []);
+
+  useEffect(() => {
+    const release = () => { timelineScrollbarDragRef.current = false; };
+    window.addEventListener('pointerup', release);
+    window.addEventListener('pointercancel', release);
+    window.addEventListener('blur', release);
+    return () => {
+      window.removeEventListener('pointerup', release);
+      window.removeEventListener('pointercancel', release);
+      window.removeEventListener('blur', release);
     };
   }, []);
 
@@ -3822,7 +3822,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const direction = top - timelineScrollRef.current;
     timelineScrollRef.current = top;
     recomputeAtBottom(); updateActiveTurn();
-    if (direction) pageTimeline(direction);
+    // Native clamping, anchoring and restoration also emit scroll events.
+    // Only an active scrollbar drag may turn those events into pagination.
+    if (direction && timelineScrollbarDragRef.current) pageTimeline(direction);
   }
   async function copyAssistantTurn(index: number): Promise<string> {
     const snapshot = messagesRef.current;
@@ -3870,6 +3872,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   function interactWithTimeline(event: Event) {
     processReadIntent.current = true;
     if (timelineStart === null && !atBottomRef.current) setTimelineStart(range.start);
+    if (event.type === 'pointerdown') {
+      timelineScrollbarDragRef.current = event.target === scrollRef.current
+        && (event as PointerEvent).pointerType === 'mouse';
+    }
+    if (event.type === 'keydown') {
+      const key = event as KeyboardEvent;
+      const editing = (key.target as Element | null)?.closest('input, textarea, select, [contenteditable="true"]');
+      if (!editing && !key.ctrlKey && !key.metaKey && !key.altKey) {
+        if (['ArrowUp', 'PageUp', 'Home'].includes(key.key)) pageTimeline(-1);
+        if (['ArrowDown', 'PageDown', 'End'].includes(key.key)) pageTimeline(1);
+      }
+    }
     if (event.type === 'wheel') pageTimeline((event as WheelEvent).deltaY);
     if (event.type === 'touchstart') timelineTouchRef.current = (event as TouchEvent).touches[0]?.clientY ?? null;
     if (event.type === 'touchmove') {
@@ -4666,7 +4680,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           </div>
         )}
 
-        <div ref={turnSpaceRef} class="turn-reply-space" aria-hidden="true" />
         </div>
         {/* Zero-height sticky seat, following Harness: the control belongs to the
             conversation scroller and is centered on the same content lane. */}

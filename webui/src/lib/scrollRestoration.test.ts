@@ -143,12 +143,11 @@ test('layout shrink at the bottom does not look like upward reading', () => {
   assert.equal(f.follows(), true);
 });
 
-test('layout measures reply space before following and tracks the corrected position', () => {
-  const viewport = { scrollTop: 0, scrollHeight: 600, clientHeight: 400 };
+test('viewport resizing preserves following at the corrected position', () => {
+  const viewport = { scrollTop: 0, scrollHeight: 1000, clientHeight: 400 };
   const scroll = createScrollRestoration({
     viewport: () => viewport, session: () => 'a', following: () => true,
     setFollowing() {}, schedule: () => 0, cancel() {},
-    prepareLayout: () => { viewport.scrollHeight = 1000; },
   });
   scroll.layout();
   assert.equal(viewport.scrollTop, 600);
