@@ -111,7 +111,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NetworkConnectHint =>
             "Network connect failed. If this works in a browser you may be behind a proxy/firewall: configure a proxy with /proxy or set HTTPS_PROXY, or open the login URL above in a browser to finish. Press Esc to skip and /login later.".into(),
         Msg::NetworkConnectHintNoResolver =>
-            "Network connect failed, and /etc/resolv.conf is not readable on this host. The Linux artifacts are statically linked against musl, whose resolver sends queries to 127.0.0.1 when it cannot read that file, so name resolution fails on Android / Termux. Mount a resolver configuration, for example: proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode.".into(),
+            "Network connect failed, and /etc/resolv.conf is not readable on this host. Termux uses $PREFIX/etc/resolv.conf as a fallback; check its nameserver entries, network and proxy settings. A temporary alternative is to mount a valid configuration: proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode.".into(),
         Msg::CpSetupHeader =>
             "  {brand} CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
