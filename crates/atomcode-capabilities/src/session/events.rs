@@ -1925,6 +1925,45 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
     unanswered_from(events, position, turn).map(|prompt| (seq, turn, prompt))
 }
 
+/// The number of the last turn in `events` when no `TurnEnd` follows its
+/// `TurnStart` in file order: the log of a run whose process stopped
+/// mid-turn. `None` when every started turn ended, or when the log holds no
+/// turn at all.
+pub(crate) fn unterminated_turn(events: &[LoggedEvent]) -> Option<u64> {
+    let (position, turn) = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, logged)| match logged.event {
+            SessionEvent::TurnStart { turn } => Some((position, turn)),
+            _ => None,
+        })?;
+    let ended = events[position + 1..].iter().any(|logged| {
+        matches!(logged.event, SessionEvent::TurnEnd { turn: ended, .. } if *ended == turn)
+    });
+    (!ended).then_some(turn)
+pub(crate) fn unterminated_turn(events: &[LoggedEvent]) -> Option<u64> {
+    let (position, turn) = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(position, logged)| match logged.event {
+            SessionEvent::TurnStart { turn } => Some((position, turn)),
+            _ => None,
+        })?;
+    let mut closed = false;
+    for logged in &events[position + 1..] {
+        match logged.event {
+            SessionEvent::TurnEnd { turn: ended, .. } if ended == turn => closed = true,
+            // A rewind that takes the conversation back means the person
+            // withdrew the turn; it did not die part way through.
+            SessionEvent::Rewound { scope, .. } if scope.takes_back_conversation() => closed = true,
+            _ => {}
+        }
+    }
+    (!closed).then_some(turn)
+}
+
 /// The prompt of the turn at `start` when that turn is still accepted and
 /// unanswered. A resume marker names this position, so `prepare` can retract
 /// exactly what it handed back instead of re-deciding against a log that moved.
@@ -2481,6 +2520,74 @@ mod tests {
             .create_event_session(&lease, &SessionHeader::new(id), &meta(id))
             .unwrap();
         lease
+    }
+
+    #[test]
+    fn a_turn_without_its_end_is_reported_as_unterminated() {
+        let mid_turn = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "hello".into(),
+                    images: vec![],
+                },
+            ),
+        ];
+        assert_eq!(
+            unterminated_turn(&mid_turn),
+            Some(1),
+            "a TurnStart with no TurnEnd after it is a mid-turn death"
+        );
+
+        let finished = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                0,
+                SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: StopReason::Stopped,
+                    error: None,
+                },
+            ),
+        ];
+        assert_eq!(
+            unterminated_turn(&finished),
+            None,
+            "a turn that recorded its end is not unterminated"
+        );
+
+        let later_turn_ended = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                0,
+                SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: StopReason::Stopped,
+                    error: None,
+                },
+            ),
+            logged(3, 0, SessionEvent::TurnStart { turn: 2 }),
+            logged(
+                4,
+                0,
+                SessionEvent::TurnEnd {
+                    turn: 2,
+                    stop: StopReason::Stopped,
+                    error: None,
+                },
+            ),
+        ];
+        assert_eq!(
+            unterminated_turn(&later_turn_ended),
+            None,
+            "only the last turn decides: earlier ends do not leak"
+        );
+        assert_eq!(unterminated_turn(&[]), None, "an empty log holds no turn");
     }
 
     fn logged(seq: u64, at: u64, event: SessionEvent) -> LoggedEvent {

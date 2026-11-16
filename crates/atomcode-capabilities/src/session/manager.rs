@@ -2024,6 +2024,17 @@ impl SessionManager {
             // A stale or unsafe auxiliary checkpoint must not shadow committed
             // state on future resumes.
             self.clear_inflight_snapshot(lease.id());
+            // Not a clean stop either: the checkpoint held activity the log
+            // never finished. Say so instead of letting the resume read as an
+            // ordinary open.
+            notes.push(format!(
+                "the previous run of session {id} stopped mid-turn: its unfinished activity \
+                 was cleared, and the conversation resumes from its last completed turn"
+            notes.push(format!(
+                "the previous run of session {} stopped mid-turn: its unfinished activity \
+                 was cleared, and the conversation resumes from its last completed turn",
+                lease.id()
+            ));
             Ok((loaded, None))
         }
     }
@@ -2085,6 +2096,20 @@ impl SessionManager {
         // own `Rewound`, and `unanswered_prompt` hands back only a turn no
         // rewind follows, so this finds a later prompt still waiting — never
         // the withdrawn one.
+        // A stopped prompt is handed back below. When no prompt is waiting,
+        // the run may still have died mid-turn: the last `TurnStart` never
+        // followed by its `TurnEnd` is a process that stopped with rounds of
+        // activity unfinished. Say so on resume — silence reads the locked
+        // sending state as a provider outage.
+        if super::events::unanswered_prompt(own_events).is_none() {
+            if let Some(turn) = super::events::unterminated_turn(own_events) {
+                notes.push(format!(
+                    "the previous run of session {id} stopped mid-turn: turn {turn} never \
+                     recorded its end, so the conversation resumes with that turn left \
+                     unfinished"
+                ));
+            }
+        }
         let Some((to, turn, prompt)) = super::events::unanswered_prompt(own_events) else {
             return Ok((loaded, None));
         };
