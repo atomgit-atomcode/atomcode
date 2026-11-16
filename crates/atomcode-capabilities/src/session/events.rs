@@ -1926,22 +1926,9 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
 }
 
 /// The number of the last turn in `events` when no `TurnEnd` follows its
-/// `TurnStart` in file order: the log of a run whose process stopped
-/// mid-turn. `None` when every started turn ended, or when the log holds no
-/// turn at all.
-pub(crate) fn unterminated_turn(events: &[LoggedEvent]) -> Option<u64> {
-    let (position, turn) = events
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(position, logged)| match logged.event {
-            SessionEvent::TurnStart { turn } => Some((position, turn)),
-            _ => None,
-        })?;
-    let ended = events[position + 1..].iter().any(|logged| {
-        matches!(logged.event, SessionEvent::TurnEnd { turn: ended, .. } if *ended == turn)
-    });
-    (!ended).then_some(turn)
+/// `TurnStart` in file order and no conversation rewind withdrew it.
+/// A code-only rewind does not close a conversation turn. This diagnoses the
+/// log, not the cause of the interruption. `None` for a closed or empty log.
 pub(crate) fn unterminated_turn(events: &[LoggedEvent]) -> Option<u64> {
     let (position, turn) = events
         .iter()
@@ -2588,6 +2575,96 @@ mod tests {
             "only the last turn decides: earlier ends do not leak"
         );
         assert_eq!(unterminated_turn(&[]), None, "an empty log holds no turn");
+    }
+
+    #[test]
+    fn resume_notes_distinguish_unfinished_completed_and_withdrawn_turns() {
+        for (ending, expect_note) in [
+            (None, true),
+            (
+                Some(SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: StopReason::Stopped,
+                    error: None,
+                }),
+                false,
+            ),
+            (
+                Some(SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: StopReason::Cancelled,
+                    error: None,
+                }),
+                false,
+            ),
+            (
+                Some(SessionEvent::Rewound {
+                    turn: 1,
+                    to: 1,
+                    scope: RewindScope::Conversation,
+                }),
+                false,
+            ),
+            (
+                Some(SessionEvent::Rewound {
+                    turn: 1,
+                    to: 1,
+                    scope: RewindScope::Both,
+                }),
+                false,
+            ),
+            (
+                Some(SessionEvent::Rewound {
+                    turn: 1,
+                    to: 1,
+                    scope: RewindScope::Code,
+                }),
+                true,
+            ),
+        ] {
+            let (_dir, manager) = store();
+            let lease = created(&manager, "resume-note");
+            let mut events = vec![
+                logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    0,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "task".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    3,
+                    0,
+                    SessionEvent::AssistantMessage {
+                        turn: 1,
+                        round: 1,
+                        text: "partial work".into(),
+                        reasoning: String::new(),
+                        tool_calls: vec![],
+                        reasoning_blocks: vec![],
+                        meta: None,
+                    },
+                ),
+            ];
+            if let Some(ending) = ending {
+                events.push(logged(4, 0, ending));
+            }
+            manager.append_events(&lease, &events).unwrap();
+            let before = manager.load_native_session(lease.id()).unwrap().snapshot;
+            let mut notes = Vec::new();
+            let (loaded, pending) = manager.open_for_resume_noting(&lease, &mut notes).unwrap();
+            assert!(pending.is_none(), "work already began; do not replay");
+            assert_eq!(loaded.snapshot, before, "diagnosis must not change history");
+            assert_eq!(
+                notes.iter().any(|n| n.contains("never recorded its end")),
+                expect_note,
+                "{events:?}: {notes:?}"
+            );
+            assert_eq!(manager.load_events(lease.id()).unwrap(), events);
+        }
     }
 
     fn logged(seq: u64, at: u64, event: SessionEvent) -> LoggedEvent {

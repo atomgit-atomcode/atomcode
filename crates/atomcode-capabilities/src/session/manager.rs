@@ -2024,15 +2024,11 @@ impl SessionManager {
             // A stale or unsafe auxiliary checkpoint must not shadow committed
             // state on future resumes.
             self.clear_inflight_snapshot(lease.id());
-            // Not a clean stop either: the checkpoint held activity the log
-            // never finished. Say so instead of letting the resume read as an
-            // ordinary open.
+            // This can also be a stale checkpoint from a completed turn;
+            // its presence cannot prove a crash or loss of committed history.
             notes.push(format!(
-                "the previous run of session {id} stopped mid-turn: its unfinished activity \
-                 was cleared, and the conversation resumes from its last completed turn"
-            notes.push(format!(
-                "the previous run of session {} stopped mid-turn: its unfinished activity \
-                 was cleared, and the conversation resumes from its last completed turn",
+                "a stale or unsafe checkpoint for session {} was not replayed; \
+                 the committed conversation was retained",
                 lease.id()
             ));
             Ok((loaded, None))
@@ -2101,7 +2097,7 @@ impl SessionManager {
         // followed by its `TurnEnd` is a process that stopped with rounds of
         // activity unfinished. Say so on resume — silence reads the locked
         // sending state as a provider outage.
-        if super::events::unanswered_prompt(own_events).is_none() {
+        let Some((to, turn, prompt)) = super::events::unanswered_prompt(own_events) else {
             if let Some(turn) = super::events::unterminated_turn(own_events) {
                 notes.push(format!(
                     "the previous run of session {id} stopped mid-turn: turn {turn} never \
@@ -2109,8 +2105,6 @@ impl SessionManager {
                      unfinished"
                 ));
             }
-        }
-        let Some((to, turn, prompt)) = super::events::unanswered_prompt(own_events) else {
             return Ok((loaded, None));
         };
         // Loading does not retract: the prompt stays visible until the runtime is
@@ -9512,6 +9506,50 @@ mod tests {
             !mgr.has_inflight_snapshot(id),
             "unsafe checkpoints are cleared so they cannot shadow later resumes"
         );
+    }
+
+    #[test]
+    fn stale_or_unsafe_checkpoints_do_not_claim_a_mid_turn_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("checkpoint-note").unwrap();
+        let canonical = snap(&["committed"]);
+        let mut meta = SessionMeta::new(lease.id(), "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        for checkpoint in [
+            canonical.clone(),
+            SessionSnapshot::new(vec![
+                Message::user("committed"),
+                Message::assistant("uncommitted work", vec![]),
+            ]),
+        ] {
+            mgr.save_inflight_snapshot(lease.id(), &checkpoint, true)
+                .unwrap();
+            let mut notes = Vec::new();
+            let (loaded, pending) = mgr
+                .load_native_session_for_resume_noting(&lease, &mut notes)
+                .unwrap();
+            assert_eq!(loaded.snapshot, canonical);
+            assert!(pending.is_none());
+            assert!(!mgr.has_inflight_snapshot(lease.id()));
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].contains("was not replayed"));
+            assert!(!notes[0].contains("stopped mid-turn"));
+            let mut again = Vec::new();
+            mgr.load_native_session_for_resume_noting(&lease, &mut again)
+                .unwrap();
+            assert!(
+                again.is_empty(),
+                "do not repeat a cleared checkpoint notice"
+            );
+        }
     }
 
     #[test]
