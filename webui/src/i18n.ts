@@ -288,6 +288,7 @@ const zh = {
 
   // Reasoning effort selector for endpoints that explicitly enable it.
   'effort.label': '强度',
+  'effort.unavailable': '此模型未提供可调强度',
   'effort.busy': '本轮结束后可修改思考强度',
   'effort.failed': '思考强度修改失败，请重试',
   'skills.refreshFailedRetry': '技能刷新失败，正在显示上次结果，点击重试',
@@ -1115,6 +1116,7 @@ const en: Record<MsgKey, string> = {
 
   // Reasoning effort selector for endpoints that explicitly enable it.
   'effort.label': 'Effort',
+  'effort.unavailable': 'Adjustable effort is not available for this model.',
   'effort.busy': 'Reasoning effort can be changed after this turn finishes',
   'effort.failed': 'Could not update reasoning effort. Please retry.',
   'skills.refreshFailedRetry': 'Refresh failed. Showing previous skills. Click to retry.',

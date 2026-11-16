@@ -73,27 +73,35 @@ export function ModelSelector({
   const ref = useRef<HTMLDivElement>(null);
   const [effortDraft, setEffortDraft] = useState<string | null | undefined>(undefined);
 
-  const [popupStyle, setPopupStyle] = useState<{top?: string; bottom: string; maxHeight: string} | undefined>();
+  const [popupStyle, setPopupStyle] = useState<{position: 'fixed'; left: string; right: string; width: string; top: string; bottom: string; maxHeight: string} | undefined>();
   useLayoutEffect(() => {
     if (!open && !effortOpen) return;
     const position = () => {
-      if (window.innerWidth > 600 || !ref.current) { setPopupStyle(undefined); return; }
-      const rect = ref.current.getBoundingClientRect();
+      if (!ref.current) return;
+      const rect = (ref.current.querySelector('.model-selector-trigger') ?? ref.current).getBoundingClientRect();
       const viewport = window.visualViewport;
       const visibleTop = viewport?.offsetTop ?? 0;
       const visibleBottom = visibleTop + (viewport?.height ?? window.innerHeight);
+      const visibleLeft = viewport?.offsetLeft ?? 0;
+      const visibleWidth = viewport?.width ?? window.innerWidth;
+      const width = Math.max(0, Math.min(effortOpen ? 280 : 350, visibleWidth - 24));
+      const left = Math.max(visibleLeft + 12, Math.min(rect.left + rect.width / 2 - width / 2, visibleLeft + visibleWidth - width - 12));
       const above = Math.max(0, rect.top - visibleTop - 20);
       const below = Math.max(0, visibleBottom - rect.bottom - 20);
-      setPopupStyle(above >= 200 || above >= below
-        ? {bottom: `${window.innerHeight - rect.top + 8}px`, maxHeight: `${above}px`}
-        : {top: `${rect.bottom + 8}px`, bottom: 'auto', maxHeight: `${below}px`});
+      const base = {position: 'fixed' as const, left: `${left}px`, right: 'auto', width: `${width}px`};
+      setPopupStyle(above >= (effortOpen ? 170 : 280) || above >= below
+        ? {...base, top: 'auto', bottom: `${window.innerHeight - rect.top + 8}px`, maxHeight: `${Math.min(280, above)}px`}
+        : {...base, top: `${rect.bottom + 8}px`, bottom: 'auto', maxHeight: `${Math.min(280, below)}px`});
     };
     position();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(position);
+    if (ref.current) observer?.observe(ref.current.querySelector('.model-selector-trigger') ?? ref.current);
     window.addEventListener('resize', position);
     window.addEventListener('scroll', position, true);
     window.visualViewport?.addEventListener('resize', position);
     window.visualViewport?.addEventListener('scroll', position);
     return () => {
+      observer?.disconnect();
       window.removeEventListener('resize', position);
       window.removeEventListener('scroll', position, true);
       window.visualViewport?.removeEventListener('resize', position);
@@ -151,6 +159,9 @@ export function ModelSelector({
   const currentProvider = useRef(current?.provider);
   currentProvider.current = current?.provider;
   useEffect(() => { setEffortDraft(undefined); }, [effortOpen, current?.provider, liveEffort]);
+  useLayoutEffect(() => {
+    if (effortOpen) ref.current?.querySelector<HTMLButtonElement>('.model-effort-name')?.focus();
+  }, [effortOpen]);
   // Switching models resets the effort display back to the new model's
   // persisted value; capability declarations decide whether the selector appears.
   useEffect(() => { setEffortOverride(undefined); }, [current?.provider, current?.model]);
@@ -215,8 +226,8 @@ export function ModelSelector({
         {effortOpen && current && (
           <div class="model-dropdown model-effort-panel" style={popupStyle}>
             <div class="model-effort-heading">
-              <span>{t('effort.label')}</span>
-              <strong aria-live="polite">{effortLabel(effortDraft !== undefined ? effortDraft : effort)}</strong>
+              <span>{t(current.effort_applicable ? 'effort.label' : 'model.label')}</span>
+              {current.effort_applicable && <strong aria-live="polite">{effortLabel(effortDraft !== undefined ? effortDraft : effort)}</strong>}
             </div>
             <button class="model-effort-name" type="button" onClick={() => { ref.current?.querySelector<HTMLButtonElement>('.model-selector-trigger')?.focus(); setEffortOpen(false); setOpen(true); }}>
               <span>{current.model}{isDup(current.model) ? ` (${providerLabel(current)})` : ''}</span>
@@ -229,7 +240,7 @@ export function ModelSelector({
                 : EFFORT_OPTIONS;
               const preview = effortDraft !== undefined ? effortDraft : effort;
               const index = Math.max(0, options.findIndex(o => o.val === preview));
-              return <div class="model-effort-slider">
+              return <div class="model-effort-slider" style={{'--effort-count': options.length}}>
                 <input type="range" min="0" max={options.length - 1} step="1" value={index}
                   aria-label={t('effort.label')} aria-valuetext={effortLabel(preview)}
                   disabled={busy || options.length < 2} aria-disabled={busy || effortSaving} aria-busy={effortSaving}
@@ -241,13 +252,15 @@ export function ModelSelector({
                     if (effortSaving) { e.currentTarget.value = String(index); return; }
                     selectEffort(options[Number(e.currentTarget.value)].val);
                   }} />
-                <div class="model-effort-stops" aria-hidden="true">
-                  {options.map((o, i) => <span key={o.val ?? 'default'} class={i === index ? 'active' : ''} />)}
+                <div class="model-effort-stops" role="group" aria-label={t('effort.label')}>
+                  {options.map((o, i) => <button key={o.val ?? 'default'} type="button"
+                    class={i === index ? 'active' : ''} aria-pressed={i === index}
+                    disabled={busy || effortSaving} onClick={() => selectEffort(o.val)}>{effortLabel(o.val)}</button>)}
                 </div>
-                <div class="model-effort-endpoints"><span>{t('effort.default')}</span><span>{effortLabel(options[options.length - 1].val)}</span></div>
                 {busy && <p class="model-effort-hint">{t('effort.busy')}</p>}
               </div>;
             })()}
+            {!current.effort_applicable && <p class="model-effort-hint">{t('effort.unavailable')}</p>}
           </div>
         )}
         {open && (
@@ -257,7 +270,7 @@ export function ModelSelector({
                 class={'model-item' + (m.provider === current?.provider && m.model === current?.model ? ' active' : '')}
                 type="button"
                 title={m.provider}
-                onClick={() => { onChange(m.provider); setOpen(false); }}
+                onClick={() => { onChange(m.provider); setOpen(false); setEffortOpen(true); }}
               >
                 <span class="model-item-model">{m.model}</span>
                 {m.provider === current?.provider && m.model === current?.model && <span class="model-choice-check" aria-hidden="true">✓</span>}
