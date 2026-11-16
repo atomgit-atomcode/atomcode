@@ -7422,7 +7422,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             let _ = crate::parts::wire_side_providers(&runtime.parts, &next, &candidate);
                             if let Some(snapshot) = runtime.parts.snapshot_hook() { snapshot.set_model_attribution(&next.provider_name, &next.model); }
-                            tell(runtime, crate::told::reconfigured(&runtime.config, &next));
+                            tell(runtime, crate::told::reconfigured(&runtime.config, &next, observed_tokens.map(|t| t as u64)));
                             runtime.config = next;
                             // The live agent is unchanged and no turn is in flight.
                             // Mode changes retain its generation; only the provider seam is patched.
@@ -8023,7 +8023,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         snapshot.set_model_attribution(&next.provider_name, &next.model);
                                     }
                                 }
-                                tell(&runtime, crate::told::reconfigured(&runtime.config, &next));
+                                tell(&runtime, crate::told::reconfigured(&runtime.config, &next, observed_tokens.map(|t| t as u64)));
                                 runtime.config = next;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = current_runtime_model(&runtime).unwrap_or_default();
@@ -8235,7 +8235,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate);
                                 // Before the pending prompt is replayed, so the
                                 // note precedes the first message on the new model.
-                                tell(&runtime, crate::told::reconfigured(&old_config, &runtime.config));
+                                tell(
+                                    &runtime,
+                                    crate::told::reconfigured(
+                                        &old_config,
+                                        &runtime.config,
+                                        observed_tokens.map(|t| t as u64),
+                                    ),
+                                );
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -9114,7 +9121,14 @@ fn spawn_runtime_owner_with_optional_agent(
                         match reloaded_from {
                             Some(None) => tell(&runtime, Some(crate::told::reloaded())),
                             Some(Some(before)) => {
-                                tell(&runtime, crate::told::reconfigured(&before, &runtime.config))
+                                tell(
+                                    &runtime,
+                                    crate::told::reconfigured(
+                                        &before,
+                                        &runtime.config,
+                                        observed_tokens.map(|t| t as u64),
+                                    ),
+                                )
                             }
                             None => {}
                         }
