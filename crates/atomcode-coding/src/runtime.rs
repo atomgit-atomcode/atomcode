@@ -12645,6 +12645,7 @@ struct TeamRowPatch<'a> {
     project_root: &'a std::path::Path,
     max_members: usize,
     max_rounds: u32,
+    headless_wait: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -12750,6 +12751,7 @@ fn harness_option_rows(
                     project_root: wd,
                     max_members,
                     max_rounds,
+                    headless_wait: !config.is_attended(),
                 },
             )
             .map_err(|e| e.to_string())?;

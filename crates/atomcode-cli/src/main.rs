@@ -634,7 +634,7 @@ struct Cli {
     #[arg(long)]
     provider: Option<String>,
 
-    /// Model to use (overrides config provider model)
+    /// Model to use; a configured provider/model selection switches the full route
     #[arg(long)]
     model: Option<String>,
 
@@ -2193,7 +2193,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     &mut config,
                     cli.provider.as_deref(),
                     cli.model.as_deref(),
-                );
+                )?;
                 let working_dir = resolve_working_dir(cli.dir.clone());
                 let runtime_cfg = runtime_config_from(
                     &config,
@@ -2449,7 +2449,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     // background task fires on completion, so the slash menu refreshes
     // without a restart.
 
-    apply_cli_runtime_overrides(&mut config, cli.provider.as_deref(), cli.model.as_deref());
+    apply_cli_runtime_overrides(&mut config, cli.provider.as_deref(), cli.model.as_deref())?;
 
     // Mutable: a `resume <id>` whose session lives in another project adopts that
     // session's own directory below (Plan A).
@@ -3221,7 +3221,38 @@ fn apply_cli_runtime_overrides(
     config: &mut atomcode_config::config::Config,
     provider_override: Option<&str>,
     model_override: Option<&str>,
-) {
+) -> anyhow::Result<()> {
+    // A qualified `provider/model` that is itself a configured selection is a
+    // complete route, not a model name to send to whichever account happens to
+    // be active. Keep `--provider` authoritative when both flags are supplied;
+    // in that case `--model` retains its historical meaning as an override of
+    // the explicitly selected provider's model.
+    if let Some(selection) = model_override.filter(|selection| {
+        provider_override.is_none() && selection.contains('/') && config.selection_exists(selection)
+    }) {
+        let selection = selection.to_string();
+        config.default_model = Some(selection.clone());
+        config.default_provider = selection;
+        return Ok(());
+    }
+    // A qualified model whose prefix names another configured account is
+    // almost certainly a provider-selection typo. Fail before making a request
+    // to the currently active account with the other account's model id.
+    if provider_override.is_none() {
+        if let Some(model) = model_override {
+            if let Some((account, _)) = model.split_once('/') {
+                if config.logical_accounts().contains_key(account)
+                    && config
+                        .resolve_model(None)
+                        .is_ok_and(|active| active.account_id != account)
+                {
+                    anyhow::bail!(
+                        "model `{model}` belongs to account `{account}`, while the active model uses another account; use `--provider <selection>` to switch the complete provider route"
+                    );
+                }
+            }
+        }
+    }
     let provider_name = provider_override
         .map(str::to_string)
         // Fall back to the canonical active selection (new-schema `default_model`
@@ -3237,10 +3268,10 @@ fn apply_cli_runtime_overrides(
         } else if let Some(m) = config.models.get_mut(&provider_name) {
             m.model = model.to_string();
         } else {
-            return;
+            return Ok(());
         }
     } else if !config.selection_exists(&provider_name) {
-        return;
+        return Ok(());
     }
     if provider_override.is_some() {
         // `default_model` is canonical (`effective_model_selection` prefers it);
@@ -3248,6 +3279,7 @@ fn apply_cli_runtime_overrides(
         config.default_model = Some(provider_name.clone());
         config.default_provider = provider_name;
     }
+    Ok(())
 }
 
 /// Derive the coding runtime config from the current config + working dir.
@@ -6183,9 +6215,154 @@ mod tests {
         )
         .unwrap();
 
-        apply_cli_runtime_overrides(&mut config, Some("direct"), None);
+        apply_cli_runtime_overrides(&mut config, Some("direct"), None).unwrap();
 
         assert_eq!(config.default_provider, "direct");
+    }
+
+    #[test]
+    fn qualified_model_selection_switches_the_complete_provider_route() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "deepseek/flash"
+
+                [provider_accounts.deepseek]
+                provider = "openai"
+                base_url = "https://deepseek.example/v1"
+                api_key = "deepseek-key"
+
+                [models."deepseek/flash"]
+                account = "deepseek"
+                model = "deepseek-flash"
+                context_window = 131072
+
+                [provider_accounts.qianwenai]
+                provider = "anthropic"
+                base_url = "https://qianwen.example/v1"
+                api_key = "qianwen-key"
+
+                [models."qianwenai/qwen3.8-flash"]
+                account = "qianwenai"
+                model = "qwen3.8-flash"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(&mut config, None, Some("qianwenai/qwen3.8-flash")).unwrap();
+
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("qianwenai/qwen3.8-flash")
+        );
+        let runtime = runtime_config_from(
+            &config,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.provider_name, "qianwenai/qwen3.8-flash");
+        assert_eq!(runtime.model, "qwen3.8-flash");
+        assert_eq!(runtime.base_url, "https://qianwen.example/v1");
+        assert_eq!(runtime.api_key, "qianwen-key");
+    }
+
+    #[test]
+    fn bare_model_override_stays_on_the_current_provider() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_provider = "deepseek"
+
+                [providers.deepseek]
+                type = "openai"
+                model = "deepseek-flash"
+                base_url = "https://deepseek.example/v1"
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(&mut config, None, Some("another-model")).unwrap();
+
+        assert_eq!(config.providers["deepseek"].model, "another-model");
+        assert_eq!(config.default_provider, "deepseek");
+    }
+
+    #[test]
+    fn qualified_model_for_another_account_fails_before_requesting() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "deepseek/flash"
+
+                [provider_accounts.deepseek]
+                provider = "openai"
+                base_url = "https://deepseek.example/v1"
+
+                [models."deepseek/flash"]
+                account = "deepseek"
+                model = "deepseek-flash"
+                context_window = 131072
+
+                [provider_accounts.qianwenai]
+                provider = "anthropic"
+                base_url = "https://qianwen.example/v1"
+
+                [models."qianwenai/other-model"]
+                account = "qianwenai"
+                model = "other-model"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+
+        let error =
+            apply_cli_runtime_overrides(&mut config, None, Some("qianwenai/unconfigured-model"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("use `--provider <selection>`"));
+        assert_eq!(config.default_model.as_deref(), Some("deepseek/flash"));
+    }
+
+    #[test]
+    fn explicit_provider_keeps_precedence_over_qualified_model_override() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "deepseek/flash"
+
+                [provider_accounts.deepseek]
+                provider = "openai"
+                base_url = "https://deepseek.example/v1"
+
+                [models."deepseek/flash"]
+                account = "deepseek"
+                model = "deepseek-flash"
+                context_window = 131072
+
+                [provider_accounts.qianwenai]
+                provider = "anthropic"
+                base_url = "https://qianwen.example/v1"
+
+                [models."qianwenai/qwen3.8-flash"]
+                account = "qianwenai"
+                model = "qwen3.8-flash"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(
+            &mut config,
+            Some("deepseek/flash"),
+            Some("qianwenai/qwen3.8-flash"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.models["deepseek/flash"].model,
+            "qianwenai/qwen3.8-flash"
+        );
+        assert_eq!(config.default_model.as_deref(), Some("deepseek/flash"));
     }
 
     #[test]

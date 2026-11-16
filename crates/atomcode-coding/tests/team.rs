@@ -296,6 +296,21 @@ async fn status_tell_and_stop_are_the_leads_to_call() {
         r#"{ text = "first answer" }, { text = "second answer" }"#,
     ))
     .await;
+    let team_tool = app
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .get("team")
+        .unwrap();
+    assert!(
+        !team_tool.parameters_schema()["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "wait"),
+        "interactive teams do not expose a blocking wait"
+    );
+    assert!(team_tool.description().contains("do not poll repeatedly"));
     let lead = create_agent(&app).await.unwrap();
     run_turn(&app, "go").await.unwrap();
     let agents = app.context().service::<AgentsSvc>().unwrap();
@@ -362,6 +377,50 @@ async fn status_tell_and_stop_are_the_leads_to_call() {
         gone.content.contains("live members: none"),
         "{}",
         gone.content
+    );
+}
+
+#[tokio::test]
+async fn headless_team_wait_returns_member_report_without_status_polling() {
+    let dir = scratch("headless-wait");
+    let lead_script = format!(
+        r#"{DELEGATE}, {{ text = "wait for scout", calls = [ {{ name = "team", args = {{ action = "wait", name = "scout", timeout_secs = 5 }} }} ] }}, {{ text = "scout reported the result" }}"#
+    );
+    let app = start(tree_with(
+        &dir,
+        &lead_script,
+        r#"{ text = "found the relevant code" }"#,
+        "headless_wait = true",
+    ))
+    .await;
+    let team_tool = app
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .get("team")
+        .unwrap();
+    assert!(
+        team_tool.parameters_schema()["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "wait"),
+        "headless teams expose the bounded wait action"
+    );
+    let lead = create_agent(&app).await.unwrap();
+
+    let response = run_turn(&app, "delegate and wait for the report")
+        .await
+        .unwrap();
+    assert_eq!(response.text, "scout reported the result");
+    let events = lead.session().events();
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolResultLogged { content, .. }
+                if content.contains("found the relevant code")
+        )),
+        "the blocking wait returns the completed member's report"
     );
 }
 
