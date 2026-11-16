@@ -63,7 +63,7 @@ pub(crate) fn reconfigured(
         if next_window > 0 {
             if let Some(used) = used_tokens {
                 if used * 4 > next_window * 3 {
-                if used >= next_window {
+                    said.push(if used >= next_window {
                         format!(
                             "The conversation is about {used} tokens, past this model's \
                              {next_window}-token window: the next message cannot fit. Run \
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn a_switch_past_the_new_window_says_the_next_message_cannot_fit() {
-        let old = CodingAgentConfig::new(
+        let mut old = CodingAgentConfig::new(
             "key",
             "https://example.test/v1",
             "big",
@@ -378,6 +378,7 @@ mod tests {
             ".",
             crate::config::product_dirs_from_env(),
         );
+        old.context_window = 200_000;
         new.context_window = 128_000;
         let said =
             reconfigured(&old, &new, Some(200_000)).expect("a switch past the new window is told");
@@ -387,7 +388,7 @@ mod tests {
 
     #[test]
     fn a_switch_over_the_compaction_threshold_says_what_comes_next() {
-        let old = CodingAgentConfig::new(
+        let mut old = CodingAgentConfig::new(
             "key",
             "https://example.test/v1",
             "big",
@@ -401,6 +402,7 @@ mod tests {
             ".",
             crate::config::product_dirs_from_env(),
         );
+        old.context_window = 200_000;
         new.context_window = 128_000;
         let said =
             reconfigured(&old, &new, Some(100_000)).expect("a switch over the threshold is told");
@@ -410,7 +412,7 @@ mod tests {
 
     #[test]
     fn a_switch_within_the_window_or_an_unknown_window_stays_quiet() {
-        let old = CodingAgentConfig::new(
+        let mut old = CodingAgentConfig::new(
             "key",
             "https://example.test/v1",
             "big",
@@ -424,6 +426,7 @@ mod tests {
             ".",
             crate::config::product_dirs_from_env(),
         );
+        old.context_window = 200_000;
         new.context_window = 128_000;
         // 50_000 of 128_000 is under the compaction threshold: the switch is
         // still told, but without a window warning.

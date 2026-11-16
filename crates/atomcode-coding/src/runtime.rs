@@ -9115,6 +9115,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         controls
                             .provider_unavailable_reason
                             .store(0, Ordering::Release);
+                        // The last observed usage still describes this
+                        // conversation's size — the switch changes the window,
+                        // not the history — so take it before the reset and
+                        // let the switch hint compare it against the new
+                        // window.
+                        let switch_used = observed_tokens;
                         observed_tokens = None;
                         snapshot_in_flight = false;
                         compaction_suspended = false;
@@ -9126,7 +9132,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     crate::told::reconfigured(
                                         &before,
                                         &runtime.config,
-                                        observed_tokens.map(|t| t as u64),
+                                        switch_used.map(|t| t as u64),
                                     ),
                                 )
                             }
