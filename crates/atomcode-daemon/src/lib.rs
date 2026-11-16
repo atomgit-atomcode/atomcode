@@ -2078,6 +2078,94 @@ pub(crate) fn update_project_state(project: &mut ProjectState, new_path: &std::p
     }
 }
 
+/// The /cd refusal shown to a remote client. `action` names what the client
+/// actually asked for — with a session_id it is a session switch, without one
+/// a plain directory change — so a directory change is never reported as a
+/// failed session switch. A deferred request (ActiveTurn) is not a failure; a
+/// RuntimeRejected reason is already a person-readable sentence. The variants
+/// the navigation paths can raise are named individually; the Debug shape
+/// stays only for variants that cannot reach this handler (issue #1740).
+fn format_navigation_rejection(error: &crate::live_hub::HubError, action: &str) -> String {
+    use crate::live_hub::HubError;
+    let (verdict, reason) = match error {
+        // "not applied", not "deferred": nothing queues the switch — the
+        // client must issue it again once the turn is done.
+        HubError::ActiveTurn => (
+            "not applied",
+            "The current session is still working on its turn. Try again in a moment.",
+        ),
+        HubError::RuntimeRejected(reason) => ("rejected", reason.as_str()),
+        HubError::Unbound => (
+            "rejected",
+            "No coding runtime is attached to this project yet. Start a session first, then try again.",
+        ),
+        HubError::RuntimeUnavailable => (
+            "rejected",
+            "The coding runtime is unavailable. Restart the daemon or open a new session, then try again.",
+        ),
+        HubError::StaleBinding => (
+            "rejected",
+            "The runtime binding is stale: the session may have been replaced. Refresh and try again.",
+        ),
+        HubError::RuntimeGenerationChanged { .. } => (
+            "rejected",
+            "The runtime state changed while this request was in flight. Try again.",
+        ),
+        HubError::SnapshotUnavailable(reason) => ("rejected", reason.as_str()),
+        // Keep the shape out of the client message, as on the
+        // embedded-navigation side (issue #1740); the diagnostic goes to the
+        // log. Only variants that cannot reach the /cd paths land here.
+        other => {
+            tracing::warn!(?other, "live navigation: unmapped hub error");
+            return format!("{action} rejected: the runtime could not perform the request. Try again.");
+        }
+    };
+    format!("{action} {verdict}: {reason}")
+}
+
+#[cfg(test)]
+mod navigation_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn cd_refusal_names_the_reason_not_the_variant() {
+        use crate::live_hub::HubError;
+        let rejected = format_navigation_rejection(
+            &HubError::RuntimeRejected(
+                "Session not found: the target session is no longer available.".into(),
+            ),
+            "Session switch",
+        );
+        assert_eq!(
+            rejected,
+            "Session switch rejected: Session not found: the target session is no longer available."
+        );
+        assert!(!rejected.contains("RuntimeRejected"));
+        let busy = format_navigation_rejection(&HubError::ActiveTurn, "Session switch");
+        assert!(busy.contains("not applied"), "{busy}");
+    }
+
+    #[test]
+    fn plain_directory_change_is_not_labeled_as_session_switch() {
+        use crate::live_hub::HubError;
+        let busy = format_navigation_rejection(&HubError::ActiveTurn, "Directory change");
+        assert!(busy.starts_with("Directory change not applied"), "{busy}");
+        let unbound = format_navigation_rejection(&HubError::Unbound, "Directory change");
+        assert!(!unbound.contains("Unbound"), "{unbound}");
+        let generation = format_navigation_rejection(
+            &HubError::RuntimeGenerationChanged {
+                expected: 1,
+                actual: 2,
+            },
+            "Directory change",
+        );
+        assert!(
+            !generation.contains("RuntimeGenerationChanged"),
+            "{generation}"
+        );
+    }
+}
+
 /// POST /cd - Change working directory (like /cd command)
 async fn change_dir(
     State(state): State<AppState>,
@@ -2173,10 +2261,23 @@ async fn change_dir(
                     opened_session = changed.session_id;
                 }
                 Err(error) => {
+                    // Name the action the client actually asked for, using the
+                    // SAME criterion native_live::navigate applies — a
+                    // blank session_id takes the directory-change path there,
+                    // so it must not be labelled a session switch here either.
+                    let action = if req
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty())
+                    {
+                        "Session switch"
+                    } else {
+                        "Directory change"
+                    };
                     return Json(ChangeDirResponse {
                         session_id: None,
                         success: false,
-                        message: format!("Runtime rejected navigation: {error:?}"),
+                        message: format_navigation_rejection(&error, action),
                         current_dir: project.working_dir.clone(),
                         project_hash: hash_path(&project.working_dir),
                     });
