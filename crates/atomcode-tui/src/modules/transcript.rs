@@ -24,10 +24,8 @@ pub const ID: &str = "transcript";
 
 #[derive(Default)]
 struct Open {
-    retry_started_at: Option<u64>,
     retry_block: Option<BlockId>,
     retry_details: String,
-    retry_prolonged: bool,
     /// The assistant text block currently accumulating chunks.
     text: Option<(BlockId, String)>,
     /// The reasoning block currently accumulating chunks.
@@ -250,24 +248,18 @@ impl Producer for Transcript {
             | SessionEvent::AssistantMessage { .. }
             | SessionEvent::TurnEnd { .. }
             | SessionEvent::Interrupted { .. } => {
-                open.retry_started_at = None;
                 if let Some(id) = open.retry_block.take() {
-                    // This request is over; a "retrying" hint must not outlive
-                    // it. Keep the group's complete diagnostics expandable.
+                    // Settle this request's group, keeping its diagnostics
+                    // available through /errors after completion.
                     out.amend(
                         id,
                         Arc::new(crate::provider_notice::RetryBlock {
-                            prolonged: false,
                             detail: open.retry_details.clone(),
                         }),
                     );
                     out.settle(id);
                 }
                 open.retry_details.clear();
-                open.retry_prolonged = false;
-            }
-            SessionEvent::RequestHeader { .. } => {
-                open.retry_started_at.get_or_insert(logged.at);
             }
             _ => {}
         }
@@ -594,8 +586,6 @@ impl Producer for Transcript {
                 if let (atomcode_harness::session::NoticeKind::ProviderRetry, Some(retry)) =
                     (notice, retry)
                 {
-                    let started = *open.retry_started_at.get_or_insert(logged.at);
-                    open.retry_prolonged |= logged.at.saturating_sub(started) >= 60_000;
                     if !open.retry_details.is_empty() {
                         open.retry_details.push('\n');
                     }
@@ -607,7 +597,6 @@ impl Producer for Transcript {
                             max: retry.max_attempts,
                         }));
                     let block = Arc::new(crate::provider_notice::RetryBlock {
-                        prolonged: open.retry_prolonged,
                         detail: open.retry_details.clone(),
                     });
                     if let Some(id) = open.retry_block {
@@ -1418,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failures_update_one_group_and_warn_once_after_a_minute() {
+    fn repeated_failures_keep_one_quiet_expandable_group() {
         use atomcode_harness::session::{HeaderReason, NoticeKind, RetryAttempt};
         let t = Transcript::default();
         let mut s = Stream::new();
@@ -1475,10 +1464,7 @@ mod tests {
             .map(|line| line.plain())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            hint.contains(&*crate::i18n::t(Msg::ProviderRetryProlonged)),
-            "{hint}"
-        );
+        assert!(hint.is_empty(), "{hint}");
         let details = said(&s);
         for n in 1..=4 {
             assert!(details.contains(&format!("original-{n}")));

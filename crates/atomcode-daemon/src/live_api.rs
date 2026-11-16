@@ -361,6 +361,7 @@ pub(crate) fn chat_runtime_config(
         headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
+        response_header_timeout_secs: p.and_then(|p| p.response_header_timeout_secs),
         upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
             config.loop_config.max_rounds,
@@ -857,6 +858,9 @@ pub(crate) enum LiveWireEvent {
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Routine automatic retry diagnostics; clients keep these out of live status.
+    #[serde(rename = "provider_retry")]
+    ProviderRetry { message: String },
     /// Auxiliary session persistence failed. Kept distinct from conversational
     /// warnings so browser clients render it outside the message timeline.
     #[serde(rename = "persistence_warning")]
@@ -1103,7 +1107,7 @@ impl NativeLiveWireProjector {
                     max_attempts,
                     backoff_secs,
                     reason,
-                } => LiveWireEvent::Warning {
+                } => LiveWireEvent::ProviderRetry {
                     message: format!(
                         "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
                     ),
@@ -4120,6 +4124,25 @@ mod tests {
                 kind: "unknown_future_kind".into(),
             })
             .is_none());
+    }
+
+    #[test]
+    fn automatic_retries_are_diagnostics_instead_of_warnings() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(
+            atomcode_coding::CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::ProviderRetry {
+                    attempt: 1,
+                    max_attempts: 5,
+                    backoff_secs: 3,
+                    reason: "timeout".into(),
+                },
+            ),
+        ));
+        let wire = wire.unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "provider_retry");
+        assert!(json["message"].as_str().unwrap().contains("timeout"));
     }
 
     #[test]

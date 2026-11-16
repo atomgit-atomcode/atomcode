@@ -1127,6 +1127,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "模型服务身份验证失败".into(),
         Msg::ProviderRateLimitError => "模型服务限流".into(),
         Msg::ProviderConnectionError => "无法连接模型服务".into(),
+        Msg::ProviderResponseTimeout => "模型服务未及时响应".into(),
         Msg::ProviderConnectionTimeout => "连接模型服务超时".into(),
         Msg::ProviderTlsInterrupted => "TLS 连接异常中断".into(),
         Msg::ProviderPartialReply => "响应中断，已保留部分回复".into(),

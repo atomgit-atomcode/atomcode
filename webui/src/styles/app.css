@@ -4409,3 +4409,17 @@ body {
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+
+/* Retry diagnostics are opt-in after the request, never a live status banner. */
+.provider-diagnostics {
+  margin-top: .5rem;
+  color: var(--app-secondary-foreground);
+  font-size: .85em;
+}
+.provider-diagnostics summary { cursor: pointer; }
+.provider-diagnostics pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 16rem;
+  overflow: auto;
+}

@@ -89,6 +89,7 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'provider_retry'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | PolicyInterventionEvent
@@ -1133,6 +1134,7 @@ export type LiveWireEvent =
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string; stats?: TurnStats }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'provider_retry'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }

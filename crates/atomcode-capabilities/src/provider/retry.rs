@@ -1333,12 +1333,35 @@ mod tests {
 /// be retried again by a runtime row. Streaming bodies are outside this scope.
 pub(crate) async fn bounded_open<T>(
     per_attempt: Duration,
+    recovery: Option<&atomcode_kernel::provider::RequestRecoveryBudget>,
     open: impl std::future::Future<Output = Result<T, atomcode_kernel::stream::ProviderError>>,
 ) -> Result<T, atomcode_kernel::stream::ProviderError> {
     let budget = per_attempt.saturating_mul(2);
-    match tokio::time::timeout(budget, open).await {
-        Ok(result) => result,
-        Err(_) => {
+    if let Some(recovery) = recovery {
+        recovery.limit_transport_wait(budget);
+    }
+    let (budget, spent) = recovery
+        .map(|b| {
+            let s = b.snapshot();
+            (
+                s.transport_wait_limit.unwrap_or(budget),
+                s.transport_wait.saturating_add(s.reserved_wait),
+            )
+        })
+        .unwrap_or((budget, Duration::ZERO));
+    let remaining = budget.saturating_sub(spent);
+    let started = tokio::time::Instant::now();
+    let result = if remaining.is_zero() {
+        None
+    } else {
+        tokio::time::timeout(remaining, open).await.ok()
+    };
+    if let Some(recovery) = recovery {
+        recovery.record_transport_wait(started.elapsed());
+    }
+    match result {
+        Some(result) => result,
+        None => {
             tracing::warn!(
                 phase = "response_headers",
                 budget_ms = budget.as_millis() as u64,
@@ -1347,7 +1370,7 @@ pub(crate) async fn bounded_open<T>(
             Err(atomcode_kernel::stream::ProviderError {
                 retryable: false,
                 message: format!(
-                    "等待响应头超时：连接恢复与重试总等待已达到 {}s，请稍后重试",
+                    "等待模型服务响应头超时：连接与重试累计等待已达到 {}s，请稍后重试",
                     budget.as_secs()
                 ),
                 code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.into()),
@@ -1361,8 +1384,69 @@ pub(crate) async fn bounded_open<T>(
 mod open_budget_tests {
     use super::*;
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn native_retries_share_header_time_and_backoff_without_capping_streaming() {
+        use atomcode_kernel::provider::RequestRecoveryBudget;
+        let shared = RequestRecoveryBudget::new(6, Duration::from_secs(300));
+        let per_attempt = Duration::from_secs(300);
+        let started = tokio::time::Instant::now();
+        let first = bounded_open::<()>(per_attempt, Some(&shared), async {
+            tokio::time::sleep(per_attempt).await;
+            Err(atomcode_kernel::stream::ProviderError {
+                retryable: true,
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(first.retryable);
+        shared.reserve_wait(Duration::from_secs(3)).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let second = bounded_open::<()>(per_attempt, Some(&shared), async {
+            tokio::time::sleep(per_attempt).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(!second.retryable);
+        assert_eq!(started.elapsed(), Duration::from_secs(600));
+        assert!(shared.reserve_wait(Duration::from_secs(1)).is_err());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(bounded_open(per_attempt, Some(&shared), async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let fresh = RequestRecoveryBudget::new(6, Duration::from_secs(300));
+        bounded_open(per_attempt, Some(&fresh), async {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            Ok(())
+        })
+        .await
+        .unwrap(); // A response after the old 90s cutoff succeeds.
+        tokio::time::sleep(Duration::from_secs(1800)).await; // response body
+        assert_eq!(fresh.snapshot().transport_wait, Duration::from_secs(120));
+        bounded_open(per_attempt, Some(&fresh), async { Ok(()) })
+            .await
+            .unwrap();
+        // A fallback adapter with a larger setting must not refill this request.
+        let resumed = tokio::time::Instant::now();
+        let error = bounded_open(Duration::from_secs(600), Some(&fresh), async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(!error.retryable);
+        assert_eq!(resumed.elapsed(), Duration::from_secs(480));
+        assert_eq!(fresh.snapshot().transport_wait, Duration::from_secs(600));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn open_budget_preserves_original_errors_and_success() {
-        let error = bounded_open::<()>(Duration::from_secs(90), async {
+        let error = bounded_open::<()>(Duration::from_secs(90), None, async {
             Err(atomcode_kernel::stream::ProviderError {
                 retryable: false,
                 http_status: Some(401),
@@ -1375,7 +1459,7 @@ mod open_budget_tests {
         assert_eq!(error.http_status, Some(401));
         assert_eq!(error.message, "unauthorized");
         assert_eq!(
-            bounded_open(Duration::from_secs(90), async { Ok(42) })
+            bounded_open(Duration::from_secs(90), None, async { Ok(42) })
                 .await
                 .unwrap(),
             42
@@ -1385,7 +1469,7 @@ mod open_budget_tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn open_budget_bounds_attempts_and_backoff_and_is_terminal() {
         let started = tokio::time::Instant::now();
-        let error = bounded_open::<()>(Duration::from_secs(90), async {
+        let error = bounded_open::<()>(Duration::from_secs(90), None, async {
             tokio::time::sleep(Duration::from_secs(90)).await;
             tokio::time::sleep(Duration::from_secs(3)).await;
             tokio::time::sleep(Duration::from_secs(90)).await;

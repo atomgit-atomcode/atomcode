@@ -207,13 +207,10 @@ pub struct OpenAiCompatConfig {
     /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
-    /// accepts the connection but never responds would otherwise hang FOREVER —
-    /// no overall request timeout is set here (deliberately: a streaming response
-    /// must not be capped). Applied to EACH attempt, not to the retry loop as a
-    /// whole, so a slow-but-alive gateway still gets the full budget. `send()`
-    /// resolves once the response HEAD arrives, so this never truncates a slow body.
-    /// A timeout is classified retryable.
+    /// Per-attempt HTTP response-header timeout (default 300s). `send()` resolves
+    /// when headers arrive, so this never caps response-body streaming. The OPEN
+    /// retry loop additionally has a cumulative 2x allowance; native requests
+    /// share it across outer retries and include their reserved backoff.
     pub open_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
@@ -309,7 +306,7 @@ impl OpenAiCompatConfig {
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
             first_token_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
+            open_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             request_signer: None,
@@ -1209,6 +1206,7 @@ pub(crate) async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
         open_timeout,
+        request_recovery,
         open_stream_attempts(
             client,
             url,
@@ -1334,7 +1332,7 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
+                        "open failed: 等待模型服务响应头超过 {}s",
                         open_timeout.as_secs()
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),

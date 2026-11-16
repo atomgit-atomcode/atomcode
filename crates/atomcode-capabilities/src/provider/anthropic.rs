@@ -75,7 +75,7 @@ pub struct AnthropicConfig {
     /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call — see the matching
+    /// Per-attempt response-header timeout (default 300s) — see the matching
     /// field on `OpenAiCompatConfig`. A gateway that accepts the connection but never
     /// responds would otherwise hang forever. A timeout is classified retryable.
     pub open_timeout: Duration,
@@ -118,7 +118,7 @@ impl AnthropicConfig {
             send_sampling_params: false,
             idle_timeout: Duration::from_secs(120),
             first_token_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
+            open_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
@@ -253,7 +253,8 @@ impl LlmProvider for AnthropicProvider {
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
         let policy = retry::policy_for_call(&self.cfg.retry, options);
-        let caller_recovers = options.request_recovery.is_some();
+        let request_recovery = options.request_recovery.clone();
+        let caller_recovers = request_recovery.is_some();
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
@@ -273,7 +274,7 @@ impl LlmProvider for AnthropicProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
-            caller_recovers,
+            request_recovery.as_ref(),
             open_timeout,
         )
         .await?;
@@ -364,7 +365,7 @@ impl LlmProvider for AnthropicProvider {
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, caller_recovers, open_timeout).await
+                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, request_recovery.as_ref(), open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -461,11 +462,12 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
-    caller_recovers: bool,
+    request_recovery: Option<&atomcode_kernel::provider::RequestRecoveryBudget>,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
         open_timeout,
+        request_recovery,
         open_stream_attempts(
             client,
             url,
@@ -475,7 +477,7 @@ async fn open_stream(
             session_id,
             policy,
             rate_limit_retry_owner,
-            caller_recovers,
+            request_recovery.is_some(),
             open_timeout,
         ),
     )
@@ -542,7 +544,7 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
+                        "open failed: 等待模型服务响应头超过 {}s",
                         open_timeout.as_secs()
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),

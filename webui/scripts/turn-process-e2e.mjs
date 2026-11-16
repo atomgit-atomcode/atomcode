@@ -72,6 +72,12 @@ try {
   emit({type:'text',content:'LIVE_PROCESS'});
   emit({type:'tool_start',id:'read-live',name:'read',arguments:'{}'});
   emit({type:'tool_result',id:'read-live',name:'read',output:'ok',success:true,duration_ms:100});
+  emit({type:'provider_retry',message:'RETRY_DIAGNOSTIC_ONE'});
+  emit({type:'provider_retry',message:'RETRY_DIAGNOSTIC_TWO'});
+  await page.waitForTimeout(150);
+  assert.equal(await page.locator('.btn-stop:visible').count(),1,'Stop remains available during retry');
+  assert.equal(await page.locator('.provider-diagnostics:visible').count(),0,'no retry disclosure during the active request');
+  assert.equal(await page.getByText('RETRY_DIAGNOSTIC_ONE',{exact:true}).count(),0);
   emit({type:'text',content:'LIVE_FINAL'});
   await page.getByText('LIVE_PROCESS',{exact:true}).waitFor();
   await page.getByText('LIVE_FINAL',{exact:true}).waitFor();
@@ -84,6 +90,9 @@ try {
   await page.screenshot({path:'/tmp/atomcode-turn-process.png',fullPage:true});
   await page.locator('.turn-process-toggle').last().click();
   await page.getByText('LIVE_PROCESS',{exact:true}).waitFor();
+  const diagnostic=page.locator('.provider-diagnostics').last();
+  await diagnostic.locator('summary').click();
+  assert.match(await diagnostic.locator('pre').textContent(),/RETRY_DIAGNOSTIC_ONE\nRETRY_DIAGNOSTIC_TWO/);
   emit({type:'user',text:'CANCEL_REQUEST'});emit({type:'state',running:true});
   emit({type:'text',content:'CANCEL_PROCESS'});
   emit({type:'tool_start',id:'cancel-tool',name:'read',arguments:'{}'});

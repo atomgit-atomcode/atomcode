@@ -4287,6 +4287,9 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Routine automatic retry diagnostics; clients keep these out of live status.
+    #[serde(rename = "provider_retry")]
+    ProviderRetry { message: String },
     /// Auxiliary session persistence failed. Clients must display this outside
     /// the assistant message timeline.
     #[serde(rename = "persistence_warning")]
@@ -4643,6 +4646,26 @@ mod chat_event_type_tests {
             let json = serde_json::to_value(done).unwrap();
             assert_eq!(json["stop_reason"], expected);
         }
+    }
+
+    #[test]
+    fn automatic_retries_are_diagnostics_instead_of_warnings() {
+        let mut projector = ChatRuntimeProjector::default();
+        let wire = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::ProviderRetry {
+                    attempt: 1,
+                    max_attempts: 5,
+                    backoff_secs: 3,
+                    reason: "timeout".into(),
+                },
+            ),
+            "session-1",
+        );
+        let wire = &wire[0];
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "provider_retry");
+        assert!(json["message"].as_str().unwrap().contains("timeout"));
     }
 
     #[test]
@@ -5288,7 +5311,7 @@ impl ChatRuntimeProjector {
                 max_attempts,
                 backoff_secs,
                 reason,
-            } => vec![ChatEvent::Warning {
+            } => vec![ChatEvent::ProviderRetry {
                 message: format!(
                     "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
                 ),
@@ -10416,6 +10439,7 @@ mod tests {
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
+            response_header_timeout_secs: None,
         }
     }
 

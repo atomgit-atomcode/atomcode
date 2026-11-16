@@ -58,6 +58,7 @@ pub(crate) fn reason(error: &str) -> String {
         }
         None if partial_reply_preserved(error) => Msg::ProviderPartialReply,
         None if lower.contains("without sending tls close_notify") => Msg::ProviderTlsInterrupted,
+        None if error.contains("等待模型服务响应头") => Msg::ProviderResponseTimeout,
         None if lower.contains("connection timed out") || error.contains("等待首字节超过") => {
             Msg::ProviderConnectionTimeout
         }
@@ -108,6 +109,7 @@ pub(crate) fn advice(error: &str) -> String {
         {
             Msg::ProviderCheckConnection
         }
+        None if reason(error) == t(Msg::ProviderResponseTimeout) => Msg::ProviderTryAgain,
         _ if reason(error) == t(Msg::ProviderConnectionError) => Msg::ProviderCheckConnection,
         Some(429 | 500 | 502 | 503 | 504) => Msg::ProviderTryAgain,
         None if error.to_ascii_lowercase().contains("overloaded") => Msg::ProviderTryAgain,
@@ -126,7 +128,6 @@ pub(crate) fn advice(error: &str) -> String {
 /// no folded rows; /errors still exposes every original failure.
 #[derive(Debug)]
 pub(crate) struct RetryBlock {
-    pub prolonged: bool,
     pub detail: String,
 }
 impl Content for RetryBlock {
@@ -134,21 +135,10 @@ impl Content for RetryBlock {
         "provider_diagnostic"
     }
     fn content_hash(&self) -> ContentHash {
-        hash_of(&[
-            "retry_group",
-            if self.prolonged { "long" } else { "quiet" },
-            &self.detail,
-        ])
+        hash_of(&["retry_group", &self.detail])
     }
-    fn summary_lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        if self.prolonged {
-            NoticeBlock {
-                detail: t(Msg::ProviderRetryProlonged).into_owned(),
-            }
-            .lines(ctx)
-        } else {
-            Vec::new()
-        }
+    fn summary_lines(&self, _ctx: &RenderCtx) -> Vec<Line> {
+        Vec::new()
     }
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let mut lines = self.summary_lines(ctx);
@@ -218,6 +208,15 @@ mod tests {
         assert_eq!(reason(tls), t(Msg::ProviderTlsInterrupted));
         let timeout = "open failed: Connection timed out (os error 110)";
         assert_eq!(reason(timeout), t(Msg::ProviderConnectionTimeout));
+        for timeout in [
+            "open failed: 等待模型服务响应头超过 300s",
+            "等待模型服务响应头超时：连接与重试累计等待已达到 600s，请稍后重试",
+        ] {
+            assert_eq!(reason(timeout), t(Msg::ProviderResponseTimeout));
+            assert!(advice(timeout).contains(&*t(Msg::ProviderTryAgain)));
+            assert!(!advice(timeout).contains(&*t(Msg::ProviderCheckConnection)));
+        }
+
         let partial = "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复。详情: connection timed out; without sending TLS close_notify";
         assert_eq!(reason(partial), t(Msg::ProviderPartialReply));
         assert!(advice(partial).contains(&*t(Msg::ProviderContinueReply)));

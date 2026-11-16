@@ -102,6 +102,31 @@ impl DefaultCodingProviderFactory {
     }
 }
 
+/// Model/provider overrides win over the process-wide fallback. Never disable
+/// the deadline with zero or an invalid environment value.
+fn response_header_timeout(cfg: &CodingAgentConfig) -> std::time::Duration {
+    resolve_response_header_timeout(
+        cfg.response_header_timeout_secs,
+        std::env::var("ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+fn resolve_response_header_timeout(
+    configured: Option<std::num::NonZeroU64>,
+    env: Option<&str>,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        configured
+            .map(|n| n.get())
+            .or_else(|| {
+                env.and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(300),
+    )
+}
+
 impl CodingProviderFactory for DefaultCodingProviderFactory {
     fn build(
         &self,
@@ -120,6 +145,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.context_window = cfg.context_window;
                 ac.idle_timeout = cfg.stream_timeout;
                 ac.first_token_timeout = cfg.first_token_timeout;
+                ac.open_timeout = response_header_timeout(cfg);
                 ac.max_tokens = default_max_tokens(cfg.context_window);
                 ac.supports_vision = cfg.supports_vision;
                 ac.effort_levels = cfg.effort_levels.clone();
@@ -165,6 +191,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.first_token_timeout = cfg.first_token_timeout;
+                pc.open_timeout = response_header_timeout(cfg);
                 pc.supports_vision = cfg.supports_vision;
                 pc.effort_levels = cfg.effort_levels.clone();
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
@@ -195,6 +222,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.first_token_timeout = cfg.first_token_timeout;
+                pc.open_timeout = response_header_timeout(cfg);
                 pc.supports_vision = cfg.supports_vision;
                 pc.effort_levels = cfg.effort_levels.clone();
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
@@ -320,6 +348,7 @@ pub fn derive_tier_config(
     tier.headers = provider.headers.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
     tier.retry_max_attempts = provider.retry_max_attempts;
+    tier.response_header_timeout_secs = provider.response_header_timeout_secs;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_model_providers = None;
@@ -381,6 +410,7 @@ pub fn derive_tier_config_from_resolved(
     tier.headers = resolved.headers.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
     tier.retry_max_attempts = resolved.retry_max_attempts;
+    tier.response_header_timeout_secs = resolved.response_header_timeout_secs;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_model_providers = None;
@@ -699,5 +729,82 @@ mod tests {
 
         let tier = derive_tier_config(&config("openai"), "tier-provider", &provider);
         assert_eq!(tier.retry_max_attempts, Some(6));
+    }
+}
+
+#[cfg(test)]
+mod response_header_timeout_tests {
+    use super::*;
+    #[test]
+    fn runtime_and_tiers_take_the_selected_models_timeout() {
+        let source: atomcode_config::Config = toml::from_str(
+            r#"
+[providers.slow]
+type = "anthropic"
+model = "slow"
+response_header_timeout_secs = 600
+[providers.fast]
+type = "openai"
+model = "fast"
+"#,
+        )
+        .unwrap();
+        let runtime = crate::CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            crate::config::product_dirs_from_env(),
+            Some("slow"),
+            None,
+            false,
+            true,
+        );
+        let base = runtime.agent_config();
+        assert_eq!(
+            response_header_timeout(&base),
+            std::time::Duration::from_secs(600)
+        );
+        let tier = derive_tier_config(&base, "fast", &source.providers["fast"]);
+        assert!(
+            tier.response_header_timeout_secs.is_none(),
+            "do not inherit the host override"
+        );
+        let resolved = source.resolve_model(Some("fast")).unwrap();
+        assert!(derive_tier_config_from_resolved(&base, &resolved)
+            .response_header_timeout_secs
+            .is_none());
+        let mut switched = base;
+        crate::config::apply_provider_config(&mut switched, &resolved.to_provider_config());
+        assert!(switched.response_header_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn provider_override_wins_and_invalid_env_cannot_disable_the_deadline() {
+        use std::{num::NonZeroU64, time::Duration};
+        assert_eq!(
+            resolve_response_header_timeout(None, None),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_response_header_timeout(None, Some("600")),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            resolve_response_header_timeout(NonZeroU64::new(120), Some("600")),
+            Duration::from_secs(120)
+        );
+        for invalid in ["0", "-1", "invalid", ""] {
+            assert_eq!(
+                resolve_response_header_timeout(None, Some(invalid)),
+                Duration::from_secs(300)
+            );
+        }
+        assert_eq!(
+            AnthropicConfig::new("", "http://localhost", "test").open_timeout,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            OpenAiCompatConfig::new("", "http://localhost", "test").open_timeout,
+            Duration::from_secs(300)
+        );
     }
 }

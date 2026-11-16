@@ -236,6 +236,9 @@ pub struct CodingAgentConfig {
     /// An explicit upstream retry count takes precedence.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     /// Retry count after the initial attempt, sourced from `[network]
     /// upstream_retry_max_attempts`. When set, the native shared total is this
     /// count plus one, taking precedence over the provider's total-attempt cap.
@@ -353,6 +356,9 @@ pub struct CodingRuntimeConfig {
     /// transient retry, 429 and stream continuation. `None` uses six.
     /// An explicit upstream retry count takes precedence.
     pub retry_max_attempts: Option<u32>,
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     /// Retry count after the first attempt (`[network] upstream_retry_max_attempts`).
     /// Takes precedence over the provider's shared total-attempt cap.
     pub upstream_retry_max_attempts: Option<u32>,
@@ -531,7 +537,7 @@ pub fn describe_config_file_for(
          a `[providers.<name>]` entry (`type`, `model`, `api_key`, `base_url`, …); \
          `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
-         highest the capable one.\n\
+         highest the capable one. `response_header_timeout_secs` sets a positive HTTP response-header wait (default 300 seconds), with a cumulative OPEN/retry allowance of twice that value; streaming after headers is separate. `ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS` supplies the fallback when unset.\n\
          - `[skills]` `extra_dirs`: additional trusted skill roots, e.g. [`~/shared-skills`]. \
          Relative paths use the session working directory; `~` uses the user home. Standard \
          roots take precedence over extra roots; later extra roots win among themselves. \
@@ -744,6 +750,7 @@ impl CodingRuntimeConfig {
             headers: r.map(|r| r.headers.clone()).unwrap_or_default(),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
+            response_header_timeout_secs: r.and_then(|r| r.response_header_timeout_secs),
             upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
@@ -829,6 +836,7 @@ impl CodingRuntimeConfig {
         config.headers = self.headers.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.retry_max_attempts = self.retry_max_attempts;
+        config.response_header_timeout_secs = self.response_header_timeout_secs;
         config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
@@ -900,6 +908,7 @@ pub fn apply_provider_config(
     config.headers = provider.headers.clone();
     config.skip_tls_verify = provider.skip_tls_verify;
     config.retry_max_attempts = provider.retry_max_attempts;
+    config.response_header_timeout_secs = provider.response_header_timeout_secs;
 }
 
 /// A thunk the runtime supplies that constructs a (gateway-signed) tier provider. `Some` on
@@ -1354,6 +1363,7 @@ impl CodingAgentConfig {
             headers: Default::default(),
             skip_tls_verify: false,
             retry_max_attempts: None,
+            response_header_timeout_secs: None,
             upstream_retry_max_attempts: None,
             subagent_config: None,
             subagent_fast_provider: None,

@@ -141,6 +141,7 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  retryDiagnostics?: string[];
   turnStop?: string;
   sourceSeq?: number;
   specPinned?: boolean;
@@ -1789,6 +1790,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       case 'context_summary': return e;
       case 'context_compacting': return e;
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
+      case 'provider_retry': return { type: 'provider_retry', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
       case 'persistence_warning': return { type: 'persistence_warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
@@ -2940,6 +2942,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           stopReason: 'error',
           sessionId: activeIdRef.current ?? undefined,
           message: event.message,
+        });
+        break;
+
+      case 'provider_retry':
+        // Presentation only: the server retains ownership of retries and termination.
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== 'assistant') return prev;
+          return [...prev.slice(0, -1), { ...last,
+            retryDiagnostics: [...(last.retryDiagnostics ?? []), event.message] }];
         });
         break;
 
@@ -5075,7 +5087,7 @@ function AssistantMessageView({
   const groups = pollGroups ?? groupEmptyPolls(search.trim() ? [] : [msg]);
   const onlyHiddenPolls = msg.parts.every(part => part.kind === 'tool'
     ? groups.hidden.has(part.tool.id) : part.kind === 'text' && !part.text.trim());
-  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0) return null;
+  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length) return null;
 
   return (
     <div class={cls} ref={searchRef}>
@@ -5137,6 +5149,12 @@ function AssistantMessageView({
           {artifactError && <div class="turn-artifact-error" role="status">{artifactError}</div>}
         </div>
       )}
+      {!busy && msg.retryDiagnostics?.length ? (
+        <details class="provider-diagnostics">
+          <summary>{t('chat.requestDiagnostics')}</summary>
+          <pre>{msg.retryDiagnostics.join('\n')}</pre>
+        </details>
+      ) : null}
       {(copyBtn || showTimestamp) && (
         <div class="msg-actions msg-actions-left">
           {copyBtn}

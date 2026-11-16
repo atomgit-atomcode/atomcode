@@ -15387,6 +15387,7 @@ mod tests {
             ephemeral: false,
             capable_model: Some(rank),
             retry_max_attempts: None,
+            response_header_timeout_secs: None,
         }
     }
 
