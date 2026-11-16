@@ -739,6 +739,53 @@ async fn a_new_session_is_a_session_change_and_the_rebuilt_app_feeds_the_same_ch
 }
 
 #[tokio::test]
+async fn resume_distinguishes_an_empty_session_from_a_missing_one() {
+    use atomcode_capabilities::session::{SessionManager, SessionMeta};
+    use atomcode_kernel::session::SessionHeader;
+    let env = env();
+    let mut connection = connected(&env).await;
+    let source = connection.session.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let target = "empty-resume-target";
+    let lease = manager.acquire_lease(target).unwrap();
+    let mut meta = SessionMeta::new(target, env.project.path().to_string_lossy().as_ref(), 1);
+    meta.owner = atomcode_capabilities::session::manager::StorageOwner::Native;
+    manager
+        .create_event_session(&lease, &SessionHeader::new(target), &meta)
+        .unwrap();
+    drop(lease);
+    for (target, empty) in [(target, true), ("missing-resume-target", false)] {
+        let result = connection
+            .control
+            .call(HostCommand::Resume {
+                session: source.clone(),
+                target: target.into(),
+            })
+            .await;
+        if empty {
+            assert!(
+                matches!(result, Err(HostError::Failed { message }) if message.contains("no messages"))
+            );
+        } else {
+            assert_eq!(result, Err(HostError::NotFound));
+        }
+    }
+    connection.commands.send(subscribe(&source)).unwrap();
+    connection
+        .commands
+        .send(message("still on the original session"))
+        .unwrap();
+    let events = through_turn(&mut connection).await;
+    assert_eq!(
+        user_messages(&events, &source),
+        vec!["still on the original session"]
+    );
+}
+
+#[tokio::test]
 async fn a_stored_session_is_listed_and_resumed_with_its_history() {
     let env = env();
     let mut connection = connected(&env).await;

@@ -34,7 +34,7 @@ use atomcode_kernel::session::{LoggedEvent, SessionEvent};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
-use crate::host::{HostConfig, RuntimeControl};
+use crate::host::{find_switchable_entry, HostConfig, RuntimeControl};
 
 /// 后台最多放这么多个会话。与 tuix 一致。
 pub const MOST: usize = 16;
@@ -1980,22 +1980,6 @@ impl HostControl for Background {
     }
 }
 
-/// The destination of a shared project switch, looked up in the catalog. A
-/// session with no messages is found but not switchable: say so, instead of
-/// answering "not found" for a session that exists.
-fn find_switchable_entry<'a>(
-    entries: &'a [atomcode_capabilities::session::CatalogEntry],
-    target: &str,
-) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
-    match entries.iter().find(|entry| entry.id == target) {
-        Some(entry) if entry.message_count > 0 => Ok(entry),
-        Some(_) => Err(HostError::Failed {
-            message: "That session has no messages yet, so there is nothing to switch to.".into(),
-        }),
-        None => Err(HostError::NotFound),
-    }
-}
-
 // Keep actionable refusals typed across the embedded-driver boundary.
 fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::HubError {
     use atomcode_daemon::live_hub::HubError;
@@ -2212,38 +2196,6 @@ mod tests {
         });
         assert!(!fallback.contains("CodeRewindUnavailable"), "{fallback}");
         assert!(!fallback.contains("internal detail"), "{fallback}");
-    }
-
-    #[test]
-    fn find_switchable_entry_tells_missing_from_empty() {
-        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
-        fn entry(id: &str, message_count: usize) -> CatalogEntry {
-            CatalogEntry {
-                id: id.into(),
-                name: String::new(),
-                fork_root_id: None,
-                project_bucket: "bucket".into(),
-                working_dir: std::path::PathBuf::from("/tmp"),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                message_count,
-                turn_count: 0,
-                presence: CatalogPresence::NativeOnly,
-                needs_newer_version: false,
-                origin: atomcode_capabilities::session::manager::SessionOrigin::Manual,
-            }
-        }
-        let entries = vec![entry("empty", 0), entry("full", 2)];
-        assert!(matches!(
-            find_switchable_entry(&entries, "ghost"),
-            Err(HostError::NotFound)
-        ));
-        assert!(matches!(
-            find_switchable_entry(&entries, "empty"),
-            Err(HostError::Failed { message }) if message.contains("no messages")
-        ));
-        let found = find_switchable_entry(&entries, "full").expect("switchable");
-        assert_eq!(found.id, "full");
     }
 
     /// 范围里有几个文件在变,是真的去问 git。

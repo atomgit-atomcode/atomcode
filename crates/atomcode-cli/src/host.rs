@@ -2121,13 +2121,7 @@ impl HostControl for RuntimeControl {
                 let scan = SessionManager::scan_all(
                     atomcode_coding::config::product_dirs_from_env().user(),
                 );
-                let Some(entry) = scan
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id == target && entry.message_count > 0)
-                else {
-                    return Err(HostError::NotFound);
-                };
+                let entry = find_switchable_entry(&scan.entries, &target)?;
                 if entry.needs_newer_version {
                     return Err(HostError::Failed {
                         message: format!(
@@ -3323,6 +3317,22 @@ fn file_change(
     }
 }
 
+/// The destination of a session switch, looked up in the catalog. A
+/// session with no messages is found but not switchable: say so, instead of
+/// answering "not found" for a session that exists.
+pub(crate) fn find_switchable_entry<'a>(
+    entries: &'a [atomcode_capabilities::session::CatalogEntry],
+    target: &str,
+) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
+    match entries.iter().find(|entry| entry.id == target) {
+        Some(entry) if entry.message_count > 0 => Ok(entry),
+        Some(_) => Err(HostError::Failed {
+            message: "That session has no messages yet, so there is nothing to switch to.".into(),
+        }),
+        None => Err(HostError::NotFound),
+    }
+}
+
 pub fn refused(error: RuntimeError) -> HostError {
     {
         match error {
@@ -3647,6 +3657,38 @@ fn catalog_tool(listing: atomcode_harness::seams::ToolListing) -> atomcode_host_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_switchable_entry_tells_missing_from_empty() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+        fn entry(id: &str, message_count: usize) -> CatalogEntry {
+            CatalogEntry {
+                id: id.into(),
+                name: String::new(),
+                fork_root_id: None,
+                project_bucket: "bucket".into(),
+                working_dir: std::path::PathBuf::from("/tmp"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                message_count,
+                turn_count: 0,
+                presence: CatalogPresence::NativeOnly,
+                needs_newer_version: false,
+                origin: atomcode_capabilities::session::manager::SessionOrigin::Manual,
+            }
+        }
+        let entries = vec![entry("empty", 0), entry("full", 2)];
+        assert!(matches!(
+            find_switchable_entry(&entries, "ghost"),
+            Err(HostError::NotFound)
+        ));
+        assert!(matches!(
+            find_switchable_entry(&entries, "empty"),
+            Err(HostError::Failed { message }) if message.contains("no messages")
+        ));
+        let found = find_switchable_entry(&entries, "full").expect("switchable");
+        assert_eq!(found.id, "full");
+    }
 
     /// 运行时说了话的事件,不能在转给屏幕的路上被 `_ => None` 吃掉。
     ///
