@@ -2433,6 +2433,18 @@ impl CodingRuntimeHandle {
         self.deliver(None, input, None).await
     }
 
+    /// Admit a prepared input only to the runtime generation it was prepared for.
+    /// Unlike `submit`, this must not sample the generation again after a driver
+    /// has awaited preprocessing: a session switch may have replaced the target.
+    pub async fn submit_at_generation(
+        &self,
+        generation: u64,
+        input: UserInput,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        self.deliver_at_generation(generation, None, input, None)
+            .await
+    }
+
     /// As [`Self::submit`], carrying the driver's own id for this message.
     ///
     /// The harness answers a claimed message under the id its command arrived
@@ -2462,13 +2474,29 @@ impl CodingRuntimeHandle {
         input: UserInput,
         extra_context: Option<String>,
     ) -> Result<SubmitReceipt, RuntimeError> {
-        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let state = self.state.load(Ordering::Acquire);
+        self.deliver_at_generation(
+            runtime_state_generation(state),
+            receipt,
+            input,
+            extra_context,
+        )
+        .await
+    }
+
+    async fn deliver_at_generation(
+        &self,
+        generation: u64,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+        input: UserInput,
+        extra_context: Option<String>,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
                 invocation: None,
-                generation: runtime_state_generation(state),
+                generation,
                 input,
                 receipt,
                 extra_context,
@@ -16551,6 +16579,41 @@ mod tests {
             Err(RuntimeError::DeliveryFailed)
         );
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prepared_submit_cannot_enter_a_replacement_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().into();
+        start.agent.dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".submit-test");
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let captured_generation = runtime.handle.status().generation;
+        let changed = runtime.handle.fresh_session().await.unwrap();
+        assert_ne!(changed.generation.0, captured_generation);
+        let before = runtime.handle.snapshot().await.unwrap();
+
+        assert_eq!(
+            runtime
+                .handle
+                .submit_at_generation(captured_generation, UserInput::from("belongs to A"))
+                .await,
+            Err(RuntimeError::Unavailable)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(runtime.handle.snapshot().await.unwrap(), before);
+        runtime
+            .handle
+            .submit_at_generation(changed.generation.0, UserInput::from("belongs to B"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot.messages.iter().any(|m| m.text == "belongs to B"));
+        assert!(!snapshot.messages.iter().any(|m| m.text == "belongs to A"));
         runtime.handle.shutdown().await.unwrap();
     }
 

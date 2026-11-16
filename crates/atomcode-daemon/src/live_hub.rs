@@ -796,14 +796,33 @@ impl LiveViewHub {
         echo_input: UserInput,
         client_input_id: Option<String>,
     ) -> Result<SubmitReceipt, HubError> {
-        let (binding, handle) = self.bound_handle()?;
-        let correlation_registered = if let Some(client_input_id) = client_input_id.clone() {
+        let (binding, _) = self.bound_handle()?;
+        self.submit_confirmed_with_echo_for(&binding, runtime_input, echo_input, client_input_id)
+            .await
+    }
+
+    /// Preserve the binding captured before HTTP input preparation. Both the
+    /// hub identity and the runtime generation must still match at admission.
+    pub async fn submit_confirmed_with_echo_for(
+        &self,
+        binding: &LiveBinding,
+        runtime_input: UserInput,
+        echo_input: UserInput,
+        client_input_id: Option<String>,
+    ) -> Result<SubmitReceipt, HubError> {
+        let handle = self.bound_handle_for(binding)?;
+        let correlation_registered = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(error) = &state.snapshot_error {
+                return Err(HubError::SnapshotUnavailable(error.clone()));
+            }
             let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
-            if current.identity.id != binding.id {
+            if current.identity.id != binding.id
+                || current.identity.generation != binding.generation
+            {
                 return Err(HubError::StaleBinding);
             }
-            if state.turn_active {
+            if let Some(client_input_id) = client_input_id.clone().filter(|_| state.turn_active) {
                 state.pending_web_steers.push_back(PendingWebSteer {
                     runtime_input: runtime_input.clone(),
                     client_input_id,
@@ -812,15 +831,16 @@ impl LiveViewHub {
             } else {
                 false
             }
-        } else {
-            false
         };
-        let receipt = handle.submit(runtime_input).await.map_err(|error| {
-            if correlation_registered {
-                self.remove_pending_web_steer(client_input_id.as_deref());
-            }
-            HubError::RuntimeRejected(error.to_string())
-        })?;
+        let receipt = handle
+            .submit_at_generation(binding.generation, runtime_input)
+            .await
+            .map_err(|error| {
+                if correlation_registered {
+                    self.remove_pending_web_steer(client_input_id.as_deref());
+                }
+                HubError::RuntimeRejected(error.to_string())
+            })?;
         let receipt_generation = match receipt {
             SubmitReceipt::Started { generation, .. }
             | SubmitReceipt::Steered { generation, .. }
@@ -2567,6 +2587,62 @@ mod tests {
 
     fn snapshot(text: &str) -> SessionSnapshot {
         SessionSnapshot::new(vec![Message::user(text)])
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prepared_message_does_not_follow_a_rebound_hub() {
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        let control = Arc::new(RealControl {
+            handle: runtime.handle.clone(),
+        });
+        hub.bind("A", project.path().into(), snapshot("A"), control.clone())
+            .unwrap();
+        let captured = hub.join().unwrap().binding;
+        // A projection failure discovered during preparation must still fail
+        // closed, just like an ordinary confirmed submission.
+        hub.state.lock().unwrap().snapshot_error = Some("projection failed".into());
+        let input = UserInput::from("only for A");
+        assert_eq!(
+            hub.submit_confirmed_with_echo_for(&captured, input.clone(), input, None)
+                .await,
+            Err(HubError::SnapshotUnavailable("projection failed".into()))
+        );
+        hub.state.lock().unwrap().snapshot_error = None;
+        // The HTTP handler is suspended preparing A's input; navigation wins.
+        hub.bind("B", project.path().into(), snapshot("B"), control)
+            .unwrap();
+        let mut view = hub.join().unwrap();
+        let input = UserInput::from("only for A");
+        assert_eq!(
+            hub.submit_confirmed_with_echo_for(
+                &captured,
+                input.clone(),
+                input,
+                Some("A-send".into())
+            )
+            .await,
+            Err(HubError::StaleBinding)
+        );
+        assert!(
+            runtime.commands.try_recv().is_err(),
+            "no message reached the agent"
+        );
+        assert!(
+            view.receiver.try_recv().is_err(),
+            "no accepted echo reached B"
+        );
+
+        let input = UserInput::from("only for B");
+        hub.submit_confirmed_with_echo_for(&view.binding, input.clone(), input, None)
+            .await
+            .unwrap();
+        assert!(matches!(runtime.commands.recv().await,
+            Some(atomcode_kernel::event::AgentCommand::SendMessage { text, .. }) if text == "only for B"));
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[test]

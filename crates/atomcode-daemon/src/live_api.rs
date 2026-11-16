@@ -2124,6 +2124,7 @@ pub(crate) async fn live_message(
             return Json(serde_json::json!({ "accepted": false, "error": error }));
         }
     };
+    let mut submission_binding = join.binding.clone();
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
     let mut provider_change_applied = true;
@@ -2165,7 +2166,10 @@ pub(crate) async fn live_message(
             match crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
                 .await
             {
-                Ok(_) => {
+                Ok(generation) => {
+                    // Only our own successful reload may advance the captured
+                    // target. Never reacquire whichever session is current.
+                    submission_binding.generation = generation.0;
                     provider_name = requested_provider;
                 }
                 // A turn is active, so this /live/message is a STEER that folds into
@@ -2239,6 +2243,7 @@ pub(crate) async fn live_message(
     );
     let (runtime_input, echo_input) = split_live_inputs(req.message, original_images, runtime_text);
     match crate::native_live::submit_confirmed_with_echo(
+        &submission_binding,
         runtime_input,
         echo_input,
         req.client_input_id,
