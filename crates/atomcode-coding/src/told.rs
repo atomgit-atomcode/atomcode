@@ -33,9 +33,25 @@ fn reminder(body: &str) -> String {
 
 /// What changed between two configurations the conversation ran on — the
 /// model, the reasoning effort, thinking — or `None` when none of those did.
-pub(crate) fn reconfigured(from: &CodingAgentConfig, to: &CodingAgentConfig) -> Option<String> {
+pub(crate) fn reconfigured(
+    from: &CodingAgentConfig,
+    to: &CodingAgentConfig,
+    used_tokens: Option<u64>,
+) -> Option<String> {
     let mut said = Vec::new();
     if from.provider_name != to.provider_name || from.model != to.model {
+        // The window is the NEW model's: a conversation that fit the old one
+        // may not fit here. The swap itself succeeds silently, and the
+        // mismatch would surface one message later as a provider error or a
+        // silent auto-compaction — nothing would point back at the switch.
+        // Say it now, while the cause is on screen. The trigger mirrors the
+        // product's own compaction point — `compact_threshold` (default 0.7,
+        // config.rs) of the window, capped by `compact_token_limit`, the same
+        // pair the `compaction-tail` patch hands to loop_policy
+        // (crates/atomcode-coding/src/on_harness.rs).
+        let next_window = u64::from(to.context_window);
+        let compact_threshold = to.compact_threshold;
+        let compact_token_limit = to.compact_token_limit;
         let name = |config: &CodingAgentConfig| {
             if from.provider_name == to.provider_name {
                 format!("`{}`", config.model)
@@ -48,6 +64,30 @@ pub(crate) fn reconfigured(from: &CodingAgentConfig, to: &CodingAgentConfig) -> 
             "The model for this conversation was switched from {from} to {to}. The replies \
              above this point were written by {from}; from here on you are {to}."
         ));
+        if next_window > 0 {
+            if let Some(used) = used_tokens {
+                let mut trigger = (next_window as f32 * compact_threshold) as u64;
+                if let Some(limit) = compact_token_limit {
+                    trigger = trigger.min(u64::from(limit));
+                }
+                if used >= next_window {
+                    said.push(format!(
+                        "The conversation is about {used} tokens, at or past this model's \
+                         {next_window}-token window: the next message cannot fit into it. The \
+                         person can compact the conversation (for example with /compact) or \
+                         switch to a model with a larger window."
+                    ));
+                } else if trigger > 0 && used > trigger {
+                    said.push(format!(
+                        "The conversation is about {used} tokens, over this model's configured \
+                         compaction trigger ({trigger} of a {next_window}-token window): an \
+                         automatic compaction will likely run before the next message. The \
+                         person can also compact first (for example with /compact) to fold it \
+                         on their own terms."
+                    ));
+                }
+            }
+        }
     }
     let effort = from.chat_options.reasoning_effort;
     let next_effort = to.chat_options.reasoning_effort;
@@ -326,8 +366,142 @@ mod tests {
             ".",
             crate::config::product_dirs_from_env(),
         );
-        assert_eq!(reconfigured(&config, &config), None);
+        assert_eq!(reconfigured(&config, &config, None), None);
         assert_eq!(mode_changed(RuntimeMode::Plan, RuntimeMode::Plan), None);
+    }
+
+    #[test]
+    fn a_switch_past_the_new_window_says_the_next_message_cannot_fit() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        new.context_window = 128_000;
+        let said =
+            reconfigured(&old, &new, Some(200_000)).expect("a switch past the new window is told");
+        assert!(said.contains("cannot fit"), "{said}");
+        assert!(said.contains("128000"), "the window is named: {said}");
+    }
+
+    #[test]
+    fn a_switch_over_the_compaction_threshold_says_what_comes_next() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        new.context_window = 128_000;
+        let said =
+            reconfigured(&old, &new, Some(100_000)).expect("a switch over the threshold is told");
+        assert!(said.contains("automatic compaction"), "{said}");
+        assert!(!said.contains("cannot fit"), "{said}");
+    }
+
+    #[test]
+    fn a_switch_within_the_window_or_an_unknown_window_stays_quiet() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        new.context_window = 128_000;
+        // 50_000 of 128_000 is under the compaction threshold: the switch is
+        // still told, but without a window warning.
+        let said = reconfigured(&old, &new, Some(50_000)).expect("the switch itself is told");
+        assert!(
+            !said.contains("compaction threshold") && !said.contains("cannot fit"),
+            "no window warning under the threshold: {said}"
+        );
+        // An unknown window cannot be judged; keep the quiet.
+        new.context_window = 0;
+        let said = reconfigured(&old, &new, Some(200_000)).expect("the switch itself is told");
+        assert!(
+            !said.contains("tokens, past") && !said.contains("tokens, over"),
+            "no window warning for an unknown window: {said}"
+        );
+    }
+
+    #[test]
+    fn the_trigger_follows_the_configured_compaction_threshold() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        // 92_000 of 128_000 is 72% — past the product default trigger (0.7 →
+        // 89_600) yet under a hard-coded 0.75: the hint must appear because
+        // the trigger reads the config, not a constant.
+        let said = reconfigured(&old, &new, Some(92_000)).expect("over the configured trigger");
+        assert!(said.contains("automatic compaction"), "{said}");
+    }
+
+    #[test]
+    fn a_raised_threshold_pushes_the_hint_out() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        new.compact_threshold = 0.9;
+        // 100_000 of 128_000 is 78% — under a 0.9 trigger (115_200): quiet.
+        let said = reconfigured(&old, &new, Some(100_000)).expect("the switch itself is told");
+        assert!(
+            !said.contains("automatic compaction") && !said.contains("cannot fit"),
+            "no window warning under a raised threshold: {said}"
+        );
     }
 
     #[test]
