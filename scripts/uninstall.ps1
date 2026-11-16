@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Group2Files = @("auth.toml","mcp.json","config.toml","ATOMCODE.md")
+$Group2Files = @("auth.toml","mcp.json","config.toml","ATOMCODE.md","auth/ssh-keys.json","auth/ssh-keys.lock")
 $Group3Files = @("history","input_history.txt","recent_dirs.txt","codingplan_sync.json","device_id")
 $Group3Dirs  = @("staged","telemetry","plugins","commands","skills")
 $Group3Prefixes = @("notice.")
