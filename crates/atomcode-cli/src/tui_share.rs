@@ -460,9 +460,8 @@ async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String
         .arg(format!("http://127.0.0.1:{port}"))
         .arg("--supervise-daemon")
         .arg("false")
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .kill_on_drop(true);
+    crate::relay::capture_relay_output(&mut command, "app");
     if let Some(name) = &machine {
         command.arg("--machine-name").arg(name);
     }

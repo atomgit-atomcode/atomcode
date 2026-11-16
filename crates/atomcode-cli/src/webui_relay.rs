@@ -205,9 +205,8 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
                     "--supervise-daemon",
                     "false",
                 ])
-                .kill_on_drop(true)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                .kill_on_drop(true);
+            crate::relay::capture_relay_output(&mut command, "webui");
             if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
                 .ok()
                 .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
