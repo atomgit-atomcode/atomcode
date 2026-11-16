@@ -642,12 +642,13 @@ fn build_request_body(
     } else {
         "anthropic".to_owned()
     };
-    let (system, msgs) = format_messages_for_provider(
+    let (system, msgs) = format_messages_with_cache_boundaries(
         messages,
         cfg.thinking,
         cfg.supports_vision,
         &source,
         cfg.deepseek_messages,
+        !cfg.deepseek_messages,
     );
     if let Some(s) = system {
         body.insert("system".into(), json!(s));
@@ -732,56 +733,54 @@ fn build_request_body(
     body
 }
 
-/// Place markers only after wire messages have been merged. Tools and system
-/// reserve two stable prefixes; up to two recent message boundaries cover the
-/// rolling conversation. Never mark signed/generated thinking blocks.
+/// Tools and system reserve two stable prefixes. Conversation markers are selected
+/// from message provenance before merging, so request-only reminders stay outside.
 fn apply_prompt_cache(body: &mut Value) {
     let marker = json!({"type": "ephemeral"});
-    let mut remaining = 4usize;
     if let Some(tool) = body
         .get_mut("tools")
         .and_then(Value::as_array_mut)
         .and_then(|t| t.last_mut())
     {
         tool["cache_control"] = marker.clone();
-        remaining -= 1;
     }
     if let Some(system) = body.get_mut("system") {
         if let Some(text) = system.as_str().filter(|s| !s.is_empty()) {
-            *system = json!([{"type": "text", "text": text, "cache_control": marker.clone()}]);
-            remaining -= 1;
+            *system = json!([{"type": "text", "text": text, "cache_control": marker}]);
         }
     }
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        let mut marked = 0;
-        for message in messages.iter_mut().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let Some(content) = message.get_mut("content") else {
-                continue;
-            };
-            if let Some(text) = content.as_str().filter(|s| !s.is_empty()) {
-                *content = json!([{"type": "text", "text": text}]);
-            }
-            let Some(blocks) = content.as_array_mut() else {
-                continue;
-            };
-            if let Some(block) = blocks.iter_mut().rev().find(|block| {
-                matches!(
-                    block.get("type").and_then(Value::as_str),
-                    Some("text" | "image" | "tool_use" | "tool_result")
-                ) && !(block["type"] == "text" && block["text"].as_str().is_none_or(str::is_empty))
-            }) {
-                block["cache_control"] = marker.clone();
-                remaining -= 1;
-                // Keep the strategy small: at most two rolling messages.
-                marked += 1;
-                if marked == 2 {
-                    break;
-                }
-            }
+}
+
+fn cacheable_block(block: &Value) -> bool {
+    matches!(
+        block["type"].as_str(),
+        Some("text" | "image" | "tool_use" | "tool_result")
+    ) && !(block["type"] == "text" && block["text"].as_str().is_none_or(str::is_empty))
+}
+
+fn cache_boundary(message: &Value) -> Option<usize> {
+    let content = &message["content"];
+    if let Some(text) = content.as_str() {
+        return (!text.is_empty()).then_some(0);
+    }
+    content.as_array()?.iter().rposition(cacheable_block)
+}
+
+/// Mark at most two stable conversation boundaries BEFORE adjacent users merge.
+/// Converting a selected string to a block also keeps a later reminder separate
+/// instead of joining it into the cached text. Never mark signed thinking.
+fn mark_recent_message_boundaries(messages: &mut [(Value, Option<usize>)]) {
+    for (message, boundary) in messages
+        .iter_mut()
+        .rev()
+        .filter(|(_, b)| b.is_some())
+        .take(2)
+    {
+        let content = &mut message["content"];
+        if let Some(text) = content.as_str() {
+            *content = json!([{"type":"text", "text":text}]);
         }
+        content[boundary.unwrap()]["cache_control"] = json!({"type":"ephemeral"});
     }
 }
 
@@ -802,12 +801,31 @@ fn format_messages_with_vision(
     format_messages_for_provider(messages, echo_thinking, supports_vision, "anthropic", false)
 }
 
+#[cfg(test)]
 fn format_messages_for_provider(
     messages: &[Message],
     echo_thinking: bool,
     supports_vision: bool,
     reasoning_source: &str,
     deepseek: bool,
+) -> (Option<String>, Vec<Value>) {
+    format_messages_with_cache_boundaries(
+        messages,
+        echo_thinking,
+        supports_vision,
+        reasoning_source,
+        deepseek,
+        false,
+    )
+}
+
+fn format_messages_with_cache_boundaries(
+    messages: &[Message],
+    echo_thinking: bool,
+    supports_vision: bool,
+    reasoning_source: &str,
+    deepseek: bool,
+    cache: bool,
 ) -> (Option<String>, Vec<Value>) {
     // Leading System messages lift to the top-level `system` (joined). Anthropic has no
     // system message ROLE on the wire.
@@ -834,24 +852,23 @@ fn format_messages_for_provider(
         Some(system_text)
     };
 
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut out: Vec<(Value, Option<usize>)> = Vec::with_capacity(messages.len());
     let mut i = 0;
     while i < messages.len() {
         let m = &messages[i];
         match m.role {
             Role::System => {} // lifted above
             Role::User => {
-                out.push(format_user_message(m, supports_vision));
+                let wire = format_user_message(m, supports_vision);
+                let boundary = (!m.synthetic).then(|| cache_boundary(&wire)).flatten();
+                out.push((wire, boundary));
                 i += 1;
                 continue;
             }
             Role::Assistant => {
-                out.push(format_assistant_message(
-                    m,
-                    echo_thinking,
-                    reasoning_source,
-                    deepseek,
-                ));
+                let wire = format_assistant_message(m, echo_thinking, reasoning_source, deepseek);
+                let boundary = (!m.synthetic).then(|| cache_boundary(&wire)).flatten();
+                out.push((wire, boundary));
                 i += 1;
                 continue;
             }
@@ -859,9 +876,13 @@ fn format_messages_for_provider(
                 // Fold the CONSECUTIVE run of tool results into ONE user message — the
                 // typical shape after an assistant fired N parallel tool calls.
                 let mut blocks: Vec<Value> = Vec::new();
+                let mut boundary = None;
                 while i < messages.len() && messages[i].role == Role::Tool {
                     let tr = &messages[i];
                     if let Some(id) = tr.tool_call_id.as_deref().filter(|s| !s.is_empty()) {
+                        if !tr.synthetic {
+                            boundary = Some(blocks.len());
+                        }
                         blocks.push(json!({
                             "type": "tool_result",
                             "tool_use_id": id,
@@ -872,7 +893,7 @@ fn format_messages_for_provider(
                     i += 1;
                 }
                 if !blocks.is_empty() {
-                    out.push(json!({ "role": "user", "content": blocks }));
+                    out.push((json!({ "role": "user", "content": blocks }), boundary));
                 }
                 continue;
             }
@@ -885,7 +906,19 @@ fn format_messages_for_provider(
     // history places a synthetic-summary user beside the real user; multiple tail hooks
     // stack. Merge every consecutive `role:"user"` run into one (others — OpenAI/Ollama —
     // tolerate adjacency, so they don't need this).
-    let out = merge_consecutive_user(out);
+    if cache {
+        // Keep content-block boundaries stable even after a moving marker leaves
+        // an older message. Otherwise adjacent text users would later join into
+        // one string, rewriting a prefix that used to contain separate blocks.
+        for (message, _) in &mut out {
+            let content = &mut message["content"];
+            if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
+                *content = json!([{"type":"text", "text":text}]);
+            }
+        }
+        mark_recent_message_boundaries(&mut out);
+    }
+    let out = merge_consecutive_user(out.into_iter().map(|(wire, _)| wire).collect());
     (system, out)
 }
 
@@ -1733,6 +1766,14 @@ mod tests {
             {"role":"user", "content":"old question"},
             {"role":"assistant", "content":[{"type":"thinking","thinking":"private","signature":"sig"}, {"type":"text","text":"answer"}]},
             {"role":"user", "content":[{"type":"tool_result","tool_use_id":"id","content":"result"}]}]});
+        let mut messages: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m.clone(), cache_boundary(m)))
+            .collect();
+        mark_recent_message_boundaries(&mut messages);
+        body["messages"] = json!(messages.into_iter().map(|(m, _)| m).collect::<Vec<_>>());
         apply_prompt_cache(&mut body);
         assert_eq!(body.to_string().matches("cache_control").count(), 4);
         assert!(body["messages"][0]["content"].is_string());
@@ -1755,6 +1796,14 @@ mod tests {
             {"role":"user", "content":"question"},
             {"role":"assistant", "content":[{"type":"text", "text":"answer"}, {"type":"thinking", "thinking":"private", "signature":"signed"}]},
             thinking.clone()]});
+        let mut messages: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m.clone(), cache_boundary(m)))
+            .collect();
+        mark_recent_message_boundaries(&mut messages);
+        body["messages"] = json!(messages.into_iter().map(|(m, _)| m).collect::<Vec<_>>());
         apply_prompt_cache(&mut body);
         assert_eq!(body["messages"][2], thinking);
         assert!(body["messages"][1]["content"][0]
@@ -1764,6 +1813,204 @@ mod tests {
             .get("cache_control")
             .is_none());
         assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    }
+
+    #[test]
+    fn cache_boundary_separates_real_user_from_request_only_reminders() {
+        let messages = [
+            Message::user("<system-reminder>real user text</system-reminder>"),
+            Message::synthetic_user("date"),
+            Message::synthetic_user("todo state"),
+        ];
+        let body = build_request_body(
+            "qwen4-max-preview",
+            &messages,
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(wire.len(), 1, "strict user alternation remains intact");
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], messages[0].text);
+        assert!(
+            blocks[0].get("cache_control").is_some(),
+            "provenance, not reminder-looking text, selects boundaries"
+        );
+        assert!(blocks[1].get("cache_control").is_none());
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    fn cache_test_call(id: &str) -> Message {
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        )
+    }
+
+    // Normalize content encodings, but keep every semantic block and its role.
+    fn conversation_blocks(body: &Value) -> (Vec<Value>, Option<usize>) {
+        let mut blocks = Vec::new();
+        let mut boundary = None;
+        for message in body["messages"].as_array().unwrap() {
+            for mut block in content_to_blocks(message["content"].clone()) {
+                if block
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cache_control")
+                    .is_some()
+                {
+                    boundary = Some(blocks.len());
+                }
+                blocks.push(json!({"role":message["role"], "block":block}));
+            }
+        }
+        (blocks, boundary)
+    }
+
+    #[test]
+    fn cached_tool_result_prefix_survives_the_next_tool_round() {
+        let mut messages = vec![
+            Message::user("reference material"),
+            cache_test_call("one"),
+            Message::tool_result("one", "first result", false),
+        ];
+        let body = |messages: &[Message]| {
+            build_request_body(
+                "qwen4-max-preview",
+                messages,
+                &[],
+                &ChatOptions::default(),
+                &cfg(),
+            )
+        };
+        let mut request = messages.clone();
+        request.push(Message::synthetic_user("temporary date and todo A"));
+        let first = body(&request);
+        let (prefix, boundary) = conversation_blocks(&first);
+        let end = boundary.unwrap();
+        assert_eq!(prefix[end]["block"]["type"], "tool_result");
+        assert_eq!(prefix[end]["block"]["content"], "first result");
+        messages.extend([
+            cache_test_call("two"),
+            Message::tool_result("two", "second result", false),
+            Message::synthetic_user("temporary date and todo B"),
+        ]);
+        let next = body(&messages);
+        let (extended, next_boundary) = conversation_blocks(&next);
+        assert_eq!(
+            prefix[..=end],
+            extended[..=end],
+            "the cached prefix excludes the disappearing reminder"
+        );
+        assert!(
+            next_boundary.unwrap() > end,
+            "the rolling boundary advances"
+        );
+        assert_eq!(next["messages"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn moving_cache_marker_does_not_rejoin_earlier_user_context() {
+        let history = vec![
+            Message::user("large reference"),
+            Message::synthetic_user("persisted bootstrap context"),
+        ];
+        let body = |messages: &[Message]| {
+            build_request_body(
+                "qwen4-max-preview",
+                messages,
+                &[],
+                &ChatOptions::default(),
+                &cfg(),
+            )
+        };
+        let mut first_request = history.clone();
+        first_request.push(Message::synthetic_user("temporary date"));
+        let (prefix, boundary) = conversation_blocks(&body(&first_request));
+        let mut next = history;
+        next.extend([
+            cache_test_call("one"),
+            Message::tool_result("one", "result", false),
+            Message::synthetic_user("temporary date"),
+        ]);
+        let (extended, _) = conversation_blocks(&body(&next));
+        assert_eq!(prefix[..=boundary.unwrap()], extended[..=boundary.unwrap()]);
+        assert_eq!(extended[0]["block"]["text"], "large reference");
+        assert_eq!(extended[1]["block"]["text"], "persisted bootstrap context");
+    }
+
+    #[test]
+    fn parallel_results_cache_the_last_stable_result_before_reminders() {
+        let mut call = cache_test_call("one");
+        call.tool_calls.push(ToolCall {
+            id: "two".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        let body = build_request_body(
+            "qwen4-max-preview",
+            &[
+                Message::system("stable system"),
+                Message::user("question"),
+                call,
+                Message::tool_result("one", "A", false),
+                Message::tool_result("two", "B", true),
+                Message::synthetic_user("date"),
+                Message::synthetic_user("todo"),
+            ],
+            &[ToolDef {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        let blocks = body["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 4);
+        assert!(blocks[0].get("cache_control").is_none());
+        assert!(blocks[1].get("cache_control").is_some());
+        assert_eq!(blocks[1]["is_error"], true);
+        assert!(blocks[2].get("cache_control").is_none());
+        assert!(blocks[3].get("cache_control").is_none());
+        assert_eq!(body.to_string().matches("cache_control").count(), 4);
+    }
+
+    #[test]
+    fn synthetic_only_requests_do_not_get_conversation_cache_markers() {
+        let body = build_request_body(
+            "qwen4-max-preview",
+            &[
+                Message::system("stable"),
+                Message::synthetic_user("reminder"),
+            ],
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        assert!(!body["messages"].to_string().contains("cache_control"));
+        assert_eq!(body.to_string().matches("cache_control").count(), 1);
+    }
+
+    #[test]
+    fn deepseek_keeps_user_reminder_encoding_without_cache_markers() {
+        let mut config = cfg();
+        config.deepseek_messages = true;
+        let body = build_request_body(
+            "deepseek-flash",
+            &[Message::user("question"), Message::synthetic_user("date")],
+            &[],
+            &ChatOptions::default(),
+            &config,
+        );
+        assert_eq!(body["messages"][0]["content"], "question\n\ndate");
+        assert!(!body.to_string().contains("cache_control"));
     }
 
     #[test]
