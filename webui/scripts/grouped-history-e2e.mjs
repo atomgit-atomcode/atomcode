@@ -14,6 +14,7 @@ const full=[
   {role:'assistant',content:'HISTORY_FINAL',created_at:1700000004000},
 ];
 const clients=new Set();
+let navigationRecords=[];
 const snapshot=()=>({type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full});
 const server=createServer(async(req,res)=>{
   const path=new URL(req.url,'http://localhost').pathname;
@@ -28,7 +29,7 @@ const server=createServer(async(req,res)=>{
   if(path==='/project')return json({working_dir:'/fixture',project_hash:'fixture'});
   if(path==='/config')return json({providers:[],notifications:{enabled:false}});
   if(path==='/models')return json([{name:'fixture',model:'fixture',provider:'fixture',effort_levels:[]}]);
-  if(path.endsWith('/transcript'))return json({session_id:id,turns:[]});
+  if(path.endsWith('/transcript'))return json({session_id:id,turns:navigationRecords});
   if(path==='/live/mode')return json({mode:'build'});
   if(path==='/live/session')return json({success:true,session_id:id});
   if(path==='/sessions'||path==='/projects/fixture/sessions')return json([meta]);
@@ -77,6 +78,7 @@ try {
     }
     await page.getByText('GROUP_REQUEST_0',{exact:true}).waitFor();
     await page.getByText('GROUP_FINAL_0',{exact:true}).waitFor();
+    assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'),/GROUP_REQUEST_0/,'navigation follows the displayed page even when it does not overflow');
     assert.equal(await page.locator('.tool-body').count(),0,'archived completed groups stay collapsed');
     const toggle=page.locator('.turn-process-toggle').first();
     assert.equal(await toggle.getAttribute('aria-expanded'),'false');
@@ -148,6 +150,44 @@ try {
       assert.equal(await page.locator('.user-message-wrapper').first().innerText(),beforeRelease,
         'releasing the scrollbar must stop gesture-driven pagination');
     }
+    await page.close();
+  }
+  // A collapsed process can extend the displayed range far before the raw
+  // window. Leaving the bottom must freeze that window, not start a new page
+  // at the old process and drop all the recent conversations.
+  full.splice(0,full.length,
+    {role:'user',content:'LARGE_OLD_REQUEST',created_at:1700000000000},
+    {role:'assistant',content:'Old process',tool_calls:Array.from({length:400},(_,i)=>({id:`old-${i}`,name:'read',arguments:'{}'}))},
+    ...Array.from({length:400},(_,i)=>({role:'tool',content:'',tool_result:{call_id:`old-${i}`,success:true,summary:'ok'}})),
+    {role:'assistant',content:'LARGE_OLD_FINAL',created_at:1700000004000},
+    ...Array.from({length:4},(_,i)=>[
+      {role:'user',content:`RECENT_REQUEST_${i}`,created_at:1700000010000+i*10000},
+      {role:'assistant',content:`RECENT_FINAL_${i}\n\n`+'Recent answer text. '.repeat(100),created_at:1700000014000+i*10000},
+    ]).flat());
+  navigationRecords=full.filter(message=>message.role==='user').map((message,index)=>({turn_id:index+1,user:message.content,started_at:message.created_at,undone:false}));
+  for(const width of [1200,390]) {
+    const page=await browser.newPage({viewport:{width,height:900}});
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');});
+    await page.goto(`http://127.0.0.1:${server.address().port}/?sync=1&session=${id}`);
+    const viewport=page.locator('.messages-container');
+    await page.getByText('RECENT_REQUEST_3',{exact:true}).waitFor();
+    await page.waitForTimeout(900);
+    const before=await viewport.evaluate(el=>({top:el.scrollTop,height:el.scrollHeight,users:[...el.querySelectorAll('.user-message-wrapper')].map(n=>n.innerText)}));
+    await viewport.hover(); await page.mouse.wheel(0,-60); await page.waitForTimeout(200);
+    const after=await viewport.evaluate(el=>({top:el.scrollTop,height:el.scrollHeight,users:[...el.querySelectorAll('.user-message-wrapper')].map(n=>n.innerText)}));
+    assert.deepEqual(after.users,before.users,'a small upward gesture must not replace the recent turns with an older page');
+    assert.equal(after.height,before.height,'freezing the current window must not remove content');
+    assert.ok(Math.abs(before.top-after.top-60)<3,'the view should move only by the wheel delta');
+    assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'),/RECENT_REQUEST_3/);
+    // Read the penultimate prompt and verify the navigation label, not just a
+    // numeric index that could point at a different merged history entry.
+    await viewport.evaluate(el=>{
+      const target=[...el.querySelectorAll('.user-message-wrapper')].find(n=>n.textContent.includes('RECENT_REQUEST_2'));
+      el.scrollTop+=target.getBoundingClientRect().top-el.getBoundingClientRect().top-20;
+    });
+    await page.waitForTimeout(150);
+    assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'),/RECENT_REQUEST_2/);
     await page.close();
   }
   assert.deepEqual(errors,[]);

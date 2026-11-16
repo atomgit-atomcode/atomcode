@@ -1286,7 +1286,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       ? scrollRestorationRef.current.onScroll()
       : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
     if (atBottom === null) return;
-    if (!atBottom && timelineStart === null) setTimelineStart(range.start);
+    if (!atBottom && timelineStart === null) setTimelineStart(timeline.windowStart);
     if (atBottom && timelineStart !== null && range.end >= messages.length) setTimelineStart(null);
     atBottomRef.current = atBottom;
     setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
@@ -3798,7 +3798,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         start: older.length + range.start, before: true,
       };
       atBottomRef.current = false;
-      setTimelineStart(older.length + range.start);
+      setTimelineStart(older.length + timeline.windowStart);
       setMessages(current => [...older, ...current]);
       setServerHistory({ session: id, cursor: detail.history_older, baseline: serverHistoryRef.current.baseline });
     } catch (error) {
@@ -3865,7 +3865,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     new Set(pendingSteers.filter(steer => steer.confirmed).map(steer => steer.id))), [messages, pendingSteers]);
   function updateActiveTurn() {
     const el = scrollRef.current;
-    if (!el || navTurns.length === 0) return;
+    if (!el || page.loading || navTurns.length === 0) return;
     const readingLine = el.getBoundingClientRect().top + 48;
     // Offscreen user anchors are intentionally unmounted. Only measure the
     // bounded visible slice; Infinity placeholders are not a sorted DOM index.
@@ -3883,7 +3883,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
   function interactWithTimeline(event: Event) {
     processReadIntent.current = true;
-    if (timelineStart === null && !atBottomRef.current) setTimelineStart(range.start);
+    if (timelineStart === null && !atBottomRef.current) setTimelineStart(timeline.windowStart);
     if (event.type === 'pointerdown') {
       timelineScrollbarDragRef.current = event.target === scrollRef.current
         && (event as PointerEvent).pointerType === 'mouse';
@@ -3950,9 +3950,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return () => { if (navFlashTimer.current) clearTimeout(navFlashTimer.current); };
   }, [navigationScope]);
   useEffect(() => {
+    // A page swap or process collapse can replace the visible turn without a
+    // scroll event (especially when it fits in the viewport). Wait for hydrated
+    // content and measure the new DOM instead of leaving the old rail marker.
+    if (page.loading) return;
     const frame = requestAnimationFrame(updateActiveTurn);
     return () => cancelAnimationFrame(frame);
-  }, [navTurns, navigationScope]);
+  }, [navTurns, navigationScope, range.start, range.end, page.loading, processExpanded, searchTrim]);
 
   useEffect(() => {
     if (navHighlight === null || page.loading) return;
