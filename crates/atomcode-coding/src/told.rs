@@ -40,10 +40,8 @@ pub(crate) fn reconfigured(
 ) -> Option<String> {
     let mut said = Vec::new();
     if from.provider_name != to.provider_name || from.model != to.model {
-        // The window is the NEW model's: a conversation that fit the old one
-        // may not fit here. The swap itself succeeds silently, and the
-        // mismatch would surface one message later as a provider error or a
-        // silent auto-compaction — nothing would point back at the switch.
+        // The window is the NEW model's. Usage is the previous model's last
+        // reported prompt count, so it is only an estimate across tokenizers.
         // Say it now, while the cause is on screen. The trigger mirrors the
         // product's own compaction point — `compact_threshold` (default 0.7,
         // config.rs) of the window, capped by `compact_token_limit`, the same
@@ -72,18 +70,19 @@ pub(crate) fn reconfigured(
                 }
                 if used >= next_window {
                     said.push(format!(
-                        "The conversation is about {used} tokens, at or past this model's \
-                         {next_window}-token window: the next message cannot fit into it. The \
-                         person can compact the conversation (for example with /compact) or \
-                         switch to a model with a larger window."
+                        "The previous model last reported about {used} input tokens. This is at \
+                         or above the new model's {next_window}-token context window, but it is \
+                         only an estimate because tokenization and provider accounting may differ. \
+                         The host may compact the conversation before the next request; if that \
+                         is unavailable or fails, the provider may reject the request."
                     ));
-                } else if trigger > 0 && used > trigger {
+                } else if used > 0 && used >= trigger {
                     said.push(format!(
-                        "The conversation is about {used} tokens, over this model's configured \
-                         compaction trigger ({trigger} of a {next_window}-token window): an \
-                         automatic compaction will likely run before the next message. The \
-                         person can also compact first (for example with /compact) to fold it \
-                         on their own terms."
+                        "The previous model last reported about {used} input tokens, at or above the \
+                         new model's configured compaction trigger ({trigger} of a \
+                         {next_window}-token window). This is only an estimate because \
+                         tokenization and provider accounting may differ; the host may compact \
+                         the conversation before the next request."
                     ));
                 }
             }
@@ -112,6 +111,38 @@ pub(crate) fn reconfigured(
         );
     }
     (!said.is_empty()).then(|| reminder(&said.join(" ")))
+}
+
+/// A user-facing warning for a model switch whose previous prompt usage is at
+/// or beyond the new model's configured automatic-compaction trigger.
+///
+/// This deliberately describes risk rather than predicting rejection: usage is
+/// reported by the old provider, and automatic compaction gets a chance to run
+/// before the next request.
+pub(crate) fn context_window_warning(
+    from: &CodingAgentConfig,
+    to: &CodingAgentConfig,
+    used_tokens: Option<u64>,
+) -> Option<String> {
+    if (from.provider_name == to.provider_name && from.model == to.model) || to.context_window == 0
+    {
+        return None;
+    }
+    let used = used_tokens?;
+    let window = u64::from(to.context_window);
+    let mut trigger = (window as f32 * to.compact_threshold) as u64;
+    if let Some(limit) = to.compact_token_limit {
+        trigger = trigger.min(u64::from(limit));
+    }
+    if used == 0 || (used < window && used < trigger) {
+        return None;
+    }
+
+    let percent = used.saturating_mul(100) / window;
+    Some(format!(
+        "已切换到模型 {}。上一模型最近一次上报的输入约 {used} tokens，相当于新模型 {window} tokens 上下文窗口的约 {percent}%；已达到新模型的上下文窗口或配置的自动压缩触发线。不同模型的 tokenizer 和用量统计可能不同，此数值仅供参考。下一次请求可能先触发自动压缩；如果压缩不可用或失败，服务端可能拒绝请求。可先执行 /compact，或切换到上下文窗口更大的模型。",
+        to.model
+    ))
 }
 
 fn mode_name(mode: RuntimeMode) -> &'static str {
@@ -371,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_past_the_new_window_says_the_next_message_cannot_fit() {
+    fn a_switch_past_the_new_window_reports_risk_without_predicting_rejection() {
         let mut old = CodingAgentConfig::new(
             "key",
             "https://example.test/v1",
@@ -390,7 +421,9 @@ mod tests {
         new.context_window = 128_000;
         let said =
             reconfigured(&old, &new, Some(200_000)).expect("a switch past the new window is told");
-        assert!(said.contains("cannot fit"), "{said}");
+        assert!(said.contains("only an estimate"), "{said}");
+        assert!(said.contains("provider may reject"), "{said}");
+        assert!(!said.contains("cannot fit"), "{said}");
         assert!(said.contains("128000"), "the window is named: {said}");
     }
 
@@ -414,7 +447,7 @@ mod tests {
         new.context_window = 128_000;
         let said =
             reconfigured(&old, &new, Some(100_000)).expect("a switch over the threshold is told");
-        assert!(said.contains("automatic compaction"), "{said}");
+        assert!(said.contains("host may compact"), "{said}");
         assert!(!said.contains("cannot fit"), "{said}");
     }
 
@@ -440,14 +473,14 @@ mod tests {
         // still told, but without a window warning.
         let said = reconfigured(&old, &new, Some(50_000)).expect("the switch itself is told");
         assert!(
-            !said.contains("compaction threshold") && !said.contains("cannot fit"),
+            !said.contains("configured compaction trigger") && !said.contains("cannot fit"),
             "no window warning under the threshold: {said}"
         );
         // An unknown window cannot be judged; keep the quiet.
         new.context_window = 0;
         let said = reconfigured(&old, &new, Some(200_000)).expect("the switch itself is told");
         assert!(
-            !said.contains("tokens, past") && !said.contains("tokens, over"),
+            !said.contains("input tokens") && !said.contains("configured compaction trigger"),
             "no window warning for an unknown window: {said}"
         );
     }
@@ -474,7 +507,89 @@ mod tests {
         // 89_600) yet under a hard-coded 0.75: the hint must appear because
         // the trigger reads the config, not a constant.
         let said = reconfigured(&old, &new, Some(92_000)).expect("over the configured trigger");
-        assert!(said.contains("automatic compaction"), "{said}");
+        assert!(said.contains("host may compact"), "{said}");
+    }
+
+    #[test]
+    fn the_person_gets_a_qualified_warning_when_the_new_model_may_compact() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+
+        let warning = context_window_warning(&old, &new, Some(92_000))
+            .expect("usage exceeds the configured compaction trigger");
+        assert!(warning.contains("约 71%"), "{warning}");
+        assert!(
+            warning.contains("已达到新模型的上下文窗口或配置的自动压缩触发线"),
+            "{warning}"
+        );
+        assert!(warning.contains("tokenizer"), "{warning}");
+        assert!(warning.contains("/compact"), "{warning}");
+        assert!(!warning.contains("无法继续"), "{warning}");
+    }
+
+    #[test]
+    fn no_user_warning_is_emitted_below_trigger_or_for_unknown_usage() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        assert_eq!(context_window_warning(&old, &new, Some(89_599)), None);
+        assert_eq!(context_window_warning(&old, &new, None), None);
+        new.context_window = 0;
+        assert_eq!(context_window_warning(&old, &new, Some(200_000)), None);
+    }
+
+    #[test]
+    fn a_lower_token_limit_warns_without_claiming_the_window_is_near_full() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        new.compact_token_limit = Some(20_000);
+
+        let warning = context_window_warning(&old, &new, Some(25_000))
+            .expect("usage exceeds the configured token cap");
+        assert!(warning.contains("约 19%"), "{warning}");
+        assert!(warning.contains("压缩触发线"), "{warning}");
+        assert!(!warning.contains("已接近新模型"), "{warning}");
     }
 
     #[test]
@@ -499,7 +614,7 @@ mod tests {
         // 100_000 of 128_000 is 78% — under a 0.9 trigger (115_200): quiet.
         let said = reconfigured(&old, &new, Some(100_000)).expect("the switch itself is told");
         assert!(
-            !said.contains("automatic compaction") && !said.contains("cannot fit"),
+            !said.contains("host may compact") && !said.contains("cannot fit"),
             "no window warning under a raised threshold: {said}"
         );
     }
