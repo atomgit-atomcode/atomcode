@@ -1,0 +1,338 @@
+{
+  "binary": "target/debug/atomcode",
+  "proxy_mutates_request": false,
+  "runs": [
+    {
+      "turn": 1,
+      "exit_code": 0,
+      "elapsed_ms": 30364,
+      "usage": [
+        {
+          "type": "usage",
+          "round": 1,
+          "turn_id": 1,
+          "request_id": 1,
+          "prompt_tokens": 150056,
+          "completion_tokens": 151,
+          "cached_tokens": 0,
+          "elapsed_ms": 0,
+          "reasoning_elapsed_ms": 0
+        },
+        {
+          "type": "usage",
+          "round": 2,
+          "turn_id": 1,
+          "request_id": 2,
+          "prompt_tokens": 150100,
+          "completion_tokens": 88,
+          "cached_tokens": 149928,
+          "elapsed_ms": 0,
+          "reasoning_elapsed_ms": 0
+        },
+        {
+          "type": "usage",
+          "round": 3,
+          "turn_id": 1,
+          "request_id": 3,
+          "prompt_tokens": 150234,
+          "completion_tokens": 98,
+          "cached_tokens": 150059,
+          "elapsed_ms": 0,
+          "reasoning_elapsed_ms": 0
+        },
+        {
+          "type": "usage",
+          "round": 4,
+          "turn_id": 1,
+          "request_id": 4,
+          "prompt_tokens": 150341,
+          "completion_tokens": 12,
+          "cached_tokens": 150193,
+          "elapsed_ms": 0,
+          "reasoning_elapsed_ms": 0
+        }
+      ],
+      "terminal": [
+        {
+          "type": "turn.completed",
+          "stop_reason": "Stopped",
+          "exit_code": 0,
+          "duration_ms": 26885,
+          "rounds": 4,
+          "tool_calls": 3,
+          "total_tokens": 601080,
+          "prompt_tokens": 600731,
+          "completion_tokens": 349,
+          "cached_tokens": 450180,
+          "cache_hit_rate": 0.7493869968421806,
+          "ttft_ms": 11456,
+          "snapshot_error": null
+        }
+      ],
+      "tool_names": [
+        "read_file",
+        "read_file",
+        "read_file"
+      ],
+      "errors": []
+    }
+  ],
+  "wire_metadata": [
+    {
+      "ordinal": 1,
+      "lane": "auxiliary",
+      "model": "qwen4-max-preview",
+      "tools": 0,
+      "messages": 1,
+      "blocks": 2,
+      "markers": [
+        {
+          "path": "system[0]",
+          "block": 0,
+          "type": "text"
+        },
+        {
+          "path": "messages[0].content[0]",
+          "block": 1,
+          "type": "text"
+        }
+      ],
+      "shared_prior_blocks": null,
+      "previous_blocks": null,
+      "usage_events": [
+        {
+          "event": "message_start",
+          "usage": {
+            "input_tokens": 737,
+            "output_tokens": 0
+          }
+        },
+        {
+          "event": "message_delta",
+          "usage": {
+            "input_tokens": 252,
+            "output_tokens": 39,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 512
+          }
+        }
+      ],
+      "http_status": 200
+    },
+    {
+      "ordinal": 2,
+      "lane": "main",
+      "model": "qwen4-max-preview",
+      "tools": 43,
+      "messages": 1,
+      "blocks": 47,
+      "markers": [
+        {
+          "path": "tools[42]",
+          "block": 42,
+          "type": "tool_definition"
+        },
+        {
+          "path": "system[0]",
+          "block": 43,
+          "type": "text"
+        },
+        {
+          "path": "messages[0].content[0]",
+          "block": 44,
+          "type": "text"
+        }
+      ],
+      "shared_prior_blocks": null,
+      "previous_blocks": null,
+      "usage_events": [
+        {
+          "event": "message_start",
+          "usage": {
+            "input_tokens": 148919,
+            "output_tokens": 0
+          }
+        },
+        {
+          "event": "message_delta",
+          "usage": {
+            "input_tokens": 128,
+            "output_tokens": 151,
+            "cache_creation_input_tokens": 149928,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 149928,
+              "ephemeral_1h_input_tokens": 0
+            }
+          }
+        }
+      ],
+      "http_status": 200
+    },
+    {
+      "ordinal": 3,
+      "lane": "main",
+      "model": "qwen4-max-preview",
+      "tools": 43,
+      "messages": 3,
+      "blocks": 48,
+      "markers": [
+        {
+          "path": "tools[42]",
+          "block": 42,
+          "type": "tool_definition"
+        },
+        {
+          "path": "system[0]",
+          "block": 43,
+          "type": "text"
+        },
+        {
+          "path": "messages[1].content[0]",
+          "block": 45,
+          "type": "tool_use"
+        },
+        {
+          "path": "messages[2].content[0]",
+          "block": 46,
+          "type": "tool_result"
+        }
+      ],
+      "shared_prior_blocks": 45,
+      "previous_blocks": 47,
+      "usage_events": [
+        {
+          "event": "message_start",
+          "usage": {
+            "input_tokens": 148826,
+            "output_tokens": 0
+          }
+        },
+        {
+          "event": "message_delta",
+          "usage": {
+            "input_tokens": 41,
+            "output_tokens": 88,
+            "cache_creation_input_tokens": 131,
+            "cache_read_input_tokens": 149928,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 131,
+              "ephemeral_1h_input_tokens": 0
+            }
+          }
+        }
+      ],
+      "http_status": 200
+    },
+    {
+      "ordinal": 4,
+      "lane": "main",
+      "model": "qwen4-max-preview",
+      "tools": 43,
+      "messages": 5,
+      "blocks": 50,
+      "markers": [
+        {
+          "path": "tools[42]",
+          "block": 42,
+          "type": "tool_definition"
+        },
+        {
+          "path": "system[0]",
+          "block": 43,
+          "type": "text"
+        },
+        {
+          "path": "messages[3].content[0]",
+          "block": 47,
+          "type": "tool_use"
+        },
+        {
+          "path": "messages[4].content[0]",
+          "block": 48,
+          "type": "tool_result"
+        }
+      ],
+      "shared_prior_blocks": 47,
+      "previous_blocks": 48,
+      "usage_events": [
+        {
+          "event": "message_start",
+          "usage": {
+            "input_tokens": 148826,
+            "output_tokens": 0
+          }
+        },
+        {
+          "event": "message_delta",
+          "usage": {
+            "input_tokens": 41,
+            "output_tokens": 98,
+            "cache_creation_input_tokens": 134,
+            "cache_read_input_tokens": 150059,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 134,
+              "ephemeral_1h_input_tokens": 0
+            }
+          }
+        }
+      ],
+      "http_status": 200
+    },
+    {
+      "ordinal": 5,
+      "lane": "main",
+      "model": "qwen4-max-preview",
+      "tools": 43,
+      "messages": 7,
+      "blocks": 52,
+      "markers": [
+        {
+          "path": "tools[42]",
+          "block": 42,
+          "type": "tool_definition"
+        },
+        {
+          "path": "system[0]",
+          "block": 43,
+          "type": "text"
+        },
+        {
+          "path": "messages[5].content[0]",
+          "block": 49,
+          "type": "tool_use"
+        },
+        {
+          "path": "messages[6].content[0]",
+          "block": 50,
+          "type": "tool_result"
+        }
+      ],
+      "shared_prior_blocks": 49,
+      "previous_blocks": 50,
+      "usage_events": [
+        {
+          "event": "message_start",
+          "usage": {
+            "input_tokens": 148826,
+            "output_tokens": 0
+          }
+        },
+        {
+          "event": "message_delta",
+          "usage": {
+            "input_tokens": 41,
+            "output_tokens": 12,
+            "cache_creation_input_tokens": 107,
+            "cache_read_input_tokens": 150193,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 107,
+              "ephemeral_1h_input_tokens": 0
+            }
+          }
+        }
+      ],
+      "http_status": 200
+    }
+  ]
+}
