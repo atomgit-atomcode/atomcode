@@ -63,7 +63,7 @@ pub(crate) fn reconfigured(
         if next_window > 0 {
             if let Some(used) = used_tokens {
                 if used * 4 > next_window * 3 {
-                    said.push(if used > next_window {
+                if used >= next_window {
                         format!(
                             "The conversation is about {used} tokens, past this model's \
                              {next_window}-token window: the next message cannot fit. Run \
