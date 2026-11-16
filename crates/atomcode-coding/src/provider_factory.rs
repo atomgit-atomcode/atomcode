@@ -5,7 +5,8 @@ use atomcode_capabilities::provider::{
     AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider,
     ReasoningPolicy, RequestSigner, ResponsesProvider, RetryPolicy,
 };
-use atomcode_kernel::provider::LlmProvider;
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort};
+use tracing::Instrument;
 
 use crate::CodingAgentConfig;
 use crate::{SubagentModelProviders, SubagentModelResolver, SubagentProvider, TierProvider};
@@ -99,6 +100,74 @@ impl DefaultCodingProviderFactory {
     pub fn with_authenticator(mut self, authenticator: Arc<dyn ProviderAuthenticator>) -> Self {
         self.authenticator = Some(authenticator);
         self
+    }
+}
+
+/// Immutable defaults of THIS model selection, shared by main and direct side
+/// calls. The runtime still owns provider rebuilding; adapters still own wire
+/// capability checks and rejection latches. Explicit per-call values win.
+struct ModelDefaultsProvider {
+    inner: Arc<dyn LlmProvider>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for ModelDefaultsProvider {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
+    fn effort_levels(&self) -> Vec<String> {
+        self.inner.effort_levels()
+    }
+    fn bind_session_id(&self, id: &str) {
+        self.inner.bind_session_id(id);
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[atomcode_kernel::message::Message],
+        tools: &[atomcode_kernel::tool::ToolDef],
+        options: &ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        let mut resolved = options.clone();
+        resolved.reasoning_effort = options.reasoning_effort.or(self.reasoning_effort);
+        let source = match options.reasoning_effort {
+            Some(value) if Some(value) != self.reasoning_effort => "call_override",
+            // Main middleware may already have filled the same model default;
+            // do not label an equal value as a deliberate downgrade/override.
+            Some(_) => "request_value",
+            None if self.reasoning_effort.is_some() => "model_default",
+            None => "api_default",
+        };
+        let span = tracing::info_span!(
+            "model_request_options",
+            effort_source = source,
+            requested_effort = options
+                .reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("omitted"),
+            model_default_effort = self
+                .reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("omitted"),
+            resolved_effort = resolved
+                .reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("omitted")
+        );
+        self.inner
+            .chat_stream(messages, tools, &resolved)
+            .instrument(span)
+            .await
     }
 }
 
@@ -253,6 +322,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 )
             }
         };
+        let provider: Arc<dyn LlmProvider> = Arc::new(ModelDefaultsProvider {
+            inner: provider,
+            reasoning_effort: cfg.chat_options.reasoning_effort,
+        });
         if let Some(session_id) = session_id {
             provider.bind_session_id(session_id);
         }
@@ -535,6 +608,137 @@ mod tests {
         // A real value pins it (whitespace tolerated).
         assert_eq!(parse_ollama_num_ctx(Some("32768")), Some(32_768));
         assert_eq!(parse_ollama_num_ctx(Some("  8192 ")), Some(8_192));
+    }
+
+    #[derive(Default)]
+    struct CapturedProvider {
+        calls: std::sync::Mutex<Vec<ChatOptions>>,
+        bindings: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturedProvider {
+        fn model_name(&self) -> &str {
+            "configured-model"
+        }
+        fn context_window(&self) -> u32 {
+            123_456
+        }
+        fn supports_vision(&self) -> bool {
+            true
+        }
+        fn effort_levels(&self) -> Vec<String> {
+            vec!["low".into(), "high".into(), "max".into()]
+        }
+        fn bind_session_id(&self, id: &str) {
+            self.bindings.lock().unwrap().push(id.into());
+        }
+        async fn chat_stream(
+            &self,
+            _: &[atomcode_kernel::message::Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            options: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            self.calls.lock().unwrap().push(options.clone());
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn direct_calls_inherit_model_effort_and_explicit_calls_override_it() {
+        let inner = Arc::new(CapturedProvider::default());
+        let provider = ModelDefaultsProvider {
+            inner: inner.clone(),
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let options = ChatOptions {
+            max_tokens: Some(77),
+            temperature: Some(0.25),
+            tool_choice: atomcode_kernel::provider::ToolChoice::None,
+            ..Default::default()
+        };
+        for effort in [
+            None,
+            None,
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Max),
+        ] {
+            let mut request = options.clone();
+            request.reasoning_effort = effort;
+            drop(provider.chat_stream(&[], &[], &request).await.unwrap());
+            assert_eq!(
+                request.reasoning_effort, effort,
+                "caller-owned options are not mutated"
+            );
+        }
+        let calls = inner.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.reasoning_effort).collect::<Vec<_>>(),
+            vec![
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Max)
+            ]
+        );
+        for call in calls.iter() {
+            assert_eq!(call.max_tokens, options.max_tokens);
+            assert_eq!(call.temperature, options.temperature);
+            assert_eq!(call.tool_choice, options.tool_choice);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn rebuilding_with_api_default_and_other_model_defaults_keeps_them_independent() {
+        let inner = Arc::new(CapturedProvider::default());
+        for effort in [
+            Some(ReasoningEffort::High),
+            None,
+            Some(ReasoningEffort::Low),
+        ] {
+            let provider = ModelDefaultsProvider {
+                inner: inner.clone(),
+                reasoning_effort: effort,
+            };
+            drop(
+                provider
+                    .chat_stream(&[], &[], &ChatOptions::default())
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            inner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.reasoning_effort)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ReasoningEffort::High),
+                None,
+                Some(ReasoningEffort::Low)
+            ]
+        );
+    }
+
+    #[test]
+    fn model_defaults_forward_capabilities_and_session_affinity() {
+        let inner = Arc::new(CapturedProvider::default());
+        let provider = ModelDefaultsProvider {
+            inner: inner.clone(),
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        assert_eq!(provider.model_name(), inner.model_name());
+        assert_eq!(provider.context_window(), inner.context_window());
+        assert_eq!(provider.supports_vision(), inner.supports_vision());
+        assert_eq!(provider.effort_levels(), inner.effort_levels());
+        provider.bind_session_id("test-session");
+        assert_eq!(*inner.bindings.lock().unwrap(), ["test-session"]);
     }
 
     fn config(provider_type: &str) -> CodingAgentConfig {

@@ -768,6 +768,16 @@ impl LlmProvider for OpenAiCompatProvider {
         let effort_known_unsupported = self
             .effort_unsupported
             .load(std::sync::atomic::Ordering::Relaxed);
+        let requested_effort = options.reasoning_effort;
+        let effort_disposition = if requested_effort.is_none() {
+            "api_default"
+        } else if effort_known_unsupported {
+            "gateway_rejected"
+        } else if !self.cfg.supports_reasoning_effort {
+            "endpoint_capability_disabled"
+        } else {
+            "sent"
+        };
         let stripped_opts;
         let options = if effort_known_unsupported && options.reasoning_effort.is_some() {
             let mut o = options.clone();
@@ -799,6 +809,8 @@ impl LlmProvider for OpenAiCompatProvider {
         timing.mark("request_start");
         timing.span().in_scope(|| tracing::info!(request_id = timing.id, model = %self.cfg.model,
             reasoning_effort = body.get("reasoning_effort").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
+            adapter_requested_effort = requested_effort.map(ReasoningEffort::as_str).unwrap_or("omitted"),
+            reasoning_effort_disposition = effort_disposition,
             thinking_type = body.pointer("/thinking/type").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
             enable_thinking = ?body.get("enable_thinking").and_then(serde_json::Value::as_bool),
             max_tokens = ?body.get("max_tokens").and_then(serde_json::Value::as_u64),
