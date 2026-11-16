@@ -70,7 +70,7 @@ import { CompactionHistory } from './CompactionHistory';
 import { historyMessages } from '../lib/inlineHistory';
 import { TurnNavRail } from './TurnNavRail';
 import type { TranscriptTurn } from '../api';
-import { deriveTurnNavigation, createTurnNavigationIntent } from '../lib/turnNavigation';
+import { deriveTurnNavigation, createTurnNavigationIntent, turnAtReadingSpan } from '../lib/turnNavigation';
 import { ModelSelector } from './ModelSelector';
 import { mayFollowModelDefault, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { ModeSelector } from './ModeSelector';
@@ -3879,17 +3879,19 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const readingLine = el.getBoundingClientRect().top + 48;
     // Offscreen user anchors are intentionally unmounted. Only measure the
     // bounded visible slice; Infinity placeholders are not a sorted DOM index.
-    let index = Math.max(0, navTurns.findIndex(turn => turn.endIndex >= range.start));
-    for (let i = index; i < navTurns.length && navTurns[i].messageIndex < range.end; i++) {
+    const spans: { index: number; bottom: number }[] = [];
+    const start = Math.max(0, navTurns.findIndex(turn => turn.endIndex >= range.start));
+    for (let i = start; i < navTurns.length && navTurns[i].messageIndex < range.end; i++) {
       const turn = navTurns[i];
-      let node: HTMLElement | null | undefined;
+      let bottom: number | undefined;
       for (let j = Math.max(range.start, turn.messageIndex); j <= Math.min(range.end - 1, turn.endIndex); j++) {
-        const candidate = matchRefs.current[j];
-        if (candidate?.isConnected) { node = candidate; break; }
+        const node = matchRefs.current[j];
+        if (node?.isConnected) bottom = Math.max(bottom ?? -Infinity, node.getBoundingClientRect().bottom);
       }
-      if (node && node.getBoundingClientRect().top <= readingLine) index = i;
+      if (bottom !== undefined) spans.push({ index: i, bottom });
     }
-    setActiveNavIndex(previous => previous === index ? previous : index);
+    const index = turnAtReadingSpan(spans, readingLine);
+    if (index !== null) setActiveNavIndex(previous => previous === index ? previous : index);
   }
   function interactWithTimeline(event: Event) {
     processReadIntent.current = true;

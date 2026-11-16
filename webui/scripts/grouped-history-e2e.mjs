@@ -188,6 +188,19 @@ try {
     });
     await page.waitForTimeout(150);
     assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'),/RECENT_REQUEST_2/);
+    // Put the reading line in the gap after the previous reply. The upcoming
+    // prompt is visible below it; an old offscreen anchor must not stay active.
+    await viewport.evaluate(el=>{
+      const target=[...el.querySelectorAll('.user-message-wrapper')].find(n=>n.textContent.includes('RECENT_REQUEST_2'));
+      target.style.marginTop='100px';
+      el.querySelector('.timeline-inner').style.paddingBottom='900px';
+      el.scrollTop+=target.getBoundingClientRect().top-el.getBoundingClientRect().top-70;
+      el.dispatchEvent(new Event('scroll'));
+    });
+    await page.waitForTimeout(200);
+    assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'),/RECENT_REQUEST_2/,
+      'a previous turn ending above the reading line cannot own the gap before the visible prompt');
+
     await page.close();
   }
   // At the actual bottom, several short/repeated turns can share the viewport.

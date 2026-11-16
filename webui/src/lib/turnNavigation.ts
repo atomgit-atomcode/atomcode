@@ -144,3 +144,9 @@ export function mergeTurnNavigation<T extends ArchivedNavigationTurn>(records: r
   let cursor = 0;
   return entries.map(entry => time(entry) == null ? entry : timed[cursor++]);
 }
+
+/** Read the first turn whose content has not ended above the reading line.
+ * A gap before the next prompt belongs to that upcoming turn, not the old one. */
+export function turnAtReadingSpan(spans: readonly { index: number; bottom: number }[], line: number): number | null {
+  return spans.find(span => span.bottom > line)?.index ?? spans[spans.length - 1]?.index ?? null;
+}

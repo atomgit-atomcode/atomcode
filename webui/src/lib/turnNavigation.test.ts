@@ -122,3 +122,12 @@ test('unmatched older live prompts stay chronological instead of becoming the fi
     [[1, -1], [null, 0], [17, 1], [18, 2]]);
   assert.equal(entries.at(-1)?.live, items.length - 1);
 });
+
+test('a finished previous turn cannot keep the highlight across the gap before a visible prompt', async () => {
+  const { turnAtReadingSpan } = await import('./turnNavigation.ts');
+  const spans = [{ index: 12, bottom: 110 }, { index: 13, bottom: 900 }];
+  assert.equal(turnAtReadingSpan(spans, 140), 13);
+  assert.equal(turnAtReadingSpan(spans, 90), 12, 'still reading the previous reply');
+  assert.equal(turnAtReadingSpan(spans, 1000), 13);
+  assert.equal(turnAtReadingSpan([], 140), null);
+});
