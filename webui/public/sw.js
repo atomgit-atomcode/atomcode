@@ -38,15 +38,27 @@ function offlinePage(acceptLanguage) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${t.title}</title>
 <style>
+  :root { color-scheme: light dark; --page: #f7f7f5; --surface: #fff; --text: #222;
+          --muted: #595959; --border: #ddd; --code: #f0f0ee; --focus: #c2410c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --page: #1e1e1e; --surface: #262626; --text: #ededed; --muted: #b8b8b8;
+            --border: #454545; --code: #363636; --focus: #fb923c; }
+  }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f7f7f5; color: #222; }
-  @media (prefers-color-scheme: dark) { body { background: #1e1e1e; color: #ddd; } .card { background: #262626; border-color: #3a3a3a; } }
-  .card { max-width: 560px; margin: 24px; padding: 28px 32px; background: #fff; border: 1px solid #ddd; border-radius: 10px; }
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--page); color: var(--text); }
+  .card { max-width: 560px; min-width: 0; margin: 24px; padding: 28px 32px; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 10px; overflow-wrap: break-word; }
   h1 { font-size: 1.25rem; margin: 0 0 12px; }
   p, li { line-height: 1.65; }
-  code { padding: 1px 6px; border-radius: 4px; background: rgba(128,128,128,0.18); }
-  .note { opacity: 0.75; font-size: 0.9rem; }
-  button { margin-top: 8px; padding: 8px 16px; border-radius: 6px; border: 1px solid #c2410c; background: #c2410c; color: #fff; cursor: pointer; }
+  ul { padding-left: 24px; }
+  li + li { margin-top: 8px; }
+  code { padding: 1px 6px; border-radius: 4px; background: var(--code); }
+  .note { color: var(--muted); font-size: 0.9rem; }
+  button { margin-top: 8px; min-height: 44px; max-width: 100%; padding: 8px 16px; font: inherit;
+           border-radius: 6px; border: 1px solid #c2410c; background: #c2410c; color: #fff; cursor: pointer; }
+  button:hover { background: #9a3412; border-color: #9a3412; }
+  button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+  @media (max-width: 480px) { .card { margin: 16px; padding: 24px 20px; } }
 </style></head>
 <body><div class="card">
   <h1>${t.title}</h1>
