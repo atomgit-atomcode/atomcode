@@ -1,5 +1,5 @@
 import { ModelCardDialog } from './ModelCardDialog';
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState, useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import { getModels, ModelInfo, postLiveReasoningEffort, ReasoningEffortError } from '../api';
 import { useT } from '../settings';
 import { displayedModel, type RuntimeModelIdentity } from '../lib/modelIdentity';
@@ -71,7 +71,35 @@ export function ModelSelector({
   // local override after the user picks one (config isn't re-fetched).
   const [effortOverride, setEffortOverride] = useState<string | null | undefined>(undefined);
   const ref = useRef<HTMLDivElement>(null);
-  const effortRef = useRef<HTMLDivElement>(null);
+  const [effortDraft, setEffortDraft] = useState<string | null | undefined>(undefined);
+
+  const [popupStyle, setPopupStyle] = useState<{top?: string; bottom: string; maxHeight: string} | undefined>();
+  useLayoutEffect(() => {
+    if (!open && !effortOpen) return;
+    const position = () => {
+      if (window.innerWidth > 600 || !ref.current) { setPopupStyle(undefined); return; }
+      const rect = ref.current.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const visibleTop = viewport?.offsetTop ?? 0;
+      const visibleBottom = visibleTop + (viewport?.height ?? window.innerHeight);
+      const above = Math.max(0, rect.top - visibleTop - 20);
+      const below = Math.max(0, visibleBottom - rect.bottom - 20);
+      setPopupStyle(above >= 200 || above >= below
+        ? {bottom: `${window.innerHeight - rect.top + 8}px`, maxHeight: `${above}px`}
+        : {top: `${rect.bottom + 8}px`, bottom: 'auto', maxHeight: `${below}px`});
+    };
+    position();
+    window.addEventListener('resize', position);
+    window.addEventListener('scroll', position, true);
+    window.visualViewport?.addEventListener('resize', position);
+    window.visualViewport?.addEventListener('scroll', position);
+    return () => {
+      window.removeEventListener('resize', position);
+      window.removeEventListener('scroll', position, true);
+      window.visualViewport?.removeEventListener('resize', position);
+      window.visualViewport?.removeEventListener('scroll', position);
+    };
+  }, [open, effortOpen]);
 
   const modelsRef = useRef(models);
   modelsRef.current = models;
@@ -106,20 +134,23 @@ export function ModelSelector({
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [onDefaultChange]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open && !effortOpen) return;
     const h = (e: MouseEvent) => {
       const tgt = e.target as Node;
-      if (ref.current && !ref.current.contains(tgt)) setOpen(false);
-      if (effortRef.current && !effortRef.current.contains(tgt)) setEffortOpen(false);
+      if (ref.current && !ref.current.contains(tgt)) { setOpen(false); setEffortOpen(false); }
+    };
+    const escape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setOpen(false); setEffortOpen(false); ref.current?.querySelector<HTMLButtonElement>('.model-selector-trigger')?.focus(); }
     };
     document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
+    document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('mousedown', h); document.removeEventListener('keydown', escape); };
   }, [open, effortOpen]);
   const current = displayedModel(models, value, runtime);
   const currentProvider = useRef(current?.provider);
   currentProvider.current = current?.provider;
-  useEffect(() => { if (busy) setEffortOpen(false); }, [busy]);
+  useEffect(() => { setEffortDraft(undefined); }, [effortOpen, current?.provider, liveEffort]);
   // Switching models resets the effort display back to the new model's
   // persisted value; capability declarations decide whether the selector appears.
   useEffect(() => { setEffortOverride(undefined); }, [current?.provider, current?.model]);
@@ -129,7 +160,7 @@ export function ModelSelector({
   const effort = effortOverride !== undefined ? effortOverride : (current?.reasoning_effort ?? null);
   const effortLabel = (v: string | null): string => {
     const o = EFFORT_OPTIONS.find((x) => x.val === v) ?? EFFORT_OPTIONS[0];
-    return t(o.key);
+    return o.val === v ? t(o.key) : (v ?? t('effort.default'));
   };
   const selectEffort = (v: string | null) => {
     if (busy || effortSaving || !current) return;
@@ -138,7 +169,7 @@ export function ModelSelector({
     setEffortError(null);
     setEffortSaving(true);
     setEffortOverride(v);
-    setEffortOpen(false);
+    setEffortDraft(undefined);
     void postLiveReasoningEffort(v, target).then(() => {
       if (currentProvider.current === target) onEffortChange?.(target, v);
       // The write succeeded. A later list refresh failure must not undo that fact.
@@ -169,50 +200,58 @@ export function ModelSelector({
       {cardModel && <ModelCardDialog model={cardModel} onClose={() => setCardModel(null)} />}
       {effortError && <span role="alert">{effortError}</span>}
       {currentTurn && current && <span class="model-next-turn" role="status">{t('model.nextTurnStatus', {current:currentTurn.model??currentTurn.provider, next:current.model})}</span>}
-      {current?.effort_applicable && (
-        <div class="model-selector effort-selector model-selector-up" ref={effortRef}>
-          <button
-            class="model-selector-trigger"
-            onClick={() => { setEffortOpen((o) => !o); setOpen(false); }}
-            type="button"
-            disabled={busy || effortSaving}
-            title={t(busy ? 'effort.busy' : 'effort.label')}
-          >
-            <span class="effort-prefix">{t('effort.label')}</span>
-            <span class="model-selector-label">{effortLabel(effort)}</span>
-            <span class="model-selector-chevron">▾</span>
-          </button>
-          {effortOpen && !busy && !effortSaving && (
-            <div class="model-dropdown">
-              {EFFORT_OPTIONS.filter(
-                (o) =>
-                  o.val === null ||
-                  !current?.effort_levels?.length ||
-                  current.effort_levels.includes(o.val),
-              ).map((o) => (
-                <button
-                  key={o.key}
-                  class={'model-item' + (o.val === effort ? ' active' : '')}
-                  type="button"
-                  onClick={() => selectEffort(o.val)}
-                >
-                  <span class="model-item-model">{t(o.key)}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-      <div class="model-selector model-selector-up" ref={ref}>
-        <button class="model-selector-trigger" onClick={() => { setOpen((o) => !o); setEffortOpen(false); }} type="button">
+      <div class="model-selector unified-model-selector model-selector-up" ref={ref}>
+        <button class="model-selector-trigger" aria-expanded={open || effortOpen}
+          onClick={() => {
+            if (open || effortOpen) { setOpen(false); setEffortOpen(false); }
+            else if (current?.effort_applicable) setEffortOpen(true);
+            else setOpen(true);
+          }} type="button">
           <span class="model-selector-label">{current ? current.model : t('model.label')}{currentTurn && <span class="model-next-turn-badge"> · {t('model.nextTurn')}</span>}</span>
-          {current && isDup(current.model) && (
-            <span class="model-selector-provider">{providerLabel(current)}</span>
-          )}
-          <span class="model-selector-chevron">▾</span>
+          {current && isDup(current.model) && <span class="model-selector-provider">{providerLabel(current)}</span>}
+          {current?.effort_applicable && <span class="model-effort-summary">{effortLabel(effort)}</span>}
+          <span class="model-selector-chevron" aria-hidden="true">▾</span>
         </button>
+        {effortOpen && current && (
+          <div class="model-dropdown model-effort-panel" style={popupStyle}>
+            <div class="model-effort-heading">
+              <span>{t('effort.label')}</span>
+              <strong aria-live="polite">{effortLabel(effortDraft !== undefined ? effortDraft : effort)}</strong>
+            </div>
+            <button class="model-effort-name" type="button" onClick={() => { ref.current?.querySelector<HTMLButtonElement>('.model-selector-trigger')?.focus(); setEffortOpen(false); setOpen(true); }}>
+              <span>{current.model}{isDup(current.model) ? ` (${providerLabel(current)})` : ''}</span>
+              <span aria-hidden="true">›</span>
+            </button>
+            {current.effort_applicable && (() => {
+              // The server owns the order, including levels newer than this UI.
+              const options = current.effort_levels?.length
+                ? [{val: null}, ...Array.from(new Set(current.effort_levels)).map(val => ({val}))]
+                : EFFORT_OPTIONS;
+              const preview = effortDraft !== undefined ? effortDraft : effort;
+              const index = Math.max(0, options.findIndex(o => o.val === preview));
+              return <div class="model-effort-slider">
+                <input type="range" min="0" max={options.length - 1} step="1" value={index}
+                  aria-label={t('effort.label')} aria-valuetext={effortLabel(preview)}
+                  disabled={busy || options.length < 2} aria-disabled={busy || effortSaving} aria-busy={effortSaving}
+                  onInput={e => {
+                    if (effortSaving) { e.currentTarget.value = String(index); return; }
+                    setEffortDraft(options[Number(e.currentTarget.value)].val);
+                  }}
+                  onChange={e => {
+                    if (effortSaving) { e.currentTarget.value = String(index); return; }
+                    selectEffort(options[Number(e.currentTarget.value)].val);
+                  }} />
+                <div class="model-effort-stops" aria-hidden="true">
+                  {options.map((o, i) => <span key={o.val ?? 'default'} class={i === index ? 'active' : ''} />)}
+                </div>
+                <div class="model-effort-endpoints"><span>{t('effort.default')}</span><span>{effortLabel(options[options.length - 1].val)}</span></div>
+                {busy && <p class="model-effort-hint">{t('effort.busy')}</p>}
+              </div>;
+            })()}
+          </div>
+        )}
         {open && (
-          <div class="model-dropdown">
+          <div class="model-dropdown model-choice-list" style={popupStyle}>
             {models.map((m) => (
               <div class="model-card-row" key={m.provider}><button
                 class={'model-item' + (m.provider === current?.provider && m.model === current?.model ? ' active' : '')}
@@ -221,6 +260,7 @@ export function ModelSelector({
                 onClick={() => { onChange(m.provider); setOpen(false); }}
               >
                 <span class="model-item-model">{m.model}</span>
+                {m.provider === current?.provider && m.model === current?.model && <span class="model-choice-check" aria-hidden="true">✓</span>}
                 {isDup(m.model) && <span class="model-item-provider">{providerLabel(m)}</span>}
               </button><button type="button" class="model-card-info" aria-label={`${t('cards.open')}: ${m.model}`} title={t('cards.open')} onClick={() => { setCardModel(m); setOpen(false); }}>{m.model_card_status === 'no_public_data' ? t('cards.noPublicBadge') : 'ⓘ'}</button></div>
             ))}
