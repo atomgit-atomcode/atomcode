@@ -706,6 +706,13 @@ function AddProviderCard({
         </div>
       )}
 
+      {mode === 'preset' && connections.length <= 1 && (
+        <div class="add-model-field">
+          <label class="add-model-label">{t('providers.protocol')}</label>
+          <span>{selectedType === 'openai' ? 'OpenAI' : selectedType === 'anthropic' ? 'Anthropic' : selectedType === 'responses' ? 'OpenAI Responses' : selectedType === 'ollama' ? 'Ollama' : selectedType === 'deepseek-messages' ? 'DeepSeek Messages' : selectedType}</span>
+        </div>
+      )}
+
       {mode === 'custom' && (
         <div class="add-model-field">
           <label class="add-model-label">{t('providers.accountId')}</label>
@@ -722,20 +729,18 @@ function AddProviderCard({
         </div>
       )}
 
-      {(mode === 'custom' || connections.length > 1) && (
-        <div class="add-model-field">
-          <label class="add-model-label">{t('providers.baseUrl')}</label>
-          <input
-            class="menu-input"
-            type="url"
-            spellcheck={false}
-            placeholder={defaultEndpoint ?? (selectedType === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1')}
-            aria-label={t('providers.baseUrl')}
-            value={connection ? endpoint : draft.baseUrl}
-            onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
-          />
-        </div>
-      )}
+      <div class="add-model-field">
+        <label class="add-model-label">{t('providers.baseUrl')}</label>
+        <input
+          class="menu-input"
+          type="url"
+          spellcheck={false}
+          placeholder={defaultEndpoint ?? (selectedType === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1')}
+          aria-label={t('providers.baseUrl')}
+          value={mode === 'preset' ? endpoint : draft.baseUrl}
+          onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
+        />
+      </div>
 
       <div class="add-model-field">
         <label class="add-model-label">{t('providers.apiKey')}</label>
@@ -767,23 +772,6 @@ function AddProviderCard({
             onInput={(e) => setDraft({ ...typed, displayName: (e.target as HTMLInputElement).value })}
           />
         </div>
-        {mode === 'preset' && connections.length <= 1 && (
-          <div class="add-model-field">
-            <label class="add-model-label">{t('providers.baseUrl')}</label>
-            <input
-              class="menu-input"
-              type="url"
-              spellcheck={false}
-              placeholder={chosen?.default_base_url ?? ''}
-              aria-label={t('providers.baseUrl')}
-              value={draft.baseUrl}
-              onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
-            />
-            {chosen?.default_base_url && (
-              <span class="field-hint">{t('providers.baseUrlDefault', { url: chosen.default_base_url })}</span>
-            )}
-          </div>
-        )}
       </details>
 
       <ModelRowsEditor

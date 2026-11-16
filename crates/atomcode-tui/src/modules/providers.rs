@@ -244,6 +244,25 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
         Some(form) => {
             rows.push(Row::FormHead);
             rows.push(Row::Blank);
+            if let Form::Account(f) = form {
+                if !f.fields(view).contains(&AccountField::Protocol) {
+                    rows.push(Row::Card(format!(
+                        "  {}  {}",
+                        t(Msg::FieldProtocol),
+                        f.protocol_label(view)
+                    )));
+                }
+                if !f.fields(view).contains(&AccountField::Endpoint) && !f.endpoint.is_empty() {
+                    rows.extend(
+                        width::wrap(
+                            &format!("{}  {}", t(Msg::FieldAddress), f.endpoint),
+                            w.saturating_sub(2).max(1),
+                        )
+                        .into_iter()
+                        .map(Row::Card),
+                    );
+                }
+            }
             let fields = match form {
                 Form::Account(f) => f.fields(view).len(),
                 Form::Model(f) => f.fields(view).len(),
@@ -799,11 +818,20 @@ fn listed_parts(
                 return None;
             };
             let host = row.endpoint_host();
-            let mut about = vec![if host.is_empty() {
-                row.protocol.clone()
+            let choices = view.connections(&row.id);
+            let protocol = if !row.configured && choices.len() > 1 {
+                choices
+                    .iter()
+                    .map(|choice| choice.protocol.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
             } else {
-                host.to_string()
-            }];
+                row.protocol.clone()
+            };
+            let mut about = vec![protocol];
+            if !host.is_empty() {
+                about.push(host.to_string());
+            }
             if row.configured {
                 about.push(t(Msg::ProviderModelCount { n: row.models }).into_owned());
                 about.push(
@@ -2297,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_hides_address_and_offers_clickable_advanced_settings() {
+    fn a_connection_shows_protocol_and_address_and_offers_clickable_advanced_settings() {
         use crate::surface::KeyPress;
         let v = view();
         let form = AccountForm::connect(&v, v.account("deepseek").unwrap());
@@ -2307,7 +2335,8 @@ mod tests {
         }));
         let text = drawn(&m, 120, 24);
         assert!(text.contains(&t(Msg::FieldKey).to_string()), "{text}");
-        assert!(!text.contains("https://"), "{text}");
+        assert!(text.contains("https://"), "{text}");
+        assert!(text.contains("OpenAI"), "{text}");
         let (col, row) = button_hit(&m, KeyPress::ctrl('o'));
         let vp = Viewport::new(Rect::sized(120, 24), &m);
         assert_eq!(action_at(&m, &vp, col, row), Some(KeyPress::ctrl('o')));

@@ -16,6 +16,24 @@ config.provider_presets.push({ id: 'aliyun', display_name: 'Alibaba', type: 'ope
   { type: 'openai', base_urls: ['https://dashscope.aliyuncs.com/compatible-mode/v1'] },
   { type: 'anthropic', base_urls: ['https://dashscope.aliyuncs.com/apps/anthropic'] },
 ] });
+config.provider_presets.push({ id: 'anthropic', display_name: 'Anthropic Official', type: 'anthropic', default_base_url: 'https://api.anthropic.com', requires_api_key: true, discoverable: true });
+config.provider_presets.push({ id: 'zhipu-coding', display_name: 'Zhipu Coding', type: 'openai', default_base_url: 'https://open.bigmodel.cn/api/coding/paas/v4', requires_api_key: true, discoverable: true, connections: [
+  { type: 'openai', base_urls: ['https://open.bigmodel.cn/api/coding/paas/v4'] },
+  { type: 'anthropic', base_urls: ['https://open.bigmodel.cn/api/anthropic'] },
+] });
+const addedPresets = [
+  ['aliyun-token-plan', 'Alibaba Cloud Token Plan', 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic'],
+  ['aliyun-coding', 'Alibaba Cloud Coding Plan', 'https://coding.dashscope.aliyuncs.com/v1', 'https://coding.dashscope.aliyuncs.com/apps/anthropic'],
+  ['xiaomi-token-plan', 'Xiaomi MiMo Token Plan', 'https://token-plan-cn.xiaomimimo.com/v1', 'https://token-plan-cn.xiaomimimo.com/anthropic'],
+  ['kimi-code', 'Kimi Code', 'https://api.kimi.com/coding/v1', 'https://api.kimi.com/coding'],
+  ['tencent-tokenhub', 'Tencent TokenHub', 'https://tokenhub.tencentmaas.com/v1', 'https://tokenhub.tencentmaas.com'],
+  ['tencent-token-plan', 'Tencent Token Plan', 'https://tokenhub.tencentmaas.com/plan/v3', 'https://tokenhub.tencentmaas.com/plan/anthropic'],
+  ['tencent-coding', 'Tencent Coding Plan', 'https://api.lkeap.cloud.tencent.com/coding/v3', 'https://api.lkeap.cloud.tencent.com/coding/anthropic'],
+];
+for (const [id, display_name, openai, anthropic] of addedPresets) {
+  config.provider_presets.push({ id, display_name, type: 'openai', default_base_url: openai, requires_api_key: true, discoverable: true,
+    connections: anthropic ? [{ type: 'openai', base_urls: [openai] }, { type: 'anthropic', base_urls: [anthropic] }] : [] });
+}
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://fixture').pathname;
   const json = value => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
@@ -58,6 +76,33 @@ try {
       await form.locator('.custom-select-option').getByText(name, { exact: true }).click();
     };
     await endpoint.waitFor(); // Visible without opening advanced settings.
+    for (const [, name, openai, anthropic] of addedPresets) {
+      await form.locator('.custom-select-trigger').first().click();
+      await form.locator('.custom-select-option').filter({ hasText: name }).click();
+      assert.equal(await endpoint.inputValue(), openai, name);
+      await key.fill('fixture-plan-key');
+      if (anthropic) {
+        await select('Anthropic');
+        assert.equal(await endpoint.inputValue(), anthropic, name);
+        assert.equal(await key.inputValue(), 'fixture-plan-key');
+        await select('OpenAI');
+        assert.equal(await endpoint.inputValue(), openai, name);
+      }
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), name);
+    }
+
+    await form.locator('.custom-select-trigger').first().click();
+    await form.locator('.custom-select-option').filter({ hasText: 'Anthropic Official' }).click();
+    assert.equal(await endpoint.inputValue(), 'https://api.anthropic.com');
+    assert.equal(await form.locator('.add-model-field').filter({ has: page.locator('.add-model-label', { hasText: /^Protocol$/ }) }).innerText(), 'Protocol\nAnthropic');
+    await form.locator('.custom-select-trigger').first().click();
+    await form.locator('.custom-select-option').filter({ hasText: 'Zhipu Coding' }).click();
+    await select('Anthropic');
+    assert.equal(await endpoint.inputValue(), 'https://open.bigmodel.cn/api/anthropic');
+    await select('OpenAI');
+    assert.equal(await endpoint.inputValue(), 'https://open.bigmodel.cn/api/coding/paas/v4');
+    await form.locator('.custom-select-trigger').first().click();
+    await form.locator('.custom-select-option').filter({ hasText: 'TaoToken' }).click();
     assert.equal(await endpoint.inputValue(), connections[0].base_urls[0]);
     await key.fill('fixture-key');
     await model.fill('old-openai-model');
@@ -69,7 +114,7 @@ try {
     await select('OpenAI');
     assert.equal(await endpoint.inputValue(), connections[0].base_urls[1]);
     await form.locator('.custom-select-trigger').first().click();
-    await form.locator('.custom-select-option').filter({ hasText: 'Alibaba' }).click();
+    await form.locator('.custom-select-option').filter({ hasText: /^Alibaba ·/ }).click();
     assert.equal(await endpoint.inputValue(), 'https://dashscope.aliyuncs.com/compatible-mode/v1');
     await select('Anthropic');
     assert.equal(await endpoint.inputValue(), 'https://dashscope.aliyuncs.com/apps/anthropic');
@@ -91,6 +136,7 @@ try {
     assert.equal(discoveries.at(-1).base_url, connections[1].base_urls[1]);
     await picker.getByRole('button', { name: 'Cancel', exact: true }).click();
     await model.fill('manual-model');
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'no horizontal overflow');
     await page.screenshot({ path: `/tmp/atomcode-provider-protocol-${width}.png` });
     const previous = writes.length;
     await form.locator('.add-model-actions .btn-primary').click();

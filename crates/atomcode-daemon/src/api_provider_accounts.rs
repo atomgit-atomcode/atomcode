@@ -1053,6 +1053,26 @@ mod tests {
         // and explicit plan endpoint survive the actual write/reload boundary.
         for (vendor, endpoint) in [
             ("taotoken", "https://api.taotoken.net/coding"),
+            ("zhipu", "https://open.bigmodel.cn/api/anthropic"),
+            ("zhipu-coding", "https://open.bigmodel.cn/api/anthropic"),
+            ("minimax", "https://api.minimaxi.com/anthropic"),
+            ("minimax-token-plan", "https://api.minimax.cn/anthropic"),
+            ("moonshot", "https://api.moonshot.cn/anthropic"),
+            (
+                "xiaomi-mimo",
+                "https://token-plan-cn.xiaomimimo.com/anthropic",
+            ),
+            ("longcat", "https://api.longcat.chat/anthropic"),
+            (
+                "volcengine",
+                "https://ark.cn-beijing.volces.com/api/compatible",
+            ),
+            (
+                "volcengine-coding",
+                "https://ark.cn-beijing.volces.com/api/coding",
+            ),
+            ("siliconflow", "https://api.siliconflow.cn"),
+            ("openrouter", "https://openrouter.ai/api"),
             (
                 "aliyun",
                 "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
@@ -1081,6 +1101,45 @@ mod tests {
                 saved.provider_accounts[vendor].provider,
                 "anthropic-compatible"
             );
+        }
+        // Newly offered products work with only a key/model: each protocol
+        // supplies its own default, persisted without changing billing routes.
+        for vendor in [
+            "aliyun-token-plan",
+            "aliyun-coding",
+            "xiaomi-token-plan",
+            "kimi-code",
+            "tencent-tokenhub",
+            "tencent-token-plan",
+            "tencent-coding",
+        ] {
+            let preset = atomcode_config::config::provider_preset::preset(vendor).unwrap();
+            for protocol in ["openai", "anthropic"] {
+                let options = atomcode_config::config::provider_preset::connections(vendor);
+                let option = options.iter().find(|o| o.provider_type.wire() == protocol);
+                if protocol == "anthropic" && option.is_none() {
+                    continue;
+                }
+                let id = format!("{vendor}-{protocol}");
+                let created = http
+                    .post(format!("{base}/provider-accounts"))
+                    .json(
+                        &serde_json::json!({"id":id,"provider":vendor,"protocol":protocol,
+                        "api_key":"fixture-key","models":[{"model":"fixture"}]}),
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(created.status(), StatusCode::CREATED, "{id}");
+                let saved = config();
+                let resolved = saved.resolve_model(Some(&format!("{id}/fixture"))).unwrap();
+                assert_eq!(resolved.provider_type, protocol, "{id}");
+                assert_eq!(
+                    resolved.base_url.as_deref(),
+                    option.map(|o| o.base_urls[0]).or(preset.default_base_url),
+                    "{id}"
+                );
+            }
         }
         let defaulted = http.post(format!("{base}/provider-accounts"))
             .json(&serde_json::json!({"id":"ali-default", "provider":"aliyun", "protocol":"anthropic", "api_key":"fixture-key", "models":[{"model":"fixture"}]}))

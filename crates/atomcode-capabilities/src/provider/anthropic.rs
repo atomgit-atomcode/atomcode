@@ -17,7 +17,8 @@
 //!     adapter replays as signed `thinking`/`redacted_thinking` content next request.
 //!   - `system` is a TOP-LEVEL request field (not a message role); `max_tokens` is
 //!     REQUIRED; tool `input_schema` (not `function.parameters`); `tool_use.input` is a
-//!     JSON OBJECT (not a string). Auth is `x-api-key` + `anthropic-version`, not Bearer.
+//!     JSON OBJECT (not a string). Native auth uses `x-api-key` + `anthropic-version`;
+//!     documented compatible gateways may require Bearer authentication.
 //!   - PREFIX BYTE-STABILITY for prompt caching: the body is built from a BTreeMap-backed
 //!     `Map` (sorted on serialize) with no timestamps/uuids, so the same
 //!     `(system, messages, tools)` always serialize identically.
@@ -484,6 +485,44 @@ async fn open_stream(
     .await
 }
 
+/// The Messages wire does not imply the native Anthropic authentication scheme.
+/// Keep discovery and inference on the same documented auth policy. Match exact
+/// hosts AND routes; custom gateways retain native auth and account overrides.
+/// Sources: LongCat APIDocs, Kimi Messages, SiliconFlow messages-post and
+/// OpenRouter / Ark Coding Plan Claude Code integration (linked in the catalog).
+pub(super) fn authenticate(
+    request: reqwest::RequestBuilder,
+    url: &str,
+    key: &str,
+) -> reqwest::RequestBuilder {
+    let bearer = reqwest::Url::parse(url).ok().is_some_and(|url| {
+        matches!(
+            (url.host_str().unwrap_or_default(), url.path()),
+            ("api.longcat.chat", "/anthropic/v1/messages" | "/v1/models")
+                | ("api.moonshot.cn", "/anthropic/v1/messages" | "/v1/models")
+                | ("api.siliconflow.cn", "/v1/messages" | "/v1/models")
+                | ("openrouter.ai", "/api/v1/messages" | "/api/v1/models")
+                | (
+                    "api.lkeap.cloud.tencent.com",
+                    "/coding/anthropic/v1/messages" | "/coding/anthropic/v1/models"
+                )
+                | (
+                    "tokenhub.tencentmaas.com",
+                    "/plan/anthropic/v1/messages" | "/plan/anthropic/v1/models"
+                )
+                | (
+                    "ark.cn-beijing.volces.com",
+                    "/api/coding/v1/messages" | "/api/coding/v1/models"
+                )
+        )
+    });
+    if bearer {
+        request.bearer_auth(key)
+    } else {
+        request.header("x-api-key", key)
+    }
+}
+
 async fn open_stream_attempts(
     client: &super::openai_compat::SwappableClient,
     url: &str,
@@ -507,7 +546,7 @@ async fn open_stream_attempts(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes.clone());
         if !api_key.is_empty() {
-            req = req.header("x-api-key", api_key);
+            req = authenticate(req, url, api_key);
         }
         req = with_session_headers(req, url, session_id);
         req = super::apply_account_headers(req, &client.headers)?;
@@ -1605,6 +1644,28 @@ mod tests {
             json!({"type":"thinking", "thinking":"unsigned"})
         );
         assert!(!body.to_string().contains("redacted_thinking"));
+    }
+
+    #[test]
+    fn tokenhub_preset_builds_the_documented_messages_request() {
+        let connection = atomcode_config::config::provider_preset::connections("tencent-tokenhub")
+            .iter()
+            .find(|c| c.provider_type.wire() == "anthropic")
+            .unwrap();
+        let provider = AnthropicProvider::new(AnthropicConfig::new(
+            "test-key",
+            connection.base_urls[0],
+            "fixture-model",
+        ))
+        .unwrap();
+        assert_eq!(provider.url, "https://tokenhub.tencentmaas.com/v1/messages");
+        let client = reqwest::Client::new();
+        let request = authenticate(client.post(&provider.url), &provider.url, "test-key")
+            .build()
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.headers()["x-api-key"], "test-key");
+        assert!(!request.headers().contains_key("authorization"));
     }
 
     #[tokio::test]

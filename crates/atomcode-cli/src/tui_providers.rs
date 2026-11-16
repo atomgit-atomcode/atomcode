@@ -735,7 +735,7 @@ rank = 2
             .map(|row| row.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            &offers[..14],
+            &offers[..21],
             &[
                 "deepseek",
                 "zhipu",
@@ -745,11 +745,18 @@ rank = 2
                 "minimax",
                 "minimax-token-plan",
                 "moonshot",
+                "kimi-code",
                 "aliyun",
+                "aliyun-token-plan",
+                "aliyun-coding",
                 "xiaomi-mimo",
+                "xiaomi-token-plan",
                 "longcat",
                 "volcengine",
                 "volcengine-coding",
+                "tencent-tokenhub",
+                "tencent-token-plan",
+                "tencent-coding",
                 "siliconflow",
             ]
         );

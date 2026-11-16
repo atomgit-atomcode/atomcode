@@ -143,6 +143,25 @@ pub fn discovery_url(base_url: &str, provider_type: &str) -> Result<reqwest::Url
         url.set_fragment(None);
         return Ok(url);
     }
+    // These vendors document a single, same-origin model catalog shared by
+    // their chat protocols (LongCat APIDocs; Kimi API model-list reference).
+    let shared_catalog = matches!(
+        (
+            url.host_str().unwrap_or_default(),
+            url.path().trim_end_matches('/'),
+            discovery_protocol(provider_type)
+        ),
+        ("api.longcat.chat", "/anthropic", Some("anthropic"))
+            | ("api.longcat.chat", "/openai/v1", Some("openai"))
+            | ("api.moonshot.cn", "/anthropic", Some("anthropic"))
+            | ("tokenhub.tencentmaas.com", "", Some("anthropic"))
+    );
+    if shared_catalog {
+        url.set_path("/v1/models");
+        url.set_query(None);
+        url.set_fragment(None);
+        return Ok(url);
+    }
     let path = format!("{}{}", url.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
     // Anthropic pages its list (20 by default); one request for all of them.
@@ -170,11 +189,15 @@ fn discovery_auth(
     protocol: &str,
     key: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let openai_listing = is_aliyun_model_host(url) && url.path() == "/compatible-mode/v1/models";
+    // TokenHub's shared Models API requires Bearer, while its ordinary
+    // Messages API uses x-api-key (unlike its subscription gateway).
+    // https://cloud.tencent.com/document/product/1823/130078
+    let openai_listing = (is_aliyun_model_host(url) && url.path() == "/compatible-mode/v1/models")
+        || (url.host_str() == Some("tokenhub.tencentmaas.com") && url.path() == "/v1/models");
     if protocol == "anthropic" && !openai_listing {
         let request = request.header("anthropic-version", "2023-06-01");
         match key {
-            Some(key) => request.header("x-api-key", key.trim()),
+            Some(key) => super::anthropic::authenticate(request, url.as_str(), key.trim()),
             None => request,
         }
     } else {
@@ -547,6 +570,105 @@ mod metadata_tests {
             assert_eq!(request.headers()["authorization"], "Bearer test-key");
             assert!(!request.headers().contains_key("x-api-key"));
             assert!(!request.headers().contains_key("anthropic-version"));
+        }
+    }
+
+    #[test]
+    fn tokenhub_listing_uses_bearer_but_messages_keep_api_key_auth() {
+        let client = reqwest::Client::new();
+        for (base, protocol) in [
+            ("https://tokenhub.tencentmaas.com/", "anthropic"),
+            ("https://tokenhub.tencentmaas.com/v1", "openai"),
+        ] {
+            let url = discovery_url(base, protocol).unwrap();
+            assert_eq!(url.as_str(), "https://tokenhub.tencentmaas.com/v1/models");
+            let request =
+                discovery_auth(client.get(url.clone()), &url, protocol, Some(" test-key "))
+                    .build()
+                    .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+            assert!(!request.headers().contains_key("x-api-key"));
+            assert!(!request.headers().contains_key("anthropic-version"));
+        }
+        for url in [
+            "https://tokenhub.tencentmaas.com/v1/messages",
+            "https://tokenhub.tencentmaas.com.example.test/v1/models",
+            "https://tokenhub.tencentmaas.com/custom/v1/models",
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let request = discovery_auth(client.get(url), &parsed, "anthropic", Some("test-key"))
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["x-api-key"], "test-key");
+            assert!(!request.headers().contains_key("authorization"));
+        }
+    }
+
+    #[test]
+    fn compatible_vendors_use_their_documented_catalog_and_auth() {
+        let client = reqwest::Client::new();
+        for (base, path) in [
+            ("https://api.longcat.chat/anthropic", "/v1/models"),
+            ("https://api.moonshot.cn/anthropic", "/v1/models"),
+            ("https://api.siliconflow.cn", "/v1/models"),
+            ("https://openrouter.ai/api", "/api/v1/models"),
+            (
+                "https://api.lkeap.cloud.tencent.com/coding/anthropic",
+                "/coding/anthropic/v1/models",
+            ),
+            (
+                "https://tokenhub.tencentmaas.com/plan/anthropic",
+                "/plan/anthropic/v1/models",
+            ),
+            (
+                "https://ark.cn-beijing.volces.com/api/coding",
+                "/api/coding/v1/models",
+            ),
+        ] {
+            let url = discovery_url(base, "anthropic").unwrap();
+            assert_eq!(url.path(), path);
+            assert_eq!(
+                url.host_str(),
+                reqwest::Url::parse(base).unwrap().host_str()
+            );
+            let request =
+                discovery_auth(client.get(url.clone()), &url, "anthropic", Some("test-key"))
+                    .build()
+                    .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+            assert!(!request.headers().contains_key("x-api-key"));
+            let message_url = format!("{base}/v1/messages");
+            let chat = super::super::anthropic::authenticate(
+                client.post(&message_url),
+                &message_url,
+                "test-key",
+            )
+            .build()
+            .unwrap();
+            assert_eq!(chat.headers()["authorization"], "Bearer test-key");
+            assert!(!chat.headers().contains_key("x-api-key"));
+        }
+        assert_eq!(
+            discovery_url("https://api.longcat.chat/openai/v1", "openai")
+                .unwrap()
+                .as_str(),
+            "https://api.longcat.chat/v1/models"
+        );
+        for url in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.longcat.chat.evil.test/anthropic/v1/messages",
+            "https://evil.test/api.siliconflow.cn/v1/messages",
+            "https://api.longcat.chat/custom/v1/messages",
+            "https://api.minimax.cn/anthropic/v1/messages",
+            "https://api.kimi.com/coding/v1/messages",
+            "https://api.lkeap.cloud.tencent.com.evil.test/coding/anthropic/v1/messages",
+            "https://tokenhub.tencentmaas.com/custom/plan/anthropic/v1/messages",
+        ] {
+            let request = super::super::anthropic::authenticate(client.post(url), url, "test-key")
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["x-api-key"], "test-key");
+            assert!(!request.headers().contains_key("authorization"));
         }
     }
 
