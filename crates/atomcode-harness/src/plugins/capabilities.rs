@@ -439,7 +439,23 @@ impl Plugin for WebPlugin {
 /// product once mounted the tool and not this, so on the product `/review`
 /// did not exist.
 pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
-    crate::commands::register(ctx, Arc::new(ReviewCommand(tool)))
+    register_review_command_with_policy(ctx, tool, false)
+}
+
+/// Register the built-in slash command with an explicit inline execution
+/// policy. Use this for tools whose command path must bypass model-oriented
+/// delegation; generic third-party reviewer tools should use
+/// [`register_review_command`] so their argument contract stays untouched.
+pub fn register_review_command_inline(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
+    register_review_command_with_policy(ctx, tool, true)
+}
+
+fn register_review_command_with_policy(
+    ctx: &Context,
+    tool: Arc<dyn Tool>,
+    inline: bool,
+) -> Result<(), String> {
+    crate::commands::register(ctx, Arc::new(ReviewCommand(tool, inline)))
 }
 
 /// `review`: the reviewer over the current changes, run by a person.
@@ -447,7 +463,7 @@ pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(),
 /// The same tool the row mounted, with the same rules and the same provider
 /// slot. What "the current changes" means — staged, a base, a range — is the
 /// tool's own argument, passed through as typed.
-struct ReviewCommand(Arc<dyn Tool>);
+struct ReviewCommand(Arc<dyn Tool>, bool);
 
 #[async_trait]
 impl crate::commands::CatalogCommand for ReviewCommand {
@@ -485,6 +501,13 @@ impl crate::commands::CatalogCommand for ReviewCommand {
             base => {
                 call.insert("base".into(), serde_json::Value::String(base.to_string()));
             }
+        }
+        // The command is already the user's explicit review request. Mark it
+        // internally so ReviewTool runs its read-only reviewer directly
+        // instead of handing the task to a second agent that only calls this
+        // same tool. This field is not part of the model-facing schema.
+        if self.1 {
+            call.insert("_inline_command".into(), serde_json::Value::Bool(true));
         }
         let result = self
             .0

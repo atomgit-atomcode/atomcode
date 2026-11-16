@@ -343,6 +343,12 @@ struct Args {
     /// User review focus and constraints, retained across delegation.
     #[serde(default)]
     instructions: Option<String>,
+    /// Internal dispatch hint set only by the built-in `/review` command. It
+    /// is deliberately absent from the model-facing schema: slash commands
+    /// run the review directly, while model tool calls may use background
+    /// delegation.
+    #[serde(default, rename = "_inline_command")]
+    inline_command: bool,
 }
 
 #[derive(Deserialize)]
@@ -600,19 +606,20 @@ impl Tool for ReviewTool {
         }
 
         // The scope is settled — non-empty, and confirmed if it had to be — so
-        // this is the review the person asked for. Where the host can run it out
-        // of view, it goes there and this turn is free again. After the
-        // preflight on purpose: a scope that needs a yes is asked about here,
-        // where the person is, not in a session nobody is looking at. The
-        // arguments go along as they came, `confirm_scope` included, so the
-        // review over there starts on the same scope without asking again.
-        if let Some(delegate) = &self.delegate {
-            let task = delegated_task(args, a.instructions.as_deref());
-            if let Some(Ok(started)) = delegate
-                .delegate(&ctx.working_dir, task, scope.host_word())
-                .await
-            {
-                return ok(delegated_reply(&started));
+        // this is the review the person asked for. Model tool calls may go to a
+        // background session; `/review` sets `inline_command` because it is
+        // already the explicit command to run this reviewer. Keep this after
+        // preflight so oversized scopes are always confirmed in the visible
+        // conversation before either execution path starts.
+        if !a.inline_command {
+            if let Some(delegate) = &self.delegate {
+                let task = delegated_task(args, a.instructions.as_deref());
+                if let Some(Ok(started)) = delegate
+                    .delegate(&ctx.working_dir, task, scope.host_word())
+                    .await
+                {
+                    return ok(delegated_reply(&started));
+                }
             }
         }
 
@@ -1235,11 +1242,13 @@ mod tests {
     #[test]
     fn args_parse_defaults_and_fields() {
         let d: Args = serde_json::from_str("{}").unwrap();
-        assert!(d.base.is_none() && !d.staged);
+        assert!(d.base.is_none() && !d.staged && !d.inline_command);
         let s: Args = serde_json::from_str(r#"{"staged":true}"#).unwrap();
         assert!(s.staged);
         let b: Args = serde_json::from_str(r#"{"base":"main"}"#).unwrap();
         assert_eq!(b.base.as_deref(), Some("main"));
+        let command: Args = serde_json::from_str(r#"{"_inline_command":true}"#).unwrap();
+        assert!(command.inline_command);
     }
 
     #[test]
@@ -1275,6 +1284,13 @@ mod tests {
             test_dirs(),
         );
         assert_no_forbidden_keys(&tool.parameters_schema(), "$");
+        assert!(
+            !tool.parameters_schema()["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("_inline_command"),
+            "the internal slash-command dispatch hint must not be exposed to models"
+        );
     }
 
     #[test]
@@ -1736,6 +1752,31 @@ mod tests {
         assert_eq!(asked.len(), 1);
         assert!(asked[0].0.contains(r#"{"depth":"deep"}"#), "{}", asked[0].0);
         assert_eq!(asked[0].1.as_deref(), Some("working_tree"));
+    }
+
+    #[tokio::test]
+    async fn inline_command_hint_skips_background_delegate() {
+        let dir = repo_with_working_tree_change();
+        let delegate = Arc::new(Recorded {
+            takes: true,
+            asked: Default::default(),
+        });
+        let tool = ReviewTool::new(
+            Arc::new(RwLock::new(None)),
+            ReviewToolConfig::default(),
+            test_dirs(),
+        )
+        .with_delegate(Some(delegate.clone()));
+
+        let result = tool
+            .execute(r#"{"_inline_command":true}"#, &ctx_in(dir.path()))
+            .await;
+
+        assert!(result.content.contains("review provider is not wired"));
+        assert!(
+            delegate.asked.lock().unwrap().is_empty(),
+            "the slash command executes this reviewer directly"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

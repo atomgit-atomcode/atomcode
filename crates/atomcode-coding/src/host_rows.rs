@@ -1196,7 +1196,10 @@ impl Plugin for HostToolsPlugin {
         // — or `/review` does not exist on the product at all, which is what it
         // was until 2026-09-22.
         if let Some(review) = self.0.iter().find(|tool| tool.name() == "code_review") {
-            atomcode_harness::plugins::capabilities::register_review_command(ctx, review.clone())?;
+            atomcode_harness::plugins::capabilities::register_review_command_inline(
+                ctx,
+                review.clone(),
+            )?;
         }
         let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {

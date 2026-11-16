@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::plugins::capabilities::register_review_command;
+use atomcode_harness::plugins::capabilities::register_review_command_inline;
 use atomcode_harness::plugins::tools::{contribute_prompt, mount};
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
@@ -109,7 +109,7 @@ impl Plugin for ReviewToolPlugin {
         // "review what I changed" is a thing a person asks for directly, and
         // asking the model to call a tool on their behalf spends a turn to
         // reach the same reviewer.
-        register_review_command(ctx, tool)?;
+        register_review_command_inline(ctx, tool)?;
         // This row's guidance for this row's tool. It lived in the coding persona as
         // `## CODE REVIEW`, which described the tool on BOTH assemblies — and stayed describing
         // it after this row was patched out of the tree.
