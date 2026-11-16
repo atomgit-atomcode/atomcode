@@ -3933,6 +3933,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   }
   function navigateTurn(messageIndex: number) {
+    // Resetting the live window can itself scroll before its anchor is mounted.
+    // Archive paging must ignore both this reflow and the subsequent smooth jump.
+    timelineIgnoreScrollRef.current = performance.now() + 800;
     const generation = sessionGenerationRef.current;
     setTimelineStart(targetTimelineStart(messages, messageIndex, limits.mounted, limits.pageBytes));
     setHistoryTarget(null); setHistoryReset(value => value + 1);
@@ -4553,6 +4556,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           canLoadBefore={!serverHistory.cursor && (historyDisplay.active || range.start <= liveFrom)} compact={compactTimeline}
           focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null}
           viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onNavigate={navigateNode}
+          isNavigating={() => performance.now() < timelineIgnoreScrollRef.current}
           onWindow={(active, showLive, liveStart) => {
             setHistoryDisplay({ active, showLive, liveStart });
             if (!active) setActiveHistoryTurn(null);

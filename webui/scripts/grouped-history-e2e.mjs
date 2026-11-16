@@ -213,6 +213,27 @@ try {
     assert.equal(await page.locator('.turn-nav-node.is-active').getAttribute('data-turn-index'),'3','returning to bottom restores the newest marker');
     await page.close();
   }
+  // Older unmatched live messages must not be appended after newer greetings.
+  full.unshift({role:'user',content:'OLDER_UNMATCHED_APPROVAL',created_at:1700000000000},
+    {role:'assistant',content:'OLDER_APPROVAL_REPLY',created_at:1700000001000});
+  for (const width of [1200,390]) {
+    const page=await browser.newPage({viewport:{width,height:900}});
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');});
+    await page.goto(`http://127.0.0.1:${server.address().port}/?sync=1&session=${id}`);
+    await page.getByText('GREETING_REPLY_3',{exact:true}).waitFor();
+    await page.waitForTimeout(900);
+    await page.waitForFunction(()=>document.querySelectorAll('.turn-nav-node').length===5);
+    assert.equal(await page.locator('.turn-nav-node.is-active').getAttribute('data-turn-index'),'4');
+    const last=page.locator('.turn-nav-node').last();
+    assert.match(await last.getAttribute('aria-label'), /GREETING_REPLY_3/);
+    await page.locator('.turn-nav-toggle').click();
+    await last.click();
+    await page.waitForTimeout(500);
+    await page.locator('.messages-container').getByText('GREETING_REPLY_3',{exact:true}).waitFor({state:'visible'});
+    assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'), /GREETING_REPLY_3/);
+    await page.close();
+  }
+  full.splice(0,2);
   // Reading compacted history and returning to a short live suffix must not
   // leave its historical highlight overriding the live bottom selection.
   navigationRecords=navigationRecords.map((record,i)=>({...record,assistant:`GREETING_REPLY_${i}`,ts:record.started_at+4000}));

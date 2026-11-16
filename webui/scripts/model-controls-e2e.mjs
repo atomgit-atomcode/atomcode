@@ -7,7 +7,7 @@ const dist = resolve(import.meta.dirname, '../dist');
 const catalog = JSON.parse(await readFile(resolve(import.meta.dirname, '../../data/model-cards.json'), 'utf8'));
 const session = { id: 'card-fixture', name: 'Model card fixture', working_dir: '/fixture', project_hash: 'fixture', message_count: 0, created_at: 1700000000, updated_at: 1700000001 };
 const models = [
-  { provider: 'glm', model: 'glm-5.3-flash', model_card_id: 'glm-5-3-flash', context_window: 12345, supports_vision: true, is_default: true, effort_applicable: true, reasoning_effort: 'low', effort_levels: ['low', 'high'] },
+  { provider: 'glm', model: 'glm-5.3-flash-provider-qualified-preview-2026-11-16', model_card_id: 'glm-5-3-flash', context_window: 12345, supports_vision: true, is_default: true, effort_applicable: true, reasoning_effort: 'low', effort_levels: ['low', 'high'] },
   { provider: 'unlisted', model: 'lumen-alpha', model_card_id: null, model_card_status: 'no_public_data', context_window: 9876, supports_vision: null, effort_levels: [] },
   { provider: 'six', model: 'minimax-m3.1-flash', model_card_id: null, context_window: 9876, supports_vision: false, effort_applicable: true, reasoning_effort: 'medium', effort_levels: ['low','medium','high','xhigh','max'] },
 ];
@@ -22,7 +22,7 @@ const server = createServer(async (req, res) => {
   if (!['GET', 'HEAD'].includes(req.method)) writes++;
   if (path === '/live') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-    res.write(`data: ${JSON.stringify({ type: 'snapshot', session_id: session.id, working_dir: '/fixture', project_hash: 'fixture', provider: 'glm', model: 'glm-5.3-flash', mode: 'build', messages: [] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'snapshot', session_id: session.id, working_dir: '/fixture', project_hash: 'fixture', provider: 'glm', model: 'glm-5.3-flash-provider-qualified-preview-2026-11-16', mode: 'build', messages: [] })}\n\n`);
     res.write('data: {"type":"state","running":false}\n\n');
     streams.add(res); req.on('close', () => streams.delete(res)); return;
   }
@@ -92,7 +92,7 @@ try {
     await mkdir('/tmp/atomcode-model-controls', { recursive: true });
     await page.screenshot({path: `/tmp/atomcode-model-controls/${mobile ? `mobile-${width}` : 'desktop'}.png`});
     const box = await page.locator('.model-effort-panel').boundingBox();
-    assert.ok(box.height <= 170 && (mobile || box.width <= 280), 'effort card stays compact');
+    assert.ok(box.height <= 210 && (mobile || box.width <= 280), 'effort card stays compact');
     assert.deepEqual(await page.locator('.model-effort-stops button').allTextContents(), [mobile ? '默认' : 'Default','Low','High']);
     const viewport = page.viewportSize();
     assert.ok(box.x >= 0 && box.x + box.width <= viewport.width && box.y >= 0 && box.y + box.height <= viewport.height, 'panel fits viewport');
@@ -103,6 +103,16 @@ try {
     await page.locator('.model-effort-stops button').filter({hasText:'Low'}).click();
     await page.waitForFunction(()=>document.querySelector('.model-effort-summary')?.textContent==='Low');
     assert.equal(effortWrites.at(-1).reasoning_effort,'low','clicking a labeled stop changes effort');
+    await page.locator('.model-effort-stops button').first().click();
+    await page.waitForFunction(() => !document.querySelector('.model-effort-summary'));
+    assert.equal(effortWrites.at(-1).reasoning_effort, null);
+    const label = page.locator('.unified-model-selector .model-selector-label');
+    assert.ok(await label.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'full model name');
+    assert.notEqual(await label.evaluate(el => getComputedStyle(el).textOverflow), 'ellipsis');
+    if (mobile) assert.ok((await trigger.boundingBox()).height >= 44, 'mobile touch target stays accessible');
+    assert.ok(await page.locator('.model-effort-name span').first().evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'full model name inside card');
+    await page.locator('.model-effort-stops button').filter({hasText:'Low'}).click();
+    await page.waitForFunction(() => document.querySelector('.model-effort-summary')?.textContent === 'Low');
 
     await page.locator('.model-effort-name').click();
     assert.equal(await slider.count(), 0);

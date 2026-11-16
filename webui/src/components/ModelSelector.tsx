@@ -220,7 +220,7 @@ export function ModelSelector({
           }} type="button">
           <span class="model-selector-label">{current ? current.model : t('model.label')}{currentTurn && <span class="model-next-turn-badge"> · {t('model.nextTurn')}</span>}</span>
           {current && isDup(current.model) && <span class="model-selector-provider">{providerLabel(current)}</span>}
-          {current?.effort_applicable && <span class="model-effort-summary">{effortLabel(effort)}</span>}
+          {current?.effort_applicable && effort !== null && <span class="model-effort-summary">{effortLabel(effort)}</span>}
           <span class="model-selector-chevron" aria-hidden="true">▾</span>
         </button>
         {effortOpen && current && (

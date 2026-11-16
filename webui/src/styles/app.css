@@ -4435,7 +4435,7 @@ body {
 .model-effort-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: var(--app-secondary-foreground); font-size: .8125rem; }
 .model-effort-heading strong { color: var(--app-primary-foreground); font-size: 1rem; font-weight: 600; }
 .model-effort-name { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; min-height: 32px; border: 0; border-radius: 8px; padding: 4px 0; background: transparent; color: var(--app-secondary-foreground); cursor: pointer; font: inherit; }
-.model-effort-name span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-effort-name span:first-child { min-width: 0; white-space: normal; overflow-wrap: anywhere; text-align: left; }
 .model-effort-name:hover { background: var(--app-ghost-button-hover-background); }
 .model-effort-slider { position: relative; }
 .model-effort-slider input { width: calc(100% - 100% / var(--effort-count) + 16px); height: 24px; margin: 0 calc(50% / var(--effort-count) - 8px); cursor: pointer; accent-color: var(--app-primary-foreground); touch-action: pan-y; }
@@ -4460,4 +4460,21 @@ body {
   .model-effort-name { min-height: 40px; }
   .model-effort-stops button { min-height: 40px; }
   .unified-model-selector .model-card-info { min-width: 44px; min-height: 44px; }
+}
+
+/* Keep the selected model readable; long IDs wrap instead of being ellipsized. */
+.unified-model-selector .model-selector-trigger {
+  max-width: none;
+  height: auto;
+  min-height: 28px;
+}
+.unified-model-selector .model-selector-label {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 768px) {
+  .unified-model-selector .model-selector-trigger { min-height: 44px; }
 }

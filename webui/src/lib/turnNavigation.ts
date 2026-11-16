@@ -132,5 +132,15 @@ export function mergeTurnNavigation<T extends ArchivedNavigationTurn>(records: r
   items.forEach((item, live) => {
     if (!covered.has(live) && !(records.length && item.retained)) entries.push({ record: null, live });
   });
-  return entries;
+  // A live item absent from a stale/compacted archive can be older than the
+  // archive's last record. Appending it blindly puts an old prompt at the end
+  // and makes the bottom marker point at the penultimate rail entry.
+  const time = (entry: typeof entries[number]) =>
+    entry.record?.started_at ?? (entry.live >= 0 ? items[entry.live].ts : undefined);
+  // Keep unknown-time legacy entries in their existing slots, rather than
+  // inventing dates or using a non-transitive comparison with timed entries.
+  const timed = entries.filter(entry => time(entry) != null)
+    .sort((a, b) => time(a)! - time(b)!);
+  let cursor = 0;
+  return entries.map(entry => time(entry) == null ? entry : timed[cursor++]);
 }

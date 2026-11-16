@@ -104,3 +104,21 @@ test('unified navigation never maps repeated or truncated legacy previews onto t
   assert.deepEqual(mergeTurnNavigation(records, items).map(e => e.live), [-1, -1, 0]);
   assert.deepEqual(mergeTurnNavigation([{ ...records[0], user_truncated: true }], items).map(e => e.live), [-1, 0]);
 });
+
+test('unmatched older live prompts stay chronological instead of becoming the final navigation item', async () => {
+  const { mergeTurnNavigation } = await import('./turnNavigation.ts');
+  const items = deriveTurnNavigation([
+    message('user', 'approval dialog', { ts: 1000 }),
+    message('user', 'hello', { ts: 3000 }),
+    message('user', 'hello', { ts: 4000 }),
+  ]);
+  const records = [
+    { turn_id: 1, user: 'earlier', started_at: 500, undone: false },
+    { turn_id: 17, user: 'hello', started_at: 3000, undone: false },
+    { turn_id: 18, user: 'hello', started_at: 4000, undone: false },
+  ];
+  const entries = mergeTurnNavigation(records, items);
+  assert.deepEqual(entries.map(e => [e.record?.turn_id ?? null, e.live]),
+    [[1, -1], [null, 0], [17, 1], [18, 2]]);
+  assert.equal(entries.at(-1)?.live, items.length - 1);
+});
