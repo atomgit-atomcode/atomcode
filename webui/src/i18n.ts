@@ -618,6 +618,8 @@ const zh = {
   'sync.stopBeforeAttach': '当前独立回合仍在执行或终态未确认，请先停止回合再开启同步。',
 
   // Copy button
+  'chat.editMessage': '编辑消息',
+  'chat.editMessageHint': '放回输入框编辑；发送后作为新消息追加',
   'copy.copy': '复制',
   'copy.copied': '已复制',
   'copy.failed': '复制失败，请重试',
@@ -1439,6 +1441,8 @@ const en: Record<MsgKey, string> = {
   'sync.stopBeforeAttach': 'The independent turn is still running or unresolved. Stop it before enabling sync.',
 
   // Copy button
+  'chat.editMessage': 'Edit message',
+  'chat.editMessageHint': 'Edit in the composer; sending appends a new message',
   'copy.copy': 'Copy',
   'copy.copied': 'Copied',
   'copy.failed': 'Could not copy. Please retry.',

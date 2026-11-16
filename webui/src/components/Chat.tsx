@@ -200,13 +200,14 @@ function notificationDedupeKey(
 /** Zero-pad a local date/time component to 2 digits. */
 const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
 
-/** Format a message timestamp as a stable, always-visible local wall clock. */
-function formatMsgTime(ts: number | undefined): string {
+/** Local wall clock: compact user metadata, full dates for tooltips and replies. */
+function formatMsgTime(ts: number | undefined, compact = false): string {
   // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
   // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
   if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
+  if (compact) return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
@@ -2426,7 +2427,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     setMessages(current=>current.map(message=>message.sourceSeq===seq?{...message,specPinned:pinned}:message));
   }
   async function chooseMessageSpec(message:Message) {
-    if(!sessionId||!message.sourceSeq||busyRef.current||specActionBusy)return;
+    if(!sessionId||busyRef.current||specActionBusy)return;
+    if(!message.sourceSeq){setSpecPicker('list');return;}
     if(!message.specPinned){setSpecPicker('show '+message.sourceSeq);return;}
     const generation=sessionGenerationRef.current;
     setSpecActionBusy(true);
@@ -4617,7 +4619,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                   isActiveSearchMatch={isActiveSearchMatch}
                   steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
                   onSpec={()=>void chooseMessageSpec(msg)}
-                  specDisabled={busy||specActionBusy||!msg.sourceSeq}
+                  specDisabled={busy||specActionBusy}
+                  onEdit={() => {
+                    setInput(current => [messageText(msg), current].filter(Boolean).join('\n'));
+                    if (msg.images?.length) setPendingImages(current => [...msg.images!, ...current]);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
                 />
               );
             }
@@ -5266,6 +5273,7 @@ function UserMessageView({
   steerPending,
   onSpec,
   specDisabled,
+  onEdit,
 }: {
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
@@ -5275,6 +5283,7 @@ function UserMessageView({
   steerPending?: boolean;
   onSpec?:()=>void;
   specDisabled?:boolean;
+  onEdit?:()=>void;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
@@ -5312,8 +5321,12 @@ function UserMessageView({
     </button>
   );
 
-  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={!msg.sourceSeq?t('spec.awaitSaved'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
+  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={specDisabled?t('spec.running'):!msg.sourceSeq?t('spec.manage'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
     <svg width="14" height="14" viewBox="0 0 16 16" fill={msg.specPinned?'currentColor':'none'} aria-hidden="true"><path d="m5 2 6 0-1 4 3 3H9v4l-1 2-1-2V9H3l3-3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+  </button>;
+  const editBtn = onEdit && <button type="button" class="msg-copy-btn" onClick={onEdit}
+    title={t('chat.editMessageHint')} aria-label={t('chat.editMessage')}>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m10 2 4 4-8 8H2v-4Z M8 4l4 4" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
   </button>;
   const wrapperClass = 'user-message-wrapper'
     + (isActiveSearchMatch ? ' is-active-search-match' : '')
@@ -5341,8 +5354,8 @@ function UserMessageView({
         </button>
         {steerBadge}
         <div class="msg-actions">
-          {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-          {copyBtn}{specButton}
+          {timeLabel && <div class="msg-time msg-time-user" title={timeLabel}>{formatMsgTime(msg.ts, true) || timeLabel}</div>}
+          {copyBtn}{editBtn}{specButton}
         </div>
       </div>
     );
@@ -5363,8 +5376,8 @@ function UserMessageView({
         {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
-        {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-        {copyBtn}{specButton}
+        {timeLabel && <div class="msg-time msg-time-user" title={timeLabel}>{formatMsgTime(msg.ts, true) || timeLabel}</div>}
+        {copyBtn}{editBtn}{specButton}
       </div>
       {steerBadge}
     </div>

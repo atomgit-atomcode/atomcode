@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, '../dist');
 const id = 'context-summary-fixture';
 const meta = { id, name: 'Context summary', working_dir: '/fixture', project_hash: 'fixture', created_at: 1700000000, updated_at: 1700000001, message_count: 2 };
 const specificationText = 'MUST NOT change public API\r\nconst exact = 42;';
-const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
+const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false, created_at:1700000000000 }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conversation with a long title for layout coverage' };
 let releaseSlowHistory = null;
@@ -350,6 +350,20 @@ try {
   await composer.waitFor();
   emit({type:'state', running:false});
   assert.equal(await composer.inputValue(), 'Draft before leaving');
+  const userRow = page.locator('.user-message-wrapper').first();
+  {
+    await page.mouse.move(0,0);
+    await page.waitForTimeout(150);
+    assert.equal(await userRow.locator('.msg-actions').evaluate(el=>getComputedStyle(el).opacity), '0');
+    await userRow.hover();
+  }
+  assert.match(await userRow.locator('.msg-time').textContent(), /^\d{2}:\d{2}$/);
+  assert.match(await userRow.locator('.msg-time').getAttribute('title'), /^\d{4}-/);
+  await userRow.getByRole('button',{name:'Edit message',exact:true}).click();
+  assert.equal(await composer.inputValue(), specificationText.replace(/\r\n/g,'\n')+'\nDraft before leaving');
+  assert.equal(specificationPinned,false,'editing only populates the draft');
+  await composer.fill('Draft before leaving');
+  await userRow.hover();
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).click();
   const specifications=page.getByRole('dialog',{name:'Task specifications'});
   await specifications.waitFor();
@@ -370,6 +384,20 @@ try {
   await inlineUnpin.click();
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).waitFor();
   assert.equal(specificationPinned,false);
+  delete messages[0].source_seq;
+  emit(snapshot());
+  const fallbackPin=page.getByRole('button',{name:'Pin as task specification',exact:true});
+  await page.waitForFunction(()=>document.querySelector('[title="Manage task specifications"]'));
+  await page.locator('.user-message-wrapper').first().hover();
+  await fallbackPin.click();
+  await specifications.waitFor();
+  await specifications.locator('.task-spec-list button').first().click();
+  await specifications.locator('pre').waitFor();
+  assert.equal(await specifications.locator('pre').textContent(),specificationText);
+  assert.equal(specificationPinned,false,'missing event identity opens original-message review instead of guessing');
+  await specifications.getByRole('button',{name:'Close',exact:true}).click();
+  messages[0].source_seq=12;
+  emit(snapshot());
 
   // Finishing does not silently activate the viewed history; continuing is explicit.
   emit({type:'state', running:true});

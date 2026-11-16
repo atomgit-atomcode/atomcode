@@ -107,8 +107,9 @@ try {
     await page.waitForFunction(() => !document.querySelector('.model-effort-summary'));
     assert.equal(effortWrites.at(-1).reasoning_effort, null);
     const label = page.locator('.unified-model-selector .model-selector-label');
-    assert.ok(await label.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'full model name');
-    assert.notEqual(await label.evaluate(el => getComputedStyle(el).textOverflow), 'ellipsis');
+    assert.equal(await label.evaluate(el => getComputedStyle(el).textOverflow), 'ellipsis');
+    assert.ok((await trigger.boundingBox()).width <= 221, 'model trigger keeps a fixed width');
+    assert.match(await trigger.getAttribute('title'), /glm-5.3-flash-provider-qualified-preview/);
     if (mobile) assert.ok((await trigger.boundingBox()).height >= 44, 'mobile touch target stays accessible');
     assert.ok(await page.locator('.model-effort-name span').first().evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'full model name inside card');
     await page.locator('.model-effort-stops button').filter({hasText:'Low'}).click();

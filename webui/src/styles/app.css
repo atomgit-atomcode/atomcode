@@ -4462,19 +4462,30 @@ body {
   .unified-model-selector .model-card-info { min-width: 44px; min-height: 44px; }
 }
 
-/* Keep the selected model readable; long IDs wrap instead of being ellipsized. */
+/* A bounded, single-line trigger; the card retains the full model name. */
+.input-footer .model-controls > .unified-model-selector {
+  width: 220px;
+  max-width: 100%;
+  flex: 0 1 220px;
+}
 .unified-model-selector .model-selector-trigger {
-  max-width: none;
-  height: auto;
-  min-height: 28px;
+  width: 100%;
+  max-width: 100%;
+  height: 28px;
+  box-sizing: border-box;
 }
 .unified-model-selector .model-selector-label {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  overflow-wrap: anywhere;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 768px) {
+  .unified-model-selector .model-selector-trigger { height: 44px; }
 }
 
-@media (max-width: 768px) {
-  .unified-model-selector .model-selector-trigger { min-height: 44px; }
-}
+/* The whole user-message toolbar stays quiet until hover or keyboard focus. */
+.user-message-wrapper > .msg-actions { opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+.user-message-wrapper:hover > .msg-actions,
+.user-message-wrapper:focus-within > .msg-actions { opacity: 1; pointer-events: auto; }

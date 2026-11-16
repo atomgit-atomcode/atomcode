@@ -212,7 +212,7 @@ export function ModelSelector({
       {effortError && <span role="alert">{effortError}</span>}
       {currentTurn && current && <span class="model-next-turn" role="status">{t('model.nextTurnStatus', {current:currentTurn.model??currentTurn.provider, next:current.model})}</span>}
       <div class="model-selector unified-model-selector model-selector-up" ref={ref}>
-        <button class="model-selector-trigger" aria-expanded={open || effortOpen}
+        <button class="model-selector-trigger" title={current?.model} aria-expanded={open || effortOpen}
           onClick={() => {
             if (open || effortOpen) { setOpen(false); setEffortOpen(false); }
             else if (current?.effort_applicable) setEffortOpen(true);
