@@ -27,6 +27,7 @@
     "test:scroll-ime": "node scripts/scroll-ime-e2e.mjs",
     "test:turn-anchor": "node scripts/turn-anchor-e2e.mjs",
     "test:model-controls": "node scripts/model-controls-e2e.mjs",
+    "test:provider-protocol": "node scripts/provider-protocol-e2e.mjs",
     "test:model-cards": "node scripts/model-cards-e2e.mjs",
     "test:git-branch": "node scripts/git-branch-e2e.mjs",
     "test:mcp-session": "node scripts/mcp-session-e2e.mjs"

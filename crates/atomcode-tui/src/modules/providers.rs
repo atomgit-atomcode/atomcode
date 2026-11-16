@@ -25,7 +25,8 @@ use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{
-    self, box_edge, edit_line, pad_to, panel_edge, search_line, LABEL_MAX, LABEL_MIN, LEAD,
+    self, box_edge, edit_line_with_label_width, pad_to, panel_edge, search_line, LABEL_MAX,
+    LABEL_MIN, LEAD,
 };
 use crate::moment::{Moment, Viewport};
 use crate::providers::{
@@ -877,7 +878,7 @@ const ABOUT_MIN: usize = 20;
 /// listed, so every row lines up and none is cut — as long as the descriptions
 /// still keep [`ABOUT_MIN`] beside it.
 ///
-/// Not the form's fixed [`LABEL_MAX`]: a form's labels are short field names,
+/// Not the form's [`LABEL_MAX`] cap: a form's labels are short field names,
 /// while a list's are model ids, and an OpenRouter id
 /// (`openrouter/thinkingmachines/…`) is past thirty columns before it says
 /// which model it is. Capped at thirty, every such row was cut to the same
@@ -936,8 +937,22 @@ fn field_line(
     // A text field with the keyboard is drawn with its caret in it; everything
     // else is drawn as a value, because a caret on a toggle would say "type
     // here" about a field nothing can be typed into.
+    let label_width = match form {
+        Form::Account(f) => f
+            .fields(view)
+            .iter()
+            .map(|field| width::str_width(&account_field(view, f, *field, false, caps).0))
+            .max(),
+        Form::Model(f) => f
+            .fields(view)
+            .iter()
+            .map(|field| width::str_width(&model_field(view, f, *field, false, caps).0))
+            .max(),
+    }
+    .unwrap_or(LABEL_MIN)
+    .clamp(LABEL_MIN, LABEL_MAX);
     if focused && typing {
-        return edit_line(&label, &value, caret, w, caps);
+        return edit_line_with_label_width(&label, &value, caret, w, caps, label_width);
     }
     let base = if focused {
         theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
@@ -949,7 +964,7 @@ fn field_line(
     } else {
         "  ".to_string()
     };
-    let label_room = w.saturating_sub(LEAD + 2).clamp(LABEL_MIN, LABEL_MAX);
+    let label_room = label_width.min(w.saturating_sub(LEAD + 2 + 8));
     let shown = width::take_width(&label, label_room);
     let pad = label_room.saturating_sub(width::str_width(&shown));
     let spans = vec![
@@ -1207,11 +1222,17 @@ fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
             key("^o", Msg::ProviderAdvanced),
             key("esc", Msg::LegendCancel),
         ],
-        Some(Form::Account(form)) if form.preset.is_some() => vec![
-            key("⏎", Msg::ProviderContinue),
-            key("^o", Msg::ProviderAdvanced),
-            key("esc", Msg::LegendCancel),
-        ],
+        Some(Form::Account(form)) if form.preset.is_some() => {
+            let mut keys = vec![
+                key("⏎", Msg::ProviderContinue),
+                key("^o", Msg::ProviderAdvanced),
+                key("esc", Msg::LegendCancel),
+            ];
+            if form.fields(view).contains(&AccountField::Protocol) {
+                keys.insert(1, key("←→", Msg::LegendChangeValue));
+            }
+            keys
+        }
         Some(Form::Model(form)) if form.connecting => vec![
             key("⏎", Msg::ProviderConnectUse),
             key("^s", Msg::ProviderSaveOnly),
@@ -2125,6 +2146,38 @@ mod tests {
         let dot = crate::caps::Caps::default().g(crate::caps::Glyph::Bullet);
         assert!(out.contains(&dot.to_string().repeat(5)), "{out}");
         assert!(out.contains("密钥"), "{out}");
+    }
+
+    #[test]
+    fn the_manual_model_caret_stays_near_its_label_on_wide_terminals() {
+        let v = view();
+        let mut form = ModelForm::add(&v, Some("deepseek")).unwrap();
+        form.advanced = false;
+        form.focus = ModelField::Model;
+        form.discovery_error = Some("HTTP 404".into());
+        let at = form
+            .fields(&v)
+            .iter()
+            .position(|f| *f == ModelField::Model)
+            .unwrap();
+        let panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        for w in [40, 80, 280] {
+            let line = field_line(&v, &panel, at, w, crate::caps::Caps::default());
+            let caret_column: usize = line
+                .spans
+                .iter()
+                .take_while(|span| !span.style.reverse)
+                .map(|span| span.width())
+                .sum();
+            assert!(line.spans.iter().any(|span| span.style.reverse));
+            assert!(
+                caret_column <= 12,
+                "caret too far from model label: {line:?}"
+            );
+        }
     }
 
     #[test]

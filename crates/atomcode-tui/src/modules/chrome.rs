@@ -112,6 +112,18 @@ pub fn edit_line(
     w: usize,
     caps: crate::caps::Caps,
 ) -> Line {
+    edit_line_with_label_width(label, value, caret, w, caps, LABEL_MAX)
+}
+
+/// A form can align its fields to the labels it actually displays.
+pub fn edit_line_with_label_width(
+    label: &str,
+    value: &str,
+    caret: usize,
+    w: usize,
+    caps: crate::caps::Caps,
+    label_width: usize,
+) -> Line {
     let base = theme::fg(Role::Warning);
     if w <= LEAD + 2 {
         return Line::from_spans(caret_spans(value, caret, base, w, caps));
@@ -120,6 +132,7 @@ pub fn edit_line(
         .saturating_sub(LEAD)
         .saturating_sub(2)
         .clamp(LABEL_MIN, LABEL_MAX)
+        .min(label_width)
         .min(w.saturating_sub(LEAD + 2 + 8));
     let label = width::take_width(label, label_room);
     let pad = label_room.saturating_sub(width::str_width(&label));

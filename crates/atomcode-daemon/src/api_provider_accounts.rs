@@ -52,6 +52,8 @@ pub(crate) struct CreateAccountRequest {
     pub id: Option<String>,
     /// A vendor preset (`deepseek`) or a protocol (`openai-compatible`).
     pub provider: String,
+    /// Optional choice from the selected vendor's connection catalog.
+    pub protocol: Option<String>,
     pub display_name: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -353,6 +355,30 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
     let Some(preset) = provider_preset::preset(provider) else {
         return bad_request("unknown_provider", format!("Unknown provider '{provider}'"));
     };
+    let connection = if let Some(wire) = req.protocol.as_deref() {
+        let choice = provider_preset::connections(provider)
+            .iter()
+            .find(|choice| choice.provider_type.wire() == wire);
+        if choice.is_none() && wire != preset.provider_type.wire() {
+            return bad_request(
+                "unsupported_protocol",
+                "This provider does not offer the selected protocol",
+            );
+        }
+        choice
+    } else {
+        None
+    };
+    let connection_preset = connection
+        .map(|choice| choice.preset_id)
+        .unwrap_or(preset.id);
+    let endpoint = req
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .or_else(|| connection.and_then(|choice| choice.base_urls.first().copied()))
+        .unwrap_or_default();
     // The gateway account is signed in through /login; one typed here would be
     // a lookalike that never gets its token.
     if atomcode_config::config::is_codingplan_provider_name(preset.id)
@@ -387,9 +413,9 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
     match ProviderBook::default_book().create_account(
         &AccountInput {
             name,
-            protocol: preset.id,
+            protocol: connection_preset,
             display_name: req.display_name.as_deref(),
-            endpoint: req.base_url.as_deref().unwrap_or_default(),
+            endpoint,
             key: req.api_key.as_deref(),
             headers: req.headers.as_ref(),
             exact_id,
@@ -1022,6 +1048,59 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# kept by hand"), "{text}");
+
+        // The vendor identity names the account, while its selected protocol
+        // and explicit plan endpoint survive the actual write/reload boundary.
+        for (vendor, endpoint) in [
+            ("taotoken", "https://api.taotoken.net/coding"),
+            (
+                "aliyun",
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            ),
+        ] {
+            let created = http.post(format!("{base}/provider-accounts"))
+                .json(&serde_json::json!({"provider":vendor,"protocol":"anthropic","base_url":endpoint,"api_key":"fixture-key","models":[{"model":"fixture"}]}))
+                .send().await.unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let body: serde_json::Value = created.json().await.unwrap();
+            assert_eq!(body["account"], vendor);
+            let choices = body["config"]["provider_presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == vendor)
+                .unwrap();
+            assert_eq!(choices["connections"][1]["type"], "anthropic");
+            let saved = config();
+            let resolved = saved
+                .resolve_model(Some(&format!("{vendor}/fixture")))
+                .unwrap();
+            assert_eq!(resolved.provider_type, "anthropic");
+            assert_eq!(resolved.base_url.as_deref(), Some(endpoint));
+            assert_eq!(
+                saved.provider_accounts[vendor].provider,
+                "anthropic-compatible"
+            );
+        }
+        let defaulted = http.post(format!("{base}/provider-accounts"))
+            .json(&serde_json::json!({"id":"ali-default", "provider":"aliyun", "protocol":"anthropic", "api_key":"fixture-key", "models":[{"model":"fixture"}]}))
+            .send().await.unwrap();
+        assert_eq!(defaulted.status(), StatusCode::CREATED);
+        assert_eq!(
+            config()
+                .resolve_model(Some("ali-default/fixture"))
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://dashscope.aliyuncs.com/apps/anthropic")
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.contains("# kept by hand"));
+        let refused = http.post(format!("{base}/provider-accounts"))
+            .json(&serde_json::json!({"provider":"taotoken","protocol":"ollama","models":[{"model":"fixture"}]}))
+            .send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         match previous {
             Some(value) => std::env::set_var("ATOMCODE_HOME", value),

@@ -288,6 +288,7 @@ const zh = {
 
   // Reasoning effort selector for endpoints that explicitly enable it.
   'effort.label': '强度',
+  'effort.unavailable': '此模型未提供可调强度',
   'effort.busy': '本轮结束后可修改思考强度',
   'effort.failed': '思考强度修改失败，请重试',
   'skills.refreshFailedRetry': '技能刷新失败，正在显示上次结果，点击重试',
@@ -704,6 +705,7 @@ const zh = {
   'providers.modeCustomHint': '接入任何兼容 OpenAI、Anthropic 或 Ollama 协议的接口。',
   'providers.vendor': '服务商',
   'providers.protocol': '协议',
+  'providers.protocolEndpointHint': '已知地址会随协议切换并保留套餐入口；自定义地址请核对。',
   'providers.accountId': '服务商 ID',
   'providers.accountIdHint': '字母或数字开头，只含字母、数字和 - _ .；创建后不能修改，模型 ID 会以它为前缀。',
   'providers.displayName': '显示名称',
@@ -1115,6 +1117,7 @@ const en: Record<MsgKey, string> = {
 
   // Reasoning effort selector for endpoints that explicitly enable it.
   'effort.label': 'Effort',
+  'effort.unavailable': 'Adjustable effort is not available for this model.',
   'effort.busy': 'Reasoning effort can be changed after this turn finishes',
   'effort.failed': 'Could not update reasoning effort. Please retry.',
   'skills.refreshFailedRetry': 'Refresh failed. Showing previous skills. Click to retry.',
@@ -1522,6 +1525,7 @@ const en: Record<MsgKey, string> = {
   'providers.modeCustomHint': 'Connect any endpoint that speaks the OpenAI, Anthropic or Ollama protocol.',
   'providers.vendor': 'Provider',
   'providers.protocol': 'Protocol',
+  'providers.protocolEndpointHint': 'Known addresses follow the protocol and keep the selected plan. Check custom addresses when switching.',
   'providers.accountId': 'Provider ID',
   'providers.accountIdHint': 'Starts with a letter or digit; letters, digits and - _ . only. Cannot be changed later; model IDs are prefixed with it.',
   'providers.displayName': 'Display name',

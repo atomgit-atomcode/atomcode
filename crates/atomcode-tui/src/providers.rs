@@ -49,6 +49,14 @@ pub struct Protocol {
     pub needs_key: bool,
 }
 
+/// Host-provided connection choices for one vendor offer. Corresponding URL
+/// indices preserve the same service/plan when switching the protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetConnection {
+    pub protocol: Protocol,
+    pub base_urls: Vec<String>,
+}
+
 /// One account: a place to send requests, and a credential to send them with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRow {
@@ -167,6 +175,7 @@ pub struct ProvidersView {
     models: Arc<Vec<ModelRow>>,
     protocols: Arc<Vec<Protocol>>,
     efforts: Arc<Vec<String>>,
+    connections: Arc<Vec<(String, Vec<PresetConnection>)>>,
     /// The row [`Self::with_current`] resolved the session to, when it could.
     ///
     /// Not the same as the row marked `current`: a name no row or two rows
@@ -188,12 +197,26 @@ impl ProvidersView {
             models: Arc::new(models),
             protocols: Arc::new(protocols),
             efforts: Arc::new(efforts),
+            connections: Arc::new(Vec::new()),
             live: None,
         }
     }
 
     pub fn accounts(&self) -> &[AccountRow] {
         &self.accounts
+    }
+
+    pub fn with_connections(mut self, connections: Vec<(String, Vec<PresetConnection>)>) -> Self {
+        self.connections = Arc::new(connections);
+        self
+    }
+
+    pub fn connections(&self, preset: &str) -> &[PresetConnection] {
+        self.connections
+            .iter()
+            .find(|(id, _)| id == preset)
+            .map(|(_, options)| options.as_slice())
+            .unwrap_or_default()
     }
 
     /// The model one step on from the one in use, or one step back.
@@ -275,6 +298,7 @@ impl ProvidersView {
             models: Arc::new(models),
             protocols: self.protocols.clone(),
             efforts: self.efforts.clone(),
+            connections: self.connections.clone(),
             live: Some(at),
         }
     }
@@ -677,6 +701,9 @@ impl AccountForm {
             AccountField::Endpoint
         };
         form.caret = 0;
+        if view.connections(&row.id).len() > 1 {
+            form.focus = AccountField::Protocol;
+        }
         form
     }
 
@@ -688,6 +715,17 @@ impl AccountForm {
     pub fn fields(&self, view: &ProvidersView) -> Vec<AccountField> {
         let mut out = Vec::new();
         if !self.advanced {
+            if self
+                .preset
+                .as_deref()
+                .is_some_and(|id| view.connections(id).len() > 1)
+            {
+                let mut fields = vec![AccountField::Protocol, AccountField::Endpoint];
+                if self.needs_key(view) {
+                    fields.push(AccountField::Key);
+                }
+                return fields;
+            }
             return if self.needs_key(view) {
                 vec![AccountField::Key]
             } else {
@@ -768,6 +806,39 @@ impl AccountForm {
     /// protocol suggested: a person who typed their own endpoint and then
     /// cycled the protocol to see what else is on offer must not find it gone.
     fn cycle_protocol(&mut self, view: &ProvidersView, forward: bool) {
+        if let Some(id) = self.preset.as_deref() {
+            let options = view.connections(id);
+            if let Some(at) = options
+                .iter()
+                .position(|option| option.protocol.label == self.protocol_label(view))
+            {
+                let next = if forward {
+                    (at + 1) % options.len()
+                } else {
+                    (at + options.len() - 1) % options.len()
+                };
+                if let Some(protocol) = view
+                    .protocols()
+                    .iter()
+                    .position(|p| p.label == options[next].protocol.label)
+                {
+                    if self.endpoint.trim().is_empty() {
+                        self.endpoint = options[next].protocol.endpoint.clone().unwrap_or_default();
+                    } else if let Some(index) = options[at]
+                        .base_urls
+                        .iter()
+                        .position(|url| url == self.endpoint.trim().trim_end_matches('/'))
+                    {
+                        if let Some(url) = options[next].base_urls.get(index) {
+                            self.endpoint = url.clone();
+                        }
+                    }
+                    self.protocol = protocol;
+                    self.caret = self.caret.min(self.focused_len());
+                }
+                return;
+            }
+        }
         self.preset = None;
         let protocols = view.protocols();
         if protocols.is_empty() {
@@ -1916,7 +1987,12 @@ fn account_key(
         }
         _ => {}
     }
-    if form.protocol != previous_protocol {
+    if form.protocol != previous_protocol
+        && !form
+            .preset
+            .as_deref()
+            .is_some_and(|id| view.connections(id).len() > 1)
+    {
         secret.clear();
         form.key_len = 0;
     }
@@ -1975,7 +2051,17 @@ fn save_account(
         (form.needs_key(view) && !secret.trim().is_empty()).then(|| secret.trim().to_string());
     let draft = AccountDraft {
         name,
-        protocol: form.preset.clone().unwrap_or_else(|| protocol.id.clone()),
+        protocol: form
+            .preset
+            .as_deref()
+            .and_then(|id| {
+                view.connections(id)
+                    .iter()
+                    .find(|option| option.protocol.label == protocol.label)
+            })
+            .map(|option| option.protocol.id.clone())
+            .or_else(|| form.preset.clone())
+            .unwrap_or_else(|| protocol.id.clone()),
         endpoint,
         key,
     };
@@ -2781,6 +2867,81 @@ mod tests {
 
     fn press(key: Key) -> KeyPress {
         KeyPress::plain(key)
+    }
+
+    #[test]
+    fn a_vendor_offer_exposes_protocol_and_preserves_plan_key_and_custom_address() {
+        let original = view();
+        let mut protocols = original.protocols().to_vec();
+        protocols.push(Protocol {
+            id: "anthropic-compatible".into(),
+            label: "Anthropic".into(),
+            endpoint: None,
+            needs_key: true,
+        });
+        let view = ProvidersView::new(original.accounts().to_vec(), vec![], protocols, vec![])
+            .with_connections(vec![(
+                "deepseek".into(),
+                vec![
+                    PresetConnection {
+                        protocol: Protocol {
+                            id: "deepseek".into(),
+                            label: "OpenAI".into(),
+                            endpoint: Some("https://vendor.test/v1".into()),
+                            needs_key: true,
+                        },
+                        base_urls: vec![
+                            "https://vendor.test/v1".into(),
+                            "https://vendor.test/plan/v1".into(),
+                        ],
+                    },
+                    PresetConnection {
+                        protocol: Protocol {
+                            id: "anthropic-compatible".into(),
+                            label: "Anthropic".into(),
+                            endpoint: Some("https://vendor.test".into()),
+                            needs_key: true,
+                        },
+                        base_urls: vec![
+                            "https://vendor.test".into(),
+                            "https://vendor.test/plan".into(),
+                        ],
+                    },
+                ],
+            )]);
+        for (input, expected) in [
+            ("https://vendor.test/plan/v1/", "https://vendor.test/plan"),
+            ("https://custom.test/route", "https://custom.test/route"),
+        ] {
+            let mut form = AccountForm::connect(&view, view.account("deepseek").unwrap());
+            form.endpoint = input.into();
+            form.key_len = 8;
+            assert!(!form.advanced);
+            assert_eq!(
+                form.fields(&view),
+                vec![
+                    AccountField::Protocol,
+                    AccountField::Endpoint,
+                    AccountField::Key
+                ]
+            );
+            let mut panel = Panel {
+                form: Some(Form::Account(form)),
+                ..Panel::new()
+            };
+            let mut secret = "test-key".to_string();
+            key(&view, &mut panel, &mut secret, press(Key::Right));
+            assert_eq!(secret, "test-key");
+            let Step::SaveAccount { draft, .. } =
+                key(&view, &mut panel, &mut secret, press(Key::Enter))
+            else {
+                panic!("save account")
+            };
+            assert_eq!(draft.name, "deepseek");
+            assert_eq!(draft.protocol, "anthropic-compatible");
+            assert_eq!(draft.endpoint, expected);
+            assert_eq!(draft.key.as_deref(), Some("test-key"));
+        }
     }
 
     fn ctrl(c: char) -> KeyPress {
@@ -3746,6 +3907,44 @@ mod tests {
         assert!(form.selected.is_empty());
         assert!(discovered(&view, &mut panel, "deepseek", Ok(listed(&[("late", None)]))).is_none());
         assert!(picking(&panel).is_none());
+    }
+
+    #[test]
+    fn a_failed_listing_still_allows_typing_pasting_and_saving_a_model() {
+        let view = view();
+        for use_now in [true, false] {
+            let mut form = ModelForm::add(&view, Some("deepseek")).unwrap();
+            form.connecting = true;
+            form.advanced = false;
+            form.focus = ModelField::Model;
+            form.start_discovery();
+            let mut panel = Panel {
+                form: Some(Form::Model(form)),
+                ..Panel::new()
+            };
+            let mut secret = String::new();
+            discovered(&view, &mut panel, "deepseek", Err("HTTP 404".into()));
+            assert!(picking(&panel).is_none());
+            key(&view, &mut panel, &mut secret, press(Key::Char('q')));
+            assert!(paste(&mut panel, &mut secret, "wen-custom\n"));
+            let step = key(
+                &view,
+                &mut panel,
+                &mut secret,
+                if use_now {
+                    press(Key::Enter)
+                } else {
+                    ctrl('s')
+                },
+            );
+            let Step::SaveModel { id, draft } = step else {
+                panic!("manual model must be saved: {step:?}");
+            };
+            assert!(id.is_none());
+            assert_eq!(draft.account, "deepseek");
+            assert_eq!(draft.model, "qwen-custom");
+            assert_eq!(draft.use_now, use_now);
+        }
     }
 
     /// Ctrl+F on the model field of an add form asks for the account's listing;

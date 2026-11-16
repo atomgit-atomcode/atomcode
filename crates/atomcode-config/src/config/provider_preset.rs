@@ -317,10 +317,101 @@ pub fn preset_or_compatible(id: &str) -> &'static ProviderPreset {
     preset(id).unwrap_or(&OPENAI_COMPATIBLE)
 }
 
+/// Connection choices for a vendor. Matching indices in `base_urls` refer to
+/// the same service/plan; changing protocol must never switch billing routes.
+/// `preset_id` is an existing persisted protocol, not a new account format.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderConnection {
+    pub preset_id: &'static str,
+    pub provider_type: ProviderType,
+    pub base_urls: &'static [&'static str],
+}
+
+/// Only protocols and address pairs documented by the service are offered.
+/// Single-protocol vendors use their ordinary preset without extra controls.
+pub fn connections(id: &str) -> &'static [ProviderConnection] {
+    match id {
+        "taotoken" => &[
+            ProviderConnection {
+                preset_id: "taotoken",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &[
+                    "https://taotoken.net/api/v1",
+                    "https://api.taotoken.net/v1",
+                    "https://api.taotoken.net/coding/v1",
+                    "https://api.taotoken.net/token/v1",
+                ],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &[
+                    "https://taotoken.net/api",
+                    "https://api.taotoken.net",
+                    "https://api.taotoken.net/coding",
+                    "https://api.taotoken.net/token",
+                ],
+            },
+        ],
+        "aliyun" => &[
+            ProviderConnection {
+                preset_id: "aliyun",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &[
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                    "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+                    "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1",
+                ],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &[
+                    "https://dashscope.aliyuncs.com/apps/anthropic",
+                    "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+                    "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+                    "https://dashscope-us.aliyuncs.com/apps/anthropic",
+                    "https://cn-hongkong.dashscope.aliyuncs.com/apps/anthropic",
+                ],
+            },
+        ],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn vendor_connections_use_existing_protocols_and_pair_the_same_plans() {
+        for vendor in ["taotoken", "aliyun"] {
+            let options = connections(vendor);
+            assert_eq!(options.len(), 2);
+            assert_eq!(
+                options[0].base_urls.first().copied(),
+                preset(vendor).unwrap().default_base_url
+            );
+            for option in options {
+                assert_eq!(
+                    preset(option.preset_id).unwrap().provider_type,
+                    option.provider_type
+                );
+                assert_eq!(option.base_urls.len(), options[0].base_urls.len());
+            }
+            for (openai, anthropic) in options[0].base_urls.iter().zip(options[1].base_urls) {
+                assert_eq!(openai.split('/').nth(2), anthropic.split('/').nth(2));
+                for plan in ["/coding", "/token", "token-plan."] {
+                    assert_eq!(openai.contains(plan), anthropic.contains(plan));
+                }
+            }
+        }
+        assert!(connections("unknown").is_empty());
+        assert!(connections("anthropic").is_empty());
+    }
 
     /// The curated vendor set and 2 generic compatible presets must
     /// all be present and resolvable by id.

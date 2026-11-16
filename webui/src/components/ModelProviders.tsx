@@ -49,6 +49,7 @@ import {
   formatTokens,
   apiKeyProblem,
   validBaseUrl,
+  switchConnectionUrl,
   ReasoningDraft,
   reasoningFrom,
   toggleLevel,
@@ -593,6 +594,7 @@ function AddProviderCard({
   const [mode, setMode] = useState<'preset' | 'custom'>(presets.length > 0 ? 'preset' : 'custom');
   const [preset, setPreset] = useState<ProviderDraft>(() => blankDraft('preset', presets[0]?.id ?? ''));
   const [custom, setCustom] = useState<ProviderDraft>(() => blankDraft('custom', protocols[0]?.id ?? ''));
+  const [presetProtocol, setPresetProtocol] = useState('');
   const [setDefault, setSetDefault] = useState(!hasDefault);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -601,23 +603,27 @@ function AddProviderCard({
   const setDraft = mode === 'preset' ? setPreset : setCustom;
   const choices = mode === 'preset' ? presets : protocols;
   const chosen: ProviderPresetInfo | undefined = choices.find((p) => p.id === typed.provider);
+  const connections = mode === 'preset' ? chosen?.connections ?? [] : [];
+  const connection = connections.find((option) => option.type === presetProtocol) ?? connections[0];
+  const selectedType = connection?.type ?? chosen?.type;
+  const defaultEndpoint = connection?.base_urls[0] ?? chosen?.default_base_url;
   // A local Ollama takes no key: one typed before switching to it is hidden,
   // so it is neither judged nor sent.
-  const keyless = chosen?.type === 'ollama';
+  const keyless = selectedType === 'ollama';
   const draft = keyless ? { ...typed, apiKey: '' } : typed;
   const takenIds = (config.provider_accounts ?? []).map((a) => a.id);
   const blocker = firstBlocker(draft, {
     takenIds,
-    hasDefaultEndpoint: !!chosen?.default_base_url,
+    hasDefaultEndpoint: !!defaultEndpoint,
     requiresKey: mode === 'preset' && !!chosen?.requires_api_key && chosen?.type !== 'ollama' && Object.keys(headerBody(draft.headers ?? [])).length === 0,
   });
-  const endpoint = draft.baseUrl.trim() || chosen?.default_base_url || '';
+  const endpoint = draft.baseUrl.trim() || defaultEndpoint || '';
   const discoveryRequest = useMemo(() => ({
-    type: chosen?.type ?? 'openai',
+    type: selectedType ?? 'openai',
     base_url: endpoint,
     api_key: draft.apiKey.trim() || undefined,
     headers: headerBody(draft.headers ?? []),
-  }), [chosen?.type, endpoint, draft.apiKey, draft.headers]);
+  }), [selectedType, endpoint, draft.apiKey, draft.headers]);
 
   async function submit() {
     if (blocker || saving || headerProblem(draft.headers ?? [])) return;
@@ -627,14 +633,15 @@ function AddProviderCard({
       const res = await createAccount({
         id: mode === 'custom' ? draft.id.trim() : undefined,
         provider: draft.provider,
+        protocol: connection?.type,
         display_name: draft.displayName.trim() || undefined,
-        base_url: draft.baseUrl.trim() || undefined,
+        base_url: connection ? endpoint : draft.baseUrl.trim() || undefined,
         api_key: draft.apiKey.trim() || undefined,
         headers: headerBody(draft.headers ?? []),
         models: draft.models.map(modelBody),
         set_default: setDefault,
       });
-      await onCreated(res.account, res.models, chosen?.type === 'openai');
+      await onCreated(res.account, res.models, selectedType === 'openai');
     } catch (e) {
       setError(errorText(e, t));
     } finally {
@@ -671,9 +678,33 @@ function AddProviderCard({
             const host = providerHost(p.default_base_url);
             return { value: p.id, label: host ? `${p.display_name} · ${host}` : p.display_name };
           })}
-          onChange={(v) => setDraft({ ...typed, provider: v })}
+          onChange={(v) => {
+            const address = typed.baseUrl.trim().replace(/\/+$/, '');
+            const knownAddress = !address || address === chosen?.default_base_url
+              || connections.some((option) => option.base_urls.includes(address));
+            if (mode === 'preset') setPresetProtocol('');
+            setDraft({ ...typed, provider: v, baseUrl: knownAddress ? '' : typed.baseUrl, models: [emptyModelDraft()] });
+          }}
         />
       </div>
+
+      {connections.length > 1 && (
+        <div class="add-model-field">
+          <label class="add-model-label">{t('providers.protocol')}</label>
+          <Select
+            value={selectedType ?? ''}
+            options={connections.map((option) => ({ value: option.type, label: option.type === 'anthropic' ? 'Anthropic' : 'OpenAI' }))}
+            onChange={(type) => {
+              if (type === selectedType) return;
+              const next = connections.find((option) => option.type === type);
+              if (!next || !connection) return;
+              setPresetProtocol(type);
+              setDraft({ ...typed, baseUrl: switchConnectionUrl(endpoint, connection.base_urls, next.base_urls), models: [emptyModelDraft()] });
+            }}
+          />
+          <span class="field-hint">{t('providers.protocolEndpointHint')}</span>
+        </div>
+      )}
 
       {mode === 'custom' && (
         <div class="add-model-field">
@@ -691,16 +722,16 @@ function AddProviderCard({
         </div>
       )}
 
-      {mode === 'custom' && (
+      {(mode === 'custom' || connections.length > 1) && (
         <div class="add-model-field">
           <label class="add-model-label">{t('providers.baseUrl')}</label>
           <input
             class="menu-input"
             type="url"
             spellcheck={false}
-            placeholder={chosen?.type === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1'}
+            placeholder={defaultEndpoint ?? (selectedType === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1')}
             aria-label={t('providers.baseUrl')}
-            value={draft.baseUrl}
+            value={connection ? endpoint : draft.baseUrl}
             onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
           />
         </div>
@@ -736,7 +767,7 @@ function AddProviderCard({
             onInput={(e) => setDraft({ ...typed, displayName: (e.target as HTMLInputElement).value })}
           />
         </div>
-        {mode === 'preset' && (
+        {mode === 'preset' && connections.length <= 1 && (
           <div class="add-model-field">
             <label class="add-model-label">{t('providers.baseUrl')}</label>
             <input
@@ -756,7 +787,7 @@ function AddProviderCard({
       </details>
 
       <ModelRowsEditor
-        key={mode}
+        key={`${mode}:${draft.provider}:${selectedType}`}
         rows={draft.models}
         levels={levelsOf(config)}
         setRows={(models) => setDraft({ ...typed, models })}

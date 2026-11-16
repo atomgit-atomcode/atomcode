@@ -3866,6 +3866,14 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   function updateActiveTurn() {
     const el = scrollRef.current;
     if (!el || page.loading || navTurns.length === 0) return;
+    // At the end of the live timeline, short replies may leave several older
+    // turns above the latest one. The bottom means the latest turn, regardless
+    // of which older prompt happens to intersect the top reading line.
+    if ((!historyDisplay.active || historyDisplay.showLive) && range.end === messages.length
+      && el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK) {
+      setActiveNavIndex(navTurns.length - 1);
+      return;
+    }
     const readingLine = el.getBoundingClientRect().top + 48;
     // Offscreen user anchors are intentionally unmounted. Only measure the
     // bounded visible slice; Infinity placeholders are not a sorted DOM index.
@@ -4714,7 +4722,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       </div>
 
       <TurnNavRail key={`${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`}
-        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={activeHistoryTurn}
+        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={atBottomRef.current ? null : activeHistoryTurn}
         projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined}
         sessionId={sessionId ?? undefined} streaming={busy}
         onNavigate={navigateTurn} onHistory={navigateHistoricalTurn} />

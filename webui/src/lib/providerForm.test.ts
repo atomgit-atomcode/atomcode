@@ -7,6 +7,7 @@ import {
   apiKeyProblem,
   validAccountId,
   validBaseUrl,
+  switchConnectionUrl,
   firstBlocker,
   modelsBlocker,
   modelBody,
@@ -17,6 +18,18 @@ import {
   reasoningEditBody,
   type ProviderDraft,
 } from './providerForm.ts';
+
+test('switching vendor protocols preserves billing routes and custom endpoints', () => {
+  const openai = ['https://taotoken.net/api/v1', 'https://api.taotoken.net/coding/v1', 'https://api.taotoken.net/token/v1'];
+  const anthropic = ['https://taotoken.net/api', 'https://api.taotoken.net/coding', 'https://api.taotoken.net/token'];
+  for (let i = 0; i < openai.length; i++) {
+    assert.equal(switchConnectionUrl(` ${openai[i]}/ `, openai, anthropic), anthropic[i]);
+    assert.equal(switchConnectionUrl(anthropic[i], anthropic, openai), openai[i]);
+  }
+  assert.equal(switchConnectionUrl('', openai, anthropic), anthropic[0]);
+  assert.equal(switchConnectionUrl('https://custom.example/team/v1', openai, anthropic), 'https://custom.example/team/v1');
+  assert.equal(switchConnectionUrl(openai[1], openai, []), openai[1]);
+});
 
 test('token counts are read the way people write them', () => {
   assert.equal(parseTokens(''), undefined);

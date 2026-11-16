@@ -134,6 +134,38 @@ impl ConfigProviders {
                 .map(|level| level.to_string())
                 .collect(),
         )
+        .with_connections(
+            provider_preset::PRESETS
+                .iter()
+                .filter_map(|preset| {
+                    let choices = provider_preset::connections(preset.id);
+                    (!choices.is_empty()).then(|| {
+                        (
+                            preset.id.to_string(),
+                            choices
+                                .iter()
+                                .map(|choice| atomcode_tui::providers::PresetConnection {
+                                    protocol: Protocol {
+                                        id: choice.preset_id.to_string(),
+                                        label: protocol_label(choice.provider_type),
+                                        endpoint: choice
+                                            .base_urls
+                                            .first()
+                                            .map(|url| (*url).to_string()),
+                                        needs_key: true,
+                                    },
+                                    base_urls: choice
+                                        .base_urls
+                                        .iter()
+                                        .map(|url| (*url).to_string())
+                                        .collect(),
+                                })
+                                .collect(),
+                        )
+                    })
+                })
+                .collect(),
+        )
     }
 }
 

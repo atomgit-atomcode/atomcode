@@ -1,6 +1,7 @@
 //! What models an endpoint offers, from its own listing — `GET {base}/models`
 //! (OpenAI-shaped and Responses), `{base}/v1/models` (Anthropic), `/api/tags`
 //! (Ollama) — so a person adding a model picks it rather than typing its id.
+//! Alibaba's Anthropic gateway uses its same-origin OpenAI model listing.
 //!
 //! One implementation for both front ends that offer it: the web UI's
 //! `POST /providers/discover-models` and the terminal's `/provider` panel.
@@ -129,12 +130,59 @@ pub fn discovery_url(base_url: &str, provider_type: &str) -> Result<reqwest::Url
     if !url.username().is_empty() || url.password().is_some() {
         return Err("model discovery URL must not contain credentials".into());
     }
+    // Alibaba's Anthropic-compatible gateway implements Messages but not the
+    // Models API. Its paired OpenAI listing uses the same origin and API key:
+    // https://help.aliyun.com/zh/model-studio/base-url
+    // Keep this vendor-specific; never guess a sibling endpoint on other hosts.
+    if suffix == "/v1/models"
+        && is_aliyun_model_host(&url)
+        && url.path().trim_end_matches('/') == "/apps/anthropic"
+    {
+        url.set_path("/compatible-mode/v1/models");
+        url.set_query(None);
+        url.set_fragment(None);
+        return Ok(url);
+    }
     let path = format!("{}{}", url.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
     // Anthropic pages its list (20 by default); one request for all of them.
     url.set_query((suffix == "/v1/models").then_some("limit=1000"));
     url.set_fragment(None);
     Ok(url)
+}
+
+fn is_aliyun_model_host(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.ends_with(".maas.aliyuncs.com")
+            || matches!(
+                host,
+                "dashscope.aliyuncs.com"
+                    | "dashscope-intl.aliyuncs.com"
+                    | "dashscope-us.aliyuncs.com"
+                    | "cn-hongkong.dashscope.aliyuncs.com"
+            )
+    })
+}
+
+fn discovery_auth(
+    request: reqwest::RequestBuilder,
+    url: &reqwest::Url,
+    protocol: &str,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let openai_listing = is_aliyun_model_host(url) && url.path() == "/compatible-mode/v1/models";
+    if protocol == "anthropic" && !openai_listing {
+        let request = request.header("anthropic-version", "2023-06-01");
+        match key {
+            Some(key) => request.header("x-api-key", key.trim()),
+            None => request,
+        }
+    } else {
+        match key {
+            Some(key) => request.bearer_auth(key.trim()),
+            None => request,
+        }
+    }
 }
 
 pub fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
@@ -425,17 +473,13 @@ pub async fn fetch_discovery_body(
     let client = discovery_client(transport, timeout, true, proxy.as_ref())
         .or_else(|_| discovery_client(transport, timeout, false, proxy.as_ref()))
         .map_err(|_| DiscoveryRequestError::Transport)?;
-    let mut request = client.get(url.clone()).header("accept", "application/json");
-    if protocol == "anthropic" {
-        // Anthropic authenticates the way its chat adapter does.
-        request = request.header("anthropic-version", "2023-06-01");
-        if let Some(key) = transport.api_key.as_deref() {
-            request = request.header("x-api-key", key.trim());
-        }
-    } else if let Some(key) = transport.api_key.as_deref() {
-        request = request.bearer_auth(key.trim());
-    }
-    request = super::apply_account_headers(request, &transport.headers)
+    let request = discovery_auth(
+        client.get(url.clone()).header("accept", "application/json"),
+        &url,
+        protocol,
+        transport.api_key.as_deref(),
+    );
+    let request = super::apply_account_headers(request, &transport.headers)
         .map_err(|_| DiscoveryRequestError::Transport)?;
     let proxy_may_apply = protocol == "ollama" && discovery_proxy_may_apply(&url, proxy.as_ref());
     let response = request.send().await.map_err(|error| {
@@ -474,6 +518,64 @@ pub fn normalize_discovered_models(mut models: Vec<DiscoveredModel>) -> Vec<Disc
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn aliyun_anthropic_lists_models_on_its_same_origin_openai_endpoint() {
+        let client = reqwest::Client::new();
+        for host in [
+            "token-plan.cn-beijing.maas.aliyuncs.com",
+            "workspace.ap-southeast-1.maas.aliyuncs.com",
+            "dashscope.aliyuncs.com",
+            "dashscope-intl.aliyuncs.com",
+            "dashscope-us.aliyuncs.com",
+            "cn-hongkong.dashscope.aliyuncs.com",
+        ] {
+            let base = format!("https://{host}:8443/apps/anthropic/?old=query#fragment");
+            let url = discovery_url(&base, "anthropic").unwrap();
+            assert_eq!(
+                url.as_str(),
+                format!("https://{host}:8443/compatible-mode/v1/models")
+            );
+            let request = discovery_auth(
+                client.get(url.clone()),
+                &url,
+                "anthropic",
+                Some(" test-key "),
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+            assert!(!request.headers().contains_key("x-api-key"));
+            assert!(!request.headers().contains_key("anthropic-version"));
+        }
+    }
+
+    #[test]
+    fn other_anthropic_endpoints_keep_their_path_and_authentication() {
+        let client = reqwest::Client::new();
+        for base in [
+            "https://api.anthropic.com",
+            "https://example.test/apps/anthropic",
+            "https://dashscope.aliyuncs.com.example.test/apps/anthropic",
+            "https://notmaas.aliyuncs.com/apps/anthropic",
+            "https://dashscope.aliyuncs.com/custom/apps/anthropic",
+        ] {
+            let url = discovery_url(base, "anthropic").unwrap();
+            assert_eq!(url.as_str(), format!("{base}/v1/models?limit=1000"));
+            let request =
+                discovery_auth(client.get(url.clone()), &url, "anthropic", Some("test-key"))
+                    .build()
+                    .unwrap();
+            assert_eq!(request.headers()["x-api-key"], "test-key");
+            assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+            assert!(!request.headers().contains_key("authorization"));
+        }
+        assert!(discovery_url(
+            "https://user:secret@dashscope.aliyuncs.com/apps/anthropic",
+            "anthropic"
+        )
+        .is_err());
+    }
 
     #[tokio::test]
     async fn a_refused_ollama_connection_offers_startup_guidance_only_for_ollama() {

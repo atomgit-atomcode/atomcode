@@ -539,6 +539,7 @@ export interface ProviderPresetInfo {
   model_source?: 'embedded' | 'discovery_api' | 'manual';
   /** Its models can be listed from the endpoint. */
   discoverable?: boolean;
+  connections?: { type: string; base_urls: string[] }[];
 }
 
 export interface DiscoveredModelInfo {
@@ -802,6 +803,7 @@ export interface CreateAccountBody {
   id?: string;
   /** A vendor preset id or a protocol id. */
   provider: string;
+  protocol?: string;
   display_name?: string;
   base_url?: string;
   api_key?: string;

@@ -9,7 +9,7 @@ const session = { id: 'card-fixture', name: 'Model card fixture', working_dir: '
 const models = [
   { provider: 'glm', model: 'glm-5.3-flash', model_card_id: 'glm-5-3-flash', context_window: 12345, supports_vision: true, is_default: true, effort_applicable: true, reasoning_effort: 'low', effort_levels: ['low', 'high'] },
   { provider: 'unlisted', model: 'lumen-alpha', model_card_id: null, model_card_status: 'no_public_data', context_window: 9876, supports_vision: null, effort_levels: [] },
-  { provider: 'unknown', model: 'private-model', model_card_id: null, context_window: 9876, supports_vision: false, effort_levels: [] },
+  { provider: 'six', model: 'minimax-m3.1-flash', model_card_id: null, context_window: 9876, supports_vision: false, effort_applicable: true, reasoning_effort: 'medium', effort_levels: ['low','medium','high','xhigh','max'] },
 ];
 let catalogueRequests = 0;
 let writes = 0;
@@ -31,9 +31,10 @@ const server = createServer(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw); effortWrites.push(body);
     if (fail) { res.statusCode = 409; return json({ error: 'busy', active_turn: true }); }
-    models[0].reasoning_effort = body.reasoning_effort;
+    models.find(model=>model.provider===body.provider).reasoning_effort = body.reasoning_effort;
     return json({ ok: true });
   }
+  if (path === '/live/provider') return json({ok:true});
   if (path === '/models') return json(models);
   if (path === '/project') return json({ working_dir: '/fixture', project_hash: 'fixture' });
   if (path === '/config') return json({ providers: [], notifications: { enabled: false } });
@@ -60,7 +61,7 @@ try {
     const mobile = width <= 600;
     models[0].reasoning_effort = 'low';
     const context = await browser.newContext({ viewport: { width, height: mobile ? 844 : 1000 }, hasTouch: mobile });
-    await context.addInitScript(() => { localStorage.setItem('atomcode.lang', 'en'); localStorage.setItem('atomcode.theme', 'light'); });
+    await context.addInitScript(mobile => { localStorage.setItem('atomcode.lang', mobile ? 'zh' : 'en'); localStorage.setItem('atomcode.theme', 'light'); }, mobile);
     const page = await context.newPage();
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(base + '/?sync=1&session=' + session.id);
@@ -91,16 +92,51 @@ try {
     await mkdir('/tmp/atomcode-model-controls', { recursive: true });
     await page.screenshot({path: `/tmp/atomcode-model-controls/${mobile ? `mobile-${width}` : 'desktop'}.png`});
     const box = await page.locator('.model-effort-panel').boundingBox();
+    assert.ok(box.height <= 170 && (mobile || box.width <= 280), 'effort card stays compact');
+    assert.deepEqual(await page.locator('.model-effort-stops button').allTextContents(), [mobile ? '默认' : 'Default','Low','High']);
     const viewport = page.viewportSize();
     assert.ok(box.x >= 0 && box.x + box.width <= viewport.width && box.y >= 0 && box.y + box.height <= viewport.height, 'panel fits viewport');
-    if (mobile) {
-      const anchor = await trigger.boundingBox();
-      assert.ok(box.y + box.height <= anchor.y, 'mobile panel is anchored above the entry');
-    }
+    const anchor = await trigger.boundingBox();
+    assert.ok(box.y + box.height <= anchor.y && anchor.y-box.y-box.height<=14, 'card sits directly above the entry');
+    const centered = Math.max(12,Math.min(anchor.x+anchor.width/2-box.width/2,viewport.width-box.width-12));
+    assert.ok(Math.abs(box.x-centered)<2,'card is centered on its trigger unless the viewport edge clamps it: '+JSON.stringify({box,anchor,centered,style:await page.locator('.model-effort-panel').getAttribute('style'),wrapper:await page.locator('.unified-model-selector').boundingBox()}));
+    await page.locator('.model-effort-stops button').filter({hasText:'Low'}).click();
+    await page.waitForFunction(()=>document.querySelector('.model-effort-summary')?.textContent==='Low');
+    assert.equal(effortWrites.at(-1).reasoning_effort,'low','clicking a labeled stop changes effort');
+
     await page.locator('.model-effort-name').click();
     assert.equal(await slider.count(), 0);
     await page.locator('.model-card-info').first().waitFor();
     assert.equal(await page.locator('.model-choice-check').count(), 1);
+    await page.locator('.model-item').filter({hasText:'lumen-alpha'}).click();
+    await page.locator('.model-effort-panel').waitFor();
+    await page.waitForFunction(()=>document.querySelector('.model-effort-name')?.textContent.includes('lumen-alpha'));
+    assert.equal(await slider.count(),0,'a model without adjustable effort still returns to its card');
+    assert.ok(await page.locator('.model-effort-hint').isVisible());
+    await page.locator('.model-effort-name').click();
+    await page.locator('.model-item').filter({hasText:'glm-5.3-flash'}).click();
+    await slider.waitFor();
+    assert.equal(await page.locator('.model-choice-list').count(),0,'selecting another model returns to the effort card');
+    await page.locator('.model-effort-name').click();
+    await page.locator('.model-item').filter({hasText:'minimax-m3.1-flash'}).click();
+    await slider.waitFor();
+    assert.deepEqual(await page.locator('.model-effort-stops button').allTextContents(),[mobile?'默认':'Default','Low','Medium','High','xHigh','Max']);
+    await page.locator('.model-effort-stops button').filter({hasText:/^Medium$/}).click();
+    await page.waitForFunction(()=>document.querySelector('input[type=range]')?.getAttribute('aria-busy')!=='true');
+    assert.equal(effortWrites.at(-1).provider,'six','labeled stops target the newly selected provider');
+    assert.ok(await page.locator('.model-effort-stops button').evaluateAll(buttons=>buttons.every(button=>{const range=document.createRange();range.selectNodeContents(button);return range.getBoundingClientRect().height<20;})), 'all six labels fit on one line');
+    await page.screenshot({path:`/tmp/atomcode-model-controls/six-levels-${width}.png`});
+    if(mobile) {
+      for(const size of [{width,height:440},{width:844,height:390}]) {
+        await page.setViewportSize(size); await page.waitForTimeout(100);
+        const panel=await page.locator('.model-effort-panel').boundingBox();
+        assert.ok(panel.x>=0 && panel.x+panel.width<=size.width && panel.y>=0 && panel.y+panel.height<=size.height,'card stays visible after keyboard-sized shrink or landscape rotation');
+      }
+      await page.setViewportSize({width,height:844});
+    }
+    await page.locator('.model-effort-name').click();
+    await page.locator('.model-item').filter({hasText:'glm-5.3-flash'}).click();
+    await slider.waitFor();
     await page.keyboard.press('Escape');
     assert.equal(await page.locator('.model-choice-list').count(), 0);
     assert.ok(await trigger.evaluate(el => el === document.activeElement));

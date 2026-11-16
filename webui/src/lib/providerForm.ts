@@ -55,6 +55,15 @@ export function validBaseUrl(raw: string): boolean {
   }
 }
 
+/** Convert only a catalogued pair, preserving its plan/region. Custom URLs
+ * stay visible and unchanged instead of being replaced with vendor defaults. */
+export function switchConnectionUrl(raw: string, previous: string[], next: string[]): string {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!value) return next[0] ?? '';
+  const index = previous.indexOf(value);
+  return index >= 0 && next[index] ? next[index] : raw;
+}
+
 /** A model's reasoning settings in a form. Declaring levels is what makes a
  * model offer a level picker in the chat; `effort` is the level requests carry
  * by default, `null` for the endpoint's own default. */

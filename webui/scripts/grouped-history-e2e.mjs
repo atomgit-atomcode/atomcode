@@ -190,6 +190,47 @@ try {
     assert.match(await page.locator('.turn-nav-node.is-active').getAttribute('aria-label'),/RECENT_REQUEST_2/);
     await page.close();
   }
+  // At the actual bottom, several short/repeated turns can share the viewport.
+  // The latest turn must win over an older prompt near the top reading line.
+  full.splice(0,full.length,...Array.from({length:4},(_,i)=>[
+    {role:'user',content:'Repeated greeting',created_at:1700000100000+i*10000},
+    {role:'assistant',content:`GREETING_REPLY_${i}`,created_at:1700000104000+i*10000},
+  ]).flat());
+  navigationRecords=full.filter(message=>message.role==='user').map((message,index)=>({turn_id:index+1,user:message.content,started_at:message.created_at,undone:false}));
+  for(const width of [1200,390]) {
+    const page=await browser.newPage({viewport:{width,height:900}});
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');});
+    await page.goto(`http://127.0.0.1:${server.address().port}/?sync=1&session=${id}`);
+    await page.setViewportSize({width,height:650});
+    await page.getByText('GREETING_REPLY_3',{exact:true}).waitFor();
+    await page.waitForTimeout(900);
+    assert.equal(await page.locator('.turn-nav-node.is-active').getAttribute('data-turn-index'),'3','bottom selects the newest short turn, even with repeated prompts');
+    const viewport=page.locator('.messages-container');
+    await viewport.hover(); await page.mouse.wheel(0,-120); await page.waitForTimeout(150);
+    assert.notEqual(await page.locator('.turn-nav-node.is-active').getAttribute('data-turn-index'),'3','reading above the bottom follows the visible older turn');
+    await page.locator('.jump-to-bottom').click(); await page.waitForTimeout(600);
+    assert.equal(await page.locator('.turn-nav-node.is-active').getAttribute('data-turn-index'),'3','returning to bottom restores the newest marker');
+    await page.close();
+  }
+  // Reading compacted history and returning to a short live suffix must not
+  // leave its historical highlight overriding the live bottom selection.
+  navigationRecords=navigationRecords.map((record,i)=>({...record,assistant:`GREETING_REPLY_${i}`,ts:record.started_at+4000}));
+  full.splice(0,full.length-2);
+  const joined=await browser.newPage({viewport:{width:1200,height:1200}});
+  joined.on('pageerror',error=>errors.push(error.message));
+  await joined.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');});
+  await joined.goto(`http://127.0.0.1:${server.address().port}/?sync=1&session=${id}`);
+  await joined.getByText('GREETING_REPLY_3',{exact:true}).waitFor();
+  await joined.waitForTimeout(900);
+  const joinedViewport=joined.locator('.messages-container');
+  await joinedViewport.hover(); await joined.mouse.wheel(0,-120);
+  await joined.locator('[data-history-turn]').first().waitFor();
+  await joined.waitForTimeout(250);
+  await joinedViewport.evaluate(el=>{el.scrollTop=el.scrollHeight;el.dispatchEvent(new Event('scroll'));});
+  await joined.waitForTimeout(200);
+  assert.equal(await joined.locator('.turn-nav-node.is-active').getAttribute('data-turn-index'),'3','archived highlight cannot override the live bottom');
+  await joined.close();
   assert.deepEqual(errors,[]);
   console.log('PASS: mobile/desktop groups, stable layout, bounded expansion, wheel/keyboard/touch/scrollbar pagination');
 } finally { await browser.close(); await new Promise(resolve=>server.close(resolve)); }

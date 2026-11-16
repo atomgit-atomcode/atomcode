@@ -180,6 +180,17 @@ fn preset_info(
         .to_string(),
         discoverable: crate::api_provider::discovery_protocol(preset.provider_type.wire())
             .is_some(),
+        connections: atomcode_config::config::provider_preset::connections(preset.id)
+            .iter()
+            .map(|choice| crate::ProviderConnectionInfo {
+                provider_type: choice.provider_type.wire().to_string(),
+                base_urls: choice
+                    .base_urls
+                    .iter()
+                    .map(|url| (*url).to_string())
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

@@ -238,6 +238,15 @@ pub(crate) struct ProviderPresetInfo {
     /// Its models can be listed from the endpoint.
     #[serde(default)]
     pub discoverable: bool,
+    /// Vendor-supported protocol choices, with corresponding plan URLs.
+    pub connections: Vec<ProviderConnectionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderConnectionInfo {
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub base_urls: Vec<String>,
 }
 
 /// One model a provider's listing offers — the shared type, under the name
