@@ -1223,7 +1223,7 @@ impl AnthropicSseDecoder {
         );
         let mut out = Vec::new();
         // A failed response still consumed the usage the provider reported.
-        if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
+        if self.has_usage() {
             out.push(StreamEvent::Usage(self.usage()));
         }
         out.push(StreamEvent::Error(ProviderError {
@@ -1262,7 +1262,7 @@ impl AnthropicSseDecoder {
         }
         // `feed` keeps the tail at or below `max_line_bytes`, and a tail above
         // it was refused there, so there is nothing left to reject here.
-        if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
+        if self.has_usage() {
             out.push(StreamEvent::Usage(self.usage()));
         }
         out.push(StreamEvent::Done {
@@ -1274,6 +1274,18 @@ impl AnthropicSseDecoder {
 
     fn cached_total(&self) -> u32 {
         self.cache_read
+    }
+
+    /// True when the provider reported any usage worth delivering. `usage()`
+    /// folds `cache_creation` into `prompt`, so a check that looks only at
+    /// `input_tokens`, `output_tokens`, and `cache_read` drops a response whose
+    /// whole prompt was a cache write. Both the refused-line and EOF paths use
+    /// this, so they keep the same rule.
+    fn has_usage(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cached_total() > 0
+            || self.cache_creation > 0
     }
 
     fn usage(&self) -> TokenUsage {
@@ -2875,6 +2887,44 @@ mod tests {
             "{ev:?}"
         );
         assert!(matches!(ev.last(), Some(StreamEvent::Error(_))), "{ev:?}");
+    }
+
+    #[test]
+    fn sse_line_over_cap_reports_cache_creation_only_usage() {
+        // A fully cached prompt can report only `cache_creation_input_tokens`:
+        // input, output, and cache_read all stay zero. The refused stream still
+        // consumed those tokens, so the usage must survive the refusal.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(128);
+        let start = line(
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":9}}}),
+        );
+        assert!(start.len() < 128);
+        d.feed(start.as_bytes());
+        let ev = d.feed(&[b'x'; 129]);
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 9),
+            "{ev:?}"
+        );
+        assert!(matches!(ev.last(), Some(StreamEvent::Error(_))), "{ev:?}");
+    }
+
+    #[test]
+    fn sse_finish_reports_cache_creation_only_usage() {
+        // The EOF path shares the rule with the refused-line path.
+        let mut d = AnthropicSseDecoder::new();
+        d.feed(
+            line(
+                "message_start",
+                json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":9}}}),
+            )
+            .as_bytes(),
+        );
+        let ev = d.finish();
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 9),
+            "{ev:?}"
+        );
     }
 
     #[test]
