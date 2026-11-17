@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { getSessionPage, type DisplayHistoryCursor, type SessionMetaWithProject } from '../api';
-import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
+import type { ComponentChildren } from 'preact';
+import type { SessionMessage } from '../api';
 import { useT } from '../settings';
-import { Markdown } from './Markdown';
 
 /** A display-only reader: never attaches a runtime or subscribes to its events. */
-export function SessionBrowse({ session }: { session: SessionMetaWithProject }) {
+export function SessionBrowse({ session, renderMessages }: {
+  session: SessionMetaWithProject;
+  renderMessages: (messages: SessionMessage[], viewport: () => HTMLDivElement | null) => ComponentChildren;
+}) {
   const t = useT();
-  const [text, setText] = useState<string | null>(null);
+  const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [older, setOlder] = useState<DisplayHistoryCursor>();
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -20,11 +23,11 @@ export function SessionBrowse({ session }: { session: SessionMetaWithProject }) 
     const controller = new AbortController();
     reader.current = controller;
     loadingRef.current = false; lastScroll.current = 0;
-    setText(null); setOlder(undefined); setFailed(false); setLoading(false);
+    setMessages(null); setOlder(undefined); setFailed(false); setLoading(false);
     if (!session.project_hash) { setFailed(true); return () => controller.abort(); }
     getSessionPage(session.project_hash, session.id, controller.signal).then(detail => {
       if (!controller.signal.aborted) {
-        setText(sessionMessagesToMarkdownLines(detail.messages, detail.name).join('\n'));
+        setMessages(detail.messages);
         setOlder(detail.history_older);
         requestAnimationFrame(() => { if (!controller.signal.aborted && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight; });
       }
@@ -44,7 +47,7 @@ export function SessionBrowse({ session }: { session: SessionMetaWithProject }) 
       const el = viewport.current;
       const height = el?.scrollHeight ?? 0;
       const top = el?.scrollTop ?? 0;
-      setText(previous => sessionMessagesToMarkdownLines(detail.messages, '').join('\n') + '\n\n' + previous);
+      setMessages(previous => [...detail.messages, ...(previous ?? [])]);
       setOlder(detail.history_older);
       requestAnimationFrame(() => { if (!controller.signal.aborted && el?.isConnected) el.scrollTop = top + el.scrollHeight - height; });
     } catch { if (!controller.signal.aborted) setFailed(true); }
@@ -58,7 +61,7 @@ export function SessionBrowse({ session }: { session: SessionMetaWithProject }) 
     if (event.deltaY < 0 && (viewport.current?.scrollTop ?? 0) < 80) void loadOlder();
   }}><div class="timeline-inner">
     {older && <button class="history-load-more" disabled={loading} onClick={() => void loadOlder()}>{loading ? '…' : t('chat.loadEarlierHistory')}</button>}
-    {failed && <div role="alert">{t('chat.historyFailed')}<button onClick={() => setRetry(n => n + 1)}>{t('chat.historyRetry')}</button></div>}
-    {text === null ? !failed && <div role="status">{t('chat.historyLoading')}</div> : <Markdown content={text} />}
+    {failed && <div role="alert">{t('chat.historyFailed')}<button onClick={() => older ? void loadOlder() : setRetry(n => n + 1)}>{t('chat.historyRetry')}</button></div>}
+    {messages === null ? !failed && <div role="status">{t('chat.historyLoading')}</div> : renderMessages(messages, () => viewport.current)}
   </div></div>;
 }

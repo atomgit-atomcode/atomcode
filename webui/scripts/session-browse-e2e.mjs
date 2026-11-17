@@ -14,6 +14,8 @@ const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conve
 let releaseSlowHistory = null;
 let switchRejection = null;
 let switches = 0;
+let pagedBrowse = false;
+let failOlder = false;
 let refreshOnConnect = true;
 let specificationPinned = false;
 const patchUploads = [];
@@ -56,7 +58,26 @@ const server = createServer(async (req, res) => {
     if(switchRejection && JSON.parse(body).session_id!==id) return json(switchRejection);
     return json({ok:true});
   }
-  if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other, messages: [{role:'user', content:'Historical question'}, {role:'assistant', content:'Historical answer'}] });
+  if (path === '/projects/fixture/sessions/' + other.id && pagedBrowse && new URL(req.url,'http://localhost').searchParams.has('before')) {
+    if (failOlder) {failOlder=false; res.statusCode=503; return json({error:'temporary history failure'});}
+    return json({...other,messages:[
+      {role:'user',content:'Older tool request',created_at:1699999990000},
+      {role:'assistant',content:'Inspecting the older file.',tool_calls:[{id:'old-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'old-tool',success:true,summary:'Older tool output'}},
+      {role:'assistant',content:'Older tool answer',created_at:1699999991000}
+    ]});
+  }
+  if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other,
+    ...(pagedBrowse ? {history_older:{session:other.id,before:4,digest:'fixture'}} : {}), messages: [
+    {role:'user', content:'Earlier historical question', created_at:1700000000000},
+    {role:'assistant', content:'## Original heading\n\n'+('Earlier paragraph with **bold** and `code`.\n\n'.repeat(24)), created_at:1700000001000},
+    {role:'user', content:'Historical question', ...(pagedBrowse ? {} : {created_at:1700000002000})},
+    ...(pagedBrowse ? [
+      {role:'assistant',content:'Inspecting the recent file.',tool_calls:[{id:'recent-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'recent-tool',success:true,summary:'Recent tool output'}}
+    ] : []),
+    {role:'assistant', content:'Historical answer', created_at:1700000003000}
+  ] });
   if (path === '/projects/fixture/sessions/' + third.id) { releaseSlowHistory = () => json({ ...third, messages: [{role:'user',content:'Stale slow history'}] }); return; }
   if (path === '/live') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
@@ -210,6 +231,9 @@ try {
   assert(await hoverCard.isVisible(), 'selecting card text does not dismiss it');
   await page.locator('.session-list-body').dispatchEvent('scroll');
   await hoverCard.waitFor({state:'hidden'});
+  const liveTypography = await page.locator('.assistant-message-content').first().evaluate(el => {
+    const css=getComputedStyle(el); return {font:css.fontFamily,size:css.fontSize,color:css.color};
+  });
   await page.locator('.session-item-main').filter({hasText:'Other conversation'}).click();
   await page.getByText('Historical answer', {exact:true}).waitFor();
   assert.equal(switches, before);
@@ -237,7 +261,30 @@ try {
   for(const button of await page.locator('.session-browse-actions button').all()) {
     const bounds=await button.boundingBox(); assert(bounds.x>=banner.x&&bounds.x+bounds.width<=banner.x+banner.width+1);
   }
+  const scroller = page.locator('.session-chat-column .messages-container');
+  const messageBounds = await scroller.boundingBox();
+  assert(banner.y >= messageBounds.y + messageBounds.height - 2, 'browse notice replaces the bottom composer');
+  assert(banner.y + banner.height <= 900, 'browse card stays inside viewport');
+  assert.equal(await page.locator('.user-message-bubble').count(), 2, 'history retains user bubbles');
+  assert.equal(await page.locator('.assistant-message-content').count(), 2, 'history uses normal assistant renderer');
+  assert.deepEqual(await page.locator('.assistant-message-content').first().evaluate(el => {
+    const css=getComputedStyle(el); return {font:css.fontFamily,size:css.fontSize,color:css.color};
+  }), liveTypography, 'read-only history keeps normal typography');
+  assert.equal(await page.locator('.timeline-inner > .markdown-body').count(), 0, 'no exported Markdown document');
+  const nav = page.locator('.turn-nav-rail');
+  await nav.waitFor();
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[1]?.classList.contains('is-active'));
+  if (width < 600) await nav.locator('.turn-nav-toggle').click();
+  await nav.locator('.turn-nav-node').first().click();
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[0]?.classList.contains('is-active'));
+  assert(await scroller.evaluate(el => el.scrollTop < 100), 'rail navigates to first historical turn');
+  await scroller.evaluate(el => {el.scrollTop=el.scrollHeight;});
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[1]?.classList.contains('is-active'));
   await page.screenshot({path:`/tmp/atomcode-session-browse-${width}.png`});
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme','dark'));
+  await page.screenshot({path:`/tmp/atomcode-session-browse-dark-${width}.png`});
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme','light'));
+
   emit({type:'text', content:' Background stream stays with A.'});
   emit({type:'permission_request', tool_name:'bash', reason:'Approval from running A', call_id:'browse-call', arguments:'{"command":"pwd"}'});
   await page.getByText('Approval from running A', {exact:true}).waitFor();
@@ -416,6 +463,39 @@ try {
   assert.deepEqual(errors, []);
   await page.close();
  }
+  {
+    pagedBrowse=true; failOlder=true;
+    const page=await browser.newPage({viewport:{width:1200,height:900}});
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
+    await page.goto(base+'/?sync=1&session=context-summary');
+    await page.locator('.message-input').waitFor();
+    emit({type:'state',running:true});
+    await page.locator('.session-running-mark').waitFor();
+    const before=switches;
+    await page.locator('.session-item-main').filter({hasText:other.name}).click();
+    await page.getByText('Historical answer',{exact:true}).waitFor();
+    await page.locator('.turn-process-toggle').click();
+    await page.locator('.tool-header').click();
+    await page.getByText('Recent tool output',{exact:true}).waitFor();
+    const prompt=page.getByText('Historical question',{exact:true});
+    const top=(await prompt.boundingBox()).y;
+    await page.locator('.history-load-more').evaluate(el=>el.click());
+    await page.locator('.messages-container [role="alert"]').waitFor();
+    assert.equal(await page.getByText('Historical answer',{exact:true}).count(),1,'older-page failure retains displayed history');
+    await page.locator('.messages-container [role="alert"] button').evaluate(el=>el.click());
+    await page.getByText('Older tool answer',{exact:true}).waitFor();
+    assert.equal(await page.locator('.user-message-bubble').count(),3);
+    assert.equal(await page.locator('.turn-nav-node').count(),3);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const afterTop=(await prompt.boundingBox()).y;
+    assert(Math.abs(afterTop-top)<3,`prepending history preserves reading position: ${top} -> ${afterTop}`);
+    assert.equal(await page.getByText('Recent tool output',{exact:true}).count(),1,'prepending preserves the expanded recent process and tool');
+    await page.locator('.turn-process-toggle').first().click();
+    await page.locator('.tool-header').first().click();
+    await page.getByText('Older tool output',{exact:true}).waitFor();
+    assert.equal(switches,before,'paging and expanding history never rebind the live runtime');
+    await page.close(); pagedBrowse=false;
+  }
   for (const refusal of [
     {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn'},
     {ok:false,active_turn:false,error:'session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")'},

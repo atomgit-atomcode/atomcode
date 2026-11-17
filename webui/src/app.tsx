@@ -651,6 +651,9 @@ export function App() {
           </header>
         )}
 
+        {browseSession && <header class="session-header session-browse-header">
+          <span class="session-title-text session-browse-title" title={browseSession.name}>{browseSession.name}</span>
+        </header>}
         <div class="session-body app-sidebar">
           <div class="session-chat-column">
           {forkNotice?.id === sessionId && <div class="session-fork-notice" role="status"><span>{forkNotice.text}</span></div>}

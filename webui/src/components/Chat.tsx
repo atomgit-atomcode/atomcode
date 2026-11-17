@@ -4480,18 +4480,24 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   if (browseSession) {
     const target = activeSession?.name || sessionId || '';
     return withInteraction(<>
-      <div class="session-browse-notice" role="status">
-        <div class="session-browse-summary">
-          <span class="session-browse-label">{t('browse.label')}</span>
-          <strong class="session-browse-title" title={browseSession.name}>{browseSession.name}</strong>
-          <span class="session-browse-description">{t(busy || hasBlockingInteraction ? 'browse.background' : 'browse.ready', { name: target })}</span>
-        </div>
-        <div class="session-browse-actions">
-          <button class="session-browse-return" onClick={onReturnToBound}>{t(busy || hasBlockingInteraction ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
-          {!busy && !hasBlockingInteraction && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession}
+        renderMessages={(raw, viewport) => <BrowseMessagesView messages={sessionMessagesToDisplay(raw, false)}
+          sessionId={browseSession.id} viewport={viewport} />} />
+      <div class="input-container session-browse-composer">
+        <div class="session-browse-notice session-browse-card" role="status">
+          <svg class="session-browse-lock" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <rect x="5" y="10" width="14" height="11" rx="3" /><path d="M8 10V7a4 4 0 0 1 8 0v3" />
+          </svg>
+          <div class="session-browse-summary">
+            <strong class="session-browse-label">{t('browse.label')}</strong>
+            <span class="session-browse-description">{t(busy || hasBlockingInteraction ? 'browse.background' : 'browse.ready', { name: target })}</span>
+          </div>
+          <div class="session-browse-actions">
+            <button class="session-browse-return" onClick={onReturnToBound}>{t(busy || hasBlockingInteraction ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
+            {!busy && !hasBlockingInteraction && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+          </div>
         </div>
       </div>
-      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession} />
       {blockingInteraction && <div class="interaction-dock-seat" ref={interactionSeat} aria-label={target}></div>}
     </>);
   }
@@ -4921,10 +4927,76 @@ function TodoProgressPanel({ items, projectHash, sessionId, sourceRevision }: { 
   );
 }
 
-/** Render an assistant message's ordered parts in chronological order: each
- *  text run becomes Markdown; runs of consecutive tool calls share one
- *  `.tool-list` container. This is what preserves the text→tool→text→tool
- *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+/** Display history with the live message components, without projecting runtime state. */
+function BrowseMessagesView({ messages, sessionId, viewport }: {
+  messages: Message[]; sessionId: string; viewport: () => HTMLElement | null;
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [active, setActive] = useState(0);
+  const refs = useRef<(HTMLElement | null)[]>([]);
+  const turns = deriveTurnNavigation(messages);
+  const processes = turnProcesses(messages);
+  const ends = assistantTurnEndFlags(messages.map(message => message.role));
+  const artifacts = artifactsByAssistantIndex(messages);
+  const polls = groupEmptyPolls(messages);
+  function updateActive() {
+    const el = viewport();
+    if (!el || !turns.length) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 2) {
+      setActive(turns.length - 1); return;
+    }
+    const line = el.getBoundingClientRect().top + 24;
+    const spans = turns.map((turn, index) => {
+      let bottom = 0;
+      for (let n = turn.messageIndex; n <= turn.endIndex; n++) {
+        const node = refs.current[n];
+        if (node?.isConnected) bottom = Math.max(bottom, node.getBoundingClientRect().bottom);
+      }
+      return { index, bottom };
+    });
+    setActive(turnAtReadingSpan(spans, line) ?? 0);
+  }
+  useLayoutEffect(() => {
+    const el = viewport(); if (!el) return;
+    const frame = requestAnimationFrame(updateActive);
+    el.addEventListener('scroll', updateActive, { passive: true });
+    const observer = new ResizeObserver(updateActive);
+    observer.observe(el); if (el.firstElementChild) observer.observe(el.firstElementChild);
+    return () => { cancelAnimationFrame(frame); el.removeEventListener('scroll', updateActive); observer.disconnect(); };
+  }, [messages, expanded]);
+  const host = viewport()?.parentElement;
+  return <>
+    {messages.map((msg, index) => {
+      const ref = (el: HTMLElement | null) => { refs.current[index] = el; };
+      // This reader only prepends older pages, so distance from the tail stays stable.
+      const key = messages.length - index;
+      if (msg.role === 'user') return <UserMessageView key={key} msg={msg} searchRef={ref}
+        timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} />;
+      const process = processes.get(index);
+      const processKey = process ? String(messages.length - process.last) : '';
+      const folded = process?.foldable && !expanded[processKey];
+      const toggle = process?.foldable && process.first === index
+        ? <TurnProcessToggle process={process} expanded={!folded}
+            onToggle={() => setExpanded(previous => ({ ...previous, [processKey]: !previous[processKey] }))} /> : null;
+      if (folded && process && index !== process.last) return <Fragment key={key}>{toggle}</Fragment>;
+      const display = folded && process ? { ...msg, parts: process.finalParts } : msg;
+      return <Fragment key={key}>{toggle}<AssistantMessageView msg={display}
+        isLast={index === messages.length - 1} busy={false} lastIdx={messages.length - 1}
+        isLastInTurn={ends[index]} copyText={() => {
+          const turn = turns.find(turn => index >= turn.messageIndex && index <= turn.endIndex);
+          return Promise.resolve(messages.slice(turn ? turn.messageIndex + 1 : index, index + 1)
+            .filter(message => message.role === 'assistant').map(messageFullText).join('\n\n'));
+        }} artifacts={artifacts.get(index) ?? []} sessionId={sessionId} searchRef={ref}
+        timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} pollGroups={polls} /></Fragment>;
+    })}
+    {host && createPortal(<TurnNavRail items={turns} activeIndex={active} streaming={false}
+      onNavigate={index => {
+        const el = viewport(); const node = refs.current[index];
+        if (el && node) el.scrollTo({ top: el.scrollTop + node.getBoundingClientRect().top - el.getBoundingClientRect().top - 20 });
+      }} onHistory={() => {}} />, host)}
+  </>;
+}
+
 /** A single archived user turn may itself contain thousands of tools. */
 function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBeforeRead, onEdges }: {
   turn: TranscriptTurn; compact: boolean; sessionId: string | null; search: string;
