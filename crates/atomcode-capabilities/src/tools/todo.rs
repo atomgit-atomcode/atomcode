@@ -81,9 +81,11 @@ pub fn render_todos_text(todos: &[TodoItem], unicode: bool) -> String {
         .join("\n")
 }
 
-/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. This is the shape the
-/// TUI title cache (`parse_todo_titles_into`) reads to learn `id → title`, so an incremental
-/// `todo update id=N` row can render the task NAME, not just `#N`. Empty list → "(no tasks)".
+/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. The coding crate's
+/// plan-continuity reminder re-renders the live plan with this, so `id → content` stays
+/// readable wherever the list is quoted. The TUI derives task titles from the
+/// transcript-derived plan itself (`plan.title_as_of`), not from this shape.
+/// Empty list → "(no tasks)".
 pub fn render_todos_numbered(todos: &[TodoItem], unicode: bool) -> String {
     if todos.is_empty() {
         return "(no tasks)".to_string();
@@ -1332,8 +1334,6 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         // Same contract as above: the confirmation without the list — the
         // names ride in the call arguments of the same round.
-        // Same contract as above: the confirmation without the list — the
-        // names ride in the call arguments of the same round.
         assert!(r.content.contains("1 item — 1 pending"), "{}", r.content);
         assert!(
             !r.content.contains("verify scheduler registration"),
@@ -1354,7 +1354,16 @@ mod tests {
         // The echo is a confirmation, not a second copy of the list: the
         // model's own call arguments already carry the task names in the same
         // round.
-        assert!(result.content.contains("1 pending"), "{}", result.content);
+        assert!(
+            result.content.contains("1 item — 1 pending"),
+            "{}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("verify scheduler registration"),
+            "the echo must not repeat the list: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -1377,22 +1386,25 @@ mod tests {
     }
 
     #[test]
-    fn todowrite_result_is_numbered_for_title_cache() {
-        // The result must carry `<glyph> <id>. <content>` so the TUI title cache learns ids.
+    fn render_todos_numbered_lists_id_and_content() {
+        // The reminder path re-renders the live plan with ids: `<glyph> <id>. <content>`.
         let out = render_todos_numbered(&parse_todos(PLAN3).unwrap(), false);
         assert!(out.contains("] 1. a"), "{out}");
         assert!(out.contains("] 3. c"), "{out}");
     }
 
     #[tokio::test]
-    async fn todowrite_accepts_full_list_shape() {
+    async fn todowrite_full_plan_gets_compact_confirmation() {
         let t = TodoTool::new();
         assert_eq!(t.name(), "todowrite");
         let r = t.execute(PLAN3, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
+        // The confirmation counts and carries open ids; the list itself stays in
+        // the call arguments of the same round.
+        assert!(r.content.contains("3 items — 3 pending"), "{}", r.content);
         assert!(
-            r.content.contains("1. a"),
-            "numbered list echoed: {}",
+            !r.content.contains("1. a"),
+            "the echo must not repeat the list: {}",
             r.content
         );
     }
