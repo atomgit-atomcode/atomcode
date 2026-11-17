@@ -1916,8 +1916,13 @@ async fn cancelling_an_ordinary_retry_backoff_never_opens_another_request() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancelling_stream_recovery_backoff_never_opens_another_request() {
     use atomcode_kernel::stream::StreamEvent;
-    for with_tool in [false, true] {
-        let mut broken = vec![StreamEvent::TextDelta("saved before cancellation".into())];
+    for kind in 0..3 {
+        let with_tool = kind == 1;
+        let mut broken = vec![if kind == 2 {
+            StreamEvent::Reasoning("unfinished thinking".into())
+        } else {
+            StreamEvent::TextDelta("saved before cancellation".into())
+        }];
         if with_tool {
             broken.push(StreamEvent::ToolCallDelta {
                 index: 0,
@@ -1997,11 +2002,7 @@ async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
             Some("[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 0 }"),
             Msg::StreamRecoveryExhausted { max_recoveries: 0 },
         ),
-        (
-            vec![StreamEvent::Reasoning("thinking only".into()), transport()],
-            None,
-            Msg::StreamRecoveryNoProgress,
-        ),
+        (vec![transport()], None, Msg::StreamRecoveryNoProgress),
         (
             vec![
                 StreamEvent::TextDelta("saved".into()),
@@ -2027,6 +2028,366 @@ async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
         assert_eq!(provider.recorded().len(), 1);
         let events = app.context().only_session().unwrap().events();
         assert!(format!("{events:?}").contains(t(reason).as_ref()));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_only_interruptions_retry_twice_and_keep_history_out_of_the_prompt() {
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    for succeeds in [false, true] {
+        let broken = || {
+            vec![
+                StreamEvent::Reasoning("unfinished thinking".into()),
+                StreamEvent::Error(ProviderError {
+                    code: Some(atomcode_harness::plugins::agent_loop::STREAM_IDLE_CODE.into()),
+                    message: "idle timeout".into(),
+                    ..Default::default()
+                }),
+            ]
+        };
+        let (app, provider, count) = streamed_app(
+            vec![
+                broken(),
+                broken(),
+                if succeeds { finished() } else { broken() },
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            outcome.stop,
+            if succeeds {
+                StopReason::Stopped
+            } else {
+                StopReason::Timeout
+            }
+        );
+        assert_eq!(provider.recorded().len(), 3);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let log = app.context().only_session().unwrap();
+        let display = atomcode_kernel::session::derive_messages_with_meta(&log.events());
+        assert_eq!(
+            display
+                .iter()
+                .filter(|m| m.reasoning.as_deref() == Some("unfinished thinking"))
+                .count(),
+            if succeeds { 2 } else { 3 }
+        );
+        for (messages, _, _) in provider.recorded() {
+            assert!(!messages
+                .iter()
+                .any(|m| m.reasoning.as_deref() == Some("unfinished thinking")));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_restart_spends_the_existing_text_continuation_budget() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![StreamEvent::TextDelta("saved".into()), transport()],
+            vec![StreamEvent::Reasoning("thinking".into()), transport()],
+            vec![StreamEvent::Reasoning("still thinking".into()), transport()],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::ProviderError
+    );
+    assert_eq!(provider.recorded().len(), 3);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_only_without_dispatch_proof_is_not_restarted() {
+    let dir = scratch("reasoning-unknown-dispatch");
+    let app = start(tree(&dir, &[])).await;
+    let error = RequestError {
+        code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+        ..RequestError::message("interrupted")
+    }
+    .with_partial(ModelResponse {
+        reasoning: "thinking".into(),
+        ..Default::default()
+    });
+    let result = run_with(&app, 1, error).await;
+    assert_eq!(result.stop, StopReason::ProviderError);
+    assert_eq!(result.attempts, 1);
+}
+
+struct ImageMutation(Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait]
+impl atomcode_kernel::tool::Tool for ImageMutation {
+    fn name(&self) -> &str {
+        "image_mutation"
+    }
+    fn description(&self) -> &str {
+        "A mutation returning an inline image"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        atomcode_kernel::tool::ToolResult {
+            content: "image saved".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "cmF3".into(),
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+struct ImageRedaction(bool);
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for ImageRedaction {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        let mut results = next.run(batch).await;
+        // Only transform the original batch, so reuse must read the committed
+        // image itself rather than rely on this transform being repeated.
+        for result in &mut results {
+            if result.call_id == "first" {
+                result.images[0].data = if self.0 {
+                    "cmVkYWN0ZWQ=".into()
+                } else {
+                    String::new()
+                };
+            }
+        }
+        results
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn image_tool_recovery_reuses_committed_images_without_repeating_the_mutation() {
+    use atomcode_kernel::stream::StreamEvent;
+    for retained in [true, false] {
+        let (app, provider, count) = streamed_app(
+            vec![
+                completed_call("first", "image_mutation"),
+                vec![StreamEvent::Reasoning("inspect image".into()), transport()],
+                completed_call("repeat", "image_mutation"),
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        app.context()
+            .require::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .register(Arc::new(ImageMutation(count.clone())))
+            .unwrap();
+        let _guard = app
+            .context()
+            .on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(
+                Arc::new(ImageRedaction(retained)),
+                false,
+            );
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            outcome.stop,
+            if retained {
+                StopReason::Stopped
+            } else {
+                StopReason::ProviderError
+            },
+            "{outcome:?}; events={:?}",
+            app.context().only_session().unwrap().events()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.recorded().len(), if retained { 4 } else { 2 });
+        if retained {
+            let events = app.context().only_session().unwrap().events();
+            assert!(events.iter().any(|e| matches!(&e.event,
+                SessionEvent::ToolResultLogged { call_id, content, images, .. }
+                if call_id == "repeat" && content.contains("tool not executed again") && images.len() == 1 && images[0].data == "cmVkYWN0ZWQ=")));
+            let calls = provider.recorded();
+            let images: Vec<_> = calls[3].0.iter().flat_map(|m| &m.images).collect();
+            assert_eq!(images.len(), 2);
+            assert!(images.iter().all(|i| i.data == "cmVkYWN0ZWQ="));
+        }
+    }
+}
+
+// No injected timeout error: the production watchdog must expire while this
+// provider keeps yielding metadata after its last reasoning content.
+struct SilentAfterImages {
+    stalls: usize,
+    requests: std::sync::Mutex<Vec<Vec<atomcode_kernel::message::Message>>>,
+}
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for SilentAfterImages {
+    fn model_name(&self) -> &str {
+        "silent-after-images"
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[atomcode_kernel::message::Message],
+        _: &[atomcode_kernel::tool::ToolDef],
+        _: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        use atomcode_kernel::stream::StreamEvent;
+        use futures::StreamExt;
+        let attempt = {
+            let mut requests = self.requests.lock().unwrap();
+            let attempt = requests.len();
+            requests.push(messages.to_vec());
+            attempt
+        };
+        if attempt > 0 && attempt <= self.stalls {
+            return Ok(Box::pin(
+                futures::stream::iter(vec![StreamEvent::Reasoning(
+                    "inspect the saved image".into(),
+                )])
+                .chain(futures::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Some((StreamEvent::Usage(Default::default()), ()))
+                })),
+            ));
+        }
+        Ok(Box::pin(futures::stream::iter(if attempt == 0 {
+            completed_call("first", "image_mutation")
+        } else if attempt == self.stalls + 1 {
+            completed_call("repeat", "image_mutation")
+        } else {
+            finished()
+        })))
+    }
+}
+
+async fn silent_image_app(
+    stalls: usize,
+) -> (
+    App,
+    Arc<SilentAfterImages>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = scratch("real-content-idle");
+    let provider = Arc::new(SilentAfterImages {
+        stalls,
+        requests: Default::default(),
+    });
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(StreamScript(provider.clone())));
+    let loop_config = format!(
+        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?}, stream_idle_ms = 300000, stream_first_content_ms = 600000 }}",
+        root = dir.to_string_lossy()
+    );
+    let mut app = App::new(
+        registry,
+        tree(
+            &dir,
+            &[
+                "[[patch]]\nid = \"llm\"\nname = \"recovery-stream-script\"\nconfig = {}",
+                &loop_config,
+            ],
+        ),
+    );
+    app.start().await.unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    app.context()
+        .require::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .register(Arc::new(ImageMutation(count.clone())))
+        .unwrap();
+    (app, provider, count)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn actual_content_idle_after_image_tools_recovers_twice_then_succeeds_or_stops() {
+    for stalls in [2, 3] {
+        let (app, provider, count) = silent_image_app(stalls).await;
+        let started = Instant::now();
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            outcome.stop,
+            if stalls == 2 {
+                StopReason::Stopped
+            } else {
+                StopReason::Timeout
+            }
+        );
+        // Each idle deadline is 300s; the only extra time is 1s + 2s backoff.
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(stalls as u64 * 300 + 3)
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the mutation must never run twice"
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), if stalls == 2 { 5 } else { 4 });
+        for messages in requests.iter().skip(1) {
+            assert!(messages
+                .iter()
+                .flat_map(|m| &m.images)
+                .any(|i| i.data == "cmF3"));
+            assert!(!messages
+                .iter()
+                .any(|m| m.reasoning.as_deref() == Some("inspect the saved image")));
+        }
+        let log = app.context().only_session().unwrap();
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::ToolStarted { .. }))
+                .count(),
+            1
+        );
+        let display = atomcode_kernel::session::derive_messages_with_meta(&log.events());
+        assert_eq!(
+            display
+                .iter()
+                .filter(|m| m.reasoning.as_deref() == Some("inspect the saved image"))
+                .count(),
+            stalls
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelling_actual_content_idle_or_its_backoff_never_reissues_the_request() {
+    for cancel_after in [Duration::from_secs(100), Duration::from_millis(300_500)] {
+        let (app, provider, count) = silent_image_app(2).await;
+        let agent = atomcode_harness::create_agent(&app).await.unwrap();
+        agent.send("go");
+        let started = Instant::now();
+        let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
+            tokio::time::sleep(cancel_after).await;
+            agent.interrupt();
+        });
+        assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
+        assert_eq!(started.elapsed(), cancel_after);
+        tokio::time::sleep(Duration::from_secs(1000)).await;
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
 

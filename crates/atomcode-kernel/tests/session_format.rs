@@ -15,6 +15,45 @@
 use atomcode_kernel::session::InjectionOrigin;
 
 #[test]
+fn interrupted_thinking_is_visible_in_history_but_not_replayed_as_an_answer() {
+    use atomcode_kernel::message::{MessageMeta, ReasoningBlock};
+    use atomcode_kernel::session::{
+        derive_messages, derive_messages_with_meta, LoggedEvent, SessionEvent,
+    };
+    for (text, finish, replayed) in [
+        ("", "error", false),
+        ("partial answer", "error", true),
+        ("", "stop", true),
+    ] {
+        let events = vec![LoggedEvent {
+            seq: 1,
+            at: 0,
+            event: SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: text.into(),
+                reasoning: "unfinished thought".into(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![ReasoningBlock {
+                    text: "unfinished thought".into(),
+                    provider: Some("anthropic".into()),
+                    opaque: None,
+                }],
+                meta: Some(MessageMeta {
+                    finish_reason: finish.into(),
+                    ..Default::default()
+                }),
+            },
+        }];
+        assert_eq!(derive_messages(&events).len(), usize::from(replayed));
+        let display = derive_messages_with_meta(&events);
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].reasoning.as_deref(), Some("unfinished thought"));
+        assert_eq!(display[0].reasoning_blocks.len(), 1);
+    }
+}
+
+#[test]
 fn a_skill_injection_names_what_supplied_the_hidden_context() {
     let origin = InjectionOrigin::Skill {
         name: "review".into(),

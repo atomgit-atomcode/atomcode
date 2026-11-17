@@ -647,6 +647,7 @@ struct StreamRow {
     /// How many times a turn may preserve a broken stream's output and carry
     /// on. Low on purpose: a stream that keeps breaking mid-flight is a signal
     /// about the connection, not something to paper over indefinitely.
+    /// Reasoning-only failures use this same counter, capped at two recoveries.
     #[serde(default = "default_recoveries")]
     max_recoveries: u32,
 }
@@ -728,10 +729,26 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 .is_some_and(|p| !p.text.trim().is_empty());
             let proven_undispatched = error.unexecuted_tool_output
                 && error.tool_dispatch == crate::events::ToolDispatchProof::NotDispatched;
+            // A reasoning-only attempt has no answer to continue, but can be
+            // requested again if neither this attempt nor prior tool work is
+            // uncertain. Spend the SAME per-turn budget, with a lower ceiling.
+            let reasoning_only = !has_text
+                && !error.unexecuted_tool_output
+                && error.tool_dispatch == crate::events::ToolDispatchProof::NotDispatched
+                && error.partial.as_ref().is_some_and(|p| {
+                    p.tool_calls.is_empty()
+                        && (!p.reasoning.trim().is_empty() || !p.reasoning_blocks.is_empty())
+                });
+            let reasoning_retry = reasoning_only && self.progress.restart_safe(&session);
+            let max_recoveries = if reasoning_only {
+                self.max_recoveries.min(2)
+            } else {
+                self.max_recoveries
+            };
             let eligible = error.http_status.is_none()
                 && (transport || idle)
                 && (!error.unexecuted_tool_output || proven_undispatched)
-                && (has_text || confirmed || proven_undispatched);
+                && (has_text || confirmed || proven_undispatched || reasoning_retry);
             let turn = session.current_turn();
             // Each failed attempt is preserved once, including the final failure.
             if let Some(partial) = &error.partial {
@@ -770,7 +787,7 @@ impl Waterfall<AgentRequest> for StreamRecovery {
             let attempt = eligible
                 .then(|| {
                     self.progress
-                        .recover(&session, self.max_recoveries, confirmed)
+                        .recover(&session, max_recoveries, confirmed || reasoning_retry)
                 })
                 .flatten();
             let Some(attempt) = attempt else {
@@ -778,16 +795,14 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                     use atomcode_config::i18n::{t, Msg};
                     let why = if error.unexecuted_tool_output && !proven_undispatched {
                         Msg::StreamRecoveryUnsafeTools
-                    } else if !has_text && !confirmed && !proven_undispatched {
+                    } else if !has_text && !confirmed && !proven_undispatched && !reasoning_retry {
                         Msg::StreamRecoveryNoProgress
                     } else {
-                        Msg::StreamRecoveryExhausted {
-                            max_recoveries: self.max_recoveries,
-                        }
+                        Msg::StreamRecoveryExhausted { max_recoveries }
                     };
                     tracing::warn!(
                         turn,
-                        max_recoveries = self.max_recoveries,
+                        max_recoveries,
                         eligible,
                         unexecuted_tool_output = error.unexecuted_tool_output,
                         tool_dispatch = ?error.tool_dispatch,
@@ -809,7 +824,7 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 NoticeKind::ProviderRetry,
                 atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryRetry {
                     attempt,
-                    max_recoveries: self.max_recoveries,
+                    max_recoveries,
                     delay_secs,
                 })
                 .into_owned(),
@@ -822,7 +837,7 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 &session,
                 SessionEvent::Injected {
                     turn,
-                    text: if proven_undispatched {
+                    text: if proven_undispatched || reasoning_retry {
                         UNDISPATCHED_RESUME_NUDGE
                     } else {
                         RESUME_NUDGE

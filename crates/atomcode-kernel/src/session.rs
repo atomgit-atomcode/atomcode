@@ -1393,6 +1393,16 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 meta,
                 ..
             } => {
+                // Keep interrupted thinking in the display/history projection,
+                // but do not replay an empty answer or an unfinished signature
+                // as a completed assistant message to a provider.
+                if !with_meta
+                    && text.trim().is_empty()
+                    && tool_calls.is_empty()
+                    && meta.as_ref().is_some_and(|m| m.finish_reason == "error")
+                {
+                    continue;
+                }
                 let mut message = Message::assistant(text_of(text), tool_calls.clone());
                 if !reasoning.is_empty() {
                     message.reasoning = Some(reasoning.clone());
