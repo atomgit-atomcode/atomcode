@@ -675,7 +675,7 @@ mod tests {
     async fn a_walk_skips_dotenv_secrets_but_searches_templates() {
         let d = tempfile::tempdir().unwrap();
         let needle = "grep-walk-dotenv-criterion";
-        for name in [".env", ".env.local", ".env.example"] {
+        for name in [".env", ".env.local", ".env'backup", ".env.example"] {
             std::fs::write(d.path().join(name), format!("KEY={needle}\n")).unwrap();
         }
 
@@ -695,6 +695,11 @@ mod tests {
         assert!(
             !r.content.contains(".env.local:1:"),
             "a secret variant must not be searched by a walk: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains(".env'backup:1:"),
+            "the legacy apostrophe boundary must stay protected: {}",
             r.content
         );
         assert!(
