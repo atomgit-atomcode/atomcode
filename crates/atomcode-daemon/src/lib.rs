@@ -180,6 +180,8 @@ pub(crate) struct ConfigResponse {
     pub path: PathBuf,
     pub default_provider: String,
     pub default_workdir: Option<String>,
+    pub vision_preprocessor_provider: Option<String>,
+    pub vision_preprocessor_status: atomcode_config::vision_preprocessor::VisionPreprocessorStatus,
     pub providers: Vec<ProviderInfo>,
     /// Sanitized reusable provider accounts. Credentials never cross this API;
     /// `has_api_key` is the only credential-related field exposed to the UI.
@@ -8355,6 +8357,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Config API (P0)
         .route("/config", get(api_config::get_config))
         .route("/config/reload", post(api_config::reload_config))
+        .route(
+            "/config/vision-preprocessor",
+            post(api_config::set_vision_preprocessor),
+        )
         .route(
             "/config/modes",
             get(api_config::get_mode_models).post(api_config::set_mode_models),

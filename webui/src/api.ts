@@ -575,6 +575,8 @@ export interface NotificationConfigInfo {
 }
 
 export interface ConfigInfo {
+  vision_preprocessor_provider?: string | null;
+  vision_preprocessor_status?: 'unconfigured' | 'resolved' | 'unresolvable' | 'unsupported';
   path: string;
   default_provider: string;
   default_workdir?: string;
@@ -594,6 +596,12 @@ export interface ConfigInfo {
 export async function getConfig(): Promise<ConfigInfo> {
   const resp = await apiFetch('/config', { headers: authHeaders() });
   return readJson(resp);
+}
+
+export async function saveVisionPreprocessor(provider: string): Promise<ConfigInfo> {
+  return readJson(await apiFetch('/config/vision-preprocessor', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ provider }),
+  }));
 }
 
 /** Trigger a hot-reload of config from disk (POST /config/reload). */

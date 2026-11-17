@@ -4527,3 +4527,17 @@ body {
 .user-message-wrapper > .msg-actions { opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
 .user-message-wrapper:hover > .msg-actions,
 .user-message-wrapper:focus-within > .msg-actions { opacity: 1; pointer-events: auto; }
+
+.vision-preprocessor {
+  padding: 16px;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: var(--corner-radius-large);
+  min-width: 0;
+}
+.vision-preprocessor label { display: block; font-weight: 600; }
+.vision-preprocessor p { margin: 8px 0; font-size: 0.875rem; color: var(--app-secondary-foreground); overflow-wrap: anywhere; }
+.vision-preprocessor select {
+  width: 100%; min-width: 0; max-width: 100%; min-height: 44px;
+  padding: 8px 12px; border: 1px solid var(--app-border-subtle); border-radius: var(--corner-radius-small);
+  background: var(--app-input-background); color: var(--app-primary-foreground); font: inherit;
+}

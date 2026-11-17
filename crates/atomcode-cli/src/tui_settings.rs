@@ -128,6 +128,18 @@ impl ConfigSettings {
                             applies: Applies::Reprepare,
                         }),
                 )
+                .chain(std::iter::once(SettingRow {
+                    id: atomcode_config::vision_preprocessor::SETTING_ID.into(),
+                    label: atomcode_config::vision_preprocessor::setting_label(&config),
+                    value: config
+                        .vision_preprocessor_provider
+                        .clone()
+                        .unwrap_or_default(),
+                    kind: SettingKind::Choice(
+                        atomcode_config::vision_preprocessor::vision_preprocessor_choices(&config),
+                    ),
+                    applies: Applies::NextTurn,
+                }))
                 .chain(retry_row(&config))
                 .collect(),
         )
@@ -225,6 +237,14 @@ impl Settings for ConfigSettings {
                 .map_err(|error| format!("{error:#}"))?;
             return Ok(self.read());
         }
+        if id == atomcode_config::vision_preprocessor::SETTING_ID {
+            atomcode_config::ConfigStore::new(self.path.clone())
+                .update_document(|document| {
+                    atomcode_config::vision_preprocessor::patch_setting(document, value)
+                })
+                .map_err(|error| format!("{error:#}"))?;
+            return Ok(self.read());
+        }
         if id == RETRY {
             write_retry(&self.path, Some(value))?;
             return Ok(self.read());
@@ -260,6 +280,9 @@ impl Settings for ConfigSettings {
                 })
                 .map_err(|error| format!("{error:#}"))?;
             return Ok(self.read());
+        }
+        if id == atomcode_config::vision_preprocessor::SETTING_ID {
+            return self.set(id, "");
         }
         if id == RETRY {
             write_retry(&self.path, None)?;
@@ -337,6 +360,47 @@ fn applies_of(policy: atomcode_config::settings::ApplyPolicy) -> Applies {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_offers_only_image_models_for_vl_and_preserves_invalid_values() {
+        use atomcode_tui::settings::{Applies, SettingKind, Settings};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+# retained
+vision_preprocessor_provider = "removed"
+[providers.vl]
+type = "openai"
+model = "custom"
+supports_vision = true
+[providers.text]
+type = "openai"
+model = "gpt-4o"
+supports_vision = false
+"#,
+        )
+        .unwrap();
+        let port = super::ConfigSettings::new(path.clone());
+        let id = atomcode_config::vision_preprocessor::SETTING_ID;
+        let view = port.rows();
+        let row = view.rows().iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.value, "removed");
+        assert_eq!(row.kind, SettingKind::Choice(vec!["".into(), "vl".into()]));
+        assert_eq!(row.applies, Applies::NextTurn);
+        assert!(port.set(id, "text").is_err());
+        port.set(id, "vl").unwrap();
+        let saved = atomcode_config::Config::load(&path).unwrap();
+        assert_eq!(saved.vision_preprocessor_provider.as_deref(), Some("vl"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# retained"));
+        port.reset(id).unwrap();
+        assert!(atomcode_config::Config::load(&path)
+            .unwrap()
+            .vision_preprocessor_provider
+            .is_none());
+    }
     use super::*;
 
     #[test]
@@ -523,6 +587,7 @@ mod tests {
             .collect();
         assert!(
             extra.iter().all(|id| *id == RETRY
+                || *id == atomcode_config::vision_preprocessor::SETTING_ID
                 || [
                     "modes.plan.model",
                     "modes.plan.reasoning_effort",
@@ -757,7 +822,12 @@ reasoning_effort_levels=["low","high"]
         std::fs::write(&path, "this is not toml {{{").unwrap();
         let port = ConfigSettings::new(path);
         let rows = port.rows();
-        assert_eq!(rows.len(), atomcode_config::settings::SETTINGS.len() + 4);
+        assert_eq!(
+            rows.len(),
+            atomcode_config::settings::SETTINGS.len()
+                + atomcode_config::mode_models::setting_rows(&Default::default()).len()
+                + 1, // VL selection is available even without configured models.
+        );
     }
 
     #[test]

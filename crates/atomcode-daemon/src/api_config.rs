@@ -5,6 +5,26 @@ use axum::{response::IntoResponse, Json};
 
 use crate::{json_error, ConfigResponse, ProviderAccountInfo, ProviderInfo, ProviderPresetInfo};
 
+use atomcode_config::vision_preprocessor::{
+    select_vision_preprocessor, vision_preprocessor_status,
+};
+
+#[derive(serde::Deserialize)]
+pub(crate) struct VisionPreprocessorUpdate {
+    provider: String,
+}
+
+pub(crate) async fn set_vision_preprocessor(
+    Json(request): Json<VisionPreprocessorUpdate>,
+) -> axum::response::Response {
+    // Validate against the latest snapshot inside the same locked update as
+    // persistence. Other model/account edits must not be overwritten.
+    match update_config(|config| select_vision_preprocessor(config, &request.provider)) {
+        Ok(config) => Json(config_response(&config)).into_response(),
+        Err(error) => json_error(axum::http::StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+
 /// Load config from disk.
 pub(crate) fn load_config() -> Result<Config, String> {
     let path = Config::default_path();
@@ -62,6 +82,8 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         path: Config::default_path(),
         default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
+        vision_preprocessor_provider: config.vision_preprocessor_provider.clone(),
+        vision_preprocessor_status: vision_preprocessor_status(config),
         providers,
         provider_accounts: {
             let mut accounts: Vec<_> = config
@@ -308,6 +330,40 @@ pub(crate) async fn reload_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_response_preserves_stale_vl_selection_and_reports_capability() {
+        use atomcode_config::vision_preprocessor::VisionPreprocessorStatus;
+        let mut config = Config::default();
+        config.vision_preprocessor_provider = Some("removed-vl".into());
+        let response = config_response(&config);
+        assert_eq!(
+            response.vision_preprocessor_provider.as_deref(),
+            Some("removed-vl")
+        );
+        assert_eq!(
+            response.vision_preprocessor_status,
+            VisionPreprocessorStatus::Unresolvable
+        );
+        let mut vl = provider("https://example.invalid");
+        vl.supports_vision = Some(true);
+        config.providers.insert("vl".into(), vl);
+        select_vision_preprocessor(&mut config, "vl").unwrap();
+        assert_eq!(
+            config_response(&config).vision_preprocessor_status,
+            VisionPreprocessorStatus::Resolved
+        );
+        config.providers.get_mut("vl").unwrap().supports_vision = Some(false);
+        assert_eq!(
+            config_response(&config).vision_preprocessor_status,
+            VisionPreprocessorStatus::Unsupported
+        );
+        select_vision_preprocessor(&mut config, "").unwrap();
+        assert_eq!(
+            config_response(&config).vision_preprocessor_status,
+            VisionPreprocessorStatus::Unconfigured
+        );
+    }
 
     fn provider(base_url: &str) -> ProviderConfig {
         ProviderConfig {

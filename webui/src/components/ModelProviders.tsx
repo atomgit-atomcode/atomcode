@@ -13,6 +13,7 @@ import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeader
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   getConfig,
+  saveVisionPreprocessor,
   postConfigReload,
   ConfigInfo,
   ProviderInfo,
@@ -267,6 +268,13 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               {!config && !loadError && <div class="modal-loading">{t('settings.loading')}</div>}
               {config && (
                 <>
+                  {config.vision_preprocessor_status !== undefined && (
+                    <VisionPreprocessor config={config} onSaved={(result) => setConfig((current) => current ? {
+                      ...current,
+                      vision_preprocessor_provider: result.vision_preprocessor_provider,
+                      vision_preprocessor_status: result.vision_preprocessor_status,
+                    } : result)} />
+                  )}
                   <div class="provider-list account-list">
                     {accounts.map((account) => (
                       <AccountCard
@@ -1524,4 +1532,37 @@ function ModelEditor({
       </div>
     </div>
   );
+}
+
+function VisionPreprocessor({ config, onSaved }: { config: ConfigInfo; onSaved: (config: ConfigInfo) => void }) {
+  const { t } = useSettings();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const pending = useRef(false);
+  const current = config.vision_preprocessor_provider ?? '';
+  const models = config.providers.filter((model) => model.supports_vision);
+  const invalid = current !== '' && !models.some((model) => model.name === current);
+  const status = config.vision_preprocessor_status ?? 'unconfigured';
+  async function select(value: string) {
+    if (pending.current) return;
+    pending.current = true;
+    setSaving(true);
+    setError('');
+    try { onSaved(await saveVisionPreprocessor(value)); }
+    catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+    finally { pending.current = false; setSaving(false); }
+  }
+  return <section class="vision-preprocessor" aria-labelledby="vl-model-label" aria-busy={saving}>
+    <label id="vl-model-label" htmlFor="vl-model-select">{t('visionPreprocessor.title')}</label>
+    <p id="vl-model-hint">{t('visionPreprocessor.hint')}</p>
+    <select id="vl-model-select" value={current} disabled={saving} aria-describedby="vl-model-hint vl-model-status"
+      onChange={(event) => { void select(event.currentTarget.value); }}>
+      <option value="">{t('visionPreprocessor.off')}</option>
+      {invalid && <option value={current} disabled>{current}</option>}
+      {models.map((model) => <option key={model.name} value={model.name}>{model.display_name || model.model} · {model.name}</option>)}
+    </select>
+    <p id="vl-model-status" role="status">{saving ? t('visionPreprocessor.saving') : t(`visionPreprocessor.${status}`)}</p>
+    {models.length === 0 && <p>{t('visionPreprocessor.empty')}</p>}
+    {error && <p class="modal-error" role="alert">{error}</p>}
+  </section>;
 }
