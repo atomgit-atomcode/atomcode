@@ -206,6 +206,12 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             .user_agent
             .clone()
             .unwrap_or_else(|| self.default_user_agent.clone());
+        // Direct provider calls may omit ChatOptions::max_tokens. They must
+        // inherit the selected model's budget too, just like the main loop.
+        let max_tokens = cfg
+            .chat_options
+            .max_tokens
+            .unwrap_or_else(|| default_max_tokens(cfg.context_window));
         let provider: Arc<dyn LlmProvider> = match cfg.provider_type.as_str() {
             "claude" | "anthropic" | "deepseek-messages" => {
                 let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
@@ -215,7 +221,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.idle_timeout = cfg.stream_timeout;
                 ac.first_token_timeout = cfg.first_token_timeout;
                 ac.open_timeout = response_header_timeout(cfg);
-                ac.max_tokens = default_max_tokens(cfg.context_window);
+                ac.max_tokens = max_tokens;
                 ac.supports_vision = cfg.supports_vision;
                 ac.effort_levels = cfg.effort_levels.clone();
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -235,7 +241,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.context_window = cfg.context_window;
                 oc.idle_timeout = cfg.stream_timeout;
                 oc.first_token_timeout = cfg.first_token_timeout;
-                oc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                oc.max_tokens = Some(max_tokens);
                 // Explicit opt-in: pin the Ollama runtime window only when the user set
                 // ATOMCODE_OLLAMA_NUM_CTX. Unset ⇒ leave the daemon's own default alone.
                 oc.num_ctx =
@@ -263,7 +269,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.open_timeout = response_header_timeout(cfg);
                 pc.supports_vision = cfg.supports_vision;
                 pc.effort_levels = cfg.effort_levels.clone();
-                pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                pc.max_tokens = Some(max_tokens);
                 pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
                 pc.reasoning_policy =
                     ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -294,7 +300,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.open_timeout = response_header_timeout(cfg);
                 pc.supports_vision = cfg.supports_vision;
                 pc.effort_levels = cfg.effort_levels.clone();
-                pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                pc.max_tokens = Some(max_tokens);
                 // An explicit per-model default is also an explicit capability
                 // declaration. CodingPlan's DeepSeek V4 Flash predates server-side
                 // capability metadata, so keep that one exact built-in fallback.
@@ -808,6 +814,95 @@ mod tests {
             32_000,
             "128K/4 sits just under the ceiling"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn configured_output_budget_reaches_every_wire_format() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // This tests real local HTTP serialization, not timeout behavior.
+        tokio::time::resume();
+        for protocol in [
+            "openai",
+            "responses",
+            "anthropic",
+            "deepseek-messages",
+            "ollama",
+        ] {
+            for budget in [None, Some(4096_u32), Some(393216)] {
+                for call_override in [None, Some(1024_u32)] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base_url = format!("http://{}", listener.local_addr().unwrap());
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut bytes = Vec::new();
+                        let (body_start, length) = loop {
+                            let mut chunk = [0_u8; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap();
+                            assert!(n > 0, "request ended before headers");
+                            bytes.extend_from_slice(&chunk[..n]);
+                            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers =
+                                    String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                                let length: usize = headers
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .unwrap()
+                                    .trim()
+                                    .parse()
+                                    .unwrap();
+                                break (end + 4, length);
+                            }
+                        };
+                        while bytes.len() < body_start + length {
+                            let mut chunk = [0_u8; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap();
+                            assert!(n > 0, "request ended before body");
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&bytes[body_start..body_start + length])
+                                .unwrap();
+                        // A terminal response is sufficient: assertions concern the request.
+                        socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        body
+                    });
+                    let catalog: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+                        "providers": {"selected": {
+                            "type": protocol, "model": "test-model", "base_url": base_url,
+                            "context_window": 512000, "max_tokens": budget, "retry_max_attempts": 1
+                        }}
+                    })).unwrap();
+                    let selected = catalog.resolve_model(Some("selected")).unwrap();
+                    let cfg = derive_tier_config_from_resolved(&config("openai"), &selected);
+                    let provider = DefaultCodingProviderFactory::new("test")
+                        .build(&cfg, None)
+                        .unwrap();
+                    let result = provider
+                        .chat_stream(
+                            &[atomcode_kernel::message::Message::user("hi")],
+                            &[],
+                            &ChatOptions {
+                                max_tokens: call_override,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                    let body = server.await.unwrap();
+                    let sent = match protocol {
+                        "responses" => &body["max_output_tokens"],
+                        "ollama" => &body["options"]["num_predict"],
+                        _ => &body["max_tokens"],
+                    };
+                    let expected = call_override.or(budget).unwrap_or(32768);
+                    assert_eq!(
+                        sent.as_u64(),
+                        Some(u64::from(expected)),
+                        "{protocol}, {budget:?}, {call_override:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

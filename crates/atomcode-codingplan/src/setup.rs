@@ -1467,7 +1467,16 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .filter(|n| *n > 0)
             .unwrap_or(0)
             .max(MIN_CONTEXT_WINDOW),
-        max_tokens: None,
+        // Match model discovery's output-budget precedence. Reject values that
+        // cannot be represented by the runtime's u32 instead of wrapping them.
+        max_tokens: entry
+            .max_output_tokens
+            .filter(|&n| n > 0 && u32::try_from(n).is_ok())
+            .or_else(|| {
+                entry
+                    .max_tokens
+                    .filter(|&n| n > 0 && u32::try_from(n).is_ok())
+            }),
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
@@ -1526,6 +1535,93 @@ mod tests {
 
     fn blank_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn model_output_budget_deserializes_and_keeps_server_values() {
+        for (fields, expected) in [
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"max_tokens": null, "max_output_tokens": null}),
+                None,
+            ),
+            (
+                serde_json::json!({"max_tokens": 0, "max_output_tokens": 0}),
+                None,
+            ),
+            (serde_json::json!({"max_tokens": 4096}), Some(4096)),
+            (
+                serde_json::json!({"max_output_tokens": 393216}),
+                Some(393216),
+            ),
+            (
+                serde_json::json!({"max_tokens": 4096, "max_output_tokens": 65536}),
+                Some(65536),
+            ),
+            (
+                serde_json::json!({"max_tokens": 4096, "max_output_tokens": 0}),
+                Some(4096),
+            ),
+            (serde_json::json!({"max_tokens": 4294967296_u64}), None),
+        ] {
+            let mut payload = serde_json::json!({
+                "display_model_name": "test-model", "context_window": 512000,
+                "plan_available": true
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let served: ModelEntry = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(
+                build_codingplan_provider(&served).max_tokens,
+                expected,
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_output_budget_survives_refresh_save_and_resolution() {
+        for policy in [
+            DefaultModelPolicy::AdoptServerDefault,
+            DefaultModelPolicy::PreservePrevious,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut latest = blank_config();
+            // Both login and background refresh must replace a stale budget,
+            // including removing it when the server no longer supplies one.
+            for budget in [Some(4096), Some(393216), None] {
+                let mut prepared = latest.clone();
+                let served: ModelEntry = serde_json::from_value(serde_json::json!({
+                    "display_model_name": "test-model", "context_window": 512000,
+                    "plan_available": true, "max_tokens": budget
+                }))
+                .unwrap();
+                let models = run_register(&mut prepared, vec![served]);
+                let report = SetupReport {
+                    login: StepResult::Skipped("test".into()),
+                    claim: StepResult::Skipped("test".into()),
+                    claim_attempts: Vec::new(),
+                    models: StepResult::Ok(models),
+                    status: StepResult::Skipped("test".into()),
+                    auth_expired: false,
+                };
+                merge_successful_config(&mut latest, &prepared, &report, policy).unwrap();
+                latest.save(&path).unwrap();
+                latest = Config::load(&path).unwrap();
+                assert_eq!(latest.models[px()].max_tokens, budget);
+                assert_eq!(latest.resolve_model(Some(px())).unwrap().max_tokens, budget);
+                assert_eq!(
+                    latest
+                        .provider_config_for_selection(px())
+                        .unwrap()
+                        .max_tokens,
+                    budget
+                );
+            }
+        }
     }
 
     /// The configured provider prefix. Expectations derive from it rather than
@@ -1985,6 +2081,8 @@ mod tests {
             base_url: Some("https://custom.example.com/v1".into()),
             provider_type: Some("claude".into()),
             context_window: Some(128_000),
+            max_tokens: Some(4096),
+            max_output_tokens: None,
             supports_vision: Some(true),
             plan_available: true,
             capable_model: None,
@@ -1996,6 +2094,7 @@ mod tests {
         assert_eq!(p.provider_type, "claude");
         assert_eq!(p.base_url.as_deref(), Some("https://custom.example.com/v1"));
         assert_eq!(p.context_window, 128_000);
+        assert_eq!(p.max_tokens, Some(4096));
         assert_eq!(p.supports_vision, Some(true));
     }
 

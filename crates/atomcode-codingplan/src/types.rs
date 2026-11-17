@@ -146,6 +146,13 @@ pub struct ModelEntry {
     /// silently truncated.
     #[serde(default)]
     pub context_window: Option<usize>,
+    /// Per-request output budget advertised by the gateway. Missing/null/zero
+    /// values keep the client's default; valid values are not context-derived.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// Alternate output-budget spelling, preferred over `max_tokens` when valid.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
     /// Explicit vision capability advertised by `models-v2`. `None` keeps
     /// compatibility with older servers and lets `ProviderConfig` fall back
     /// to its existing model-name heuristic; `Some(false)` must remain an
