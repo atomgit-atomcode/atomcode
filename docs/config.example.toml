@@ -505,6 +505,7 @@ theme = "auto"
 # 显式选择会固定后端，不再自动切换；/config 也可修改此选项。
 [web_search]
 provider = "auto" # auto | exa | parallel | tavily | firecrawl | tinyfish | duckduckgo
+auto_default_migrated = true # 保留此标记：旧配置的 exa 仅自动迁移一次，之后尊重用户选择。
 # api_key = "..." # 仅 Exa；优先使用 EXA_API_KEY，勿将真实 Key 提交到仓库。
 # 其他后端可选环境变量：PARALLEL_API_KEY、TAVILY_API_KEY、FIRECRAWL_API_KEY、TINYFISH_API_KEY。
 # 未提供 Key 时使用上游 keyless 接口，仍受上游匿名额度/速率限制。

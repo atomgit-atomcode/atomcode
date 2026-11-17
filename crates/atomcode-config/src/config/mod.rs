@@ -795,6 +795,9 @@ pub struct Config {
 /// Web search backend configuration. Persisted as the `[web_search]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchConfig {
+    /// One-time upgrade marker. After migration, explicit provider choices stay pinned.
+    #[serde(default)]
+    pub auto_default_migrated: bool,
     /// Search backend: `auto` (default, bounded failover across hosted providers),
     /// `exa`, `parallel`, `tavily`, `firecrawl`, `tinyfish`, or legacy `duckduckgo`.
     /// Explicit providers stay pinned. Other provider keys use their corresponding
@@ -812,6 +815,15 @@ fn default_search_provider() -> String {
 }
 
 impl WebSearchConfig {
+    fn migrate_auto_default(&mut self) {
+        if !self.auto_default_migrated {
+            if self.provider.trim().eq_ignore_ascii_case("exa") {
+                self.provider = default_search_provider();
+            }
+            self.auto_default_migrated = true;
+        }
+    }
+
     pub const PROVIDERS: &'static [&'static str] = &[
         "auto",
         "exa",
@@ -826,6 +838,7 @@ impl WebSearchConfig {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
+            auto_default_migrated: true,
             provider: default_search_provider(),
             api_key: None,
         }
@@ -2715,6 +2728,7 @@ impl Config {
         // Pricing support was retired after v5.0.7. Clean only those known
         // legacy tables; keep startup readable when the file is read-only.
         let _ = crate::store::ConfigStore::new(path).remove_legacy_pricing();
+        let _ = crate::store::ConfigStore::new(path).migrate_web_search_default();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         Self::parse_disk_content_tolerant(&content, path)
@@ -2726,6 +2740,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         migrate_legacy_coding_round_default(&mut config);
+        config.web_search.migrate_auto_default();
         apply_env_overrides(&mut config);
         Ok(config)
     }
@@ -2766,6 +2781,7 @@ impl Config {
         config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
         migrate_legacy_coding_round_default(&mut config);
+        config.web_search.migrate_auto_default();
         apply_env_overrides(&mut config);
         if config
             .quarantined_providers

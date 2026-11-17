@@ -175,6 +175,7 @@ fn write_search_provider(path: &std::path::Path, provider: Option<&str>) -> Resu
     }
     atomcode_config::ConfigStore::new(path.to_owned())
         .update_document(|document| {
+            document["web_search"]["auto_default_migrated"] = toml_edit::value(true);
             if let Some(provider) = provider {
                 document["web_search"]["provider"] = toml_edit::value(provider);
             } else if let Some(table) = document
@@ -408,6 +409,27 @@ fn applies_of(policy: atomcode_config::settings::ApplyPolicy) -> Applies {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selecting_exa_before_the_first_read_is_an_explicit_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[web_search]\nprovider = 'exa'\n").unwrap();
+        let port = super::ConfigSettings::new(path.clone());
+        port.set(SEARCH_PROVIDER, "exa").unwrap();
+        let config = atomcode_config::Config::load(&path).unwrap();
+        assert_eq!(config.web_search.provider, "exa");
+        assert!(config.web_search.auto_default_migrated);
+        assert_eq!(
+            port.rows()
+                .rows()
+                .iter()
+                .find(|r| r.id == SEARCH_PROVIDER)
+                .unwrap()
+                .value,
+            "exa"
+        );
+    }
+
     #[test]
     fn web_search_selector_defaults_to_auto_and_preserves_credentials_when_reset() {
         let dir = tempfile::tempdir().unwrap();

@@ -20,8 +20,12 @@
 
 验证不调用真实公网搜索消耗配额；实际网络可达性和各上游匿名额度不由单元测试保证。不更改发布版本，不自动提交推送。
 
-实施结果：五个协议适配、自动路由、配置默认值和 /config 选择器均已完成。保留固定 Exa/DDG 和已有 Exa Key 的兼容语义；已有显式 `provider = "exa"` 的配置不会被偷偷改成 auto。
+初次实施结果：五个协议适配、自动路由、配置默认值和 /config 选择器均已完成。保留固定 Exa/DDG 和已有 Exa Key 的兼容语义。初次提交保留旧配置的显式 Exa，后续经用户明确授权按下述规则迁移。
 
 验证记录：capabilities/config/harness/CLI 的 3435 项库测试通过（7 项跳过）；coding mount_wiring 的 18 项测试通过，包括凭据不进入配置树、搜索默认值和项目覆盖；最终搜索专项 23 项通过，覆盖无 Key/带 Key 协议、TinyFish 握手、限流冷却、故障切换、超时取消、脱敏、响应限制和固定后端。未做真实公网额度/可达性验证。
 
 完整编译门最终通过（含两种 canary 自检）；格式与 diff 检查通过，Cargo.lock 无改动且无禁止的三个 package。首轮门在并行构建/修改期间最后一次自检未通过；随后独立 workspace 编译成功，再跑完整门全部通过，不将首轮失败计作通过。
+
+后续默认值迁移：用户明确要求旧 Exa 配置也改成 auto。配置读取将未带 `auto_default_migrated` 标记的 Exa 改为 auto，并通过 ConfigStore 的文件锁与原子文档替换保存标记；其他后端不改。严格/容错解析均有内存迁移，保证只读文件仍使用 auto，不将迁移写入失败变成启动失败。/config 显式保存同时写标记，用户之后选择 Exa 不会再被覆盖。迁移保留 Key、未知字段、注释；环境变量覆盖保持现有优先级。测试覆盖重复读取、后续固定 Exa、其他后端、无法写盘时的解析回退，以及未先读取就直接 /config 选择 Exa。
+
+迁移验证：配置库与 CLI settings 共 377 项测试通过；最后补充的写盘失败路径包含在另跑的两项迁移专项中，均通过。完整编译门重跑通过，格式与 diff 检查通过。首轮编译曾因并行门删除 `__feature_gate_canary.rs` 报文件不存在，不计为通过。日志：`/tmp/atomcode-search-migration-tests.log`、`/tmp/atomcode-search-migration-fallback.log`、`/tmp/atomcode-search-migration-compile-final.log`。
