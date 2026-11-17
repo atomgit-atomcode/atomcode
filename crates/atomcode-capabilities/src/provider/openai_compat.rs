@@ -750,6 +750,12 @@ impl LlmProvider for OpenAiCompatProvider {
         self.cfg.effort_levels.clone()
     }
 
+    /// The same policy `format_messages` encodes with: only `Exclude` drops every
+    /// prior turn's thinking.
+    fn replays_reasoning(&self) -> bool {
+        self.policy != ReasoningPolicy::Exclude
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         // One-shot: the kernel binds exactly once at spawn. Ignore a redundant
         // re-bind (OnceLock keeps the first value) rather than panicking.
@@ -4137,6 +4143,30 @@ mod tests {
         assert!(
             !s.contains("data:image"),
             "no image_url bytes may leak: {s:?}"
+        );
+    }
+
+    /// The size estimate must count prior thinking exactly where the encoder
+    /// sends it: a model whose policy drops it would otherwise look several
+    /// times larger than it is and be compacted at a fraction of its window.
+    #[test]
+    fn replays_reasoning_follows_the_reasoning_policy() {
+        let provider = |model: &str| {
+            OpenAiCompatProvider::new(OpenAiCompatConfig::new(
+                "k",
+                "https://example.invalid/v1",
+                model,
+            ))
+            .unwrap()
+        };
+        assert!(!provider("lumen-alpha").replays_reasoning(), "Exclude");
+        assert!(provider("deepseek-v4-flash").replays_reasoning(), "Include");
+        assert!(provider("glm-5.2").replays_reasoning(), "Preserve");
+        let mut cfg = OpenAiCompatConfig::new("k", "https://example.invalid/v1", "glm-5.2");
+        cfg.reasoning_policy = Some(ReasoningPolicy::Exclude);
+        assert!(
+            !OpenAiCompatProvider::new(cfg).unwrap().replays_reasoning(),
+            "override"
         );
     }
 

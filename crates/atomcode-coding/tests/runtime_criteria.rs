@@ -6088,10 +6088,13 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
     // A 128k window keeps about 32k tokens of recent turns; each prompt is ~10k.
     recorder.window.store(128_000, Ordering::SeqCst);
     recorder.prompt_tokens.store(104_000, Ordering::SeqCst);
-    let mut runtime =
-        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
-            .await
-            .unwrap();
+    // Every answer reports 104k however much was cut, so each next request
+    // measures 104k plus a ~10k prompt. A short completion keeps that inside the
+    // window; the default 16k would leave no room, and the pre-send guard —
+    // not the summary threshold under test — would act first.
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.chat_options.max_tokens = Some(1_024);
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
     let id = runtime.session.clone().unwrap().id;
 
     for n in 0..6 {

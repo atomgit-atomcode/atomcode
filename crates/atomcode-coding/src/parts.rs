@@ -1414,6 +1414,9 @@ impl LlmProvider for SlotProvider {
             .map(|p| p.effort_levels())
             .unwrap_or_default()
     }
+    fn replays_reasoning(&self) -> bool {
+        self.current().is_none_or(|p| p.replays_reasoning())
+    }
     async fn chat_stream(
         &self,
         messages: &[Message],

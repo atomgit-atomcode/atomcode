@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use atomcode_kernel::message::Message;
 
@@ -40,6 +40,81 @@ pub struct SessionLog {
     turn: AtomicU64,
     /// What stamps a record with when it was committed.
     clock: Arc<dyn atomcode_kernel::clock::WallClock>,
+    /// The last request's size as the provider measured it, beside this side's
+    /// estimate of the same request. Not a fact: nothing model-visible, and a
+    /// resumed log simply starts without one.
+    prompt_anchor: Mutex<Option<PromptAnchor>>,
+}
+
+/// One request sized twice: by the provider (`measured`) and by the local
+/// byte estimate (`estimated`), as sent through one `provider`.
+///
+/// While the history only grows, the next request is that one plus what was
+/// appended since, so `measured + (estimate now − estimated)` sizes it with only
+/// the appended part estimated. The estimate's error — CJK and JSON
+/// undercounted, thinking the adapter drops overcounted, the system prompt and
+/// tool schemas not counted at all — then stays with the measurement instead of
+/// compounding over hundreds of rounds.
+///
+/// Only while it only grows: once a compaction, a stub, a rewrite or an undo
+/// takes something out, what left is priced at the estimate's error, not the
+/// provider's — a thinking-heavy history overcounted 2× would project its
+/// remainder at nothing. [`SessionLog::prompt_anchor`] stops answering then,
+/// until the next measured request sets a new one.
+#[derive(Clone, Debug)]
+pub struct PromptAnchor {
+    /// The adapter the request went through. Weak, so a swapped-out provider's
+    /// address is never reused for another while this compares against it: a
+    /// new provider — another account, protocol or reasoning policy for the
+    /// same model name — is a new wire format and is not projected.
+    pub provider: std::sync::Weak<dyn atomcode_kernel::provider::LlmProvider>,
+    pub measured: u64,
+    pub estimated: u64,
+    /// The last fact in the log when the measured request was assembled.
+    pub through: SeqNo,
+}
+
+/// A request size projected from a [`PromptAnchor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Projection {
+    /// Measured plus the estimated change.
+    pub size: u64,
+    /// The part of `size` only estimated — what an error margin is for.
+    pub unmeasured: u64,
+}
+
+impl PromptAnchor {
+    /// The size of a request through `provider` that estimates at
+    /// `estimated`, or `None` when this anchor was measured through another.
+    pub fn project(
+        &self,
+        provider: &Arc<dyn atomcode_kernel::provider::LlmProvider>,
+        estimated: u64,
+    ) -> Option<Projection> {
+        if !std::ptr::addr_eq(self.provider.as_ptr(), Arc::as_ptr(provider)) {
+            return None;
+        }
+        Some(Projection {
+            size: self
+                .measured
+                .saturating_add(estimated)
+                .saturating_sub(self.estimated),
+            unmeasured: estimated.saturating_sub(self.estimated),
+        })
+    }
+}
+
+/// Whether `event` takes something out of what the model is shown, rather
+/// than adding to it.
+fn removes_history(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::Compacted { .. }
+            | SessionEvent::ToolResultsStubbed { .. }
+            | SessionEvent::MessagesRewritten { .. }
+            | SessionEvent::Rewound { .. }
+            | SessionEvent::Interrupted { undone: true, .. }
+    )
 }
 
 impl SessionLog {
@@ -62,7 +137,32 @@ impl SessionLog {
             next_seq: AtomicU64::new(1),
             turn: AtomicU64::new(0),
             clock,
+            prompt_anchor: Mutex::new(None),
         }
+    }
+
+    /// The last measured request, while everything since only added to the
+    /// history. See [`PromptAnchor`].
+    pub fn prompt_anchor(&self) -> Option<PromptAnchor> {
+        let anchor = self
+            .prompt_anchor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        let removed = self
+            .events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .take_while(|logged| logged.seq > anchor.through)
+            .any(|logged| removes_history(&logged.event));
+        (!removed).then_some(anchor)
+    }
+
+    /// Replace the anchor; `None` forgets it, after which a size is estimated whole.
+    pub fn set_prompt_anchor(&self, anchor: Option<PromptAnchor>) {
+        *self.prompt_anchor.lock().unwrap_or_else(|p| p.into_inner()) = anchor;
     }
 
     pub fn id(&self) -> &str {
@@ -482,5 +582,87 @@ impl SessionProjections {
             .keys()
             .copied()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod prompt_anchor_tests {
+    use super::*;
+    use atomcode_kernel::provider::{ChatOptions, LlmProvider};
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    use atomcode_kernel::tool::ToolDef;
+    use futures::stream::BoxStream;
+
+    struct Named;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Named {
+        fn model_name(&self) -> &str {
+            "m"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolDef],
+            _: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            unreachable!("never sent")
+        }
+    }
+
+    fn provider() -> Arc<dyn LlmProvider> {
+        Arc::new(Named)
+    }
+
+    fn anchor(through: &Arc<dyn LlmProvider>, seq: SeqNo) -> PromptAnchor {
+        PromptAnchor {
+            provider: Arc::downgrade(through),
+            measured: 400_000,
+            estimated: 850_000,
+            through: seq,
+        }
+    }
+
+    #[test]
+    fn only_what_was_appended_since_the_measurement_is_estimated() {
+        let p = provider();
+        assert_eq!(
+            anchor(&p, 0).project(&p, 852_000),
+            Some(Projection {
+                size: 402_000,
+                unmeasured: 2_000
+            })
+        );
+    }
+
+    /// Same model name, another adapter: another account, protocol or
+    /// reasoning policy encodes the same history differently.
+    #[test]
+    fn another_provider_is_not_projected() {
+        let (p, q) = (provider(), provider());
+        assert_eq!(anchor(&p, 0).project(&q, 852_000), None);
+    }
+
+    /// The estimate overcounted this history 2×; pricing what a compaction
+    /// removed at that rate would project the remainder at nothing.
+    #[test]
+    fn a_history_something_was_taken_out_of_is_not_projected() {
+        let log = SessionLog::new("s");
+        let p = provider();
+        let through = log.last_seq();
+        log.set_prompt_anchor(Some(anchor(&p, through)));
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "more".into(),
+            images: vec![],
+        });
+        assert!(log.prompt_anchor().is_some(), "an append keeps the anchor");
+        log.append(SessionEvent::Compacted {
+            turn: 1,
+            through: 1,
+            summary: "s".into(),
+            from: 0,
+        });
+        assert!(log.prompt_anchor().is_none(), "a compaction ends it");
     }
 }

@@ -125,6 +125,9 @@ impl LlmProvider for ModelDefaultsProvider {
     fn effort_levels(&self) -> Vec<String> {
         self.inner.effort_levels()
     }
+    fn replays_reasoning(&self) -> bool {
+        self.inner.replays_reasoning()
+    }
     fn bind_session_id(&self, id: &str) {
         self.inner.bind_session_id(id);
     }

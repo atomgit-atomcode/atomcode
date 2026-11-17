@@ -189,6 +189,11 @@ impl LlmProvider for OllamaProvider {
         self.cfg.effort_levels.clone()
     }
 
+    /// Prior thinking is never put back into a request message.
+    fn replays_reasoning(&self) -> bool {
+        false
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         let _ = self.session_id.set(session_id.to_string());
     }

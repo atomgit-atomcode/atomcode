@@ -405,6 +405,16 @@ impl Message {
     /// reporting provider records utilization 0.0 forever and never compacts).
     /// Mirrors the legacy estimate heuristic (see `atomcode-coding`'s telemetry copy).
     pub fn estimate_tokens(&self) -> u32 {
+        self.estimate_wire_tokens(true)
+    }
+
+    /// [`estimate_tokens`](Self::estimate_tokens) for an adapter that does or does
+    /// not send prior `reasoning` back ([`LlmProvider::replays_reasoning`]). Counting
+    /// thinking that never reaches the wire is the larger error of the two: a
+    /// thinking-heavy history carries more reasoning than everything else combined.
+    ///
+    /// [`LlmProvider::replays_reasoning`]: crate::provider::LlmProvider::replays_reasoning
+    pub fn estimate_wire_tokens(&self, replays_reasoning: bool) -> u32 {
         // Images dominate when present (vision ≈ 1600 tok each).
         if !self.images.is_empty() {
             return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
@@ -417,7 +427,12 @@ impl Message {
                 .iter()
                 .map(|tc| tc.name.len() + tc.arguments.len() + 20)
                 .sum();
-            self.text.len() + calls + self.reasoning.as_ref().map_or(0, |r| r.len())
+            let reasoning = self
+                .reasoning
+                .as_ref()
+                .filter(|_| replays_reasoning)
+                .map_or(0, |r| r.len());
+            self.text.len() + calls + reasoning
         } else {
             self.text.len()
         };
@@ -1149,6 +1164,28 @@ impl SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_the_adapter_drops_is_not_counted() {
+        let mut m = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "c".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        m.reasoning = Some("t".repeat(40_000));
+        let replayed = m.estimate_wire_tokens(true);
+        let dropped = m.estimate_wire_tokens(false);
+        assert!(replayed >= 10_000, "{replayed}");
+        assert!(dropped < 20, "{dropped}");
+        assert_eq!(
+            m.estimate_tokens(),
+            replayed,
+            "the plain estimate stays conservative"
+        );
+    }
 
     fn img(bytes: usize) -> ImageContent {
         ImageContent {

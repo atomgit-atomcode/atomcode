@@ -204,6 +204,7 @@ mod tests {
             os_home: std::path::PathBuf::from("/home/u"),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new("/home/u/.ours", ".ours"),
+            skill_dirs: Vec::new(),
         };
         let report = scan(&[], &ctx);
         assert!(report.sources.is_empty());
@@ -442,6 +443,23 @@ pub struct ScanContext {
     /// `ProductDirs` lives in this crate (`product_dirs.rs`), so carrying it
     /// costs no new dependency.
     pub product: crate::ProductDirs,
+    /// The skill directories the runtime ACTUALLY uses, in the same LOW→HIGH
+    /// order.
+    ///
+    /// **The host resolves these**, because only the host knows the user's
+    /// configured `extra_skill_dirs` (`coding/src/parts.rs:558`
+    /// `resolve_skill_dirs_at` expands `~`, makes relative paths
+    /// project-relative, and puts the extras FIRST — before the standard
+    /// list).
+    ///
+    /// The capability cannot recompute them: `standard_skill_dirs` alone
+    /// would miss the configured roots, and the registry could then pick a
+    /// DIFFERENT winner for a same-named skill than the runtime does — while
+    /// the report claimed to be saying "the way the runtime does".
+    ///
+    /// **Empty means "the standard list"** — the host passes the real list
+    /// in production, and an empty list keeps the fixtures honest.
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 /// One external agent's assets.
@@ -718,7 +736,7 @@ pub struct ProviderAccountDraft {
 - [ ] **Step 6: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
-Expected: PASS —— 3 tests。
+Expected: PASS —— Task 1 的三条（报告计数 / 空报告 / 无来源扫描）。
 
 - [ ] **Step 7: 提交**
 
@@ -758,7 +776,9 @@ mod tests {
             os_home: home.to_path_buf(),
             project: project.to_path_buf(),
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         }
+        skill_dirs: Vec::new(),
     }
 
     fn skill_at(root: &std::path::Path, name: &str) {
@@ -1181,15 +1201,19 @@ impl MigrationSource for ClaudeSource {
         }
         let global_state = ctx.os_home.join(".claude.json");
         if global_state.is_file() {
-            match mcp_server_count(&global_state) {
-                Ok(count) if count > 0 => out.push(AssetReport {
+            // The same helper as the project's file — one parse, and the
+            // counts come from the loader.
+            match mcp_servers(&global_state) {
+                // The definitions can be brought over, so the count is the
+                // TOTAL: a disabled server is still a definition to move.
+                Ok(counts) if counts.total > 0 => out.push(AssetReport {
                     kind: AssetKind::McpServers,
                     name: "mcpServers".into(),
                     path: global_state,
                     scope: AssetScope::User,
                     status: AssetStatus::Actionable,
                     detail: super::text::mcp_copyable(
-                        count,
+                        counts.total,
                         &ctx.product.user().join("mcp.json"),
                     ),
                 }),
@@ -1609,6 +1633,9 @@ pub fn provider_name_unusable(name: &str) -> String {
 pub fn provider_protocol_unsupported(protocol: &str) -> String {
     t(Msg::MigrationProviderProtocolUnsupported { protocol }).into_owned()
 }
+pub fn provider_nothing_to_connect_to() -> String {
+    t(Msg::MigrationProviderNothingToConnectTo).into_owned()
+}
 ```
 
 **技能那部分的两个助手也放这里**（`claude.rs` 自己的文件里）—— Task 1 的
@@ -1680,7 +1707,9 @@ fn collect_skill_rows(
     if depth > max_depth {
         out.push(AssetReport {
             kind,
-            name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            // The name matches the PATH this row reports (`dir`), not the
+            // skills root it was found under.
+            name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
             path: dir.to_path_buf(),
             scope,
             status: AssetStatus::Blocked,
@@ -1695,7 +1724,7 @@ fn collect_skill_rows(
         Err(error) => {
             out.push(AssetReport {
                 kind,
-                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 path: dir.to_path_buf(),
                 scope,
                 status: AssetStatus::Blocked,
@@ -1707,7 +1736,7 @@ fn collect_skill_rows(
     if !ancestors.insert(identity.clone()) {
         out.push(AssetReport {
             kind,
-            name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
             path: dir.to_path_buf(),
             scope,
             status: AssetStatus::Blocked,
@@ -1720,7 +1749,7 @@ fn collect_skill_rows(
         Err(error) => {
             out.push(AssetReport {
                 kind,
-                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 path: dir.to_path_buf(),
                 scope,
                 status: AssetStatus::Blocked,
@@ -1738,7 +1767,7 @@ fn collect_skill_rows(
             Ok(entry) => paths.push(entry.path()),
             Err(error) => out.push(AssetReport {
                 kind,
-                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 path: dir.to_path_buf(),
                 scope,
                 status: AssetStatus::Blocked,
@@ -1844,12 +1873,22 @@ struct SkillTruth {
 impl SkillTruth {
     /// Load the registry the way the runtime does.
     fn load(ctx: &ScanContext) -> Self {
-        let roots = crate::skills::SkillRoots {
-            home: &ctx.os_home,
-            project: &ctx.project,
-            dirs: &ctx.product,
+        // **The host's list**, not `standard_skill_dirs` — the runtime puts
+        // the user's configured `extra_skill_dirs` FIRST, and a skill there
+        // can win a same-name collision. Recomputing the standard list here
+        // would make the report pick a different winner than the runtime.
+        //
+        // An empty list means "the standard list" — the host passes the real
+        // list in production, and the fixtures use the default.
+        let dirs = if ctx.skill_dirs.is_empty() {
+            crate::skills::standard_skill_dirs(crate::skills::SkillRoots {
+                home: &ctx.os_home,
+                project: &ctx.project,
+                dirs: &ctx.product,
+            })
+        } else {
+            ctx.skill_dirs.clone()
         };
-        let dirs = crate::skills::standard_skill_dirs(roots);
         let registry = crate::skills::SkillRegistry::load_with_explicit(&dirs, &[]);
         // **Both** maps: `all()` is the SKILLS map, and the flat command
         // templates live in a separate one (`slash_commands()`,
@@ -1914,8 +1953,9 @@ impl SkillTruth {
 }
 ```
 
-（`claude.rs` 顶部还要加 `use super::{SkillTruth, skill_rows};` —— 子模块**不会**
-自动拿到父模块的名字，必须显式 `use`。）
+（`SkillTruth` 与 `skill_rows` 现在就**定义在 `claude.rs` 里**（上面那段代码），
+所以 `claude.rs` **不需要** `use super::{SkillTruth, skill_rows};` —— 父模块里
+已经没有这两个名字了，那条 import 会编译不过。）
 
 > `provider_copyable` 放在**这里**而不是 Task 3：Task 2 的 Claude 扫描已经要报
 > provider 那一行，而 Task 2 必须能**单独编译并通过**（阶段 P2 的验收就是
@@ -1976,6 +2016,7 @@ impl SkillTruth {
     MigrationProviderProtocolUnsupported {
         protocol: &'a str,
     },
+    MigrationProviderNothingToConnectTo,
     MigrationAgentsBlocked,
     MigrationPluginsBlocked,
     MigrationSessionsBlocked {
@@ -2044,6 +2085,10 @@ impl SkillTruth {
             format!("This endpoint speaks {protocol}, which we do not support — not imported")
                 .into()
         }
+        Msg::MigrationProviderNothingToConnectTo => {
+            "This provider names no endpoint and no credential — there is nothing to connect to"
+                .into()
+        }
         Msg::MigrationAgentsBlocked => {
             "Our role files need `permission` and `difficulty` frontmatter, which these do not \
              have — not migrated"
@@ -2105,6 +2150,9 @@ impl SkillTruth {
         Msg::MigrationProviderProtocolUnsupported { protocol } => {
             format!("这个端点说的是 {protocol}，我们不支持 —— 未导入").into()
         }
+        Msg::MigrationProviderNothingToConnectTo => {
+            "这个 provider 没有写端点也没有写凭据 —— 没有可连接的对象".into()
+        }
         Msg::MigrationAgentsBlocked => {
             "我们的角色文件需要 permission 与 difficulty 前置元数据，Claude 的 subagent 文件没有 \
              —— 未迁移"
@@ -2119,7 +2167,7 @@ impl SkillTruth {
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::claude`
-Expected: PASS —— 7 tests。
+Expected: PASS —— 本 Task 定义的全部 `migration::claude` 判据（指令 / 技能 / 权限 / MCP / hooks / subagent / provider 各若干，**以实际条数为准**，关键是全绿）。
 
 - [ ] **Step 6: 跑 i18n 编译检查**
 
@@ -2163,7 +2211,9 @@ mod tests {
             os_home: home.to_path_buf(),
             project: project.to_path_buf(),
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         }
+        skill_dirs: Vec::new(),
     }
 
     /// Write a file, creating its parent directory first.
@@ -2508,7 +2558,19 @@ fn mcp_server_count(value: &toml::Value) -> Option<usize> {
 fn session_file_count(sessions: &Path) -> Result<usize, String> {
     let mut count = 0usize;
     let mut stack = vec![sessions.to_path_buf()];
+    // **The visited set stops a symlink cycle.** `is_dir()` follows links, so
+    // a directory that links back to an ancestor would be walked forever and
+    // the read-only report would never finish.
+    let mut visited: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     while let Some(dir) = stack.pop() {
+        let identity = match std::fs::canonicalize(&dir) {
+            Ok(path) => path,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !visited.insert(identity) {
+            continue;
+        }
         let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -2576,7 +2638,7 @@ pub fn unreadable_config() -> String {
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
-Expected: PASS —— 12 tests（3 + 7 + 5 中的 claude/codex 部分；数字以实际为准，关键是全绿）。
+Expected: PASS —— 本 Task 定义的 claude / codex 判据全部通过（**以实际条数为准**）。
 
 - [ ] **Step 6: 提交**
 
@@ -2736,6 +2798,15 @@ fn same_account(
     models: &std::collections::HashMap<String, atomcode_config::config::ModelProfileConfig>,
     draft: &ProviderAccountDraft,
 ) -> bool {
+    // **A blocked draft is never "already imported".** A blocked draft is one
+    // we REFUSE to import — an unsupported protocol, a name that cannot
+    // become an account id, a definition with nothing to connect to. If our
+    // config happened to contain a matching entry (someone made it by hand),
+    // the row must stay `Blocked`: the re-check must not turn "we will not
+    // import this" into "this is done".
+    if draft.blocked.is_some() {
+        return false;
+    }
     // Both sides are the STORED form: the account's `base_url` is `None`
     // when it follows the protocol's default, and the draft's is `None` for
     // the same reason (`effective_endpoint`).
@@ -2782,7 +2853,9 @@ pub fn scan_context(
         os_home: os_home.to_path_buf(),
         project: project.to_path_buf(),
         product,
+        skill_dirs: Vec::new(),
     }
+    skill_dirs: Vec::new(),
 }
 
 #[cfg(test)]
@@ -2884,6 +2957,7 @@ mod tests {
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -2926,6 +3000,7 @@ mod tests {
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -3047,7 +3122,7 @@ pub mod import_cmd;
 - [ ] **Step 6: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd`
-Expected: PASS —— 3 tests。
+Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数为准**）。
 
 - [ ] **Step 7: 加 CLI 子命令**
 
@@ -3175,7 +3250,7 @@ Expected: PASS + 退出 0。
 - [ ] **Step 9: 提交**
 
 ```bash
-git add crates/atomcode-cli/src/import_cmd.rs crates/atomcode-cli/src/main.rs crates/atomcode-cli/src/lib.rs crates/atomcode-cli/Cargo.toml
+git add crates/atomcode-cli/src/import_cmd.rs crates/atomcode-cli/src/main.rs crates/atomcode-cli/src/lib.rs crates/atomcode-cli/Cargo.toml crates/atomcode-i18n/src/product/
 git commit -m "feat(cli): add atomcode import, a read-only asset report
 
 Prints what another agent left behind and where each item stands: read
@@ -3462,6 +3537,7 @@ impl Migration for DiskMigration {
             os_home: self.home.clone(),
             project: self.project.clone(),
             product: self.product.clone(),
+            skill_dirs: Vec::new(),
         };
         let sources = atomcode_capabilities::migration::builtin_sources();
         let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
@@ -3597,10 +3673,55 @@ impl Migration for DiskMigration {
     }
 ```
 
+**还要一条判据，证明 `/import` 真的注册了、而且真的能跑** —— 上面两条只测渲染
+函数：命令没进行清单、或者端口取不到，它们照样通过。
+
+在 `crates/atomcode-tui/tests/e2e.rs` 加（那里已经有 `launch::Ports` 的构造点与
+一个假的服务实现，照抄形状）：
+
+```rust
+/// The `/import` command is REGISTERED (it is in the command inventory) and
+/// it RUNS (it reaches the port and renders what the host said).
+#[tokio::test]
+async fn the_import_command_is_registered_and_renders_the_host_report() {
+    let mut app = /* the e2e harness this file already builds */;
+    // A host that answers with one known row.
+    app.provide_migration(FakeMigration {
+        report: atomcode_tui::migration::MigrationReportView {
+            sources: vec![atomcode_tui::migration::MigrationSourceView {
+                source_id: "claude-code".into(),
+                display_name: "Claude Code".into(),
+                assets: vec![atomcode_tui::migration::MigrationAssetView {
+                    name: "web-access".into(),
+                    status: atomcode_tui::migration::AssetStatusView::Active,
+                    detail: "Read directly".into(),
+                }],
+            }],
+        },
+    });
+
+    // It is REGISTERED: the command is in the inventory.
+    let commands = app.command_names();
+    assert!(
+        commands.iter().any(|name| name == "/import"),
+        "/import is not registered: {commands:?}"
+    );
+
+    // It RUNS: the port is reached and its report is rendered.
+    let outcome = app.run_command("/import", "").await;
+    let said = outcome.said_text();
+    assert!(said.contains("Claude Code"), "{said}");
+    assert!(said.contains("web-access"), "{said}");
+}
+```
+
+> 判据的**名字**里有 `import`，所以 `cargo nextest run -p atomcode-tui import`
+> 这一条过滤能同时跑到它与渲染那两条。
+
 - [ ] **Step 9: 跑测试**
 
 Run: `cargo nextest run -p atomcode-tui import`
-Expected: PASS —— 2 tests。
+Expected: PASS —— 3 tests（两条渲染 + 一条注册与执行）。
 
 Run: `cargo check -p atomcode-cli`
 Expected: 退出 0。
@@ -3608,7 +3729,7 @@ Expected: 退出 0。
 - [ ] **Step 10: 提交**
 
 ```bash
-git add crates/atomcode-tui/src/migration.rs crates/atomcode-tui/src/commands.rs crates/atomcode-tui/src/lib.rs crates/atomcode-tui/src/plugin.rs crates/atomcode-tui/src/launch.rs crates/atomcode-cli/src/tui_migration.rs crates/atomcode-cli/src/lib.rs crates/atomcode-i18n/src/screen/
+git add crates/atomcode-tui/src/migration.rs crates/atomcode-tui/src/commands.rs crates/atomcode-tui/src/lib.rs crates/atomcode-tui/src/plugin.rs crates/atomcode-tui/src/launch.rs crates/atomcode-tui/src/rows.rs crates/atomcode-tui/tests/language.rs crates/atomcode-tui/tests/e2e.rs crates/atomcode-cli/src/tui_migration.rs crates/atomcode-cli/src/lib.rs crates/atomcode-i18n/src/screen/
 git commit -m "feat(tui): add /import, another agent's assets on screen
 
 The screen asks the host for the report and lays it out; the host owns the
@@ -3701,6 +3822,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
@@ -3727,6 +3849,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
@@ -3745,6 +3868,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(
@@ -3769,6 +3893,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
 
         // The row comes from the draft, so the row's NAME is the account id —
@@ -3793,6 +3918,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert!(drafts.is_empty());
@@ -3832,6 +3958,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         let draft = drafts
@@ -3884,6 +4011,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         let first = drafts.iter().find(|d| d.id == "first").expect("first exists");
@@ -4065,6 +4193,7 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
             models: Vec::new(),
             source_path: ctx.os_home.join(".claude").join("settings.json"),
             scope: AssetScope::User,
+            blocked: None,
         }]
     }
 ```
@@ -4124,22 +4253,16 @@ Claude 这一侧需要。
                     "codex",
                     provider.get("wire_api").and_then(|v| v.as_str()),
                 );
-                // **Whether the definition is usable at all** is decided
-                // BEFORE normalization, and the filter happens BEFORE the
-                // draft is built. Normalizing can turn a valid definition
-                // into an empty-looking one — a provider that uses the
-                // Responses default endpoint has its endpoint stored as
-                // `None`, so filtering on the NORMALIZED endpoint would
-                // drop it, taking its model and its report row with it.
-                // The provider EXISTS; it just follows the protocol's
-                // default.
+                // **Nothing is dropped here.** Every provider table the
+                // source declares becomes a row — a definition that cannot
+                // be imported is `Blocked` with the reason, not silence.
                 //
-                // A definition with neither an endpoint nor a credential is
-                // not an account at all — there is nothing to connect to.
-                let usable = base_url.is_some() || key.is_some();
-                if !usable {
-                    return None;
-                }
+                // Normalizing can turn a valid definition into an
+                // empty-looking one — a provider that uses the Responses
+                // default endpoint has its endpoint stored as `None` — so
+                // the decision is made on the RAW definition, never on the
+                // normalized one.
+                //
                 // A name that cannot become an account id at all is a real
                 // problem the person should see, not something to paper
                 // over with the raw name.
@@ -4148,8 +4271,13 @@ Claude 这一侧需要。
                 // write (`create_account` would silently downgrade it).
                 let blocked = if id.is_none() {
                     Some(super::text::provider_name_unusable(&name))
-                } else if super::provider::is_unsupported_protocol(&protocol) {
+                } else if super::is_unsupported_protocol(&protocol) {
                     Some(super::text::provider_protocol_unsupported(&protocol))
+                } else if base_url.is_none() && key.is_none() {
+                    // No endpoint and no credential: there is nothing to
+                    // connect to. It is still a definition the person wrote,
+                    // so it is reported — as blocked.
+                    Some(super::text::provider_nothing_to_connect_to())
                 } else {
                     None
                 };
@@ -4178,9 +4306,8 @@ Claude 这一侧需要。
                     // project's config is not the person's own provider.
                     scope,
                     blocked,
-                }
+                })
             })
-            .flatten()
             .collect();
 
         // A model with NO named provider needs no special handling here: the
@@ -4348,6 +4475,7 @@ host can ask about that single item before writing it."
             models: vec!["gpt-x".into()],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         };
         let written =
             super::write_account(&config, &draft, true).expect("the account is written");
@@ -4378,6 +4506,7 @@ host can ask about that single item before writing it."
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         };
         let error = super::write_account(&config, &draft, true)
             .expect_err("a key with a dollar sign cannot be written");
@@ -4402,6 +4531,7 @@ host can ask about that single item before writing it."
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         };
         let error =
             super::write_account(&config, &draft, false).expect_err("a secret needs a yes");
@@ -4429,6 +4559,7 @@ host can ask about that single item before writing it."
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         };
         let error =
             super::write_account(&config, &draft, true).expect_err("the id is taken");
@@ -4477,7 +4608,9 @@ host can ask about that single item before writing it."
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
+            blocked: None,
         }
+        blocked: None,
     }
 
     fn ctx_for(dir: &std::path::Path) -> atomcode_capabilities::migration::ScanContext {
@@ -4485,7 +4618,9 @@ host can ask about that single item before writing it."
             os_home: dir.to_path_buf(),
             project: dir.to_path_buf(),
             product: atomcode_capabilities::ProductDirs::new(dir.join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
         }
+        skill_dirs: Vec::new(),
     }
 
     fn sources(
@@ -4807,6 +4942,14 @@ pub fn apply_provider_accounts(
     let mut already = Vec::new();
     let mut skipped = Vec::new();
     for draft in &drafts {
+        // A draft we REFUSE to import is refused FIRST — before the
+        // existing-account check. Otherwise a hand-made account that happens
+        // to match would be reported as "already there", and the real reason
+        // (we cannot import this) would never be said.
+        if let Some(reason) = &draft.blocked {
+            skipped.push(format!("{} ({reason})", draft.id));
+            continue;
+        }
         if let Some(account) = existing.provider_accounts.get(&draft.id) {
             if same_account(account, &existing.models, draft) {
                 already.push(draft.id.clone());
@@ -4829,7 +4972,7 @@ pub fn apply_provider_accounts(
                 skipped.push(draft.id.clone());
                 continue;
             }
-            ask_to_confirm(draft)?
+            ask_to_confirm(draft, config_path)?
         } else if yes {
             true
         } else {
@@ -4837,7 +4980,7 @@ pub fn apply_provider_accounts(
                 skipped.push(draft.id.clone());
                 continue;
             }
-            ask_to_confirm(draft)?
+            ask_to_confirm(draft, config_path)?
         };
         if !confirmed {
             skipped.push(draft.id.clone());
@@ -4875,7 +5018,7 @@ pub fn apply_provider_accounts(
 /// The question names the account, the endpoint, the protocol and the models,
 /// and says that the key is a literal found in the other agent's config — so
 /// the answer is about a specific thing, not a blanket yes.
-fn ask_to_confirm(draft: &ProviderAccountDraft) -> Result<bool, String> {
+fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bool, String> {
     use atomcode_i18n::product::{t, Msg};
     use std::io::Write;
     print!(
@@ -4883,8 +5026,24 @@ fn ask_to_confirm(draft: &ProviderAccountDraft) -> Result<bool, String> {
         t(Msg::MigrationImportConfirm {
             id: &draft.id,
             protocol: &draft.protocol,
-            endpoint: draft.base_url.as_deref().unwrap_or("-"),
+            // The endpoint IN USE — a protocol's own default is shown, not a
+            // dash, because that is the endpoint this account will talk to.
+            endpoint: &atomcode_capabilities::migration::provider::endpoint_in_use(
+                &draft.protocol,
+                draft.base_url.as_deref(),
+            )
+            .unwrap_or_else(|| "-".into()),
             models: &draft.models.join(", "),
+            // What will happen to the credential. For a literal it says the
+            // secret will be COPIED INTO the file, and names the file — the
+            // person is being asked to agree to that, not to "import the key
+            // found somewhere".
+            credential: &match &draft.api_key {
+                Some(ApiKeyRef::Plaintext(_)) => "plaintext".into(),
+                Some(ApiKeyRef::EnvVar(name)) => format!("env:{name}"),
+                None => "none".into(),
+            },
+            destination: &config_path.display().to_string(),
         })
     );
     std::io::stdout().flush().ok();
@@ -4985,6 +5144,12 @@ async fn run_import_command(
         protocol: &'a str,
         endpoint: &'a str,
         models: &'a str,
+        /// What will happen to the credential: `plaintext`, `env:NAME`, or
+        /// `none`. The prompt must say which — the person is agreeing to
+        /// copy a literal secret into a file, not to "import a key".
+        credential: &'a str,
+        /// The file the account will be written into.
+        destination: &'a str,
     },
 ```
 
@@ -5005,15 +5170,29 @@ async fn run_import_command(
             protocol,
             endpoint,
             models,
+            credential,
+            destination,
         } => {
             let models = if models.is_empty() {
                 String::new()
             } else {
                 format!(" with models {models}")
             };
+            // **The credential's fate is spelled out.** For a literal it
+            // says the secret is COPIED INTO the file, and names the file.
+            let credential = match credential.strip_prefix("plaintext") {
+                Some(_) => format!(
+                    " and copy its PLAINTEXT KEY into {destination}"
+                ),
+                None => match credential.strip_prefix("env:") {
+                    Some(name) => {
+                        format!(" and use the environment variable {name} (the secret stays put)")
+                    }
+                    None => String::new(),
+                },
+            };
             format!(
-                "Import account `{id}` ({protocol} -> {endpoint}){models} with the key found in the \
-                 other agent's config? [y/N] "
+                "Import account `{id}` ({protocol} -> {endpoint}){models}{credential}? [y/N] "
             )
             .into()
         }
@@ -5036,15 +5215,27 @@ async fn run_import_command(
             protocol,
             endpoint,
             models,
+            credential,
+            destination,
         } => {
             let models = if models.is_empty() {
                 String::new()
             } else {
                 format!("，模型 {models}")
             };
+            // **凭据的下场要说清楚。** 明文密钥要说明「会被**复制进**这个文件」，
+            // 并写出是哪个文件。
+            let credential = match credential.strip_prefix("plaintext") {
+                Some(_) => format!("，并把其中的**明文密钥**复制进 {destination}"),
+                None => match credential.strip_prefix("env:") {
+                    Some(name) => {
+                        format!("，并使用环境变量 {name}（密钥留在原地）")
+                    }
+                    None => String::new(),
+                },
+            };
             format!(
-                "要导入账号 `{id}`（{protocol} -> {endpoint}）{models}，并使用在另一个 Agent 的 \
-                 配置里找到的密钥吗？[y/N] "
+                "要导入账号 `{id}`（{protocol} -> {endpoint}）{models}{credential}吗？[y/N] "
             )
             .into()
         }
@@ -5055,7 +5246,7 @@ async fn run_import_command(
 - [ ] **Step 7: 跑测试**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd`
-Expected: PASS —— 6 tests。
+Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数为准**）。
 
 - [ ] **Step 8: 提交**
 
@@ -5136,6 +5327,10 @@ Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `C
 cargo build -p atomcode-cli
 BIN="$(pwd)/target/debug/atomcode"
 ```
+
+> 这一步**必须在下面每一条手工命令之前**：编译门与 nextest 都不保证
+> `target/debug/atomcode` 是刚链出来的（它们可能只跑了 check，或者命中了旧的
+> 增量产物）。手工验收要看的，就是**这个构建**的行为。
 
 **在临时目录里跑**，这样当前仓库的 `.codex/config.toml`（本仓库有 `AGENTS.md`，
 也可能有自己的配置）不会混进「隔离」的夹具里：

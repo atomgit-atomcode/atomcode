@@ -649,6 +649,9 @@ impl LlmProvider for MeteredProvider {
     fn effort_levels(&self) -> Vec<String> {
         self.inner.effort_levels()
     }
+    fn replays_reasoning(&self) -> bool {
+        self.inner.replays_reasoning()
+    }
     fn bind_session_id(&self, session_id: &str) {
         self.inner.bind_session_id(session_id);
     }

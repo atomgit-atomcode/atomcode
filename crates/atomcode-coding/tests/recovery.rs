@@ -490,6 +490,224 @@ async fn a_request_that_would_not_fit_is_compacted_before_it_is_sent() {
     );
 }
 
+/// Commit a tool result far larger than a 30k window, as a first turn leaves one.
+fn commit_a_large_result(app: &App) {
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::AssistantMessage {
+            turn,
+            round: 2,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "big".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        },
+    );
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::ToolResultLogged {
+            turn,
+            round: 2,
+            call_id: "big".into(),
+            content: "a line of a very large file\n".repeat(6_000),
+            is_error: false,
+            images: vec![],
+        },
+    );
+}
+
+/// The conversation's own provider.
+fn conversation_provider(app: &App) -> Arc<dyn atomcode_kernel::provider::LlmProvider> {
+    app.context()
+        .service::<atomcode_harness::seams::LlmSvc>()
+        .expect("an llm is mounted")
+}
+
+/// Anchor the history as it stands at `measured` tokens through `provider`.
+fn anchor_now(
+    app: &App,
+    provider: &Arc<dyn atomcode_kernel::provider::LlmProvider>,
+    measured: u64,
+) {
+    let log = app.context().only_session().unwrap();
+    let estimated = log
+        .derive_messages()
+        .iter()
+        .map(|m| u64::from(m.estimate_tokens()))
+        .sum();
+    log.set_prompt_anchor(Some(atomcode_harness::session::PromptAnchor {
+        provider: Arc::downgrade(provider),
+        measured,
+        estimated,
+        through: log.last_seq(),
+    }));
+}
+
+const REPLAY_30K: &str = "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\n\
+                          config = { context_window = 30000, script = [ { text = \"ok\" } ] }";
+
+/// The provider measured the history well inside the window; the byte estimate
+/// says otherwise. The measurement wins. Estimating a long session whole —
+/// thinking the adapter drops, CJK, JSON — compacted a 1M-window conversation at
+/// 40% of its window, four times in an hour.
+#[tokio::test]
+async fn a_request_the_provider_measured_as_fitting_is_not_compacted_on_an_estimate() {
+    let dir = scratch("overflow-anchored");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    run_turn(&app, "first").await.unwrap();
+    commit_a_large_result(&app);
+    anchor_now(&app, &conversation_provider(&app), 5_000);
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w > 100_000),
+        "a request that fits was compacted: {widest:?}"
+    );
+}
+
+/// A measurement is of one adapter's tokenizer and wire format; through
+/// another — even for a model of the same name — the history is sized whole.
+#[tokio::test]
+async fn a_measurement_through_another_provider_does_not_size_this_one() {
+    let dir = scratch("overflow-anchor-other-provider");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    run_turn(&app, "first").await.unwrap();
+    commit_a_large_result(&app);
+    let swapped_out: Arc<dyn atomcode_kernel::provider::LlmProvider> =
+        Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![]));
+    anchor_now(&app, &swapped_out, 5_000);
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w < 10_000),
+        "a request went out carrying the whole result: {widest:?}"
+    );
+}
+
+/// A measurement holds for a history that only grew. Once something is taken
+/// out, what is left would be priced at the estimate's own error — so the
+/// next request is sized whole, and this one is too large whole.
+#[tokio::test]
+async fn a_measurement_does_not_outlive_a_compaction() {
+    let dir = scratch("overflow-anchor-compacted");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    run_turn(&app, "first").await.unwrap();
+    commit_a_large_result(&app);
+    anchor_now(&app, &conversation_provider(&app), 5_000);
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::MessagesRewritten {
+            turn,
+            texts: Vec::new(),
+        },
+    );
+    assert!(
+        log.prompt_anchor().is_none(),
+        "a rewrite ends the measurement"
+    );
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = ctx.on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w < 10_000),
+        "a request went out carrying the whole result: {widest:?}"
+    );
+}
+
+/// Answers with the given prompt usage.
+struct Measured(u32);
+
+#[async_trait]
+impl Waterfall<AgentRequest> for Measured {
+    async fn handle(
+        &self,
+        _req: &mut ModelRequest,
+        _next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        Ok(ModelResponse {
+            text: "measured".into(),
+            usage: Some(atomcode_kernel::stream::TokenUsage {
+                prompt: self.0,
+                completion: 1,
+                cached: 0,
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_answered_request_is_remembered_at_the_size_the_provider_measured() {
+    let dir = scratch("overflow-anchor-recorded");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(Measured(1_234)), false);
+    run_turn(&app, "go").await.unwrap();
+
+    let log = app.context().only_session().unwrap();
+    let anchor = log.prompt_anchor().expect("a measured answer anchors");
+    assert!(
+        std::ptr::addr_eq(
+            anchor.provider.as_ptr(),
+            Arc::as_ptr(&conversation_provider(&app))
+        ),
+        "anchored to the provider that answered"
+    );
+    assert_eq!(anchor.measured, 1_234);
+    assert!(anchor.estimated > 0, "{anchor:?}");
+}
+
+/// A refusal proves the projection ran low, so the retries are sized whole.
+#[tokio::test]
+async fn a_refused_request_forgets_the_measurement() {
+    let dir = scratch("overflow-anchor-forgotten");
+    let app = start(tree(&dir, &[])).await;
+    run_turn(&app, "first").await.unwrap();
+    run_turn(&app, "second").await.unwrap();
+    anchor_now(&app, &conversation_provider(&app), 10);
+
+    let run = run_with(&app, 1, overflowing()).await;
+    assert_eq!(run.attempts, 2, "one overflow, one retry");
+    assert!(
+        app.context()
+            .only_session()
+            .unwrap()
+            .prompt_anchor()
+            .is_none(),
+        "an answer without usage must not restore the refuted anchor"
+    );
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn an_unshrinkable_preflight_overflow_stops_before_the_provider_and_keeps_history() {
     let dir = scratch("overflow-preserve-history");

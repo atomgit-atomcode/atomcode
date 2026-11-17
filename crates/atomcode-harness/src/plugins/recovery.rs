@@ -323,7 +323,7 @@ impl OverflowLadder {
                 } else {
                     "tool output reduced"
                 };
-                let before = estimate(&req.messages);
+                let before = self.projected(&req.messages);
                 crate::session::apply_compaction(&self.ctx, &session, decision);
                 super::loop_policy::reproject(req, &session);
                 notice(
@@ -331,7 +331,7 @@ impl OverflowLadder {
                     NoticeKind::OverflowCompacted,
                     format!(
                         "{what}; {action} ({before} → {} estimated tokens; step {}/{})",
-                        estimate(&req.messages),
+                        self.projected(&req.messages),
                         *attempt,
                         self.max_attempts
                     ),
@@ -385,7 +385,102 @@ impl OverflowLadder {
             .max_tokens
             .map(|n| n.to_string())
             .unwrap_or_else(|| "default".into());
-        format!("model={model}, context_window={window} tokens, usable_input={limit} tokens, max_output={output} tokens, estimated_messages={} tokens", estimate(&req.messages))
+        format!("model={model}, context_window={window} tokens, usable_input={limit} tokens, max_output={output} tokens, estimated_messages={} tokens", self.projected(&req.messages))
+    }
+
+    /// What `messages` will cost as a request: the last request as the provider
+    /// measured it plus what was appended since, estimated ([`PromptAnchor`]),
+    /// or the whole estimate when there is no measurement to build on. A whole
+    /// estimate counts prior thinking only where the adapter sends it back.
+    ///
+    /// [`PromptAnchor`]: crate::session::PromptAnchor
+    fn projected(&self, messages: &[Message]) -> u64 {
+        match self.sized(messages) {
+            Sized::Measured(projection) => projection.size,
+            Sized::Estimated(size) => size,
+        }
+    }
+
+    fn sized(&self, messages: &[Message]) -> Sized {
+        let provider = self.ctx.service::<LlmSvc>();
+        let estimated = estimate(messages, provider.as_deref());
+        let Some(provider) = provider else {
+            return Sized::Estimated(estimated);
+        };
+        crate::agent::scoped(&self.ctx)
+            .service::<SessionSvc>()
+            .and_then(|session| session.prompt_anchor())
+            .and_then(|anchor| anchor.project(&provider, estimated))
+            .map_or(Sized::Estimated(estimated), Sized::Measured)
+    }
+
+    /// Whether `req` is past what the model can take beside its completion.
+    /// The estimate's margin covers what was estimated: all of a whole
+    /// estimate ([`effective_input_limit`]), only the part appended since a
+    /// measurement ([`measured_input_limit`]).
+    ///
+    /// [`effective_input_limit`]: atomcode_kernel::agent::effective_input_limit
+    /// [`measured_input_limit`]: atomcode_kernel::agent::measured_input_limit
+    fn would_not_fit(&self, req: &ModelRequest, window: u32) -> bool {
+        let max_tokens = req.options.max_tokens;
+        let (size, limit) = match self.sized(&req.messages) {
+            Sized::Measured(projection) => (
+                projection.size,
+                atomcode_kernel::agent::measured_input_limit(
+                    window,
+                    max_tokens,
+                    projection.unmeasured,
+                ),
+            ),
+            Sized::Estimated(size) => (
+                size,
+                atomcode_kernel::agent::effective_input_limit(window, max_tokens),
+            ),
+        };
+        size >= u64::from(limit)
+    }
+
+    /// The log position a request about to be sent was assembled at: what a
+    /// measurement of it holds for, until something is taken out after it.
+    fn position(&self) -> Option<crate::session::SeqNo> {
+        crate::agent::scoped(&self.ctx)
+            .service::<SessionSvc>()
+            .map(|session| session.last_seq())
+    }
+
+    /// Remember what the provider measured the request it just answered at. A
+    /// response without usage keeps the previous anchor: what was appended
+    /// since it is still only estimated, which is what the anchor is for.
+    fn anchor(
+        &self,
+        req: &ModelRequest,
+        through: Option<crate::session::SeqNo>,
+        response: &ModelResponse,
+    ) {
+        let Some(usage) = response.usage.as_ref().filter(|usage| usage.prompt > 0) else {
+            return;
+        };
+        let (Some(session), Some(provider), Some(through)) = (
+            crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
+            self.ctx.service::<LlmSvc>(),
+            through,
+        ) else {
+            return;
+        };
+        session.set_prompt_anchor(Some(crate::session::PromptAnchor {
+            provider: Arc::downgrade(&provider),
+            measured: u64::from(usage.prompt),
+            estimated: estimate(&req.messages, Some(provider.as_ref())),
+            through,
+        }));
+    }
+
+    /// The provider just said the request did not fit, so whatever the anchor
+    /// projected ran low: size the retries by the whole estimate.
+    fn forget_anchor(&self) {
+        if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
+            session.set_prompt_anchor(None);
+        }
     }
 }
 
@@ -411,11 +506,9 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             .any(|m| m.role == atomcode_kernel::message::Role::Assistant);
         let mut diagnostic = None;
         if window > 0 && answered {
-            let limit =
-                atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
             let mut attempt = 0;
-            let before = estimate(&req.messages);
-            while estimate(&req.messages) >= u64::from(limit) {
+            let before = self.projected(&req.messages);
+            while self.would_not_fit(req, window) {
                 if let Err(why) = self
                     .shrink(
                         req,
@@ -439,9 +532,14 @@ impl Waterfall<AgentRequest> for OverflowLadder {
 
         let mut attempt = 0;
         loop {
+            let through = self.position();
             match next.run(req).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    self.anchor(req, through, &response);
+                    return Ok(response);
+                }
                 Err(error) if error.context_overflow => {
+                    self.forget_anchor();
                     if attempt < self.max_attempts {
                         if let Err(why) =
                             reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
@@ -468,10 +566,22 @@ impl Waterfall<AgentRequest> for OverflowLadder {
     }
 }
 
-fn estimate(messages: &[Message]) -> u64 {
+/// How a request was sized: from a measurement, or estimated whole.
+enum Sized {
+    Measured(crate::session::Projection),
+    Estimated(u64),
+}
+
+/// The byte estimate of `messages` as `provider` would send them: prior
+/// thinking counts only where the adapter puts it back on the wire.
+fn estimate(
+    messages: &[Message],
+    provider: Option<&dyn atomcode_kernel::provider::LlmProvider>,
+) -> u64 {
+    let replays_reasoning = provider.is_none_or(|p| p.replays_reasoning());
     messages
         .iter()
-        .map(|m| u64::from(m.estimate_tokens()))
+        .map(|m| u64::from(m.estimate_wire_tokens(replays_reasoning)))
         .sum()
 }
 
