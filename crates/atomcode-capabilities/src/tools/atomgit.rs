@@ -1074,7 +1074,7 @@ impl Tool for AtomgitPrTool {
             "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr close") {
                 Ok((o, r, n)) => match c.pr_close(&o, &r, n).await {
                     Ok(pr) => ok(format!("Closed {}", render_pr(&pr))),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 Err(e) => e,
             },
@@ -1105,21 +1105,21 @@ impl Tool for AtomgitPrTool {
             "comment_delete" => match (a.owner, a.repo, a.comment_id) {
                 (Some(o), Some(r), Some(id)) => match c.pr_comment_delete(&o, &r, id).await {
                     Ok(()) => ok(format!("Deleted comment {id}")),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 _ => err("atomgit_pr comment_delete: owner, repo and comment_id are required".to_string()),
             },
             "comment_reply" => match (a.owner, a.repo, a.number, a.parent_id, a.body) {
                 (Some(o), Some(r), Some(n), Some(pid), Some(b)) => match c.pr_comment_reply(&o, &r, n, pid, &b).await {
                     Ok(cm) => ok(format!("Replied (comment {})", cm.id)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 _ => err("atomgit_pr comment_reply: owner, repo, number, parent_id and body are required".to_string()),
             },
             "link_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr link_issues") {
                 Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_link_issues(&o, &r, n, &a.issues).await {
                     Ok(()) => ok(format!("Linked issues {:?} to PR #{n}", a.issues)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 Ok(_) => err("atomgit_pr link_issues: issues=[...] is required".to_string()),
                 Err(e) => e,
@@ -1127,7 +1127,7 @@ impl Tool for AtomgitPrTool {
             "unlink_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr unlink_issues") {
                 Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_unlink_issues(&o, &r, n, &a.issues).await {
                     Ok(()) => ok(format!("Unlinked issues {:?} from PR #{n}", a.issues)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 Ok(_) => err("atomgit_pr unlink_issues: issues=[...] is required".to_string()),
                 Err(e) => e,
