@@ -853,6 +853,7 @@ fn diagnostics_key(path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(any(windows, test))]
 fn windows_diagnostics_key(path: &Path) -> PathBuf {
     PathBuf::from(path.to_string_lossy().replace('/', "\\").to_lowercase())
 }
