@@ -17,7 +17,6 @@ pub const ID: &str = "status";
 #[derive(Default)]
 pub struct State {
     pub turns: u64,
-    pub summaries: u64,
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -83,9 +82,6 @@ impl View for Status {
     }
 
     fn absorb(state: &mut State, fact: &SessionEvent) {
-        if atomcode_harness::session::is_context_summary(fact) {
-            state.summaries += 1;
-        }
         match fact {
             SessionEvent::TurnStart { turn } => {
                 state.turns = *turn;
@@ -342,21 +338,11 @@ impl View for Status {
         let used = gauge_tokens(state, vp.moment);
         // Only what means something: a context usage segment appears once there
         // are tokens or a window to report, never as a bare zero.
-        let mut ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
+        let ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
             format_ctx_usage(used as usize, vp.moment.ctx_window as usize)
         } else {
             String::new()
         };
-        if state.summaries > 0 {
-            let count =
-                atomcode_i18n::product::t(atomcode_i18n::product::Msg::ContextSummaryCount {
-                    count: state.summaries,
-                });
-            if !ctx_str.is_empty() {
-                ctx_str.push_str(" · ");
-            }
-            ctx_str.push_str(&count);
-        }
         let cache_str =
             cache_indicator(state.session_cached, state.session_prompt).unwrap_or_default();
 
@@ -872,7 +858,7 @@ mod tests {
     use crate::moment::Moment;
 
     #[test]
-    fn summary_count_shares_the_existing_token_segment_and_has_no_progress_label() {
+    fn summary_count_does_not_occupy_the_status_token_segment() {
         let _locale = crate::i18n::test_lock();
         let mut state = State::default();
         let moment = Moment {
@@ -892,7 +878,6 @@ mod tests {
                 texts: vec![],
             },
         );
-        assert_eq!(state.summaries, 0);
         Status::absorb(
             &mut state,
             &SessionEvent::Compacted {
@@ -903,7 +888,7 @@ mod tests {
             },
         );
         let line = draw::<Status>(&state, 160, &moment);
-        assert!(line.contains(label.as_ref()), "{line}");
+        assert!(!line.contains(label.as_ref()), "{line}");
         assert_eq!(line.matches("tok").count(), 1, "{line}");
         assert!(!line.contains("正在") && !line.contains("Summarizing"));
         for width in [20, 40, 80] {
@@ -911,7 +896,6 @@ mod tests {
                 crate::width::str_width(&draw::<Status>(&state, width, &moment)) <= width as usize
             );
         }
-        assert_eq!(State::default().summaries, 0);
     }
 
     crate::tui_conformance!(view Status as status_conformance);
