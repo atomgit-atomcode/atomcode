@@ -1306,13 +1306,23 @@ impl Config {
     pub fn logical_accounts(&self) -> HashMap<String, ProviderAccountConfig> {
         let mut out: HashMap<String, ProviderAccountConfig> = HashMap::new();
         for (name, p) in &self.providers {
-            if is_codingplan_provider_name(name) {
-                // All CodingPlan flat providers share one gateway + OAuth signer;
-                // fold them into a single account per wire format. Fields are
-                // uniform across the group, so the first one seen defines them.
+            if is_codingplan_provider_name(name)
+                && codingplan_shares_group_gateway(p.base_url.as_deref())
+            {
+                // All CodingPlan flat providers on the canonical shared gateway
+                // share one account + OAuth signer; fold them together. Fields
+                // are uniform across the group, so the first one seen defines
+                // them. Providers on a different per-model gateway keep their
+                // own account (see `codingplan_shares_group_gateway`).
                 let id = codingplan_group_account_id(&p.provider_type);
                 out.entry(id.to_string())
                     .or_insert_with(|| project_legacy_account(p));
+            } else if is_codingplan_provider_name(name) {
+                // A per-model gateway keeps its own account; the provider key
+                // is the composite `{account}-{model}`, so strip the model
+                // suffix to recover the account id.
+                let id = codingplan_explicit_account_id(name, &p.model);
+                out.entry(id).or_insert_with(|| project_legacy_account(p));
             } else {
                 out.insert(name.clone(), project_legacy_account(p));
             }
@@ -1369,9 +1379,15 @@ impl Config {
         let mut out: HashMap<String, ModelProfileConfig> = HashMap::new();
         for (name, p) in &self.providers {
             // Model id stays the legacy provider name (so `default_provider`
-            // resolves); only the parent account folds for CodingPlan providers.
-            let account = if is_codingplan_provider_name(name) {
+            // resolves); only the parent account folds for CodingPlan providers
+            // on the canonical shared gateway. A per-model gateway keeps its
+            // own account id (== provider name) so distinct base URLs survive.
+            let account = if is_codingplan_provider_name(name)
+                && codingplan_shares_group_gateway(p.base_url.as_deref())
+            {
                 codingplan_group_account_id(&p.provider_type).to_string()
+            } else if is_codingplan_provider_name(name) {
+                codingplan_explicit_account_id(name, &p.model)
             } else {
                 name.clone()
             };
@@ -2043,6 +2059,38 @@ mod codingplan_prefix_tests {
         assert!(name_matches_prefix("AtomGit-GLM-5.2", "AtomGit"));
         assert!(!name_matches_prefix("deepseek", "Longyuan"));
         assert!(!name_matches_prefix("Longyuanx", "Longyuan"));
+    }
+}
+
+/// Recover the explicit CodingPlan account id from a composite selection key:
+/// the setup writes `{account}-{model}` for providers on a per-model gateway,
+/// so stripping the trailing `-{model}` yields the account (`AtomGit-Auto-
+/// Gateway-auto` → `AtomGit-Auto-Gateway`). Falls back to the full name when
+/// the suffix does not match, keeping the key usable as an account id.
+fn codingplan_explicit_account_id(name: &str, model: &str) -> String {
+    let suffix = format!("-{model}");
+    match name.strip_suffix(&suffix) {
+        Some(head) if !head.is_empty() => head.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Whether a legacy CodingPlan provider points at the canonical shared
+/// gateway (same origin as `codingplan_llm_base_url`). Only those fold into
+/// the single group account; a per-model gateway (e.g. an `auto` route on a
+/// different host) keeps its own account so its distinct base URL survives.
+/// Strict origin equality — not `is_codingplan_llm_gateway`, whose whitelist
+/// deliberately admits sibling gateways that must NOT be folded together.
+fn codingplan_shares_group_gateway(base_url: Option<&str>) -> bool {
+    let Some(u) = base_url else {
+        return true; // no base_url ⇒ historical payload ⇒ shared gateway
+    };
+    match (
+        url::Url::parse(u),
+        url::Url::parse(crate::endpoints::codingplan_llm_base_url()),
+    ) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => u == crate::endpoints::codingplan_llm_base_url(),
     }
 }
 
