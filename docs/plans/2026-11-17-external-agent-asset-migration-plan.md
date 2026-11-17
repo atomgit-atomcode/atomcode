@@ -503,6 +503,12 @@ pub fn provider_row(
     status: AssetStatus,
     detail: String,
 ) -> AssetReport {
+    // A draft that cannot be imported is reported as `Blocked`, with the
+    // reason it carries — not as "can be brought over".
+    let (status, detail) = match &draft.blocked {
+        Some(reason) => (AssetStatus::Blocked, reason.clone()),
+        None => (status, detail),
+    };
     AssetReport {
         kind: AssetKind::ProviderConfig,
         name: draft.id.clone(),
@@ -540,10 +546,22 @@ fn instruction_verdict(
 ) -> Option<InstructionVerdict> {
     // The loader wants the product tree as the "home" (`instructions.rs:105`).
     let loaded = crate::instructions::load_instructions(ctx.product.user(), &ctx.project);
-    let source = loaded
-        .sources
-        .into_iter()
-        .find(|source| source.path == path)?;
+    let source = loaded.sources.iter().find(|source| source.path == path)?.clone();
+    // The file that WINS in the project tier — the one the loader did not
+    // shadow. A shadowed file's own name is NOT the explanation ("CLAUDE.md
+    // takes precedence" about a shadowed CLAUDE.md says nothing); the
+    // winner's name is.
+    //
+    // The loader marks the FIRST existing project file as the winner and
+    // shadows the rest (`instructions.rs:131-139`: `selected |= path.is_file()`),
+    // so the winner is the first PROJECT source that is neither shadowed nor
+    // missing — even if it is empty, because an empty file still wins the
+    // slot.
+    let winner = loaded.sources.iter().find(|candidate| {
+        candidate.scope == "PROJECT"
+            && candidate.state != crate::instructions::InstructionState::Shadowed
+            && candidate.state != crate::instructions::InstructionState::Missing
+    });
     Some(InstructionVerdict {
         name: source
             .path
@@ -554,6 +572,14 @@ fn instruction_verdict(
         path: source.path,
         scope: AssetScope::Project,
         state: source.state,
+        shadowed_by: winner.map(|winner| {
+            winner
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }),
     })
 }
 
@@ -563,142 +589,10 @@ struct InstructionVerdict {
     path: std::path::PathBuf,
     scope: AssetScope,
     state: crate::instructions::InstructionState,
+    /// The project file that wins over this one, when this one is shadowed.
+    shadowed_by: Option<String>,
 }
 
-/// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
-///
-/// A directory that does not exist is simply empty. A directory that exists
-/// but cannot be read is NOT empty — it is a problem the person should see,
-/// so it becomes a `Blocked` row rather than silence.
-///
-/// **Whether the asset is really in effect is decided by the real registry**,
-/// not by "the file exists". Two things make existence insufficient: a
-/// `SKILL.md` that fails to parse is skipped (`registry.rs:262`), and a skill
-/// with the same name in an earlier directory **overrides** this one
-/// (`registry.rs:250` records "overridden by …"). A report that says "already
-/// in the skill catalog" about an overridden file is wrong.
-fn skill_rows(
-    kind: AssetKind,
-    scope: AssetScope,
-    root: &Path,
-    registry: &SkillTruth,
-) -> Vec<AssetReport> {
-    let mut out = Vec::new();
-    if !root.is_dir() {
-        return out;
-    }
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            out.push(AssetReport {
-                kind,
-                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                path: root.to_path_buf(),
-                scope,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&error.to_string()),
-            });
-            return out;
-        }
-    };
-    // An entry that cannot be read is a row, not a silent skip: a skill we
-    // could not look at is one we could not promise works.
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                out.push(AssetReport {
-                    kind,
-                    name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                    path: root.to_path_buf(),
-                    scope,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&error.to_string()),
-                });
-                continue;
-            }
-        };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_skill = path.is_dir() && path.join("SKILL.md").is_file();
-        let is_command = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
-        if !is_skill && !is_command {
-            continue;
-        }
-        let (status, detail) = registry.verdict(&name, &path);
-        out.push(AssetReport {
-            kind,
-            name,
-            path,
-            scope,
-            status,
-            detail,
-        });
-    }
-    out
-}
-
-/// What the real skill registry makes of the skills we found.
-///
-/// The registry is loaded ONCE per scan, from the same directory list our own
-/// loader uses (`standard_skill_dirs`), so it sees the same collisions the
-/// runtime will see.
-struct SkillTruth {
-    /// The `SKILL.md` (or command file) each loaded skill came from.
-    loaded: Vec<std::path::PathBuf>,
-    /// The files the registry rejected, with the reason.
-    rejected: Vec<(std::path::PathBuf, String)>,
-}
-
-impl SkillTruth {
-    /// Load the registry the way the runtime does.
-    fn load(ctx: &ScanContext) -> Self {
-        let roots = crate::skills::SkillRoots {
-            home: &ctx.os_home,
-            project: &ctx.project,
-            dirs: &ctx.product,
-        };
-        let dirs = crate::skills::standard_skill_dirs(roots);
-        let registry = crate::skills::SkillRegistry::load_with_explicit(&dirs, &[]);
-        let loaded = registry
-            .all()
-            .iter()
-            .map(|skill| skill.source_path.clone())
-            .collect();
-        let rejected = registry
-            .diagnostics()
-            .into_iter()
-            .filter(|diagnostic| !diagnostic.warning)
-            .map(|diagnostic| (diagnostic.path, diagnostic.reason))
-            .collect();
-        Self { loaded, rejected }
-    }
-
-    /// Whether this file is the one that is actually in effect.
-    fn verdict(&self, name: &str, path: &Path) -> (AssetStatus, String) {
-        let file = if path.is_dir() {
-            path.join("SKILL.md")
-        } else {
-            path.to_path_buf()
-        };
-        if let Some((_, reason)) = self
-            .rejected
-            .iter()
-            .find(|(rejected, _)| *rejected == file)
-        {
-            return (AssetStatus::Blocked, super::text::skill_rejected(reason));
-        }
-        if self.loaded.contains(&file) {
-            return (AssetStatus::Active, super::text::skill_active());
-        }
-        // The file exists but is not the one in effect — another directory
-        // has a skill of the same name and wins.
-        (
-            AssetStatus::Blocked,
-            super::text::skill_overridden(name),
-        )
-    }
-}
 ```
 
 （`claude.rs` / `codex.rs` / `provider.rs` 在 Task 2 / 3 / 6 建；本 Task 先建三个空壳文件让编译通过：`claude.rs` 与 `codex.rs` 各自放一个 `pub struct ClaudeSource;` 之类，Task 2/3 填内容；`provider.rs` 在 Task 6 建。**为让本 Task 编译通过，Step 5 之后先建两个空壳：**）
@@ -804,6 +698,20 @@ pub struct ProviderAccountDraft {
     /// Whether the account came from the person's own tree or from the
     /// current project. A project provider is not the user's provider.
     pub scope: AssetScope,
+    /// Why this account CANNOT be imported, when that is the case.
+    ///
+    /// `None` means it can. A `Some` reason means the account is still
+    /// **reported** — it is configured, the person should see it — but the
+    /// importer refuses it.
+    ///
+    /// Two things land here:
+    /// - the name cannot become an account id at all (`account_id_for`
+    ///   returns an error), so there is nothing to write it under;
+    /// - the endpoint speaks a wire protocol we do not support.
+    ///
+    /// Both used to be either silently dropped or reported as importable,
+    /// which is the one thing this report must never do.
+    pub blocked: Option<String>,
 }
 ```
 
@@ -1118,32 +1026,41 @@ impl MigrationSource for ClaudeSource {
         // ends up saying "already in effect" about a file that is not.
         let project_instructions = ctx.project.join("CLAUDE.md");
         if let Some(source) = super::instruction_verdict(ctx, &project_instructions) {
-            let (status, detail) = match source.state {
-                crate::instructions::InstructionState::Loaded => {
-                    (AssetStatus::Active, super::text::instructions_active())
-                }
-                crate::instructions::InstructionState::Shadowed => (
-                    AssetStatus::Blocked,
-                    super::text::instructions_shadowed(&source.name),
-                ),
-                crate::instructions::InstructionState::Empty => {
-                    (AssetStatus::Blocked, super::text::instructions_empty())
-                }
-                crate::instructions::InstructionState::Unreadable => (
-                    AssetStatus::Blocked,
-                    super::text::unreadable_file("the file could not be read"),
-                ),
-                // A file that is not there is not an asset at all.
-                crate::instructions::InstructionState::Missing => continue,
-            };
-            out.push(AssetReport {
-                kind: AssetKind::Instructions,
-                name: source.name,
-                path: source.path,
-                scope: source.scope,
-                status,
-                detail,
-            });
+            // A `Missing` file is not an asset at all, so it produces NO row.
+            // It cannot be a `continue` — this is not a loop, and the rest of
+            // the assets still need scanning.
+            if source.state != crate::instructions::InstructionState::Missing {
+                let (status, detail) = match source.state {
+                    crate::instructions::InstructionState::Loaded => {
+                        (AssetStatus::Active, super::text::instructions_active())
+                    }
+                    // The message names the file that WINS, not this one.
+                    crate::instructions::InstructionState::Shadowed => (
+                        AssetStatus::Blocked,
+                        super::text::instructions_shadowed(
+                            source.shadowed_by.as_deref().unwrap_or(&source.name),
+                        ),
+                    ),
+                    crate::instructions::InstructionState::Empty => {
+                        (AssetStatus::Blocked, super::text::instructions_empty())
+                    }
+                    crate::instructions::InstructionState::Unreadable => (
+                        AssetStatus::Blocked,
+                        super::text::unreadable_file("the file could not be read"),
+                    ),
+                    crate::instructions::InstructionState::Missing => {
+                        unreachable!("handled above")
+                    }
+                };
+                out.push(AssetReport {
+                    kind: AssetKind::Instructions,
+                    name: source.name,
+                    path: source.path,
+                    scope: source.scope,
+                    status,
+                    detail,
+                });
+            }
         }
         let user_instructions = user.join("CLAUDE.md");
         if user_instructions.is_file() {
@@ -1224,37 +1141,33 @@ impl MigrationSource for ClaudeSource {
         // `~/.claude.json` is not, so it can only be brought over.
         let project_mcp = ctx.project.join(".mcp.json");
         if project_mcp.is_file() {
-            match mcp_server_count(&project_mcp) {
-                // A server with neither `command` nor `url` fails the WHOLE
-                // file (`mcp/config.rs:670-673`), so none of its servers run.
-                Ok(count) if count > 0 => {
-                    match mcp_servers_are_valid(&project_mcp) {
-                        Ok(true) => out.push(AssetReport {
+            // **One parse.** The loader's verdict and the count come from
+            // the same parse, so they cannot disagree about the same file.
+            match mcp_servers(&project_mcp) {
+                Ok(counts) if counts.total > 0 => {
+                    if counts.enabled > 0 {
+                        out.push(AssetReport {
                             kind: AssetKind::McpServers,
                             name: "mcpServers".into(),
-                            path: project_mcp,
+                            path: project_mcp.clone(),
                             scope: AssetScope::Project,
                             status: AssetStatus::Active,
-                            detail: super::text::mcp_active(count),
-                        }),
-                        Ok(false) => out.push(AssetReport {
+                            detail: super::text::mcp_active(counts.enabled),
+                        });
+                    } else {
+                        // Configured, but every server is disabled: the
+                        // definitions are there, none of them run.
+                        out.push(AssetReport {
                             kind: AssetKind::McpServers,
-                            name: ".mcp.json".into(),
-                            path: project_mcp,
+                            name: "mcpServers".into(),
+                            path: project_mcp.clone(),
                             scope: AssetScope::Project,
                             status: AssetStatus::Blocked,
-                            detail: super::text::rules_rejected(),
-                        }),
-                        Err(reason) => out.push(AssetReport {
-                            kind: AssetKind::McpServers,
-                            name: ".mcp.json".into(),
-                            path: project_mcp,
-                            scope: AssetScope::Project,
-                            status: AssetStatus::Blocked,
-                            detail: super::text::unreadable_file(&reason),
-                        }),
+                            detail: super::text::mcp_all_disabled(counts.total),
+                        });
                     }
                 }
+                // A file that parses and declares nothing is not an asset.
                 Ok(_) => {}
                 Err(reason) => out.push(AssetReport {
                     kind: AssetKind::McpServers,
@@ -1510,33 +1423,35 @@ fn permission_rules_are_valid(value: &serde_json::Value) -> bool {
     invalid.is_empty()
 }
 
-/// What our own loader makes of this MCP file.
+/// What an MCP file declares: how many servers, and how many of them are
+/// ENABLED.
 ///
 /// **This calls the real loader** — `crate::mcp::parse_mcp_servers` — rather
 /// than re-checking the shape by hand. The loader does typed deserialization,
 /// `requirements::validate` for experimental capabilities, and HTTP auth
 /// validation; a hand-rolled check that only looked for `command`/`url` would
-/// call a file "in effect" that the loader rejects.
-///
-/// The loader also reads the legacy `servers` key as an alias for
-/// `mcpServers` (`mcp/config.rs:140`), so counting is left to it too.
-fn mcp_servers_are_valid(path: &Path) -> Result<bool, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    match crate::mcp::parse_mcp_servers(&raw, crate::mcp::McpConfigSource::Project) {
-        Ok(_) => Ok(true),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// How many MCP servers a file declares — and how many of them are ENABLED.
+/// call a file "in effect" that the loader rejects. It also reads the legacy
+/// `servers` key as an alias for `mcpServers` (`mcp/config.rs:140`), so
+/// counting is left to it too.
 ///
 /// A disabled server is configured but not running, so it must not be counted
-/// as "in effect" (`mcp/config.rs:320` filters `!c.disabled`).
-fn mcp_server_count(path: &Path) -> Result<usize, String> {
+/// as "in effect" (`mcp/config.rs:320` filters `!c.disabled`) — but it is
+/// still an asset the person configured, and hiding it would make a
+/// configured-but-disabled server vanish from the report entirely.
+fn mcp_servers(path: &Path) -> Result<McpCounts, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let servers = crate::mcp::parse_mcp_servers(&raw, crate::mcp::McpConfigSource::Project)
         .map_err(|e| e.to_string())?;
-    Ok(servers.iter().filter(|server| !server.disabled).count())
+    Ok(McpCounts {
+        total: servers.len(),
+        enabled: servers.iter().filter(|server| !server.disabled).count(),
+    })
+}
+
+/// How many MCP servers a file declares, and how many run.
+struct McpCounts {
+    total: usize,
+    enabled: usize,
 }
 
 /// The provider Claude was pointed at, and how its credential is written.
@@ -1571,8 +1486,20 @@ fn claude_provider(user: &Path) -> Option<(Option<String>, Option<String>)> {
 /// "there are none", and the caller reports it as such.
 fn session_file_count(projects: &Path) -> Result<usize, String> {
     let mut count = 0usize;
+    // **The visited set is what stops a symlink cycle.** `is_dir()` follows
+    // links, so a directory that links back to an ancestor would otherwise
+    // be walked forever and the read-only report would never finish.
+    let mut visited: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     let mut stack = vec![projects.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        let identity = match std::fs::canonicalize(&dir) {
+            Ok(path) => path,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !visited.insert(identity) {
+            continue;
+        }
         let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -1645,6 +1572,9 @@ pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
 pub fn mcp_active(count: usize) -> String {
     t(Msg::MigrationMcpActive { count }).into_owned()
 }
+pub fn mcp_all_disabled(count: usize) -> String {
+    t(Msg::MigrationMcpAllDisabled { count }).into_owned()
+}
 pub fn unreadable_file(reason: &str) -> String {
     t(Msg::MigrationUnreadableFile { reason }).into_owned()
 }
@@ -1673,7 +1603,319 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
     })
     .into_owned()
 }
+pub fn provider_name_unusable(name: &str) -> String {
+    t(Msg::MigrationProviderNameUnusable { name }).into_owned()
+}
+pub fn provider_protocol_unsupported(protocol: &str) -> String {
+    t(Msg::MigrationProviderProtocolUnsupported { protocol }).into_owned()
+}
 ```
+
+**技能那部分的两个助手也放这里**（`claude.rs` 自己的文件里）—— Task 1 的
+`mod.rs` 里**没有**它们：它们要用 `text::*` 的文案，而 `text.rs` 是 Task 2
+才建的，Task 1 必须能单独编译。Codex 的技能不在我们的扫描目录里，所以只有
+Claude 这一侧需要。
+
+```rust
+/// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
+///
+/// A directory that does not exist is simply empty. A directory that exists
+/// but cannot be read is NOT empty — it is a problem the person should see,
+/// so it becomes a `Blocked` row rather than silence.
+///
+/// **Whether the asset is really in effect is decided by the real registry**,
+/// not by "the file exists". Two things make existence insufficient: a
+/// `SKILL.md` that fails to parse is skipped (`registry.rs:262`), and a skill
+/// with the same name in an earlier directory **overrides** this one
+/// (`registry.rs:250` records "overridden by …"). A report that says "already
+/// in the skill catalog" about an overridden file is wrong.
+fn skill_rows(
+    kind: AssetKind,
+    scope: AssetScope,
+    root: &Path,
+    registry: &SkillTruth,
+) -> Vec<AssetReport> {
+    let mut out = Vec::new();
+    if !root.is_dir() {
+        return out;
+    }
+    // **Grouping directories are walked**, the way the registry walks them
+    // (`registry.rs:288`): `skills/group/deploy/SKILL.md` is a real skill, and
+    // a report that only looked at the immediate children would drop it —
+    // a valid, active skill that vanishes from the report.
+    //
+    // The walk mirrors the registry's rules: the same depth bound, the same
+    // ignored cache directories, and the same symlink-cycle guard. A file
+    // error becomes a `Blocked` row rather than a silent skip.
+    const MAX_DEPTH: usize = 8;
+    let mut ancestors: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    collect_skill_rows(
+        kind,
+        scope,
+        root,
+        root,
+        0,
+        MAX_DEPTH,
+        &mut ancestors,
+        registry,
+        &mut out,
+    );
+    out
+}
+
+/// Walk one skill directory, mirroring the registry's discovery rules.
+#[allow(clippy::too_many_arguments)]
+fn collect_skill_rows(
+    kind: AssetKind,
+    scope: AssetScope,
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    ancestors: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    registry: &SkillTruth,
+    out: &mut Vec<AssetReport>,
+) {
+    if depth > max_depth {
+        out.push(AssetReport {
+            kind,
+            name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            path: dir.to_path_buf(),
+            scope,
+            status: AssetStatus::Blocked,
+            detail: super::text::skill_rejected("the grouping depth limit was exceeded"),
+        });
+        return;
+    }
+    // The cycle guard: a symlink back to an ancestor would otherwise be
+    // walked forever. The registry does the same (`registry.rs:320`).
+    let identity = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(error) => {
+            out.push(AssetReport {
+                kind,
+                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                path: dir.to_path_buf(),
+                scope,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&error.to_string()),
+            });
+            return;
+        }
+    };
+    if !ancestors.insert(identity.clone()) {
+        out.push(AssetReport {
+            kind,
+            name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            path: dir.to_path_buf(),
+            scope,
+            status: AssetStatus::Blocked,
+            detail: super::text::skill_rejected("a symlink cycle was detected"),
+        });
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            out.push(AssetReport {
+                kind,
+                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                path: dir.to_path_buf(),
+                scope,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&error.to_string()),
+            });
+            ancestors.remove(&identity);
+            return;
+        }
+    };
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    // An entry that cannot be read is a row, not a silent skip: a skill we
+    // could not look at is one we could not promise works.
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(error) => out.push(AssetReport {
+                kind,
+                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                path: dir.to_path_buf(),
+                scope,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&error.to_string()),
+            }),
+        }
+    }
+    paths.sort();
+    for path in paths {
+        if path.is_file() {
+            // Flat command templates are TOP-LEVEL only (`registry.rs:340`):
+            // a skill's own `*.md` files are its resources, not commands.
+            if depth == 0 && path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let name = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let (status, detail) = registry.verdict(&name, &path);
+                out.push(AssetReport {
+                    kind,
+                    name,
+                    path,
+                    scope,
+                    status,
+                    detail,
+                });
+            }
+        } else if path.is_dir() {
+            // The registry skips dependency/cache directories
+            // (`registry.rs:13`) — the report must skip them too, or it
+            // would report thousands of vendored files as skills.
+            if is_ignored_skill_directory(&path) {
+                continue;
+            }
+            let skill_md = path.join("SKILL.md");
+            if skill_md.is_file() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let (status, detail) = registry.verdict(&name, &path);
+                out.push(AssetReport {
+                    kind,
+                    name,
+                    path,
+                    scope,
+                    status,
+                    detail,
+                });
+            } else {
+                // A grouping directory: keep walking.
+                collect_skill_rows(
+                    kind,
+                    scope,
+                    root,
+                    &path,
+                    depth + 1,
+                    max_depth,
+                    ancestors,
+                    registry,
+                    out,
+                );
+            }
+        }
+    }
+    ancestors.remove(&identity);
+}
+
+/// The dependency/cache directories the registry skips.
+///
+/// The same list as `registry.rs:13` — the report must not walk into
+/// `node_modules` and report thousands of vendored files as skills.
+fn is_ignored_skill_directory(path: &Path) -> bool {
+    const IGNORED: &[&str] = &[
+        ".venv",
+        "venv",
+        "node_modules",
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+    ];
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| IGNORED.iter().any(|ignored| name.eq_ignore_ascii_case(ignored)))
+}
+
+/// What the real skill registry makes of the skills we found.
+///
+/// The registry is loaded ONCE per scan, from the same directory list our own
+/// loader uses (`standard_skill_dirs`), so it sees the same collisions the
+/// runtime will see.
+struct SkillTruth {
+    /// The `SKILL.md` (or command file) each loaded skill came from.
+    loaded: Vec<std::path::PathBuf>,
+    /// Every diagnostic the registry produced, with its reason.
+    diagnostics: Vec<(std::path::PathBuf, String)>,
+}
+
+impl SkillTruth {
+    /// Load the registry the way the runtime does.
+    fn load(ctx: &ScanContext) -> Self {
+        let roots = crate::skills::SkillRoots {
+            home: &ctx.os_home,
+            project: &ctx.project,
+            dirs: &ctx.product,
+        };
+        let dirs = crate::skills::standard_skill_dirs(roots);
+        let registry = crate::skills::SkillRegistry::load_with_explicit(&dirs, &[]);
+        // **Both** maps: `all()` is the SKILLS map, and the flat command
+        // templates live in a separate one (`slash_commands()`,
+        // `registry.rs:467`). Looking only at `all()` would make every
+        // command file look overridden.
+        let loaded = registry
+            .all()
+            .iter()
+            .chain(registry.slash_commands().iter())
+            .map(|skill| skill.source_path.clone())
+            .collect();
+        // **Every** diagnostic is kept, not just the non-warning ones. The
+        // registry marks a PARSE FAILURE as a warning (`registry.rs:262`)
+        // and an OVERRIDE as non-warning (`registry.rs:250`) — so filtering
+        // out the warnings kept the overrides and threw away the failures,
+        // which is exactly backwards: a skill that failed to load was being
+        // reported as a name collision.
+        //
+        // The verdict decides which is which (see below): a path that IS
+        // loaded is active even if it also carries a non-fatal warning.
+        let diagnostics = registry
+            .diagnostics()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.path, diagnostic.reason))
+            .collect();
+        Self { loaded, diagnostics }
+    }
+
+    /// Whether this file is the one that is actually in effect.
+    ///
+    /// **The order matters.** A path that IS loaded is active, even if it
+    /// also carries a diagnostic (the registry reports a bad `args:` value
+    /// as a warning while the skill still loads, `registry.rs:229`). Only a
+    /// path that is NOT loaded is classified by its diagnostic — and then the
+    /// diagnostic's own words say why.
+    fn verdict(&self, name: &str, path: &Path) -> (AssetStatus, String) {
+        let file = if path.is_dir() {
+            path.join("SKILL.md")
+        } else {
+            path.to_path_buf()
+        };
+        if self.loaded.contains(&file) {
+            return (AssetStatus::Active, super::text::skill_active());
+        }
+        // Not loaded. The registry's own diagnostic says why: either the
+        // loader rejected it, or another directory's skill of the same name
+        // won.
+        if let Some((_, reason)) = self
+            .diagnostics
+            .iter()
+            .find(|(diagnostic, _)| *diagnostic == file)
+        {
+            return (AssetStatus::Blocked, super::text::skill_rejected(reason));
+        }
+        // The file exists but is not the one in effect — another directory
+        // has a skill of the same name and wins.
+        (
+            AssetStatus::Blocked,
+            super::text::skill_overridden(name),
+        )
+    }
+}
+```
+
+（`claude.rs` 顶部还要加 `use super::{SkillTruth, skill_rows};` —— 子模块**不会**
+自动拿到父模块的名字，必须显式 `use`。）
 
 > `provider_copyable` 放在**这里**而不是 Task 3：Task 2 的 Claude 扫描已经要报
 > provider 那一行，而 Task 2 必须能**单独编译并通过**（阶段 P2 的验收就是
@@ -1714,6 +1956,9 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
     MigrationMcpActive {
         count: usize,
     },
+    MigrationMcpAllDisabled {
+        count: usize,
+    },
     MigrationUnreadableFile {
         reason: &'a str,
     },
@@ -1724,6 +1969,12 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
     MigrationProviderCopyable {
         base_url: &'a str,
         key: &'a str,
+    },
+    MigrationProviderNameUnusable {
+        name: &'a str,
+    },
+    MigrationProviderProtocolUnsupported {
+        protocol: &'a str,
     },
     MigrationAgentsBlocked,
     MigrationPluginsBlocked,
@@ -1767,6 +2018,9 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
         Msg::MigrationMcpActive { count } => {
             format!("{count} MCP server(s) — read directly from this project").into()
         }
+        Msg::MigrationMcpAllDisabled { count } => {
+            format!("{count} MCP server(s) are configured but disabled — none of them run").into()
+        }
         Msg::MigrationUnreadableFile { reason } => {
             format!("This file could not be read: {reason}").into()
         }
@@ -1782,6 +2036,13 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
                  review them before writing"
             )
             .into()
+        }
+        Msg::MigrationProviderNameUnusable { name } => {
+            format!("{name}: this name cannot be an account id — not imported").into()
+        }
+        Msg::MigrationProviderProtocolUnsupported { protocol } => {
+            format!("This endpoint speaks {protocol}, which we do not support — not imported")
+                .into()
         }
         Msg::MigrationAgentsBlocked => {
             "Our role files need `permission` and `difficulty` frontmatter, which these do not \
@@ -1824,6 +2085,9 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
         Msg::MigrationMcpActive { count } => {
             format!("{count} 个 MCP 服务 —— 直接读取本项目的这个文件").into()
         }
+        Msg::MigrationMcpAllDisabled { count } => {
+            format!("{count} 个 MCP 服务已配置但被禁用 —— 都没有在运行").into()
+        }
         Msg::MigrationUnreadableFile { reason } => {
             format!("这个文件无法读取：{reason}").into()
         }
@@ -1834,6 +2098,12 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
         Msg::MigrationProviderCopyable { base_url, key } => {
             format!("其中的 provider 设置可以导入（endpoint {base_url}，凭据 {key}）—— 写入前请先确认")
                 .into()
+        }
+        Msg::MigrationProviderNameUnusable { name } => {
+            format!("{name}：这个名字不能作为账号 id —— 未导入").into()
+        }
+        Msg::MigrationProviderProtocolUnsupported { protocol } => {
+            format!("这个端点说的是 {protocol}，我们不支持 —— 未导入").into()
         }
         Msg::MigrationAgentsBlocked => {
             "我们的角色文件需要 permission 与 difficulty 前置元数据，Claude 的 subagent 文件没有 \
@@ -2048,31 +2318,41 @@ impl MigrationSource for CodexSource {
         // hand-rolled check that could drift from it.
         let project_agents = ctx.project.join("AGENTS.md");
         if let Some(source) = super::instruction_verdict(ctx, &project_agents) {
-            let (status, detail) = match source.state {
-                crate::instructions::InstructionState::Loaded => {
-                    (AssetStatus::Active, super::text::instructions_active())
-                }
-                crate::instructions::InstructionState::Shadowed => (
-                    AssetStatus::Blocked,
-                    super::text::instructions_shadowed(&source.name),
-                ),
-                crate::instructions::InstructionState::Empty => {
-                    (AssetStatus::Blocked, super::text::instructions_empty())
-                }
-                crate::instructions::InstructionState::Unreadable => (
-                    AssetStatus::Blocked,
-                    super::text::unreadable_file("the file could not be read"),
-                ),
-                crate::instructions::InstructionState::Missing => continue,
-            };
-            out.push(AssetReport {
-                kind: AssetKind::Instructions,
-                name: source.name,
-                path: source.path,
-                scope: source.scope,
-                status,
-                detail,
-            });
+            // A `Missing` file produces NO row — and it cannot be a
+            // `continue`, because this is not a loop.
+            if source.state != crate::instructions::InstructionState::Missing {
+                let (status, detail) = match source.state {
+                    crate::instructions::InstructionState::Loaded => {
+                        (AssetStatus::Active, super::text::instructions_active())
+                    }
+                    // The message names the file that WINS, not this one.
+                    crate::instructions::InstructionState::Shadowed => (
+                        AssetStatus::Blocked,
+                        super::text::instructions_shadowed(
+                            source.shadowed_by.as_deref().unwrap_or(&source.name),
+                        ),
+                    ),
+                    crate::instructions::InstructionState::Empty => {
+                        (AssetStatus::Blocked, super::text::instructions_empty())
+                    }
+                    crate::instructions::InstructionState::Unreadable => (
+                        (AssetStatus::Blocked, super::text::unreadable_file(
+                            "the file could not be read",
+                        ))
+                    }
+                    crate::instructions::InstructionState::Missing => {
+                        unreachable!("handled above")
+                    }
+                };
+                out.push(AssetReport {
+                    kind: AssetKind::Instructions,
+                    name: source.name,
+                    path: source.path,
+                    scope: source.scope,
+                    status,
+                    detail,
+                });
+            }
         }
 
         // Skills.
@@ -2331,7 +2611,7 @@ nothing."
 //! the only path that writes.
 
 use atomcode_capabilities::migration::{
-    self, AssetKind, AssetStatus, MigrationReport, ProviderAccountDraft, ScanContext,
+    self, ApiKeyRef, AssetKind, AssetStatus, MigrationReport, ProviderAccountDraft, ScanContext,
 };
 use std::path::{Path, PathBuf};
 
@@ -2415,7 +2695,16 @@ pub fn mark_already_imported(
             if asset.kind != AssetKind::ProviderConfig {
                 continue;
             }
-            let Some(draft) = drafts.iter().find(|d| d.id == asset.name) else {
+            // **The draft must come from THIS source.** Matching on the id
+            // alone would let one source's row be judged by another
+            // source's account: Claude's account and a Codex provider that
+            // both land on the id `claude` would be confused, and one
+            // source could be reported as "already imported" because of the
+            // other's configuration.
+            let Some(draft) = drafts
+                .iter()
+                .find(|d| d.id == asset.name && d.source_path == asset.path)
+            else {
                 continue;
             };
             let Some(account) = accounts.get(&draft.id) else {
@@ -2963,7 +3252,9 @@ pub enum AssetStatusView {
 ///
 /// The **product** table, not the screen table: the CLI says the same state
 /// with the same words, and one thing must not be said two ways.
-fn status_word(status: AssetStatusView) -> String {
+///
+/// `pub(crate)` because `commands.rs` — a sibling module — calls it.
+pub(crate) fn status_word(status: AssetStatusView) -> String {
     use crate::i18n::product::{t, Msg};
     match status {
         AssetStatusView::Active => t(Msg::MigrationStatusActive).into_owned(),
@@ -3053,9 +3344,12 @@ fn render_import_report(report: &crate::migration::MigrationReportView) -> Strin
             // The status word is part of what the row means, so it is shown —
             // and it comes from the SAME shared product message the CLI uses,
             // so the two cannot say the same state two ways.
+            //
+            // `crate::migration::` — `commands.rs` is a SIBLING module, so it
+            // does not see `migration`'s private items.
             out.push_str(&format!(
                 "  [{}] {} — {}\n",
-                status_word(asset.status),
+                crate::migration::status_word(asset.status),
                 asset.name,
                 asset.detail
             ));
@@ -3131,7 +3425,7 @@ commands!(
 
 use async_trait::async_trait;
 use atomcode_tui::migration::{
-    Migration, MigrationAssetView, MigrationReportView, MigrationSourceView,
+    AssetStatusView, Migration, MigrationAssetView, MigrationReportView, MigrationSourceView,
 };
 use std::path::PathBuf;
 
@@ -3284,7 +3578,7 @@ impl Migration for DiskMigration {
                 display_name: "Claude Code".into(),
                 assets: vec![crate::migration::MigrationAssetView {
                     name: "web-access".into(),
-                    status: "active".into(),
+                    status: crate::migration::AssetStatusView::Active,
                     detail: "Read directly".into(),
                 }],
             }],
@@ -3376,8 +3670,11 @@ pub fn effective_endpoint(protocol: &str, endpoint: &str) -> Option<String> {
 mod tests {
     use super::*;
     // The tests call `provider_drafts`, a method on the trait — so the trait
-    // has to be in scope, not just the types.
-    use crate::migration::{MigrationSource, ScanContext};
+    // has to be in scope, not just the types. `AssetKind` / `AssetStatus` are
+    // used by the criteria that drive the public `scan()`.
+    use crate::migration::{
+        AssetKind, AssetScope, AssetStatus, MigrationSource, ScanContext,
+    };
     use std::path::Path;
 
     /// Claude's settings.json with a provider configured by environment
@@ -3680,14 +3977,12 @@ pub fn account_id_for(name: &str) -> Option<String> {
 /// `base_url = None` while the draft still says the default URL.
 ///
 /// `endpoint_override` is made **public** for this (`pub fn effective_endpoint`).
+///
+/// **This delegates to the writer's rule** rather than re-implementing it. A
+/// copy would be correct today and wrong the day the writer changes — and the
+/// symptom would be a re-check that never matches.
 pub fn effective_endpoint(protocol: &str, endpoint: Option<&str>) -> Option<String> {
-    let endpoint = endpoint?.trim();
-    if endpoint.is_empty() {
-        return None;
-    }
-    let default = atomcode_config::config::provider_preset::preset(protocol)
-        .and_then(|preset| preset.default_base_url);
-    (Some(endpoint) != default).then(|| endpoint.to_string())
+    atomcode_config::provider_book::effective_endpoint(protocol, endpoint.unwrap_or_default())
 }
 
 /// The endpoint the account will actually talk to.
@@ -3776,6 +4071,22 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 
 （`claude.rs` 顶部加 `use super::provider::{ApiKeyRef, ProviderAccountDraft};`）
 
+**技能那部分的两个助手也放这里**（Task 1 的 `mod.rs` 里没有它们 —— 它们要用
+`text::*` 的文案，而 `text.rs` 是 Task 2 才建的；Task 1 必须能单独编译）：
+
+```rust
+```
+
+**技能那部分的两个助手放在这里**（`claude.rs` 自己的文件里）—— Task 1 的
+`mod.rs` 里**没有**它们：它们要用 `text::*` 的文案，而 `text.rs` 是 Task 2
+才建的，Task 1 必须能单独编译。Codex 的技能不在我们的扫描目录里，所以只有
+Claude 这一侧需要。
+
+```rust
+```
+
+
+
 **Codex 的草案**（加进 `codex.rs` 的 `impl MigrationSource`）：
 
 ```rust
@@ -3813,10 +4124,41 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
                     "codex",
                     provider.get("wire_api").and_then(|v| v.as_str()),
                 );
-                ProviderAccountDraft {
-                    // The id the account will get, not the raw name.
-                    id: super::provider::account_id_for(&name)
-                        .unwrap_or_else(|| name.clone()),
+                // **Whether the definition is usable at all** is decided
+                // BEFORE normalization, and the filter happens BEFORE the
+                // draft is built. Normalizing can turn a valid definition
+                // into an empty-looking one — a provider that uses the
+                // Responses default endpoint has its endpoint stored as
+                // `None`, so filtering on the NORMALIZED endpoint would
+                // drop it, taking its model and its report row with it.
+                // The provider EXISTS; it just follows the protocol's
+                // default.
+                //
+                // A definition with neither an endpoint nor a credential is
+                // not an account at all — there is nothing to connect to.
+                let usable = base_url.is_some() || key.is_some();
+                if !usable {
+                    return None;
+                }
+                // A name that cannot become an account id at all is a real
+                // problem the person should see, not something to paper
+                // over with the raw name.
+                let id = super::provider::account_id_for(&name);
+                // A wire protocol we do not speak is refused before the
+                // write (`create_account` would silently downgrade it).
+                let blocked = if id.is_none() {
+                    Some(super::text::provider_name_unusable(&name))
+                } else if super::provider::is_unsupported_protocol(&protocol) {
+                    Some(super::text::provider_protocol_unsupported(&protocol))
+                } else {
+                    None
+                };
+                Some(ProviderAccountDraft {
+                    // The id the account will get, not the raw name. When the
+                    // name cannot become an id, the raw name is kept ONLY so
+                    // the row can name the definition — `blocked` says it
+                    // cannot be imported.
+                    id: id.clone().unwrap_or_else(|| name.clone()),
                     protocol: protocol.clone(),
                     // The endpoint as it will be stored.
                     base_url: super::provider::effective_endpoint(
@@ -3835,9 +4177,10 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
                     // The scope the config was read at: a provider from the
                     // project's config is not the person's own provider.
                     scope,
+                    blocked,
                 }
             })
-            .filter(|draft| draft.base_url.is_some() || draft.api_key.is_some())
+            .flatten()
             .collect();
 
         // A model with NO named provider needs no special handling here: the
@@ -3969,7 +4312,7 @@ Expected: PASS —— 全部绿。
 - [ ] **Step 5: 提交**
 
 ```bash
-git add crates/atomcode-capabilities/src/migration/
+git add crates/atomcode-config/src/provider_book.rs crates/atomcode-capabilities/src/migration/
 git commit -m "feat(capabilities): map external provider accounts to drafts
 
 A credential that names an environment variable stays a name, so the
@@ -4392,6 +4735,11 @@ pub fn write_account(
         key: key.as_deref(),
         exact_id: true,
     };
+    // A draft that cannot be imported is refused **before** the write.
+    // The report already says so; the writer must not try anyway.
+    if let Some(reason) = &draft.blocked {
+        return Err(format!("{}: {reason}", draft.id));
+    }
     // An unsupported wire protocol is refused **before** the write.
     // `create_account` resolves an unknown preset to `openai-compatible`
     // (`config/provider_preset.rs:381`), so the import would otherwise
@@ -4737,6 +5085,9 @@ Expected: 退出 0。
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
 Expected: 全绿。
 
+Run: `cargo nextest run -p atomcode-config`
+Expected: 全绿 —— **Task 6 改了 `provider_book.rs`**（公开了两个归一规则的包装），所以 config crate 也在受影响范围内，它的测试也要跑。
+
 Run: `cargo nextest run -p atomcode-cli`
 Expected: 全绿。
 
@@ -4765,9 +5116,12 @@ Expected: 退出 0。
 
 - [ ] **Step 5: 手工验收（本机）**
 
+**用编出来的那个二进制**（`PATH` 上的 `atomcode` 可能是装好的旧版）：
+
 ```bash
-atomcode import
-atomcode import --json | head -40
+BIN="$(pwd)/target/debug/atomcode"
+"$BIN" import
+"$BIN" import --json | head -40
 ```
 
 Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `CLAUDE.md`（本仓库没有）与 `AGENTS.md`（本仓库有）状态正确；`~/.claude/CLAUDE.md` 标 `can move`；`~/.claude/skills/*` 标 `in effect`。
@@ -4819,9 +5173,11 @@ Expected:
 `Already there`（**不是**报错），配置**逐字节不变**：
 
 ```bash
-before=$(cat "$dst/config.toml")
+# **用 `cp` 存一份，不用 `$(cat …)`** —— 命令替换会**去掉结尾的换行**，
+# 于是「文件没变」也会被 `diff` 报成变了。
+cp "$dst/config.toml" "$dst/config.before"
 ( cd "$work" && HOME="$src" "$BIN" --config "$dst/config.toml" import --apply --yes )
-diff <(printf '%s' "$before") "$dst/config.toml" && echo "unchanged"
+cmp "$dst/config.before" "$dst/config.toml" && echo "unchanged"
 ```
 
 **再单独跑一次只读报告**（这才是回检那一态）：Expected: `gateway` 标为

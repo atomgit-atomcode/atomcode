@@ -79,7 +79,7 @@ crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
 
 **关键约束**（`AGENTS.md` + `gates/layers.sh` + ADR 0022 §3）：
 
-- `migration` feature **不依赖 `atomcode-config`**。不是 UI 不许用 config（`gates/layers.sh` 的「UI 不认 Host,也不认 Product」只禁 `atomcode-tui → atomcode-coding / atomcode`；`atomcode-config` 本来就在 TUI 的依赖图里），而是这个模块**用不到**它：报告只需要「我们的树在哪」，而 `ProductDirs` 就在本 crate 里（`product_dirs.rs`），带着它不增依赖。反过来，config 是**写入**的那一侧，只归宿主。
+- `migration` feature **依赖 `atomcode-config`** —— 为了**共用写入方的归一规则**：账号 id 与 endpoint 写入时会被归一（`base_id` 清洗并可能加前缀，`endpoint_override` 把「协议自带默认 endpoint」存成空），报告不跟着归一，回检就永远对不上。规则必须只有一份，不能两份各自漂移。capabilities→config 这条边**本来就有**（`provider` / `mcp` / `instructions` / `session` 等 feature 都拉它），门禁也不禁这条 —— 门禁禁的是 `atomcode-tui → atomcode-coding / atomcode`。
 - `capabilities` **不解析环境**。家目录、项目根由宿主解析后传进来（`AGENTS.md`：「解析环境只在宿主」）。
 - feature 声明：`migration = ["tools", "instructions", "mcp", "skills", "dep:atomcode-i18n", "dep:atomcode-config", "dep:toml"]`。
 
@@ -181,8 +181,8 @@ pub struct MigrationReport {
 |---|---|---|
 | 指令（项目） | `<project>/CLAUDE.md` | `Active`（直接读）—— 但若同目录有 `AGENTS.md` 等更高优先级文件，则是 `Blocked`（被遮蔽，不会被读） |
 | 指令（用户） | `~/.claude/CLAUDE.md` | `Actionable`（复制到产品用户树 `ATOMCODE.md`） |
-| 技能 | `~/.claude/skills/*`、`<project>/.claude/skills/*` | `Active` |
-| 命令 | `~/.claude/commands/*`、`<project>/.claude/commands/*` | `Active` |
+| 技能 | `~/.claude/skills/*`、`<project>/.claude/skills/*` | `Active` —— 但**由真注册表判定**：解析失败、被同名的另一个目录覆盖、或在被忽略的缓存目录里，都不是 `Active` |
+| 命令 | `~/.claude/commands/*`、`<project>/.claude/commands/*` | `Active` —— 同上，由真注册表判定（命令模板在注册表的**另一张表**里，`slash_commands()`） |
 | 权限（项目） | `<project>/.claude/settings.json`、`settings.local.json` | `Active`（文件损坏则 `Blocked`） |
 | 权限（用户） | `~/.claude/settings.json` | `Actionable`（复制到产品用户树 `settings.json`） |
 | MCP（项目） | `<project>/.mcp.json` | `Active`（文件损坏则 `Blocked`） |
@@ -245,7 +245,7 @@ pub struct MigrationReport {
 
 **写入**：复用 `atomcode_config::provider_book::ProviderBook::create_account`（`provider_book.rs:192`）。它自带文件锁、`toml_edit` 逐键 patch（保住用户在文件里的注释与排版）、原子替换。**不新造写入逻辑。**
 
-**落点**：第二期需要 `atomcode-config`（只有 CLI 有），所以**第二期只做 CLI**（`atomcode import --apply`）。TUI 的 `/import` 只出报告，并指向这条 CLI 命令。这样凭据写入留在 CLI 这一侧（与 `atomcode login` 同一层），TUI 不长出凭据写入流程。
+**落点**：**第二期只做 CLI**（`atomcode import --apply`）。TUI 的 `/import` 只出报告，并指向这条 CLI 命令 —— 凭据写入留在 CLI 这一侧（与 `atomcode login` 同一层），TUI 不长出凭据写入流程。
 
 **确认粒度**：**逐项**。
 
@@ -280,7 +280,7 @@ TUI 通过 `atomcode-tui` 新增的 `migration.rs` 端口 trait（镜像 `setup.
 
 **文案只出一处**：`capabilities::migration` 产出的每项资产**已带本地化好的 `detail`**（用 `atomcode_i18n::product`）。两个前端都只**显示**它，不各自拼句子 → 一件事一种说法。TUI 面板的标题 / 空态等**界面文案**走 screen 表。
 
-> 为什么不直接让 TUI 调 capabilities？因为 `migration` feature 不依赖 `atomcode-config`，TUI **可以**直接调。但家目录只有宿主能解析：`atomcode-tui` 没有 `dirs` 依赖，`atomcode-host-api` 里也没有家目录字段（已核实）。而扫描要扫的就是「**别人家目录**里的资产」—— 这个路径必须由宿主解析后传进来。端口形态与 `/setup` 一致，少一套心智。
+> 为什么不直接让 TUI 调 capabilities？TUI **可以**直接调 capabilities，但**家目录只有宿主能解析**：`atomcode-tui` 没有 `dirs` 依赖，`atomcode-host-api` 里也没有家目录字段（已核实）。而扫描要扫的就是「**别人家目录**里的资产」—— 这个路径必须由宿主解析后传进来。端口形态与 `/setup` 一致，少一套心智。
 
 ### 3.7 失败语义
 
