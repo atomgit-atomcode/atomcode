@@ -45,7 +45,7 @@ use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
 
 /// Resolve the LLM gateway base URL for CodingPlan-managed providers, used
-/// when the `models-v2` payload doesn't carry a per-model `base_url`.
+/// when the `models-v3` payload doesn't carry a per-model `base_url`.
 ///
 /// Resolved by [`atomcode_config::endpoints::codingplan_llm_base_url`]: the
 /// `ATOMCODE_CODINGPLAN_LLM_BASE_URL` override, else the deployment profile's
@@ -674,7 +674,7 @@ pub fn run(
         });
     }
 
-    // Decide the plan_type to send to /models-v2. Three sources:
+    // Decide the plan_type to send to /models-v3. Three sources:
     //   * Fresh `Ok` claim: use the tier the cascade landed on.
     //   * `Skipped` (server returned `duplicate=true` at one of the
     //     tiers): step_claim picked the tier it stopped at; we don't
@@ -937,12 +937,12 @@ fn step_models_and_register(
             );
         }
     };
-    let all_models = match client.list_models_v2(plan_type) {
+    let all_models = match client.list_models_v3(plan_type) {
         Ok(v) => v,
         Err(e) => {
             let auth_expired = is_auth_expired(&e);
             return (
-                StepResult::Err(format!("list models-v2: {:#}", e)),
+                StepResult::Err(format!("list models-v3: {:#}", e)),
                 auth_expired,
             );
         }
@@ -996,7 +996,34 @@ fn step_models_and_register(
         .iter()
         .map(|m| m.display_model_name.clone())
         .collect();
-    let provider_names = provider_names_for(&names);
+    // Per-entry explicit `provider_account` wins when the server sends one.
+    // The provider (selection) name is the composite `{account}-{model}` so
+    // several models can share one explicit account without id collisions;
+    // the fold layer strips the model suffix to recover the account id.
+    // Absent keeps the historical `AtomGit` / `AtomGit-{display_model_name}`
+    // naming so older payloads and existing users are unaffected.
+    let provider_names: Vec<String> = available
+        .iter()
+        .map(|m| {
+            m.provider_account
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| {
+                    format!("{}-{}", name, sanitize_model_for_name(&m.display_model_name))
+                })
+                .unwrap_or_else(|| {
+                    if available.len() == 1 {
+                        provider_prefix().to_string()
+                    } else {
+                        format!(
+                            "{}-{}",
+                            provider_prefix(),
+                            sanitize_model_for_name(&m.display_model_name)
+                        )
+                    }
+                })
+        })
+        .collect();
     for (pname, m) in provider_names.iter().zip(available.iter()) {
         let pc = build_codingplan_provider(m);
         config.providers.insert(pname.clone(), pc);
@@ -1425,7 +1452,7 @@ fn sanitize_model_for_name(model: &str) -> String {
 /// Build a ProviderConfig from a model-list entry. The server's
 /// per-model fields take precedence; missing fields fall back to the
 /// historical fallbacks ([`codingplan_llm_base_url`] / `PROVIDER_TYPE`), and the
-/// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v2`
+/// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v3`
 /// payloads without the new columns continue to work without code changes.
 ///
 /// `api_key` is carried through only when the payload supplies one, for a
@@ -1452,7 +1479,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         ),
         system_prompt: None,
         // Prefer the gateway's explicit per-model capability. `None` is kept
-        // for older models-v2 payloads so the existing model-name heuristic
+        // for older models-v3 payloads so the existing model-name heuristic
         // remains the backward-compatible fallback at provider resolution.
         supports_vision: entry.supports_vision,
         user_agent: None,
@@ -1504,7 +1531,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
     }
 }
 
-/// Resolve the effective image-input capability advertised by models-v2.
+/// Resolve the effective image-input capability advertised by models-v3.
 /// An explicit server value is authoritative; older payloads without the field
 /// retain the historical model-name heuristic.
 fn model_entry_supports_vision(entry: &ModelEntry) -> bool {
@@ -1789,7 +1816,7 @@ mod tests {
     fn build_provider_uses_canonical_defaults() {
         // All optional server fields missing → fall back to the
         // historical constants. Pins the back-compat path for
-        // older `models-v2` builds that don't yet emit `base_url`,
+        // older `models-v3` builds that don't yet emit `base_url`,
         // `type`, or `context_window`.
         let p = build_codingplan_provider(&entry("foo/bar"));
         assert_eq!(p.provider_type, "openai");
@@ -1819,7 +1846,7 @@ mod tests {
         assert_eq!(glm.reasoning_effort_levels, None);
     }
 
-    // models-v2 now advertises per-model `reasoning_effort_levels`. A NON-EMPTY server
+    // models-v3 now advertises per-model `reasoning_effort_levels`. A NON-EMPTY server
     // list is persisted verbatim and overrides the client builtin (deepseek -> [high,max]);
     // an EMPTY list means "no effort switching" and falls back to the builtin (which is
     // None for a non-builtin model), never persisting a bare empty vec.
@@ -1852,7 +1879,7 @@ mod tests {
         );
     }
 
-    // The exact models-v2 payload shape from the (pre-prod) gateway must deserialize,
+    // The exact models-v3 payload shape from the (pre-prod) gateway must deserialize,
     // carrying `reasoning_effort_levels` through to the `ModelEntry`.
     #[test]
     fn model_entry_deserializes_server_reasoning_effort_levels() {
@@ -2079,6 +2106,7 @@ mod tests {
             is_atomcode_exclusive: 1,
             display_model_name: "GLM-5.1".into(),
             base_url: Some("https://custom.example.com/v1".into()),
+            provider_account: None,
             provider_type: Some("claude".into()),
             context_window: Some(128_000),
             max_tokens: Some(4096),
@@ -3332,7 +3360,7 @@ mod tests {
 
     #[test]
     fn a_payload_without_the_key_column_still_deserializes() {
-        // Older / hosted `models-v2` responses have no such field.
+        // Older / hosted `models-v3` responses have no such field.
         let e: super::super::types::ModelEntry =
             serde_json::from_value(serde_json::json!({"display_model_name": "GLM-5.2"})).unwrap();
         assert_eq!(e.api_key, None);
