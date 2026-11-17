@@ -3,6 +3,7 @@ import { useState, useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import { getModels, ModelInfo, postLiveReasoningEffort, ReasoningEffortError } from '../api';
 import { useT } from '../settings';
 import { displayedModel, type RuntimeModelIdentity } from '../lib/modelIdentity';
+import { useComposerToolbarHold } from '../lib/composerFocus';
 import { MsgKey } from '../i18n';
 
 // Endpoint-declared reasoning effort levels. `null` returns to the model's
@@ -72,6 +73,7 @@ export function ModelSelector({
   const [effortOverride, setEffortOverride] = useState<string | null | undefined>(undefined);
   const ref = useRef<HTMLDivElement>(null);
   const [effortDraft, setEffortDraft] = useState<string | null | undefined>(undefined);
+  const toolbarHold = useComposerToolbarHold();
 
   const [popupStyle, setPopupStyle] = useState<{position: 'fixed'; left: string; right: string; width: string; top: string; bottom: string; maxHeight: string} | undefined>();
   useLayoutEffect(() => {
@@ -213,6 +215,10 @@ export function ModelSelector({
       {currentTurn && current && <span class="model-next-turn" role="status">{t('model.nextTurnStatus', {current:currentTurn.model??currentTurn.provider, next:current.model})}</span>}
       <div class="model-selector unified-model-selector model-selector-up" ref={ref}>
         <button class="model-selector-trigger" title={current?.model} aria-expanded={open || effortOpen}
+          // Keeps the mobile composer expanded while the trigger is pressed — see lib/composerFocus.
+          onPointerDown={toolbarHold.onPointerDown}
+          onPointerUp={toolbarHold.onPointerUp}
+          onPointerCancel={toolbarHold.onPointerCancel}
           onClick={() => {
             if (open || effortOpen) { setOpen(false); setEffortOpen(false); }
             else if (current?.effort_applicable) setEffortOpen(true);

@@ -62,3 +62,22 @@ test('mobile composer isolates selectors from the send tap target', () => {
   assert.match(css, /\.input-footer-actions \.model-selector-trigger,[\s\S]*?min-height:\s*44px;/);
   assert.match(css, /padding:\s*6px 8px max\(8px, env\(safe-area-inset-bottom\)\);/);
 });
+
+test('every mobile collapse rule keeps a held toolbar and an open popup visible', () => {
+  const css = readFileSync(join(root, 'src/styles/app.css'), 'utf8');
+
+  // The collapsed toolbar is what swallows a tap on iOS Safari: the field
+  // blurs, the toolbar collapses, and the control under the finger becomes
+  // display:none before its click is dispatched. Two guards keep it reachable:
+  // the hold marker, and an open popup belonging to any toolbar control.
+  const collapseRules = css.match(/\.input-box\.can-collapse[^{]*/g) ?? [];
+  assert.ok(collapseRules.length > 0, 'the mobile collapse rules exist');
+  for (const rule of collapseRules) {
+    assert.match(rule, /:not\(\.toolbar-held\)/, `a collapse rule must exclude the held marker: ${rule}`);
+    assert.match(
+      rule,
+      /:not\(:has\(\.model-dropdown, \.attach-popover\)\)/,
+      `a collapse rule must exclude an open toolbar popup: ${rule}`,
+    );
+  }
+});

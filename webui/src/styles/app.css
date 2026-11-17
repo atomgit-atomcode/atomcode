@@ -4121,16 +4121,17 @@ body {
 
 @media (max-width: 768px) {
   /* Only populated conversations collapse; the empty landing keeps its full composer.
-     Focus or an open model popup keeps the toolbar visible, including while a
-     saving/disabled effort button temporarily loses focus. */
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) {
+     Focus or an open popup keeps the toolbar visible, including while a
+     saving/disabled effort button temporarily loses focus. Both the model and
+     the mode menu count: each sits in the toolbar the tap just revealed. */
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 4px;
     padding: 2px 6px;
   }
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .message-input {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .message-input {
     grid-column: 1;
     grid-row: 1;
     height: 44px !important; /* overrides a previous multiline inline height */
@@ -4139,26 +4140,26 @@ body {
     padding: 10px 4px;
     overflow: hidden;
   }
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .input-footer,
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .input-footer-actions {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-footer,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-footer-actions {
     display: contents;
   }
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .input-footer-primary,
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .mode-selector,
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .model-controls,
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .session-reference-chips,
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .input-turn-controls > .btn-send {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-footer-primary,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .mode-selector,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .model-controls,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .session-reference-chips,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-turn-controls > .btn-send {
     display: none;
   }
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) .input-turn-controls {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-turn-controls {
     grid-column: 2;
     grid-row: 1;
   }
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)):not(.is-running) .input-turn-controls {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held):not(.is-running) .input-turn-controls {
     display: none;
   }
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) ~ .input-subbar,
-  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.unified-model-selector .model-dropdown)) ~ .turn-stats {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) ~ .input-subbar,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) ~ .turn-stats {
     display: none;
   }
 }
