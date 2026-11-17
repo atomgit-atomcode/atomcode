@@ -4,7 +4,7 @@
 
 **Goal:** 让从 Claude Code / Codex 迁来的用户，用一条命令看清「我的资产 AtomCode 已经能用哪些、哪些能带走、哪些带不走」，并能把 provider 账号逐项确认后搬进 `config.toml`。
 
-**Architecture:** 新增 `atomcode-capabilities::migration` 模块（中立、只读、feature `migration`、**不依赖 `atomcode-config`**），把外部 Agent 的资产分成 `Active` / `Imported` / `Actionable` / `Blocked` 四态产出结构化报告；文案走 `atomcode-i18n` 的 product 表。CLI 加 `atomcode import` 子命令（扫描 + `--apply` 写入），TUI 加 `/import` 命令，通过一个镜像 `/setup` 的端口 trait 向宿主要数据。
+**Architecture:** 新增 `atomcode-capabilities::migration` 模块（中立、只读、feature `migration`），把外部 Agent 的资产分成 `Active` / `Imported` / `Actionable` / `Blocked` 四态产出结构化报告；「是否真的生效」由**真加载器**（instructions / skills / mcp / permission rules）判定，id 与 endpoint 的归一规则与写入方**共用** `atomcode-config` 的同一条；文案走 `atomcode-i18n` 的 product 表。CLI 加 `atomcode import` 子命令（扫描 + `--apply` 写入），TUI 加 `/import` 命令，通过一个镜像 `/setup` 的端口 trait 向宿主要数据。
 
 **Tech Stack:** Rust 1.94；`serde` / `serde_json` / `toml`；`atomcode-capabilities`（feature `migration`）、`atomcode-config`（`ProviderBook`）、`atomcode-i18n`（product 词表）、`atomcode-tui`（`CommandSet` + 端口）、`atomcode-cli`（clap 子命令）。
 
@@ -140,7 +140,9 @@ cargo fmt --all -- --check
 | `crates/atomcode-tui/src/commands.rs` | `/import` 命令集（新增 `ImportCommands`） |
 | `crates/atomcode-cli/src/tui_migration.rs` | 端口实现：调 capabilities 扫描，转成 TUI 视图类型 |
 
-**分层约束（`gates/layers.sh` 守）：** `migration` feature **不得**引 `atomcode-config`（用不到：报告只需要 `ProductDirs`，而它就在 capabilities 本 crate 里；config 是**写入**那一侧，只归宿主）；`atomcode-tui` **不得**引 `atomcode-coding` / `atomcode`（门禁的「UI 不认 Host,也不认 Product」）；`atomcode-i18n` 必须零 atomcode 依赖（「词表是叶子」）。
+**分层约束（`gates/layers.sh` 守）：** `atomcode-tui` **不得**引 `atomcode-coding` / `atomcode`（门禁的「UI 不认 Host,也不认 Product」）；`atomcode-i18n` 必须零 atomcode 依赖（「词表是叶子」）。
+
+`migration` feature **要**引 `atomcode-config`：写入方会归一账号 id 与 endpoint，报告不跟着归一，回检就永远对不上 —— 规则必须**共用同一条**，不能各写一份。capabilities→config 这条边**本来就有**（`provider` / `mcp` / `instructions` / `session` 等 feature 都拉它），所以门禁并不因此改变；门禁禁的是 `atomcode-tui → atomcode-coding / atomcode`。
 
 ---
 
@@ -224,21 +226,45 @@ Expected: FAIL —— `cannot find module migration` / `unresolved import`。
 # blocked. Read-only; the provider-account draft it produces is written by the
 # host, never here.
 #
-# Deliberately does NOT pull `atomcode-config`: the report needs the product's
-# trees, and `ProductDirs` already lives in THIS crate (`product_dirs.rs`) —
-# the host passes it in. Keeping the edge out means this module stays usable
-# without the config leaf.
-migration = ["tools", "dep:atomcode-i18n", "dep:toml"]
+# It DOES pull `atomcode-config`, for two reasons: the id and the endpoint
+# have to be normalised by the SAME rule the writer uses (otherwise the
+# re-check never matches), and the real loaders' verdicts are what say
+# "already in effect". `ProductDirs` lives in THIS crate (`product_dirs.rs`),
+# so the trees still cost no dependency.
+migration = [
+    "tools",
+    "instructions",
+    "mcp",
+    "skills",
+    "dep:atomcode-i18n",
+    "dep:atomcode-config",
+    "dep:toml",
+]
 ```
 
-> **`tools` 是为了复用真实验证器**，不是为了拿工具能力：判定「这个权限文件我们的加载器会不会拒绝」要用**同一个**规则解析器
-> （`crate::tools::permission_rules::PermissionRules::parse`，
-> `tools/permission_rules.rs:370`）。自己再写一份校验，迟早与真加载器不一致 ——
-> 而「说生效、其实不生效」正是这个报告最不能有的错。
+> **这些 feature 都是为了复用真实验证器**，不是为了拿能力。报告里「已经生效」这句话，
+> 只能由**真的加载器**说出来 —— 自己再写一份校验，迟早与真加载器不一致，而
+> 「说生效、其实不生效」正是这个报告最不能有的错：
 >
-> `tools` 已在 default features 里（`Cargo.toml`：`default = ["provider", "tools"]`），
-> CLI 与 TUI 本来就有，**不新增传递依赖**；而且 `tools` **不引 `atomcode-config`**，
-> 所以 capabilities→config 的边仍然没有。
+> | feature | 复用什么 | 用来判什么 |
+> |---|---|---|
+> | `instructions` | `crate::instructions::load_instructions` | 指令文件是 `Loaded` / `Empty` / `Unreadable` / `Shadowed` 中的哪一个 |
+> | `skills` | `crate::skills::SkillRegistry` | 这个技能**是不是**在生效的那一个（同名的另一个目录会覆盖它） |
+> | `mcp` | `crate::mcp::parse_mcp_servers` | 整个 MCP 文件我们的加载器会不会拒绝 |
+> | `tools` | `crate::tools::permission_rules::PermissionRules::parse` | 权限文件里的规则我们的加载器会不会拒绝 |
+> | `dep:atomcode-config` | `provider_book::account_id_for` / `effective_endpoint` | 账号 id 与 endpoint **写成什么样**（写入方会归一，报告不归一就对不上） |
+>
+> **不新增传递依赖**：`tools` 在 default features 里；`instructions` / `mcp` /
+> `session` 各自已经拉 `atomcode-config`，CLI 与 TUI 本来就有；
+> `skills` 不拉任何东西。capabilities→config 这条边**本来就有**（`provider`、
+> `notify`、`setup`、`mcp`、`instructions`、`session`、`offline` 都拉），
+> 所以 `gates/layers.sh` 的分层规则并不因此改变 —— 那条门禁禁的是
+> `atomcode-tui → atomcode-coding / atomcode`，不是 capabilities→config。
+>
+> 之前这里写着「migration 不引 atomcode-config」，那是基于一个**错误前提**：
+> 以为 UI 不能碰 config。实际上 TUI 的依赖图里本来就有 config（经 `mcp` /
+> `instructions` / `session`），门禁也没有这条限制。现在要引，是因为**写入方会
+> 归一 id 与 endpoint**，报告不跟着归一，回检就永远对不上。
 
 `toml` 与 `atomcode-i18n` 已是 optional 依赖（第 130 / 23 行），**不要**再往 `[dependencies]` 加。
 
@@ -442,42 +468,236 @@ pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>> {
 
 /// Scan every source. A source that finds nothing contributes no rows.
 ///
-/// **Provider rows come from the drafts, not from the scan.** The re-check
-/// compares a row against what is in OUR config by account id, so the row's
-/// name has to BE that id. A row named "provider" (Claude) or "config.toml"
-/// (Codex) could never match, and the re-check would never fire — so the
-/// provider rows are added here, from the same drafts the importer uses.
+/// Only `detect()` is called here. The provider rows are part of what a
+/// source detects — they are added by that source's own `detect()`, from the
+/// same drafts the importer uses (Task 6). So this function needs no draft
+/// machinery, and Task 1 stands on its own.
 pub fn scan(sources: &[Box<dyn MigrationSource>], ctx: &ScanContext) -> MigrationReport {
     let mut report = MigrationReport::default();
     for source in sources {
         let assets = source.detect(ctx);
-        let drafts = source.provider_drafts(ctx);
-        if assets.is_empty() && drafts.is_empty() {
+        if assets.is_empty() {
             continue;
-        }
-        let mut rows = assets;
-        // One row per provider draft. The row's NAME is the account id — the
-        // same id the importer will write — so the re-check can match it.
-        for draft in drafts {
-            rows.push(AssetReport {
-                kind: AssetKind::ProviderConfig,
-                name: draft.id.clone(),
-                path: draft.source_path.clone(),
-                scope: AssetScope::User,
-                status: AssetStatus::Actionable,
-                detail: super::text::provider_copyable(
-                    draft.base_url.as_deref(),
-                    draft.api_key.as_ref().map(|k| k.kind()),
-                ),
-            });
         }
         report.sources.push(SourceReport {
             source_id: source.id(),
             display_name: source.display_name(),
-            assets: rows,
+            assets,
         });
     }
     report
+}
+
+/// The report row for a provider account.
+///
+/// **The row's NAME is the account id** — the same id the importer will
+/// write. A row named "provider" or "config.toml" could never be matched by
+/// the re-check, and the re-check would never fire. Every source builds its
+/// provider rows through this one function, so the rule lives in one place.
+///
+/// The `detail` is passed in rather than built here: this module has no
+/// sentence of its own, and the source that found the account knows which
+/// wording applies to it.
+pub fn provider_row(
+    draft: &ProviderAccountDraft,
+    status: AssetStatus,
+    detail: String,
+) -> AssetReport {
+    AssetReport {
+        kind: AssetKind::ProviderConfig,
+        name: draft.id.clone(),
+        path: draft.source_path.clone(),
+        scope: draft.scope,
+        status,
+        detail,
+    }
+}
+
+/// Whether a protocol id names a wire format we do not speak.
+///
+/// `protocol_for` returns `unsupported:<source>:<wire_api>` for one, and
+/// such an account must never be imported: `ProviderBook::create_account`
+/// resolves an unknown preset to `openai-compatible`
+/// (`config/provider_preset.rs:381`), so the import would silently succeed
+/// with the WRONG wire protocol.
+pub fn is_unsupported_protocol(protocol: &str) -> bool {
+    protocol.starts_with("unsupported:")
+}
+
+/// What the real instruction loader makes of ONE instruction file.
+///
+/// The loader is the only thing that knows the order, what "shadowed" means,
+/// and that an empty file is `Empty` rather than `Loaded` (`instructions.rs:173`).
+/// So the report asks it, rather than re-deriving those rules — a
+/// hand-rolled check is exactly how a report ends up saying "already in
+/// effect" about a file that is not.
+///
+/// `None` when the loader does not know this file at all — it is not an
+/// instruction file, or it is not in the project tier.
+fn instruction_verdict(
+    ctx: &ScanContext,
+    path: &std::path::Path,
+) -> Option<InstructionVerdict> {
+    // The loader wants the product tree as the "home" (`instructions.rs:105`).
+    let loaded = crate::instructions::load_instructions(ctx.product.user(), &ctx.project);
+    let source = loaded
+        .sources
+        .into_iter()
+        .find(|source| source.path == path)?;
+    Some(InstructionVerdict {
+        name: source
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path: source.path,
+        scope: AssetScope::Project,
+        state: source.state,
+    })
+}
+
+/// One instruction file, and what the loader said about it.
+struct InstructionVerdict {
+    name: String,
+    path: std::path::PathBuf,
+    scope: AssetScope,
+    state: crate::instructions::InstructionState,
+}
+
+/// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
+///
+/// A directory that does not exist is simply empty. A directory that exists
+/// but cannot be read is NOT empty — it is a problem the person should see,
+/// so it becomes a `Blocked` row rather than silence.
+///
+/// **Whether the asset is really in effect is decided by the real registry**,
+/// not by "the file exists". Two things make existence insufficient: a
+/// `SKILL.md` that fails to parse is skipped (`registry.rs:262`), and a skill
+/// with the same name in an earlier directory **overrides** this one
+/// (`registry.rs:250` records "overridden by …"). A report that says "already
+/// in the skill catalog" about an overridden file is wrong.
+fn skill_rows(
+    kind: AssetKind,
+    scope: AssetScope,
+    root: &Path,
+    registry: &SkillTruth,
+) -> Vec<AssetReport> {
+    let mut out = Vec::new();
+    if !root.is_dir() {
+        return out;
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            out.push(AssetReport {
+                kind,
+                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                path: root.to_path_buf(),
+                scope,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&error.to_string()),
+            });
+            return out;
+        }
+    };
+    // An entry that cannot be read is a row, not a silent skip: a skill we
+    // could not look at is one we could not promise works.
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                out.push(AssetReport {
+                    kind,
+                    name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    path: root.to_path_buf(),
+                    scope,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&error.to_string()),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_skill = path.is_dir() && path.join("SKILL.md").is_file();
+        let is_command = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
+        if !is_skill && !is_command {
+            continue;
+        }
+        let (status, detail) = registry.verdict(&name, &path);
+        out.push(AssetReport {
+            kind,
+            name,
+            path,
+            scope,
+            status,
+            detail,
+        });
+    }
+    out
+}
+
+/// What the real skill registry makes of the skills we found.
+///
+/// The registry is loaded ONCE per scan, from the same directory list our own
+/// loader uses (`standard_skill_dirs`), so it sees the same collisions the
+/// runtime will see.
+struct SkillTruth {
+    /// The `SKILL.md` (or command file) each loaded skill came from.
+    loaded: Vec<std::path::PathBuf>,
+    /// The files the registry rejected, with the reason.
+    rejected: Vec<(std::path::PathBuf, String)>,
+}
+
+impl SkillTruth {
+    /// Load the registry the way the runtime does.
+    fn load(ctx: &ScanContext) -> Self {
+        let roots = crate::skills::SkillRoots {
+            home: &ctx.os_home,
+            project: &ctx.project,
+            dirs: &ctx.product,
+        };
+        let dirs = crate::skills::standard_skill_dirs(roots);
+        let registry = crate::skills::SkillRegistry::load_with_explicit(&dirs, &[]);
+        let loaded = registry
+            .all()
+            .iter()
+            .map(|skill| skill.source_path.clone())
+            .collect();
+        let rejected = registry
+            .diagnostics()
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.warning)
+            .map(|diagnostic| (diagnostic.path, diagnostic.reason))
+            .collect();
+        Self { loaded, rejected }
+    }
+
+    /// Whether this file is the one that is actually in effect.
+    fn verdict(&self, name: &str, path: &Path) -> (AssetStatus, String) {
+        let file = if path.is_dir() {
+            path.join("SKILL.md")
+        } else {
+            path.to_path_buf()
+        };
+        if let Some((_, reason)) = self
+            .rejected
+            .iter()
+            .find(|(rejected, _)| *rejected == file)
+        {
+            return (AssetStatus::Blocked, super::text::skill_rejected(reason));
+        }
+        if self.loaded.contains(&file) {
+            return (AssetStatus::Active, super::text::skill_active());
+        }
+        // The file exists but is not the one in effect — another directory
+        // has a skill of the same name and wins.
+        (
+            AssetStatus::Blocked,
+            super::text::skill_overridden(name),
+        )
+    }
 }
 ```
 
@@ -534,6 +754,8 @@ impl MigrationSource for CodexSource {
 ```rust
 //! Provider accounts found in another agent's configuration. Filled in by Task 6.
 
+use super::report::AssetScope;
+
 /// How a credential is referenced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKeyRef {
@@ -559,12 +781,18 @@ impl ApiKeyRef {
 /// A provider account an external agent has configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountDraft {
-    /// The id the account would get.
+    /// **The id the account WILL get** — already normalised by
+    /// `account_id_for`, the same rule the writer uses. It is not the raw
+    /// source id: `create_account` sanitises the name and may prefix it, so
+    /// a draft built on the raw name would never be found again.
     pub id: String,
     /// A preset or protocol id (`openai-compatible`, `anthropic-compatible`,
     /// `openai-responses`).
     pub protocol: String,
-    /// The endpoint, when the source named one.
+    /// The endpoint as it will be **stored** — normalised by
+    /// `effective_endpoint`, so it is `None` when the endpoint is the
+    /// protocol's own default (the writer stores nothing in that case).
+    /// The endpoint in USE is `endpoint_in_use(protocol, base_url)`.
     pub base_url: Option<String>,
     /// The credential, when the source named one.
     pub api_key: Option<ApiKeyRef>,
@@ -573,6 +801,9 @@ pub struct ProviderAccountDraft {
     /// Where this account was configured — the file it was read from. The
     /// report shows it, so a person can see WHICH file to look at.
     pub source_path: std::path::PathBuf,
+    /// Whether the account came from the person's own tree or from the
+    /// current project. A project provider is not the user's provider.
+    pub scope: AssetScope,
 }
 ```
 
@@ -593,7 +824,7 @@ come over). \"Compatible\" and \"needs conversion\" cannot say whether a
 lost session history is recoverable, and that is the thing a person needs
 to know before deciding.
 
-The feature does not pull atomcode-config, so the screen may use it."
+The feature pulls atomcode-config, which the screen already has transitively."
 ```
 
 ---
@@ -768,23 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_in_the_user_settings_is_reported() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(
-            &home.path().join(".claude").join("settings.json"),
-            r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_API_KEY":"sk-x"}}"#,
-        );
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let provider = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::ProviderConfig)
-            .expect("the provider is reported");
-        assert_eq!(provider.status, AssetStatus::Actionable);
-    }
-
-    #[test]
     fn an_actionable_row_names_the_path_to_copy_it_to() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -890,34 +1104,43 @@ impl MigrationSource for ClaudeSource {
         let mut out = Vec::new();
         let user = ctx.os_home.join(".claude");
         let project_claude = ctx.project.join(".claude");
+        // Loaded ONCE per scan: the registry is what decides whether a skill
+        // is really in effect.
+        let skills = SkillTruth::load(ctx);
 
-        // Instructions. The project one is read as-is — but only if it is the
-        // one that WINS: the project tier takes the first existing name in
+        // Instructions. The verdict comes from the **real loader** —
+        // `crate::instructions::load_instructions` — not from a hand-rolled
+        // "is it empty / is it shadowed" check. The loader knows the whole
         // order (`.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`, `CLAUDE.md`,
-        // `claude.md` — `instructions.rs:17`), so a `CLAUDE.md` next to an
-        // `AGENTS.md` is never loaded. Reporting it as "already in effect"
-        // would be a lie, so a shadowed file says so instead.
+        // `claude.md` — `instructions.rs:17`), what "shadowed" means, and that
+        // an empty file loads as `Empty` rather than `Loaded`
+        // (`instructions.rs:173`). Re-implementing those rules is how a report
+        // ends up saying "already in effect" about a file that is not.
         let project_instructions = ctx.project.join("CLAUDE.md");
-        if project_instructions.is_file() {
-            let shadowed_by = higher_precedence_instruction(&ctx.project);
-            let (status, detail) = match shadowed_by {
-                Some(other) => (
+        if let Some(source) = super::instruction_verdict(ctx, &project_instructions) {
+            let (status, detail) = match source.state {
+                crate::instructions::InstructionState::Loaded => {
+                    (AssetStatus::Active, super::text::instructions_active())
+                }
+                crate::instructions::InstructionState::Shadowed => (
                     AssetStatus::Blocked,
-                    super::text::instructions_shadowed(&other),
+                    super::text::instructions_shadowed(&source.name),
                 ),
-                // An EMPTY file loads as `Empty`, not `Loaded`
-                // (`instructions.rs:173`), so nothing is applied from it.
-                None if is_empty_file(&project_instructions) => (
+                crate::instructions::InstructionState::Empty => {
+                    (AssetStatus::Blocked, super::text::instructions_empty())
+                }
+                crate::instructions::InstructionState::Unreadable => (
                     AssetStatus::Blocked,
-                    super::text::instructions_empty(),
+                    super::text::unreadable_file("the file could not be read"),
                 ),
-                None => (AssetStatus::Active, super::text::instructions_active()),
+                // A file that is not there is not an asset at all.
+                crate::instructions::InstructionState::Missing => continue,
             };
             out.push(AssetReport {
                 kind: AssetKind::Instructions,
-                name: "CLAUDE.md".into(),
-                path: project_instructions,
-                scope: AssetScope::Project,
+                name: source.name,
+                path: source.path,
+                scope: source.scope,
                 status,
                 detail,
             });
@@ -945,7 +1168,7 @@ impl MigrationSource for ClaudeSource {
                 (AssetScope::User, user.join(dir)),
                 (AssetScope::Project, project_claude.join(dir)),
             ] {
-                out.extend(skill_rows(kind, scope, &root));
+                out.extend(skill_rows(kind, scope, &root, &skills));
             }
         }
 
@@ -1095,10 +1318,23 @@ impl MigrationSource for ClaudeSource {
             }
         }
 
-        // The provider row is NOT added here: `scan()` adds one row per
-        // provider draft, so the row's name is the account id the importer
-        // will write. A row named "provider" could never be matched by the
-        // re-check.
+        // The provider rows. They come from the drafts, so the row's NAME is
+        // the account id the importer will write — a row named "provider"
+        // could never be matched by the re-check.
+        //
+        // In THIS task `provider_drafts` is still the default (empty), so no
+        // provider row appears yet; Task 6 fills the drafts in and the rows
+        // appear with it.
+        for draft in self.provider_drafts(ctx) {
+            out.push(super::provider_row(
+                &draft,
+                AssetStatus::Actionable,
+                super::text::provider_copyable(
+                    draft.base_url.as_deref(),
+                    draft.api_key.as_ref().map(|k| k.kind()),
+                ),
+            ));
+        }
 
         // Subagent definitions: our role files need frontmatter Claude's
         // subagent files do not have, so they cannot come over.
@@ -1194,115 +1430,12 @@ impl MigrationSource for ClaudeSource {
     }
 }
 
-/// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
-///
-/// A directory that does not exist is simply empty. A directory that exists
-/// but cannot be read is NOT empty — it is a problem the person should see,
-/// so it becomes a `Blocked` row rather than silence.
-fn skill_rows(kind: AssetKind, scope: AssetScope, root: &Path) -> Vec<AssetReport> {
-    let mut out = Vec::new();
-    if !root.is_dir() {
-        return out;
-    }
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            out.push(AssetReport {
-                kind,
-                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                path: root.to_path_buf(),
-                scope,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&error.to_string()),
-            });
-            return out;
-        }
-    };
-    // An entry that cannot be read is a row, not a silent skip: a skill we
-    // could not look at is one we could not promise works.
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                out.push(AssetReport {
-                    kind,
-                    name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                    path: root.to_path_buf(),
-                    scope,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&error.to_string()),
-                });
-                continue;
-            }
-        };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_skill = path.is_dir() && path.join("SKILL.md").is_file();
-        let is_command = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
-        if !is_skill && !is_command {
-            continue;
-        }
-        out.push(AssetReport {
-            kind,
-            name,
-            path,
-            scope,
-            status: AssetStatus::Active,
-            detail: super::text::skill_active(),
-        });
-    }
-    out
-}
-
-/// Whether a file has no content to apply.
-///
-/// An empty instruction file loads as `Empty`, not `Loaded`
-/// (`instructions.rs:173`), so it contributes nothing — "already in effect"
-/// would overstate it.
-fn is_empty_file(path: &Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(body) => body.trim().is_empty(),
-        // Unreadable is not empty; the caller reports it as unreadable.
-        Err(_) => false,
-    }
-}
-
-/// The instruction file that wins over `CLAUDE.md` in the project tier, if any.
-///
-/// The project tier takes the **first existing** name in order
-/// (`.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`, `CLAUDE.md`, `claude.md` —
-/// `instructions.rs:17`), and only that one is loaded. So a `CLAUDE.md` that
-/// sits next to an `AGENTS.md` is never read, and the report has to say so
-/// rather than call it "already in effect".
-fn higher_precedence_instruction(project: &Path) -> Option<String> {
-    for name in [".atomcode.md", "ATOMCODE.md", "AGENTS.md"] {
-        if project.join(name).is_file() {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
 
 /// How many `mcpServers` a JSON file declares.
 ///
 /// `Ok(0)` means the file parsed and declares none. `Err` means the file could
 /// not be read or parsed — which is **not** the same as "there are none", and
 /// the report says so instead of quietly showing nothing.
-fn mcp_server_count(path: &Path) -> Result<usize, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    // Our loader strips comments before parsing (`mcp/config.rs:624`:
-    // `serde_json::from_str(&crate::jsonc::strip_comments(content))`), because
-    // these files are hand-edited. Parsing them WITHOUT stripping would call
-    // a perfectly good file broken — and report it as `Blocked`.
-    let value: serde_json::Value = serde_json::from_str(&crate::jsonc::strip_comments(&raw))
-        .map_err(|e| e.to_string())?;
-    Ok(value
-        .get("mcpServers")
-        .and_then(|s| s.as_object())
-        .map(|o| o.len())
-        .unwrap_or(0))
-}
-
 /// Whether a settings file declares hooks. `Err` means it could not be read
 /// or parsed — again, not the same as "there are none".
 fn settings_hooks(path: &Path) -> Result<bool, String> {
@@ -1330,6 +1463,12 @@ fn parse_json(path: &Path) -> Result<serde_json::Value, String> {
 /// The check reuses the same rule parser our loader uses, so the two cannot
 /// drift.
 fn permission_rules_are_valid(value: &serde_json::Value) -> bool {
+    // The top level must be an object (`permission_settings.rs:328`: "expected
+    // a JSON object"). A `[]`, `null` or a scalar has no `permissions` key,
+    // so without this check it would sail through as valid.
+    if !value.is_object() {
+        return false;
+    }
     let rules = value.get("permissions");
     let Some(rules) = rules else {
         // No `permissions` key at all: nothing to reject.
@@ -1371,30 +1510,33 @@ fn permission_rules_are_valid(value: &serde_json::Value) -> bool {
     invalid.is_empty()
 }
 
-/// Whether our own loader would ACCEPT this MCP file.
+/// What our own loader makes of this MCP file.
 ///
-/// A server with neither `command` nor `url` fails the whole file
-/// (`mcp/config.rs:670-673`), so none of its servers would run.
+/// **This calls the real loader** — `crate::mcp::parse_mcp_servers` — rather
+/// than re-checking the shape by hand. The loader does typed deserialization,
+/// `requirements::validate` for experimental capabilities, and HTTP auth
+/// validation; a hand-rolled check that only looked for `command`/`url` would
+/// call a file "in effect" that the loader rejects.
+///
+/// The loader also reads the legacy `servers` key as an alias for
+/// `mcpServers` (`mcp/config.rs:140`), so counting is left to it too.
 fn mcp_servers_are_valid(path: &Path) -> Result<bool, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&crate::jsonc::strip_comments(&raw))
-        .map_err(|e| e.to_string())?;
-    let Some(servers) = value.get("mcpServers").and_then(|s| s.as_object()) else {
-        return Ok(true);
-    };
-    for (name, entry) in servers {
-        let Some(entry) = entry.as_object() else {
-            return Ok(false);
-        };
-        let has_command = entry.get("command").and_then(|v| v.as_str()).is_some();
-        let has_url = entry.get("url").and_then(|v| v.as_str()).is_some();
-        if !has_command && !has_url {
-            // "MCP server '{name}' must have either 'command' (stdio) or
-            // 'url' (http)" — the loader's own message.
-            return Ok(false);
-        }
+    match crate::mcp::parse_mcp_servers(&raw, crate::mcp::McpConfigSource::Project) {
+        Ok(_) => Ok(true),
+        Err(error) => Err(error.to_string()),
     }
-    Ok(true)
+}
+
+/// How many MCP servers a file declares — and how many of them are ENABLED.
+///
+/// A disabled server is configured but not running, so it must not be counted
+/// as "in effect" (`mcp/config.rs:320` filters `!c.disabled`).
+fn mcp_server_count(path: &Path) -> Result<usize, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let servers = crate::mcp::parse_mcp_servers(&raw, crate::mcp::McpConfigSource::Project)
+        .map_err(|e| e.to_string())?;
+    Ok(servers.iter().filter(|server| !server.disabled).count())
 }
 
 /// The provider Claude was pointed at, and how its credential is written.
@@ -1478,6 +1620,12 @@ pub fn instructions_empty() -> String {
 pub fn skill_active() -> String {
     t(Msg::MigrationSkillActive).into_owned()
 }
+pub fn skill_rejected(reason: &str) -> String {
+    t(Msg::MigrationSkillRejected { reason }).into_owned()
+}
+pub fn skill_overridden(name: &str) -> String {
+    t(Msg::MigrationSkillOverridden { name }).into_owned()
+}
 pub fn permissions_active() -> String {
     t(Msg::MigrationPermissionsActive).into_owned()
 }
@@ -1549,6 +1697,12 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
     },
     MigrationInstructionsEmpty,
     MigrationSkillActive,
+    MigrationSkillRejected {
+        reason: &'a str,
+    },
+    MigrationSkillOverridden {
+        name: &'a str,
+    },
     MigrationPermissionsActive,
     MigrationPermissionsCopyable {
         target: &'a str,
@@ -1594,6 +1748,13 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
             "The file is empty, so nothing is loaded from it".into()
         }
         Msg::MigrationSkillActive => "Read directly — already in the skill catalog".into(),
+        Msg::MigrationSkillRejected { reason } => {
+            format!("Our loader rejects this skill: {reason}").into()
+        }
+        Msg::MigrationSkillOverridden { name } => {
+            format!("Another skill named {name} takes precedence — this one is not in effect")
+                .into()
+        }
         Msg::MigrationPermissionsActive => {
             "Merged into this project's permission rules — already in effect".into()
         }
@@ -1647,6 +1808,12 @@ pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> Stri
         }
         Msg::MigrationInstructionsEmpty => "这个文件是空的，因此没有加载任何内容".into(),
         Msg::MigrationSkillActive => "直接读取 —— 已在技能目录里".into(),
+        Msg::MigrationSkillRejected { reason } => {
+            format!("我们的加载器会拒绝这个技能：{reason}").into()
+        }
+        Msg::MigrationSkillOverridden { name } => {
+            format!("另一个名为 {name} 的技能优先 —— 这个没有生效").into()
+        }
         Msg::MigrationPermissionsActive => "已并入本项目的权限规则 —— 已经生效".into(),
         Msg::MigrationPermissionsCopyable { target } => {
             format!("复制到 {target} 后即成为全局权限规则").into()
@@ -1874,16 +2041,37 @@ impl MigrationSource for CodexSource {
             });
         }
 
-        // Project-level instructions: the open standard, so we read them.
+        // Project-level instructions: the open standard, so we read them —
+        // but the SAME real loader decides, so an `AGENTS.md` that is empty,
+        // unreadable, or shadowed by a higher-priority file is not called
+        // "already in effect". The verdict comes from the loader, not from a
+        // hand-rolled check that could drift from it.
         let project_agents = ctx.project.join("AGENTS.md");
-        if project_agents.is_file() {
+        if let Some(source) = super::instruction_verdict(ctx, &project_agents) {
+            let (status, detail) = match source.state {
+                crate::instructions::InstructionState::Loaded => {
+                    (AssetStatus::Active, super::text::instructions_active())
+                }
+                crate::instructions::InstructionState::Shadowed => (
+                    AssetStatus::Blocked,
+                    super::text::instructions_shadowed(&source.name),
+                ),
+                crate::instructions::InstructionState::Empty => {
+                    (AssetStatus::Blocked, super::text::instructions_empty())
+                }
+                crate::instructions::InstructionState::Unreadable => (
+                    AssetStatus::Blocked,
+                    super::text::unreadable_file("the file could not be read"),
+                ),
+                crate::instructions::InstructionState::Missing => continue,
+            };
             out.push(AssetReport {
                 kind: AssetKind::Instructions,
-                name: "AGENTS.md".into(),
-                path: project_agents,
-                scope: AssetScope::Project,
-                status: AssetStatus::Active,
-                detail: super::text::instructions_active(),
+                name: source.name,
+                path: source.path,
+                scope: source.scope,
+                status,
+                detail,
             });
         }
 
@@ -1968,8 +2156,8 @@ impl MigrationSource for CodexSource {
                             ),
                         });
                     }
-                    // The provider rows are added by `scan()` from the
-                    // drafts — one row per account, named by its id.
+                    // The provider rows are added below, from the drafts —
+                    // one row per account, named by its id.
                 }
                 None => {
                     out.push(AssetReport {
@@ -1982,6 +2170,24 @@ impl MigrationSource for CodexSource {
                     });
                 }
             }
+        }
+
+        // The provider rows. They come from the drafts, so the row's NAME is
+        // the account id the importer will write — a row named "config.toml"
+        // could never be matched by the re-check.
+        //
+        // In THIS task `provider_drafts` is still the default (empty), so no
+        // provider row appears yet; Task 6 fills the drafts in and the rows
+        // appear with it.
+        for draft in self.provider_drafts(ctx) {
+            out.push(super::provider_row(
+                &draft,
+                AssetStatus::Actionable,
+                super::text::provider_copyable(
+                    draft.base_url.as_deref(),
+                    draft.api_key.as_ref().map(|k| k.kind()),
+                ),
+            ));
         }
 
         // Sessions.
@@ -2079,13 +2285,13 @@ pub fn unreadable_config() -> String {
 ```rust
         Msg::MigrationSkillCopyable { target } => {
             format!("复制到 {target} 后即可加载").into()
-        },
-        Msg::MigrationProviderCopyable { base_url, key } => {
-            format!("其中的 provider 设置可以导入（endpoint {base_url}，凭据 {key}）—— 写入前请先确认")
-                .into()
         }
         Msg::MigrationUnreadableConfig => "这个配置文件无法解析，因此其中内容都没读到".into(),
 ```
+
+> `MigrationProviderCopyable` **不在这里加** —— Task 2 已经加过这条臂（它服务的是
+> Claude 与 Codex 两个来源的 provider 行），再加一次就是**重复的 match 臂**，
+> 编译不过（E0081）。
 
 - [ ] **Step 5: 跑测试确认通过**
 
@@ -2186,11 +2392,12 @@ fn status_word(status: AssetStatus) -> String {
 /// person has no way to tell "not yet imported" from "already imported but
 /// different".
 ///
-/// Only the **non-secret** parts are compared — protocol, endpoint and the
-/// model list. A credential is compared by KIND (a reference to a variable
-/// against a reference to a variable), never by value: reading our own
-/// credential to compare it would put a secret in memory for no reason, and
-/// the file's credential may legitimately have been rotated since.
+/// Compared: protocol, endpoint, model list, and the credential's KIND.
+///
+/// The credential is compared by KIND (a reference to a variable against a
+/// reference to a variable), never by value: reading our own credential to
+/// compare it would put a secret in memory for no reason, and the file's
+/// credential may legitimately have been rotated since.
 pub fn mark_already_imported(
     report: &mut MigrationReport,
     drafts: &[ProviderAccountDraft],
@@ -2226,10 +2433,11 @@ pub fn mark_already_imported(
 
 /// Whether OUR account is the same account as the draft.
 ///
-/// Only the **non-secret** parts are compared — protocol, endpoint and the
-/// model list. A credential is never compared by value: the file's credential
-/// may legitimately have been rotated since, and reading it to compare it
-/// would put a secret in memory for no reason.
+/// Compared: protocol, endpoint, model list, and the credential's KIND.
+///
+/// The credential is never compared by value: the file's credential may
+/// legitimately have been rotated since, and reading it to compare it would
+/// put a secret in memory for no reason.
 ///
 /// **The protocol is compared exactly.** `openai-compatible` is a real preset
 /// id, not a wildcard: an account speaking the Responses API is a different
@@ -2239,14 +2447,37 @@ fn same_account(
     models: &std::collections::HashMap<String, atomcode_config::config::ModelProfileConfig>,
     draft: &ProviderAccountDraft,
 ) -> bool {
+    // Both sides are the STORED form: the account's `base_url` is `None`
+    // when it follows the protocol's default, and the draft's is `None` for
+    // the same reason (`effective_endpoint`).
     let same_endpoint = account.base_url.as_deref() == draft.base_url.as_deref();
     let same_protocol = account.provider == draft.protocol;
     let same_models = draft.models.iter().all(|model| {
         models
             .values()
-            .any(|m| m.model == *model && m.account == draft.id)
+            .any(|m| m.model.trim() == model.trim() && m.account == draft.id)
     });
-    same_endpoint && same_protocol && same_models
+    // The credential is compared by **KIND**, never by value: a reference to
+    // a variable is the same kind of credential as another reference, and a
+    // literal is the same kind as another literal — but the value itself is
+    // never read, because the file's key may legitimately have been rotated
+    // since, and reading it would put a secret in memory for no reason.
+    let same_credential = same_credential_kind(account.api_key.as_deref(), &draft.api_key);
+    same_endpoint && same_protocol && same_models && same_credential
+}
+
+/// Whether our stored credential is the same KIND as the draft's.
+///
+/// Our stored form is `${NAME}` for a reference and the secret itself for a
+/// literal, so the kind is readable from the shape — without touching a
+/// secret's value beyond looking at its first character.
+fn same_credential_kind(stored: Option<&str>, draft: &Option<ApiKeyRef>) -> bool {
+    let stored_is_reference = stored.is_some_and(|key| key.starts_with("${"));
+    match draft {
+        None => stored.is_none(),
+        Some(ApiKeyRef::EnvVar(_)) => stored_is_reference,
+        Some(ApiKeyRef::Plaintext(_)) => stored.is_some() && !stored_is_reference,
+    }
 }
 
 /// Where to look. The host resolves these; the capability resolves nothing.
@@ -2363,6 +2594,7 @@ mod tests {
             api_key: None,
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -2404,6 +2636,7 @@ mod tests {
             api_key: None,
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -2710,8 +2943,34 @@ pub struct MigrationSourceView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationAssetView {
     pub name: String,
-    pub status: String,
+    /// The status, as the four-state vocabulary. The screen renders it with
+    /// the SAME shared product message the CLI uses, so the two cannot say
+    /// the same state two ways.
+    pub status: AssetStatusView,
     pub detail: String,
+}
+
+/// The status of one asset, as the screen sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetStatusView {
+    Active,
+    Imported,
+    Actionable,
+    Blocked,
+}
+
+/// The word a status shows as.
+///
+/// The **product** table, not the screen table: the CLI says the same state
+/// with the same words, and one thing must not be said two ways.
+fn status_word(status: AssetStatusView) -> String {
+    use crate::i18n::product::{t, Msg};
+    match status {
+        AssetStatusView::Active => t(Msg::MigrationStatusActive).into_owned(),
+        AssetStatusView::Imported => t(Msg::MigrationStatusImported).into_owned(),
+        AssetStatusView::Actionable => t(Msg::MigrationStatusActionable).into_owned(),
+        AssetStatusView::Blocked => t(Msg::MigrationStatusBlocked).into_owned(),
+    }
 }
 
 /// Read the assets another agent left behind.
@@ -2724,8 +2983,13 @@ pub trait Migration: Send + Sync {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo check -p atomcode-tui`
-Expected: FAIL —— `migration` 模块未声明。
+Run: `cargo nextest run -p atomcode-tui migration`
+
+Expected: FAIL —— `/import` 还没注册，判据找不到这个命令。
+
+> **不是** `cargo check` 失败：一个还没被声明、也没被引用的源文件**不会**让
+> `cargo check` 失败 —— 它根本没进编译。所以这条判据必须是**跑起来的**：
+> 它断言 `/import` 出现在 `/help` 里、且渲染出报告，命令没注册就必然失败。
 
 - [ ] **Step 3: 声明模块**
 
@@ -2787,10 +3051,13 @@ fn render_import_report(report: &crate::migration::MigrationReportView) -> Strin
         out.push('\n');
         for asset in &source.assets {
             // The status word is part of what the row means, so it is shown —
-            // the CLI shows it too, and the two must not differ.
+            // and it comes from the SAME shared product message the CLI uses,
+            // so the two cannot say the same state two ways.
             out.push_str(&format!(
-                "  {} [{}] — {}\n",
-                asset.name, asset.status, asset.detail
+                "  [{}] {} — {}\n",
+                status_word(asset.status),
+                asset.name,
+                asset.detail
             ));
         }
     }
@@ -2910,7 +3177,9 @@ impl Migration for DiskMigration {
             .iter()
             .flat_map(|source| source.provider_drafts(&ctx))
             .collect();
-        atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &self.config_path);
+        // `crate::` — this file IS the `atomcode` library, so `atomcode::`
+        // does not resolve here.
+        crate::import_cmd::mark_already_imported(&mut report, &drafts, &self.config_path);
         Ok(MigrationReportView {
             sources: report
                 .sources
@@ -2923,7 +3192,20 @@ impl Migration for DiskMigration {
                         .into_iter()
                         .map(|asset| MigrationAssetView {
                             name: asset.name,
-                            status: format!("{:?}", asset.status).to_lowercase(),
+                            status: match asset.status {
+                                atomcode_capabilities::migration::AssetStatus::Active => {
+                                    AssetStatusView::Active
+                                }
+                                atomcode_capabilities::migration::AssetStatus::Imported => {
+                                    AssetStatusView::Imported
+                                }
+                                atomcode_capabilities::migration::AssetStatus::Actionable => {
+                                    AssetStatusView::Actionable
+                                }
+                                atomcode_capabilities::migration::AssetStatus::Blocked => {
+                                    AssetStatusView::Blocked
+                                }
+                            },
                             detail: asset.detail,
                         })
                         .collect(),
@@ -2948,6 +3230,12 @@ impl Migration for DiskMigration {
 ```
 
 > 字段类型是 `Option<Arc<dyn Migration>>`，所以要 `Arc::new(...)` 包起来 —— 直接传 `DiskMigration` 类型对不上。
+
+> **这一项要放在 `setup:` 与 `dirs:` 之前。** 结构体是逐字段书写的，而
+> `setup: Some(crate::tui_setup::DiskSetup::new(working_dir, dirs.clone(), config_path))`
+> **移走**了 `working_dir` 与 `config_path`，`dirs: Some(dirs)` 又移走了 `dirs`。
+> 迁移这一项排在其后就用不了这些值了 —— 报「use of moved value」。
+> 放在前面，它 `clone()` 到的就是还没被移走的那一份。
 
 `crates/atomcode-tui/src/launch.rs` 的 `pub struct Ports` 加字段：
 
@@ -3038,10 +3326,46 @@ disk. Same shape as /setup."
 ## Task 6: provider 映射（中立草案）
 
 **Files:**
+- Modify: `crates/atomcode-config/src/provider_book.rs`（把归一规则公开出来）
 - Modify: `crates/atomcode-capabilities/src/migration/provider.rs`
 - Modify: `crates/atomcode-capabilities/src/migration/claude.rs`
 - Modify: `crates/atomcode-capabilities/src/migration/codex.rs`
 - Modify: `crates/atomcode-capabilities/src/migration/mod.rs`
+
+**先做 config 那一处**（其余步骤都依赖它）：把写入方的两条归一规则公开出来，
+让报告和写入方**共用同一条**，而不是各写一份必然漂移的：
+
+`crates/atomcode-config/src/provider_book.rs` —— `base_id` 与
+`endpoint_override` 现在是私有的（`:700` 与 `:785`）。各加一个公开包装：
+
+```rust
+/// The id an account with this name would get.
+///
+/// The same rule `create_account` applies, so a caller that needs to refer
+/// to an account before it exists (a migration report, say) names it the
+/// way it will be written.
+///
+/// `None` when the name cannot become an account at all.
+pub fn account_id_for(name: &str) -> Result<String, BookError> {
+    base_id(name)
+}
+
+/// The endpoint worth storing for this protocol.
+///
+/// `None` when the endpoint is empty or is the protocol's own default — the
+/// same rule `create_account` applies.
+pub fn effective_endpoint(protocol: &str, endpoint: &str) -> Option<String> {
+    endpoint_override(endpoint, protocol).map(str::to_string)
+}
+```
+
+> `base_id` 与 `endpoint_override` **本身不动** —— 只加包装，所以写入方的行为
+> 一字不变，报告这边却能拿到同一条规则。
+>
+> `base_id` 返回 `Result`，因为名字为空或全是无法归一的字符时会
+> `BookError::NameRules`（`:703`）—— 那种名字**根本不能成为账号**，报告要把它
+> 标成 `Blocked`，不是硬造一个 id。
+
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -3134,6 +3458,38 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_in_the_user_settings_is_reported_as_a_row_named_by_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_API_KEY":"sk-x"}}"#,
+        )
+        .unwrap();
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: project.path().to_path_buf(),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+        };
+
+        // The row comes from the draft, so the row's NAME is the account id —
+        // that is what the re-check matches on.
+        let report = super::super::scan(
+            &[Box::new(super::super::claude::ClaudeSource)],
+            &ctx,
+        );
+        let row = report.sources[0]
+            .assets
+            .iter()
+            .find(|a| a.kind == AssetKind::ProviderConfig)
+            .expect("the provider is reported");
+        assert_eq!(row.name, "claude", "the row is named by the account id");
+        assert_eq!(row.status, AssetStatus::Actionable);
+    }
+
+    #[test]
     fn no_provider_configuration_means_no_drafts() {
         let home = tempfile::tempdir().unwrap();
         let ctx = ScanContext {
@@ -3172,25 +3528,31 @@ mod tests {
         )
         .unwrap();
 
-        let merged =
-            super::super::codex::merge_codex_configs(&[user_config, project_config]);
-        let (provider, _) = merged
-            .providers
-            .get("gateway")
-            .expect("the provider is merged");
+        // Asserted through the PUBLIC surface: `merge_codex_configs` and the
+        // merged struct are private to `codex.rs`, and a sibling module's
+        // test cannot reach them.
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: project.path().to_path_buf(),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+        };
+        let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
+        let draft = drafts
+            .iter()
+            .find(|d| d.id == "gateway")
+            .expect("the provider is merged into one draft");
         assert_eq!(
-            provider.get("base_url").and_then(|v| v.as_str()),
+            draft.base_url.as_deref(),
             Some("https://project.invalid/v1"),
             "the project's value wins"
         );
         assert_eq!(
-            provider.get("env_key").and_then(|v| v.as_str()),
-            Some("GW_TOKEN"),
+            draft.api_key,
+            Some(ApiKeyRef::EnvVar("GW_TOKEN".into())),
             "the inherited credential is NOT dropped"
         );
         assert_eq!(
-            provider.get("wire_api").and_then(|v| v.as_str()),
-            Some("responses"),
+            draft.protocol, "openai-responses",
             "the inherited protocol is NOT dropped"
         );
     }
@@ -3290,6 +3652,57 @@ pub fn unsupported_protocol(source: &str, wire_api: &str) -> String {
     format!("unsupported:{source}:{wire_api}")
 }
 
+/// The id the importer will give this account.
+///
+/// **The writer normalizes the name**, so the report must use the SAME id:
+/// `ProviderBook::create_account` runs the name through `base_id`
+/// (`provider_book.rs:700`), which sanitises it and prefixes `custom-` when
+/// it belongs to CodingPlan. A report built on the raw source id would never
+/// match the account on the next run — the re-check would keep saying
+/// "can be brought over" about an account that is already there.
+///
+/// `base_id` is made **public** for this (`pub fn account_id_for`), so there is
+/// **one** rule, not two that can drift.
+pub fn account_id_for(name: &str) -> Option<String> {
+    match atomcode_config::provider_book::account_id_for(name) {
+        Ok(id) => Some(id),
+        // An unusable name cannot become an account at all.
+        Err(_) => None,
+    }
+}
+
+/// The endpoint as it will be **stored**.
+///
+/// `endpoint_override` (`provider_book.rs:785`) trims the endpoint and stores
+/// NOTHING when it equals the protocol's own default — so a file does not pin
+/// a URL that should follow the build. Comparing the raw source endpoint
+/// against the stored one would never match: the account ends up with
+/// `base_url = None` while the draft still says the default URL.
+///
+/// `endpoint_override` is made **public** for this (`pub fn effective_endpoint`).
+pub fn effective_endpoint(protocol: &str, endpoint: Option<&str>) -> Option<String> {
+    let endpoint = endpoint?.trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+    let default = atomcode_config::config::provider_preset::preset(protocol)
+        .and_then(|preset| preset.default_base_url);
+    (Some(endpoint) != default).then(|| endpoint.to_string())
+}
+
+/// The endpoint the account will actually talk to.
+///
+/// The stored form may be `None` — that means "follow the protocol's
+/// default" — but the person still needs to see WHICH endpoint that is.
+pub fn endpoint_in_use(protocol: &str, endpoint: Option<&str>) -> Option<String> {
+    if let Some(stored) = effective_endpoint(protocol, endpoint) {
+        return Some(stored);
+    }
+    atomcode_config::config::provider_preset::preset(protocol)
+        .and_then(|preset| preset.default_base_url)
+        .map(str::to_string)
+}
+
 /// Read Claude's `env` block out of its settings file.
 pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
     let raw = std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()?;
@@ -3332,13 +3745,31 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
         if base_url.is_none() && key.is_none() {
             return Vec::new();
         }
+        // **Claude with only a key and no endpoint was talking to Anthropic
+        // itself.** It gets the `anthropic` preset, which HAS a default
+        // endpoint (`config/provider_preset.rs:352`). With the
+        // `anthropic-compatible` preset — which has NO default endpoint
+        // (`:86`) — the write would fail with `ProtocolNeedsEndpoint` for a
+        // perfectly ordinary configuration.
+        //
+        // With an explicit `ANTHROPIC_BASE_URL` it is a custom endpoint, so
+        // `anthropic-compatible` is right.
+        let protocol = if base_url.is_some() {
+            super::provider::protocol_for("claude-code", None)
+        } else {
+            "anthropic".to_string()
+        };
         vec![ProviderAccountDraft {
-            id: "claude".into(),
-            protocol: super::provider::protocol_for("claude-code", None),
-            base_url,
+            // The id the account will get, not the raw name.
+            id: super::provider::account_id_for("claude")
+                .unwrap_or_else(|| "claude".into()),
+            protocol: protocol.clone(),
+            // The endpoint as it will be stored.
+            base_url: super::provider::effective_endpoint(&protocol, base_url.as_deref()),
             api_key: key,
             models: Vec::new(),
             source_path: ctx.os_home.join(".claude").join("settings.json"),
+            scope: AssetScope::User,
         }]
     }
 ```
@@ -3354,14 +3785,20 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
         // project over user — otherwise the same provider id appears twice and
         // the second one is a conflict instead of an override.
         let merged = merge_codex_configs(&[
-            ctx.os_home.join(".codex").join("config.toml"),
-            ctx.project.join(".codex").join("config.toml"),
+            (
+                ctx.os_home.join(".codex").join("config.toml"),
+                super::report::AssetScope::User,
+            ),
+            (
+                ctx.project.join(".codex").join("config.toml"),
+                super::report::AssetScope::Project,
+            ),
         ]);
 
         let mut drafts: Vec<ProviderAccountDraft> = merged
             .providers
             .into_iter()
-            .map(|(name, (provider, source_path))| {
+            .map(|(name, (provider, source_path, scope))| {
                 let base_url = provider
                     .get("base_url")
                     .and_then(|v| v.as_str())
@@ -3372,13 +3809,20 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
                     .and_then(|v| v.as_str())
                     .filter(|v| !v.trim().is_empty())
                     .map(|name| ApiKeyRef::EnvVar(name.to_string()));
+                let protocol = super::provider::protocol_for(
+                    "codex",
+                    provider.get("wire_api").and_then(|v| v.as_str()),
+                );
                 ProviderAccountDraft {
-                    id: name.clone(),
-                    protocol: super::provider::protocol_for(
-                        "codex",
-                        provider.get("wire_api").and_then(|v| v.as_str()),
+                    // The id the account will get, not the raw name.
+                    id: super::provider::account_id_for(&name)
+                        .unwrap_or_else(|| name.clone()),
+                    protocol: protocol.clone(),
+                    // The endpoint as it will be stored.
+                    base_url: super::provider::effective_endpoint(
+                        &protocol,
+                        base_url.as_deref(),
                     ),
-                    base_url,
                     api_key: key,
                     source_path: source_path.clone(),
                     // The model belongs to the provider that was actually
@@ -3388,6 +3832,9 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
                     } else {
                         Vec::new()
                     },
+                    // The scope the config was read at: a provider from the
+                    // project's config is not the person's own provider.
+                    scope,
                 }
             })
             .filter(|draft| draft.base_url.is_some() || draft.api_key.is_some())
@@ -3413,9 +3860,13 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 /// Codex's layered config, merged the way Codex itself layers it: the
 /// project's file wins over the user's, key by key.
 struct MergedCodexConfig {
-    /// Provider id -> the provider's table AND the file it was read from, so
-    /// the report can show which file to look at.
-    providers: std::collections::BTreeMap<String, (toml::Value, std::path::PathBuf)>,
+    /// Provider id -> the provider's table, the file it was read from, and
+    /// the scope it was read at — so the report can show which file to look
+    /// at, and a project provider is not reported as the person's own.
+    providers: std::collections::BTreeMap<
+        String,
+        (toml::Value, std::path::PathBuf, super::report::AssetScope),
+    >,
     /// The provider the person selected, if the config names one.
     model_provider: Option<String>,
     /// The model the person was using.
@@ -3424,17 +3875,30 @@ struct MergedCodexConfig {
 
 /// Merge the config files in order — later files win.
 ///
+/// Each file comes with the scope it was read at, so a provider that came
+/// from the project's config is not reported as the person's own.
+///
 /// **Tables are merged key by key, not replaced.** Codex merges its config
 /// layers recursively (`codex-rs/config/src/merge.rs:59`, `merge_toml_values`
 /// walks into nested tables), so a project file that overrides only
 /// `base_url` under a provider id keeps the `env_key` and `wire_api` the user
 /// file set. Replacing the whole table would drop the credential — the very
 /// thing the person most needs to keep.
-fn merge_codex_configs(paths: &[std::path::PathBuf]) -> MergedCodexConfig {
-    let mut providers = std::collections::BTreeMap::new();
+fn merge_codex_configs(
+    files: &[(
+        std::path::PathBuf,
+        super::report::AssetScope,
+    )],
+) -> MergedCodexConfig {
+    // The type is spelled out: `and_modify` below needs to know what the
+    // value is.
+    let mut providers: std::collections::BTreeMap<
+        String,
+        (toml::Value, std::path::PathBuf, super::report::AssetScope),
+    > = std::collections::BTreeMap::new();
     let mut model_provider = None;
     let mut model = None;
-    for path in paths {
+    for (path, scope) in files {
         let Ok(raw) = std::fs::read_to_string(path) else {
             continue;
         };
@@ -3445,8 +3909,15 @@ fn merge_codex_configs(paths: &[std::path::PathBuf]) -> MergedCodexConfig {
             for (name, provider) in table {
                 providers
                     .entry(name.clone())
-                    .and_modify(|existing| merge_table(&mut existing.0, provider))
-                    .or_insert_with(|| (provider.clone(), path.clone()));
+                    .and_modify(|existing| {
+                        merge_table(&mut existing.0, provider);
+                        // The overlay file is now the one that decides this
+                        // provider's values — so it is also the file the report
+                        // should point at.
+                        existing.1 = path.clone();
+                        existing.2 = *scope;
+                    })
+                    .or_insert_with(|| (provider.clone(), path.clone(), *scope));
             }
         }
         if let Some(selected) = value.get("model_provider").and_then(|v| v.as_str()) {
@@ -3468,8 +3939,10 @@ fn merge_codex_configs(paths: &[std::path::PathBuf]) -> MergedCodexConfig {
 /// A scalar in the overlay replaces the base's; a table in the overlay is
 /// merged into the base's table rather than replacing it.
 fn merge_table(base: &mut toml::Value, overlay: &toml::Value) {
+    // Reborrow, so `base` is still usable in the `else` arm below — matching
+    // on `(base, overlay)` would MOVE the reference and leave it unusable.
     let (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) =
-        (base, overlay)
+        (&mut *base, overlay)
     else {
         // Not a table: the overlay wins outright.
         *base = overlay.clone();
@@ -3531,6 +4004,7 @@ host can ask about that single item before writing it."
             )),
             models: vec!["gpt-x".into()],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         };
         let written =
             super::write_account(&config, &draft, true).expect("the account is written");
@@ -3560,6 +4034,7 @@ host can ask about that single item before writing it."
             )),
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         };
         let error = super::write_account(&config, &draft, true)
             .expect_err("a key with a dollar sign cannot be written");
@@ -3583,6 +4058,7 @@ host can ask about that single item before writing it."
             )),
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         };
         let error =
             super::write_account(&config, &draft, false).expect_err("a secret needs a yes");
@@ -3609,6 +4085,7 @@ host can ask about that single item before writing it."
             api_key: None,
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         };
         let error =
             super::write_account(&config, &draft, true).expect_err("the id is taken");
@@ -3656,6 +4133,7 @@ host can ask about that single item before writing it."
             api_key: key,
             models: vec![],
             source_path: "/home/u/.codex/config.toml".into(),
+            scope: AssetScope::User,
         }
     }
 
@@ -3778,13 +4256,12 @@ Expected: FAIL —— `write_account` 不存在。
 `import_cmd.rs` 加：
 
 ```rust
-// `ProviderAccountDraft` 已经由 Task 4 的 import 引入了 —— **把它加进那一条**，
-// 不要在这里再写一条同名 import（同名 import 编译不过）。
-use atomcode_capabilities::migration::ApiKeyRef;
 use atomcode_config::provider_book::{AccountInput, BookError, ModelInput, ProviderBook};
 ```
 
-Task 4 那一条 import 因此变成：
+**`ApiKeyRef` 与 `ProviderAccountDraft` 已经在 Task 4 的那一条 import 里** ——
+不要在这里再写一条同名 import（同名 import 编译不过，E0252）。Task 4 那一条
+import 因此是：
 
 ```rust
 use atomcode_capabilities::migration::{
@@ -3849,7 +4326,7 @@ pub fn write_account(
             // rather than written, because the file would then mean two
             // things: `resolved_api_key` expands any `$` in it, and a live
             // environment variable of the same name wins over the literal.
-            if secret.contains('$') {
+            if secret.trim().contains('$') {
                 return Err(format!(
                     "{}: this key contains `$`, which the config would expand — set it by hand \
                      instead",
@@ -3866,14 +4343,22 @@ pub fn write_account(
             // platform fallbacks (`provider.rs:375`) instead of treating the
             // configured string as the literal it is. So an empty variable of
             // the same name still makes the value ambiguous.
-            if std::env::var(secret).is_ok() {
+            //
+            // The check uses the **trimmed** value, because that is what gets
+            // stored: `written_key` trims it (`provider_book.rs:753`). A value
+            // of `" GW_TOKEN "` would be stored as `GW_TOKEN` — so checking
+            // the padded string would miss that `GW_TOKEN` is a live
+            // variable, and the file would end up holding a reference where a
+            // literal was meant.
+            let stored = secret.trim();
+            if std::env::var(stored).is_ok() {
                 return Err(format!(
                     "{}: an environment variable of the same name is set, so this key cannot be \
                      written unambiguously — rename the variable or set the key by hand",
                     draft.id
                 ));
             }
-            Some(secret.clone())
+            Some(stored.to_string())
         }
     };
     let base_url = draft.base_url.as_deref().unwrap_or_default();
@@ -3907,6 +4392,17 @@ pub fn write_account(
         key: key.as_deref(),
         exact_id: true,
     };
+    // An unsupported wire protocol is refused **before** the write.
+    // `create_account` resolves an unknown preset to `openai-compatible`
+    // (`config/provider_preset.rs:381`), so the import would otherwise
+    // succeed — against the wrong wire format, and with the file now
+    // claiming a protocol it does not speak.
+    if atomcode_capabilities::migration::is_unsupported_protocol(&draft.protocol) {
+        return Err(format!(
+            "{}: this endpoint speaks a protocol we do not support ({}) — not imported",
+            draft.id, draft.protocol
+        ));
+    }
     match book.create_account(&input, &models) {
         Ok((id, _)) => Ok(id),
         Err(BookError::IdTaken(name)) => {
@@ -4280,6 +4776,16 @@ Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `C
 
 所以 `--apply` 的验收用**人工夹具**：一个临时的源目录 + 一个临时的目标配置，两个都不碰真实家目录。
 
+**先编出要验的那个二进制**：`PATH` 上的 `atomcode` 可能是装好的旧版 —— 拿它验收等于验了别的东西。
+
+```bash
+cargo build -p atomcode-cli
+BIN="$(pwd)/target/debug/atomcode"
+```
+
+**在临时目录里跑**，这样当前仓库的 `.codex/config.toml`（本仓库有 `AGENTS.md`，
+也可能有自己的配置）不会混进「隔离」的夹具里：
+
 ```bash
 # 1. 造一个假的源：一个只有变量名（没有明文密钥）的 provider
 src=$(mktemp -d)
@@ -4294,10 +4800,11 @@ TOML
 dst=$(mktemp -d)
 printf '[provider_accounts.existing]\nprovider = "openai-compatible"\n' > "$dst/config.toml"
 
-# 3. 用 HOME 指过去跑（扫描读的是 OS 家目录）
+# 3. 在一个**空的项目目录**里跑，HOME 指过去，配置指向临时文件
 #    注意：`--config` 是**顶层**参数，不带 `global = true`（`main.rs:646`），
 #    所以它必须写在子命令**前面**。
-HOME="$src" atomcode --config "$dst/config.toml" import --apply --yes
+work=$(mktemp -d)
+( cd "$work" && HOME="$src" "$BIN" --config "$dst/config.toml" import --apply --yes )
 
 # 4. 看结果：只有变量名，没有密钥值
 cat "$dst/config.toml"
@@ -4306,9 +4813,27 @@ cat "$dst/config.toml"
 Expected:
 - 退出码 0。
 - `$dst/config.toml` 里有 `[provider_accounts.gateway]`，`api_key` 是 `${ATOMCODE_TEST_GW_TOKEN}`（**变量引用**，不是密钥值）。
-- 原有�� `[provider_accounts.existing]` **还在** —— 导入是追加，不是覆盖。
+- 原有的 `[provider_accounts.existing]` **还在** —— 导入是追加，不是覆盖。
 
-**再跑一次同一条命令**（回检）：Expected: `gateway` 标为 `already imported`，而不是 `can be brought over`；退出码仍为 0，配置**不再被改写**。
+**再跑一次同一条命令**（重复导入 = 幂等）：Expected: 退出码仍为 0，输出说
+`Already there`（**不是**报错），配置**逐字节不变**：
+
+```bash
+before=$(cat "$dst/config.toml")
+( cd "$work" && HOME="$src" "$BIN" --config "$dst/config.toml" import --apply --yes )
+diff <(printf '%s' "$before") "$dst/config.toml" && echo "unchanged"
+```
+
+**再单独跑一次只读报告**（这才是回检那一态）：Expected: `gateway` 标为
+`already imported`，而不是 `can be brought over`。
+
+```bash
+( cd "$work" && HOME="$src" "$BIN" --config "$dst/config.toml" import )
+```
+
+> **为什么报告与 `--apply` 的输出不一样**：重复 `--apply` 说的是「这个账号已经
+> 在配置里了」（因为它**已经写进去了**）；只读报告说的是「这项资产已经导入」
+> （因为**回检**发现我们的配置里已有等价的账号）。两件事，措辞不同是对的。
 
 - [ ] **Step 6: 提交门的结果（若有格式改动）**
 

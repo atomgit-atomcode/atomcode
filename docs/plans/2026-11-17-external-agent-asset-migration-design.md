@@ -81,7 +81,21 @@ crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
 
 - `migration` feature **不依赖 `atomcode-config`**。不是 UI 不许用 config（`gates/layers.sh` 的「UI 不认 Host,也不认 Product」只禁 `atomcode-tui → atomcode-coding / atomcode`；`atomcode-config` 本来就在 TUI 的依赖图里），而是这个模块**用不到**它：报告只需要「我们的树在哪」，而 `ProductDirs` 就在本 crate 里（`product_dirs.rs`），带着它不增依赖。反过来，config 是**写入**的那一侧，只归宿主。
 - `capabilities` **不解析环境**。家目录、项目根由宿主解析后传进来（`AGENTS.md`：「解析环境只在宿主」）。
-- feature 声明：`migration = ["dep:atomcode-i18n", "dep:toml"]`。`toml` 用来读 Codex 的 `config.toml`；`atomcode-i18n` 是零 atomcode 依赖的叶子（`gates/layers.sh` 守它），所以 capabilities 引它不破坏分层（`memory` 模块已是同样做法）。
+- feature 声明：`migration = ["tools", "instructions", "mcp", "skills", "dep:atomcode-i18n", "dep:atomcode-config", "dep:toml"]`。
+
+  这些依赖不是为了拿能力，是为了让「已经生效」这句话**由真加载器说出来**：
+
+  | feature | 复用什么 | 用来判什么 |
+  |---|---|---|
+  | `instructions` | `instructions::load_instructions` | 指令文件是 `Loaded` / `Empty` / `Unreadable` / `Shadowed` 中的哪一个 |
+  | `skills` | `skills::SkillRegistry` | 这个技能**是不是**在生效的那一个（同名的另一个目录会覆盖它） |
+  | `mcp` | `mcp::parse_mcp_servers` | 整个 MCP 文件我们的加载器会不会拒绝 |
+  | `tools` | `tools::permission_rules::PermissionRules::parse` | 权限文件里的规则我们的加载器会不会拒绝 |
+  | `dep:atomcode-config` | `provider_book::account_id_for` / `effective_endpoint` | 账号 id 与 endpoint **写成什么样** |
+
+  自己再写一份校验，迟早与真加载器不一致 —— 而「说生效、其实不生效」正是这个报告最不能有的错。
+
+  `toml` 用来读 Codex 的 `config.toml`。`atomcode-i18n` 是零 atomcode 依赖的叶子（`gates/layers.sh` 守它），所以 capabilities 引它不破坏分层（`memory` 模块已是同样做法）。`atomcode-config` 这条边 capabilities **本来就有**（`provider` / `mcp` / `instructions` / `session` 等 feature 都拉它），门禁也不禁这条 —— 门禁禁的是 `atomcode-tui → atomcode-coding / atomcode`。
 - 报告的**结构化数据**在 capabilities，**文案**在 `atomcode-i18n` 的 **product 表**（CLI、daemon、setup 流程共用那张）。CLI 与 TUI 都读 product 表 → 一件事一种说法，不写两遍。
 
 **i18n 归属**：`capabilities/migration` 用 `atomcode_i18n::product::{t, Msg}` 出文案（与 `setup::SetupReport::render_cli`、`memory` 模块同一做法）。TUI 面板的**边框文案**（标题、空态）走 screen 表。TUI 与 CLI 源码里**不许出现中文字面量**（`gates/tui-i18n.sh` 棘轮，扫 `crates/atomcode-tui/src` 与 `crates/atomcode-cli/src`）。
@@ -206,7 +220,9 @@ pub struct MigrationReport {
 | Codex | `config.toml` → `[model_providers.<id>].base_url` | `provider_accounts.<id>.base_url` |
 | Codex | `config.toml` → `[model_providers.<id>].env_key`（**变量名**） | `provider_accounts.<id>.api_key = "${VAR_NAME}"` |
 | Codex | `config.toml` → `model` | `models.<id>.model` |
-| Codex | `config.toml` → `model_providers.<id>.wire_api` | `provider_accounts.<id>.provider`（`openai-compatible` / `anthropic-compatible`） |
+| Codex | `config.toml` → `model_providers.<id>.wire_api` | `provider_accounts.<id>.provider`（`openai-responses` / `openai-compatible` / `anthropic-compatible`） |
+| Codex | `config.toml` → `[model_providers.<id>].wire_api`（**不认识的**值） | **不导入** —— 报 `Blocked` 并写明是哪个协议。`create_account` 会把未知 preset 静默降级成 `openai-compatible`（`config/provider_preset.rs:381`），那就是「用错的线协议连上了」 |
+| Codex | `config.toml` → `[model_providers.<id>].wire_api`（**没写**） | `openai-responses` —— Codex 的 `WireApi` 默认是 Responses（`codex-rs/model-provider-info/src/lib.rs:117`），不是 chat/completions |
 
 **凭据策略**（四条，不可绕过）：
 
@@ -278,11 +294,18 @@ TUI 通过 `atomcode-tui` 新增的 `migration.rs` 端口 trait（镜像 `setup.
 | `--apply` 时配置已被别的进程改过 | `ProviderBook` 在锁内读最新文档再决策（`provider_book.rs:165` `write_deciding`），**合并**而不是拒绝；只有 id 冲突才拒绝 |
 | `--apply` 遇到带明文密钥的账号 | **每次都问**（`--yes` 也不代替这个确认）；没有终端可问时**不写**，退出码非 0 |
 | `--apply` 遇到写不出唯一含义的密钥 | 拒绝写并说明原因（见 §3.5 第 4 条），退出码非 0 |
-| `--apply` 非交互且无 `--yes` | 带密钥的账号一个都不写；无密钥的账号照写；退出码非 0（因为有东西没导） |
+| `--apply` 遇到我们不会的协议 | 报告 `Blocked` 并写明是哪个协议；**写入前拒绝**，不导入（`create_account` 会把未知 preset 静默降级成 `openai-compatible`，那就是「用错的线协议连上了」） |
+| `--apply` 无终端可问（管道 / CI） | **需要回答的账号一个都不写** —— 没有终端就没有人能回答。只引用变量名、不含密钥的账号**照写**（`--yes` 或有终端时逐条问过）。退出码非 0（因为有东西没导） |
 
 **不静默丢弃**：任何探测到的资产都必须出现在报告里（`Active` / `Imported` / `Actionable` / `Blocked` 四态之一）。这是 Codex 「残留兜底」在 AtomCode 的对应物 —— 我们的版本是「**没有一项资产可以凭空消失**」。
 
-**回检**：`Imported` 那一态就是回检的结果 —— 已经在我们配置里的账号，第二次运行报「已导入」而不是「可以带走」。只比对非密钥部分（协议、endpoint、模型清单）；密钥按**种类**比（引用 vs 引用），不按值比 —— 文件里的密钥可能早就轮换了，拿出来比对既没意义也不该过明文。
+**回检**：`Imported` 那一态就是回检的结果 —— 已经在我们配置里的账号，第二次运行报「已导入」而不是「可以带走」。
+
+比对四样：**协议**、**endpoint**、**模型清单**、**凭据的种类**。
+
+- 协议与 endpoint 都按**写入后的形态**比（写入方会把 id 归一、把「协议自带默认 endpoint」存成 `None`，报告不跟着归一就永远对不上）。
+- 模型名按**去空白后**比（写入方会 `trim`）。
+- 密钥按**种类**比：引用 vs 引用、字面量 vs 字面量，**从不按值比** —— 文件里的密钥可能早就轮换了，读出来比对既没意义也不该让明文过一遍内存。
 
 ### 3.8 文案（i18n）
 
@@ -305,7 +328,7 @@ CLI 与 TUI 都读 product 表 → 一件事一种说法。TUI 源码里**不许
 - 映射往返：外部配置 → 草案 → 写 `config.toml` → 重新加载，**语义等价**；不含真实密钥（用哨兵值）。
 - 环境变量名映射：`env_key = "MY_KEY"` → `api_key = "${MY_KEY}"`（**变量引用**，不是密钥值本身；写成裸名字会被当成密钥）。
 - 明文密钥：不确认不写；确认后只写该项。
-- 非交互无 `--yes`：需要回答的账号**一个都不写**；`config.toml` **字节不变** —— 但这只在**没有可写的账号**时成立。一批里既有需要回答的、又有不需要的，前者被跳过、后者照写，文件就**会变**（变的是被写的那部分）。
+- 无终端可问：需要回答的账号**一个都不写**。`config.toml` **字节不变** —— 但这只在**没有可写的账号**时成立。一批里既有需要回答的、又有不需要的，前者被跳过、后者照写，文件就**会变**（变的是被写的那部分）。
 - 已有同 id 账号：不覆盖，报告冲突。
 
 **门**
