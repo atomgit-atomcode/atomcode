@@ -2464,6 +2464,18 @@ impl UserInterface for Tui {
                                 current_label: pending.label,
                             });
                         }
+                        // This runtime may have changed mode while it was in the
+                        // background, when its host events were not forwarded.
+                        if let Some(control) = client.control() {
+                            if let Ok(HostReply::Mode { mode }) = control
+                                .call(HostCommand::Mode {
+                                    session: session.clone(),
+                                })
+                                .await
+                            {
+                                took_mode(&self.host.moment, &session, mode);
+                            }
+                        }
                         // The session that arrives owes its own first word.
                         // `switch_session` empties the stream (`host.rs`
                         // `switch_view`), so the question below is live again —

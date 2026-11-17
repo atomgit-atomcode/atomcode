@@ -1882,6 +1882,8 @@ impl Host {
         // over the window, which is worse, because a window is what a person
         // picks between.
         m.title = None;
+        // The replacement session's mode is read from its host after switching.
+        m.mode = None;
     }
 
     /// Where the session on screen works, as its host answered: what the status

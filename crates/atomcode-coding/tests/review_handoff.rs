@@ -122,6 +122,13 @@ async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
     })
     .await
     .unwrap();
+    // Auto approval must not widen the host-owned review assignment into
+    // arbitrary shell commands or writes.
+    runtime
+        .handle
+        .set_mode(atomcode_coding::RuntimeMode::Auto)
+        .await
+        .unwrap();
     runtime.handle.submit("Review once.".into()).await.unwrap();
     let reason = loop {
         let event = runtime.events.recv().await.unwrap();

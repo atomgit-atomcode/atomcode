@@ -654,14 +654,21 @@ async fn bg_drop_cancels_a_running_one() {
 /// A later change on the parent never silently raises a child's permissions.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[serial_test::serial(atomcode_home)]
-async fn background_tasks_snapshot_live_permissions_and_reviews_stay_read_only() {
+async fn background_tasks_and_reviews_snapshot_the_parents_live_mode() {
     use atomcode_host_api::Mode;
     for (mode, scope, expected) in [
         (Mode::Auto, None, Mode::Auto),
         (Mode::AcceptEdits, None, Mode::AcceptEdits),
         (Mode::Plan, None, Mode::Plan),
         (Mode::Ask, None, Mode::Ask),
-        (Mode::Auto, Some("working_tree".to_string()), Mode::Plan),
+        (Mode::Auto, Some("working_tree".to_string()), Mode::Auto),
+        (
+            Mode::AcceptEdits,
+            Some("staged".to_string()),
+            Mode::AcceptEdits,
+        ),
+        (Mode::Plan, Some("working_tree".to_string()), Mode::Plan),
+        (Mode::Ask, Some("working_tree".to_string()), Mode::Ask),
     ] {
         let rig = Rig::new().await;
         let parent = rig.client.root();
@@ -704,6 +711,76 @@ async fn background_tasks_snapshot_live_permissions_and_reviews_stay_read_only()
         ));
         rig.quit().await;
     }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn switching_background_sessions_restores_their_actual_mode_badges() {
+    use atomcode_host_api::Mode;
+    let rig = Rig::new().await;
+    rig.term.type_line("parent history");
+    rig.until_screen("answer 1").await;
+    rig.until("parent is idle", |rig| rig.client.root_settled())
+        .await;
+    let parent = rig.client.root();
+    let control = rig.control();
+    control
+        .call(HostCommand::SetMode {
+            session: parent.clone(),
+            mode: Mode::Auto,
+        })
+        .await
+        .unwrap();
+    let HostReply::Backgrounded { session: child, .. } = control
+        .call(HostCommand::StartBackground {
+            text: "slow job".into(),
+            scope: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("background task");
+    };
+    // The parent's later mode change does not change the child. Switching to
+    // either runtime must refresh the badge, even with no new ModeChanged event.
+    control
+        .call(HostCommand::SetMode {
+            session: parent.clone(),
+            mode: Mode::Plan,
+        })
+        .await
+        .unwrap();
+    let shows = |rig: &Rig, badge: &str| {
+        rig.term
+            .text()
+            .lines()
+            .any(|line| line.contains("scripted") && line.contains(badge))
+    };
+    rig.until("parent displays plan", |rig| shows(rig, "plan"))
+        .await;
+    control
+        .call(HostCommand::Foreground {
+            session: parent.clone(),
+            target: child.clone(),
+        })
+        .await
+        .unwrap();
+    rig.until("child displays its inherited auto mode", |rig| {
+        rig.client.root() == child && shows(rig, "auto")
+    })
+    .await;
+    control
+        .call(HostCommand::Foreground {
+            session: child,
+            target: parent.clone(),
+        })
+        .await
+        .unwrap();
+    rig.until("parent displays plan again", |rig| {
+        rig.client.root() == parent && shows(rig, "plan")
+    })
+    .await;
+    rig.quit().await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

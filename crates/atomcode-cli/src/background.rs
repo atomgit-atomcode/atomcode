@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use atomcode_capabilities::session::manager::SessionOrigin;
 use atomcode_coding::front_end::FrontEnd;
-use atomcode_coding::runtime::{RuntimeMode, RuntimePhase, UserInput};
+use atomcode_coding::runtime::{RuntimePhase, UserInput};
 use atomcode_coding::{CodingAgentConfig, CodingRuntime};
 use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
@@ -1769,15 +1769,13 @@ impl Background {
         // Read the live owner's mode, not the launch-time configuration. Take
         // one snapshot for this new task; later changes do not alter it.
         let review_only = scope.is_some() || name.as_deref() == Some("code-review");
-        let mode = if review_only {
-            RuntimeMode::Plan
-        } else {
-            control
-                .runtime()
-                .mode()
-                .await
-                .map_err(crate::host::refused)?
-        };
+        // ReviewHandoffRow confines an unopened review to its read-only reviewer;
+        // its approval mode still follows the conversation that assigned it.
+        let mode = control
+            .runtime()
+            .mode()
+            .await
+            .map_err(crate::host::refused)?;
         // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
         let files = match scope.as_deref() {
             Some(scope) => changed_files(&working_dir, scope).await,
