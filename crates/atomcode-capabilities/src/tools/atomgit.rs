@@ -27,7 +27,6 @@ fn action_of(args: &str) -> Option<String> {
 
 // ─────────────────────────── atomgit_repo ───────────────────────────
 
-#[derive(Deserialize)]
 /// Parse a tool's arguments with duplicate keys resolved last-wins.
 ///
 /// The model (or a middleware merging schema defaults) can emit the same key
@@ -52,6 +51,7 @@ fn write_error_hint(e: String) -> String {
     }
 }
 
+#[derive(Deserialize)]
 struct RepoArgs {
     action: String,
     #[serde(default)]
