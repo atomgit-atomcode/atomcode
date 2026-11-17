@@ -405,7 +405,7 @@ impl MigrationReport {
 //!
 //! The shape follows Codex's `external-agent-migration`: detect, then report,
 //! and never let an asset silently vanish — every asset found ends up in the
-//! report with one of three statuses.
+//! report with one of four statuses.
 //!
 //! Opt-in `migration` feature. See
 //! `docs/plans/2026-11-17-external-agent-asset-migration-design.md`.
@@ -418,6 +418,12 @@ pub mod report;
 use std::path::PathBuf;
 
 pub use provider::{ApiKeyRef, ProviderAccountDraft};
+/// The endpoint an account will actually talk to.
+///
+/// Re-exported because `provider` is a **private** module: the host needs
+/// this to name the endpoint in its confirmation prompt, and the host cannot
+/// reach into a private module.
+pub use provider::endpoint_in_use;
 pub use report::{
     AssetKind, AssetReport, AssetScope, AssetStatus, MigrationReport, SourceReport,
 };
@@ -474,6 +480,16 @@ pub trait MigrationSource: Send + Sync {
     fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
         Vec::new()
     }
+    /// Why the provider accounts could NOT be read, when that is the case.
+    ///
+    /// **Absence and failure are different answers.** A source whose config
+    /// file is broken has NOT "no provider accounts" — it has an unreadable
+    /// file. Without this, `--apply` would print "No provider accounts were
+    /// found" and exit successfully, and the person would never learn their
+    /// config was not read at all.
+    fn provider_drafts_error(&self, _ctx: &ScanContext) -> Option<String> {
+        None
+    }
 }
 
 /// The agents we know how to read.
@@ -529,7 +545,10 @@ pub fn provider_row(
     };
     AssetReport {
         kind: AssetKind::ProviderConfig,
-        name: draft.id.clone(),
+        // The name the SOURCE wrote, not the normalized id: it is what the
+        // person recognises, and it is what tells two colliding definitions
+        // apart.
+        name: draft.source_name.clone(),
         path: draft.source_path.clone(),
         scope: draft.scope,
         status,
@@ -546,6 +565,34 @@ pub fn provider_row(
 /// with the WRONG wire protocol.
 pub fn is_unsupported_protocol(protocol: &str) -> bool {
     protocol.starts_with("unsupported:")
+}
+
+/// Whether this path is a file we can use — and if not, WHY.
+///
+/// `Path::is_file()` collapses every error into `false`: a path we cannot
+/// stat (a parent directory we may not traverse) looks exactly like a path
+/// that is not there. The report would then say "not found" about something
+/// that IS there but unreadable — and the person never learns to look.
+///
+/// `Ok(true)` = a regular file. `Ok(false)` = not there (or not a regular
+/// file). `Err(reason)` = we could not tell.
+fn probe_file(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether this path is a directory we can use — and if not, WHY.
+///
+/// The directory counterpart of [`probe_file`].
+fn probe_dir(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// What the real instruction loader makes of ONE instruction file.
@@ -698,6 +745,13 @@ pub struct ProviderAccountDraft {
     /// source id: `create_account` sanitises the name and may prefix it, so
     /// a draft built on the raw name would never be found again.
     pub id: String,
+    /// The definition's name **as the source wrote it**.
+    ///
+    /// Two definitions in one file can normalise to the same id (`"foo bar"`
+    /// and `"foo-bar"` both become `foo-bar`), so the id alone cannot say
+    /// which definition a row is about. The original name can — and it is
+    /// what the person recognises, so the report shows it.
+    pub source_name: String,
     /// A preset or protocol id (`openai-compatible`, `anthropic-compatible`,
     /// `openai-responses`).
     pub protocol: String,
@@ -744,7 +798,7 @@ Expected: PASS —— Task 1 的三条（报告计数 / 空报告 / 无来源扫
 git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/
 git commit -m "feat(capabilities): add migration module skeleton
 
-The report carries three statuses, not two: Active (we read it today),
+The report carries four statuses, not two: Active (we read it today),
 Actionable (there is a known way to bring it over), Blocked (it cannot
 come over). \"Compatible\" and \"needs conversion\" cannot say whether a
 lost session history is recoverable, and that is the thing a person needs
@@ -778,7 +832,6 @@ mod tests {
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
         }
-        skill_dirs: Vec::new(),
     }
 
     fn skill_at(root: &std::path::Path, name: &str) {
@@ -1083,8 +1136,10 @@ impl MigrationSource for ClaudeSource {
             }
         }
         let user_instructions = user.join("CLAUDE.md");
-        if user_instructions.is_file() {
-            out.push(AssetReport {
+        // **Fallible**: a file we cannot stat is not the same as a file that
+        // is not there.
+        match probe_file(&user_instructions) {
+            Ok(true) => out.push(AssetReport {
                 kind: AssetKind::Instructions,
                 name: "CLAUDE.md".into(),
                 path: user_instructions,
@@ -1093,7 +1148,16 @@ impl MigrationSource for ClaudeSource {
                 detail: super::text::instructions_copyable(
                     &ctx.product.user().join("ATOMCODE.md"),
                 ),
-            });
+            }),
+            Ok(false) => {}
+            Err(reason) => out.push(AssetReport {
+                kind: AssetKind::Instructions,
+                name: "CLAUDE.md".into(),
+                path: user_instructions,
+                scope: AssetScope::User,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&reason),
+            }),
         }
 
         // Skills and commands: the standard paths are in our own scan list.
@@ -1118,8 +1182,23 @@ impl MigrationSource for ClaudeSource {
         ] {
             for name in ["settings.json", "settings.local.json"] {
                 let path = root.join(name);
-                if !path.is_file() {
-                    continue;
+                match probe_file(&path) {
+                    Ok(true) => {}
+                    // Not there: nothing to report.
+                    Ok(false) => continue,
+                    // There, but we cannot read it: that IS an asset, and it
+                    // is blocked.
+                    Err(reason) => {
+                        out.push(AssetReport {
+                            kind: AssetKind::Permissions,
+                            name: name.into(),
+                            path,
+                            scope,
+                            status: AssetStatus::Blocked,
+                            detail: super::text::unreadable_file(&reason),
+                        });
+                        continue;
+                    }
                 }
                 let parsed = parse_json(&path);
                 let (status, detail) = match parsed {
@@ -1160,7 +1239,7 @@ impl MigrationSource for ClaudeSource {
         // MCP servers. The project's own `.mcp.json` is read; the global
         // `~/.claude.json` is not, so it can only be brought over.
         let project_mcp = ctx.project.join(".mcp.json");
-        if project_mcp.is_file() {
+        if probe_file(&project_mcp).unwrap_or(false) {
             // **One parse.** The loader's verdict and the count come from
             // the same parse, so they cannot disagree about the same file.
             match mcp_servers(&project_mcp) {
@@ -1200,7 +1279,7 @@ impl MigrationSource for ClaudeSource {
             }
         }
         let global_state = ctx.os_home.join(".claude.json");
-        if global_state.is_file() {
+        if probe_file(&global_state).unwrap_or(false) {
             // The same helper as the project's file — one parse, and the
             // counts come from the loader.
             match mcp_servers(&global_state) {
@@ -1231,7 +1310,7 @@ impl MigrationSource for ClaudeSource {
 
         // Hooks live in the user settings file.
         let user_settings = user.join("settings.json");
-        if user_settings.is_file() {
+        if probe_file(&user_settings).unwrap_or(false) {
             match settings_hooks(&user_settings) {
                 Ok(true) => out.push(AssetReport {
                     kind: AssetKind::Hooks,
@@ -1280,7 +1359,7 @@ impl MigrationSource for ClaudeSource {
         // silence — "we found nothing" and "we could not look" are different
         // answers, and only one of them is true.
         let agents = user.join("agents");
-        if agents.is_dir() {
+        if probe_dir(&agents).unwrap_or(false) {
             match std::fs::read_dir(&agents) {
                 Ok(entries) => {
                     for entry in entries {
@@ -1528,10 +1607,16 @@ fn session_file_count(projects: &Path) -> Result<usize, String> {
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                count += 1;
+            // **Fallible**: a directory we cannot stat is not the same as a
+            // file that is not there.
+            match probe_dir(&path) {
+                Ok(true) => stack.push(path),
+                Ok(false) => {
+                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        count += 1;
+                    }
+                }
+                Err(_) => {}
             }
         }
     }
@@ -2017,6 +2102,8 @@ impl SkillTruth {
         protocol: &'a str,
     },
     MigrationProviderNothingToConnectTo,
+    MigrationCredentialHasDollar,
+    MigrationCredentialAmbiguous,
     MigrationAgentsBlocked,
     MigrationPluginsBlocked,
     MigrationSessionsBlocked {
@@ -2089,6 +2176,14 @@ impl SkillTruth {
             "This provider names no endpoint and no credential — there is nothing to connect to"
                 .into()
         }
+        Msg::MigrationCredentialHasDollar => {
+            "This key contains `$`, which the configuration would expand — not imported".into()
+        }
+        Msg::MigrationCredentialAmbiguous => {
+            "An environment variable of the same name is set, so this key cannot be written \
+             unambiguously — not imported"
+                .into()
+        }
         Msg::MigrationAgentsBlocked => {
             "Our role files need `permission` and `difficulty` frontmatter, which these do not \
              have — not migrated"
@@ -2153,6 +2248,12 @@ impl SkillTruth {
         Msg::MigrationProviderNothingToConnectTo => {
             "这个 provider 没有写端点也没有写凭据 —— 没有可连接的对象".into()
         }
+        Msg::MigrationCredentialHasDollar => {
+            "这个密钥里含有 `$`，配置会把它展开 —— 未导入".into()
+        }
+        Msg::MigrationCredentialAmbiguous => {
+            "同名环境变量已设置，这个密钥无法唯一确定 —— 未导入".into()
+        }
         Msg::MigrationAgentsBlocked => {
             "我们的角色文件需要 permission 与 difficulty 前置元数据，Claude 的 subagent 文件没有 \
              —— 未迁移"
@@ -2213,7 +2314,6 @@ mod tests {
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
         }
-        skill_dirs: Vec::new(),
     }
 
     /// Write a file, creating its parent directory first.
@@ -2385,7 +2485,7 @@ impl MigrationSource for CodexSource {
                     crate::instructions::InstructionState::Empty => {
                         (AssetStatus::Blocked, super::text::instructions_empty())
                     }
-                    crate::instructions::InstructionState::Unreadable => (
+                    crate::instructions::InstructionState::Unreadable => {
                         (AssetStatus::Blocked, super::text::unreadable_file(
                             "the file could not be read",
                         ))
@@ -2405,53 +2505,25 @@ impl MigrationSource for CodexSource {
             }
         }
 
-        // Skills.
+        // Skills. Codex installs them in GROUPING directories
+        // (`~/.codex/skills/.system/<name>/SKILL.md`), so only the immediate
+        // children would miss the installed ones — a real skill vanishing
+        // from the report. The walk is bounded and cycle-guarded, like the
+        // registry's own.
         for (scope, root) in [
             (AssetScope::User, user.join("skills")),
             (AssetScope::Project, project_codex.join("skills")),
         ] {
-            let mut names: Vec<String> = Vec::new();
-            if root.is_dir() {
-                match std::fs::read_dir(&root) {
-                    Ok(entries) => {
-                        for entry in entries {
-                            let entry = match entry {
-                                Ok(entry) => entry,
-                                Err(error) => {
-                                    out.push(AssetReport {
-                                        kind: AssetKind::Skills,
-                                        name: "skills".into(),
-                                        path: root.clone(),
-                                        scope,
-                                        status: AssetStatus::Blocked,
-                                        detail: super::text::unreadable_file(&error.to_string()),
-                                    });
-                                    continue;
-                                }
-                            };
-                            let path = entry.path();
-                            let is_skill = path.is_dir() && path.join("SKILL.md").is_file();
-                            if is_skill {
-                                names.push(entry.file_name().to_string_lossy().into_owned());
-                            }
-                        }
-                    }
-                    Err(error) => out.push(AssetReport {
-                        kind: AssetKind::Skills,
-                        name: "skills".into(),
-                        path: root.clone(),
-                        scope,
-                        status: AssetStatus::Blocked,
-                        detail: super::text::unreadable_file(&error.to_string()),
-                    }),
-                }
-            }
-            names.sort();
-            for name in names {
+            let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+            let mut ancestors: std::collections::BTreeSet<std::path::PathBuf> =
+                std::collections::BTreeSet::new();
+            collect_codex_skills(&root, 0, MAX_SKILL_DEPTH, &mut ancestors, &mut found);
+            found.sort();
+            for (name, path) in found {
                 out.push(AssetReport {
                     kind: AssetKind::Skills,
                     name: name.clone(),
-                    path: root.join(&name),
+                    path,
                     scope,
                     status: AssetStatus::Actionable,
                     detail: super::text::skill_copyable(
@@ -2548,6 +2620,61 @@ impl MigrationSource for CodexSource {
     }
 }
 
+/// The bound on how deep the Codex skill walk goes.
+///
+/// The registry's own bound is 8 (`registry.rs:296`); the same number here
+/// keeps the two from disagreeing about what exists.
+const MAX_SKILL_DEPTH: usize = 8;
+
+/// Find every Codex skill under `root`, including the ones in grouping
+/// directories (`~/.codex/skills/.system/<name>/SKILL.md`).
+///
+/// The walk is **bounded** and **cycle-guarded**: a symlink back to an
+/// ancestor would otherwise be walked forever, and the read-only report would
+/// never finish.
+fn collect_codex_skills(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    ancestors: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    found: &mut Vec<(String, std::path::PathBuf)>,
+) {
+    if depth > max_depth {
+        return;
+    }
+    let identity = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    if !ancestors.insert(identity.clone()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        paths.push(entry.path());
+    }
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            if path.join("SKILL.md").is_file() {
+                found.push((
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    path,
+                ));
+            } else {
+                collect_codex_skills(&path, depth + 1, max_depth, ancestors, found);
+            }
+        }
+    }
+    ancestors.remove(&identity);
+}
+
 /// How many `[mcp_servers.*]` tables the config declares.
 fn mcp_server_count(value: &toml::Value) -> Option<usize> {
     let servers = value.get("mcp_servers")?.as_table()?;
@@ -2575,10 +2702,16 @@ fn session_file_count(sessions: &Path) -> Result<usize, String> {
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                count += 1;
+            // **Fallible**: a directory we cannot stat is not the same as a
+            // file that is not there.
+            match probe_dir(&path) {
+                Ok(true) => stack.push(path),
+                Ok(false) => {
+                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        count += 1;
+                    }
+                }
+                Err(_) => {}
             }
         }
     }
@@ -2763,10 +2896,27 @@ pub fn mark_already_imported(
             // both land on the id `claude` would be confused, and one
             // source could be reported as "already imported" because of the
             // other's configuration.
-            let Some(draft) = drafts
-                .iter()
-                .find(|d| d.id == asset.name && d.source_path == asset.path)
-            else {
+            // **A row that is already `Blocked` is never upgraded.** The
+            // blocked reason is the more specific truth: "we will not import
+            // this" must not become "this is done".
+            if asset.status == AssetStatus::Blocked {
+                continue;
+            }
+            // **The draft must come from THIS source, and the draft must be
+            // THE ONE this row is about.**
+            //
+            // Matching on the id alone would let one source's row be judged
+            // by another source's account. But even id + source path is not
+            // enough: two definitions in ONE file can normalize to the same
+            // id (`"foo bar"` and `"foo-bar"` both become `foo-bar`), so
+            // `.find()` would hand both rows the first draft — and a blocked
+            // second definition would be judged by an unblocked first one.
+            //
+            // The row keeps the definition's ORIGINAL name, so the drafts
+            // are matched on that too.
+            let Some(draft) = drafts.iter().find(|d| {
+                d.source_name == asset.name && d.source_path == asset.path
+            }) else {
                 continue;
             };
             let Some(account) = accounts.get(&draft.id) else {
@@ -2812,11 +2962,26 @@ fn same_account(
     // the same reason (`effective_endpoint`).
     let same_endpoint = account.base_url.as_deref() == draft.base_url.as_deref();
     let same_protocol = account.provider == draft.protocol;
-    let same_models = draft.models.iter().all(|model| {
-        models
-            .values()
-            .any(|m| m.model.trim() == model.trim() && m.account == draft.id)
-    });
+    // **The model lists are compared as SETS, in both directions.** A
+    // one-way check ("every draft model is in ours") is a CONTAINMENT test,
+    // not an equivalence test: an account with the draft's models PLUS three
+    // more would pass, and the report would call it "already imported" while
+    // our config has models the source never had. The documents promise
+    // equivalence, so the check must be equivalence.
+    //
+    // Model names are compared TRIMMED, because the writer trims them
+    // (`plan_models`, `provider_book.rs:623`).
+    let ours: std::collections::BTreeSet<String> = models
+        .values()
+        .filter(|m| m.account == draft.id)
+        .map(|m| m.model.trim().to_string())
+        .collect();
+    let theirs: std::collections::BTreeSet<String> = draft
+        .models
+        .iter()
+        .map(|model| model.trim().to_string())
+        .collect();
+    let same_models = ours == theirs;
     // The credential is compared by **KIND**, never by value: a reference to
     // a variable is the same kind of credential as another reference, and a
     // literal is the same kind as another literal — but the value itself is
@@ -2848,14 +3013,14 @@ pub fn scan_context(
     os_home: &Path,
     project: &Path,
     product: atomcode_capabilities::ProductDirs,
+    skill_dirs: Vec<std::path::PathBuf>,
 ) -> ScanContext {
     ScanContext {
         os_home: os_home.to_path_buf(),
         project: project.to_path_buf(),
         product,
-        skill_dirs: Vec::new(),
+        skill_dirs,
     }
-    skill_dirs: Vec::new(),
 }
 
 #[cfg(test)]
@@ -2958,6 +3123,7 @@ mod tests {
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -3001,6 +3167,7 @@ mod tests {
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -3180,7 +3347,24 @@ async fn run_import_command(
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dirs = atomcode_coding::config::product_dirs_from_env();
-    let ctx = atomcode::import_cmd::scan_context(&home, &project, dirs.clone());
+    // The configuration we are importing INTO — it also says where our
+    // skills live (`[skills].extra_dirs`).
+    let config = atomcode_config::config::Config::load(&cli_config_path(cli_config))
+        .unwrap_or_default();
+    // The skill roots the RUNTIME uses — the user's configured `extra_dirs`
+    // come first, and a skill there can win a same-name collision. Resolving
+    // them here (rather than letting the capability fall back to the
+    // standard list) is what makes the report agree with the runtime.
+    let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
+        &config.skills.extra_dirs,
+        &project,
+        &dirs,
+        home.as_deref(),
+        None,
+    )
+    .0;
+    let ctx =
+        atomcode::import_cmd::scan_context(&home, &project, dirs.clone(), skill_dirs);
     let sources = atomcode_capabilities::migration::builtin_sources();
     let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
 
@@ -3676,45 +3860,77 @@ impl Migration for DiskMigration {
 **还要一条判据，证明 `/import` 真的注册了、而且真的能跑** —— 上面两条只测渲染
 函数：命令没进行清单、或者端口取不到，它们照样通过。
 
-在 `crates/atomcode-tui/tests/e2e.rs` 加（那里已经有 `launch::Ports` 的构造点与
-一个假的服务实现，照抄形状）：
+这条判据放在 **`crates/atomcode-tui/src/commands.rs` 的测试区**（不是
+`tests/e2e.rs`）—— 因为它要断言的是**命令集与端口**，而 `commands.rs` 的测试
+区已经有这两样：`bare()` 造一个空 `App`、`app.context()` 拿到 `Context`、
+`ctx.provide::<Svc>(…)` 装一个假端口、`ctx.service::<Svc>()` 取它
+（`plexus/src/context.rs:110` 与 `:125`）。`tests/e2e.rs` 那套 harness 走的是
+整屏挂载，与这条判据要证明的事无关。
 
 ```rust
-/// The `/import` command is REGISTERED (it is in the command inventory) and
-/// it RUNS (it reaches the port and renders what the host said).
-#[tokio::test]
-async fn the_import_command_is_registered_and_renders_the_host_report() {
-    let mut app = /* the e2e harness this file already builds */;
-    // A host that answers with one known row.
-    app.provide_migration(FakeMigration {
-        report: atomcode_tui::migration::MigrationReportView {
-            sources: vec![atomcode_tui::migration::MigrationSourceView {
-                source_id: "claude-code".into(),
-                display_name: "Claude Code".into(),
-                assets: vec![atomcode_tui::migration::MigrationAssetView {
-                    name: "web-access".into(),
-                    status: atomcode_tui::migration::AssetStatusView::Active,
-                    detail: "Read directly".into(),
+    /// A host that answers with one known row.
+    struct FakeMigration {
+        report: crate::migration::MigrationReportView,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::migration::Migration for FakeMigration {
+        async fn report(&self) -> Result<crate::migration::MigrationReportView, String> {
+            Ok(self.report.clone())
+        }
+    }
+
+    /// The `/import` command is REGISTERED (it is in the command inventory)
+    /// and it RUNS (it reaches the port and renders what the host said).
+    ///
+    /// The two rendering criteria above would pass even if `/import` were
+    /// never registered, or if the port could not be reached — they call the
+    /// renderer directly. This one goes through the command set.
+    #[tokio::test]
+    async fn the_import_command_is_registered_and_renders_the_host_report() {
+        let app = bare();
+        // The port the command reaches.
+        let _ = app.context().provide::<crate::plugin::MigrationSvc>(Arc::new(FakeMigration {
+            report: crate::migration::MigrationReportView {
+                sources: vec![crate::migration::MigrationSourceView {
+                    source_id: "claude-code".into(),
+                    display_name: "Claude Code".into(),
+                    assets: vec![crate::migration::MigrationAssetView {
+                        name: "web-access".into(),
+                        status: crate::migration::AssetStatusView::Active,
+                        detail: "Read directly".into(),
+                    }],
                 }],
-            }],
-        },
-    });
+            },
+        }));
 
-    // It is REGISTERED: the command is in the inventory.
-    let commands = app.command_names();
-    assert!(
-        commands.iter().any(|name| name == "/import"),
-        "/import is not registered: {commands:?}"
-    );
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ImportCommands));
 
-    // It RUNS: the port is reached and its report is rendered.
-    let outcome = app.run_command("/import", "").await;
-    let said = outcome.said_text();
-    assert!(said.contains("Claude Code"), "{said}");
-    assert!(said.contains("web-access"), "{said}");
-}
+        // It is REGISTERED: the command is in the inventory.
+        let names: Vec<String> = all
+            .matching("import")
+            .into_iter()
+            .map(|command| command.name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "import"),
+            "/import is not registered: {names:?}"
+        );
+
+        // It RUNS: the port is reached and its report is rendered.
+        let Outcome::Said(said) = all.dispatch("/import", &app.context()).await else {
+            panic!("/import said nothing");
+        };
+        assert!(said.contains("Claude Code"), "{said}");
+        assert!(said.contains("web-access"), "{said}");
+    }
 ```
 
+> **命令名不带斜杠**：`Command::said("import", …)`（`command.rs:148`）存的是
+> `import`，`/help` 与 `matching` 看到的就是这个名字；斜杠只是**调用时**的前缀
+> （`dispatch("/import", …)`）。所以断言的是 `"import"`，不是 `"/import"`。
+>
 > 判据的**名字**里有 `import`，所以 `cargo nextest run -p atomcode-tui import`
 > 这一条过滤能同时跑到它与渲染那两条。
 
@@ -3747,7 +3963,59 @@ disk. Same shape as /setup."
 - Modify: `crates/atomcode-capabilities/src/migration/codex.rs`
 - Modify: `crates/atomcode-capabilities/src/migration/mod.rs`
 
-**先做 config 那一处**（其余步骤都依赖它）：把写入方的两条归一规则公开出来，
+**先做 coding 那一处**（宿主技能根要靠它）：把技能目录的解析公开出来，让宿主
+按**运行时同一套规则**取得技能根，而不是自己重算一份。
+
+`crates/atomcode-coding/src/parts.rs` —— 宿主（CLI / TUI）要拿到**运行时实际
+用的**技能根，就需要一个公开入口。但**不能**让宿主自己重算一份规则：重算的那份
+迟早与运行时不一致，而「同名技能谁生效」正是报告必须说对的事。
+
+所以做法是**一个实现、两个入口**：`resolve_skill_dirs_at` 的函数体不动，只是把
+它**要读的那几个输入**显式化，再加一个公开包装。
+
+```rust
+/// The skill roots the runtime actually uses, in LOW→HIGH priority order.
+///
+/// **Public because a host that reports on skills must see the SAME roots the
+/// runtime sees** — the user's configured `extra_dirs` come FIRST, and a skill
+/// there can win a same-name collision. A host that recomputed the standard
+/// list alone would report a different winner than the one that runs.
+///
+/// The inputs are spelled out rather than taken as a whole
+/// `CodingAgentConfig`, so a host can call this without assembling one.
+/// The body is the runtime's own — there is ONE rule, not two.
+pub fn resolve_skill_dirs_from(
+    extra_dirs: &[String],
+    working_dir: &Path,
+    dirs: &ProductDirs,
+    home: Option<&Path>,
+    explicit: Option<&[PathBuf]>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    // The same body `resolve_skill_dirs_at` has today, reading these five
+    // inputs instead of `cfg` / `opts`.
+    if let Some(dirs) = explicit {
+        return (dirs.to_vec(), dirs.to_vec(), Vec::new());
+    }
+    let mut warnings = Vec::new();
+    let mut extra = Vec::new();
+    for value in extra_dirs {
+        // …the same expansion `~`, the same project-relative rule, the same
+        // warnings, the same canonicalization…
+    }
+    // …the same `dirs = extra ++ standard_skill_dirs(…)` and the same
+    // alias dedup…
+    (dirs, explicit_list, warnings)
+}
+```
+
+> **实现要求**：`resolve_skill_dirs_at` 与 `resolve_skill_dirs_from` **共用同一份
+> 函数体** —— 把 `resolve_skill_dirs_at` 改成转发给后者，`prepare` 走的还是同
+> 一条规则。这样「宿主看到的」与「运行时用的」不可能分叉。
+>
+> `explicit` 是驱动的显式覆盖（`PrepareOptions::skill_dirs`）：给了它就**只**用它，
+> 连标准目录都不扫 —— 那是覆盖的语义，宿主也要照做。
+
+**再�� config 那一处**（其余步骤都依赖它）：把写入方的两条归一规则公开出来，
 让报告和写入方**共用同一条**，而不是各写一份必然漂移的：
 
 `crates/atomcode-config/src/provider_book.rs` —— `base_id` 与
@@ -4113,6 +4381,20 @@ pub fn effective_endpoint(protocol: &str, endpoint: Option<&str>) -> Option<Stri
     atomcode_config::provider_book::effective_endpoint(protocol, endpoint.unwrap_or_default())
 }
 
+/// Whether this protocol REQUIRES an endpoint.
+///
+/// `ProviderBook::create_account` refuses a custom-compatible protocol with no
+/// endpoint (`provider_book.rs:198`: `ProtocolNeedsEndpoint`) — only a preset
+/// that has its own default can do without one.
+///
+/// The report has to know this **before** the write, or it would advertise an
+/// account as importable and then fail to write it.
+pub fn protocol_needs_endpoint(protocol: &str) -> bool {
+    atomcode_config::config::provider_preset::preset(protocol)
+        .map(|preset| preset.default_base_url.is_none())
+        .unwrap_or(true)
+}
+
 /// The endpoint the account will actually talk to.
 ///
 /// The stored form may be `None` — that means "follow the protocol's
@@ -4168,6 +4450,14 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
         if base_url.is_none() && key.is_none() {
             return Vec::new();
         }
+        // **A BLANK endpoint is an ABSENT endpoint.** Claude's settings can
+        // carry `ANTHROPIC_BASE_URL: ""`; treating that as "it has an
+        // endpoint" would pick the custom protocol and then fail to write it
+        // with `ProtocolNeedsEndpoint`. So the endpoint is trimmed and
+        // emptied ones are treated as absent.
+        let base_url = base_url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
         // **Claude with only a key and no endpoint was talking to Anthropic
         // itself.** It gets the `anthropic` preset, which HAS a default
         // endpoint (`config/provider_preset.rs:352`). With the
@@ -4186,6 +4476,8 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
             // The id the account will get, not the raw name.
             id: super::provider::account_id_for("claude")
                 .unwrap_or_else(|| "claude".into()),
+            // The name the source wrote it under.
+            source_name: "claude".into(),
             protocol: protocol.clone(),
             // The endpoint as it will be stored.
             base_url: super::provider::effective_endpoint(&protocol, base_url.as_deref()),
@@ -4281,12 +4573,14 @@ Claude 这一侧需要。
                 } else {
                     None
                 };
-                Some(ProviderAccountDraft {
+                ProviderAccountDraft {
                     // The id the account will get, not the raw name. When the
                     // name cannot become an id, the raw name is kept ONLY so
                     // the row can name the definition — `blocked` says it
                     // cannot be imported.
                     id: id.clone().unwrap_or_else(|| name.clone()),
+                    // The name the source wrote it under — the table's key.
+                    source_name: name.clone(),
                     protocol: protocol.clone(),
                     // The endpoint as it will be stored.
                     base_url: super::provider::effective_endpoint(
@@ -4306,7 +4600,7 @@ Claude 这一侧需要。
                     // project's config is not the person's own provider.
                     scope,
                     blocked,
-                })
+                }
             })
             .collect();
 
@@ -4476,6 +4770,7 @@ host can ask about that single item before writing it."
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         };
         let written =
             super::write_account(&config, &draft, true).expect("the account is written");
@@ -4507,6 +4802,7 @@ host can ask about that single item before writing it."
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         };
         let error = super::write_account(&config, &draft, true)
             .expect_err("a key with a dollar sign cannot be written");
@@ -4532,6 +4828,7 @@ host can ask about that single item before writing it."
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         };
         let error =
             super::write_account(&config, &draft, false).expect_err("a secret needs a yes");
@@ -4560,6 +4857,7 @@ host can ask about that single item before writing it."
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         };
         let error =
             super::write_account(&config, &draft, true).expect_err("the id is taken");
@@ -4609,8 +4907,9 @@ host can ask about that single item before writing it."
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
+            source_name: id.into(),
         }
-        blocked: None,
+        source_name: id.into(),
     }
 
     fn ctx_for(dir: &std::path::Path) -> atomcode_capabilities::migration::ScanContext {
@@ -4620,7 +4919,6 @@ host can ask about that single item before writing it."
             product: atomcode_capabilities::ProductDirs::new(dir.join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
         }
-        skill_dirs: Vec::new(),
     }
 
     fn sources(
@@ -4746,6 +5044,42 @@ use atomcode_capabilities::migration::{
     self, ApiKeyRef, AssetKind, AssetStatus, MigrationReport, ProviderAccountDraft, ScanContext,
 };
 ```
+
+/// Why this credential cannot be written, if it cannot.
+///
+/// The rules are the writer's, and they are **stated here once** so the report
+/// and the writer cannot disagree:
+///
+/// - a literal containing `$` would be **expanded** by `resolved_api_key`
+///   (`config/provider.rs:360`), so the file would mean something else;
+/// - a literal whose **trimmed** value names a live environment variable
+///   would resolve to that variable instead (`provider.rs:365`), so the file
+///   would mean something else.
+///
+/// The trimmed value is what matters, because that is what the writer stores
+/// (`written_key`, `provider_book.rs:753`).
+///
+/// The **value is never printed** — the reason names the account, not the key.
+fn unwriteable_credential(draft: &ProviderAccountDraft) -> Option<String> {
+    let Some(ApiKeyRef::Plaintext(secret)) = &draft.api_key else {
+        // A reference is always writable: the file holds a NAME.
+        return None;
+    };
+    let stored = secret.trim();
+    if stored.contains('$') {
+        return Some(atomcode_i18n::product::t(
+            atomcode_i18n::product::Msg::MigrationCredentialHasDollar,
+        )
+        .into_owned());
+    }
+    if std::env::var(stored).is_ok() {
+        return Some(atomcode_i18n::product::t(
+            atomcode_i18n::product::Msg::MigrationCredentialAmbiguous,
+        )
+        .into_owned());
+    }
+    None
+}
 
 /// Write one provider account.
 ///
@@ -4926,11 +5260,46 @@ pub fn apply_provider_accounts(
 ) -> Result<(String, usize), String> {
     use atomcode_i18n::product::{t, Msg};
     let mut drafts: Vec<ProviderAccountDraft> = Vec::new();
+    // **A source that could not be read is reported, not swallowed.**
+    //
+    // "No provider accounts" and "I could not read your provider config" are
+    // different answers, and the second one must not exit successfully: a
+    // script would read the exit code as "nothing to import" and move on.
+    let mut unreadable: Vec<String> = Vec::new();
     for source in sources {
         drafts.extend(source.provider_drafts(ctx));
+        if let Some(reason) = source.provider_drafts_error(ctx) {
+            unreadable.push(format!("{}: {reason}", source.display_name()));
+        }
+    }
+    // **The credential is preflighted HERE, in the host** — before the
+    // re-check and before the write.
+    //
+    // Why the host and not the capability: the check is "is there an
+    // environment variable of this name right now", and that is a question
+    // about the PROCESS, not about the file. The capability is a read-only
+    // view of the disk; it must not ask the environment anything.
+    //
+    // Why before the re-check: a literal with a `$` in it, or one whose
+    // trimmed value names a live environment variable, is a credential the
+    // writer will REFUSE. If the re-check ran first, it could call such an
+    // account "already imported" — and the report would advertise an account
+    // that cannot be written.
+    for draft in &mut drafts {
+        if let Some(reason) = unwriteable_credential(draft) {
+            draft.blocked = Some(reason);
+        }
+    }
+    if drafts.is_empty() && unreadable.is_empty() {
+        return Ok((t(Msg::MigrationImportNone).into_owned(), 0));
     }
     if drafts.is_empty() {
-        return Ok((t(Msg::MigrationImportNone).into_owned(), 0));
+        // Something could not be read, and there is nothing else to say.
+        return Err(t(Msg::MigrationProvidersUnreadable {
+            reasons: &unreadable.join("; "),
+        })
+        .into_owned());
+    }
     }
     // What is already in OUR configuration. The re-check and the apply share
     // this: an account that is already there is a **successful no-op**, not a
@@ -5028,7 +5397,7 @@ fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bo
             protocol: &draft.protocol,
             // The endpoint IN USE — a protocol's own default is shown, not a
             // dash, because that is the endpoint this account will talk to.
-            endpoint: &atomcode_capabilities::migration::provider::endpoint_in_use(
+            endpoint: &atomcode_capabilities::migration::endpoint_in_use(
                 &draft.protocol,
                 draft.base_url.as_deref(),
             )
@@ -5072,7 +5441,24 @@ async fn run_import_command(
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dirs = atomcode_coding::config::product_dirs_from_env();
-    let ctx = atomcode::import_cmd::scan_context(&home, &project, dirs.clone());
+    // The configuration we are importing INTO — it also says where our
+    // skills live (`[skills].extra_dirs`).
+    let config = atomcode_config::config::Config::load(&cli_config_path(cli_config))
+        .unwrap_or_default();
+    // The skill roots the RUNTIME uses — the user's configured `extra_dirs`
+    // come first, and a skill there can win a same-name collision. Resolving
+    // them here (rather than letting the capability fall back to the
+    // standard list) is what makes the report agree with the runtime.
+    let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
+        &config.skills.extra_dirs,
+        &project,
+        &dirs,
+        home.as_deref(),
+        None,
+    )
+    .0;
+    let ctx =
+        atomcode::import_cmd::scan_context(&home, &project, dirs.clone(), skill_dirs);
     let sources = atomcode_capabilities::migration::builtin_sources();
     let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
 
@@ -5133,6 +5519,9 @@ async fn run_import_command(
         skipped: &'a str,
     },
     MigrationImportNone,
+    MigrationProvidersUnreadable {
+        reasons: &'a str,
+    },
     MigrationImportAlreadyThere {
         already: &'a str,
     },
@@ -5159,6 +5548,9 @@ async fn run_import_command(
         Msg::MigrationImportDone { imported } => format!("Imported: {imported}.").into(),
         Msg::MigrationImportSkipped { skipped } => format!("Not imported: {skipped}.").into(),
         Msg::MigrationImportNone => "No provider accounts were found to import.".into(),
+        Msg::MigrationProvidersUnreadable { reasons } => {
+            format!("The provider configuration could not be read: {reasons}").into()
+        }
         Msg::MigrationImportAlreadyThere { already } => {
             format!("Already there: {already}.").into()
         }
@@ -5204,6 +5596,9 @@ async fn run_import_command(
         Msg::MigrationImportDone { imported } => format!("已导入：{imported}。").into(),
         Msg::MigrationImportSkipped { skipped } => format!("未导入：{skipped}。").into(),
         Msg::MigrationImportNone => "没有发现可导入的 provider 账号。".into(),
+        Msg::MigrationProvidersUnreadable { reasons } => {
+            format!("无法读取 provider 配置：{reasons}").into()
+        }
         Msg::MigrationImportAlreadyThere { already } => {
             format!("已经在配置里：{already}。").into()
         }
@@ -5307,30 +5702,32 @@ Expected: 退出 0。
 
 - [ ] **Step 5: 手工验收（本机）**
 
-**用编出来的那个二进制**（`PATH` 上的 `atomcode` 可能是装好的旧版）：
-
-```bash
-BIN="$(pwd)/target/debug/atomcode"
-"$BIN" import
-"$BIN" import --json | head -40
-```
-
-Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `CLAUDE.md`（本仓库没有）与 `AGENTS.md`（本仓库有）状态正确；`~/.claude/CLAUDE.md` 标 `can move`；`~/.claude/skills/*` 标 `in effect`。
-
-**不**用真实的 `~/.claude` 跑 `--apply`：那会把**本机真实的密钥**写进文件。而且只改 `ATOMCODE_HOME` 并不隔离**源** —— 扫描的是 OS 家目录，与 `ATOMCODE_HOME` 无关。
-
-所以 `--apply` 的验收用**人工夹具**：一个临时的源目录 + 一个临时的目标配置，两个都不碰真实家目录。
-
-**先编出要验的那个二进制**：`PATH` 上的 `atomcode` 可能是装好的旧版 —— 拿它验收等于验了别的东西。
+**先编出要验的那个二进制** —— 这一步在**每一条手工命令之前**，因为
+`PATH` 上的 `atomcode` 可能是装好的旧版，而编译门与 nextest 都不保证
+`target/debug/atomcode` 是刚链出来的（它们可能只跑了 check，或者命中了旧的
+增量产物）。手工验收要看的，就是**这个构建**的行为。
 
 ```bash
 cargo build -p atomcode-cli
 BIN="$(pwd)/target/debug/atomcode"
 ```
 
-> 这一步**必须在下面每一条手工命令之前**：编译门与 nextest 都不保证
-> `target/debug/atomcode` 是刚链出来的（它们可能只跑了 check，或者命中了旧的
-> 增量产物）。手工验收要看的，就是**这个构建**的行为。
+**只读的那两条**（用刚编出来的 `$BIN`）：
+
+```bash
+"$BIN" import
+"$BIN" import --json | head -40
+```
+
+Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `CLAUDE.md`（本仓库没有）与 `AGENTS.md`（本仓库有）状态正确；`~/.claude/CLAUDE.md` 标 `can move`；`~/.claude/skills/*` 标 `in effect`。
+
+> **不是每个 `~/.claude/skills/*` 都是 `in effect`** —— 同名的另一个目录会覆盖它，
+> 解析失败的会被加载器拒绝（`registry.rs:262`）。这两种都仍然是 `Blocked`，
+> 那是**正确**的，不是缺陷。
+
+**不**用真实的 `~/.claude` 跑 `--apply`：那会把**本机真实的密钥**写进文件。而且只改 `ATOMCODE_HOME` 并不隔离**源** —— 扫描的是 OS 家目录，与 `ATOMCODE_HOME` 无关。
+
+所以 `--apply` 的验收用**人工夹具**：一个临时的源目录 + 一个临时的目标配置，两个都不碰真实家目录。
 
 **在临时目录里跑**，这样当前仓库的 `.codex/config.toml`（本仓库有 `AGENTS.md`，
 也可能有自己的配置）不会混进「隔离」的夹具里：
