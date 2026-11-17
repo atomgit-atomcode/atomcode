@@ -255,3 +255,61 @@ async fn multi_tool_task_write_then_read_roundtrips() {
         "line one\nline two"
     );
 }
+
+#[test]
+fn registered_builtin_string_enums_declare_their_type() {
+    fn check(schema: &serde_json::Value, path: &str) {
+        let Some(object) = schema.as_object() else {
+            return;
+        };
+        if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array) {
+            if !values.is_empty() && values.iter().all(serde_json::Value::is_string) {
+                assert_eq!(
+                    object.get("type"),
+                    Some(&serde_json::json!("string")),
+                    "untyped builtin string enum: {path}"
+                );
+            }
+        }
+        for key in ["properties", "$defs", "definitions"] {
+            if let Some(entries) = object.get(key).and_then(serde_json::Value::as_object) {
+                for (name, child) in entries {
+                    check(child, &format!("{path}/{key}/{name}"));
+                }
+            }
+        }
+        for key in [
+            "items",
+            "prefixItems",
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "additionalProperties",
+        ] {
+            if let Some(child) = object.get(key) {
+                if let Some(children) = child.as_array() {
+                    for (index, child) in children.iter().enumerate() {
+                        check(child, &format!("{path}/{key}/{index}"));
+                    }
+                } else {
+                    check(child, &format!("{path}/{key}"));
+                }
+            }
+        }
+    }
+    let mut registry = ToolRegistry::new();
+    register_coding_tools(
+        &mut registry,
+        &atomcode_capabilities::ProductDirs::new("/nonexistent/tree", ".ours"),
+    );
+    let tools = registry.mount(coding_tool_names());
+    assert!(!tools.defs().is_empty());
+    for tool in tools.defs() {
+        check(&tool.parameters, &tool.name);
+    }
+    let debug = atomcode_capabilities::tools::debug::DebugTool::new(Default::default());
+    check(
+        &atomcode_kernel::tool::Tool::parameters_schema(&debug),
+        "debug",
+    );
+}

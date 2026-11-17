@@ -35,6 +35,25 @@ async fn framing_checks_lengths_and_utf8_byte_counts() {
 }
 
 #[test]
+fn debug_action_enum_declares_string_type_for_strict_gateways() {
+    let tool = DebugTool::new(Settings::default());
+    let schema = tool.parameters_schema();
+    let action = &schema["properties"]["action"];
+    assert_eq!(action["type"], "string");
+    assert!(action["enum"].as_array().is_some_and(
+        |values| !values.is_empty() && values.iter().all(serde_json::Value::is_string)
+    ));
+    assert!(action["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("launch")));
+    assert!(action["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("terminate")));
+}
+
+#[test]
 fn debugging_never_claims_read_only_execution() {
     assert!(Settings::default().enabled);
     let tool = DebugTool::new(Settings::default());

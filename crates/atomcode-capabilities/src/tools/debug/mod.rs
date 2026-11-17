@@ -107,7 +107,7 @@ impl Tool for DebugTool {
     }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","additionalProperties":false,"required":["action"],"properties":{
-            "action":{"enum":["launch","status","wait","set_breakpoints","threads","stack_trace","scopes","variables","evaluate","continue","step_over","step_in","step_out","pause","terminate"]},
+            "action":{"type":"string","enum":["launch","status","wait","set_breakpoints","threads","stack_trace","scopes","variables","evaluate","continue","step_over","step_in","step_out","pause","terminate"]},
             "session_id":{"type":"integer","minimum":1},"stop_id":{"type":"integer","minimum":1},
             "adapter":{"type":"string","enum":discovery::ids(&self.settings)},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},
             "breakpoints":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["file","line"],"properties":{"file":{"type":"string"},"line":{"type":"integer","minimum":1}}}},

@@ -1803,6 +1803,18 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
         return;
     };
 
+    // Some strict OpenAI-compatible validators (observed on Volcano Ark
+    // `kimi-k3-1-pro`) reject a bare `enum` without `type` with a 400, although
+    // JSON Schema permits it. Only a non-empty enum whose values all share one
+    // scalar kind gets the matching `type`; the enum itself still constrains the
+    // exact values, so `number` covers integer literals safely. Empty, mixed,
+    // null-bearing, and object/array enums are left untouched.
+    if !map.contains_key("type") {
+        if let Some(kind) = map.get("enum").and_then(homogeneous_scalar_enum_type) {
+            map.insert("type".into(), Value::String(kind.into()));
+        }
+    }
+
     let allows_object = match map.get("type") {
         Some(Value::String(kind)) => kind == "object",
         Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
@@ -1847,6 +1859,23 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
             }
         }
     }
+}
+
+fn homogeneous_scalar_enum_type(values: &Value) -> Option<&'static str> {
+    let Value::Array(values) = values else {
+        return None;
+    };
+    let kind_of = |value: &Value| match value {
+        Value::String(_) => Some("string"),
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        _ => None,
+    };
+    let (first, rest) = values.split_first()?;
+    let kind = kind_of(first)?;
+    rest.iter()
+        .all(|value| kind_of(value) == Some(kind))
+        .then_some(kind)
 }
 
 fn normalize_openai_tool_schema_children(children: &mut Value) {
@@ -4764,6 +4793,76 @@ mod tests {
         // Non-object property schemas are untouched (no spurious required).
         assert!(out["properties"]["paths"].get("required").is_none());
         assert!(out["properties"]["depth"].get("required").is_none());
+    }
+
+    #[test]
+    fn bare_scalar_enum_types_reach_the_chat_wire_without_mutating_input() {
+        let schema = json!({"type":"object", "properties": {
+            "action": {"enum":["launch", "status"]},
+            "level": {"enum":[1, 2.5]},
+            "flag": {"enum":[true, false]},
+            "nested": {"type":"array", "items":{"enum":["a"]}},
+            "union": {"anyOf":[{"enum":[false]}, {"type":"null"}]},
+            "map": {"type":"object", "additionalProperties":{"enum":[3]}},
+            "literal": {"default":{"enum":["data"]}, "examples":[{"enum":["data"]}], "const":{"enum":["data"]}}
+        }, "$defs":{"Mode":{"enum":["fast"]}}});
+        let before = schema.clone();
+        let tools = [ToolDef {
+            name: "external".into(),
+            description: "fixture".into(),
+            parameters: schema.clone(),
+        }];
+        let cfg = OpenAiCompatConfig::new("fixture", "http://localhost", "kimi-k3-1-pro");
+        let body = build_request_body(
+            "kimi-k3-1-pro",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+        );
+        let out = &body["tools"][0]["function"]["parameters"];
+        let props = &out["properties"];
+        assert_eq!(props["action"]["type"], "string");
+        assert_eq!(
+            props["action"]["enum"],
+            before["properties"]["action"]["enum"]
+        );
+        assert_eq!(props["level"]["type"], "number");
+        assert_eq!(props["flag"]["type"], "boolean");
+        assert_eq!(props["nested"]["items"]["type"], "string");
+        assert_eq!(props["union"]["anyOf"][0]["type"], "boolean");
+        assert_eq!(props["map"]["additionalProperties"]["type"], "number");
+        assert_eq!(out["$defs"]["Mode"]["type"], "string");
+        assert_eq!(props["literal"], before["properties"]["literal"]);
+        assert_eq!(tools[0].parameters, before);
+        assert_eq!(schema, before);
+        assert_eq!(*out, shared_normalize_tool_schema(&schema));
+        assert_eq!(
+            *out,
+            shared_normalize_tool_schema(out),
+            "normalization is idempotent"
+        );
+    }
+
+    #[test]
+    fn enum_normalization_preserves_ambiguous_and_explicit_schemas() {
+        for schema in [
+            json!({"enum":[]}),
+            json!({"enum":[null]}),
+            json!({"enum":["a",null]}),
+            json!({"enum":[1,"a"]}),
+            json!({"enum":[true,1]}),
+            json!({"enum":[{}]}),
+            json!({"enum":[{"enum":["literal"]}]}),
+            json!({"enum":[[1]]}),
+            json!({"type":"integer", "enum":[1,2]}),
+            json!({"type":["string","null"], "enum":["a",null]}),
+            json!({"enum":"not-an-array"}),
+        ] {
+            assert_eq!(shared_normalize_tool_schema(&schema), schema);
+        }
     }
 
     #[test]
