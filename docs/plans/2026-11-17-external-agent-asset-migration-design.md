@@ -182,17 +182,21 @@ pub struct MigrationReport {
 | 外部 | 外部字段 | AtomCode 字段 |
 |---|---|---|
 | Claude | `settings.json` → `env.ANTHROPIC_BASE_URL` | `provider_accounts.<id>.base_url` |
-| Claude | `settings.json` → `env.ANTHROPIC_API_KEY`（**环境变量名**时） | `provider_accounts.<id>.api_key = "<VAR_NAME>"` |
+| Claude | `settings.json` → `env.ANTHROPIC_API_KEY`（**值就是密钥**） | `provider_accounts.<id>.api_key`（**逐项确认后**才写） |
 | Claude | `settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | 同上 |
 | Codex | `config.toml` → `[model_providers.<id>].base_url` | `provider_accounts.<id>.base_url` |
-| Codex | `config.toml` → `[model_providers.<id>].env_key`（**环境变量名**） | `provider_accounts.<id>.api_key = "<VAR_NAME>"` |
+| Codex | `config.toml` → `[model_providers.<id>].env_key`（**变量名**） | `provider_accounts.<id>.api_key = "<VAR_NAME>"` |
 | Codex | `config.toml` → `model` | `models.<id>.model` |
 | Codex | `config.toml` → `model_providers.<id>.wire_api` | `provider_accounts.<id>.provider`（`openai-compatible` / `anthropic-compatible`） |
 
 **凭据策略**（三条，不可绕过）：
 
 1. **不读 Keychain。** Claude 的 key 在 macOS Keychain、Codex 是 OAuth token —— 都搬不了，也不假装能搬。
-2. **优先环境变量引用。** 外部配置若用**变量名**指向密钥（Codex `env_key`、Claude `env.*`），写成 `api_key = "<VAR_NAME>"`。密钥不进我们的磁盘，运行时由 `ProviderAccountConfig::resolved_api_key`（`config/provider.rs:356`）解析 —— **这条路径本来就支持变量名**。
+2. **按来源各自的语义处理，不猜。** 两个来源的凭据字段**方向相反**：
+   - Codex 的 `env_key` 是**变量的名字** → 写成 `api_key = "<VAR_NAME>"`。密钥不进我们的磁盘，运行时由 `ProviderAccountConfig::resolved_api_key`（`config/provider.rs:356`）解析 —— **这条路径本来就支持变量名**。
+   - Claude 的 `env` 块是**名字 → 值**，值**就是**密钥本身 → 只能是明文，走第 3 条。
+
+   一个「长得像变量名就当引用」的启发式会把 Claude 的 `ANTHROPIC_API_KEY=MY_KEY`（值恰好像名字）误判成引用，把真密钥当名字存进文件 —— 运行时读不到密钥，而文件里还留着一个看似无害的字符串。**按来源分别处理。**
 3. **明文密钥只在逐项确认后写。** 源里若是明文，报告标「检测到明文密钥」，只在用户对**该项**明确确认后才写入；**永不批量导入**。
 
 **写入**：复用 `atomcode_config::provider_book::ProviderBook::create_account`（`provider_book.rs:192`）。它自带文件锁、`toml_edit` 逐键 patch（保住用户在文件里的注释与排版）、原子替换。**不新造写入逻辑。**
