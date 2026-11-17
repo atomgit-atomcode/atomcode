@@ -28,6 +28,30 @@ fn action_of(args: &str) -> Option<String> {
 // ─────────────────────────── atomgit_repo ───────────────────────────
 
 #[derive(Deserialize)]
+/// Parse a tool's arguments with duplicate keys resolved last-wins.
+///
+/// The model (or a middleware merging schema defaults) can emit the same key
+/// twice; serde's derived struct deserializer turns that into a hard
+/// "duplicate field" error mid-request. `serde_json::Value` keeps the last
+/// occurrence, so routing through it turns that failure class into an
+/// ordinary overwrite.
+fn parse_tool_args<T: serde::de::DeserializeOwned>(label: &str, args: &str) -> Result<T, String> {
+    let value = serde_json::from_str::<serde_json::Value>(args)
+        .map_err(|e| format!("{label}: invalid arguments: {e}"))?;
+    serde_json::from_value(value).map_err(|e| format!("{label}: invalid arguments: {e}"))
+}
+
+/// The gateway answers 400 UN_KNOW when it drops a mutating body (observed on
+/// PATCH/POST): retrying blind repeats the loss — the read path confirms what
+/// actually landed, so a re-send can be informed instead of repeated.
+fn write_error_hint(e: String) -> String {
+    if e.contains("UN_KNOW") {
+        format!("{e} — the gateway may have dropped this write's body; verify with the matching read/list call before resending.")
+    } else {
+        e
+    }
+}
+
 struct RepoArgs {
     action: String,
     #[serde(default)]
@@ -198,9 +222,9 @@ impl Tool for AtomgitRepoTool {
         }
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let a: RepoArgs = match serde_json::from_str(args) {
+        let a: RepoArgs = match parse_tool_args("atomgit_repo", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_repo: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         if a.url.is_some() && a.action != "view" {
             return err(
@@ -441,9 +465,9 @@ impl Tool for AtomgitIssueTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: IssueArgs = match serde_json::from_str(args) {
+        let a: IssueArgs = match parse_tool_args("atomgit_issue", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_issue: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         let c = &self.client;
         match a.action.as_str() {
@@ -677,9 +701,9 @@ impl Tool for AtomgitApiTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: ApiArgs = match serde_json::from_str(args) {
+        let a: ApiArgs = match parse_tool_args("atomgit_api", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_api: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         let Some(method) = parse_api_method(&a.method) else {
             return err(format!(
@@ -971,9 +995,9 @@ impl Tool for AtomgitPrTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: PrArgs = match serde_json::from_str(args) {
+        let a: PrArgs = match parse_tool_args("atomgit_pr", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_pr: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         let c = &self.client;
         match a.action.as_str() {
@@ -1018,7 +1042,7 @@ impl Tool for AtomgitPrTool {
                     (Some(o), Some(r), Some(t)) if !o.trim().is_empty() && !r.trim().is_empty() && !t.trim().is_empty() => {
                         match c.pr_create(&o, &r, &t, a.body.as_deref().unwrap_or(""), &base, &head).await {
                             Ok(pr) => ok(format!("Created {}", render_pr(&pr))),
-                            Err(e) => err(e),
+                            Err(e) => err(write_error_hint(e)),
                         }
                     }
                     _ => err("atomgit_pr create: owner, repo, title and head are required. owner/repo is the TARGET repository; use base for its target branch and head=fork_owner:branch for a fork.".to_string()),
@@ -1042,7 +1066,7 @@ impl Tool for AtomgitPrTool {
                     }
                     match c.pr_update(&o, &r, n, &u).await {
                         Ok(pr) => ok(format!("Updated {}", render_pr(&pr))),
-                        Err(e) => err(e),
+                        Err(e) => err(write_error_hint(e)),
                     }
                 }
                 Err(e) => e,
@@ -1058,7 +1082,7 @@ impl Tool for AtomgitPrTool {
                 Ok((o, r, n)) => match a.body {
                     Some(b) => match c.pr_comment_create(&o, &r, n, &b).await {
                         Ok(cc) => ok(render_created_comment(&cc)),
-                        Err(e) => err(e),
+                        Err(e) => err(write_error_hint(e)),
                     },
                     None => err("atomgit_pr comment_create: body is required".to_string()),
                 },
@@ -1074,7 +1098,7 @@ impl Tool for AtomgitPrTool {
             "comment_edit" => match (a.owner, a.repo, a.comment_id, a.body) {
                 (Some(o), Some(r), Some(id), Some(b)) => match c.pr_comment_edit(&o, &r, id, &b).await {
                     Ok(cm) => ok(format!("Edited comment {}", cm.id)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 _ => err("atomgit_pr comment_edit: owner, repo, comment_id and body are required".to_string()),
             },
@@ -1121,6 +1145,27 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn parse_tool_args_resolves_duplicate_keys_last_wins() {
+        // The model (or a middleware merging schema defaults) can emit the
+        // same key twice; the struct deserializer used to fail with
+        // "duplicate field" before this helper routed through Value.
+        let a: PrArgs =
+            parse_tool_args("atomgit_pr", r#"{"action":"view","number":1,"number":2}"#).unwrap();
+        assert_eq!(a.number, Some(2));
+    }
+
+    #[test]
+    fn write_error_hint_flags_unknown_gateway_errors() {
+        let hinted = write_error_hint("400 UN_KNOW: dropped".to_string());
+        assert!(
+            hinted.contains("verify with the matching read/list call"),
+            "{}",
+            hinted
+        );
+        assert_eq!(write_error_hint("404: nope".to_string()), "404: nope");
+    }
 
     fn ctx() -> ToolContext {
         ToolContext {
