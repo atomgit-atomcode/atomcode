@@ -1643,6 +1643,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pr_create_unknow_gateway_error_carries_the_self_correction_hint() {
+        // The hint's premise is that the client's error string carries the
+        // gateway's UN_KNOW marker; if a client-side rewrite ever drops it,
+        // the hint silently never fires while the suite stays green — this
+        // end-to-end criterion pins the premise against the real client path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/upstream/project/pulls"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"message": "proxy error", "error_code": "UN_KNOW"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = pr_tool(&server).execute(
+            r#"{"action":"create","owner":"upstream","repo":"project","title":"T","head":"contributor:feature","base":"main"}"#, &ctx()
+        ).await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("verify with the matching read/list call"),
+            "the UN_KNOW hint must ride the tool result: {}",
+            result.content
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn pr_close_renders() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
