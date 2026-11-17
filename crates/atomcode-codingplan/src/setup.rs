@@ -1009,7 +1009,11 @@ fn step_models_and_register(
                 .clone()
                 .filter(|name| !name.trim().is_empty())
                 .map(|name| {
-                    format!("{}-{}", name, sanitize_model_for_name(&m.display_model_name))
+                    format!(
+                        "{}-{}",
+                        name,
+                        sanitize_model_for_name(&m.display_model_name)
+                    )
                 })
                 .unwrap_or_else(|| {
                     if available.len() == 1 {
