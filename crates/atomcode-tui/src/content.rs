@@ -751,15 +751,7 @@ impl Content for UserSaid {
         }
         let room = (width as usize).saturating_sub(2);
         let text = clip(&text, room);
-        input_bar(
-            &text,
-            width,
-            &format!("{} ", Caps::default().g(Glyph::Prompt)),
-            None,
-            user(),
-        )
-        .into_iter()
-        .next()
+        user_bar(&text, width).into_iter().next()
     }
 
     fn content_hash(&self) -> ContentHash {
@@ -786,13 +778,7 @@ impl Content for UserSaid {
         // as one muted `! command` row — said, so a resumed session still shows
         // that the message carried it, but not as the tags the model reads.
         let (ran, said) = crate::shell::split_context(&self.0);
-        let mut rows = input_bar(
-            said,
-            ctx.width,
-            &format!("{} ", Caps::default().g(Glyph::Prompt)),
-            None,
-            user(),
-        );
+        let mut rows = user_bar(said, ctx.width);
         let room = (ctx.width as usize).saturating_sub(4);
         for command in ran {
             rows.extend(input_bar(
@@ -839,6 +825,25 @@ fn input_bar(text: &str, w: u16, mark: &str, mark_style: Option<Style>, style: S
             Line::from_spans(spans)
         })
         .collect()
+}
+
+fn user_bar(text: &str, width: u16) -> Vec<Line> {
+    let mut rows = input_bar(
+        text,
+        width,
+        &format!("{} ", Caps::default().g(Glyph::Prompt)),
+        None,
+        user(),
+    );
+    for row in &mut rows {
+        // The wrapper keeps its prompt/continuation indent in its own span.
+        // Only that span is decoration; literal chevrons and indentation in
+        // the person's message remain copyable.
+        if let Some(prefix) = row.spans.first_mut() {
+            *prefix = prefix.clone().decoration();
+        }
+    }
+    rows
 }
 
 /// A `!` command the person ran here, echoed as Claude Code echoes one: the
@@ -6742,5 +6747,37 @@ mod prompt_header_tests {
         assert!(!header.plain().contains('\x1b'));
         assert!(!header.plain().contains('\n'));
         assert_eq!(prompt.content_hash(), hash);
+    }
+}
+
+#[cfg(test)]
+mod user_clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn user_prompt_is_decoration_but_literal_chevrons_and_indents_are_text() {
+        let ctx = RenderCtx::bare(40);
+        for text in ["你好世界", "❯ literal", "  indented"] {
+            let user = UserSaid(text.into());
+            let lines = user.lines(&ctx);
+            assert_eq!(lines[0].selected_text(0, 40).trim_end(), text);
+            assert_eq!(user.reading_text(&ctx), text);
+            let mut frame = crate::frame::Frame::new(40, 2);
+            frame.place("user", crate::frame::Rect::sized(40, 2), lines);
+            assert_eq!(frame.selected_text(&frame.line_at(0).unwrap()), text);
+            if text == "你好世界" {
+                assert_eq!(frame.selected_text(&frame.word_at(3, 0).unwrap()), text);
+            }
+            let header = user.prompt_header(40).unwrap();
+            assert_eq!(header.selected_text(0, 40).trim_end(), text.trim_start());
+        }
+        let user = UserSaid("abcdefghij".into());
+        let lines = user.lines(&RenderCtx::bare(6));
+        assert!(lines.len() > 1);
+        let copied: String = lines
+            .iter()
+            .map(|line| line.selected_text(0, 6).trim_end().to_owned())
+            .collect();
+        assert_eq!(copied, "abcdefghij");
     }
 }

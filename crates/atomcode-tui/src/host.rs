@@ -7746,14 +7746,7 @@ impl Host {
                 out.push(String::new());
                 continue;
             }
-            let text = line.plain();
-            let head = crate::width::take_width(&text, a as usize);
-            #[allow(
-                clippy::string_slice,
-                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
-            )]
-            let rest = &text[head.len()..];
-            let piece = crate::width::take_width(rest, (b - a) as usize);
+            let piece = line.selected_text(a as usize, b as usize);
             out.push(piece.trim_end().to_string());
         }
         out.join("\n")

@@ -16151,6 +16151,42 @@ mod paste_habit_tests {
     }
 
     #[test]
+    fn transcript_selection_copies_user_text_without_its_display_prompt() {
+        for text in ["你好世界", "❯ literal", "  indented"] {
+            let (host, tui) = screen();
+            host.modules
+                .add_producer(crate::modules::transcript::Transcript::new())
+                .unwrap();
+            host.absorb(&atomcode_harness::session::SessionEvent::UserMessage {
+                turn: 1,
+                text: text.into(),
+                images: Vec::new(),
+            });
+            let size = (60, 24);
+            let frame = host.compose(size);
+            let y = frame
+                .rows()
+                .iter()
+                .position(|row| row.contains(text))
+                .unwrap() as u16;
+            tui.act(Action::SelectLine(3, y), &tui.client);
+            assert_eq!(tui.surface.clipboard_text().as_deref(), Some(text));
+            if text == "你好世界" {
+                tui.act(Action::SelectWord(3, y), &tui.client);
+                assert_eq!(tui.surface.clipboard_text().as_deref(), Some(text));
+            }
+            let moment = host.moment.read().unwrap();
+            let row = host.block_view(size, &moment).unwrap().row_at(y).unwrap();
+            let selected = crate::moment::StreamSelection {
+                anchor: (0, row),
+                head: (59, row),
+                extended: false,
+            };
+            assert_eq!(host.block_text(size, &moment, &selected), text);
+        }
+    }
+
+    #[test]
     fn backspace_erases_the_first_chinese_character_on_a_wrapped_visual_row() {
         let (host, tui) = screen();
         let text = "中文".repeat(45);
