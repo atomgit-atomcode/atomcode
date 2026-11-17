@@ -396,7 +396,7 @@ impl Plugin for WebPlugin {
             .or_else(crate::model_source::web_search_provider);
         let search = match &provider {
             Some(name) => WebSearchTool::with_provider_and_key(name, self.api_key.clone()),
-            None => WebSearchTool::with_provider_and_key("exa", self.api_key.clone()),
+            None => WebSearchTool::with_provider_and_key("auto", self.api_key.clone()),
         };
         mount(
             ctx,

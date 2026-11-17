@@ -1,14 +1,6 @@
-//! `web_search` — keyword web search. Two backends, selected at construction:
-//!   - **Exa** (default) — the Exa MCP search API (`https://mcp.exa.ai/mcp`): reachable
-//!     without a VPN, returns clean LLM-ready result text, keyless tier (an optional
-//!     `EXA_API_KEY` raises limits). This is the default and the recommended backend.
-//!   - **DuckDuckGo** (legacy) — scrapes `html.duckduckgo.com`: keyless and no third
-//!     party, but blocked in some regions. Opt-in via [`WebSearchTool::duckduckgo`].
-//!
-//! Read-only ⇒ `Safe`. Neutral port of the production tool (release/v4.25.1), with the
-//! `curl` subprocess replaced by `reqwest` (the `web` feature already pulls the HTTP
-//! stack; Exa is a normal JSON API with no anti-bot TLS fingerprinting). A failed search
-//! appends a hint steering the model to a browser-based `web-access` skill if one exists.
+//! Web search with five hosted backends and bounded automatic failover.
+//! Explicit DuckDuckGo remains available for compatibility. Credentials and
+//! transient health live in the mounted tool instance, never in row config.
 
 use super::{err, ok};
 use async_trait::async_trait;
@@ -16,6 +8,12 @@ use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
+
+mod backends;
+mod routing;
+use routing::Health;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 
@@ -30,22 +28,39 @@ fn note_network_unreachable() {
 #[cfg(not(feature = "offline"))]
 fn note_network_unreachable() {}
 
-/// Which backend `web_search` queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A fixed backend or the automatic pool of hosted search services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchProvider {
-    /// Exa MCP search (mcp.exa.ai) — the globally-reachable default.
+    Auto,
     Exa,
-    /// Legacy DuckDuckGo HTML scraping.
+    Parallel,
+    Tavily,
+    Firecrawl,
+    TinyFish,
     DuckDuckGo,
 }
 
 impl SearchProvider {
-    /// Parse a config string: `"duckduckgo"`/`"ddg"` → DuckDuckGo; anything else
-    /// (including `"exa"` / empty / unknown) → Exa, the safe default.
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "duckduckgo" | "ddg" => SearchProvider::DuckDuckGo,
-            _ => SearchProvider::Exa,
+            "exa" => Self::Exa,
+            "parallel" => Self::Parallel,
+            "tavily" => Self::Tavily,
+            "firecrawl" => Self::Firecrawl,
+            "tinyfish" => Self::TinyFish,
+            "duckduckgo" | "ddg" => Self::DuckDuckGo,
+            _ => Self::Auto,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Exa => "exa",
+            Self::Parallel => "parallel",
+            Self::Tavily => "tavily",
+            Self::Firecrawl => "firecrawl",
+            Self::TinyFish => "tinyfish",
+            Self::DuckDuckGo => "duckduckgo",
         }
     }
 }
@@ -78,57 +93,81 @@ fn cap_exa_results(text: &str, max: usize) -> String {
     blocks.join("\n\n---\n\n").trim_end().to_string()
 }
 
-/// `web_search` tool. Backend + optional Exa key are resolved once at construction.
-#[derive(Debug, Clone)]
+/// Search credentials and health are shared by clones of this mounted tool.
+#[derive(Clone)]
 pub struct WebSearchTool {
     provider: SearchProvider,
-    /// Exa API key — `None` uses Exa's keyless tier. `Default`/`new` read `EXA_API_KEY`.
     exa_api_key: Option<String>,
+    keys: HashMap<SearchProvider, String>,
+    health: Arc<Mutex<Health>>,
 }
-
-impl Default for WebSearchTool {
-    fn default() -> Self {
-        Self {
-            provider: SearchProvider::Exa,
-            exa_api_key: env_exa_key(),
-        }
+impl std::fmt::Debug for WebSearchTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSearchTool")
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
     }
 }
-
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self::with_provider("auto")
+    }
+}
 impl WebSearchTool {
-    /// Default tool: Exa backend, `EXA_API_KEY` picked up from the environment if set.
     pub fn new() -> Self {
         Self::default()
     }
-    /// Exa backend with an explicit key (`None` ⇒ keyless / `EXA_API_KEY` env fallback).
     pub fn exa(api_key: Option<String>) -> Self {
-        Self {
-            provider: SearchProvider::Exa,
-            exa_api_key: api_key.or_else(env_exa_key),
-        }
+        let mut tool = Self::with_provider("exa");
+        tool.exa_api_key = api_key
+            .filter(|key| !key.trim().is_empty())
+            .or_else(env_exa_key);
+        tool
     }
-    /// Legacy DuckDuckGo backend (no key).
     pub fn duckduckgo() -> Self {
-        Self {
-            provider: SearchProvider::DuckDuckGo,
-            exa_api_key: None,
-        }
+        Self::with_provider("duckduckgo")
     }
-    /// Build from a provider string (e.g. from config); Exa for unknown values.
     pub fn with_provider(provider: &str) -> Self {
-        Self {
-            provider: SearchProvider::from_str(provider),
-            exa_api_key: env_exa_key(),
-        }
+        Self::with_provider_and_key(provider, None)
     }
-    /// As [`Self::with_provider`], with an Exa key from configuration. `EXA_API_KEY`
-    /// still wins when it is set, which is what `[web_search] api_key` documents.
+    /// The optional configured key retains its historical Exa-only meaning.
     pub fn with_provider_and_key(provider: &str, api_key: Option<String>) -> Self {
+        let keys = [
+            (SearchProvider::Parallel, "PARALLEL_API_KEY"),
+            (SearchProvider::Tavily, "TAVILY_API_KEY"),
+            (SearchProvider::Firecrawl, "FIRECRAWL_API_KEY"),
+            (SearchProvider::TinyFish, "TINYFISH_API_KEY"),
+        ]
+        .into_iter()
+        .filter_map(|(id, name)| env_key(name).map(|key| (id, key)))
+        .collect();
         Self {
             provider: SearchProvider::from_str(provider),
             exa_api_key: env_exa_key().or(api_key.filter(|key| !key.trim().is_empty())),
+            keys,
+            health: Default::default(),
         }
     }
+    fn key(&self, provider: SearchProvider) -> Option<&str> {
+        if provider == SearchProvider::Exa {
+            self.exa_api_key.as_deref()
+        } else {
+            self.keys.get(&provider).map(String::as_str)
+        }
+    }
+    fn redact(&self, mut text: String) -> String {
+        for key in self.exa_api_key.iter().chain(self.keys.values()) {
+            text = text.replace(key, "[redacted]");
+            let encoded: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+            text = text.replace(&encoded, "[redacted]");
+        }
+        text
+    }
+}
+fn env_key(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
 }
 
 fn env_exa_key() -> Option<String> {
@@ -199,7 +238,7 @@ impl Tool for WebSearchTool {
         })
     }
     // read-only search → Safe.
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let a: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => {
@@ -209,10 +248,20 @@ impl Tool for WebSearchTool {
             }
         };
         let max = a.max_results.clamp(1, 20);
-        match self.provider {
-            SearchProvider::Exa => self.search_exa(&a.query, max).await,
-            SearchProvider::DuckDuckGo => self.search_ddg(&a.query, max).await,
+        if a.query.trim().is_empty() {
+            return err("web_search: query must not be empty");
         }
+        if self.provider == SearchProvider::DuckDuckGo {
+            return tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => err("web_search: cancelled"),
+                result = self.search_ddg(&a.query, max) => result,
+            };
+        }
+        self.route(&a.query, ctx, |provider| {
+            self.search_hosted(provider, &a.query, max)
+        })
+        .await
     }
 }
 
@@ -242,70 +291,6 @@ impl WebSearchTool {
         Self::client_builder()
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))
-    }
-
-    /// Exa MCP backend: POST a JSON-RPC `tools/call` (`web_search_exa`) and read the
-    /// LLM-ready text out of the SSE response.
-    async fn search_exa(&self, query: &str, max: usize) -> ToolResult {
-        let client = match Self::client() {
-            Ok(c) => c,
-            Err(e) => return fail(format!("web_search: {e}")),
-        };
-        let url = match &self.exa_api_key {
-            Some(k) => format!("https://mcp.exa.ai/mcp?exaApiKey={k}"),
-            None => "https://mcp.exa.ai/mcp".to_string(),
-        };
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "web_search_exa", "arguments": { "query": query, "numResults": max } }
-        });
-        let resp = match client
-            .post(&url)
-            .header("accept", "application/json, text/event-stream")
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                note_network_unreachable();
-                return fail(format!(
-                    "Exa web search could not reach mcp.exa.ai for '{query}': {e}"
-                ));
-            }
-        };
-        if let Some(message) = redirect_error(resp.status()) {
-            return fail(message);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            // Surface the server's error body. Exa's 429 body states the cause and the fix
-            // ("You've hit Exa's free MCP rate limit… create your own Exa API key"); dropping
-            // it makes quota exhaustion look like a network fault, and the model keeps
-            // retrying. `append_error_body` char-truncates (UTF-8-safe) and omits an empty
-            // body; NEVER pass the request URL — it carries `?exaApiKey=`.
-            let body = resp.text().await.unwrap_or_default();
-            return fail(append_error_body(
-                format!("Exa web search: HTTP {status} for '{query}'"),
-                &body,
-            ));
-        }
-        let sse = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => return fail(format!("Exa web search: failed to read response: {e}")),
-        };
-        match parse_exa_sse(&sse) {
-            Some(text) if !text.trim().is_empty() => {
-                let capped = cap_exa_results(text.trim(), max);
-                ok(format!("Search results for \"{query}\":\n\n{capped}"))
-            }
-            _ => fail(format!(
-                "Exa web search returned no usable results for '{query}' ({} bytes received).",
-                sse.len()
-            )),
-        }
     }
 
     /// Legacy DuckDuckGo HTML-scraping backend.
@@ -369,31 +354,11 @@ impl WebSearchTool {
 
 /// Pull the LLM-ready text out of an Exa MCP SSE response: scan `data:` lines for a
 /// JSON-RPC envelope and combine every `result.content[].text`.
+#[cfg(test)]
 fn parse_exa_sse(body: &str) -> Option<String> {
-    for line in body.lines() {
-        let payload = match line.strip_prefix("data:") {
-            Some(p) => p.trim(),
-            None => continue,
-        };
-        let Ok(json) = serde_json::from_str::<Value>(payload) else {
-            continue;
-        };
-        if let Some(content) = json.pointer("/result/content").and_then(|c| c.as_array()) {
-            let mut combined = String::new();
-            for item in content {
-                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                    if !combined.is_empty() {
-                        combined.push_str("\n\n");
-                    }
-                    combined.push_str(t);
-                }
-            }
-            if !combined.is_empty() {
-                return Some(combined);
-            }
-        }
-    }
-    None
+    backends::decode_mcp(body)
+        .ok()
+        .and_then(|result| backends::text_content(&result).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +622,7 @@ mod tests {
 
     #[test]
     fn default_is_exa() {
-        assert_eq!(WebSearchTool::new().provider, SearchProvider::Exa);
+        assert_eq!(WebSearchTool::new().provider, SearchProvider::Auto);
         assert_eq!(
             WebSearchTool::duckduckgo().provider,
             SearchProvider::DuckDuckGo
@@ -670,8 +635,8 @@ mod tests {
         assert_eq!(SearchProvider::from_str("exa"), SearchProvider::Exa);
         assert_eq!(
             SearchProvider::from_str("anything"),
-            SearchProvider::Exa,
-            "unknown → Exa default"
+            SearchProvider::Auto,
+            "unknown → automatic default"
         );
     }
 

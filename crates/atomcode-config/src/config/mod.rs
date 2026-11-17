@@ -795,9 +795,10 @@ pub struct Config {
 /// Web search backend configuration. Persisted as the `[web_search]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchConfig {
-    /// Search backend: `"exa"` (default — MCP API at mcp.exa.ai, reachable
-    /// without a VPN and returns LLM-ready result text) or `"duckduckgo"`
-    /// (legacy HTML scraping of html.duckduckgo.com, blocked in some regions).
+    /// Search backend: `auto` (default, bounded failover across hosted providers),
+    /// `exa`, `parallel`, `tavily`, `firecrawl`, `tinyfish`, or legacy `duckduckgo`.
+    /// Explicit providers stay pinned. Other provider keys use their corresponding
+    /// PARALLEL_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / TINYFISH_API_KEY env vars.
     #[serde(default = "default_search_provider")]
     pub provider: String,
     /// Optional Exa API key. Also read from the `EXA_API_KEY` env var, which
@@ -807,7 +808,19 @@ pub struct WebSearchConfig {
 }
 
 fn default_search_provider() -> String {
-    "exa".to_string()
+    "auto".to_string()
+}
+
+impl WebSearchConfig {
+    pub const PROVIDERS: &'static [&'static str] = &[
+        "auto",
+        "exa",
+        "parallel",
+        "tavily",
+        "firecrawl",
+        "tinyfish",
+        "duckduckgo",
+    ];
 }
 
 impl Default for WebSearchConfig {

@@ -195,10 +195,8 @@ pub struct CodingAgentConfig {
     /// stub older output sooner, and values above the window-relative budget
     /// are clamped to it. None keeps the window-relative budget.
     pub compact_stub_recent_budget: Option<u32>,
-    /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
-    /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
-    /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
-    /// tool was hardwired to Exa with no way to opt into DDG.
+    /// Web search backend: auto (default), exa, parallel, tavily, firecrawl,
+    /// tinyfish or legacy duckduckgo/ddg. An explicit backend stays pinned.
     pub web_search_provider: Option<String>,
     /// `[web_search] api_key`, for Exa. `None` leaves the tool to `EXA_API_KEY` or
     /// the keyless tier.
@@ -599,7 +597,7 @@ pub fn describe_config_file_for(
          `[lsp.features]` and service `features` select definition/references/hover/diagnostics/document_symbols with on|auto|off. \
          `[lsp] trace = off|messages|verbose` enables bounded, redacted protocol logging. Relative LSP JSON files use the user config directory. \
          Use the lsp tool probe/status/reload operations to diagnose initialization and reread JSON files; command/policy changes require a new runtime.\n\
-         - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
+         - `[web_search]` `provider` = `auto` (default) | `exa` | `parallel` | `tavily` | `firecrawl` | `tinyfish` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
          - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
          true), `language` (`en` | `zh_CN`), `[network]` `upstream_retry_max_attempts`, \
