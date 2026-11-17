@@ -43,6 +43,12 @@ pub const MAX_TODO_SIDECAR_BYTES: usize = 256 * 1024;
 const MAX_TODO_SIDECAR_FILE_BYTES: usize = 2 * MAX_TODO_SIDECAR_BYTES + 64;
 const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
 const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
+/// How often [`SessionManager::acquire_lease`] retries contention before
+/// calling the session in use. A [`SessionManager::lease_is_held`] probe holds
+/// the lock for microseconds; a runtime holding the session holds it for
+/// minutes, so the retries only ever outlast the former.
+const LEASE_PROBE_RETRIES: u32 = 3;
+const LEASE_PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Serializable todo-list sidecar. Independent of the transcript so a compaction
 /// that drains old turns (including the early todowrite plan call) does not erase
@@ -2333,25 +2339,65 @@ impl SessionManager {
     }
 
     /// Try to become the sole active runtime for `id`. Contention is reported
-    /// immediately as [`SessionStoreError::SessionInUse`]; this never waits.
+    /// as [`SessionStoreError::SessionInUse`] without waiting for the holder;
+    /// only a [`lease_is_held`](Self::lease_is_held) probe, which holds the
+    /// lock for an instant, is waited out.
     pub fn acquire_lease(&self, id: &str) -> SessionResult<SessionLease> {
         validate_session_id(id)?;
         fs::create_dir_all(&self.root).map_err(|error| io_at(&self.root, error))?;
         let path = self.lease_path(id)?;
         reject_existing_non_regular(&path)?;
         let file = open_session_lock_file(id, &path)?;
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(SessionLease {
-                inner: Arc::new(SessionLeaseInner {
-                    id: id.to_string(),
-                    path,
-                    file,
-                }),
-            }),
-            Err(error) if is_file_lock_contention(&error) => Err(SessionStoreError::SessionInUse {
-                id: id.to_string(),
-                path,
-            }),
+        let mut probes_waited_out = 0;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {
+                    return Ok(SessionLease {
+                        inner: Arc::new(SessionLeaseInner {
+                            id: id.to_string(),
+                            path,
+                            file,
+                        }),
+                    })
+                }
+                Err(error)
+                    if is_file_lock_contention(&error)
+                        && probes_waited_out < LEASE_PROBE_RETRIES =>
+                {
+                    probes_waited_out += 1;
+                    std::thread::sleep(LEASE_PROBE_RETRY_DELAY);
+                }
+                Err(error) if is_file_lock_contention(&error) => {
+                    return Err(SessionStoreError::SessionInUse {
+                        id: id.to_string(),
+                        path,
+                    })
+                }
+                Err(error) => return Err(io_at(&path, error)),
+            }
+        }
+    }
+
+    /// Whether some runtime — in this process or another — holds `id`'s lease
+    /// right now, i.e. has the session open.
+    ///
+    /// Read-only: a session never leased has no lease file and none is created.
+    /// The probe takes a shared lock and drops it at once; an
+    /// [`acquire_lease`](Self::acquire_lease) racing it retries past that
+    /// instant instead of reporting the session in use.
+    pub fn lease_is_held(&self, id: &str) -> SessionResult<bool> {
+        let path = self.lease_path(id)?;
+        let file = match open_read_file(&path) {
+            Ok(file) => file,
+            Err(SessionStoreError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                Ok(false)
+            }
+            Err(error) if is_file_lock_contention(&error) => Ok(true),
             Err(error) => Err(io_at(&path, error)),
         }
     }

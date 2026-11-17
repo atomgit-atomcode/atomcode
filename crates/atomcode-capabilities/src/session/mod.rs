@@ -38,6 +38,7 @@ pub mod transcript;
 mod usage_provider;
 pub mod worklog;
 pub use context::SessionContextHook;
+pub use events::SessionActivity;
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
     CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,

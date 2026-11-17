@@ -2480,6 +2480,146 @@ fn header_line(header: &SessionHeader) -> SessionResult<Vec<u8>> {
     Ok(line)
 }
 
+/// What a session is doing right now, as any process reading its files can
+/// tell — the TUI that has it open need not be asked.
+///
+/// Only a session someone holds has an activity: a log whose last turn never
+/// ended but whose lease is free was interrupted (the process died), and is not
+/// running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivity {
+    /// Open in a runtime, between turns.
+    Open,
+    /// A turn is under way.
+    Running,
+    /// A turn is waiting on a question put to the person.
+    Waiting,
+}
+
+impl SessionManager {
+    /// [`SessionActivity`] of `id`, or `None` when no runtime holds it.
+    ///
+    /// Reads the lease and the end of the log; never writes. A session from
+    /// before the event log can only be told `Open`.
+    pub fn activity(&self, id: &str) -> SessionResult<Option<SessionActivity>> {
+        if !self.lease_is_held(id)? {
+            return Ok(None);
+        }
+        if !self.is_event_session(id) {
+            return Ok(Some(SessionActivity::Open));
+        }
+        self.activity_from_log_tail(id)
+    }
+
+    /// Scan newest complete lines first. Keep one line, not the entire log or
+    /// growing windows; older history is never read after a decisive boundary.
+    fn activity_from_log_tail(&self, id: &str) -> SessionResult<Option<SessionActivity>> {
+        let path = self.events_path(id)?;
+        let mut file = open_read_file(&path)?;
+        let len = file.metadata().map_err(|error| io_at(&path, error))?.len();
+        scan_activity_backwards(&mut file, &path, len)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityLine {
+    event: Option<ActivityFact>,
+}
+
+/// Unknown payload fields are skipped by serde, so a large tool result is not
+/// allocated again as a JSON Value just to learn its event kind.
+#[derive(serde::Deserialize)]
+struct ActivityFact {
+    kind: String,
+    scope: Option<RewindScope>,
+}
+
+fn scan_activity_backwards(
+    file: &mut fs::File,
+    path: &Path,
+    mut end: u64,
+) -> SessionResult<Option<SessionActivity>> {
+    let mut chunk = Vec::new();
+    let mut reversed_line = Vec::new();
+    let mut complete = false;
+    let mut answers = 0usize;
+    loop {
+        let start = end.saturating_sub(TAIL_WINDOW);
+        read_log_window(file, path, start, end, &mut chunk)?;
+        for byte in chunk.iter().rev() {
+            if *byte == b'\n' {
+                if complete {
+                    reversed_line.reverse();
+                    if let Some(activity) = activity_line(&reversed_line, &mut answers, path)? {
+                        return Ok(Some(activity));
+                    }
+                    reversed_line.clear();
+                }
+                // Discard any trailing append that has not committed a newline.
+                complete = true;
+            } else if complete {
+                if reversed_line.len() >= MAX_JSONL_LINE_BYTES {
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "session activity",
+                        message: format!("{}: event line exceeds size limit", path.display()),
+                    });
+                }
+                reversed_line.push(*byte);
+            }
+        }
+        if start == 0 {
+            if complete && !reversed_line.is_empty() {
+                reversed_line.reverse();
+                if let Some(activity) = activity_line(&reversed_line, &mut answers, path)? {
+                    return Ok(Some(activity));
+                }
+            }
+            return Ok(Some(SessionActivity::Open));
+        }
+        end = start;
+    }
+}
+
+fn activity_line(
+    raw: &[u8],
+    answers: &mut usize,
+    path: &Path,
+) -> SessionResult<Option<SessionActivity>> {
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let line: ActivityLine =
+        serde_json::from_slice(raw).map_err(|error| SessionStoreError::Corrupt {
+            kind: "session activity",
+            message: format!("{}: {error}", path.display()),
+        })?;
+    let Some(event) = line.event else {
+        return Ok(None);
+    };
+    Ok(match event.kind.as_str() {
+        "turn_end" => Some(SessionActivity::Open),
+        "rewound"
+            if event
+                .scope
+                .is_some_and(|scope| scope.takes_back_conversation()) =>
+        {
+            Some(SessionActivity::Open)
+        }
+        "answered" => {
+            *answers += 1;
+            None
+        }
+        "asked" if *answers == 0 => Some(SessionActivity::Waiting),
+        "asked" => {
+            *answers -= 1;
+            None
+        }
+        "turn_start" => Some(SessionActivity::Running),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9119,5 +9259,209 @@ mod tests {
                 serde_json::to_vec(&value).unwrap().len()
             );
         }
+    }
+
+    #[test]
+    fn a_session_nobody_holds_has_no_activity_even_mid_turn() {
+        let (dir, manager) = store();
+        assert_eq!(manager.activity("never-opened").unwrap(), None);
+        assert!(
+            !dir.path().join(BUCKET).join("never-opened.lease").exists(),
+            "probing does not create a lease file"
+        );
+
+        let lease = created(&manager, "died");
+        manager
+            .append_events(&lease, &[logged(1, 0, SessionEvent::TurnStart { turn: 1 })])
+            .unwrap();
+        drop(lease);
+        assert_eq!(
+            manager.activity("died").unwrap(),
+            None,
+            "an unfinished turn whose holder is gone was interrupted, not running"
+        );
+    }
+
+    #[test]
+    fn a_held_session_tells_open_running_and_waiting_apart() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s");
+        let append = |seq, event| {
+            manager
+                .append_events(&lease, &[logged(seq, 0, event)])
+                .unwrap()
+        };
+        let other = SessionManager::with_root(manager.root());
+        let activity = || other.activity("s").unwrap();
+
+        assert_eq!(activity(), Some(SessionActivity::Open));
+        append(1, SessionEvent::TurnStart { turn: 1 });
+        assert_eq!(activity(), Some(SessionActivity::Running));
+        append(
+            2,
+            SessionEvent::Asked {
+                turn: 1,
+                question: atomcode_kernel::session::Question::plain("allow?", &["yes", "no"]),
+            },
+        );
+        assert_eq!(activity(), Some(SessionActivity::Waiting));
+        append(
+            3,
+            SessionEvent::Answered {
+                turn: 1,
+                answer: Some("yes".into()),
+                by: "the person at the terminal".into(),
+            },
+        );
+        assert_eq!(activity(), Some(SessionActivity::Running));
+        append(
+            4,
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        );
+        assert_eq!(activity(), Some(SessionActivity::Open));
+    }
+
+    #[test]
+    fn a_turn_longer_than_the_tail_window_is_still_running() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "long");
+        let big = "x".repeat(TAIL_WINDOW as usize * 2);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: big,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            manager.activity("long").unwrap(),
+            Some(SessionActivity::Running)
+        );
+    }
+
+    #[test]
+    fn activity_scan_stops_before_unrelated_old_history_and_ignores_partial_append() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        // This old prefix would fail a full log load. A recent turn boundary
+        // must suffice even when it is several chunks behind a tool result.
+        file.write_all(&vec![b'x'; TAIL_WINDOW as usize * 2])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        for event in [
+            SessionEvent::TurnStart { turn: 2 },
+            SessionEvent::UserMessage {
+                turn: 2,
+                text: "x".repeat(TAIL_WINDOW as usize * 3),
+                images: vec![],
+            },
+        ] {
+            serde_json::to_writer(&mut file, &serde_json::json!({"event": event})).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.write_all(b"{\"event\":{\"kind\":\"turn_end\"")
+            .unwrap();
+        let path = file.path().to_owned();
+        let len = file.as_file().metadata().unwrap().len();
+        assert_eq!(
+            scan_activity_backwards(file.as_file_mut(), &path, len).unwrap(),
+            Some(SessionActivity::Running)
+        );
+    }
+
+    #[test]
+    fn activity_pairs_questions_across_chunk_boundaries() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "questions");
+        let question = || atomcode_kernel::session::Question::plain("allow?", &["yes", "no"]);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::Asked {
+                            turn: 1,
+                            question: question(),
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::Asked {
+                            turn: 1,
+                            question: question(),
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "x".repeat(TAIL_WINDOW as usize * 2),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::Answered {
+                            turn: 1,
+                            answer: Some("yes".into()),
+                            by: "test".into(),
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            manager.activity("questions").unwrap(),
+            Some(SessionActivity::Waiting)
+        );
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::Answered {
+                        turn: 1,
+                        answer: None,
+                        by: "test".into(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            manager.activity("questions").unwrap(),
+            Some(SessionActivity::Running)
+        );
+    }
+
+    #[test]
+    fn probing_a_lease_never_keeps_a_runtime_from_taking_it() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s");
+        assert!(manager.lease_is_held("s").unwrap());
+        drop(lease);
+        assert!(!manager.lease_is_held("s").unwrap());
+        let again = manager.acquire_lease("s").unwrap();
+        assert!(manager.lease_is_held("s").unwrap());
+        drop(again);
     }
 }

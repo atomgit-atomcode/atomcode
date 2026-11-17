@@ -1598,6 +1598,10 @@ pub struct SessionSummary {
     pub file_size: u64,
     pub working_directory_available: bool,
     pub scheduled: bool,
+    /// What a runtime holding the session — a TUI, this daemon — is doing with
+    /// it. Absent when nobody holds it, and outside the per-project listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<atomcode_capabilities::session::SessionActivity>,
 }
 
 fn catalog_scan_in_root(
@@ -1708,6 +1712,7 @@ fn catalog_entry_to_session_summary(
         working_directory_available: entry.working_directory_available(),
         scheduled: entry.origin
             == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
+        activity: None,
     }
 }
 
@@ -1851,10 +1856,26 @@ fn list_sessions_in_root(
         .collect();
     let mut entries = visible_catalog_entries(sessions_root, entries, active);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    let bucket = NativeSessionManager::with_root(sessions_root.join(project_hash));
     Ok(entries
         .iter()
-        .map(catalog_entry_to_session_summary)
+        .map(|entry| SessionSummary {
+            activity: session_activity(&bucket, &entry.id),
+            ..catalog_entry_to_session_summary(entry)
+        })
         .collect())
+}
+
+/// A listed session's activity. A probe that fails leaves the row unmarked
+/// rather than failing the listing: the mark is a hint, the list is not.
+fn session_activity(
+    bucket: &NativeSessionManager,
+    id: &str,
+) -> Option<atomcode_capabilities::session::SessionActivity> {
+    bucket.activity(id).unwrap_or_else(|error| {
+        tracing::debug!(session = id, %error, "session activity probe failed");
+        None
+    })
 }
 
 /// List all sessions across all projects
@@ -10725,6 +10746,62 @@ mod tests {
             manager.read_meta(session_id).unwrap().name,
             "修复 VS Code 历史标题"
         );
+    }
+
+    #[test]
+    fn daemon_project_listing_marks_a_session_another_runtime_is_running() {
+        use atomcode_capabilities::session::{
+            SessionActivity, SessionManager, SessionMeta, StorageOwner,
+        };
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_bucket = "0123456789abcdef";
+        let session_id = "open-in-a-terminal";
+        let manager = SessionManager::with_root(tmp.path().join(project_bucket));
+        let lease = manager.acquire_lease(session_id).unwrap();
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .create_event_session(&lease, &SessionHeader::new(session_id), &meta)
+            .unwrap();
+        let fact = |seq, event| LoggedEvent { seq, at: 0, event };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    fact(1, SessionEvent::TurnStart { turn: 1 }),
+                    fact(
+                        2,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "继续".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].activity, Some(SessionActivity::Running));
+        assert_eq!(
+            serde_json::to_value(&sessions[0]).unwrap()["activity"],
+            "running"
+        );
+
+        drop(lease);
+        let sessions = list_sessions_in_root(tmp.path(), project_bucket, None).unwrap();
+        assert_eq!(
+            sessions[0].activity, None,
+            "a released session is not running"
+        );
+        assert!(serde_json::to_value(&sessions[0])
+            .unwrap()
+            .get("activity")
+            .is_none());
     }
 
     #[tokio::test]

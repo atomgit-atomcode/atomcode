@@ -290,7 +290,12 @@ export interface SessionMeta {
   file_size?: number;
   working_directory_available?: boolean;
   scheduled?: boolean;
+  /** What a runtime holding the session (another terminal, this daemon) is
+   *  doing with it. Only the per-project listing reports it; absent = nobody. */
+  activity?: SessionActivity;
 }
+
+export type SessionActivity = 'open' | 'running' | 'waiting';
 
 export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
@@ -381,8 +386,9 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
 // project of its own history when many other projects have newer sessions.
 // The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
 // stamp it back on for the client's project-scoped dedup/filter.
-export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
+export async function listProjectSessions(projectHash: string, signal?: AbortSignal): Promise<SessionMetaWithProject[]> {
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
+    signal,
     headers: authHeaders(),
   });
   const list: SessionMeta[] = await readJson(resp);

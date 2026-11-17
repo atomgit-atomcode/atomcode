@@ -4278,6 +4278,7 @@ body {
   .session-browse-card .session-browse-actions button { min-height: 44px; }
 }
 .session-running-mark { flex-shrink: 0; padding: 1px 5px; border-radius: 4px; background: var(--app-secondary-background); color: var(--app-secondary-foreground); font-size: 11px; }
+.session-open-mark { background: transparent; color: var(--app-caption-foreground); }
 
 .task-specifications { width: min(760px, calc(100vw - 24px)); max-height: 85vh; overflow: auto; padding: 20px; border-radius: 12px; }
 .task-specifications header, .task-specifications footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
