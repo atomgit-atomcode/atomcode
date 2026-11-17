@@ -1435,6 +1435,7 @@ pub fn format_duration_secs(secs: i64) -> String {
 /// Decide the config-key name for each model. Single model → bare
 /// `AtomGit` (keeps the name tidy for the common case); 2+ models →
 /// `AtomGit-{name with / replaced by -}`.
+#[cfg(test)]
 fn provider_names_for(model_names: &[String]) -> Vec<String> {
     if model_names.len() == 1 {
         vec![provider_prefix().to_string()]
