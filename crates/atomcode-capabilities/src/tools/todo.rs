@@ -556,7 +556,7 @@ impl Tool for TodoTool {
         // are 1-based in list order (derivable from the arguments), and the
         // TUI seeds task titles from the transcript-derived plan
         // (`named_todo_update` → `plan.title_as_of`), so the echo only needs
-        // the confirmation, the status counts and the open ids.
+        // the confirmation, the status counts and the in-progress ids.
         if v.get("todos").is_some() && !is_incremental_action(&v) {
             return match validate_new_todo_plan(args) {
                 Ok(todos) if todos.is_empty() => ok("Plan cleared: no tasks.".to_string()),
@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_echoes_normalized_list() {
+    async fn execute_confirms_plan_without_echoing_list() {
         let t = TodoTool::new();
         let r = t
             .execute(
@@ -1338,6 +1338,18 @@ mod tests {
         assert!(
             !r.content.contains("verify scheduler registration"),
             "the echo must not repeat the list: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_confirms_cleared_plan() {
+        let t = TodoTool::new();
+        let r = t.execute(r#"{"todos":[]}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Plan cleared: no tasks."),
+            "{}",
             r.content
         );
     }
