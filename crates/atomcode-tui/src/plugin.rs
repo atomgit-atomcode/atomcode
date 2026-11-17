@@ -1302,11 +1302,25 @@ enum Wake {
 /// The scrollbar is screen policy. The old knob — `mascot = true` — is now
 /// `[[insert]] name = "tui-panel-mascot"`, which is the point: a panel is a row,
 /// not a boolean on somebody else's row.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
     #[serde(default)]
     scrollbar: crate::moment::ScrollbarMode,
+    #[serde(default = "default_diff_wrap")]
+    wrap_diff: bool,
+}
+
+fn default_diff_wrap() -> bool {
+    true
+}
+impl Default for Row {
+    fn default() -> Self {
+        Self {
+            scrollbar: Default::default(),
+            wrap_diff: true,
+        }
+    }
 }
 
 /// Whether a fact is the line a turn opens with on screen — what the working
@@ -4167,6 +4181,13 @@ impl Tui {
         if let Some(sheet) = moment.asking.as_mut() {
             sheet.edit_key = crate::keymap::parse_question_edit_key(edit_key)
                 .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
+        }
+        if let Some(row) = view.rows().iter().find(|row| row.id == "ui.wrap_diff") {
+            moment.clip_diff = row.value == "false";
+            let wrap = !moment.clip_diff;
+            if let Some(sheet) = moment.sheet.as_mut() {
+                sheet.set_diff_wrap(wrap);
+            }
         }
         if moment.settings == view {
             return false;
@@ -11754,6 +11775,7 @@ impl Plugin for TuiUiPlugin {
         let surface = ctx.require::<SurfaceSvc>().map_err(|e| e.to_string())?;
         let (host, tui) = assemble(surface);
         host.moment.write().expect("moment poisoned").scrollbar_mode = row.scrollbar;
+        host.moment.write().expect("moment poisoned").clip_diff = !row.wrap_diff;
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
             .map_err(|e| e.to_string())?;
@@ -17360,6 +17382,65 @@ mod newline_settings_tests {
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
 
     struct Port(Mutex<String>);
+    struct DiffPort(Mutex<bool>);
+    impl Settings for DiffPort {
+        fn rows(&self) -> SettingsView {
+            SettingsView::new(vec![SettingRow {
+                id: "ui.wrap_diff".into(),
+                label: "Wrap diff".into(),
+                value: self.0.lock().unwrap().to_string(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Immediately,
+            }])
+        }
+        fn set(&self, _: &str, value: &str) -> Result<SettingsView, String> {
+            *self.0.lock().unwrap() = value.parse().map_err(|_| "invalid boolean")?;
+            Ok(self.rows())
+        }
+        fn reset(&self, id: &str) -> Result<SettingsView, String> {
+            self.set(id, "true")
+        }
+    }
+
+    #[test]
+    fn settings_reflow_an_open_diff_without_rebuilding_the_runtime() {
+        let (host, tui) = assemble(crate::surface::Headless::new(30, 24));
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .unwrap();
+        assert!(
+            host.open_sheet(crate::sheet::Sheet::read(crate::sheet::Read::diff(
+                "diff",
+                "a",
+                "@@ -0,0 +1 @@\n+longlonglonglonglonglonglonglonglonglonglonglong",
+            )))
+        );
+        let port = Arc::new(DiffPort(Mutex::new(false)));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<SettingsSvc>(port).unwrap();
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.refresh_settings();
+        {
+            let moment = host.moment.read().unwrap();
+            assert!(moment.clip_diff);
+            let crate::sheet::Page::Read(read) = &moment.sheet.as_ref().unwrap().page else {
+                unreachable!()
+            };
+            assert!(!read.wrap_diff);
+        }
+        tui.apply_setting("ui.wrap_diff", "true").unwrap();
+        // The settings panel refreshes its projection after a successful edit.
+        tui.refresh_settings();
+        let moment = host.moment.read().unwrap();
+        assert!(!moment.clip_diff);
+        let crate::sheet::Page::Read(read) = &moment.sheet.as_ref().unwrap().page else {
+            unreachable!()
+        };
+        assert!(read.wrap_diff);
+        assert!(read.display_len(20) > 1);
+    }
     impl Settings for Port {
         fn rows(&self) -> SettingsView {
             SettingsView::new(vec![SettingRow {

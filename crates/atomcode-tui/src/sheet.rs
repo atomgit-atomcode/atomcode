@@ -298,7 +298,7 @@ pub struct ReadLine {
 }
 
 /// 从头读到尾的一段字:一个文件,或者一个文件的改动。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Read {
     /// Explicit reviewed-content action (Enter); absent on ordinary readers.
     pub action: Option<(String, String)>,
@@ -310,12 +310,32 @@ pub struct Read {
     pub top: usize,
     /// 什么都没有的时候说什么(空文件)。
     pub empty: String,
+    is_diff: bool,
+    pub wrap_diff: bool,
+    layout: Arc<std::sync::Mutex<Option<(usize, &'static str, Arc<Vec<crate::frame::Line>>)>>>,
 }
+
+impl PartialEq for Read {
+    fn eq(&self, other: &Self) -> bool {
+        self.action == other.action
+            && self.id == other.id
+            && self.title == other.title
+            && self.lines == other.lines
+            && self.top == other.top
+            && self.empty == other.empty
+            && self.is_diff == other.is_diff
+            && self.wrap_diff == other.wrap_diff
+    }
+}
+impl Eq for Read {}
 
 impl Read {
     /// 一个文件,每行带行号。
     pub fn file(id: &'static str, title: Vec<Piece>, text: &str) -> Self {
         Self {
+            is_diff: false,
+            wrap_diff: false,
+            layout: Default::default(),
             action: None,
             id,
             title,
@@ -342,6 +362,9 @@ impl Read {
         let added = lines.iter().filter(|l| l.mark == Mark::Added).count();
         let removed = lines.iter().filter(|l| l.mark == Mark::Removed).count();
         Self {
+            is_diff: true,
+            wrap_diff: true,
+            layout: Default::default(),
             action: None,
             id,
             title: vec![
@@ -363,12 +386,106 @@ impl Read {
     /// 视野最多往下走到哪一行开始:最后一屏满着,而不是只剩最后一行。`room` 是
     /// **实际画出来**的行数 —— 屏幕矮的时候比 [`READ_ROWS`] 少,按固定的数算,
     /// 文件末尾那几行就永远滚不到。
-    fn last_top(&self, room: usize) -> usize {
-        self.lines.len().saturating_sub(room.max(1))
+    fn last_top(&self, room: usize, width: usize) -> usize {
+        self.display_len(width).saturating_sub(room.max(1))
     }
 
-    fn scroll(&mut self, by: isize, room: usize) {
-        self.top = self.top.saturating_add_signed(by).min(self.last_top(room));
+    fn scroll(&mut self, by: isize, room: usize, width: usize) {
+        self.top = self
+            .top
+            .saturating_add_signed(by)
+            .min(self.last_top(room, width));
+    }
+
+    pub(crate) fn display_len(&self, width: usize) -> usize {
+        if self.wrap_diff {
+            if let Some((w, _, rows)) = self.layout.lock().expect("diff layout poisoned").as_ref() {
+                if *w == width.min(u16::MAX as usize) {
+                    return rows.len();
+                }
+            }
+            self.display_rows(width).len()
+        } else {
+            self.lines.len()
+        }
+    }
+
+    pub(crate) fn display_rows(&self, width: usize) -> Arc<Vec<crate::frame::Line>> {
+        self.display_rows_with_marker(
+            width,
+            crate::caps::Caps::default().g(crate::caps::Glyph::Pending),
+        )
+    }
+
+    pub(crate) fn display_rows_with_marker(
+        &self,
+        width: usize,
+        marker: &'static str,
+    ) -> Arc<Vec<crate::frame::Line>> {
+        let width = width.min(u16::MAX as usize);
+        let mut cached = self.layout.lock().expect("diff layout poisoned");
+        if let Some((w, previous, rows)) = cached.as_ref() {
+            if *w == width && *previous == marker {
+                return rows.clone();
+            }
+        }
+        use crate::{
+            frame::{Color, Line, Style},
+            theme::Role,
+        };
+        let digits = self
+            .lines
+            .iter()
+            .filter_map(|line| line.number)
+            .max()
+            .unwrap_or(0)
+            .to_string()
+            .len()
+            .max(2);
+        let rows: Vec<Line> = self
+            .lines
+            .iter()
+            .flat_map(|line| {
+                let (sign, role) = match line.mark {
+                    Mark::Added => ('+', Role::Success),
+                    Mark::Removed => ('-', Role::Error),
+                    Mark::Note | Mark::Gap => (' ', Role::Muted),
+                    _ => (' ', Role::PanelFg),
+                };
+                if line.mark == Mark::Gap {
+                    return vec![Line::styled(
+                        format!("  {:>digits$} {marker}", ""),
+                        Style::new().fg(Color::role(Role::Muted)),
+                    )
+                    .truncate(width)];
+                }
+                let number = line.number.map(|n| n.to_string()).unwrap_or_default();
+                crate::diff::display_row(
+                    &line.text,
+                    &format!("  {number:>digits$} {sign} "),
+                    &format!("  {:>digits$} > ", ""),
+                    width as u16,
+                    Style::new().fg(Color::role(role)),
+                    true,
+                )
+            })
+            .collect();
+        let rows = Arc::new(rows);
+        *cached = Some((width, marker, rows.clone()));
+        rows
+    }
+}
+
+impl Sheet {
+    pub(crate) fn set_diff_wrap(&mut self, enabled: bool) {
+        for page in std::iter::once(&mut self.page).chain(self.back.as_deref_mut()) {
+            if let Page::Read(read) = page {
+                if read.is_diff && read.wrap_diff != enabled {
+                    read.wrap_diff = enabled;
+                    read.top = 0;
+                }
+            }
+        }
     }
 }
 
@@ -700,7 +817,7 @@ pub fn key_in(sheet: &mut Sheet, press: KeyPress, room: usize, width: usize) -> 
                     None => Step::Close,
                 };
             }
-            read_key(read, press, room);
+            read_key(read, press, room, width);
             Step::Stay
         }
         Page::Doc(doc) => {
@@ -808,17 +925,17 @@ fn list_key(list: &mut List, press: KeyPress) -> Step {
     }
 }
 
-fn read_key(read: &mut Read, press: KeyPress, room: usize) {
+fn read_key(read: &mut Read, press: KeyPress, room: usize, width: usize) {
     // 翻一页走的比一屏少一行:翻过去还看得见上一页的最后一行,知道接在哪儿。
     let page = room.saturating_sub(1).max(1) as isize;
     match (press.key, press.mods) {
-        (Key::Up, _) | (Key::Char('k'), Mods::NONE) => read.scroll(-1, room),
-        (Key::Down, _) | (Key::Char('j'), Mods::NONE) => read.scroll(1, room),
-        (Key::PageUp, _) => read.scroll(-page, room),
-        (Key::PageDown, _) | (Key::Char(' '), Mods::NONE) => read.scroll(page, room),
+        (Key::Up, _) | (Key::Char('k'), Mods::NONE) => read.scroll(-1, room, width),
+        (Key::Down, _) | (Key::Char('j'), Mods::NONE) => read.scroll(1, room, width),
+        (Key::PageUp, _) => read.scroll(-page, room, width),
+        (Key::PageDown, _) | (Key::Char(' '), Mods::NONE) => read.scroll(page, room, width),
         (Key::Home, _) | (Key::Char('g'), Mods::NONE) => read.top = 0,
         (Key::End, _) | (Key::Char('G'), Mods::NONE | Mods::SHIFT) => {
-            read.top = read.last_top(room)
+            read.top = read.last_top(room, width)
         }
         // 别的键什么都不做 —— 原来的弹窗是按任何键都关掉,一个手滑就得从头打开。
         _ => {}
@@ -838,7 +955,7 @@ pub fn wheel_in(sheet: &mut Sheet, by: i32, room: usize, width: usize) {
             list.cursor =
                 (list.cursor as i64 + by as i64).clamp(0, rows.saturating_sub(1) as i64) as usize;
         }
-        Page::Read(read) => read.scroll(by as isize, room),
+        Page::Read(read) => read.scroll(by as isize, room, width),
         Page::Doc(doc) => doc.scroll(by as isize, room, doc_width(width)),
     }
 }
@@ -1111,4 +1228,41 @@ mod reading_tests {
             Step::Close
         );
     }
+}
+#[test]
+fn diff_paging_reaches_the_wrapped_tail_and_reflows_after_resize() {
+    let source = "abcdefghijklmno".repeat(20) + "TAIL";
+    let mut sheet = Sheet::read(Read::diff(
+        "diff",
+        "file.txt",
+        &format!("@@ -0,0 +1 @@\n+{source}"),
+    ));
+    let before = match &sheet.page {
+        Page::Read(read) => read.lines.clone(),
+        _ => unreachable!(),
+    };
+    key_in(&mut sheet, KeyPress::plain(Key::End), 5, 20);
+    let Page::Read(read) = &sheet.page else {
+        unreachable!()
+    };
+    let rows = read.display_rows(20);
+    assert!(rows.len() > 5);
+    assert_eq!(read.top, rows.len() - 5);
+    assert!(rows.last().unwrap().plain().ends_with("TAIL"));
+    assert!(
+        Arc::ptr_eq(&rows, &read.display_rows(20)),
+        "scrolling reuses the width's layout"
+    );
+    key_in(&mut sheet, KeyPress::plain(Key::End), 5, 50);
+    let Page::Read(read) = &sheet.page else {
+        unreachable!()
+    };
+    assert_eq!(read.top, read.display_len(50).saturating_sub(5));
+    assert_eq!(read.lines, before, "layout never rewrites source lines");
+    sheet.set_diff_wrap(false);
+    let Page::Read(read) = &sheet.page else {
+        unreachable!()
+    };
+    assert_eq!(read.display_len(20), 1);
+    assert_eq!(read.top, 0);
 }

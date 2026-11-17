@@ -884,6 +884,9 @@ pub enum ScrollbarMode {
 /// Terminal UI preferences, persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// Soft-wrap diff rows in tool results and the /diff reader.
+    #[serde(default = "default_true")]
+    pub wrap_diff: bool,
     /// User overrides for composer shortcuts; omitted actions keep defaults.
     #[serde(default)]
     pub keybindings: UiKeybindings,
@@ -999,6 +1002,7 @@ pub struct UiKeybindings {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            wrap_diff: true,
             keybindings: UiKeybindings::default(),
             theme: UiTheme::default(),
             screen: Screen::default(),

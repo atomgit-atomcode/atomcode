@@ -79,8 +79,8 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
     ContentHash(h)
 }
 
-/// The part of the terminal's capabilities a block may see: **only the bits that
-/// decide shape or existence.**
+/// The terminal capabilities and display policy a block may see: **only the
+/// bits that decide shape or existence.**
 ///
 /// No `palette`. Colour is not a block's to decide — a block writes
 /// `Color::Role(Role)` and [`crate::ansi::encode_with`] resolves it on the way
@@ -95,6 +95,8 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
 /// yes, add it here (and to the caches, which key on this); no, leave it out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShapeCaps {
+    /// Display policy that changes diff row geometry, independent of hardware.
+    pub wrap_diff: bool,
     pub unicode: bool,
     /// See [`crate::caps::Caps::basic_glyphs`].
     pub basic_glyphs: bool,
@@ -115,11 +117,17 @@ impl ShapeCaps {
     pub fn of(caps: &crate::caps::Caps) -> Self {
         Self {
             unicode: caps.unicode,
+            wrap_diff: true,
             basic_glyphs: caps.basic_glyphs,
             colors: caps.colors,
             cell_background: caps.cell_background,
             graphics: caps.graphics,
         }
+    }
+
+    pub fn with_diff_wrap(mut self, enabled: bool) -> Self {
+        self.wrap_diff = enabled;
+        self
     }
 
     /// A decorative glyph as *this* terminal writes it.
@@ -835,6 +843,7 @@ mod tests {
     fn shape(unicode: bool) -> ShapeCaps {
         ShapeCaps {
             unicode,
+            wrap_diff: true,
             basic_glyphs: false,
             colors: crate::caps::Colors::Ansi256,
             cell_background: true,

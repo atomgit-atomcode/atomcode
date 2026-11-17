@@ -1562,7 +1562,7 @@ impl ToolCallBlock {
     /// diff, or `write_file`'s content as all-additions — when it succeeded and
     /// there is a change worth colouring. `None` for every other call and state,
     /// which then renders its result as text.
-    fn diff_view(&self, w: u16) -> Option<crate::diff::Rendered> {
+    fn diff_view(&self, w: u16, wrap: bool) -> Option<crate::diff::Rendered> {
         const MAX: usize = 400;
         // The indent the plain result body uses too, so folding one for the other
         // does not shift the column.
@@ -1571,7 +1571,7 @@ impl ToolCallBlock {
             return None;
         };
         match self.name.as_str() {
-            "edit_file" => crate::diff::render_edit(output, w, indent, MAX),
+            "edit_file" => crate::diff::render_edit_with_wrap(output, w, indent, MAX, wrap),
             "write_file" => {
                 let content = serde_json::from_str::<serde_json::Value>(&self.args)
                     .ok()?
@@ -1581,7 +1581,9 @@ impl ToolCallBlock {
                 if content.trim().is_empty() {
                     return None;
                 }
-                Some(crate::diff::render_written(&content, w, indent, MAX))
+                Some(crate::diff::render_written_with_wrap(
+                    &content, w, indent, MAX, wrap,
+                ))
             }
             _ => None,
         }
@@ -2192,7 +2194,7 @@ impl Content for ToolCallBlock {
         // row: the subject line when the model gave a reason, the head otherwise),
         // right after the file, and the line is re-clipped so the suffix cannot
         // push it past the width.
-        if let Some(diff) = self.diff_view(w) {
+        if let Some(diff) = self.diff_view(w, ctx.caps.wrap_diff) {
             if let Some(mut last) = out.pop() {
                 last.spans
                     .extend(self.diff_count_spans(diff.added, diff.removed));
@@ -4294,6 +4296,7 @@ mod tests {
                 colors: crate::caps::Colors::Ansi256,
                 cell_background,
                 graphics: crate::caps::Graphics::None,
+                wrap_diff: true,
             },
         }
     }
@@ -4346,6 +4349,7 @@ mod tests {
             width: 100,
             caps: crate::block::ShapeCaps {
                 colors: crate::caps::colors_for(&env, false),
+                wrap_diff: true,
                 unicode: crate::caps::unicode_for(&env),
                 basic_glyphs: caps.basic_glyphs,
                 cell_background: crate::caps::cell_background_for(&env, false, false),
@@ -5374,6 +5378,39 @@ mod tests {
                 .any(|s| s.style.fg == red),
             "a removed row is red"
         );
+    }
+
+    #[test]
+    fn diff_wrap_remeasures_settled_tools_without_changing_source_or_copy() {
+        let text = "https://example.com/".repeat(10);
+        let block = ToolCallBlock {
+            call_id: "wrap".into(),
+            name: "edit_file".into(),
+            args: r#"{"file_path":"a.rs"}"#.into(),
+            outcome: Outcome::Ok(format!("@@ -0,0 +1 @@\n+{text}")),
+            dir: None,
+            progress: None,
+        };
+        let wrap = crate::block::RenderCtx::bare(30);
+        let clip = crate::block::RenderCtx {
+            caps: wrap.caps.with_diff_wrap(false),
+            ..wrap
+        };
+        assert_eq!(block.reading_text(&wrap), block.reading_text(&clip));
+        let mut stream = crate::block::Stream::new();
+        let mut writer = stream.writer("test");
+        let id = writer.emit(Default::default(), std::sync::Arc::new(block));
+        writer.settle_all();
+        let slot = stream.get(id).unwrap();
+        let hash = slot.block().content.content_hash();
+        let clipped = slot.rows_at(&clip).0;
+        let wrapped = slot.rows_at(&wrap).0;
+        assert!(wrapped > clipped);
+        assert!(
+            slot.rows_at(&clip).1.is_some(),
+            "changing wrapping invalidates row measurements"
+        );
+        assert_eq!(slot.block().content.content_hash(), hash);
     }
 
     #[test]

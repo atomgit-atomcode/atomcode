@@ -4738,7 +4738,7 @@ impl Host {
     /// is a new list in the old one's place. What goes *behind* a page (Esc's
     /// way back) is decided by whoever opened it ([`crate::sheet::Sheet::back`]),
     /// not here.
-    pub fn open_sheet(&self, sheet: crate::sheet::Sheet) -> bool {
+    pub fn open_sheet(&self, mut sheet: crate::sheet::Sheet) -> bool {
         if !self.modules.has_view(crate::modules::sheet::ID) {
             return false;
         }
@@ -4756,6 +4756,7 @@ impl Host {
         m.mcp_panel = None;
         m.resume_panel = None;
         m.bg_panel = None;
+        sheet.set_diff_wrap(!m.clip_diff);
         m.sheet = Some(sheet);
         true
     }
@@ -4856,6 +4857,7 @@ impl Host {
         current.pending = None;
         m.sheet = match next {
             Some(mut next) => {
+                next.set_diff_wrap(!m.clip_diff);
                 let behind = m.sheet.take().map(|sheet| sheet.page);
                 if let (Page::Read(_) | Page::Doc(_), None, Some(list @ Page::List(_))) =
                     (&next.page, &next.back, behind)
@@ -6375,7 +6377,7 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let ctx = crate::block::RenderCtx {
             width: rect.w,
-            caps: crate::block::ShapeCaps::of(&moment.caps),
+            caps: crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
         };
         let index = self.row_index_window(
             &ctx,
@@ -6789,7 +6791,7 @@ impl Host {
         // rather than read inside `rows_at` because `stream_height`'s contract is
         // that the caller may already hold the moment's write lock (two callers
         // in `plugin.rs` do), so nothing below may take it again.
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
 
         let layout = self.layout.tree();
         let modules = self.modules.clone();
@@ -7360,7 +7362,8 @@ impl Host {
             let idx = self.row_index.lock().expect("row index poisoned");
             if idx.loaded_start != 0
                 || idx.width != width
-                || idx.caps != crate::block::ShapeCaps::of(&moment.caps)
+                || idx.caps
+                    != crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff)
                 || idx.presentation != presentation
                 || idx.activity != moment.activity
             {
@@ -7586,7 +7589,7 @@ impl Host {
     /// How many rows the conversation's blocks render to at `width` — the
     /// painter's own count ([`Host::row_index_window`]), tail not included.
     fn block_total(&self, width: u16, moment: &Moment) -> usize {
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         self.row_index_window(
@@ -7607,7 +7610,8 @@ impl Host {
             .row_index_window(
                 &crate::block::RenderCtx {
                     width,
-                    caps: crate::block::ShapeCaps::of(&moment.caps),
+                    caps: crate::block::ShapeCaps::of(&moment.caps)
+                        .with_diff_wrap(!moment.clip_diff),
                 },
                 stream.slots(),
                 &pres,
@@ -7634,7 +7638,7 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let ctx = crate::block::RenderCtx {
             width: 120,
-            caps: crate::block::ShapeCaps::of(&moment.caps),
+            caps: crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
         };
         let mut text = String::new();
         for slot in stream.slots() {
@@ -7657,7 +7661,7 @@ impl Host {
     /// tall and a long session is not.
     pub fn transcript_lines(&self, width: u16, moment: &Moment) -> Vec<Line> {
         let total = self.full_block_total(width, moment);
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         // A question in flight with no panel to ride is drawn under the
         // blocks in every window (`stream_lines`), taking rows the count above
         // does not know about; each slice asks for that much more room so the
@@ -7724,7 +7728,7 @@ impl Host {
         let (lines, _) = self.stream_lines(
             rect,
             end - last,
-            crate::block::ShapeCaps::of(&moment.caps),
+            crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
             moment.activity,
             moment.tick,
         );
@@ -7794,7 +7798,7 @@ impl Host {
     /// until one of them changed.
     fn stream_height_in(&self, room: Rect, moment: &Moment) -> (usize, usize) {
         let width = room.w;
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         // The sum, from the one place both this and the painter read it — see

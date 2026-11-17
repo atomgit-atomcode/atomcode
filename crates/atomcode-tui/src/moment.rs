@@ -491,6 +491,8 @@ pub struct Moment {
     pub suggestion: Option<String>,
     pub scroll: ScrollPos,
     pub scrollbar_mode: ScrollbarMode,
+    /// Inverted so a default screen wraps diffs without a launcher override.
+    pub clip_diff: bool,
     pub scrollbar_until: Option<tokio::time::Instant>,
     pub scrollbar_dragging: bool,
     /// What the pointer has selected, if anything. Screen state, not a fact —

@@ -32,6 +32,7 @@ pub struct Screen {
     /// Take the pointer. Off leaves selection to the terminal.
     pub mouse: bool,
     pub scrollbar: String,
+    pub wrap_diff: bool,
 }
 
 impl Default for Screen {
@@ -42,6 +43,7 @@ impl Default for Screen {
             theme: None,
             mouse: true,
             scrollbar: "hidden".into(),
+            wrap_diff: true,
         }
     }
 }
@@ -114,8 +116,8 @@ pub fn tree(screen: &Screen, extra: &[&str]) -> Result<ConfigTree, String> {
         layers.push("[[patch]]\nid = \"tui-panel-mascot\"\ndisabled = false\n".to_string());
     }
     layers.push(format!(
-        "[[patch]]\nid = \"ui\"\nconfig = {{ scrollbar = {:?} }}\n",
-        screen.scrollbar
+        "[[patch]]\nid = \"ui\"\nconfig = {{ scrollbar = {:?}, wrap_diff = {} }}\n",
+        screen.scrollbar, screen.wrap_diff
     ));
     layers.extend(extra.iter().map(|layer| layer.to_string()));
     let layers = layers

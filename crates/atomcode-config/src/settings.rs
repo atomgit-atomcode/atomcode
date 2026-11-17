@@ -357,6 +357,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Choice(SCROLLBARS),
         apply: ApplyPolicy::NextStartup,
     },
+    SettingSpec {
+        id: "ui.wrap_diff",
+        path: &["ui", "wrap_diff"],
+        label_en: "Wrap long diff lines",
+        label_zh: "Diff 长行自动换行",
+        aliases: &["wrap_diff", "diff wrap", "差异换行"],
+        kind: SettingKind::Boolean,
+        apply: ApplyPolicy::ImmediateUi,
+    },
     // `false` hands the pointer to the terminal, so PLAIN click-drag does the
     // terminal's OWN selection (spans the scrollback, copies clean) — at the cost
     // of ALL in-app mouse: no click-to-fold, no copy menu, and the wheel becomes
@@ -631,6 +640,7 @@ impl SettingSpec {
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.scrollbar" => format!("{:?}", config.ui.scrollbar).to_lowercase(),
+            "ui.wrap_diff" => config.ui.wrap_diff.to_string(),
             "ui.mouse" => config.ui.mouse.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.keybindings.newline" => config
@@ -1399,6 +1409,23 @@ mod tests {
         let off: Config = toml::from_str("[ui]\nmouse = false\n").unwrap();
         assert!(!off.ui.mouse, "`mouse = false` is honoured, not discarded");
         assert_eq!(setting.value(&off), "false");
+    }
+
+    #[test]
+    fn diff_wrap_defaults_on_and_is_editable_through_config() {
+        let config = Config::default();
+        assert!(config.ui.wrap_diff);
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(empty.ui.wrap_diff);
+        let setting = SETTINGS.iter().find(|s| s.id == "ui.wrap_diff").unwrap();
+        assert_eq!(setting.value(&config), "true");
+        assert_eq!(setting.apply, ApplyPolicy::ImmediateUi);
+        let mut document = "# keep\n".parse::<toml_edit::DocumentMut>().unwrap();
+        setting.patch(&mut document, "false").unwrap();
+        let saved: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!saved.ui.wrap_diff);
+        assert_eq!(setting.value(&saved), "false");
+        assert!(document.to_string().contains("# keep"));
     }
 
     #[test]

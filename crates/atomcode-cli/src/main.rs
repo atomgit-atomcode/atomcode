@@ -2873,6 +2873,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     // still forces it off on a single run.
                     mouse: config.ui.mouse && !cli.no_mouse,
                     scrollbar: format!("{:?}", config.ui.scrollbar).to_lowercase(),
+                    wrap_diff: config.ui.wrap_diff,
                     ..Default::default()
                 };
                 tracing::info!(
