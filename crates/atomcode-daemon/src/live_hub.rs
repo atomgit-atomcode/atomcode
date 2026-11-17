@@ -87,6 +87,7 @@ pub struct LiveObservation {
 pub struct LiveJoin {
     pub binding: LiveBinding,
     pub snapshot: Arc<SessionSnapshot>,
+    pub mode: atomcode_coding::RuntimeMode,
     pub model: Option<String>,
     /// Latest Goal controller state. Unlike turn replay, this must survive a
     /// completed turn so late `/live` subscribers can restore the Goal UI.
@@ -182,6 +183,7 @@ struct HubState {
     next_cursor: u64,
     binding: Option<BoundRuntime>,
     snapshot: Option<Arc<SessionSnapshot>>,
+    mode: atomcode_coding::RuntimeMode,
     model: Option<String>,
     pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     snapshot_error: Option<String>,
@@ -413,6 +415,7 @@ impl LiveViewHub {
         if status.generation != view.generation {
             return Err(HubError::StaleBinding);
         }
+        let mode = view.mode;
         let staged = Self::new();
         let binding = staged.bind_initial(
             view.session_id,
@@ -423,11 +426,14 @@ impl LiveViewHub {
             control.clone(),
             true,
         )?;
-        staged
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .model = view.model;
+        {
+            let mut state = staged
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.mode = mode;
+            state.model = view.model;
+        }
         for event in view.events {
             staged.publish(&binding, event)?;
         }
@@ -559,6 +565,7 @@ impl LiveViewHub {
             control,
         });
         state.snapshot = Some(Arc::new(snapshot));
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
@@ -598,6 +605,7 @@ impl LiveViewHub {
         Ok(LiveJoin {
             binding,
             snapshot,
+            mode: state.mode,
             model: state.model.clone(),
             pending_turn_model: state.pending_turn_model.clone(),
             goal_progress: sampled_goal_progress(&state),
@@ -617,6 +625,13 @@ impl LiveViewHub {
             .ok_or(HubError::Unbound)
     }
 
+    /// Current runtime mode from the installed presentation view. `None`
+    /// means no live runtime is bound and callers may use their configured default.
+    pub fn current_mode(&self) -> Option<atomcode_coding::RuntimeMode> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.binding.as_ref().map(|_| state.mode)
+    }
+
     pub fn unbind(&self, binding: &LiveBinding) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let current_binding_id = state
@@ -632,6 +647,7 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
@@ -672,6 +688,7 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
@@ -1430,6 +1447,9 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        if let CodingRuntimeEvent::ModeChanged { mode } = &event {
+            state.mode = *mode;
+        }
         if let CodingRuntimeEvent::RequestResolved { id, kind } = &event {
             // A terminal/TUI response bypasses the HTTP response route. Retire
             // its replay entry here too; the route may already have done so.
@@ -4141,6 +4161,39 @@ mod tests {
         )
         .unwrap();
         assert!(hub.join().unwrap().model.is_none());
+    }
+
+    #[test]
+    fn late_join_uses_runtime_mode_after_idle_mode_change() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "session-1".into(),
+            PathBuf::from("/one"),
+            snapshot("done"),
+        );
+        view.mode = atomcode_coding::RuntimeMode::Auto;
+        let binding = hub
+            .bind_live_view(view, "provider-a".into(), "fingerprint".into(), control)
+            .unwrap();
+
+        assert_eq!(hub.join().unwrap().mode, atomcode_coding::RuntimeMode::Auto);
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::ModeChanged {
+                    mode: atomcode_coding::RuntimeMode::Plan,
+                },
+            },
+        )
+        .unwrap();
+
+        let reconnected = hub.join().unwrap();
+        assert_eq!(reconnected.mode, atomcode_coding::RuntimeMode::Plan);
+        assert!(reconnected.replay.is_empty(), "idle mode is snapshot state");
     }
 
     #[test]

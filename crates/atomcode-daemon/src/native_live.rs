@@ -359,6 +359,10 @@ pub async fn model_selection() -> Result<atomcode_config::mode_models::ModeSelec
     hub().model_selection().await
 }
 
+pub fn current_mode() -> Option<RuntimeMode> {
+    hub().current_mode()
+}
+
 pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
     hub().set_mode(mode).await
 }

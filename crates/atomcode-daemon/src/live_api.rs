@@ -65,12 +65,6 @@ fn native_runtime_mode(mode: ApprovalMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-/// 当前审批模式的线格字符串（"build" / "accept_edits" / "bypass" / "plan"），
-/// 供 Snapshot / 广播使用。
-fn live_current_mode_wire() -> String {
-    live_current_approval_mode().wire().to_string()
-}
-
 /// Coding Runtime 是工作目录的唯一运行时所有者；未绑定时使用 daemon 项目状态。
 fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
     crate::native_live::binding()
@@ -1764,7 +1758,7 @@ pub(crate) async fn live_stream(
             project_hash,
             provider: join.binding.provider.clone(),
             model: join.model.clone(),
-            mode: live_current_mode_wire(),
+            mode: join.mode.wire().to_string(),
             working_dir: snapshot_wd.to_string_lossy().to_string(),
             goal: initial_goal.as_ref().map(goal_snapshot),
             loop_progress: join.loop_progress.clone(),
@@ -2509,7 +2503,7 @@ pub(crate) struct ApprovalModeResp {
 pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     Json(ApprovalModeResp {
         ok: true,
-        mode: live_current_approval_mode(),
+        mode: crate::native_live::current_mode().unwrap_or_else(live_current_approval_mode),
         error: None,
         selection: None,
     })
