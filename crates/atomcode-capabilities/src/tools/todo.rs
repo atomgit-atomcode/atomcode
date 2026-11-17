@@ -1332,7 +1332,14 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         // Same contract as above: the confirmation without the list — the
         // names ride in the call arguments of the same round.
-        assert!(r.content.contains("1 pending"), "{}", r.content);
+        // Same contract as above: the confirmation without the list — the
+        // names ride in the call arguments of the same round.
+        assert!(r.content.contains("1 item — 1 pending"), "{}", r.content);
+        assert!(
+            !r.content.contains("verify scheduler registration"),
+            "the echo must not repeat the list: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
