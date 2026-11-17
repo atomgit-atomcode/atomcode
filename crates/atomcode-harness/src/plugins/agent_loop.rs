@@ -680,9 +680,16 @@ async fn stream_attempt(
     }
 
     // A response with neither text nor tool calls cannot advance the turn.
-    // Reported as a typed failure so a retry policy can decide, rather than
-    // silently producing an empty assistant message.
     if out.text.trim().is_empty() && out.tool_calls.is_empty() {
+        // Reasoning alone is an answer that stopped short, not a provider that
+        // failed: handed on as such, so truncation recovery can ask the model
+        // to act on it. Retrying it blind discards the reasoning and repeats it.
+        if !out.reasoning.trim().is_empty() || !out.reasoning_blocks.is_empty() {
+            out.ended_in_reasoning = true;
+            return Ok(out);
+        }
+        // Nothing at all: a typed failure so a retry policy can decide, rather
+        // than silently producing an empty assistant message.
         return Err(RequestError::empty().into());
     }
     Ok(out)
@@ -1067,6 +1074,12 @@ impl PluginAgentLoop {
                     },
                 );
             }
+            // Nothing to add to an internal note, but the provider's usage is
+            // still a paid receipt and must be kept before suppressing the reply.
+            if response.ended_in_reasoning && !response.truncated && answering_a_nudge {
+                outcome.stop = StopReason::Stopped;
+                break;
+            }
             let meta = response_meta(
                 &session,
                 provider.as_ref(),
@@ -1311,7 +1324,7 @@ pub(super) fn response_meta(
         session_id: Some(session.id().to_string()),
         finish_reason: if !response.tool_calls.is_empty() {
             "tool_calls"
-        } else if response.truncated {
+        } else if response.truncated && !response.ended_in_reasoning {
             "length"
         } else {
             "stop"

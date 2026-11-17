@@ -83,8 +83,10 @@ pub struct RequestError {
     /// The history no longer fits. Compacting and retrying is the only thing
     /// that helps, and retrying without compacting is guaranteed to fail again.
     pub context_overflow: bool,
-    /// The provider answered with no content and no tool calls. Distinct from
-    /// an error: nothing failed, the turn simply cannot proceed on it.
+    /// The provider answered with no content, no tool calls and no reasoning.
+    /// Distinct from an error: nothing failed, the turn simply cannot proceed
+    /// on it. A reasoning-only answer is not this; see
+    /// [`ModelResponse::ended_in_reasoning`].
     pub empty_response: bool,
     /// A rate-limit policy decided this 429 is a pause, not a failure: the turn
     /// ends cleanly as rate-limited and the person is told when it resets.
@@ -191,6 +193,12 @@ pub struct ModelResponse {
     /// anything still streaming when it was cut — a tool call's arguments in
     /// particular — is incomplete and unsafe to act on.
     pub truncated: bool,
+    /// The provider ended the response normally after reasoning alone: no
+    /// text, no tool call. Not empty — the reasoning is real and was paid for —
+    /// but the turn cannot advance on it, and replaying the same request only
+    /// reasons the same way again. Seen when an upstream gateway closes a long
+    /// request at its own wall-clock limit and reports a plain `stop`.
+    pub ended_in_reasoning: bool,
 }
 
 /// A round's tool calls, on their way to being scheduled.
