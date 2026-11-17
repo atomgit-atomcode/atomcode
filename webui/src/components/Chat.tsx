@@ -1,5 +1,6 @@
 import { PromptHistory, promptHistoryDirection } from '../lib/promptHistory';
 import { HistoryLoading } from './HistoryLoading';
+import { FilePreviewDialog } from './FilePreviewDialog';
 import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
@@ -52,7 +53,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -5142,7 +5143,8 @@ function AssistantMessageView({
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
-  const [artifactError, setArtifactError] = useState('');
+  const [previewFile, setPreviewFile] = useState<{sessionId: string | null; path: string} | null>(null);
+  useEffect(() => setPreviewFile(null), [sessionId]);
   const [copyError, setCopyError] = useState(false);
 
   function handleCopy() {
@@ -5205,7 +5207,7 @@ function AssistantMessageView({
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts, search, groups)}
+          {renderAssistantParts(msg.parts, search, groups, sessionId)}
           {streaming && (
             <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
               <span class="waiting-dot" />
@@ -5225,16 +5227,7 @@ function AssistantMessageView({
                 type="button"
                 class="turn-artifact-chip"
                 title={artifact.path}
-                onClick={() => {
-                  setArtifactError('');
-                  if (sessionId) {
-                    window.dispatchEvent(new CustomEvent('workbench-open-file', { detail: { session: sessionId, path: artifact.path } }));
-                    return;
-                  }
-                  void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
-                    setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
-                  });
-                }}
+                onClick={() => setPreviewFile({sessionId, path: artifact.path})}
               >
                 {artifact.label}
               </button>
@@ -5243,9 +5236,9 @@ function AssistantMessageView({
               <span class="turn-artifact-more">+{artifacts.length - 6}</span>
             )}
           </div>
-          {artifactError && <div class="turn-artifact-error" role="status">{artifactError}</div>}
         </div>
       )}
+      {previewFile && previewFile.sessionId === sessionId && <FilePreviewDialog key={`${previewFile.sessionId}/${previewFile.path}`} sessionId={previewFile.sessionId} path={previewFile.path} onClose={() => setPreviewFile(null)} />}
       {!busy && msg.retryDiagnostics?.length ? (
         <details class="provider-diagnostics">
           <summary>{t('chat.requestDiagnostics')}</summary>
@@ -5264,7 +5257,7 @@ function AssistantMessageView({
   );
 }
 
-function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups, sessionId: string | null): VNode[] {
   const out: VNode[] = [];
   let i = 0;
   while (i < parts.length) {
@@ -5303,7 +5296,7 @@ function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: Poll
       );
       i++;
     } else {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} />);
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} sessionId={sessionId} />);
       i++;
     }
   }

@@ -1528,8 +1528,8 @@ export async function workbenchRequest<T>(path: string, body?: unknown, method?:
   if (response.status === 204) return undefined as T;
   return readJson<T>(response);
 }
-export async function workbenchPreview(session: string, path: string): Promise<Blob> {
-  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders() });
+export async function workbenchPreview(session: string, path: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders(), signal });
   if (!response.ok) throw await failure(response);
   return response.blob();
 }

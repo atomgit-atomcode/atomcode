@@ -1,0 +1,16 @@
+.file-preview-dialog {
+  width: min(960px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); padding: 0;
+  border: 1px solid var(--app-border); border-radius: 16px;
+  background: var(--app-primary-background); color: var(--app-primary-foreground);
+  box-shadow: 0 20px 80px #0004;
+}
+.file-preview-dialog::backdrop { background: #0008; }
+.file-preview-dialog > header { display: flex; align-items: center; gap: 16px; padding: 16px; border-bottom: 1px solid var(--app-border); }
+.file-preview-dialog > header > div { flex: 1; min-width: 0; }
+.file-preview-dialog header p { margin: 4px 0 0; overflow-wrap: anywhere; font-size: 12px; color: var(--app-secondary-foreground); }
+.file-preview-dialog header a { flex-shrink: 0; color: var(--app-primary-foreground); text-decoration: underline; padding: 10px 0; }
+.file-preview-dialog header button { flex-shrink: 0; width: 44px; height: 44px; border: 0; background: transparent; color: inherit; font-size: 24px; cursor: pointer; }
+.file-preview-body { padding: 16px; overflow: auto; max-height: calc(100dvh - 180px); }
+.file-preview-body img { display: block; max-width: 100%; max-height: calc(100dvh - 220px); object-fit: contain; margin: auto; }
+.file-preview-body pre { margin: 0; font: 13px/1.6 var(--font-mono, monospace); white-space: pre; }
+.file-preview-body [role="alert"] { overflow-wrap: anywhere; }

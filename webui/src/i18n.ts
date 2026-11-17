@@ -9,6 +9,13 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
+  'filePreview.title': '文件预览',
+  'filePreview.close': '关闭文件预览',
+  'filePreview.download': '下载',
+  'filePreview.loading': '正在加载文件…',
+  'filePreview.failed': '无法预览此文件',
+  'filePreview.noSession': '无法确定文件所属会话，请重新打开会话后重试。',
+  'filePreview.invalidImage': '图片无法解码，文件可能已损坏。',
   'chat.loadEarlierHistory': '加载更早的记录',
   'chat.previewImage': '放大查看图片 {n}',
   'chat.closeImagePreview': '关闭图片预览',
@@ -838,6 +845,13 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'filePreview.title': 'File preview',
+  'filePreview.close': 'Close file preview',
+  'filePreview.download': 'Download',
+  'filePreview.loading': 'Loading file…',
+  'filePreview.failed': 'Unable to preview this file',
+  'filePreview.noSession': 'The file has no owning session. Reopen the conversation and try again.',
+  'filePreview.invalidImage': 'The image could not be decoded. The file may be damaged.',
   'chat.loadEarlierHistory': 'Load earlier messages',
   'chat.previewImage': 'Enlarge image {n}',
   'chat.closeImagePreview': 'Close image preview',

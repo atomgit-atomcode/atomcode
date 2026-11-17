@@ -72,17 +72,6 @@ export function App() {
   const forkingRef = useRef(false);
   const [forking, setForking] = useState(false);
   const [forkNotice, setForkNotice] = useState<{id:string;text:string}|null>(null);
-  const [workbenchFile, setWorkbenchFile] = useState<{session:string;path:string;seq:number}|null>(null);
-  useEffect(() => {
-    const open = (event: Event) => {
-      const detail = (event as CustomEvent<{session:string;path:string}>).detail;
-      if (detail?.session !== sessionId || typeof detail.path !== 'string') return;
-      setWorkbenchFile({ ...detail, seq: Date.now() });
-      setWorkbenchOpen(true);
-    };
-    window.addEventListener('workbench-open-file', open);
-    return () => window.removeEventListener('workbench-open-file', open);
-  }, [sessionId]);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
   // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
@@ -684,7 +673,7 @@ export function App() {
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
           </div>
-          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} /></div>}
+          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} onClose={() => setWorkbenchOpen(false)} /></div>}
         </div>
       </div>
 

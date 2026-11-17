@@ -1,6 +1,8 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
-import { useMemo } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
+import { FilePreviewDialog } from './FilePreviewDialog';
+import { localFilePath } from '../lib/fileLinks';
 import { createMathExtensions } from '../lib/markdownMath';
 
 marked.setOptions({ gfm: true, breaks: false });
@@ -79,23 +81,47 @@ function highlightHtml(html: string, search: string): string {
   return doc.body.innerHTML;
 }
 
-export function Markdown({ content, search }: { content: string; search?: string }) {
-  const html = useMemo(() => {
-    const raw = marked.parse(content ?? '', { renderer }) as string;
+export function Markdown({ content, search, sessionId, documentPath }: {
+  content: string; search?: string; sessionId?: string | null; documentPath?: string;
+}) {
+  const [selected, setSelected] = useState<{ sessionId: string; path: string } | null>(null);
+  useEffect(() => setSelected(null), [sessionId]);
+  const { html, files } = useMemo(() => {
+    const files: string[] = [];
+    const links = new marked.Renderer();
+    const originalLink = links.link.bind(links);
+    links.code = renderer.code;
+    links.link = (href, title, text) => {
+      const path = localFilePath(href, documentPath);
+      if (path === null) return originalLink(href, title, text);
+      // Keep local destinations out of browser navigation without relaxing sanitization.
+      if (!sessionId) return `<span>${text}</span>`;
+      const index = files.push(path) - 1;
+      return originalLink('#', title, text).replace('<a ', `<a data-local-file="${index}" `);
+    };
+    const raw = marked.parse(content ?? '', { renderer: links }) as string;
     // SECURITY: model output is untrusted — sanitize before injecting as HTML.
     // KaTeX 输出携带 MathML <semantics><annotation encoding="..."> 原 TeX
     // （供无障碍/复制），DOMPurify 默认不放行这三个面，需显式 ADD。
-    const sanitized = DOMPurify.sanitize(raw, {
+    const clean = DOMPurify.sanitize(raw, {
+      RETURN_DOM: true,
       ADD_ATTR: ['data-copy', 'encoding'],
       ADD_TAGS: ['semantics', 'annotation', 'maction'],
-    });
-    if (search && search.trim()) {
-      return highlightHtml(sanitized, search);
-    }
-    return sanitized;
-  }, [content, search]);
+    }) as HTMLElement;
+    // A blocked URL must not leave a blue, non-functional anchor behind.
+    clean.querySelectorAll('a:not([href])').forEach(link => link.replaceWith(...link.childNodes));
+    const sanitized = clean.innerHTML;
+    return { html: search?.trim() ? highlightHtml(sanitized, search) : sanitized, files };
+  }, [content, search, sessionId, documentPath]);
 
   function onClick(e: MouseEvent) {
+    const link = (e.target as HTMLElement)?.closest<HTMLAnchorElement>('a[data-local-file]');
+    if (link) {
+      e.preventDefault();
+      const path = files[Number(link.dataset.localFile)];
+      if (path !== undefined && sessionId) setSelected({ sessionId, path });
+      return;
+    }
     const t = (e.target as HTMLElement)?.closest('.copy-button') as HTMLElement | null;
     if (t?.dataset.copy) {
       navigator.clipboard?.writeText(decodeURIComponent(t.dataset.copy)).catch(() => {});
@@ -107,11 +133,13 @@ export function Markdown({ content, search }: { content: string; search?: string
     }
   }
 
-  return (
+  return (<>
     <div
       class="markdown-root assistant-message-content"
       onClick={onClick}
+      onAuxClick={event => { if ((event.target as HTMLElement)?.closest('a[data-local-file]')) event.preventDefault(); }}
       dangerouslySetInnerHTML={{ __html: html }}
     />
-  );
+    {selected && selected.sessionId === sessionId && <FilePreviewDialog key={`${selected.sessionId}/${selected.path}`} sessionId={selected.sessionId} path={selected.path} onClose={() => setSelected(null)} />}
+  </>);
 }

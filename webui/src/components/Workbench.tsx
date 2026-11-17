@@ -149,7 +149,7 @@ function FilePreview({
         <img src={image} alt={path} />
       ) : /\.md$/i.test(path) ? (
         <div class="workbench-markdown">
-          <Markdown content={text} />
+          <Markdown content={text} sessionId={session} documentPath={path} />
         </div>
       ) : (
         <pre tabIndex={0}>{text}</pre>
@@ -161,14 +161,10 @@ export function Workbench({
   session,
   cwd,
   onClose,
-  requestedFile,
-  onFileOpened,
 }: {
   session: string;
   cwd: string;
   onClose: () => void;
-  requestedFile?: { session: string; path: string; seq: number } | null;
-  onFileOpened?: () => void;
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
@@ -229,14 +225,6 @@ export function Workbench({
       document.removeEventListener("visibilitychange", refresh);
     };
   }, [session]);
-  useEffect(() => {
-    if (!requestedFile || requestedFile.session !== session) return;
-    const root = cwd.replace(/\\/g, "/").replace(/\/$/, "");
-    const candidate = requestedFile.path;
-    const path = candidate.startsWith(root + "/") ? candidate.slice(root.length + 1) : candidate;
-    openFile(path);
-    onFileOpened?.();
-  }, [requestedFile, session, cwd]);
 
   useEffect(
     () =>
