@@ -677,6 +677,17 @@ fn name_of(log: &[LoggedEvent]) -> String {
         .unwrap_or_default()
 }
 
+fn review_title(scope: Option<&str>) -> String {
+    use atomcode_i18n::screen::{t, Msg};
+    let scope = match scope {
+        None => return "code-review".into(),
+        Some("working_tree") => t(Msg::ReviewWhatUncommitted),
+        Some("staged") => t(Msg::ReviewWhatStaged),
+        Some(base) => t(Msg::ReviewWhatRange { base }),
+    };
+    format!("code-review · {scope}")
+}
+
 /// 一行里放得下的一句:第一行非空的,压掉首尾空白。
 fn one_line(text: &str) -> Option<String> {
     text.lines()
@@ -1778,6 +1789,30 @@ impl Background {
         if let Err(error) = live.control.runtime().set_mode(mode).await {
             stop(live).await;
             return Err(crate::host::refused(error));
+        }
+        if review_only {
+            // Name the assignment before its first prompt can launch the model
+            // titler. The same logged fact serves the panel and resumed sessions.
+            let session = live.control.session_id();
+            let agent = live
+                .control
+                .front_end()
+                .app()
+                .and_then(|app| Feed::find(&app, &session));
+            let Some(agent) = agent else {
+                stop(live).await;
+                return Err(HostError::Unavailable);
+            };
+            let log = agent.session();
+            atomcode_harness::session::commit(
+                agent.ctx(),
+                &log,
+                SessionEvent::Titled {
+                    turn: log.current_turn(),
+                    title: review_title(scope.as_deref()),
+                    user_set: false,
+                },
+            );
         }
         // 它是替**前台那个**干的:干完把结果投回去,而不是留在这里等人来读。
         live.origin = control.session_id();

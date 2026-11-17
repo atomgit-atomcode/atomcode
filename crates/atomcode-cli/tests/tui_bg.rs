@@ -706,6 +706,62 @@ async fn background_tasks_snapshot_live_permissions_and_reviews_stay_read_only()
     }
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn a_background_review_is_named_before_the_model_sees_its_assignment() {
+    let rig = Rig::new().await;
+    let HostReply::Backgrounded { session, .. } = rig
+        .control()
+        .call(HostCommand::StartBackground {
+            text: "slow review assignment".into(),
+            scope: Some("staged".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a background session");
+    };
+    let title = format!("code-review · {}", t(Msg::ReviewWhatStaged));
+    rig.until_background("review has its assigned title", |list| {
+        list.iter()
+            .any(|task| task.session == session && task.title.as_deref() == Some(&title))
+    })
+    .await;
+    rig.until("the review assignment reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let events = store.load_events(&session).unwrap();
+    let named = events
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event,
+                atomcode_kernel::session::SessionEvent::Titled { title: name, user_set: false, .. }
+                    if name == &title
+            )
+        })
+        .expect("the assigned title is persisted");
+    let prompted = events
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event,
+                atomcode_kernel::session::SessionEvent::UserMessage { .. }
+            )
+        })
+        .expect("the task was submitted");
+    assert!(
+        named < prompted,
+        "automatic naming must never race this assignment"
+    );
+    rig.quit().await;
+}
+
 /// **`/background <task>` runs a task without changing the foreground.** The
 /// screen stays on the session it was on; the task runs in a session of its
 /// own; `/bg 1` then brings that one forward with its answer.
