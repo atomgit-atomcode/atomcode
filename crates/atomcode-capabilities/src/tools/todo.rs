@@ -548,13 +548,53 @@ impl Tool for TodoTool {
                 return err(error);
             }
         }
-        // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
-        // into the transcript; the renderer draws the pretty version separately). The
-        // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
-        // id=N` rows show task names.
+        // Full-list (re)plan shape. The model's own call arguments already
+        // carry the full list — echoing it back doubles the round's footprint
+        // and rides every later full-context resend of this session. The ids
+        // are 1-based in list order (derivable from the arguments), and the
+        // TUI seeds task titles from the transcript-derived plan
+        // (`named_todo_update` → `plan.title_as_of`), so the echo only needs
+        // the confirmation, the status counts and the open ids.
         if v.get("todos").is_some() && !is_incremental_action(&v) {
             return match validate_new_todo_plan(args) {
-                Ok(todos) => ok(render_todos_numbered(&todos, false)),
+                Ok(todos) if todos.is_empty() => ok("Plan cleared: no tasks.".to_string()),
+                Ok(todos) => {
+                    let mut pending = Vec::new();
+                    let mut in_progress = Vec::new();
+                    let mut completed = 0usize;
+                    for (i, t) in todos.iter().enumerate() {
+                        match t.status {
+                            TodoStatus::Pending => pending.push(i + 1),
+                            TodoStatus::InProgress => in_progress.push(i + 1),
+                            TodoStatus::Completed => completed += 1,
+                        }
+                    }
+                    let ids = |v: &[usize]| {
+                        v.iter()
+                            .map(|i| format!("#{i}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let mut parts = Vec::new();
+                    if !in_progress.is_empty() {
+                        parts.push(format!(
+                            "{} in_progress ({})",
+                            in_progress.len(),
+                            ids(&in_progress)
+                        ));
+                    }
+                    parts.push(format!("{} pending", pending.len()));
+                    if completed > 0 {
+                        parts.push(format!("{} completed", completed));
+                    }
+                    let items = if todos.len() == 1 { "item" } else { "items" };
+                    ok(format!(
+                        "Plan updated: {} {} — {}. Ids are 1-based in list order; update one with action=update.",
+                        todos.len(),
+                        items,
+                        parts.join(", ")
+                    ))
+                }
                 Err(e) => err(e),
             };
         }
@@ -1290,11 +1330,9 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(
-            r.content.contains("verify scheduler registration"),
-            "{}",
-            r.content
-        );
+        // Same contract as above: the confirmation without the list — the
+        // names ride in the call arguments of the same round.
+        assert!(r.content.contains("1 pending"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -1306,11 +1344,10 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(
-            result.content.contains("verify scheduler registration"),
-            "{}",
-            result.content
-        );
+        // The echo is a confirmation, not a second copy of the list: the
+        // model's own call arguments already carry the task names in the same
+        // round.
+        assert!(result.content.contains("1 pending"), "{}", result.content);
     }
 
     #[tokio::test]
