@@ -41,24 +41,29 @@ Issue 正文说的「兼容基础已打好」与代码有出入。核实结果�
 | MCP | `<project>/.mcp.json` | ✅ 直接读 | `capabilities/src/mcp/config.rs:221` |
 | MCP | `~/.claude.json` 的 `mcpServers` | ❌ 读不到 | 该文件是 Claude 的全局状态，本仓库无任何读取点 |
 | 指令 | `~/.codex/AGENTS.md` | ❌ 读不到 | 全仓库无 `.codex` 资产读取点 |
-| subagent | `~/.claude/agents/*.md` | ❌ 不支持 | AtomCode 无用户自定义 subagent 定义文件（只有 `subagent.external` 委派外部 CLI） |
+| subagent | `~/.claude/agents/*.md` | ❌ 格式不兼容 | AtomCode **有**用户自定义角色文件（`harness/src/plugins/team.rs:1889` 读 `<产品树>/agents/` 与 `<项目>/.atomcode/agents/`），但格式不同：角色文件**必须**带 `permission` 与 `difficulty` 两个 frontmatter 键（`team.rs:279,403`），Claude 的 subagent 文件没有，会被解析器拒绝 |
 | hooks | `<产品树>/hooks.json`、`<project>/.hooks.json` | ✅ 直接读 | `capabilities/src/cc_hooks.rs:300,305` |
 
 **结论**：项目级资产大体原生兼容；**用户级**外部资产（`~/.claude/CLAUDE.md`、`~/.claude/settings.json`、`~/.codex/skills`）是真空缺口。这正是报告要如实讲清的事。
 
 ## 3. 设计
 
-### 3.1 资产状态三态
+### 3.1 资产状态四态
 
 报告里每一项资产带一个状态：
 
 | 状态 | 含义 | 动作 |
 |---|---|---|
 | `Active` | AtomCode 现在就从**这个路径**读到它 | 无 |
-| `Actionable` | 有既定导入路径（复制同格式 / 转换映射） | 报告给出具体目标路径或映射结果 |
-| `Blocked` | 本期搬不动（有损 / 属第三期 / 无目标格式） | 报告说明为什么 |
+| `Imported` | 它的等价物**已经在我们的配置里**（上一轮导入过了） | 无 —— 这是「回检」那一半 |
+| `Actionable` | 有既定导入路径（复制同格式 / 转换映射） | 报告给出**具体目标路径**或映射结果 |
+| `Blocked` | 本期搬不动（有损 / 属第三期 / 无目标格式 / 文件损坏） | 报告说明为什么 |
 
-不给「已兼容 / 需转换」两态：三态才能区分「搬一下就好」和「搬不了」，而后者是用户最需要提前知道的。
+不给「已兼容 / 需转换」两态：多态才能区分「搬一下就好」和「搬不了」，而后者是用户最需要提前知道的。
+
+`Imported` 是「检测 → 迁移 → 回检」四步循环的回检半环：没有它，第二次运行会把「已经在配置里」的账号说成「可以带走」，用户分不清「还没导」和「已经导了但内容不同」。回检只比对**非密钥**部分（协议、endpoint、模型清单）—— 拿密钥出来比对既没意义（文件里的密钥可能早就轮换了），也不该在内存里过一遍明文。
+
+> 状态为 `Blocked` 的两种来源要分开说：**读不出来**（文件坏了）与**搬不动**（格式不兼容、有损）。前者是「你的文件有问题」，后者是「我们不支持」，用户要做的动作完全不同。
 
 ### 3.2 模块与分层
 
@@ -74,7 +79,7 @@ crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
 
 **关键约束**（`AGENTS.md` + `gates/layers.sh` + ADR 0022 §3）：
 
-- `migration` feature **不依赖 `atomcode-config`**。这样 `atomcode-tui` 可以直接用（UI 不许依赖产品 config crate，ADR 0022 §3；`gates/layers.sh` 守这条）。
+- `migration` feature **不依赖 `atomcode-config`**。不是 UI 不许用 config（`gates/layers.sh` 的「UI 不认 Host,也不认 Product」只禁 `atomcode-tui → atomcode-coding / atomcode`；`atomcode-config` 本来就在 TUI 的依赖图里），而是这个模块**用不到**它：报告只需要「我们的树在哪」，而 `ProductDirs` 就在本 crate 里（`product_dirs.rs`），带着它不增依赖。反过来，config 是**写入**的那一侧，只归宿主。
 - `capabilities` **不解析环境**。家目录、项目根由宿主解析后传进来（`AGENTS.md`：「解析环境只在宿主」）。
 - feature 声明：`migration = ["dep:atomcode-i18n", "dep:toml"]`。`toml` 用来读 Codex 的 `config.toml`；`atomcode-i18n` 是零 atomcode 依赖的叶子（`gates/layers.sh` 守它），所以 capabilities 引它不破坏分层（`memory` 模块已是同样做法）。
 - 报告的**结构化数据**在 capabilities，**文案**在 `atomcode-i18n` 的 **product 表**（CLI、daemon、setup 流程共用那张）。CLI 与 TUI 都读 product 表 → 一件事一种说法，不写两遍。
@@ -89,9 +94,19 @@ crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
 /// 宿主解析好的扫描上下文。capabilities 不读环境。
 pub struct ScanContext {
     /// OS 家目录（`~/.claude` 在它下面）。
-    pub home: std::path::PathBuf,
+    ///
+    /// 叫 `os_home` 而不是 `home`：本 crate 里还有另一个 `home`，指的是
+    /// **产品目录**（`~/.atomcode`）—— 全局指令层读的是它的 `ATOMCODE.md`
+    /// （`instructions.rs:128`），权限层读的是它（`permission_settings.rs:286`）。
+    /// 两个混起来，报告就会把没被读的文件说成「已经生效」。
+    pub os_home: std::path::PathBuf,
     /// 当前项目根。
     pub project: std::path::PathBuf,
+    /// 我们自己的树在哪 —— 报告因此能给出**具体目标路径**，而不是让人自己
+    /// 猜「复制到用户级目录」到底复制到哪。
+    ///
+    /// `ProductDirs` 就在 capabilities 本 crate 里，带着它不增依赖。
+    pub product: crate::ProductDirs,
 }
 
 /// 一个外部 Agent 的资产来源。
@@ -116,10 +131,10 @@ pub fn scan(sources: &[Box<dyn MigrationSource>], ctx: &ScanContext) -> Migratio
 
 pub enum AssetKind {
     Instructions, Skills, Commands, McpServers, Permissions, Hooks,
-    ProviderConfig, Agents, Sessions,
+    ProviderConfig, Agents, Sessions, Plugins,
 }
 
-pub enum AssetStatus { Active, Actionable, Blocked }
+pub enum AssetStatus { Active, Imported, Actionable, Blocked }
 
 pub enum AssetScope { User, Project }
 
@@ -130,6 +145,7 @@ pub struct AssetReport {
     pub scope: AssetScope,
     pub status: AssetStatus,
     pub detail: String,           // 给人看的一句话：为什么这个状态、怎么办
+                                  // （可带走时，这里写出**具体目标路径**）
 }
 
 pub struct SourceReport {
@@ -149,16 +165,16 @@ pub struct MigrationReport {
 
 | 资产 | 路径 | 状态 |
 |---|---|---|
-| 指令（项目） | `<project>/CLAUDE.md` | `Active`（直接读） |
+| 指令（项目） | `<project>/CLAUDE.md` | `Active`（直接读）—— 但若同目录有 `AGENTS.md` 等更高优先级文件，则是 `Blocked`（被遮蔽，不会被读） |
 | 指令（用户） | `~/.claude/CLAUDE.md` | `Actionable`（复制到产品用户树 `ATOMCODE.md`） |
 | 技能 | `~/.claude/skills/*`、`<project>/.claude/skills/*` | `Active` |
 | 命令 | `~/.claude/commands/*`、`<project>/.claude/commands/*` | `Active` |
-| 权限（项目） | `<project>/.claude/settings.json`、`settings.local.json` | `Active` |
+| 权限（项目） | `<project>/.claude/settings.json`、`settings.local.json` | `Active`（文件损坏则 `Blocked`） |
 | 权限（用户） | `~/.claude/settings.json` | `Actionable`（复制到产品用户树 `settings.json`） |
-| MCP（项目） | `<project>/.mcp.json` | `Active` |
+| MCP（项目） | `<project>/.mcp.json` | `Active`（文件损坏则 `Blocked`） |
 | MCP（用户） | `~/.claude.json` 的 `mcpServers` | `Actionable`（需写成产品用户树 `mcp.json`） |
 | hooks | `~/.claude/settings.json` 的 `hooks` | `Actionable`（复制到产品用户树 `hooks.json`） |
-| subagent | `~/.claude/agents/*.md` | `Blocked`（AtomCode 无用户自定义 subagent 定义文件） |
+| subagent | `~/.claude/agents/*.md` | `Blocked`（**格式不兼容**：我们的角色文件必须带 `permission` 与 `difficulty` 两个 frontmatter 键，Claude 的没有，会被解析器拒绝） |
 | 插件 | `~/.claude/plugins/` | `Blocked`（插件清单格式不同） |
 | provider | `~/.claude/settings.json` 的 `env.ANTHROPIC_*` | `Actionable`（第二期） |
 | 会话 | `~/.claude/projects/**/*.jsonl` | `Blocked`（第三期，有损） |
@@ -168,12 +184,15 @@ pub struct MigrationReport {
 | 资产 | 路径 | 状态 |
 |---|---|---|
 | 指令（用户） | `~/.codex/AGENTS.md` | `Actionable` |
+| 指令（项目） | `<project>/AGENTS.md` | `Active`（开放标准，我们直接读） |
 | 技能 | `~/.codex/skills/*` | `Actionable`（复制到产品用户树 `skills/`） |
 | MCP（用户） | `~/.codex/config.toml` 的 `[mcp_servers.*]` | `Actionable`（需转成 `mcp.json`） |
-| provider | `~/.codex/config.toml` 的 `model` / `model_providers.*` | `Actionable`（第二期） |
+| provider | `~/.codex/config.toml` 的 `model` / `model_providers.*` | `Actionable`（第二期；已在我们的配置里则是 `Imported`） |
 | 会话 | `~/.codex/sessions/**/*.jsonl` | `Blocked`（第三期） |
 
 > 只有**存在**的路径才出现在报告里。空目录不报。
+>
+> **目录读不出来 ≠ 目录是空的**：读不了就是 `Blocked`（附上原因），不是「没发现」。Codex 的「残留兜底」在这里对应的就是这条 —— 探测到的每一项都在报告里，一项都不静默消失。
 
 ### 3.5 第二期：provider 账号导入
 
@@ -185,19 +204,24 @@ pub struct MigrationReport {
 | Claude | `settings.json` → `env.ANTHROPIC_API_KEY`（**值就是密钥**） | `provider_accounts.<id>.api_key`（**逐项确认后**才写） |
 | Claude | `settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | 同上 |
 | Codex | `config.toml` → `[model_providers.<id>].base_url` | `provider_accounts.<id>.base_url` |
-| Codex | `config.toml` → `[model_providers.<id>].env_key`（**变量名**） | `provider_accounts.<id>.api_key = "<VAR_NAME>"` |
+| Codex | `config.toml` → `[model_providers.<id>].env_key`（**变量名**） | `provider_accounts.<id>.api_key = "${VAR_NAME}"` |
 | Codex | `config.toml` → `model` | `models.<id>.model` |
 | Codex | `config.toml` → `model_providers.<id>.wire_api` | `provider_accounts.<id>.provider`（`openai-compatible` / `anthropic-compatible`） |
 
-**凭据策略**（三条，不可绕过）：
+**凭据策略**（四条，不可绕过）：
 
 1. **不读 Keychain。** Claude 的 key 在 macOS Keychain、Codex 是 OAuth token —— 都搬不了，也不假装能搬。
 2. **按来源各自的语义处理，不猜。** 两个来源的凭据字段**方向相反**：
-   - Codex 的 `env_key` 是**变量的名字** → 写成 `api_key = "<VAR_NAME>"`。密钥不进我们的磁盘，运行时由 `ProviderAccountConfig::resolved_api_key`（`config/provider.rs:356`）解析 —— **这条路径本来就支持变量名**。
+   - Codex 的 `env_key` 是**变量的名字** → 写成 `api_key = "${VAR_NAME}"`。
    - Claude 的 `env` 块是**名字 → 值**，值**就是**密钥本身 → 只能是明文，走第 3 条。
 
    一个「长得像变量名就当引用」的启发式会把 Claude 的 `ANTHROPIC_API_KEY=MY_KEY`（值恰好像名字）误判成引用，把真密钥当名字存进文件 —— 运行时读不到密钥，而文件里还留着一个看似无害的字符串。**按来源分别处理。**
 3. **明文密钥只在逐项确认后写。** 源里若是明文，报告标「检测到明文密钥」，只在用户对**该项**明确确认后才写入；**永不批量导入**。
+
+   **`--yes` 不构成这个确认。** `--yes` 回答的是「把这些账号导进来」，不是「把你没见过的密钥写进文件」—— 带明文密钥的账号**每次都要问**，即使有 `--yes`。没有终端可问时，这类账号**一个都不写**，`config.toml` 保持逐字节不变。
+4. **写得出来的形式只有两种，且不重叠。** `resolved_api_key`（`config/provider.rs:356`）对 `api_key` 有三个分支：含 `$` 的按环境变量展开；与某个活着的环境变量同名的取那个变量；其余当密钥本身。同一个字符串可能因此有两种含义，所以写出去的形式必须唯一：
+   - **引用**写成 `${NAME}`。展开无歧义：变量没设置就展开成空，账号变成「没有密钥」，而不是「密钥是字符串 NAME」。写成裸名字会落到「当密钥本身」那个分支，把 `NAME` 当成密钥。
+   - **明文**写成它自己，但前提是不能被读成别的东西：不含 `$`（否则会被展开），也没有同名的活环境变量（否则那个变量会盖过它）。不满足就**拒绝写**并说明原因 —— 写一个有两种含义的文件比不写更糟。
 
 **写入**：复用 `atomcode_config::provider_book::ProviderBook::create_account`（`provider_book.rs:192`）。它自带文件锁、`toml_edit` 逐键 patch（保住用户在文件里的注释与排版）、原子替换。**不新造写入逻辑。**
 
@@ -239,12 +263,17 @@ TUI 通过 `atomcode-tui` 新增的 `migration.rs` 端口 trait（镜像 `setup.
 |---|---|
 | 外部目录不存在 | 该来源不出现 / 该项不报。**不是错误。** |
 | 外部文件格式损坏（坏 JSON / 坏 TOML） | 该项报 `Blocked`，`detail` 说明「文件无法解析」，**不 panic、不中断整次扫描** |
+| 外部目录存在但读不了 | 报 `Blocked` 并附上原因 —— **不是**「没发现」。读不了与没有是两件事。 |
 | 单个资产探测出错 | 其余资产照常报告；错误变成那一项的 `detail` |
 | 扫描期间文件被删 | 视同不存在 |
-| `--apply` 时配置已被别的进程改过 | `ProviderBook` 自带修订号，`create_account` 失败即报错，**不覆盖** |
-| `--apply` 非交互且无 `--yes` | 拒绝写入，打印待确认清单，退出码非 0 |
+| `--apply` 时配置已被别的进程改过 | `ProviderBook` 在锁内读最新文档再决策（`provider_book.rs:165` `write_deciding`），**合并**而不是拒绝；只有 id 冲突才拒绝 |
+| `--apply` 遇到带明文密钥的账号 | **每次都问**（`--yes` 也不代替这个确认）；没有终端可问时**不写**，退出码非 0 |
+| `--apply` 遇到写不出唯一含义的密钥 | 拒绝写并说明原因（见 §3.5 第 4 条），退出码非 0 |
+| `--apply` 非交互且无 `--yes` | 带密钥的账号一个都不写；无密钥的账号照写；退出码非 0（因为有东西没导） |
 
-**不静默丢弃**：任何探测到的资产都必须出现在报告里（`Active` / `Actionable` / `Blocked` 三态之一）。这是 Codex「残留兜底」在 AtomCode 的对应物 —— 我们的版本是「**没有一项资产可以凭空消失**」。
+**不静默丢弃**：任何探测到的资产都必须出现在报告里（`Active` / `Imported` / `Actionable` / `Blocked` 四态之一）。这是 Codex 「残留兜底」在 AtomCode 的对应物 —— 我们的版本是「**没有一项资产可以凭空消失**」。
+
+**回检**：`Imported` 那一态就是回检的结果 —— 已经在我们配置里的账号，第二次运行报「已导入」而不是「可以带走」。只比对非密钥部分（协议、endpoint、模型清单）；密钥按**种类**比（引用 vs 引用），不按值比 —— 文件里的密钥可能早就轮换了，拿出来比对既没意义也不该过明文。
 
 ### 3.8 文案（i18n）
 

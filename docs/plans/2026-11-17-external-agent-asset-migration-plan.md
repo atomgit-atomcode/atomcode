@@ -4,7 +4,7 @@
 
 **Goal:** 让从 Claude Code / Codex 迁来的用户，用一条命令看清「我的资产 AtomCode 已经能用哪些、哪些能带走、哪些带不走」，并能把 provider 账号逐项确认后搬进 `config.toml`。
 
-**Architecture:** 新增 `atomcode-capabilities::migration` 模块（中立、只读、feature `migration`、**不依赖 `atomcode-config`**），把外部 Agent 的资产分成 `Active` / `Actionable` / `Blocked` 三态产出结构化报告；文案走 `atomcode-i18n` 的 product 表。CLI 加 `atomcode import` 子命令（扫描 + `--apply` 写入），TUI 加 `/import` 命令，通过一个镜像 `/setup` 的端口 trait 向宿主要数据。
+**Architecture:** 新增 `atomcode-capabilities::migration` 模块（中立、只读、feature `migration`、**不依赖 `atomcode-config`**），把外部 Agent 的资产分成 `Active` / `Imported` / `Actionable` / `Blocked` 四态产出结构化报告；文案走 `atomcode-i18n` 的 product 表。CLI 加 `atomcode import` 子命令（扫描 + `--apply` 写入），TUI 加 `/import` 命令，通过一个镜像 `/setup` 的端口 trait 向宿主要数据。
 
 **Tech Stack:** Rust 1.94；`serde` / `serde_json` / `toml`；`atomcode-capabilities`（feature `migration`）、`atomcode-config`（`ProviderBook`）、`atomcode-i18n`（product 词表）、`atomcode-tui`（`CommandSet` + 端口）、`atomcode-cli`（clap 子命令）。
 
@@ -20,7 +20,7 @@
 
 | 阶段 | Task | 目标 | 依赖 | 验收 |
 |---|---|---|---|---|
-| P1 骨架 | 1 | `migration` 模块与三态报告类型可用 | — | `cargo nextest run -p atomcode-capabilities --features migration` 全绿；`gates/layers.sh` 通过 |
+| P1 骨架 | 1 | `migration` 模块与四态报告类型可用 | — | `cargo nextest run -p atomcode-capabilities --features migration` 全绿；`gates/layers.sh` 通过 |
 | P2 探测 | 2, 3 | Claude / Codex 两个来源 | P1 | 样例目录快照判据全绿；坏文件不 panic |
 | P3 CLI | 4 | `atomcode import` 只读报告 | P2 | 文本与 JSON 两种形态判据全绿 |
 | P4 TUI | 5 | `/import` 面板 | P3 | 屏幕判据全绿；`gates/tui-i18n.sh` 通过 |
@@ -35,7 +35,7 @@
 - **会话历史转换**（第三期）—— 信息有损，且需要 kernel event 格式的写入契约；本期只在报告里计数并标 `Blocked`。
 - **补运行时兼容面**（让 `~/.claude/CLAUDE.md` 等被直接读取）—— 那是改产品行为，不是迁移体验；本期只在报告里如实标注。
 - **MCP 实际导入** —— MCP 配置含 `command` / `env`，搬过去等于搬一段可执行的东西，风险与凭据同级；本期只标 `Actionable` 并给目标路径。
-- **插件与 subagent 定义迁移** —— 没有目标格式（AtomCode 无用户自定义 subagent 文件，插件清单格式是对方的）；本期标 `Blocked`。
+- **插件与 subagent 定义迁移** —— 没有目标格式：我们的角色文件要 `permission` 与 `difficulty` 两个 frontmatter 键（`team.rs:279,403`），Claude 的 subagent 文件没有，会被解析器拒绝；插件清单格式是对方的。本期标 `Blocked`。
 
 ---
 
@@ -66,7 +66,7 @@
 | 外部文件损坏（坏 JSON / 坏 TOML） | 该项报 `Blocked`，其余项照常 | 不适用（只读） |
 | 单项探测抛错 | 该项的 `detail` 说明原因，其余项照常 | 不适用 |
 | 扫描期间文件被删 | 视同不存在 | 不适用 |
-| `--apply` 时配置已被别的进程改过 | `ProviderBook` 的修订号不符 → 报错 | 不适用（我们没写） |
+| `--apply` 时配置已被别的进程改过 | `ProviderBook` 在锁内读最新文档再决策（`provider_book.rs:165`），**合并**而不是拒绝；只有 id 冲突才拒绝 | 不适用（我们没写） |
 | `--apply` 时 id 已被占用 | 报冲突，**不覆盖** | 不适用（我们没写） |
 | `--apply` 写入中途失败 | `ConfigStore` 事务失败 → 整个文档不落盘 | `ProviderBook::create_account` 自带「账号与模型一次写」语义，失败不留半个账号 |
 | 明文密钥未确认 | **什么都不写**（不是写一半） | 不适用（我们没写） |
@@ -74,7 +74,7 @@
 
 **关键不变式：失败时 `config.toml` 要么完全没变，要么是完整的一次提交。** 绝不出现「账号写了、模型没写」的中间态 —— 这是 `ProviderBook::create_account` 存在的理由，本功能直接用它。
 
-**没有一项资产可以凭空消失**：任何探测到的资产都必须出现在报告里（三态之一）。这是 Codex「残留兜底」在 AtomCode 的对应物。
+**没有一项资产可以凭空消失**：任何探测到的资产都必须出现在报告里（四态之一）。这是 Codex「残留兜底」在 AtomCode 的对应物。
 
 ---
 
@@ -140,7 +140,7 @@ cargo fmt --all -- --check
 | `crates/atomcode-tui/src/commands.rs` | `/import` 命令集（新增 `ImportCommands`） |
 | `crates/atomcode-cli/src/tui_migration.rs` | 端口实现：调 capabilities 扫描，转成 TUI 视图类型 |
 
-**分层约束（`gates/layers.sh` 守）：** `migration` feature **不得**引 `atomcode-config`（否则 TUI 不能用、且 capabilities→config 的边会拖 config 进 UI 图）；`atomcode-tui` **不得**引 `atomcode-coding` / `atomcode`；`atomcode-i18n` 必须零 atomcode 依赖。
+**分层约束（`gates/layers.sh` 守）：** `migration` feature **不得**引 `atomcode-config`（用不到：报告只需要 `ProductDirs`，而它就在 capabilities 本 crate 里；config 是**写入**那一侧，只归宿主）；`atomcode-tui` **不得**引 `atomcode-coding` / `atomcode`（门禁的「UI 不认 Host,也不认 Product」）；`atomcode-i18n` 必须零 atomcode 依赖（「词表是叶子」）。
 
 ---
 
@@ -199,8 +199,9 @@ mod tests {
     #[test]
     fn scanning_with_no_sources_produces_an_empty_report() {
         let ctx = ScanContext {
-            home: std::path::PathBuf::from("/home/u"),
+            os_home: std::path::PathBuf::from("/home/u"),
             project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new("/home/u/.ours", ".ours"),
         };
         let report = scan(&[], &ctx);
         assert!(report.sources.is_empty());
@@ -221,8 +222,12 @@ Expected: FAIL —— `cannot find module migration` / `unresolved import`。
 # Scan assets left behind by other AI coding agents (Claude Code / Codex) and
 # report what we already read natively, what can be brought over, and what is
 # blocked. Read-only; the provider-account draft it produces is written by the
-# host, never here. Deliberately does NOT pull `atomcode-config`: the screen
-# may use this, and the screen may not know the product's config crate.
+# host, never here.
+#
+# Deliberately does NOT pull `atomcode-config`: the report needs the product's
+# trees, and `ProductDirs` already lives in THIS crate (`product_dirs.rs`) —
+# the host passes it in. Keeping the edge out means this module stays usable
+# without the config leaf.
 migration = ["dep:atomcode-i18n", "dep:toml"]
 ```
 
@@ -273,12 +278,17 @@ pub enum AssetKind {
     Plugins,
 }
 
-/// Whether AtomCode already reads it, can have it brought over, or cannot.
+/// Where an asset stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AssetStatus {
     /// AtomCode reads this exact path today. Nothing to do.
     Active,
+    /// Its equivalent is already in OUR configuration — a previous import
+    /// brought it over. This is the re-check half of the loop: without it,
+    /// a second run would say "can be brought over" about something that is
+    /// already there.
+    Imported,
     /// There is a known way to bring it over.
     Actionable,
     /// It cannot come over (lossy, or this release does not do it).
@@ -308,7 +318,9 @@ pub struct AssetReport {
     /// One sentence for a person: why this status, and what to do about it.
     ///
     /// Localized here so both front ends show the same words — see the design
-    /// document's "文案只出一处".
+    /// document's "文案只出一处". When the asset can be brought over, this
+    /// sentence **names the exact path to copy it to**, so "copy it to the
+    /// user tree" is not a thing the person has to work out.
     pub detail: String,
 }
 
@@ -374,13 +386,27 @@ pub use report::{
     AssetKind, AssetReport, AssetScope, AssetStatus, MigrationReport, SourceReport,
 };
 
-/// Where to look. The host resolves both — this crate reads no environment.
+/// Where to look. The host resolves all of it — this crate reads no environment.
+///
+/// **The two homes.** `os_home` is the person's home directory, where
+/// `~/.claude` and `~/.codex` live. It is NOT the product's tree: the global
+/// instruction tier reads `<product tree>/ATOMCODE.md` and the permission
+/// loader reads `<product tree>` — see `instructions.rs:128` and
+/// `permission_settings.rs:286`. The field is named `os_home` rather than
+/// `home` because this crate already has another `home` meaning, and mixing
+/// them up would make the report claim a file is read when it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanContext {
     /// The person's home directory (`~/.claude` lives under it).
-    pub home: PathBuf,
+    pub os_home: PathBuf,
     /// The current project root.
     pub project: PathBuf,
+    /// Where OUR trees are, so the report can name a target path instead of
+    /// saying "copy it to the user tree" and leaving the person to guess.
+    ///
+    /// `ProductDirs` lives in this crate (`product_dirs.rs`), so carrying it
+    /// costs no new dependency.
+    pub product: crate::ProductDirs,
 }
 
 /// One external agent's assets.
@@ -544,8 +570,9 @@ mod tests {
 
     fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
         ScanContext {
-            home: home.to_path_buf(),
+            os_home: home.to_path_buf(),
             project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
         }
     }
 
@@ -553,6 +580,18 @@ mod tests {
         let dir = root.join("skills").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
+    }
+
+    /// Write a file, creating its parent directory first.
+    ///
+    /// A fixture that writes `<home>/.claude/settings.json` into a directory
+    /// that does not exist yet fails at the write, not at the assertion — and
+    /// the failure says nothing about the behaviour being checked.
+    fn write_file(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
     }
 
     #[test]
@@ -574,7 +613,7 @@ mod tests {
     fn a_project_instruction_file_is_active() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("CLAUDE.md"), "# rules").unwrap();
+        write_file(&project.path().join("CLAUDE.md"), "# rules");
 
         let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
         let instructions = assets
@@ -591,7 +630,7 @@ mod tests {
         // ~/.claude/CLAUDE.md — so this one has to be copied, not merely read.
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".claude").join("CLAUDE.md"), "# rules").unwrap();
+        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
 
         let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
         let instructions = assets
@@ -603,15 +642,34 @@ mod tests {
     }
 
     #[test]
+    fn a_project_instruction_file_shadowed_by_agents_md_is_not_active() {
+        // The project tier takes the FIRST existing name in order, so a
+        // CLAUDE.md next to an AGENTS.md is never loaded. Calling it "already
+        // in effect" would be a lie.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("AGENTS.md"), "# rules");
+        write_file(&project.path().join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Blocked);
+        assert!(
+            instructions.detail.contains("AGENTS.md"),
+            "it says what shadows it: {}",
+            instructions.detail
+        );
+    }
+
+    #[test]
     fn a_user_settings_file_is_actionable_and_the_project_one_is_active() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".claude").join("settings.json"), "{}").unwrap();
-        std::fs::write(
-            project.path().join(".claude").join("settings.json"),
-            "{}",
-        )
-        .unwrap();
+        write_file(&home.path().join(".claude").join("settings.json"), "{}");
+        write_file(&project.path().join(".claude").join("settings.json"), "{}");
 
         let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
         let permissions: Vec<_> = assets
@@ -626,7 +684,80 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_definition_is_blocked_because_we_have_no_such_format() {
+    fn a_broken_settings_file_is_blocked_not_active() {
+        // Our own loader refuses a broken policy (`permission_settings.rs:296`),
+        // so a broken file must not be reported as already in effect.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join(".claude").join("settings.json"), "{not json");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let permissions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Permissions)
+            .expect("the broken file is reported");
+        assert_eq!(permissions.status, AssetStatus::Blocked);
+    }
+
+    #[test]
+    fn a_project_mcp_file_is_active_and_the_global_one_is_actionable() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"mcp-fs"}}}"#,
+        );
+        write_file(
+            &home.path().join(".claude.json"),
+            r#"{"mcpServers":{"gh":{"command":"mcp-gh"}}}"#,
+        );
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let mcp: Vec<_> = assets.iter().filter(|a| a.kind == AssetKind::McpServers).collect();
+        assert_eq!(mcp.len(), 2);
+        assert!(mcp.iter().any(|m| m.scope == AssetScope::Project
+            && m.status == AssetStatus::Active));
+        assert!(mcp.iter().any(|m| m.scope == AssetScope::User
+            && m.status == AssetStatus::Actionable));
+    }
+
+    #[test]
+    fn a_provider_in_the_user_settings_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &home.path().join(".claude").join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_API_KEY":"sk-x"}}"#,
+        );
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let provider = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::ProviderConfig)
+            .expect("the provider is reported");
+        assert_eq!(provider.status, AssetStatus::Actionable);
+    }
+
+    #[test]
+    fn an_actionable_row_names_the_path_to_copy_it_to() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert!(
+            instructions.detail.contains("ATOMCODE.md"),
+            "the row says where to put it: {}",
+            instructions.detail
+        );
+    }
+
+    #[test]
+    fn a_subagent_definition_is_blocked_because_the_formats_differ() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let dir = home.path().join(".claude").join("agents");
@@ -645,7 +776,7 @@ mod tests {
     fn a_broken_settings_file_does_not_stop_the_scan() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".claude").join("settings.json"), "{not json").unwrap();
+        write_file(&home.path().join(".claude").join("settings.json"), "{not json");
         skill_at(&home.path().join(".claude"), "web-access");
 
         let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
@@ -711,20 +842,32 @@ impl MigrationSource for ClaudeSource {
 
     fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
         let mut out = Vec::new();
-        let user = ctx.home.join(".claude");
+        let user = ctx.os_home.join(".claude");
         let project_claude = ctx.project.join(".claude");
 
-        // Instructions. The project one is read as-is; the user one is not,
-        // because the global tier reads the product tree, not ~/.claude.
+        // Instructions. The project one is read as-is — but only if it is the
+        // one that WINS: the project tier takes the first existing name in
+        // order (`.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`, `CLAUDE.md`,
+        // `claude.md` — `instructions.rs:17`), so a `CLAUDE.md` next to an
+        // `AGENTS.md` is never loaded. Reporting it as "already in effect"
+        // would be a lie, so a shadowed file says so instead.
         let project_instructions = ctx.project.join("CLAUDE.md");
         if project_instructions.is_file() {
+            let shadowed_by = higher_precedence_instruction(ctx.project);
+            let (status, detail) = match shadowed_by {
+                Some(other) => (
+                    AssetStatus::Blocked,
+                    super::text::instructions_shadowed(&other),
+                ),
+                None => (AssetStatus::Active, super::text::instructions_active()),
+            };
             out.push(AssetReport {
                 kind: AssetKind::Instructions,
                 name: "CLAUDE.md".into(),
                 path: project_instructions,
                 scope: AssetScope::Project,
-                status: AssetStatus::Active,
-                detail: super::text::instructions_active(),
+                status,
+                detail,
             });
         }
         let user_instructions = user.join("CLAUDE.md");
@@ -735,7 +878,9 @@ impl MigrationSource for ClaudeSource {
                 path: user_instructions,
                 scope: AssetScope::User,
                 status: AssetStatus::Actionable,
-                detail: super::text::instructions_copyable(),
+                detail: super::text::instructions_copyable(
+                    &ctx.product.user().join("ATOMCODE.md"),
+                ),
             });
         }
 
@@ -752,7 +897,9 @@ impl MigrationSource for ClaudeSource {
             }
         }
 
-        // Permissions.
+        // Permissions. A file that cannot be parsed is NOT "in effect" — our
+        // own loader refuses a broken policy (`permission_settings.rs:296`), so
+        // it must not be reported as active either.
         for (scope, root) in [
             (AssetScope::User, user.clone()),
             (AssetScope::Project, project_claude.clone()),
@@ -762,16 +909,22 @@ impl MigrationSource for ClaudeSource {
                 if !path.is_file() {
                     continue;
                 }
-                let status = match scope {
-                    // The project one is merged into our own permission rules.
-                    AssetScope::Project => AssetStatus::Active,
-                    // The user one is not read: the loader reads the product tree.
-                    AssetScope::User => AssetStatus::Actionable,
-                };
-                let detail = if status == AssetStatus::Active {
-                    super::text::permissions_active()
-                } else {
-                    super::text::permissions_copyable()
+                let parsed = parse_json(&path);
+                let (status, detail) = match parsed {
+                    Err(reason) => (AssetStatus::Blocked, super::text::unreadable_file(&reason)),
+                    Ok(_) => match scope {
+                        // The project one is merged into our own permission rules.
+                        AssetScope::Project => {
+                            (AssetStatus::Active, super::text::permissions_active())
+                        }
+                        // The user one is not read: the loader reads the product tree.
+                        AssetScope::User => (
+                            AssetStatus::Actionable,
+                            super::text::permissions_copyable(
+                                &ctx.product.user().join("settings.json"),
+                            ),
+                        ),
+                    },
                 };
                 out.push(AssetReport {
                     kind: AssetKind::Permissions,
@@ -784,28 +937,91 @@ impl MigrationSource for ClaudeSource {
             }
         }
 
-        // MCP servers the person configured globally.
-        if let Some(count) = global_mcp_server_count(&ctx.home.join(".claude.json")) {
-            out.push(AssetReport {
-                kind: AssetKind::McpServers,
-                name: "mcpServers".into(),
-                path: ctx.home.join(".claude.json"),
-                scope: AssetScope::User,
-                status: AssetStatus::Actionable,
-                detail: super::text::mcp_copyable(count),
-            });
+        // MCP servers. The project's own `.mcp.json` is read; the global
+        // `~/.claude.json` is not, so it can only be brought over.
+        let project_mcp = ctx.project.join(".mcp.json");
+        if project_mcp.is_file() {
+            match mcp_server_count(&project_mcp) {
+                Ok(count) if count > 0 => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: "mcpServers".into(),
+                    path: project_mcp,
+                    scope: AssetScope::Project,
+                    status: AssetStatus::Active,
+                    detail: super::text::mcp_active(count),
+                }),
+                Ok(_) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: ".mcp.json".into(),
+                    path: project_mcp,
+                    scope: AssetScope::Project,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
+        }
+        let global_state = ctx.os_home.join(".claude.json");
+        if global_state.is_file() {
+            match mcp_server_count(&global_state) {
+                Ok(count) if count > 0 => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: "mcpServers".into(),
+                    path: global_state,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Actionable,
+                    detail: super::text::mcp_copyable(
+                        count,
+                        &ctx.product.user().join("mcp.json"),
+                    ),
+                }),
+                Ok(_) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: ".claude.json".into(),
+                    path: global_state,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
         }
 
         // Hooks live in the user settings file.
         let user_settings = user.join("settings.json");
-        if user_settings.is_file() && settings_has_hooks(&user_settings) {
+        if user_settings.is_file() {
+            match settings_hooks(&user_settings) {
+                Ok(true) => out.push(AssetReport {
+                    kind: AssetKind::Hooks,
+                    name: "hooks".into(),
+                    path: user_settings,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Actionable,
+                    detail: super::text::hooks_copyable(
+                        &ctx.product.user().join("hooks.json"),
+                    ),
+                }),
+                Ok(false) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::Hooks,
+                    name: "settings.json".into(),
+                    path: user_settings,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
+        }
+
+        // The provider this agent was pointed at.
+        if let Some((base_url, key_kind)) = claude_provider(&user) {
             out.push(AssetReport {
-                kind: AssetKind::Hooks,
-                name: "hooks".into(),
-                path: user_settings,
+                kind: AssetKind::ProviderConfig,
+                name: "provider".into(),
+                path: user.join("settings.json"),
                 scope: AssetScope::User,
                 status: AssetStatus::Actionable,
-                detail: super::text::hooks_copyable(),
+                detail: super::text::provider_copyable(base_url.as_deref(), key_kind),
             });
         }
 
@@ -859,10 +1075,28 @@ impl MigrationSource for ClaudeSource {
 }
 
 /// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
+///
+/// A directory that does not exist is simply empty. A directory that exists
+/// but cannot be read is NOT empty — it is a problem the person should see,
+/// so it becomes a `Blocked` row rather than silence.
 fn skill_rows(kind: AssetKind, scope: AssetScope, root: &Path) -> Vec<AssetReport> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
+    if !root.is_dir() {
         return out;
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            out.push(AssetReport {
+                kind,
+                name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                path: root.to_path_buf(),
+                scope,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&error.to_string()),
+            });
+            return out;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -884,28 +1118,78 @@ fn skill_rows(kind: AssetKind, scope: AssetScope, root: &Path) -> Vec<AssetRepor
     out
 }
 
-/// How many `mcpServers` the global Claude state declares. `None` when the file
-/// is absent or unreadable — that is not an error, there is simply nothing there.
-fn global_mcp_server_count(path: &Path) -> Option<usize> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let count = value
+/// The instruction file that wins over `CLAUDE.md` in the project tier, if any.
+///
+/// The project tier takes the **first existing** name in order
+/// (`.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`, `CLAUDE.md`, `claude.md` —
+/// `instructions.rs:17`), and only that one is loaded. So a `CLAUDE.md` that
+/// sits next to an `AGENTS.md` is never read, and the report has to say so
+/// rather than call it "already in effect".
+fn higher_precedence_instruction(project: &Path) -> Option<String> {
+    for name in [".atomcode.md", "ATOMCODE.md", "AGENTS.md"] {
+        if project.join(name).is_file() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// How many `mcpServers` a JSON file declares.
+///
+/// `Ok(0)` means the file parsed and declares none. `Err` means the file could
+/// not be read or parsed — which is **not** the same as "there are none", and
+/// the report says so instead of quietly showing nothing.
+fn mcp_server_count(path: &Path) -> Result<usize, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(value
         .get("mcpServers")
         .and_then(|s| s.as_object())
         .map(|o| o.len())
-        .unwrap_or(0);
-    (count > 0).then_some(count)
+        .unwrap_or(0))
 }
 
-/// Whether a settings file declares hooks. A broken file is not hooks.
-fn settings_has_hooks(path: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    value.get("hooks").map(|h| !h.is_null()).unwrap_or(false)
+/// Whether a settings file declares hooks. `Err` means it could not be read
+/// or parsed — again, not the same as "there are none".
+fn settings_hooks(path: &Path) -> Result<bool, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(value.get("hooks").map(|h| !h.is_null()).unwrap_or(false))
+}
+
+/// Read a JSON file. `Err` carries the reason, because "this file is broken"
+/// and "this file says nothing" are different reports.
+fn parse_json(path: &Path) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&raw).map_err(|e| e.to_string())
+}
+
+/// The provider Claude was pointed at, and how its credential is written.
+///
+/// `Ok(None)` = the settings file says nothing about a provider. `Err` = the
+/// file could not be parsed.
+fn claude_provider(user: &Path) -> Option<(Option<String>, Option<String>)> {
+    let raw = std::fs::read_to_string(user.join("settings.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let env = value.get("env")?.as_object()?;
+    let base_url = env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    // The value in Claude's `env` block IS the secret; it is never a reference.
+    let key = env
+        .get("ANTHROPIC_API_KEY")
+        .or_else(|| env.get("ANTHROPIC_AUTH_TOKEN"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|_| "plaintext".to_string());
+    if base_url.is_none() && key.is_none() {
+        None
+    } else {
+        Some((base_url, key))
+    }
 }
 
 /// How many session files there are under `projects/`.
@@ -946,8 +1230,14 @@ use atomcode_i18n::product::{t, Msg};
 pub fn instructions_active() -> String {
     t(Msg::MigrationInstructionsActive).into_owned()
 }
-pub fn instructions_copyable() -> String {
-    t(Msg::MigrationInstructionsCopyable).into_owned()
+pub fn instructions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationInstructionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+pub fn instructions_shadowed(by: &str) -> String {
+    t(Msg::MigrationInstructionsShadowed { by }).into_owned()
 }
 pub fn skill_active() -> String {
     t(Msg::MigrationSkillActive).into_owned()
@@ -955,14 +1245,30 @@ pub fn skill_active() -> String {
 pub fn permissions_active() -> String {
     t(Msg::MigrationPermissionsActive).into_owned()
 }
-pub fn permissions_copyable() -> String {
-    t(Msg::MigrationPermissionsCopyable).into_owned()
+pub fn permissions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationPermissionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
 }
-pub fn mcp_copyable(count: usize) -> String {
-    t(Msg::MigrationMcpCopyable { count }).into_owned()
+pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
+    t(Msg::MigrationMcpCopyable {
+        count,
+        target: &target.display().to_string(),
+    })
+    .into_owned()
 }
-pub fn hooks_copyable() -> String {
-    t(Msg::MigrationHooksCopyable).into_owned()
+pub fn mcp_active(count: usize) -> String {
+    t(Msg::MigrationMcpActive { count }).into_owned()
+}
+pub fn unreadable_file(reason: &str) -> String {
+    t(Msg::MigrationUnreadableFile { reason }).into_owned()
+}
+pub fn hooks_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationHooksCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
 }
 pub fn agents_blocked() -> String {
     t(Msg::MigrationAgentsBlocked).into_owned()
@@ -985,14 +1291,30 @@ pub fn sessions_blocked(count: usize) -> String {
     // External-agent asset migration (see
     // docs/plans/2026-11-17-external-agent-asset-migration-design.md).
     MigrationInstructionsActive,
-    MigrationInstructionsCopyable,
+    MigrationInstructionsCopyable {
+        target: &'a str,
+    },
+    MigrationInstructionsShadowed {
+        by: &'a str,
+    },
     MigrationSkillActive,
     MigrationPermissionsActive,
-    MigrationPermissionsCopyable,
+    MigrationPermissionsCopyable {
+        target: &'a str,
+    },
     MigrationMcpCopyable {
         count: usize,
+        target: &'a str,
     },
-    MigrationHooksCopyable,
+    MigrationMcpActive {
+        count: usize,
+    },
+    MigrationUnreadableFile {
+        reason: &'a str,
+    },
+    MigrationHooksCopyable {
+        target: &'a str,
+    },
     MigrationAgentsBlocked,
     MigrationPluginsBlocked,
     MigrationSessionsBlocked {
@@ -1006,20 +1328,31 @@ pub fn sessions_blocked(count: usize) -> String {
         Msg::MigrationInstructionsActive => {
             "Read directly from this project — already in effect".into()
         }
-        Msg::MigrationInstructionsCopyable => {
-            "Copy to the user tree to make it apply to every project".into()
+        Msg::MigrationInstructionsCopyable { target } => {
+            format!("Copy it to {target} to make it apply to every project")
+        }
+        Msg::MigrationInstructionsShadowed { by } => {
+            format!("Not read: {by} takes precedence in this project")
         }
         Msg::MigrationSkillActive => "Read directly — already in the skill catalog".into(),
         Msg::MigrationPermissionsActive => {
             "Merged into this project's permission rules — already in effect".into()
         }
-        Msg::MigrationPermissionsCopyable => {
-            "Copy to the user tree to apply it to every project".into()
+        Msg::MigrationPermissionsCopyable { target } => {
+            format!("Copy it to {target} to apply it to every project")
         }
-        Msg::MigrationMcpCopyable { count } => {
-            format!("{count} MCP server(s) — copy them into the user tree's mcp.json")
+        Msg::MigrationMcpCopyable { count, target } => {
+            format!("{count} MCP server(s) — copy them into {target}")
         }
-        Msg::MigrationHooksCopyable => "Copy them into the user tree's hooks.json".into(),
+        Msg::MigrationMcpActive { count } => {
+            format!("{count} MCP server(s) — read directly from this project")
+        }
+        Msg::MigrationUnreadableFile { reason } => {
+            format!("This file could not be read: {reason}")
+        }
+        Msg::MigrationHooksCopyable { target } => {
+            format!("Copy them into {target}")
+        }
         Msg::MigrationAgentsBlocked => {
             "AtomCode has no user-defined subagent files — not migrated".into()
         }
@@ -1035,14 +1368,29 @@ pub fn sessions_blocked(count: usize) -> String {
 
 ```rust
         Msg::MigrationInstructionsActive => "直接读取本项目的这个文件 —— 已经生效".into(),
-        Msg::MigrationInstructionsCopyable => "复制到用户级目录后对所有项目生效".into(),
+        Msg::MigrationInstructionsCopyable { target } => {
+            format!("复制到 {target} 后对所有项目生效")
+        }
+        Msg::MigrationInstructionsShadowed { by } => {
+            format!("不会被读取：本项目中 {by} 的优先级更高")
+        }
         Msg::MigrationSkillActive => "直接读取 —— 已在技能目录里".into(),
         Msg::MigrationPermissionsActive => "已并入本项目的权限规则 —— 已经生效".into(),
-        Msg::MigrationPermissionsCopyable => "复制到用户级目录后对所有项目生效".into(),
-        Msg::MigrationMcpCopyable { count } => {
-            format!("{count} 个 MCP 服务 —— 可复制到用户级目录的 mcp.json")
+        Msg::MigrationPermissionsCopyable { target } => {
+            format!("复制到 {target} 后对所有项目生效")
         }
-        Msg::MigrationHooksCopyable => "可复制到用户级目录的 hooks.json".into(),
+        Msg::MigrationMcpCopyable { count, target } => {
+            format!("{count} 个 MCP 服务 —— 可复制到 {target}")
+        }
+        Msg::MigrationMcpActive { count } => {
+            format!("{count} 个 MCP 服务 —— 直接读取本项目的这个文件")
+        }
+        Msg::MigrationUnreadableFile { reason } => {
+            format!("这个文件无法读取：{reason}")
+        }
+        Msg::MigrationHooksCopyable { target } => {
+            format!("可复制到 {target}")
+        }
         Msg::MigrationAgentsBlocked => "AtomCode 没有用户自定义 subagent 文件 —— 未迁移".into(),
         Msg::MigrationPluginsBlocked => "插件清单格式是对方的 —— 未迁移".into(),
         Msg::MigrationSessionsBlocked { count } => {
@@ -1094,16 +1442,29 @@ mod tests {
 
     fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
         ScanContext {
-            home: home.to_path_buf(),
+            os_home: home.to_path_buf(),
             project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
         }
+    }
+
+    /// Write a file, creating its parent directory first.
+    ///
+    /// A fixture that writes `<home>/.codex/config.toml` into a directory that
+    /// does not exist yet fails at the write, not at the assertion — and the
+    /// failure says nothing about the behaviour being checked.
+    fn write_file(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
     }
 
     #[test]
     fn the_global_agents_file_is_actionable() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join(".codex").join("AGENTS.md"), "# rules").unwrap();
+        write_file(&home.path().join(".codex").join("AGENTS.md"), "# rules");
 
         let assets = CodexSource.detect(&ctx(home.path(), project.path()));
         let instructions = assets
@@ -1135,11 +1496,10 @@ mod tests {
     fn a_broken_config_toml_is_reported_without_taking_the_scan_down() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".codex").join("config.toml"),
+        write_file(
+            &home.path().join(".codex").join("config.toml"),
             "this is not = = toml",
-        )
-        .unwrap();
+        );
         let dir = home.path().join(".codex").join("skills").join("deploy");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
@@ -1155,11 +1515,10 @@ mod tests {
     fn mcp_servers_in_the_config_are_actionable() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".codex").join("config.toml"),
+        write_file(
+            &home.path().join(".codex").join("config.toml"),
             "[mcp_servers.fs]\ncommand = \"mcp-fs\"\n",
-        )
-        .unwrap();
+        );
 
         let assets = CodexSource.detect(&ctx(home.path(), project.path()));
         let mcp = assets
@@ -1216,7 +1575,7 @@ impl MigrationSource for CodexSource {
 
     fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
         let mut out = Vec::new();
-        let user = ctx.home.join(".codex");
+        let user = ctx.os_home.join(".codex");
         let project_codex = ctx.project.join(".codex");
 
         // Global instructions.
@@ -1228,7 +1587,9 @@ impl MigrationSource for CodexSource {
                 path: agents,
                 scope: AssetScope::User,
                 status: AssetStatus::Actionable,
-                detail: super::text::instructions_copyable(),
+                detail: super::text::instructions_copyable(
+                    &ctx.product.user().join("ATOMCODE.md"),
+                ),
             });
         }
 
@@ -1251,13 +1612,25 @@ impl MigrationSource for CodexSource {
             (AssetScope::Project, project_codex.join("skills")),
         ] {
             let mut names: Vec<String> = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let is_skill = path.is_dir() && path.join("SKILL.md").is_file();
-                    if is_skill {
-                        names.push(entry.file_name().to_string_lossy().into_owned());
+            if root.is_dir() {
+                match std::fs::read_dir(&root) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            let is_skill = path.is_dir() && path.join("SKILL.md").is_file();
+                            if is_skill {
+                                names.push(entry.file_name().to_string_lossy().into_owned());
+                            }
+                        }
                     }
+                    Err(error) => out.push(AssetReport {
+                        kind: AssetKind::Skills,
+                        name: "skills".into(),
+                        path: root.clone(),
+                        scope,
+                        status: AssetStatus::Blocked,
+                        detail: super::text::unreadable_file(&error.to_string()),
+                    }),
                 }
             }
             names.sort();
@@ -1268,7 +1641,9 @@ impl MigrationSource for CodexSource {
                     path: root.join(&name),
                     scope,
                     status: AssetStatus::Actionable,
-                    detail: super::text::skill_copyable(),
+                    detail: super::text::skill_copyable(
+                        &ctx.product.user().join("skills").join(&name),
+                    ),
                 });
             }
         }
@@ -1292,7 +1667,10 @@ impl MigrationSource for CodexSource {
                             path: path.clone(),
                             scope,
                             status: AssetStatus::Actionable,
-                            detail: super::text::mcp_copyable(count),
+                            detail: super::text::mcp_copyable(
+                                count,
+                                &ctx.product.user().join("mcp.json"),
+                            ),
                         });
                     }
                     if value.get("model").is_some() || value.get("model_providers").is_some() {
@@ -1302,7 +1680,7 @@ impl MigrationSource for CodexSource {
                             path: path.clone(),
                             scope,
                             status: AssetStatus::Actionable,
-                            detail: super::text::provider_copyable(),
+                            detail: super::text::provider_copyable(None, None),
                         });
                     }
                 }
@@ -1368,11 +1746,18 @@ fn session_file_count(sessions: &Path) -> Option<usize> {
 `text.rs` 追加：
 
 ```rust
-pub fn skill_copyable() -> String {
-    t(Msg::MigrationSkillCopyable).into_owned()
+pub fn skill_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationSkillCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
 }
-pub fn provider_copyable() -> String {
-    t(Msg::MigrationProviderCopyable).into_owned()
+pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> String {
+    t(Msg::MigrationProviderCopyable {
+        base_url: base_url.unwrap_or("-"),
+        key: key_kind.unwrap_or("-"),
+    })
+    .into_owned()
 }
 pub fn unreadable_config() -> String {
     t(Msg::MigrationUnreadableConfig).into_owned()
@@ -1382,19 +1767,27 @@ pub fn unreadable_config() -> String {
 `messages.rs` 追加：
 
 ```rust
-    MigrationSkillCopyable,
-    MigrationProviderCopyable,
+    MigrationSkillCopyable {
+        target: &'a str,
+    },
+    MigrationProviderCopyable {
+        base_url: &'a str,
+        key: &'a str,
+    },
     MigrationUnreadableConfig,
 ```
 
 `en.rs` 追加：
 
 ```rust
-        Msg::MigrationSkillCopyable => {
-            "Copy it into the user tree's skills directory to make it load".into()
+        Msg::MigrationSkillCopyable { target } => {
+            format!("Copy it to {target} to make it load")
         }
-        Msg::MigrationProviderCopyable => {
-            "Its provider settings can be imported — review them before writing".into()
+        Msg::MigrationProviderCopyable { base_url, key } => {
+            format!(
+                "Provider settings (endpoint {base_url}, credential {key}) can be imported — \
+                 review them before writing"
+            )
         }
         Msg::MigrationUnreadableConfig => {
             "This config file could not be parsed, so nothing could be read from it".into()
@@ -1404,8 +1797,12 @@ pub fn unreadable_config() -> String {
 `zh_cn.rs` 追加：
 
 ```rust
-        Msg::MigrationSkillCopyable => "复制到用户级目录的 skills 后即可加载".into(),
-        Msg::MigrationProviderCopyable => "其中的 provider 设置可以导入 —— 写入前请先确认".into(),
+        Msg::MigrationSkillCopyable { target } => {
+            format!("复制到 {target} 后即可加载")
+        },
+        Msg::MigrationProviderCopyable { base_url, key } => {
+            format!("其中的 provider 设置可以导入（endpoint {base_url}，凭据 {key}）—— 写入前请先确认")
+        }
         Msg::MigrationUnreadableConfig => "这个配置文件无法解析，因此其中内容都没读到".into(),
 ```
 
@@ -1446,7 +1843,9 @@ nothing."
 //! Read-only by default: it reports. `--apply` is the second phase, and it is
 //! the only path that writes.
 
-use atomcode_capabilities::migration::{self, AssetStatus, MigrationReport, ScanContext};
+use atomcode_capabilities::migration::{
+    self, AssetKind, AssetStatus, MigrationReport, ProviderAccountDraft, ScanContext,
+};
 use std::path::{Path, PathBuf};
 
 /// The report, as text or as JSON.
@@ -1481,6 +1880,7 @@ fn render_text(report: &MigrationReport) -> String {
     out.push_str(&t(Msg::MigrationSummary {
         total: report.total_assets(),
         active: report.assets_with_status(AssetStatus::Active),
+        imported: report.assets_with_status(AssetStatus::Imported),
         actionable: report.assets_with_status(AssetStatus::Actionable),
         blocked: report.assets_with_status(AssetStatus::Blocked),
     }));
@@ -1492,16 +1892,78 @@ fn status_word(status: AssetStatus) -> String {
     use atomcode_config::i18n::{t, Msg};
     match status {
         AssetStatus::Active => t(Msg::MigrationStatusActive).into_owned(),
+        AssetStatus::Imported => t(Msg::MigrationStatusImported).into_owned(),
         AssetStatus::Actionable => t(Msg::MigrationStatusActionable).into_owned(),
         AssetStatus::Blocked => t(Msg::MigrationStatusBlocked).into_owned(),
     }
 }
 
+/// The re-check: mark the drafts whose equivalent is already in OUR config.
+///
+/// This is the "回检" half of Codex's loop. Without it a second run says
+/// "can be brought over" about an account that is already there, and the
+/// person has no way to tell "not yet imported" from "already imported but
+/// different".
+///
+/// Only the **non-secret** parts are compared — protocol, endpoint and the
+/// model list. A credential is compared by KIND (a reference to a variable
+/// against a reference to a variable), never by value: reading our own
+/// credential to compare it would put a secret in memory for no reason, and
+/// the file's credential may legitimately have been rotated since.
+pub fn mark_already_imported(
+    report: &mut MigrationReport,
+    drafts: &[ProviderAccountDraft],
+    config_path: &Path,
+) {
+    use atomcode_config::provider_book::ProviderBook;
+    let config = ProviderBook::new(config_path.to_path_buf()).load();
+    if config.provider_accounts.is_empty() {
+        return;
+    }
+    let accounts = &config.provider_accounts;
+    let models = &config.models;
+    for source in &mut report.sources {
+        for asset in &mut source.assets {
+            if asset.kind != AssetKind::ProviderConfig {
+                continue;
+            }
+            let Some(draft) = drafts.iter().find(|d| d.id == asset.name) else {
+                continue;
+            };
+            let Some(account) = accounts.get(&draft.id) else {
+                continue;
+            };
+            let same_endpoint = account.base_url.as_deref() == draft.base_url.as_deref();
+            let same_protocol =
+                account.provider == draft.protocol || account.provider == "openai-compatible";
+            let same_models = draft.models.iter().all(|model| {
+                models
+                    .values()
+                    .any(|m| m.model == *model && m.account == draft.id)
+            });
+            if same_endpoint && same_protocol && same_models {
+                asset.status = AssetStatus::Imported;
+                asset.detail =
+                    atomcode_config::i18n::t(atomcode_config::i18n::Msg::MigrationAlreadyImported)
+                        .into_owned();
+            }
+        }
+    }
+}
+
 /// Where to look. The host resolves these; the capability resolves nothing.
-pub fn scan_context(home: &Path, project: &Path) -> ScanContext {
+///
+/// The product's trees come from the host too: the report needs to name a
+/// target path, and only the host knows where our trees are.
+pub fn scan_context(
+    os_home: &Path,
+    project: &Path,
+    product: atomcode_capabilities::ProductDirs,
+) -> ScanContext {
     ScanContext {
-        home: home.to_path_buf(),
+        os_home: os_home.to_path_buf(),
         project: project.to_path_buf(),
+        product,
     }
 }
 
@@ -1584,6 +2046,86 @@ mod tests {
             "{text}"
         );
     }
+
+    #[test]
+    fn a_draft_already_in_our_config_is_marked_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[provider_accounts.gateway]\nprovider = \"openai-compatible\"\n\
+             base_url = \"https://gw.invalid/v1\"\n",
+        )
+        .unwrap();
+
+        let draft = ProviderAccountDraft {
+            id: "gateway".into(),
+            protocol: "openai-compatible".into(),
+            base_url: Some("https://gw.invalid/v1".into()),
+            api_key: None,
+            models: vec![],
+        };
+        let mut report = MigrationReport {
+            sources: vec![atomcode_capabilities::migration::SourceReport {
+                source_id: "codex",
+                display_name: "Codex",
+                assets: vec![atomcode_capabilities::migration::AssetReport {
+                    kind: AssetKind::ProviderConfig,
+                    name: "gateway".into(),
+                    path: "/home/u/.codex/config.toml".into(),
+                    scope: atomcode_capabilities::migration::AssetScope::User,
+                    status: AssetStatus::Actionable,
+                    detail: "can be imported".into(),
+                }],
+            }],
+        };
+        super::mark_already_imported(&mut report, &[draft], &config);
+        let asset = &report.sources[0].assets[0];
+        assert_eq!(
+            asset.status,
+            AssetStatus::Imported,
+            "it is already there: {asset:?}"
+        );
+    }
+
+    #[test]
+    fn a_draft_that_differs_from_ours_stays_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[provider_accounts.gateway]\nprovider = \"openai-compatible\"\n\
+             base_url = \"https://other.invalid/v1\"\n",
+        )
+        .unwrap();
+        let draft = ProviderAccountDraft {
+            id: "gateway".into(),
+            protocol: "openai-compatible".into(),
+            base_url: Some("https://gw.invalid/v1".into()),
+            api_key: None,
+            models: vec![],
+        };
+        let mut report = MigrationReport {
+            sources: vec![atomcode_capabilities::migration::SourceReport {
+                source_id: "codex",
+                display_name: "Codex",
+                assets: vec![atomcode_capabilities::migration::AssetReport {
+                    kind: AssetKind::ProviderConfig,
+                    name: "gateway".into(),
+                    path: "/home/u/.codex/config.toml".into(),
+                    scope: atomcode_capabilities::migration::AssetScope::User,
+                    status: AssetStatus::Actionable,
+                    detail: "can be imported".into(),
+                }],
+            }],
+        };
+        super::mark_already_imported(&mut report, &[draft], &config);
+        assert_eq!(
+            report.sources[0].assets[0].status,
+            AssetStatus::Actionable,
+            "a different endpoint is not the same account"
+        );
+    }
 }
 ```
 
@@ -1624,12 +2166,15 @@ Expected: PASS —— 3 tests。
     MigrationSummary {
         total: usize,
         active: usize,
+        imported: usize,
         actionable: usize,
         blocked: usize,
     },
     MigrationStatusActive,
+    MigrationStatusImported,
     MigrationStatusActionable,
     MigrationStatusBlocked,
+    MigrationAlreadyImported,
 ```
 
 `crates/atomcode-i18n/src/product/en.rs` 的 `match` 里追加：
@@ -1641,14 +2186,20 @@ Expected: PASS —— 3 tests。
         Msg::MigrationSummary {
             total,
             active,
+            imported,
             actionable,
             blocked,
         } => format!(
-            "\n{total} assets: {active} already in effect, {actionable} can be brought over, {blocked} cannot.\n"
+            "\n{total} assets: {active} already in effect, {imported} already imported, \
+             {actionable} can be brought over, {blocked} cannot.\n"
         ),
         Msg::MigrationStatusActive => "in effect".into(),
+        Msg::MigrationStatusImported => "already imported".into(),
         Msg::MigrationStatusActionable => "can move".into(),
         Msg::MigrationStatusBlocked => "cannot move".into(),
+        Msg::MigrationAlreadyImported => {
+            "Already in your configuration — nothing left to bring over".into()
+        }
 ```
 
 `crates/atomcode-i18n/src/product/zh_cn.rs` 的 `match` 里追加：
@@ -1658,14 +2209,18 @@ Expected: PASS —— 3 tests。
         Msg::MigrationSummary {
             total,
             active,
+            imported,
             actionable,
             blocked,
         } => format!(
-            "\n共 {total} 项资产：{active} 项已经生效，{actionable} 项可以带走，{blocked} 项带不走。\n"
+            "\n共 {total} 项资产：{active} 项已经生效，{imported} 项已导入，\
+             {actionable} 项可以带走，{blocked} 项带不走。\n"
         ),
         Msg::MigrationStatusActive => "已经生效".into(),
+        Msg::MigrationStatusImported => "已导入".into(),
         Msg::MigrationStatusActionable => "可以带走".into(),
         Msg::MigrationStatusBlocked => "带不走".into(),
+        Msg::MigrationAlreadyImported => "已在你的配置里 —— 没有需要带过来的了".into(),
 ```
 
 > **中文标点按 `docs/i18n-style.md`**：全角逗号与句号，数字与中文之间留半角空格。
@@ -1695,7 +2250,8 @@ Expected: PASS —— 3 tests。
 ```rust
             Commands::Import { json, apply, yes } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let exit_code = run_import_command(json, apply, yes).await;
+                let exit_code =
+                    run_import_command(json, apply, yes, cli.config.as_deref()).await;
                 telemetry.shutdown(std::time::Duration::from_millis(500)).await;
                 return Ok(exit_code);
             }
@@ -1704,12 +2260,39 @@ Expected: PASS —— 3 tests。
 并在 `main.rs` 里加实现（放在 `run_setup_command` 旁边）：
 
 ```rust
-async fn run_import_command(json: bool, apply: bool, yes: bool) -> i32 {
+/// Where our configuration lives.
+///
+/// The host owns this path. `--config` wins when it is given, the same way it
+/// does everywhere else in this binary (`main.rs:1801`); otherwise it is the
+/// default location — the same file `atomcode login` writes to.
+fn cli_config_path(cli_config: Option<&std::path::Path>) -> std::path::PathBuf {
+    match cli_config {
+        Some(path) => path.to_path_buf(),
+        None => atomcode_config::config::Config::default_path(),
+    }
+}
+
+async fn run_import_command(
+    json: bool,
+    apply: bool,
+    yes: bool,
+    cli_config: Option<&std::path::Path>,
+) -> i32 {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let ctx = atomcode::import_cmd::scan_context(&home, &project);
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let ctx = atomcode::import_cmd::scan_context(&home, &project, dirs.clone());
     let sources = atomcode_capabilities::migration::builtin_sources();
-    let report = atomcode_capabilities::migration::scan(&sources, &ctx);
+    let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
+
+    // The re-check: what is already in OUR configuration is not "to be
+    // brought over" — it is already there.
+    let drafts: Vec<_> = sources
+        .iter()
+        .flat_map(|source| source.provider_drafts(&ctx))
+        .collect();
+    let config_path = cli_config_path(cli_config);
+    atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &config_path);
 
     if !apply {
         println!("{}", atomcode::import_cmd::render(&report, json));
@@ -1721,7 +2304,7 @@ async fn run_import_command(json: bool, apply: bool, yes: bool) -> i32 {
         &sources,
         &ctx,
         yes,
-        &cli_config_path(),
+        &config_path,
         std::io::IsTerminal::is_terminal(&std::io::stdin()),
     ) {
         Ok((text, skipped)) => {
@@ -1784,8 +2367,13 @@ rows with stable status names."
 - Create: `crates/atomcode-tui/src/migration.rs`
 - Modify: `crates/atomcode-tui/src/commands.rs`
 - Modify: `crates/atomcode-tui/src/lib.rs`
+- Modify: `crates/atomcode-tui/src/plugin.rs`（端口声明 `MigrationSvc`）
+- Modify: `crates/atomcode-tui/src/rows.rs`（`commands!` 宏 + 行清单）
+- Modify: `crates/atomcode-tui/src/launch.rs`（`Ports` 字段 + 端口注册）
+- Modify: `crates/atomcode-tui/tests/language.rs`（内置命令集清单）
+- Modify: `crates/atomcode-tui/tests/e2e.rs`（`launch::Ports` 构造点）
 - Create: `crates/atomcode-cli/src/tui_migration.rs`
-- Modify: `crates/atomcode-cli/src/lib.rs`
+- Modify: `crates/atomcode-cli/src/lib.rs`（模块声明 + `Ports` 装配）
 - Modify: `crates/atomcode-i18n/src/screen/{messages,en,zh_cn}.rs`
 
 - [ ] **Step 1: 写失败的测试**
@@ -1857,6 +2445,11 @@ fn import_catalogue() -> Vec<Command> {
     vec![Command::said("import", t(Msg::CmdAboutImport))]
 }
 
+/// `CommandSet` is an `#[async_trait]` trait (`command.rs:296`), so the impl
+/// needs the attribute too — without it the `async fn` in the trait does not
+/// match the desugared signature. `async_trait` is already imported in this
+/// file (`commands.rs:14`), so nothing else is needed.
+#[async_trait]
 impl CommandSet for ImportCommands {
     fn id(&self) -> &'static str {
         "cmd-import"
@@ -1882,7 +2475,9 @@ impl CommandSet for ImportCommands {
 fn render_import_report(report: &crate::migration::MigrationReportView) -> String {
     use crate::i18n::product::{t as pt, Msg as PMsg};
     if report.sources.is_empty() {
-        return pt(PMsg::MigrationReportEmpty);
+        // `product::t` returns a `Cow<'static, str>`, so it needs `.into_owned()`
+        // to become the `String` this returns.
+        return pt(PMsg::MigrationReportEmpty).into_owned();
     }
     let mut out = String::new();
     for source in &report.sources {
@@ -1957,10 +2552,13 @@ commands!(
 
 `crates/atomcode-cli/src/tui_migration.rs`（新建）：
 
+> **别忘了声明模块**：`crates/atomcode-cli/src/lib.rs` 的模块区加 `pub mod tui_migration;`（只建文件不声明模块，代码不会进编译）。
+
 ```rust
 //! The host side of the migration port: it scans the disk and hands the screen
 //! a view it can lay out.
 
+use async_trait::async_trait;
 use atomcode_tui::migration::{
     Migration, MigrationAssetView, MigrationReportView, MigrationSourceView,
 };
@@ -1969,11 +2567,20 @@ use std::path::PathBuf;
 pub struct DiskMigration {
     home: PathBuf,
     project: PathBuf,
+    product: atomcode_capabilities::ProductDirs,
 }
 
 impl DiskMigration {
-    pub fn new(home: PathBuf, project: PathBuf) -> Self {
-        Self { home, project }
+    pub fn new(
+        home: PathBuf,
+        project: PathBuf,
+        product: atomcode_capabilities::ProductDirs,
+    ) -> Self {
+        Self {
+            home,
+            project,
+            product,
+        }
     }
 }
 
@@ -1981,8 +2588,9 @@ impl DiskMigration {
 impl Migration for DiskMigration {
     async fn report(&self) -> Result<MigrationReportView, String> {
         let ctx = atomcode_capabilities::migration::ScanContext {
-            home: self.home.clone(),
+            os_home: self.home.clone(),
             project: self.project.clone(),
+            product: self.product.clone(),
         };
         let sources = atomcode_capabilities::migration::builtin_sources();
         let report = atomcode_capabilities::migration::scan(&sources, &ctx);
@@ -2014,11 +2622,14 @@ impl Migration for DiskMigration {
 `crates/atomcode-cli/src/lib.rs` 的 `launch::Ports { ... }` 加一项：
 
 ```rust
-                migration: Some(crate::tui_migration::DiskMigration::new(
+                migration: Some(Arc::new(crate::tui_migration::DiskMigration::new(
                     dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
                     working_dir.clone(),
-                )),
+                    dirs.clone(),
+                ))),
 ```
+
+> 字段类型是 `Option<Arc<dyn Migration>>`，所以要 `Arc::new(...)` 包起来 —— 直接传 `DiskMigration` 类型对不上。
 
 `crates/atomcode-tui/src/launch.rs` 的 `pub struct Ports` 加字段：
 
@@ -2146,8 +2757,9 @@ mod tests {
             r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_API_KEY":"sk-secret-value"}}"#,
         );
         let ctx = ScanContext {
-            home: home.path().to_path_buf(),
+            os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
@@ -2171,8 +2783,9 @@ mod tests {
         )
         .unwrap();
         let ctx = ScanContext {
-            home: home.path().to_path_buf(),
+            os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
@@ -2188,8 +2801,9 @@ mod tests {
             r#"{"env":{"ANTHROPIC_API_KEY":"sk-secret-value"}}"#,
         );
         let ctx = ScanContext {
-            home: home.path().to_path_buf(),
+            os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(
@@ -2203,8 +2817,9 @@ mod tests {
     fn no_provider_configuration_means_no_drafts() {
         let home = tempfile::tempdir().unwrap();
         let ctx = ScanContext {
-            home: home.path().to_path_buf(),
+            os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert!(drafts.is_empty());
@@ -2258,7 +2873,7 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 
 ```rust
     fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
-        let Some(env) = super::provider::claude_env(&ctx.home) else {
+        let Some(env) = super::provider::claude_env(&ctx.os_home) else {
             return Vec::new();
         };
         let base_url = env
@@ -2295,19 +2910,19 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 
 ```rust
     fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
-        let mut drafts = Vec::new();
-        for scope in [ctx.home.join(".codex"), ctx.project.join(".codex")] {
-            let path = scope.join("config.toml");
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(value) = raw.parse::<toml::Value>() else {
-                continue;
-            };
-            let Some(providers) = value.get("model_providers").and_then(|p| p.as_table()) else {
-                continue;
-            };
-            for (name, provider) in providers {
+        // Codex layers its config: the project's `.codex/config.toml` wins over
+        // the user's `~/.codex/config.toml`. So the two are **merged by id**,
+        // project over user — otherwise the same provider id appears twice and
+        // the second one is a conflict instead of an override.
+        let merged = merge_codex_configs(&[
+            ctx.os_home.join(".codex").join("config.toml"),
+            ctx.project.join(".codex").join("config.toml"),
+        ]);
+
+        let mut drafts: Vec<ProviderAccountDraft> = merged
+            .providers
+            .into_iter()
+            .map(|(name, provider)| {
                 let base_url = provider
                     .get("base_url")
                     .and_then(|v| v.as_str())
@@ -2318,10 +2933,7 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
                     .and_then(|v| v.as_str())
                     .filter(|v| !v.trim().is_empty())
                     .map(|name| ApiKeyRef::EnvVar(name.to_string()));
-                if base_url.is_none() && key.is_none() {
-                    continue;
-                }
-                drafts.push(ProviderAccountDraft {
+                ProviderAccountDraft {
                     id: name.clone(),
                     protocol: super::provider::protocol_for(
                         "codex",
@@ -2329,28 +2941,73 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
                     ),
                     base_url,
                     api_key: key,
-                    models: Vec::new(),
-                });
-            }
-        }
-        // The model the person was actually using belongs to the first
-        // provider we found, if any.
-        if let Some(first) = drafts.first_mut() {
-            for scope in [ctx.home.join(".codex"), ctx.project.join(".codex")] {
-                let Ok(raw) = std::fs::read_to_string(scope.join("config.toml")) else {
-                    continue;
-                };
-                let Ok(value) = raw.parse::<toml::Value>() else {
-                    continue;
-                };
-                if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
-                    first.models.push(model.to_string());
-                    break;
+                    // The model belongs to the provider that was actually
+                    // selected, not to whichever came first in the table.
+                    models: if merged.model_provider.as_deref() == Some(name.as_str()) {
+                        merged.model.iter().cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
                 }
+            })
+            .filter(|draft| draft.base_url.is_some() || draft.api_key.is_some())
+            .collect();
+
+        // A config that names a model but no provider table still has a model
+        // worth carrying: attach it to the only account, if there is one.
+        if merged.model_provider.is_none() {
+            if let (Some(model), Some(first)) = (merged.model.as_deref(), drafts.first_mut()) {
+                first.models = vec![model.to_string()];
             }
         }
         drafts
     }
+```
+
+**合并的实现**（放进 `codex.rs`）：
+
+```rust
+/// Codex's layered config, merged the way Codex itself layers it: the
+/// project's file wins over the user's, key by key.
+struct MergedCodexConfig {
+    /// Provider id -> the provider's table.
+    providers: std::collections::BTreeMap<String, toml::Value>,
+    /// The provider the person selected, if the config names one.
+    model_provider: Option<String>,
+    /// The model the person was using.
+    model: Option<String>,
+}
+
+/// Merge the config files in order — later files win.
+fn merge_codex_configs(paths: &[std::path::PathBuf]) -> MergedCodexConfig {
+    let mut providers = std::collections::BTreeMap::new();
+    let mut model_provider = None;
+    let mut model = None;
+    for path in paths {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = raw.parse::<toml::Value>() else {
+            continue;
+        };
+        if let Some(table) = value.get("model_providers").and_then(|p| p.as_table()) {
+            for (name, provider) in table {
+                providers.insert(name.clone(), provider.clone());
+            }
+        }
+        if let Some(selected) = value.get("model_provider").and_then(|v| v.as_str()) {
+            model_provider = Some(selected.to_string());
+        }
+        if let Some(name) = value.get("model").and_then(|v| v.as_str()) {
+            model = Some(name.to_string());
+        }
+    }
+    MergedCodexConfig {
+        providers,
+        model_provider,
+        model,
+    }
+}
 ```
 
 （`codex.rs` 顶部加 `use super::provider::{ApiKeyRef, ProviderAccountDraft};`）
@@ -2386,7 +3043,7 @@ host can ask about that single item before writing it."
 
 ```rust
     #[test]
-    fn a_draft_with_an_env_named_key_is_written_as_the_name() {
+    fn a_draft_with_an_env_named_key_is_written_as_a_reference() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         let draft = atomcode_capabilities::migration::ProviderAccountDraft {
@@ -2401,12 +3058,38 @@ host can ask about that single item before writing it."
         let written =
             super::write_account(&config, &draft, true).expect("the account is written");
         let text = std::fs::read_to_string(&config).unwrap();
-        assert!(text.contains("GW_TOKEN"), "{text}");
+        // The reference form, not the bare name: a bare name falls through to
+        // `resolved_api_key`'s literal case and would be used AS the key.
+        assert!(text.contains("${GW_TOKEN}"), "{text}");
         assert!(
             !text.contains("sk-"),
             "no secret is written: {text}"
         );
         assert_eq!(written, "gateway");
+    }
+
+    #[test]
+    fn a_literal_that_would_be_expanded_is_refused() {
+        // `resolved_api_key` expands any `$` in the value, so a key with a `$`
+        // in it would mean something else at run time.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let draft = atomcode_capabilities::migration::ProviderAccountDraft {
+            id: "gateway".into(),
+            protocol: "openai-compatible".into(),
+            base_url: Some("https://gw.invalid/v1".into()),
+            api_key: Some(atomcode_capabilities::migration::ApiKeyRef::Plaintext(
+                "sk-$ecret".into(),
+            )),
+            models: vec![],
+        };
+        let error = super::write_account(&config, &draft, true)
+            .expect_err("a key with a dollar sign cannot be written");
+        assert!(error.contains('$'), "{error}");
+        assert!(
+            !config.exists(),
+            "nothing is written when the key cannot be written unambiguously"
+        );
     }
 
     #[test]
@@ -2452,8 +3135,7 @@ host can ask about that single item before writing it."
         assert!(error.contains("gateway"), "{error}");
         let text = std::fs::read_to_string(&config).unwrap();
         assert!(
-            !text.contains("gw.invalid"),
-            "the existing account is untouched: {text}"
+            !text.contains("gw.invalid"),            "the existing account is untouched: {text}"
         );
     }
 ```
@@ -2475,21 +3157,64 @@ use atomcode_config::provider_book::{AccountInput, BookError, ModelInput, Provid
 ///
 /// A literal secret needs `confirmed`; without it nothing is written at all —
 /// not the account, not the models, not a partial file.
+///
+/// **How the credential is written.**
+///
+/// `resolved_api_key` (`config/provider.rs:356`) has three cases:
+/// a value containing `$` is expanded as an environment reference; a value
+/// whose NAME matches a live environment variable resolves to that variable;
+/// anything else is the key itself. So the same string can mean two things,
+/// and the written form has to pick one:
+///
+/// - A **reference** is written `${NAME}`. Expansion is unambiguous: an unset
+///   variable expands to nothing, so the account ends up with NO key rather
+///   than with the key "NAME". The bare name would instead fall through to
+///   the literal case and be used as the key.
+/// - A **literal** is written as itself, but only when it cannot be read as
+///   something else: no `$` in it (the config would expand it), and no live
+///   environment variable of the same name (that would win over the
+///   literal). A literal that fails either test is refused rather than
+///   written, because the file would then mean two things at once.
 pub fn write_account(
     config_path: &Path,
     draft: &ProviderAccountDraft,
     confirmed: bool,
 ) -> Result<String, String> {
-    let key = match &draft.api_key {
+    // An owned string, because the reference form has to be BUILT rather than
+    // borrowed from the draft.
+    let key: Option<String> = match &draft.api_key {
         None => None,
-        Some(ApiKeyRef::EnvVar(name)) => Some(name.as_str()),
+        // `${NAME}` is the only unambiguous way to write a reference:
+        // `resolved_api_key` (`config/provider.rs:360`) expands a value
+        // containing `$`, and an unset variable expands to nothing — so the
+        // account ends up with NO key rather than with the key "NAME".
+        // Writing the bare name would instead fall through to the literal
+        // branch (`provider.rs:370`) and use the string "NAME" as the key.
+        Some(ApiKeyRef::EnvVar(name)) => Some(format!("${{{name}}}")),
         Some(ApiKeyRef::Plaintext(secret)) => {
             if !confirmed {
                 return Err(
                     "this account has a plaintext key — confirm it to write it".into(),
                 );
             }
-            Some(secret.as_str())
+            // A literal that could be read as something else is refused
+            // rather than written, because the file would then mean two
+            // things: `resolved_api_key` expands any `$` in it, and a live
+            // environment variable of the same name wins over the literal.
+            if secret.contains('$') {
+                return Err(format!(
+                    "{}: this key contains `$`, which the config would expand — set it by hand \
+                     instead",
+                    draft.id
+                ));
+            }
+            if std::env::var(secret).is_ok_and(|value| !value.trim().is_empty()) {
+                return Err(format!(
+                    "{secret}: an environment variable of that name is set, so this value cannot \
+                     be written unambiguously — rename the variable or set the key by hand"
+                ));
+            }
+            Some(secret.clone())
         }
     };
     let base_url = draft.base_url.as_deref().unwrap_or_default();
@@ -2520,7 +3245,7 @@ pub fn write_account(
         protocol: &draft.protocol,
         display_name: None,
         endpoint: base_url,
-        key,
+        key: key.as_deref(),
         exact_id: true,
     };
     match book.create_account(&input, &models) {
@@ -2542,9 +3267,15 @@ pub fn write_account(
 ```rust
 /// Import the provider accounts an external agent has configured.
 ///
-/// `yes` answers every item. Without it, each account that carries a literal
-/// secret is asked about; the ones that only name an environment variable are
-/// written as they are.
+/// **What `yes` means.** It answers "yes, import these accounts" — it does
+/// **not** authorize writing a secret the person has not seen. An account
+/// whose credential is a literal is always asked about, one at a time, even
+/// with `--yes`: the question is about the secret, not about the import.
+///
+/// Without a terminal there is nobody to ask, so an account that needs an
+/// answer is **not written at all** — and if that is the only kind of
+/// account there is, nothing is written and the config file stays byte for
+/// byte as it was.
 ///
 /// Returns the text to show and how many items were left out. A non-zero
 /// count means the caller must not report success.
@@ -2555,58 +3286,87 @@ pub fn apply_provider_accounts(
     config_path: &Path,
     interactive: bool,
 ) -> Result<(String, usize), String> {
+    use atomcode_config::i18n::{t, Msg};
     let mut drafts: Vec<ProviderAccountDraft> = Vec::new();
     for source in sources {
         drafts.extend(source.provider_drafts(ctx));
     }
     if drafts.is_empty() {
-        return Ok(("No provider accounts were found to import.".into(), 0));
+        return Ok((t(Msg::MigrationImportNone).into_owned(), 0));
     }
     let mut written = Vec::new();
     let mut skipped = Vec::new();
     for draft in &drafts {
-        // A literal secret needs the person's yes. A name needs nothing: the
-        // secret stays where it is.
-        let needs_confirmation =
-            matches!(draft.api_key, Some(ApiKeyRef::Plaintext(_))) && !yes;
-        let confirmed = if needs_confirmation {
+        // A literal secret is always the person's own decision — `--yes` does
+        // not reach it. An account that only names a variable holds no secret,
+        // so `--yes` answers for it; without `--yes` it is asked too.
+        let holds_a_secret = matches!(draft.api_key, Some(ApiKeyRef::Plaintext(_)));
+        let confirmed = if holds_a_secret {
             if !interactive {
                 skipped.push(draft.id.clone());
                 continue;
             }
-            ask_to_confirm(&draft.id)?
-        } else {
+            ask_to_confirm(draft)?
+        } else if yes {
             true
+        } else {
+            if !interactive {
+                skipped.push(draft.id.clone());
+                continue;
+            }
+            ask_to_confirm(draft)?
         };
         if !confirmed {
             skipped.push(draft.id.clone());
             continue;
         }
-        match write_account(config_path, draft, true) {
+        match write_account(config_path, draft, confirmed) {
             Ok(id) => written.push(id),
             Err(error) => skipped.push(format!("{} ({error})", draft.id)),
         }
     }
     let mut out = String::new();
     if !written.is_empty() {
-        out.push_str(&format!("Imported: {}.\n", written.join(", ")));
+        out.push_str(&t(Msg::MigrationImportDone {
+            imported: &written.join(", "),
+        }));
+        out.push('\n');
     }
     if !skipped.is_empty() {
-        out.push_str(&format!("Not imported: {}.\n", skipped.join(", ")));
+        out.push_str(&t(Msg::MigrationImportSkipped {
+            skipped: &skipped.join(", "),
+        }));
+        out.push('\n');
     }
     Ok((out, skipped.len()))
 }
 
-/// Ask about one account. Reads a line from stdin: `y` means yes.
-fn ask_to_confirm(id: &str) -> Result<bool, String> {
+/// Ask about one account, showing what would be written.
+///
+/// The question names the account, the endpoint, the protocol and the models,
+/// and says that the key is a literal found in the other agent's config — so
+/// the answer is about a specific thing, not a blanket yes.
+fn ask_to_confirm(draft: &ProviderAccountDraft) -> Result<bool, String> {
+    use atomcode_config::i18n::{t, Msg};
     use std::io::Write;
-    print!("Import {id} with the key found in the other agent's config? [y/N] ");
+    print!(
+        "{}",
+        t(Msg::MigrationImportConfirm {
+            id: &draft.id,
+            protocol: &draft.protocol,
+            endpoint: draft.base_url.as_deref().unwrap_or("-"),
+            models: &draft.models.join(", "),
+        })
+    );
     std::io::stdout().flush().ok();
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
         .map_err(|e| format!("cannot read the answer: {e}"))?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 ```
 
@@ -2615,19 +3375,33 @@ fn ask_to_confirm(id: &str) -> Result<bool, String> {
 `main.rs` 的 `run_import_command` 改成：
 
 ```rust
-async fn run_import_command(json: bool, apply: bool, yes: bool) -> i32 {
+async fn run_import_command(
+    json: bool,
+    apply: bool,
+    yes: bool,
+    cli_config: Option<&std::path::Path>,
+) -> i32 {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let ctx = atomcode::import_cmd::scan_context(&home, &project);
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let ctx = atomcode::import_cmd::scan_context(&home, &project, dirs.clone());
     let sources = atomcode_capabilities::migration::builtin_sources();
-    let report = atomcode_capabilities::migration::scan(&sources, &ctx);
+    let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
+
+    // The re-check: what is already in OUR configuration is not "to be
+    // brought over" — it is already there.
+    let drafts: Vec<_> = sources
+        .iter()
+        .flat_map(|source| source.provider_drafts(&ctx))
+        .collect();
+    let config_path = cli_config_path(cli_config);
+    atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &config_path);
 
     if !apply {
         println!("{}", atomcode::import_cmd::render(&report, json));
         return 0;
     }
 
-    let config_path = cli_config_path();
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
     match atomcode::import_cmd::apply_provider_accounts(
         &sources,
@@ -2636,9 +3410,16 @@ async fn run_import_command(json: bool, apply: bool, yes: bool) -> i32 {
         &config_path,
         interactive,
     ) {
-        Ok(text) => {
+        // The second number is how many items were left out. Something left
+        // out is not a success: a script that reads the exit code must not be
+        // told everything went in when it did not.
+        Ok((text, skipped)) => {
             println!("{text}");
-            0
+            if skipped > 0 {
+                1
+            } else {
+                0
+            }
         }
         Err(error) => {
             eprintln!("import: {error}");
@@ -2648,15 +3429,9 @@ async fn run_import_command(json: bool, apply: bool, yes: bool) -> i32 {
 }
 ```
 
-`cli_config_path()` 若仓库已有等价的取配置路径的办法（例如 `Config::default_path()`），**用它**，不要新造：
+> **退出码**：有东西没导入 → 非 0。Task 4 的占位实现与这里的最终实现**签名一致**（都返回 `Result<(String, usize), String>`），Task 7 只换实现、不改签名，所以 Task 4 的调用方不用改。
 
-```rust
-fn cli_config_path() -> std::path::PathBuf {
-    atomcode_config::config::Config::default_path()
-}
-```
-
-**非交互且无 `--yes`**：上面的实现会跳過带明文密钥的项并打印「Not imported」—— 但**退出码必须是非 0**，否则 CI 会以为成功了。改 `apply_provider_accounts` 的返回，让调用方能知道有没有跳过：`Ok(text)` 改成返回 `Result<(String, usize), String>`，第二个是跳过的数量；`run_import_command` 在跳过数 > 0 时返回 1。
+> `cli_config_path()` 已在 Task 4 定义（同一个 `main.rs`），**不要在这里再定义一遍**。它接受 `--config` 传下来的路径，所以验收时可以把配置写到临时目录。
 
 - [ ] **Step 6: 加文案**
 
@@ -2670,23 +3445,65 @@ fn cli_config_path() -> std::path::PathBuf {
         skipped: &'a str,
     },
     MigrationImportNone,
+    MigrationImportConfirm {
+        id: &'a str,
+        protocol: &'a str,
+        endpoint: &'a str,
+        models: &'a str,
+    },
 ```
 
 `product/en.rs` 加：
 
 ```rust
-        Msg::MigrationImportDone { imported } => format!("Imported: {imported}."),
-        Msg::MigrationImportSkipped { skipped } => format!("Not imported: {skipped}."),
+        Msg::MigrationImportDone { imported } => format!("Imported: {imported}.").into(),
+        Msg::MigrationImportSkipped { skipped } => format!("Not imported: {skipped}.").into(),
         Msg::MigrationImportNone => "No provider accounts were found to import.".into(),
+        Msg::MigrationImportConfirm {
+            id,
+            protocol,
+            endpoint,
+            models,
+        } => {
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!(" with models {models}")
+            };
+            format!(
+                "Import account `{id}` ({protocol} -> {endpoint}){models} with the key found in the \
+                 other agent's config? [y/N] "
+            )
+            .into()
+        }
 ```
 
 `product/zh_cn.rs` 加：
 
 ```rust
-        Msg::MigrationImportDone { imported } => format!("已导入：{imported}。"),
-        Msg::MigrationImportSkipped { skipped } => format!("未导入：{skipped}。"),
+        Msg::MigrationImportDone { imported } => format!("已导入：{imported}。").into(),
+        Msg::MigrationImportSkipped { skipped } => format!("未导入：{skipped}。").into(),
         Msg::MigrationImportNone => "没有发现可导入的 provider 账号。".into(),
+        Msg::MigrationImportConfirm {
+            id,
+            protocol,
+            endpoint,
+            models,
+        } => {
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!("，模型 {models}")
+            };
+            format!(
+                "要导入账号 `{id}`（{protocol} -> {endpoint}）{models}，并使用在另一个 Agent 的 \
+                 配置里找到的密钥吗？[y/N] "
+            )
+            .into()
+        }
 ```
+
+> **`.into()` 不能漏**：这些 arm 返回 `Cow<'static, str>`，`format!` 给出的是 `String`，所以要 `.into()` 才匹配得上（既有 arm 也是这么写的，见 `product/en.rs:1044`）。
 
 - [ ] **Step 7: 跑测试**
 
@@ -2756,18 +3573,46 @@ atomcode import --json | head -40
 
 Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `CLAUDE.md`（本仓库没有）与 `AGENTS.md`（本仓库有）状态正确；`~/.claude/CLAUDE.md` 标 `can move`；`~/.claude/skills/*` 标 `in effect`。
 
-**不**在本机跑 `--apply`（会改真实 `~/.atomcode/config.toml`）。用临时目录验证：
+**不**用真实的 `~/.claude` 跑 `--apply`：那会把**本机真实的密钥**写进文件。而且只改 `ATOMCODE_HOME` 并不隔离**源** —— 扫描的是 OS 家目录，与 `ATOMCODE_HOME` 无关。
+
+所以 `--apply` 的验收用**人工夹具**：一个临时的源目录 + 一个临时的目标配置，两个都不碰真实家目录。
 
 ```bash
-ATOMCODE_HOME=$(mktemp -d) atomcode import --apply --yes
+# 1. 造一个假的源：一个只有变量名（没有明文密钥）的 provider
+src=$(mktemp -d)
+mkdir -p "$src/.codex"
+cat > "$src/.codex/config.toml" <<'TOML'
+[model_providers.gateway]
+base_url = "https://gw.invalid/v1"
+env_key = "ATOMCODE_TEST_GW_TOKEN"
+TOML
+
+# 2. 造一个假的目标配置
+dst=$(mktemp -d)
+printf '[provider_accounts.existing]\nprovider = "openai-compatible"\n' > "$dst/config.toml"
+
+# 3. 用 HOME 指过去跑（扫描读的是 OS 家目录）
+#    注意：`--config` 是**顶层**参数，不带 `global = true`（`main.rs:646`），
+#    所以它必须写在子命令**前面**。
+HOME="$src" atomcode --config "$dst/config.toml" import --apply --yes
+
+# 4. 看结果：只有变量名，没有密钥值
+cat "$dst/config.toml"
 ```
 
-Expected: 退出 0，且 `$ATOMCODE_HOME/config.toml` 里只有环境变量名，没有密钥值。
+Expected:
+- 退出码 0。
+- `$dst/config.toml` 里有 `[provider_accounts.gateway]`，`api_key` 是 `${ATOMCODE_TEST_GW_TOKEN}`（**变量引用**，不是密钥值）。
+- 原有�� `[provider_accounts.existing]` **还在** —— 导入是追加，不是覆盖。
+
+**再跑一次同一条命令**（回检）：Expected: `gateway` 标为 `already imported`，而不是 `can be brought over`；退出码仍为 0，配置**不再被改写**。
 
 - [ ] **Step 6: 提交门的结果（若有格式改动）**
 
+**只暂存本任务改过的文件**，不要用 `git add -A` —— 工作区里有他人的改动：
+
 ```bash
-git add -A crates/atomcode-capabilities crates/atomcode-cli crates/atomcode-tui crates/atomcode-i18n
+git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/ crates/atomcode-cli/Cargo.toml crates/atomcode-cli/src/import_cmd.rs crates/atomcode-cli/src/lib.rs crates/atomcode-cli/src/main.rs crates/atomcode-cli/src/tui_migration.rs crates/atomcode-tui/src/commands.rs crates/atomcode-tui/src/lib.rs crates/atomcode-tui/src/launch.rs crates/atomcode-tui/src/migration.rs crates/atomcode-tui/src/plugin.rs crates/atomcode-tui/src/rows.rs crates/atomcode-i18n/src/product/ crates/atomcode-i18n/src/screen/
 git commit -m "style: rustfmt"
 ```
 
