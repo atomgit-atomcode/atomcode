@@ -224,6 +224,7 @@ mod tests {
             account: "account".into(),
             model: wire.into(),
             window: 12345,
+            max_tokens: None,
             vision: Some(true),
             effort: None,
             levels: vec![],

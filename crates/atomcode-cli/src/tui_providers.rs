@@ -268,6 +268,7 @@ fn models(config: &Config) -> Vec<ModelRow> {
                 account: model.account.clone(),
                 model: model.model.clone(),
                 window: model.context_window,
+                max_tokens: model.max_tokens,
                 vision: model.supports_vision,
                 effort: model.reasoning_effort.clone(),
                 levels: model.reasoning_effort_levels.clone().unwrap_or_default(),
@@ -472,7 +473,7 @@ impl Providers for ConfigProviders {
     }
 
     /// The panel shows every field it owns, so each one is set or cleared —
-    /// and the two it does not show (a display name, an output cap) are kept.
+    /// while the display name, which the panel does not edit, is kept.
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
         self.book()
             .edit_model(
@@ -484,7 +485,7 @@ impl Providers for ConfigProviders {
                     effort: Edit::from_option(draft.effort.as_deref()),
                     levels: Edit::from_option(draft.levels.as_deref()),
                     display_name: Edit::Keep,
-                    max_tokens: draft.max_tokens.map(Edit::Set).unwrap_or(Edit::Keep),
+                    max_tokens: Edit::from_option(draft.max_tokens),
                     reasoning_history: Edit::Keep,
                     default: draft.default,
                 },
@@ -1277,6 +1278,73 @@ rank = 2
         let out = text(&path);
         assert!(out.starts_with("# hand written"), "{out}");
         assert!(out.contains(r#"default_model = "mine/c""#), "{out}");
+    }
+
+    #[test]
+    fn output_budget_round_trips_through_edit_form_and_can_be_cleared() {
+        use atomcode_tui::providers::{Form, ModelForm, Panel, Step};
+        use atomcode_tui::surface::{Key, KeyPress};
+        for id in ["mine/a", "deepseek"] {
+            let (port, path) = port("output-budget");
+            let row = port
+                .rows()
+                .models()
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .clone();
+            let mut draft = ModelDraft {
+                account: row.account.clone(),
+                model: row.model.clone(),
+                window: (row.window > 0).then_some(row.window),
+                max_tokens: Some(393216),
+                ..Default::default()
+            };
+            port.edit_model(id, &draft).unwrap();
+            let view = port.rows();
+            let row = view.models().iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.max_tokens, Some(393216));
+            let mut panel = Panel::new();
+            panel.form = Some(Form::Model(ModelForm::edit(&view, row).unwrap()));
+            let Step::SaveModel {
+                draft: unchanged, ..
+            } = atomcode_tui::providers::key(
+                &view,
+                &mut panel,
+                &mut String::new(),
+                KeyPress::plain(Key::Enter),
+            )
+            else {
+                panic!("edit form saves")
+            };
+            port.edit_model(id, &unchanged).unwrap();
+            assert_eq!(
+                port.rows()
+                    .models()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .max_tokens,
+                Some(393216)
+            );
+            draft.max_tokens = Some(4096);
+            port.edit_model(id, &draft).unwrap();
+            assert!(text(&path).contains("max_tokens = 4096"));
+            draft.max_tokens = None;
+            port.edit_model(id, &draft).unwrap();
+            assert!(!text(&path).contains("max_tokens"));
+            assert_eq!(
+                port.rows()
+                    .models()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .max_tokens,
+                None
+            );
+            assert!(text(&path).contains("sk-legacy"));
+            assert!(text(&path).contains("sk-one"));
+        }
     }
 
     #[test]

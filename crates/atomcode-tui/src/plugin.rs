@@ -14726,6 +14726,7 @@ mod provider_probe_tests {
                     account: account.into(),
                     model: wire.into(),
                     window: 128_000,
+                    max_tokens: None,
                     vision: None,
                     effort: None,
                     levels: Vec::new(),

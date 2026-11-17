@@ -106,6 +106,8 @@ pub struct ModelRow {
     pub model: String,
     /// How much it can hold, in tokens.
     pub window: usize,
+    /// Saved per-model output budget; `None` uses the runtime default.
+    pub max_tokens: Option<usize>,
     /// `None` is "let it be decided"; the two `Some`s are a person's override.
     pub vision: Option<bool>,
     /// The reasoning effort this model runs at, when it takes one.
@@ -936,6 +938,30 @@ pub fn window_label(window: usize) -> String {
     }
 }
 
+/// Exact wire budgets: labels do not round 4096 into decimal "4K".
+pub const OUTPUT_PRESETS: &[usize] = &[4096, 8192, 16384, 32768, 65536, 131072];
+
+/// Positive integer tokens, optionally in decimal K/M. Match the runtime's u32 range.
+pub fn parse_output_tokens(text: &str) -> Option<usize> {
+    let text = text.trim().to_ascii_lowercase();
+    let (number, scale) = if let Some(number) = text.strip_suffix('k') {
+        (number, 1000u32)
+    } else if let Some(number) = text.strip_suffix('m') {
+        (number, 1_000_000u32)
+    } else {
+        (text.as_str(), 1u32)
+    };
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    number
+        .parse::<u32>()
+        .ok()?
+        .checked_mul(scale)
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
+}
+
 /// Which field of the model form has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelField {
@@ -946,6 +972,7 @@ pub enum ModelField {
     Effort,
     Levels,
     Window,
+    Output,
     Default,
 }
 
@@ -971,6 +998,8 @@ pub struct ModelForm {
     /// [`parse_window`] when the form is saved; [`ModelForm::window`] is not
     /// used while this is set.
     pub window_typed: Option<String>,
+    /// Custom output budget text. Empty/invalid text must not silently mean automatic.
+    pub max_tokens_typed: Option<String>,
     pub vision: Option<bool>,
     /// `None` is a model that takes no effort setting at all.
     pub effort: Option<String>,
@@ -1061,6 +1090,7 @@ impl ModelForm {
             model: String::new(),
             window: None,
             window_typed: None,
+            max_tokens_typed: None,
             vision: None,
             effort: None,
             levels: vec![true; view.efforts().len()],
@@ -1118,6 +1148,7 @@ impl ModelForm {
             // A row the configuration gave no window stays automatic.
             window: (row.window > 0).then_some(row.window),
             window_typed: None,
+            max_tokens_typed: None,
             vision: row.vision,
             effort: row.effort.clone(),
             levels,
@@ -1136,7 +1167,7 @@ impl ModelForm {
             selected: Vec::new(),
             batch_cursor: 0,
             name: None,
-            max_tokens: None,
+            max_tokens: row.max_tokens,
         })
     }
 
@@ -1148,6 +1179,7 @@ impl ModelForm {
         self.discovered_model = Some(item.id.clone());
         self.name = item.name.clone();
         self.max_tokens = item.max_tokens;
+        self.max_tokens_typed = None;
         self.vision = item.vision;
         self.effort = item.effort.clone();
         self.known_levels = item.levels.clone();
@@ -1182,6 +1214,7 @@ impl ModelForm {
         }
         self.name = None;
         self.max_tokens = None;
+        self.max_tokens_typed = None;
         self.vision = None;
         self.effort = None;
         self.known_levels = None;
@@ -1234,6 +1267,7 @@ impl ModelForm {
             out.push(ModelField::Levels);
         }
         out.push(ModelField::Window);
+        out.push(ModelField::Output);
         if !self.connecting {
             out.push(ModelField::Default);
         }
@@ -1259,6 +1293,7 @@ impl ModelForm {
         match self.focus {
             ModelField::Model => self.model.len(),
             ModelField::Window => self.window_typed.as_ref().map_or(0, String::len),
+            ModelField::Output => self.max_tokens_typed.as_ref().map_or(0, String::len),
             _ => 0,
         }
     }
@@ -1362,6 +1397,57 @@ impl ModelForm {
         }
     }
 
+    /// Automatic is always available: unlike the context field it clears the stored override.
+    pub fn output_choices(&self) -> Vec<Option<usize>> {
+        let mut presets = OUTPUT_PRESETS.to_vec();
+        if let Some(value) = self.max_tokens.filter(|value| !presets.contains(value)) {
+            presets.push(value);
+            presets.sort_unstable();
+        }
+        std::iter::once(None)
+            .chain(presets.into_iter().map(Some))
+            .collect()
+    }
+
+    fn cycle_output(&mut self, forward: bool) {
+        let choices = self.output_choices();
+        let stops = choices.len() + 1;
+        let at = if self.max_tokens_typed.is_some() {
+            choices.len()
+        } else {
+            choices
+                .iter()
+                .position(|value| *value == self.max_tokens)
+                .unwrap_or(0)
+        };
+        let next = if forward {
+            (at + 1) % stops
+        } else {
+            (at + stops - 1) % stops
+        };
+        match choices.get(next) {
+            Some(value) => {
+                self.max_tokens = *value;
+                self.max_tokens_typed = None;
+            }
+            None => self.max_tokens_typed = Some(String::new()),
+        }
+        self.caret = self.focused_len();
+    }
+
+    fn type_output(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        if self.max_tokens_typed.is_none() {
+            self.max_tokens_typed = Some(String::new());
+            self.caret = 0;
+        }
+        if let Some((text, caret)) = self.text_and_caret() {
+            insert_at(text, caret, c);
+        }
+    }
+
     /// Off, then each level this build offers, then round.
     fn cycle_effort(&mut self, view: &ProvidersView, forward: bool) {
         let mut ring: Vec<Option<String>> = vec![None];
@@ -1389,6 +1475,7 @@ impl ModelForm {
         match self.focus {
             ModelField::Model => Some((&mut self.model, caret)),
             ModelField::Window => self.window_typed.as_mut().map(|typed| (typed, caret)),
+            ModelField::Output => self.max_tokens_typed.as_mut().map(|typed| (typed, caret)),
             _ => None,
         }
     }
@@ -1544,6 +1631,7 @@ pub struct ModelDraft {
     pub account: String,
     pub model: String,
     pub name: Option<String>,
+    /// `None` selects automatic and clears any saved output override on edit.
     pub max_tokens: Option<usize>,
     pub use_now: bool,
     /// `None` leaves it to whatever this protocol usually holds.
@@ -2155,6 +2243,7 @@ fn model_key(
                 ModelField::Vision => form.cycle_vision(forward),
                 ModelField::Effort => form.cycle_effort(view, forward),
                 ModelField::Window => form.cycle_window(forward),
+                ModelField::Output => form.cycle_output(forward),
                 ModelField::Levels => {
                     let len = form.levels.len().max(1);
                     form.level = match forward {
@@ -2193,6 +2282,7 @@ fn model_key(
             ModelField::Effort => form.cycle_effort(view, true),
             ModelField::Window if form.window_typed.is_none() => form.cycle_window(true),
             ModelField::Window => {}
+            ModelField::Output if form.max_tokens_typed.is_none() => form.cycle_output(true),
             _ => {
                 if let Some((text, caret)) = form.text_and_caret() {
                     insert_at(text, caret, ' ');
@@ -2221,6 +2311,8 @@ fn model_key(
                 form.key_len = secret.chars().count();
             } else if form.focus == ModelField::Window {
                 form.type_window(c);
+            } else if form.focus == ModelField::Output {
+                form.type_output(c);
             } else if let Some((text, caret)) = form.text_and_caret() {
                 insert_at(text, caret, c);
             }
@@ -2386,11 +2478,25 @@ fn save_model(
         },
         None => form.window,
     };
+    let max_tokens = match &form.max_tokens_typed {
+        Some(typed) => match parse_output_tokens(typed) {
+            Some(value) => Some(value),
+            None => {
+                let mut form = form.clone();
+                form.focus = ModelField::Output;
+                form.advanced = true;
+                form.caret = typed.len();
+                panel.form = Some(Form::Model(form));
+                return Step::Stay;
+            }
+        },
+        None => form.max_tokens,
+    };
     let draft = ModelDraft {
         account,
         model,
         name: form.name.clone(),
-        max_tokens: form.max_tokens,
+        max_tokens,
         use_now: form.connecting,
         window,
         vision: form.vision,
@@ -2496,6 +2602,13 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
                     form.type_window(c);
                 }
                 return form.window_typed != before;
+            }
+            if form.focus == ModelField::Output {
+                let before = form.max_tokens_typed.clone();
+                for c in line.trim().chars() {
+                    form.type_output(c);
+                }
+                return form.max_tokens_typed != before;
             }
             let model_field = form.focus == ModelField::Model;
             let Some((field, caret)) = form.text_and_caret() else {
@@ -2674,6 +2787,7 @@ mod tests {
             account: account.into(),
             model: id.into(),
             window: 128_000,
+            max_tokens: None,
             vision: None,
             effort: None,
             levels: Vec::new(),
@@ -3377,6 +3491,112 @@ mod tests {
             narrowed.declared_levels(&view),
             Some(vec!["low".to_string(), "high".to_string()])
         );
+    }
+
+    #[test]
+    fn output_budget_presets_and_automatic_are_saved() {
+        let view = view();
+        let mut form = ModelForm::add(&view, None).unwrap();
+        form.advanced = false;
+        assert!(!form.fields(&view).contains(&ModelField::Output));
+        form.advanced = true;
+        assert!(form.fields(&view).contains(&ModelField::Output));
+        form.model = "vendor-x".into();
+        form.focus = ModelField::Output;
+        let mut panel = Panel::new();
+        let mut secret = String::new();
+        panel.form = Some(Form::Model(form));
+        run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Right), press(Key::Char(' '))],
+        );
+        let Step::SaveModel { draft, .. } =
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        else {
+            panic!("saves a preset");
+        };
+        assert_eq!(draft.max_tokens, Some(8192));
+
+        let mut row = model("vendor-x", "deepseek");
+        row.max_tokens = Some(4096);
+        let form = ModelForm::edit(&view, &row).unwrap();
+        assert_eq!(form.max_tokens, row.max_tokens);
+        panel.form = Some(Form::Model(form.clone()));
+        let Step::SaveModel { draft, .. } =
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        else {
+            panic!("saves the existing budget even with advanced settings hidden");
+        };
+        assert_eq!(draft.max_tokens, Some(4096));
+        let mut form = form;
+        form.focus = ModelField::Output;
+        panel.form = Some(Form::Model(form));
+        let Step::SaveModel { draft, .. } = run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Left), press(Key::Enter)],
+        ) else {
+            panic!("saves automatic");
+        };
+        assert_eq!(draft.max_tokens, None);
+    }
+
+    #[test]
+    fn custom_output_budget_rejects_invalid_input_without_losing_it() {
+        let view = view();
+        for (input, expected) in [
+            ("4096", Some(4096)),
+            ("32k", Some(32000)),
+            ("1M", Some(1_000_000)),
+            ("4294967295", Some(u32::MAX as usize)),
+            ("0", None),
+            ("-4096", None),
+            ("1.5", None),
+            ("4294967296", None),
+            ("4294968k", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            let mut form = ModelForm::add(&view, None).unwrap();
+            form.model = "vendor-x".into();
+            form.focus = ModelField::Output;
+            form.max_tokens = Some(393216);
+            let mut panel = Panel::new();
+            let mut secret = String::new();
+            panel.form = Some(Form::Model(form));
+            if input.is_empty() {
+                // Enter the custom stop after the saved non-preset value.
+                run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
+            } else {
+                assert!(paste(&mut panel, &mut secret, input));
+            }
+            let step = run(&view, &mut panel, &mut secret, &[press(Key::Enter)]);
+            if let Some(expected) = expected {
+                let Step::SaveModel { draft, .. } = step else {
+                    panic!("{input}: {step:?}")
+                };
+                assert_eq!(draft.max_tokens, Some(expected), "{input}");
+            } else {
+                assert_eq!(step, Step::Stay, "{input}");
+                let Some(Form::Model(form)) = &panel.form else {
+                    panic!("keeps the form")
+                };
+                assert_eq!(form.focus, ModelField::Output);
+                assert!(form.advanced);
+                assert_eq!(form.max_tokens_typed.as_deref(), Some(input));
+                // A deliberate choice of automatic recovers from invalid input.
+                run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
+                let Step::SaveModel { draft, .. } =
+                    run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+                else {
+                    panic!("automatic saves")
+                };
+                assert_eq!(draft.max_tokens, None);
+            }
+        }
     }
 
     #[test]

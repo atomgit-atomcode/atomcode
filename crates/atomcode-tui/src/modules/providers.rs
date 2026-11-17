@@ -412,7 +412,10 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
                                 .as_deref()
                                 .and_then(crate::providers::parse_window)
                         }),
-                        form.max_tokens,
+                        form.max_tokens_typed
+                            .as_deref()
+                            .map(crate::providers::parse_output_tokens)
+                            .unwrap_or(form.max_tokens),
                         None,
                         None,
                         &[],
@@ -1137,6 +1140,40 @@ fn model_field(
                 0,
             ),
         },
+        ModelField::Output => match &form.max_tokens_typed {
+            // The custom stop is a text field while it has the keyboard, and
+            // says what it holds (or that it is the custom one) when it has not.
+            Some(typed) if focused => (
+                t(Msg::FieldOutputTokens).into_owned(),
+                typed.clone(),
+                focused,
+                true,
+                form.caret,
+            ),
+            Some(typed) => (
+                t(Msg::FieldOutputTokens).into_owned(),
+                match typed.trim().is_empty() {
+                    true => t(Msg::WindowCustom).into_owned(),
+                    false => typed.clone(),
+                },
+                focused,
+                false,
+                0,
+            ),
+            None => (
+                t(Msg::FieldOutputTokens).into_owned(),
+                cycled(
+                    &match form.max_tokens {
+                        Some(tokens) => tokens.to_string(),
+                        None => t(Msg::OutputAutomatic).into_owned(),
+                    },
+                    focused,
+                ),
+                focused,
+                false,
+                0,
+            ),
+        },
         ModelField::Default => (
             t(Msg::FieldUseAfterSaving).into_owned(),
             cycled(
@@ -1285,6 +1322,27 @@ fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
             vec![
                 key("space", Msg::LegendToggleLevel),
                 key("←→", Msg::LegendPickLevel),
+                key("⇥", Msg::LegendNextField),
+                key("⏎", Msg::LegendSave),
+                key("esc", Msg::LegendCancel),
+            ]
+        }
+        Some(Form::Model(form)) if form.focus == ModelField::Output => {
+            let invalid = form
+                .max_tokens_typed
+                .as_deref()
+                .is_some_and(|typed| crate::providers::parse_output_tokens(typed).is_none());
+            vec![
+                (
+                    t(if invalid {
+                        Msg::OutputInvalid
+                    } else {
+                        Msg::LegendTypeOutput
+                    })
+                    .into_owned(),
+                    String::new(),
+                ),
+                key("←→", Msg::LegendChangeValue),
                 key("⇥", Msg::LegendNextField),
                 key("⏎", Msg::LegendSave),
                 key("esc", Msg::LegendCancel),
@@ -1533,6 +1591,7 @@ mod tests {
             account: "account".into(),
             model: "glm-5.3-flash".into(),
             window: 12345,
+            max_tokens: None,
             vision: Some(true),
             effort: None,
             levels: vec![],
@@ -1583,6 +1642,7 @@ mod tests {
             account: account.into(),
             model: id.into(),
             window: 128_000,
+            max_tokens: None,
             vision: None,
             effort: None,
             levels: Vec::new(),
@@ -2303,6 +2363,37 @@ mod tests {
 
     /// The window row says that typing a number makes a custom window, and
     /// the custom field says what it takes and how to leave it.
+    #[test]
+    fn the_output_row_shows_exact_budget_and_validation_hint() {
+        let mut form = ModelForm::add(&view(), None).unwrap();
+        form.advanced = true;
+        form.focus = ModelField::Output;
+        form.max_tokens = Some(4096);
+        let render = |form: &ModelForm, width| {
+            drawn(
+                &moment(Some(Panel {
+                    form: Some(Form::Model(form.clone())),
+                    ..Panel::new()
+                })),
+                width,
+                30,
+            )
+        };
+        for width in [80, 120] {
+            let out = render(&form, width);
+            assert!(
+                out.contains(&t(Msg::FieldOutputTokens).to_string()),
+                "{out}"
+            );
+            assert!(out.contains("4096"), "{out}");
+        }
+        form.max_tokens_typed = Some("-4096".into());
+        form.caret = 5;
+        let out = render(&form, 160);
+        assert!(out.contains("-4096"), "{out}");
+        assert!(out.contains("1–4294967295"), "{out}");
+    }
+
     #[test]
     fn the_window_row_says_how_to_type_a_custom_one() {
         let mut form = ModelForm::add(&view(), None).expect("an account to add to");

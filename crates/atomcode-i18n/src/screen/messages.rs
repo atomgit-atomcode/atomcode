@@ -2000,6 +2000,10 @@ pub enum Msg<'a> {
     WindowAutomatic,
     /// The last stop on a model form's window row: a window typed by hand.
     WindowCustom,
+    FieldOutputTokens,
+    OutputAutomatic,
+    LegendTypeOutput,
+    OutputInvalid,
     /// What the custom window field takes.
     LegendTypeWindow,
     /// The arrows on the custom window field: leave it for the presets.
