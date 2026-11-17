@@ -408,9 +408,16 @@ async fn exec_fork(
         }
     }
     // A standalone stored conversation has no live owner. Acquire its source
-    // lease before copying; an active turn or another process is a refusal.
-    let native = load_native_command_session(working_dir, project_hash, source)?
-        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    // lease before copying. When another runtime holds it, explicitly branch
+    // its committed state without modifying the source or acquiring its lease.
+    let native = match load_native_command_session(working_dir, project_hash, source) {
+        Ok(native) => native,
+        Err(busy) if is_session_in_use(&busy) => {
+            return fork_held_session(working_dir, project_hash, source, busy)
+        }
+        Err(error) => return Err(error),
+    }
+    .ok_or_else(|| anyhow::anyhow!("session not found"))?;
     let id = uuid::Uuid::new_v4().to_string();
     let (_, _lease) = native.manager.branch_native_session(
         &native.lease,
@@ -422,6 +429,45 @@ async fn exec_fork(
         source_id: source.into(),
         warning: None,
     })
+}
+
+fn is_session_in_use(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<atomcode_capabilities::session::SessionStoreError>(),
+        Some(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+    )
+}
+
+/// Fork a session another runtime holds without taking its lease.
+///
+/// Caught mid legacy convergence (or just deleted) the copy cannot be read;
+/// that stays the familiar "in use" refusal rather than an internal error.
+fn fork_held_session(
+    working_dir: &Path,
+    project_hash: Option<&str>,
+    source: &str,
+    busy: anyhow::Error,
+) -> anyhow::Result<CommandResult> {
+    use atomcode_capabilities::session::SessionStoreError;
+    let bucket = command_project_bucket(working_dir, project_hash)?;
+    let manager = NativeSessionManager::with_root(
+        NativeSessionManager::sessions_root(
+            atomcode_coding::config::product_dirs_from_env().user(),
+        )
+        .join(bucket),
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    match manager.branch_committed_session(source, &id, atomcode_capabilities::session::now_ms()) {
+        Ok(_) => Ok(CommandResult::Fork {
+            session_id: id,
+            source_id: source.into(),
+            warning: None,
+        }),
+        Err(SessionStoreError::OwnershipConflict { .. } | SessionStoreError::NotFound { .. }) => {
+            Err(busy)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn exec_undo(
@@ -1021,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(env)]
-    async fn standalone_fork_keeps_the_source_and_refuses_a_leased_conversation() {
+    async fn standalone_fork_keeps_the_source_even_while_another_runtime_holds_it() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ATOMCODE_HOME");
@@ -1057,14 +1103,33 @@ mod tests {
             .unwrap();
         manager.open_as_events(&lease).unwrap();
         let original = manager.load_events("source").unwrap();
-        assert!(exec_fork(project.path(), None, Some("source"), "")
+        // Held by another runtime (a TUI in another terminal): copied from what
+        // it committed, without taking the lease from it.
+        let held = exec_fork(project.path(), None, Some("source"), "")
             .await
-            .is_err());
-        assert_eq!(
-            manager.list().len(),
-            1,
-            "a busy source must not create a candidate"
+            .unwrap();
+        let CommandResult::Fork {
+            session_id: held_copy,
+            ..
+        } = held
+        else {
+            panic!("expected fork");
+        };
+        assert_eq!(manager.load_events(&held_copy).unwrap(), original);
+        let copied_meta = manager.load_native_session(&held_copy).unwrap().meta;
+        assert!(copied_meta.fork_info.is_none());
+        assert!(copied_meta.name.ends_with(" (fork)"));
+        // A later automatic fork must not collect the explicit copy, even
+        // before the browser sends its first message or acquires a lease.
+        let (_, _automatic) = manager
+            .fork_native_session("source", "automatic", 50)
+            .unwrap();
+        assert_eq!(manager.load_events(&held_copy).unwrap(), original);
+        assert!(
+            manager.lease_is_held("source").unwrap(),
+            "the holder keeps its session"
         );
+        assert_eq!(manager.load_events("source").unwrap(), original);
         drop(lease);
         let result = exec_fork(project.path(), None, Some("source"), "")
             .await
@@ -1081,7 +1146,7 @@ mod tests {
         assert_ne!(session_id, source_id);
         assert_eq!(manager.load_events("source").unwrap(), original);
         assert_eq!(manager.load_events(&session_id).unwrap(), original);
-        assert_eq!(manager.list().len(), 2);
+        assert_eq!(manager.list().len(), 4);
         assert!(
             manager.acquire_lease(&session_id).is_ok(),
             "standalone copies have no live owner until opened"

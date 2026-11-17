@@ -1,6 +1,7 @@
 import { PromptHistory, promptHistoryDirection } from '../lib/promptHistory';
 import { HistoryLoading } from './HistoryLoading';
 import { FilePreviewDialog } from './FilePreviewDialog';
+import { TurnArtifactsCard } from './TurnArtifactsCard';
 import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
@@ -21,7 +22,7 @@ import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { detectSlashMenuQuery } from '../lib/slashCommands';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
-import type { LiveGoalProgress, LiveLoopProgress } from '../api';
+import type { LiveGoalProgress, LiveLoopProgress, SessionActivity } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -302,6 +303,11 @@ interface ChatProps {
   browseSession?: SessionMetaWithProject | null;
   onReturnToBound?: () => void;
   onContinueBrowse?: () => void;
+  /** Set while another runtime (a TUI in another terminal) holds the browsed session. */
+  browseActivity?: SessionActivity | null;
+  onForkBrowse?: () => void;
+  browseForking?: boolean;
+  browseForkError?: string | null;
   onExecutionState?: (active: boolean) => void;
   sessionId: string | null;
   onSessionId: (id: string) => void;
@@ -491,7 +497,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, onForkSession, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseActivity, onForkBrowse, browseForking, browseForkError, onExecutionState, sessionId, onSessionId, onForkSession, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
@@ -4480,8 +4486,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
   if (browseSession) {
     const target = activeSession?.name || sessionId || '';
+    const localBusy = busy || hasBlockingInteraction;
+    // Held by another runtime: only a copy can be continued here.
+    const held = browseActivity ?? null;
+    const description = held === 'running' ? t('browse.heldRunning')
+      : held === 'waiting' ? t('browse.heldWaiting')
+      : held === 'open' ? t('browse.heldOpen')
+      : t(localBusy ? 'browse.background' : 'browse.ready', { name: target });
     return withInteraction(<>
       <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession}
+        live={held === 'running' || held === 'waiting'}
         renderMessages={(raw, viewport) => <BrowseMessagesView messages={sessionMessagesToDisplay(raw, false)}
           sessionId={browseSession.id} viewport={viewport} />} />
       <div class="input-container session-browse-composer">
@@ -4491,11 +4505,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           </svg>
           <div class="session-browse-summary">
             <strong class="session-browse-label">{t('browse.label')}</strong>
-            <span class="session-browse-description">{t(busy || hasBlockingInteraction ? 'browse.background' : 'browse.ready', { name: target })}</span>
+            <span class="session-browse-description">{description}</span>
+            {browseForkError && <span class="session-browse-description" role="alert">{browseForkError}</span>}
           </div>
           <div class="session-browse-actions">
-            <button class="session-browse-return" onClick={onReturnToBound}>{t(busy || hasBlockingInteraction ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
-            {!busy && !hasBlockingInteraction && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+            <button class="session-browse-return" onClick={onReturnToBound}>{t(localBusy ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
+            {!localBusy && held && <button class="session-browse-continue" disabled={browseForking} onClick={onForkBrowse}>{t('browse.forkContinue')}</button>}
+            {!localBusy && !held && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
           </div>
         </div>
       </div>
@@ -5218,25 +5234,8 @@ function AssistantMessageView({
         </>
       )}
       {isLastInTurn && !streaming && artifacts.length > 0 && (
-        <div class="turn-artifacts" aria-label={t('chat.artifacts')}>
-          <span class="turn-artifacts-label">{t('chat.artifacts')}</span>
-          <div class="turn-artifacts-list">
-            {artifacts.slice(0, 6).map((artifact) => (
-              <button
-                key={artifact.path}
-                type="button"
-                class="turn-artifact-chip"
-                title={artifact.path}
-                onClick={() => setPreviewFile({sessionId, path: artifact.path})}
-              >
-                {artifact.label}
-              </button>
-            ))}
-            {artifacts.length > 6 && (
-              <span class="turn-artifact-more">+{artifacts.length - 6}</span>
-            )}
-          </div>
-        </div>
+        <TurnArtifactsCard artifacts={artifacts} sessionId={sessionId}
+          onPreview={path => setPreviewFile({sessionId, path})} />
       )}
       {previewFile && previewFile.sessionId === sessionId && <FilePreviewDialog key={`${previewFile.sessionId}/${previewFile.path}`} sessionId={previewFile.sessionId} path={previewFile.path} onClose={() => setPreviewFile(null)} />}
       {!busy && msg.retryDiagnostics?.length ? (

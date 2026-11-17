@@ -161,10 +161,12 @@ export function Workbench({
   session,
   cwd,
   onClose,
+  gitRequest,
 }: {
   session: string;
   cwd: string;
   onClose: () => void;
+  gitRequest?: { sessionId: string; path: string; seq: number };
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
@@ -302,6 +304,12 @@ export function Workbench({
   }, [session, saved.path, version]);
   const update = (patch: Partial<Saved>) =>
     setSaved((old) => ({ ...old, ...patch }));
+  useEffect(() => {
+    if (gitRequest?.sessionId === session) {
+      update({ tab: "git" });
+      setVersion(value => value + 1);
+    }
+  }, [session, gitRequest?.seq]);
   async function createTerminal() {
     if (busy) return;
     setBusy(true);
@@ -679,6 +687,7 @@ export function Workbench({
         </>
       ) : saved.tab === "git" ? (
         <WorkbenchGit session={session} version={version} onOpen={openFile}
+          requested={gitRequest?.sessionId === session ? gitRequest : undefined}
           maximized={contentMaximized} onMaximize={() => setContentMaximized(v => !v)}
           onRestore={() => setContentMaximized(false)} />
       ) : (

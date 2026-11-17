@@ -2620,6 +2620,32 @@ async fn get_todo_sources(
     }
 }
 
+/// GET /projects/:hash/sessions/:id/activity - What a runtime holding the
+/// session is doing with it: `{"activity": "running" | "waiting" | "open" | null}`.
+///
+/// One lease probe and a log tail, for a page watching a session another
+/// process holds; the listing answers the same for every row at once.
+async fn get_session_activity(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+    if !valid_project_bucket(&hash) {
+        return (StatusCode::BAD_REQUEST, Json("invalid project")).into_response();
+    }
+    let root = NativeSessionManager::sessions_root(
+        atomcode_coding::config::product_dirs_from_env().user(),
+    );
+    match run_session_catalog_io(move || {
+        let bucket = NativeSessionManager::with_root(root.join(&hash));
+        bucket.activity(&id).map_err(std::io::Error::other)
+    })
+    .await
+    {
+        Ok(activity) => Json(serde_json::json!({ "activity": activity })).into_response(),
+        Err(error) => {
+            let msg = format!("Failed to read session activity: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 #[derive(Default, serde::Deserialize)]
 struct DisplayHistoryQuery {
@@ -8224,6 +8250,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/projects/:hash/sessions/:id",
             get(get_session_detail).delete(delete_session),
+        )
+        .route(
+            "/projects/:hash/sessions/:id/activity",
+            get(get_session_activity),
         )
         .route(
             "/projects/:hash/sessions/:id/transcript",

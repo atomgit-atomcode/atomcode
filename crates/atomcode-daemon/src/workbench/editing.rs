@@ -275,6 +275,142 @@ struct Change {
     original: Option<String>,
     index: String,
     worktree: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<LineStats>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct LineStats {
+    additions: u64,
+    deletions: u64,
+}
+
+fn parse_numstat(
+    bytes: &[u8],
+    context: &GitWorkspace,
+) -> Result<std::collections::HashMap<String, LineStats>, String> {
+    let mut records = bytes.split(|&b| b == 0).filter(|r| !r.is_empty());
+    let mut result = std::collections::HashMap::new();
+    while let Some(record) = records.next() {
+        let mut fields = record.splitn(3, |&b| b == b'\t');
+        let additions = fields.next().ok_or("Missing additions")?;
+        let deletions = fields.next().ok_or("Missing deletions")?;
+        let mut path = fields.next().ok_or("Missing numstat path")?;
+        if path.is_empty() {
+            records.next().ok_or("Missing rename source")?;
+            path = records.next().ok_or("Missing rename destination")?;
+        }
+        if additions == b"-" || deletions == b"-" {
+            continue;
+        }
+        let path = std::str::from_utf8(path).map_err(|_| "A Git filename is not UTF-8")?;
+        let absolute = context.repo.join(path);
+        let Ok(relative) = absolute.strip_prefix(&context.root) else {
+            continue;
+        };
+        let number = |value| {
+            std::str::from_utf8(value)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or("Invalid numstat count")
+        };
+        result.insert(
+            browser_path(relative)?,
+            LineStats {
+                additions: number(additions)?,
+                deletions: number(deletions)?,
+            },
+        );
+    }
+    Ok(result)
+}
+
+async fn attach_stats(context: &GitWorkspace, changes: &mut [Change]) -> Result<(), String> {
+    let (has_head, _) = git(
+        &context.root,
+        &context.configs,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    )
+    .await?;
+    if has_head {
+        let (ok, bytes) = git(
+            &context.root,
+            &context.configs,
+            &[
+                "diff",
+                "--numstat",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=all",
+                "HEAD",
+                "--",
+                ".",
+            ],
+        )
+        .await?;
+        if !ok {
+            return Err("Unable to read Git line statistics".into());
+        }
+        let mut stats = parse_numstat(&bytes, context)?;
+        for change in changes.iter_mut() {
+            if change.index != "U" && change.worktree != "U" {
+                change.stats = stats.remove(&change.path);
+            }
+        }
+    }
+    // Bound text reads for untracked files (or every file before the first
+    // commit). Do not follow a link outside the workspace or guess binary stats.
+    let root = context.root.clone();
+    let candidates: Vec<_> = changes
+        .iter()
+        .enumerate()
+        .filter(|(_, change)| !has_head || change.index == "?")
+        .map(|(index, change)| (index, change.path.clone()))
+        .collect();
+    let stats = tokio::task::spawn_blocking(move || {
+        let mut remaining = 8 * FILE_LIMIT;
+        let mut result = Vec::new();
+        for (index, name) in candidates {
+            if std::fs::symlink_metadata(root.join(&name))
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                continue;
+            }
+            let Ok(path) = target(&root, &name) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() > remaining || meta.len() > FILE_LIMIT {
+                continue;
+            }
+            remaining -= meta.len();
+            if let Ok(text) = read_text(&path) {
+                result.push((
+                    index,
+                    LineStats {
+                        additions: text.lines().count() as u64,
+                        deletions: 0,
+                    },
+                ));
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    for (index, stats) in stats {
+        changes[index].stats = Some(stats);
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitStatusQuery {
+    session_id: String,
+    #[serde(default)]
+    stats: bool,
 }
 fn browser_path(path: &Path) -> Result<String, String> {
     path.components()
@@ -320,6 +456,7 @@ fn parse_status(bytes: &[u8], context: &GitWorkspace) -> Result<Vec<Change>, Str
             }),
             index: (record[0] as char).to_string(),
             worktree: (record[1] as char).to_string(),
+            stats: None,
         });
         if changes.len() > 1000 {
             return Err("Git status exceeds 1000 files".into());
@@ -329,7 +466,7 @@ fn parse_status(bytes: &[u8], context: &GitWorkspace) -> Result<Vec<Change>, Str
 }
 pub(super) async fn git_status(
     State(state): State<AppState>,
-    Query(q): Query<WorkspaceQuery>,
+    Query(q): Query<GitStatusQuery>,
 ) -> Response {
     let (_, root) = match workspace(&state, &q.session_id).await {
         Ok(v) => v,
@@ -354,7 +491,13 @@ pub(super) async fn git_status(
         if !ok {
             return Err("Unable to read Git status".into());
         }
-        parse_status(&bytes, &context)
+        let mut changes = parse_status(&bytes, &context)?;
+        if q.stats {
+            if let Err(error) = attach_stats(&context, &mut changes).await {
+                tracing::debug!(%error, "workspace line statistics unavailable");
+            }
+        }
+        Ok::<_, String>(changes)
     }
     .await;
     match result {
@@ -440,6 +583,150 @@ pub(super) async fn git_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numstat_preserves_unusual_names_and_rename_destinations() {
+        let context = GitWorkspace {
+            root: PathBuf::from("repo/sub"),
+            repo: PathBuf::from("repo"),
+            configs: vec![],
+        };
+        let stats = parse_numstat(
+            b"2\t1\tsub/a\tname\n.txt\0-\t-\tsub/binary\00\t0\t\0sub/old\0sub/new\03\t1\toutside\0",
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            stats["a\tname\n.txt"],
+            LineStats {
+                additions: 2,
+                deletions: 1
+            }
+        );
+        assert_eq!(
+            stats["new"],
+            LineStats {
+                additions: 0,
+                deletions: 0
+            }
+        );
+        assert!(!stats.contains_key("binary"));
+        assert!(!stats.contains_key("outside"));
+    }
+
+    async fn changes_with_stats(context: &GitWorkspace) -> Vec<Change> {
+        let (_, status) = git(
+            &context.root,
+            &context.configs,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                ".",
+            ],
+        )
+        .await
+        .unwrap();
+        let mut rows = parse_status(&status, context).unwrap();
+        attach_stats(context, &mut rows).await.unwrap();
+        rows
+    }
+
+    #[tokio::test]
+    async fn line_stats_use_head_to_worktree_net_changes_and_handle_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(git(repo, &[], &["init"]).await.unwrap().0);
+        let root = repo.join("sub");
+        std::fs::create_dir(&root).unwrap();
+        for (name, text) in [
+            ("net.txt", "old\n"),
+            ("reverted.txt", "original\n"),
+            ("old.txt", "same\n"),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        std::fs::write(root.join("binary"), b"\0old").unwrap();
+        assert!(git(repo, &[], &["add", "--", "."]).await.unwrap().0);
+        let configs = vec![
+            "user.name=Stats Test".into(),
+            "user.email=stats@example.invalid".into(),
+            "commit.gpgSign=false".into(),
+            format!("core.hooksPath={}", repo.join("no-hooks").display()),
+        ];
+        assert!(
+            git(repo, &configs, &["commit", "-m", "baseline"])
+                .await
+                .unwrap()
+                .0
+        );
+        std::fs::write(root.join("net.txt"), "staged\n").unwrap();
+        std::fs::write(root.join("reverted.txt"), "staged\n").unwrap();
+        std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+        assert!(git(repo, &[], &["add", "--", "sub"]).await.unwrap().0);
+        std::fs::write(root.join("net.txt"), "new\nextra\n").unwrap();
+        std::fs::write(root.join("reverted.txt"), "original\n").unwrap();
+        std::fs::write(root.join("binary"), b"\0new").unwrap();
+        std::fs::write(root.join("untracked.txt"), "one\ntwo").unwrap();
+        std::fs::write(root.join("untracked.bin"), b"\0binary").unwrap();
+        let context = git_workspace(root).await.unwrap();
+        let rows = changes_with_stats(&context).await;
+        let stat = |name| {
+            rows.iter()
+                .find(|row| row.path == name)
+                .unwrap()
+                .stats
+                .clone()
+        };
+        assert_eq!(
+            stat("net.txt"),
+            Some(LineStats {
+                additions: 2,
+                deletions: 1
+            })
+        );
+        assert_eq!(stat("reverted.txt"), None);
+        assert_eq!(
+            stat("new.txt"),
+            Some(LineStats {
+                additions: 0,
+                deletions: 0
+            })
+        );
+        assert_eq!(stat("binary"), None);
+        assert_eq!(
+            stat("untracked.txt"),
+            Some(LineStats {
+                additions: 2,
+                deletions: 0
+            })
+        );
+        assert_eq!(stat("untracked.bin"), None);
+    }
+
+    #[tokio::test]
+    async fn line_stats_work_before_the_first_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(git(dir.path(), &[], &["init"]).await.unwrap().0);
+        std::fs::write(dir.path().join("new.txt"), "first\nsecond\n").unwrap();
+        assert!(
+            git(dir.path(), &[], &["add", "--", "new.txt"])
+                .await
+                .unwrap()
+                .0
+        );
+        let context = git_workspace(dir.path().to_path_buf()).await.unwrap();
+        let rows = changes_with_stats(&context).await;
+        assert_eq!(
+            rows[0].stats,
+            Some(LineStats {
+                additions: 2,
+                deletions: 0
+            })
+        );
+    }
     #[test]
     fn missing_repository_diagnostics_do_not_hide_other_git_errors() {
         assert!(is_missing_repository(
@@ -634,7 +921,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let rows = parse_status(&status, &context).unwrap();
+        let mut rows = parse_status(&status, &context).unwrap();
+        attach_stats(&context, &mut rows).await.unwrap();
         let row = rows.iter().find(|r| r.path == "a.txt").unwrap();
         assert_eq!(row.index, "M");
         assert_eq!(row.worktree, "M");

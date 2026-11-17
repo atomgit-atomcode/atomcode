@@ -465,6 +465,13 @@ pub enum Msg<'a> {
     },
     /// On the row a second Delete would throw away.
     ResumeDeleteArmed,
+    /// Another runtime (another terminal) is running this session; picking it
+    /// opens a copy.
+    ResumeHeldRunning,
+    /// Another runtime's turn on this session is waiting for an answer.
+    ResumeHeldWaiting,
+    /// Another runtime has this session open, between turns.
+    ResumeHeldOpen,
     /// While the last words of the selected session are being fetched.
     ResumePreviewWaiting,
     ResumeDeleted {

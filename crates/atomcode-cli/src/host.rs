@@ -1696,9 +1696,16 @@ impl RuntimeControl {
                         needs_newer_version: entry.needs_newer_version,
                         scheduled: entry.origin
                             == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
+                        held: None,
                     },
                 )
             })
+            .collect();
+        let sessions_root =
+            SessionManager::sessions_root(atomcode_coding::config::product_dirs_from_env().user());
+        let buckets: std::collections::HashMap<String, String> = all
+            .iter()
+            .map(|(bucket, session)| (session.id.clone(), bucket.clone()))
             .collect();
         let here_bucket = working_dir.as_deref().map(|dir| {
             SessionManager::project_hash(
@@ -1707,8 +1714,37 @@ impl RuntimeControl {
             )
         });
         let mut sessions = scope_sessions(all, working_dir.as_deref(), here_bucket.as_deref());
+        // Only the rows the picker shows are probed: a lease and a log tail each.
+        for session in &mut sessions {
+            if let Some(bucket) = buckets.get(&session.id) {
+                session.held = held_activity(
+                    &SessionManager::with_root(sessions_root.join(bucket)),
+                    &session.id,
+                );
+            }
+        }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions
+    }
+}
+
+/// What another runtime holding `id` is doing with it. A failed probe leaves
+/// the row unmarked: the mark is a hint, resuming still decides.
+fn held_activity(
+    bucket: &atomcode_capabilities::session::SessionManager,
+    id: &str,
+) -> Option<atomcode_host_api::HeldActivity> {
+    use atomcode_capabilities::session::SessionActivity;
+    use atomcode_host_api::HeldActivity;
+    match bucket.activity(id) {
+        Ok(Some(SessionActivity::Open)) => Some(HeldActivity::Open),
+        Ok(Some(SessionActivity::Running)) => Some(HeldActivity::Running),
+        Ok(Some(SessionActivity::Waiting)) => Some(HeldActivity::Waiting),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(session = id, %error, "session activity probe failed");
+            None
+        }
     }
 }
 

@@ -489,6 +489,18 @@ async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String
     Ok(pair_uri(&https_base, &token, machine.as_deref()))
 }
 
+/// 进程退出时收掉手机中继子进程。
+///
+/// 子进程挂在静态槽里,而静态槽从不析构:`kill_on_drop` 在那里不会生效,
+/// 不收的话它在本进程退出后成了孤儿,还连着 App 端口——下一个占到这个端口的
+/// atomcode 就被这个旧配对的手机连上了。
+pub struct PhoneRelayGuard;
+impl Drop for PhoneRelayGuard {
+    fn drop(&mut self) {
+        stop_for_phone();
+    }
+}
+
 /// 收掉中继客户端和 App server。返回是否真有东西被收掉。
 fn stop_for_phone() -> bool {
     let child = relay_child().lock().expect("relay child poisoned").take();

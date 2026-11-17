@@ -1621,6 +1621,7 @@ fn set_env_command(env: &str) -> String {
 
 async fn run(process_start: std::time::Instant) -> Result<i32> {
     let _webui_relay = atomcode::webui_relay::ShutdownGuard;
+    let _phone_relay = atomcode::tui_share::PhoneRelayGuard;
     // All total_ms values share the native-entry clock, including local upgrade setup.
     let run_start = process_start;
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --

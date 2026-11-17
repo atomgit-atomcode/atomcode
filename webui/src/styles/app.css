@@ -3994,37 +3994,52 @@ body {
 }
 .jump-to-bottom:hover { opacity: 1; transform: translateY(-1px); }
 
-/* Turn deliverables: successful mutation tools only, deduped for the complete
-   user turn. Compact chips mirror DeepSeek Harness and remain keyboard usable. */
+/* Successful file mutations, deduped for a complete user turn. Paths wrap on
+   mobile; the card links to the existing workspace diff rather than duplicating it. */
 .turn-artifacts {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: 14px;
   margin-top: 14px;
   color: var(--app-secondary-foreground);
   font-size: 0.875rem;
 }
-.turn-artifacts-label { flex: 0 0 auto; }
-.turn-artifacts-list { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.turn-artifacts-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--app-border-subtle); }
+.turn-artifacts-header strong { flex: 1; min-width: 0; color: var(--app-primary-foreground); font-weight: 600; }
+.turn-artifacts-icon { flex: none; }
+.turn-artifacts-changes { flex: none; border: 1px solid var(--app-border-subtle); border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
+.turn-artifacts-list { list-style: none; margin: 0; padding: 6px 0; }
+.turn-artifacts-list li { margin: 0; padding: 0; }
 .turn-artifact-chip {
-  max-width: min(320px, 60vw);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
   border: 0;
-  border-radius: 7px;
-  padding: 4px 9px;
-  background: var(--app-input-secondary-background);
-  color: var(--app-primary-foreground);
+  padding: 8px 16px;
+  background: transparent;
+  color: inherit;
   font: inherit;
   font-family: var(--app-monospace-font-family);
   cursor: pointer;
 }
-.turn-artifact-chip:hover { background: var(--app-hover-background); }
-.turn-artifact-chip:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
-.turn-artifact-more { align-self: center; color: var(--app-tertiary-foreground); }
-.turn-artifact-error { flex-basis: 100%; color: var(--app-error-fg, #b3261e); font-size: 0.8125rem; }
+.turn-artifact-path { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.turn-artifact-stats { display: flex; gap: 6px; flex: none; font-variant-numeric: tabular-nums; }
+.turn-artifact-added { color: var(--app-diff-addition-foreground, #168344); color: light-dark(#168344, #74c991); }
+.turn-artifact-removed { color: var(--app-diff-deletion-foreground, #c43131); color: light-dark(#c43131, #f14c4c); }
+.turn-artifact-chip:hover, .turn-artifacts-changes:hover, .turn-artifact-more:hover { background: var(--app-hover-background); }
+.turn-artifact-chip:focus-visible, .turn-artifacts-changes:focus-visible, .turn-artifact-more:focus-visible { outline: 2px solid var(--app-brand); outline-offset: -2px; }
+.turn-artifact-more { display: flex; align-items: center; gap: 8px; border: 0; padding: 10px 16px 14px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
+@media (max-width: 767px) {
+  .turn-artifacts-header { flex-wrap: wrap; padding: 12px; gap: 8px; }
+  .turn-artifacts-header strong { flex-basis: calc(100% - 32px); }
+  .turn-artifacts-changes { margin-left: 30px; min-height: 36px; }
+  .turn-artifact-chip { padding: 10px 12px; }
+  .turn-artifact-more { padding: 10px 12px 12px; }
+}
 
 /* === Old browser notice / opened without the link === */
 .compat-notice {

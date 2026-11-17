@@ -415,6 +415,16 @@ export async function resolveSession(id: string): Promise<SessionMetaWithProject
   return readJson(resp);
 }
 
+/** What a runtime holding one session is doing — `null` when nobody holds it. */
+export async function getSessionActivity(projectHash: string, sessionId: string): Promise<SessionActivity | null> {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/activity`, {
+    headers: authHeaders(),
+  });
+  const body = await readJson(resp) as { activity?: unknown };
+  const activity = body?.activity;
+  return activity === 'open' || activity === 'running' || activity === 'waiting' ? activity : null;
+}
+
 export interface CreateSessionResponse {
   id: string;
   name: string;

@@ -1,6 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { artifactsByAssistantIndex } from './turnArtifacts.ts';
+import { artifactDisplayPath, artifactsByAssistantIndex } from './turnArtifacts.ts';
+
+test('artifact labels use the workspace boundary and preserve outside paths', () => {
+  assert.equal(artifactDisplayPath('/repo/src/file.ts', '/repo'), 'src/file.ts');
+  assert.equal(artifactDisplayPath('/repository/file.ts', '/repo'), '/repository/file.ts');
+  assert.equal(artifactDisplayPath('C:\\Repo\\src\\file.ts', 'c:/repo/'), 'src/file.ts');
+  assert.equal(artifactDisplayPath('./src/file.ts'), 'src/file.ts');
+  assert.equal(artifactDisplayPath('/repo/中文 图片.png', '/repo'), '中文 图片.png');
+});
 
 const tool = (name: string, args: unknown, status: 'done' | 'error' = 'done') => ({
   kind: 'tool' as const,

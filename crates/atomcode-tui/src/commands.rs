@@ -1848,6 +1848,17 @@ impl CommandSet for SessionCommands {
                                     turns: stored.turns,
                                     needs_newer_version: stored.needs_newer_version,
                                     scheduled: stored.scheduled,
+                                    held: stored.held.map(|held| match held {
+                                        atomcode_host_api::HeldActivity::Open => {
+                                            crate::resume::Held::Open
+                                        }
+                                        atomcode_host_api::HeldActivity::Running => {
+                                            crate::resume::Held::Running
+                                        }
+                                        atomcode_host_api::HeldActivity::Waiting => {
+                                            crate::resume::Held::Waiting
+                                        }
+                                    }),
                                 })
                                 .collect();
                             if sessions.is_empty() {
@@ -7927,6 +7938,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     })
                     .collect(),
             }));
@@ -7982,6 +7994,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     },
                     atomcode_host_api::StoredSession {
                         id: "two".into(),
@@ -7992,6 +8005,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     },
                 ],
             }));

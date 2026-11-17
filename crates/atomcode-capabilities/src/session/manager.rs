@@ -3024,6 +3024,19 @@ impl SessionManager {
         self.copy_native_session(source_id, destination_id, now_ms, false)
     }
 
+    /// Explicitly branch the committed state of a session held elsewhere.
+    /// Unlike `branch_native_session`, this never modifies the source: its
+    /// runtime retains ownership. The destination is independent of automatic
+    /// busy-fork collapse and garbage collection.
+    pub fn branch_committed_session(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.copy_native_session(source_id, destination_id, now_ms, true)
+    }
+
     /// Explicit user branch: retain provenance in the event header, but keep an
     /// independent catalog identity instead of automatic busy-fork collapse/GC.
     pub fn branch_native_session(

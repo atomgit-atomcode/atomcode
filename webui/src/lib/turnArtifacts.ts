@@ -5,6 +5,19 @@ export interface TurnArtifact {
   label: string;
 }
 
+/** Display workspace-relative paths without trimming a sibling's prefix. */
+export function artifactDisplayPath(path: string, cwd?: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const root = cwd?.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (root) {
+    const windows = /^[a-z]:\//i.test(root);
+    const comparable = windows ? normalized.toLowerCase() : normalized;
+    const prefix = (windows ? root.toLowerCase() : root) + '/';
+    if (comparable.startsWith(prefix)) return normalized.slice(root.length + 1);
+  }
+  return normalized.replace(/^\.\//, '');
+}
+
 interface ArtifactMessage {
   archiveArtifacts?: TurnArtifact[];
   role: 'user' | 'assistant' | 'system';

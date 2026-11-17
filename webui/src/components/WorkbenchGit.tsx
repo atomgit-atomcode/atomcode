@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { ApiCallError, workbenchRequest } from "../api";
 import { useSettings } from "../settings";
 type Change = {
@@ -14,6 +14,7 @@ export function WorkbenchGit({
   maximized,
   onMaximize,
   onRestore,
+  requested,
 }: {
   session: string;
   version: number;
@@ -21,6 +22,7 @@ export function WorkbenchGit({
   maximized: boolean;
   onMaximize: () => void;
   onRestore: () => void;
+  requested?: { path: string; seq: number };
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
@@ -32,6 +34,7 @@ export function WorkbenchGit({
   const [error, setError] = useState("");
   const [notRepository, setNotRepository] = useState(false);
   const [loading, setLoading] = useState(true);
+  const appliedRequest = useRef<number>();
   useEffect(() => {
     let cancelled = false;
     setError("");
@@ -43,9 +46,14 @@ export function WorkbenchGit({
       .then((rows) => {
         if (!cancelled) {
           setChanges(rows);
-          setSelected((old) =>
-            old ? rows.find((r) => r.path === old.path) || null : null,
-          );
+          if (requested && appliedRequest.current !== requested.seq) {
+            appliedRequest.current = requested.seq;
+            const target = rows.find(row => row.path === requested.path) ?? null;
+            setSelected(target);
+            setStaged(target?.worktree === " ");
+          } else {
+            setSelected((old) => old ? rows.find((r) => r.path === old.path) || null : null);
+          }
         }
       })
       .catch((e) => {
@@ -63,7 +71,7 @@ export function WorkbenchGit({
     return () => {
       cancelled = true;
     };
-  }, [session, version]);
+  }, [session, version, requested?.seq]);
   useEffect(() => {
     if (!selected) {
       setDiff("");

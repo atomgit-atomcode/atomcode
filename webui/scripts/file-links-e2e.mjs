@@ -17,9 +17,13 @@ const content=`[Image](file:///fixture/%E5%AE%A3%E4%BC%A0%20%E5%9B%BE.png) · [S
 const full=[{role:'user',content:'Show the generated files',source_seq:2},
   {role:'assistant',tool_calls:[{id:'generated-script',name:'write_file',arguments:'{"file_path":"./gen_share_card.py","content":"print(1)"}'}]},
   {role:'tool',tool_result:{call_id:'generated-script',success:true,summary:'Written'}},
+  ...Array.from({length:6},(_,i)=>[
+    {role:'assistant',tool_calls:[{id:`extra-${i}`,name:'write_file',arguments:JSON.stringify({file_path:`/fixture/src/deeply/nested/directory/generated-file-${i}.ts`,content:'export {}'})}]},
+    {role:'tool',tool_result:{call_id:`extra-${i}`,success:true,summary:'Written'}},
+  ]).flat(),
   {role:'assistant',content}];
 const clients=new Set(), previews=[];
-let switches=0, releaseSlow;
+let switches=0, releaseSlow, notGit=false;
 const snapshot=()=>({type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full});
 const server=createServer(async(req,res)=>{
   const url=new URL(req.url,'http://localhost'), path=url.pathname;
@@ -39,6 +43,16 @@ const server=createServer(async(req,res)=>{
     if(file.endsWith('.png')){res.setHeader('Content-Type','image/png');res.end(Buffer.from(png,'base64'));return;}
     res.setHeader('Content-Type','text/plain');
     res.end(file.endsWith('.html')?'<script>window.fileExecuted=true</script>':`${session}: print("generated")`);return;
+  }
+  if(path==='/workbench/git'){
+    if(notGit){res.statusCode=400;return json({error:'No Git repository',code:'workspace_not_git_repository'});}
+    return json([{path:'unrelated.txt',index:' ',worktree:'M',stats:{additions:999,deletions:999}},
+      {path:'gen_share_card.py',index:'M',worktree:' ',stats:{additions:12,deletions:3}},
+      {path:'src/deeply/nested/directory/generated-file-1.ts',index:' ',worktree:'M',stats:{additions:33,deletions:4}}]);
+  }
+  if(path==='/workbench/diff'){
+    if(url.searchParams.get('path')==='gen_share_card.py')assert.equal(url.searchParams.get('staged'),'true','a staged-only artifact opens the staged diff');
+    return json({diff:`diff --git a/${url.searchParams.get('path')} b/${url.searchParams.get('path')}\n+fixture change`});
   }
   if(path.startsWith('/sessions/resolve/'))return json(meta);
   if(path===`/projects/fixture/sessions/${id}`)return json({...meta,messages:full});
@@ -88,7 +102,26 @@ try {
   assert.equal(await link('Image').evaluate(el=>document.activeElement===el),true);
   await link('Script').click();await modal.getByText(`${id}: print("generated")`,{exact:true}).waitFor();
   assert.deepEqual(previews.at(-1),{session:id,file:'./gen_share_card.py'});await close();
-  await page.locator('.turn-artifact-chip').click();await modal.locator('pre').waitFor();
+  const card=page.locator('.turn-artifacts');
+  await card.getByText('Files modified this turn: 7',{exact:true}).waitFor();
+  assert.equal(await card.locator('.turn-artifact-chip').count(),3);
+  await card.getByRole('button',{name:'Show 4 more files'}).click();
+  assert.equal(await card.locator('.turn-artifact-chip').count(),7);
+  assert.equal(await card.locator('.turn-artifact-chip').nth(1).locator('.turn-artifact-path').innerText(),'src/deeply/nested/directory/generated-file-0.ts');
+  await card.locator('.turn-artifact-added').filter({hasText:'+12'}).waitFor();
+  assert.equal(await card.locator('.turn-artifact-removed').first().innerText(),'-3');
+  assert.equal(await card.locator('.turn-artifact-chip').nth(1).locator('.turn-artifact-stats').count(),0);
+  assert.equal(await card.getByText('+999',{exact:true}).count(),0,'unrelated files are not included');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await card.getByRole('button',{name:'Show fewer files'}).click();
+  await page.evaluate(()=>document.documentElement.setAttribute('data-theme','light'));
+  await card.screenshot({path:`/tmp/atomcode-artifact-card-${width}.png`});
+  await page.evaluate(()=>document.documentElement.setAttribute('data-theme','dark'));
+  await card.screenshot({path:`/tmp/atomcode-artifact-card-dark-${width}.png`});
+  await card.getByRole('button',{name:'View changes',exact:true}).click();
+  await page.getByLabel('Git diff',{exact:true}).filter({hasText:'gen_share_card.py'}).waitFor();
+  await page.getByRole('button',{name:'Close workspace panel'}).click();
+  await card.locator('.turn-artifact-chip').first().click();await modal.locator('pre').waitFor();
   assert.deepEqual(previews.at(-1),{session:id,file:'./gen_share_card.py'});await close();
   await link('Windows').click();await modal.locator('pre').waitFor();
   assert.deepEqual(previews.at(-1),{session:id,file:'C:/workspace/result.py'});await close();
@@ -113,8 +146,18 @@ try {
   await page.locator('.assistant-message-content').getByRole('link',{name:'Script',exact:true}).click();
   await modal.getByText(`${history.id}: print("generated")`,{exact:true}).waitFor();
   assert.deepEqual(previews.at(-1),{session:history.id,file:'./gen_share_card.py'});assert.equal(switches,before);await close();
-  await page.locator('.turn-artifact-chip').click();await modal.locator('pre').waitFor();
+  assert.equal(await page.locator('.turn-artifacts').getByRole('button',{name:'View changes',exact:true}).count(),0);
+  await page.locator('.turn-artifact-chip').first().click();await modal.locator('pre').waitFor();
   assert.deepEqual(previews.at(-1),{session:history.id,file:'./gen_share_card.py'});assert.equal(switches,before);await close();
+  notGit=true;
+  const missingGit=page.waitForResponse(response=>new URL(response.url()).pathname==='/workbench/git');
+  await page.goto(original);
+  await page.locator('.turn-artifacts').getByText('Files modified this turn: 7',{exact:true}).waitFor();
+  await missingGit;
+  assert.equal(await page.locator('.turn-artifacts-changes').count(),0);
+  assert.equal(await page.locator('.turn-artifact-stats').count(),0);
+  await page.locator('.turn-artifact-chip').first().click();await modal.locator('pre').waitFor();await close();
+  notGit=false;
   assert.deepEqual(errors,[]);await page.close();
  }
  console.log('PASS: file links, decoded paths, image/text preview and download, errors, cancellation, history ownership, no rebind, mobile and dark layouts');
