@@ -128,10 +128,14 @@ impl SensitivePaths {
     /// apply the same filename and marker rules to the decoded string. This
     /// applies those rules directly and keeps the same answers.
     pub(crate) fn references_path(&self, path: &Path) -> bool {
-        let normalized = path
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .replace('\\', "/");
+        // Lowercase once. `replace` copies the whole path a second time, and a
+        // Unix path never contains a backslash, so only normalize when one is
+        // actually there. The answer is the same: the old JSON path normalized
+        // every decoded value, backslash or not.
+        let mut normalized = path.to_string_lossy().to_ascii_lowercase();
+        if normalized.as_bytes().contains(&b'\\') {
+            normalized = normalized.replace('\\', "/");
+        }
         // A path argument in JSON ends with `.env"`. The decoded path ends with
         // the same bytes without the quote.
         normalized.ends_with(".env")
