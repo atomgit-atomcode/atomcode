@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 pub mod claude_code;
 pub mod codex;
 pub mod proc;
+mod read_only_cli;
 pub mod tool;
 
 use std::time::Duration;
@@ -68,6 +69,10 @@ pub enum SubagentKind {
     ClaudeCode,
     /// OpenAI Codex (`codex` CLI).
     Codex,
+    /// xAI Grok Build CLI.
+    Grok,
+    /// OpenCode CLI.
+    OpenCode,
 }
 
 impl SubagentKind {
@@ -78,6 +83,8 @@ impl SubagentKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude-code" | "claude_code" | "claude" | "cc" => Some(Self::ClaudeCode),
             "codex" => Some(Self::Codex),
+            "grok" | "grok-build" => Some(Self::Grok),
+            "opencode" | "open-code" => Some(Self::OpenCode),
             _ => None,
         }
     }
@@ -87,6 +94,8 @@ impl SubagentKind {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -95,6 +104,8 @@ impl SubagentKind {
         match self {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::OpenCode => "opencode",
         }
     }
 }

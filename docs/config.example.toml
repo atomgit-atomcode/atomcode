@@ -372,6 +372,23 @@ eager = "auto"
 max_concurrent = 3      # 并发子 agent 上限（下限 1）
 max_rounds = 200        # 单个子任务模型轮次高水位（0=不设上限）
 
+# 可选的只读外部子代理。使用各 CLI 自己已配置的登录和模型。
+# Grok Build 的只读沙箱支持 macOS / Linux。
+# [[subagent.external]]
+# name = "grok"
+# kind = "grok"
+# permission = "read-only"
+# timeout_secs = 600
+#
+# [[subagent.external]]
+# name = "opencode"
+# kind = "opencode"
+# permission = "read-only"
+# model = "provider/model"  # 可省略
+# timeout_secs = 600
+#
+# Grok Build 的单次任务文本经命令行参数传递，避免在委派文本中放入凭据。
+
 [team]
 max_members = 6         # 每个 lead 最多保留的成员数；空闲成员也占名额，stop 后释放
 

@@ -581,8 +581,8 @@ pub fn describe_config_file_for(
          delegated execution; `[team]` `max_members` (default 6) limits the persistent \
          roster, including idle members; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
          `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \
-         `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
-         or Claude Code CLI as a delegate where the front end allows it.\n\
+         `claude-code` | `grok` | `opencode`, `model`, `permission`, `timeout_secs`, `enabled`), add \
+         an external CLI as a delegate. Grok and OpenCode support only `read-only`.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
          - `[tools.atomgit]` `tool_search` (default true): discover AtomGit schemas via `builtin_search`; false sends them eagerly.\n\
          - `[tools.mcp]` `tool_search`: `on` (default), `auto`, or `off`; \

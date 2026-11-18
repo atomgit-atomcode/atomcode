@@ -514,7 +514,7 @@ impl Default for TeamConfig {
 pub struct ExternalSubagentConfig {
     /// Instance name, e.g. `"codex-primary"` → tool `subagent_codex_primary`.
     pub name: String,
-    /// `"codex"` or `"claude-code"`.
+    /// `"codex"`, `"claude-code"`, `"grok"`, or `"opencode"`.
     pub kind: String,
     /// Optional model override.
     #[serde(default, skip_serializing_if = "Option::is_none")]

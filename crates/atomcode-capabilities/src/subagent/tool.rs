@@ -10,6 +10,7 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolRegistry, ToolResu
 
 use super::claude_code::ClaudeCodeBackend;
 use super::codex::CodexBackend;
+use super::read_only_cli::ReadOnlyCliBackend;
 use super::{
     ExternalSubagentProfile, PermissionMode, SubagentBackend, SubagentError, SubagentEvent,
     SubagentKind, SubagentRun, SubagentStopReason,
@@ -29,6 +30,9 @@ pub fn tool_name_for(profile_name: &str) -> String {
 pub fn build_backend(profile: &ExternalSubagentProfile) -> Box<dyn SubagentBackend> {
     let timeout = profile.timeout;
     match profile.kind {
+        SubagentKind::Grok | SubagentKind::OpenCode => {
+            Box::new(ReadOnlyCliBackend(profile.clone()))
+        }
         SubagentKind::Codex => {
             let mut b = CodexBackend::new(&profile.name, profile.permission)
                 .allow_dangerous(profile.allow_dangerous);
@@ -106,6 +110,8 @@ impl ExternalSubagentTool {
         let agent = match backend.kind() {
             SubagentKind::Codex => "Codex",
             SubagentKind::ClaudeCode => "Claude Code",
+            SubagentKind::Grok => "Grok Build",
+            SubagentKind::OpenCode => "OpenCode",
         };
         let description = format!(
             "Delegate a self-contained coding task to the {agent} agent \
@@ -268,6 +274,15 @@ fn register_external_subagent_tools_with(
     let mut skipped = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for profile in profiles {
+        if matches!(profile.kind, SubagentKind::Grok | SubagentKind::OpenCode)
+            && profile.permission != PermissionMode::ReadOnly
+        {
+            skipped.push(format!(
+                "subagent: `{}` ({}) currently supports only read-only delegation; skipped",
+                profile.name, profile.kind
+            ));
+            continue;
+        }
         if !binary_available(profile.kind.binary()) {
             tracing::info!(
                 profile = %profile.name,
@@ -418,6 +433,27 @@ mod tests {
         assert_eq!(build_backend(&p).kind(), SubagentKind::Codex);
         let p = ExternalSubagentProfile::new("cc", SubagentKind::ClaudeCode);
         assert_eq!(build_backend(&p).kind(), SubagentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn new_read_only_agents_mount_and_write_profiles_are_skipped() {
+        let mut registry = ToolRegistry::new();
+        let mut writer = ExternalSubagentProfile::new("writer", SubagentKind::OpenCode);
+        writer.permission = PermissionMode::AcceptEdits;
+        let profiles = [
+            ExternalSubagentProfile::new("grok", SubagentKind::Grok),
+            ExternalSubagentProfile::new("opencode", SubagentKind::OpenCode),
+            writer,
+        ];
+        let (registered, warnings) =
+            register_external_subagent_tools_with(&mut registry, &profiles, |_| true);
+        assert_eq!(registered, ["subagent_grok", "subagent_opencode"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("only read-only"));
+        let tools = registry.mount(&["subagent_grok", "subagent_opencode", "subagent_writer"]);
+        assert!(tools.get("subagent_grok").is_some());
+        assert!(tools.get("subagent_opencode").is_some());
+        assert!(tools.get("subagent_writer").is_none());
     }
 
     #[test]
