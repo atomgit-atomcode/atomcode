@@ -467,13 +467,18 @@ async fn summarize_span_fork_overflows_into_the_transcript_path() {
     let parent = ParentPromptContext {
         tools: Arc::new([]),
     };
-    let span = vec![Message::user("q")];
+    // The span IS the parent conversation's prefix (system prompt included).
+    let span = vec![Message::system("parent persona"), Message::user("q")];
     let body = summarize_span(&provider, &span, Some(&span), Some("errors"), Some(&parent))
         .await
         .unwrap();
     assert!(body.contains("recovered summary"));
     let sent = provider.sent.lock().unwrap();
     assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0][0].text, "parent persona",
+        "the fork must be attempted before the transcript fallback"
+    );
     assert_eq!(sent[1][0].text, SUMMARY_SYSTEM_PROMPT);
 }
 
