@@ -622,16 +622,8 @@ pub async fn summarize_span(
     // rejections) that the tool-free path does not have.
     if let Some(parent) = parent {
         let replay = cache_prefix.unwrap_or(span);
-        eprintln!(
-            "DBG FORK enter: replay={} msgs, span={} msgs",
-            replay.len(),
-            span.len()
-        );
-        match summarize_span_fork(provider, replay, focus, parent).await {
-            Ok(body) => {
-                return Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"));
-            }
-            Err(e) => eprintln!("DBG FORK err: {e:?}"),
+        if let Ok(body) = summarize_span_fork(provider, replay, focus, parent).await {
+            return Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"));
         }
     }
     let window = match provider.context_window() {

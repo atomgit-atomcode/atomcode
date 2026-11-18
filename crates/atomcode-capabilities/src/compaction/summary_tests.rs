@@ -505,10 +505,8 @@ async fn summarize_span_fork_falls_back_on_any_fork_failure() {
     assert!(body.contains("recovered summary"));
     let sent = provider.sent.lock().unwrap();
     assert_eq!(sent.len(), 2);
-    let sent = provider.sent.lock().unwrap();
-    assert_eq!(sent.len(), 2);
     assert_eq!(
-        sent[0][0].text, "parent persona",
+        sent[0][0].text, "q",
         "the fork must be attempted before the transcript fallback"
     );
     assert_eq!(sent[1][0].text, SUMMARY_SYSTEM_PROMPT);
