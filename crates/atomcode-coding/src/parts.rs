@@ -833,6 +833,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string()),
         );
+        host_only_tools.push("git_status".into());
     }
     let request_user_input_enabled = opts.tools
         && opts.request_user_input
