@@ -11266,7 +11266,7 @@ fn take_suggestion(m: &mut crate::moment::Moment) -> bool {
     if !m.input.is_empty() || m.activity != crate::moment::Activity::Idle || m.secret.is_some() {
         return false;
     }
-    let Some(words) = m.suggestion.take() else {
+    let Some(words) = m.suggestion.take().filter(|words| !words.trim().is_empty()) else {
         return false;
     };
     m.input = words;
@@ -12407,7 +12407,12 @@ mod suggestion_tests {
 
         // 没有猜的话,空编辑区上的 → 什么也不做 —— 这个键不许让人意外。
         let empty = idle("lead");
-        assert!(!accept_ghost(&mut empty.write().unwrap()));
+        let mut m = empty.write().unwrap();
+        assert!(!accept_ghost(&mut m));
+        m.suggestion = Some(" \t".into());
+        assert!(!accept_ghost(&mut m));
+        assert!(m.input.is_empty());
+        assert_eq!(m.caret, 0);
     }
 }
 

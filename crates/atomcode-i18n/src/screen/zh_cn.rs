@@ -1577,6 +1577,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "追加指令：未知".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerPlaceholder => "使用 AtomCode 开始工作".into(),
         Msg::WaitsForTheTurn { command } => {
             format!("正在回复,/{command} 要等这一轮结束再用;按 Esc 可以先停下这一轮").into()
         }

@@ -41,8 +41,7 @@ fn secret_caption(moment: &crate::moment::Moment) -> Option<String> {
 ///
 /// 它和内联的 ghost 画在同一个位置、同一身暗字,只写那句话本身,不带键名,
 /// 也不带任何前缀符号。两者不会同时出现:ghost 只在行里已经打了字时才有
-/// (`text::ghost`),这一句只在行空着时才有 —— 所以空行上的暗字一定是模型
-/// 猜的那一句,打了字之后的暗字一定是自己说过的话。
+/// (`text::ghost`),这一句只在行空着时才有。没有模型建议时，渲染层才补上占位。
 ///
 /// 只在编辑区空着、没有回合在跑、也不是在问密码的时候画:它是一个猜测,
 /// 猜测不该盖住人正在写的东西,也不该在人等着回答的时候冒出来。
@@ -602,6 +601,16 @@ impl View for Input {
                 // (`suggested` 自己判断),而空行正是这个光标所在的那一行。
                 if let Some(words) = suggested(vp.moment) {
                     row.push(El::styled(words, theme::fg(Role::Muted)));
+                } else if vp.moment.input.is_empty()
+                    && vp.moment.search.is_none()
+                    && vp.moment.history_at.is_none()
+                {
+                    // Paint the hint without adding anything to the editable buffer.
+                    let hint = t(Msg::ComposerPlaceholder);
+                    row.push(El::styled(
+                        width::take_width(&hint, body),
+                        theme::fg(Role::Muted),
+                    ));
                 }
             }
             rows.push(El::row(row));
@@ -681,6 +690,25 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    #[test]
+    fn empty_composer_shows_a_placeholder_until_there_is_a_suggestion_or_input() {
+        let state = State::default();
+        let mut moment = Moment::default();
+        let placeholder = t(Msg::ComposerPlaceholder);
+        assert!(draw(&state, &moment, 60, 3)[1].contains(placeholder.as_ref()));
+        assert!(moment.input.is_empty() && moment.suggestion.is_none());
+
+        moment.suggestion = Some("Review this change".into());
+        let row = &draw(&state, &moment, 60, 3)[1];
+        assert!(row.contains("Review this change"));
+        assert!(!row.contains(placeholder.as_ref()));
+
+        moment.input = "My draft".into();
+        let row = &draw(&state, &moment, 60, 3)[1];
+        assert!(row.contains("My draft"));
+        assert!(!row.contains(placeholder.as_ref()));
     }
 
     /// A search counts over what it matched: "搜索 'cargo' 2/3" is the second of

@@ -2475,6 +2475,7 @@ pub enum Msg<'a> {
     ComposerSuggested {
         text: &'a str,
     },
+    ComposerPlaceholder,
     /// A command that replaces or rewinds the conversation, typed while a turn
     /// is running: it has to wait for the turn, and Esc stops the turn now.
     WaitsForTheTurn {
