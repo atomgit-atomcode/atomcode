@@ -314,6 +314,7 @@ export type ExtensionMessage =
   | { type: 'models'; models: ModelInfo[] }
   | { type: 'approvalMode'; mode: ApprovalMode; pending?: boolean }
   | { type: 'providers'; providers: ProviderInfo[]; defaultProvider?: string }
+  | { type: 'runtimeInfo'; provider: string; model: string }
   | { type: 'authStatus'; auth: AuthStatus }
   | { type: 'setupState'; auth?: AuthStatus; providers: ProviderInfo[]; defaultProvider?: string; currentModel?: string; setupRequired: boolean }
   | { type: 'loginStarted'; loginId: string; url: string }
@@ -329,4 +330,5 @@ export type ExtensionMessage =
   | { type: 'permissionResponseResult'; id: string; approvalId?: string; success: boolean; message?: string }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string }
-  | { type: 'chromeFont'; value: string | null };
+  | { type: 'chromeFont'; value: string | null }
+  | { type: 'chromeFontSize'; value: number };

@@ -130,15 +130,25 @@ export function InputArea() {
     const updateInputInset = () => {
       sessionBody.style.setProperty('--input-inset', `${container.offsetHeight + 32}px`);
     };
+    const updateFontSize = () => {
+      const textarea = textareaRef.current;
+      if (textarea) {
+        textarea.style.height = 'auto';
+        textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+      }
+      updateInputInset();
+    };
 
     updateInputInset();
     const resizeObserver = new ResizeObserver(updateInputInset);
     resizeObserver.observe(container);
     window.addEventListener('resize', updateInputInset);
+    document.addEventListener('atomcode-font-size', updateFontSize);
 
     return () => {
       resizeObserver.disconnect();
       window.removeEventListener('resize', updateInputInset);
+      document.removeEventListener('atomcode-font-size', updateFontSize);
       sessionBody.style.removeProperty('--input-inset');
     };
   }, []);

@@ -135,7 +135,7 @@
   padding: 9px 10px;
   width: 100%;
   user-select: text;
-  font-size: 13px;
+  font-size: calc(var(--app-font-size, 13px) * 13 / 13);
   line-height: 1.5;
   font-weight: 400;
 }
@@ -148,7 +148,7 @@
 .user-message-status {
   margin-bottom: 6px;
   color: var(--app-secondary-foreground);
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
   font-weight: 600;
   text-transform: uppercase;
 }
@@ -188,7 +188,7 @@
   background: var(--app-primary-background);
   color: var(--app-link-color);
   font: inherit;
-  font-size: 12px;
+  font-size: calc(var(--app-font-size, 13px) * 12 / 13);
   line-height: 1.5;
   cursor: pointer;
 }
@@ -215,13 +215,13 @@
   border-radius: var(--corner-radius-small);
   background: var(--app-primary-background);
   color: var(--app-primary-foreground);
-  font-size: 12px;
+  font-size: calc(var(--app-font-size, 13px) * 12 / 13);
   white-space: nowrap;
 }
 
 .user-message-attachment-icon {
   color: var(--app-secondary-foreground);
-  font-size: 10px;
+  font-size: calc(var(--app-font-size, 13px) * 10 / 13);
   text-transform: uppercase;
   flex-shrink: 0;
 }
@@ -267,18 +267,18 @@
   border-radius: var(--corner-radius-small);
   background: color-mix(in srgb, var(--app-secondary-background), transparent 35%);
   color: var(--app-secondary-foreground);
-  font-size: 12px;
+  font-size: calc(var(--app-font-size, 13px) * 12 / 13);
 }
 
 .user-message-image-placeholder-icon {
-  font-size: 28px;
+  font-size: calc(var(--app-font-size, 13px) * 28 / 13);
   line-height: 1;
   color: var(--app-secondary-foreground);
 }
 
 /* === Assistant Message === */
 .assistant-message-content {
-  font-size: 13px;
+  font-size: calc(var(--app-font-size, 13px) * 13 / 13);
   line-height: 1.6;
   width: 100%;
   min-width: 0;
@@ -304,7 +304,7 @@
   border-radius: var(--corner-radius-small);
   background: color-mix(in srgb, var(--app-secondary-background), transparent 35%);
   color: var(--app-secondary-foreground);
-  font-size: 12px;
+  font-size: calc(var(--app-font-size, 13px) * 12 / 13);
   line-height: 1.4;
 }
 
@@ -323,7 +323,7 @@
 .assistant-status-meta {
   flex-shrink: 0;
   color: var(--app-secondary-foreground);
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
 }
 
 .msg-copy-btn {
@@ -336,7 +336,7 @@
   border-radius: var(--corner-radius-small);
   background: transparent;
   color: var(--app-secondary-foreground);
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
@@ -347,7 +347,7 @@
 
 .error-message-content {
   color: var(--app-error-foreground);
-  font-size: 13px;
+  font-size: calc(var(--app-font-size, 13px) * 13 / 13);
   line-height: 1.5;
 }
 
@@ -626,7 +626,7 @@
   align-items: center;
   justify-content: center;
   gap: 4px;
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
 }
 
 .code-block-wrapper.is-single-line .copy-button {
@@ -660,7 +660,7 @@
   border-bottom: 1px solid var(--app-input-border);
   background: color-mix(in srgb, var(--app-secondary-background), transparent 45%);
   color: var(--app-secondary-foreground);
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
 }
 
 .artifact-title {
@@ -808,7 +808,7 @@
   margin: 1px 0 4px;
   color: var(--app-secondary-foreground);
   font-family: var(--app-monospace-font-family);
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -833,7 +833,7 @@
   margin-left: auto;
   border-radius: 3px;
   padding: 2px 6px;
-  font-size: 11px;
+  font-size: calc(var(--app-font-size, 13px) * 11 / 13);
   flex-shrink: 0;
 }
 
@@ -843,7 +843,7 @@
 .tool-annotation.queued { color: var(--app-secondary-foreground); background-color: color-mix(in srgb, var(--app-secondary-foreground), transparent 85%); }
 
 .tool-chevron {
-  font-size: 10px;
+  font-size: calc(var(--app-font-size, 13px) * 10 / 13);
   color: var(--app-secondary-foreground);
   flex-shrink: 0;
   transition: transform 0.15s;
@@ -895,7 +895,7 @@
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 3px;
-  font-size: 10px;
+  font-size: calc(var(--app-font-size, 13px) * 10 / 13);
   opacity: 0;
   transition: opacity 0.15s;
 }

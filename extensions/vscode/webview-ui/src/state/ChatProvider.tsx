@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
 import { ChatState, ChatAction, ExtensionMessage, ImageData, ApprovalMode } from './types';
 import { chatReducer, initialState } from './reducer';
-import { postMessage, getVSCodeApi } from '../vscode';
+import { postMessage, updateWebviewState } from '../vscode';
+import { mountChatFontSize } from '../utils/chatFontSize';
 import { createTranslator } from '../i18n';
 import { shouldShowIdleNotice } from '../utils/streamStatus';
 
@@ -50,6 +51,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
 
   // ── Bridge: extension host -> reducer ──
   useEffect(() => {
+    const fontSize = mountChatFontSize(document);
     function handleMessage(event: MessageEvent<ExtensionMessage>) {
       const msg = event.data;
       const markStreamActivity = () => {
@@ -57,6 +59,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         idleNoticeShownRef.current = false;
       };
       switch (msg.type) {
+        case 'chromeFontSize':
+          fontSize.configure(msg.value);
+          break;
         case 'chromeFont': {
           // Live-apply a chat-font config change without reloading the webview. Edit the SAME
           // `<style id="atomcode-chat-font">` rule the HTML injects (a stylesheet rule), so
@@ -90,7 +95,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           });
           // Persist session binding so tabs survive VS Code restart
           if (msg.activeSessionId) {
-            getVSCodeApi().setState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
+            updateWebviewState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
           }
           break;
         case 'userMessage':
@@ -234,7 +239,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'sessionSelected':
           dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId, projectHash: msg.projectHash });
-          getVSCodeApi().setState({ sessionId: msg.sessionId, projectHash: msg.projectHash });
+          updateWebviewState({ sessionId: msg.sessionId, projectHash: msg.projectHash });
           break;
         case 'models':
           dispatch({ type: 'SET_MODELS', models: msg.models });
@@ -336,7 +341,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     // Signal the extension host that the webview is ready
     postMessage({ type: 'ready' });
 
-    return () => window.removeEventListener('message', handleMessage);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      fontSize.dispose();
+    };
   }, []);
 
   useEffect(() => {
