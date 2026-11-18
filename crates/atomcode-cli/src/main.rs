@@ -2577,6 +2577,9 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     );
     runtime_cfg.prompt_overrides = prompt_overrides.clone();
     runtime_cfg.next_prompt_suggestions = !is_headless;
+    // The TUI shows the turn a background completion starts; `-p` exits at its
+    // first turn terminal, so there the model must wait with `bash_poll`.
+    runtime_cfg.background_wakeups = !is_headless;
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
     } else {

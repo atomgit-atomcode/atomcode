@@ -2510,6 +2510,9 @@ impl Plugin for CompactionCodingPlugin {
 pub(crate) struct CapabilityCommandsPlugin(
     pub(crate) Arc<dyn crate::runtime::RuntimeCommands>,
     pub(crate) std::path::PathBuf,
+    /// The driver shows the turn a background completion starts
+    /// (`CodingAgentConfig::background_wakeups`).
+    pub(crate) bool,
 );
 
 #[async_trait]
@@ -2526,25 +2529,57 @@ impl Plugin for CapabilityCommandsPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         // This policy belongs to the host that actually observes completions,
         // not to the portable shell tool or a second waiting state machine.
+        // Completions are delivered only after a response ends, so a model that
+        // keeps its turn open to poll only delays them; but only a driver that
+        // stays attached shows the turn a completion starts (`-p` exits at its
+        // first turn terminal), so only there may the model end its response.
+        let (policy, knowledge) = if self.2 {
+            (
+                "This host resumes you when a background job finishes. For bounded work \
+                 that may take a long time, including downloads, SDK installation, builds \
+                 and tests, use bash_start (notify_on_exit defaults to true). Keep the real \
+                 operation in that tracked job so its exit status and output are available. \
+                 While it runs, do independent work if useful; otherwise end your response. \
+                 The completion notification is delivered only after your response ends and \
+                 starts your next turn, so keeping the turn open to wait — repeated bash_poll \
+                 waits, shell sleep, ls, pgrep — only delays it. After the notification, \
+                 collect each finished job once with bash_poll and wait_ms 0, then check the \
+                 result. A file existing or a process disappearing does not prove success. \
+                 Leave completion notifications off for servers and watchers. If a job was \
+                 already started without notifications, use bash_poll to collect or wait for \
+                 that tracked job; do not restart the operation just to enable \
+                 notifications. Do not claim an untracked external process is being \
+                 observed by the host.",
+                "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement (switching model or session) retire pending notifications, so a person may need to resume the session then. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.",
+            )
+        } else {
+            (
+                "This host does not resume you when a background job finishes: the run ends \
+                 with your response. For bounded work that may take a long time, including \
+                 downloads, SDK installation, builds and tests, use bash_start and keep the \
+                 real operation in that tracked job so its exit status and output are \
+                 available. While it runs, do independent work if useful; when you are \
+                 blocked on it, wait with bash_poll using a long wait_ms, and repeat while it \
+                 reports running. Before your final answer, collect every job whose result \
+                 matters and bash_kill jobs that stopped mattering. Do not wait with shell \
+                 sleep, ls or pgrep. A file existing or a process disappearing does not prove \
+                 success. Do not claim an untracked external process is being observed by \
+                 the host.",
+                "This host does not resume the session when a background job finishes; the run ends with the model's response, so a bash_start job is waited for with bash_poll before answering.",
+            )
+        };
         atomcode_harness::plugins::tools::contribute_prompt(
             ctx,
             "background-completion-policy",
             52,
-            "This host supports background completion notifications. For bounded work that \
-             may take a long time, including downloads, SDK installation, builds and tests, \
-             use bash_start (notify_on_exit defaults to true). Keep the real operation in that \
-             tracked job so its exit status and output are available. While it runs, do \
-             independent work if useful; otherwise end your response and wait for the host \
-             notification, then collect output with bash_poll and check the result. Do not \
-             spend repeated model requests waiting with shell sleep, ls, pgrep, or empty \
-             polls. A file existing or a process disappearing does not prove success. \
-             Leave completion notifications off for servers and watchers. If a job was \
-             already started without notifications, use bash_poll to collect or wait for \
-             that tracked job; do not restart the operation just to enable notifications. \
-             Do not claim an untracked external process is being observed by the host.",
+            policy,
         );
-        atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
-            "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
+        atomcode_harness::plugins::self_knowledge::describes(
+            ctx,
+            "background-completion",
+            42,
+            knowledge,
+        );
         for command in [
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,

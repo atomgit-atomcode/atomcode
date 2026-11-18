@@ -487,6 +487,7 @@ pub mod tui_front {
             // As the interactive runtime's is built at start.
             let mut agent = crate::automation_agent_config(&runtime);
             agent.round_cap_checkpoint = true;
+            agent.background_wakeups = true;
             Ok(agent)
         }
     }

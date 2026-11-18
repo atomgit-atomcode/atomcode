@@ -49,6 +49,8 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// the map unbounded; this caps it (codex uses the same 64 for its exec sessions) and turns
 /// the overflow into a clear, actionable error rather than a silent leak.
 const MAX_BACKGROUND_JOBS: usize = 64;
+/// Output a single completion notice carries.
+const NOTICE_TAIL_CHARS: usize = 2000;
 
 const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
 const MAX_POLL_WAIT_MS: u64 = 60_000;
@@ -175,6 +177,12 @@ impl BackgroundCompletion {
     /// Build a bounded, non-consuming notice only while output remains collectable.
     /// A terminal poll removes the job, suppressing a redundant model wakeup.
     pub fn notification(&self) -> Option<String> {
+        self.notification_within(NOTICE_TAIL_CHARS)
+    }
+
+    /// [`Self::notification`] with at most `tail_chars` of output, for a notice
+    /// that shares one wakeup with others.
+    pub fn notification_within(&self, tail_chars: usize) -> Option<String> {
         let (world, raw) = {
             let guard = store().lock().unwrap();
             let job = guard.get(&self.job_id)?;
@@ -185,14 +193,14 @@ impl BackgroundCompletion {
         let tail: String = text
             .chars()
             .rev()
-            .take(2000)
+            .take(tail_chars)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
         Some(format!(
-            "Background job {} has finished (exit code: {:?}, killed: {}). Captured output tail (up to 2000 characters):\n{}\nUse bash_poll with job_id {:?} to collect remaining output. This is a process completion notification, not proof that the task succeeded.",
-            self.job_id, self.exit_code, self.killed, tail, self.job_id,
+            "Background job {} has finished (exit code: {:?}, killed: {}). Captured output tail (up to {} characters):\n{}\nUse bash_poll with job_id {:?} to collect remaining output. This is a process completion notification, not proof that the task succeeded.",
+            self.job_id, self.exit_code, self.killed, tail_chars, tail, self.job_id,
         ))
     }
 }
@@ -237,6 +245,17 @@ pub(crate) async fn start(
     let exit_status_note = super::exit_diagnostic::may_mask_status(command);
     // Bound the store BEFORE spawning so a runaway starter can't grow it (or leak processes)
     // without limit; count under the lock, drop it before the await-y spawn below.
+    {
+        let mut jobs = store().lock().unwrap();
+        if jobs.len() >= MAX_BACKGROUND_JOBS {
+            // A stopped job may never be polled after termination, so reclaim
+            // its output under pressure to make room for new work.
+            jobs.retain(|_, job| {
+                !(job.shared.finished.load(Ordering::Acquire)
+                    && *job.shared.status.lock().unwrap() == Status::Killed)
+            });
+        }
+    }
     if store().lock().unwrap().len() >= MAX_BACKGROUND_JOBS {
         return Err(format!(
             "bash_start: too many background jobs (limit {MAX_BACKGROUND_JOBS}); poll or kill \
@@ -799,11 +818,15 @@ impl Tool for BashStartTool {
             }
         };
         match start(&self.world, &a.command, ctx).await {
+            // The prefix up to "Collect output with bash_poll " is parsed back by
+            // the coding runtime (`discipline::started_job`).
             Ok(id) if a.notify_on_exit => ok(format!(
-                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
-                 after the requested host completion notification. Do useful independent work, or finish \
-                 this response and wait for the notification; do not repeatedly poll just to wait. \
-                 A host without notification support still requires manual polling. \
+                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":0}} \
+                 once the completion notification arrives, if this host resumes you when a job finishes \
+                 (see its background completion policy): meanwhile do independent work or end your \
+                 response. The notification is delivered only after your response ends, so polling to \
+                 wait only delays it. On a host that does not resume you, wait with bash_poll \
+                 {{\"job_id\":\"{id}\",\"wait_ms\":60000}} and repeat while it is running. \
                  Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
             )),
             Ok(id) => ok(format!(
@@ -868,7 +891,10 @@ fn poll_description(preview: bool) -> &'static str {
          whether it is still running or has exited. Waits up to wait_ms (default 10000, max \
          60000), collecting output until exit, status change or timeout. Set wait_until to \
          output to return early on new output; 0 checks immediately. Use this instead \
-         of shell sleep, and repeat until it reports it exited. A wait timeout leaves the \
+         of shell sleep. If this job has notify_on_exit enabled and the host resumes you on \
+         completion, end your response and collect once with wait_ms 0 after the notification. \
+         Otherwise wait with bash_poll and repeat while it reports \
+         running. A wait timeout leaves the \
          job running; it does not mean failure. Do not restart a running build. \
          When a poll has no new output and still reports running, avoid repeated waiting \
          narration or a new status update for each check. Report meaningful new output, \
@@ -1242,6 +1268,45 @@ mod tests {
             .unwrap();
         process.drained.notified().await;
         (id, process)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_full_store_makes_room_only_from_ended_killed_jobs() {
+        let exit = Exit {
+            code: Some(0),
+            signal: None,
+        };
+        let mut ids = Vec::new();
+        for _ in 0..MAX_BACKGROUND_JOBS {
+            ids.push(auth_job(Vec::new(), exit).await.0);
+        }
+        let extra = || -> Arc<dyn Shell> {
+            Arc::new(AuthWorld(Arc::new(AuthProcess {
+                chunks: Mutex::new(Default::default()),
+                drained: tokio::sync::Notify::new(),
+                finish: tokio_util::sync::CancellationToken::new(),
+                exit,
+            })))
+        };
+        assert!(
+            start(&extra(), "more", &ctx(Path::new("."))).await.is_err(),
+            "running jobs keep their slots"
+        );
+        kill(&ids[0]).unwrap();
+        while !store().lock().unwrap()[&ids[0]]
+            .shared
+            .finished
+            .load(Ordering::Acquire)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let id = start(&extra(), "more", &ctx(Path::new(".")))
+            .await
+            .expect("an ended killed job gives up its slot");
+        let jobs = store().lock().unwrap();
+        assert!(!jobs.contains_key(&ids[0]));
+        assert!(ids[1..].iter().all(|id| jobs.contains_key(id)));
+        assert!(jobs.contains_key(&id));
     }
 
     struct PollProcess {

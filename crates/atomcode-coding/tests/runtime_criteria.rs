@@ -1579,6 +1579,33 @@ fn system_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// Completions are delivered after a response ends, so only a driver that shows
+/// the turn a completion starts lets the model end its response to wait; a run
+/// that ends with the response (`-p`) is told to wait with `bash_poll` instead.
+async fn the_model_is_told_how_this_host_waits_for_background_work() {
+    for wakeups in [true, false] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.background_wakeups = wakeups;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, "hello").await;
+        let shown = system_text(&recorder.last_request());
+        assert_eq!(
+            shown.contains("This host resumes you when a background job finishes"),
+            wakeups,
+            "{shown}"
+        );
+        assert_eq!(
+            shown.contains("This host does not resume you when a background job finishes"),
+            !wakeups,
+            "{shown}"
+        );
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    }
+}
+
 /// The model is told where it is working, and a resumed session keeps the git
 /// snapshot it started with — rewriting it would break the cached prefix of the
 /// whole resumed conversation.
@@ -7106,6 +7133,7 @@ mod criteria {
         accept_edits_applies_a_write_without_asking,
         an_always_allow_survives_an_undo,
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
+        the_model_is_told_how_this_host_waits_for_background_work,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
         #[cfg(unix)]

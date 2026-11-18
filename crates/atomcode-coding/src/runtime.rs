@@ -11023,10 +11023,26 @@ fn spawn_runtime_owner_with_optional_agent(
                     if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
                         continue;
                     }
-                    let Some(text) = completion.notification() else { continue; };
-                    if loop_state.is_some() || goal.as_ref().is_some_and(|state| !state.active) {
-                        // A completion cannot shorten the person's /loop cadence
-                        // or re-engage a paused goal. Carry it with the next input.
+                    let goal_waiting = held_turn.is_some() && goal.as_ref().is_some_and(|state| state.active);
+                    // Completions that have also already happened travel in the same
+                    // notice: one turn for the batch, not one each. A job the model
+                    // stopped with bash_kill is left out — the kill's result already
+                    // told it to collect the output — unless a parked goal waits on it.
+                    let batch: Vec<_> = std::iter::once(completion)
+                        .chain(background_jobs.ready())
+                        .collect();
+                    let text = crate::background_jobs::completion_notice(&batch, goal_waiting);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let wakes = resources.as_ref().is_some_and(|runtime| runtime.config.background_wakeups);
+                    if loop_state.is_some()
+                        || goal.as_ref().is_some_and(|state| !state.active)
+                        || (!wakes && !goal_waiting)
+                    {
+                        // A completion cannot shorten the person's /loop cadence,
+                        // re-engage a paused goal, or open a turn a driver that does
+                        // not show it would never surface. Carry it with the next input.
                         pending_local_context.push(text);
                         continue;
                     }
@@ -12367,6 +12383,7 @@ fn harness_host_state(
             .collect(),
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
+        background_wakeups: config.background_wakeups,
         tool_switches: Some(parts.tool_switches()),
         permission_settings: None,
         tool_catalog_slot: parts.tool_catalog_slot(),
@@ -15941,6 +15958,22 @@ mod tests {
     ) {
         let config = native_start(false).agent;
         controller_test_runtime_with_config(provider_factory, config).await
+    }
+
+    /// A runtime whose driver shows the turn a background completion starts.
+    pub(super) async fn waking_test_runtime() -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        mpsc::UnboundedSender<WakeupRequest>,
+        Arc<std::sync::atomic::AtomicBool>,
+        KernelRuntimeAdapter,
+    ) {
+        let mut config = native_start(false).agent;
+        config.background_wakeups = true;
+        controller_test_runtime_with_config(Arc::new(GoalNotMetProviderFactory::default()), config)
+            .await
     }
 
     pub(super) async fn controller_test_runtime_with_config(
@@ -25023,7 +25056,7 @@ type = "openai"
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn background_completion_waits_for_the_current_turn_to_finish() {
         let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
-            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+            waking_test_runtime().await;
         let (call, result, finish) = crate::background_jobs::tests::job(true).await;
         events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
         events.send(AgentEvent::ToolStarted { call }).unwrap();
@@ -25061,10 +25094,84 @@ type = "openai"
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completions_that_already_happened_arrive_together_without_killed_jobs() {
+        use atomcode_kernel::tool::Tool;
+        let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            waking_test_runtime().await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        let mut jobs = Vec::new();
+        for name in ["first", "second", "stopped"] {
+            let (mut call, mut result, finish) = crate::background_jobs::tests::job(true).await;
+            call.id = name.into();
+            result.call_id = name.into();
+            let id = crate::discipline::started_job(&result.content)
+                .unwrap()
+                .to_owned();
+            events.send(AgentEvent::ToolStarted { call }).unwrap();
+            events.send(AgentEvent::ToolResult { result }).unwrap();
+            while !matches!(
+                runtime_events.recv().await,
+                Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+            ) {}
+            jobs.push((id, finish));
+        }
+        jobs[0].1.cancel();
+        jobs[1].1.cancel();
+        let ctx = atomcode_kernel::tool::ToolContext {
+            working_dir: "/tmp".into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: Default::default(),
+            requester: None,
+        };
+        let killed = atomcode_capabilities::tools::bash::BashKillTool
+            .execute(&serde_json::json!({"job_id": jobs[2].0}).to_string(), &ctx)
+            .await;
+        assert!(!killed.is_error);
+        // Every job has ended before the turn does.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        let Some(AgentCommand::SendSyntheticMessage { text }) = commands.recv().await else {
+            panic!("expected one completion notice");
+        };
+        for (id, _) in &jobs[..2] {
+            assert!(
+                text.contains(&format!("Background job {id} has finished")),
+                "{text}"
+            );
+        }
+        assert!(
+            !text.contains(&format!("Background job {} has", jobs[2].0)),
+            "a job the model stopped is not announced: {text}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err(),
+            "the batch is one wakeup and the stopped job adds none"
+        );
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_explicit_background_job_notifies_once_and_cancel_forgets_it() {
         for action in 0..4 {
             let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
-                controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+                waking_test_runtime().await;
             let (call, result, finish) = crate::background_jobs::tests::job(true).await;
             events.send(AgentEvent::ToolStarted { call }).unwrap();
             events.send(AgentEvent::ToolResult { result }).unwrap();
@@ -25125,11 +25232,13 @@ type = "openai"
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_goal_waits_for_explicit_background_completion_instead_of_spinning() {
-        goal_wait_case(false).await;
-        goal_wait_case(true).await;
+        goal_wait_case(false, false).await;
+        goal_wait_case(true, false).await;
+        // A job the model stopped is not announced, except to a goal parked on it.
+        goal_wait_case(false, true).await;
     }
 
-    async fn goal_wait_case(time_cap: bool) {
+    async fn goal_wait_case(time_cap: bool, kill: bool) {
         let mut config = native_start(false).agent;
         config.goal_max_duration_secs = if time_cap { 10 } else { 0 };
         let (handle, mut commands, events, mut runtime_events, _wake, _active, _adapter) =
@@ -25144,6 +25253,9 @@ type = "openai"
             Some(AgentCommand::SendMessage { .. })
         ));
         let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        let job = crate::discipline::started_job(&result.content)
+            .unwrap()
+            .to_owned();
         let snapshot = SessionSnapshot::new(vec![
             Message::user("finish bounded build"),
             Message::assistant("", vec![call.clone()]),
@@ -25191,7 +25303,21 @@ type = "openai"
                 }
             }
         }
-        finish.cancel();
+        if kill {
+            use atomcode_kernel::tool::Tool;
+            let ctx = atomcode_kernel::tool::ToolContext {
+                working_dir: "/tmp".into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: Default::default(),
+                requester: None,
+            };
+            let killed = atomcode_capabilities::tools::bash::BashKillTool
+                .execute(&serde_json::json!({"job_id": job}).to_string(), &ctx)
+                .await;
+            assert!(!killed.is_error);
+        } else {
+            finish.cancel();
+        }
         let next = tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv()).await;
         if time_cap {
             assert!(next.is_err(), "budget expiry must suppress late completion");
@@ -25200,6 +25326,50 @@ type = "openai"
                 matches!(next, Ok(Some(AgentCommand::SendSyntheticMessage { text })) if text.contains("Background job"))
             );
         }
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn without_wakeups_a_completion_rides_the_next_input() {
+        let (handle, mut commands, events, mut runtime_events, _wake, _active, _adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+        ) {}
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err(),
+            "a driver that would not show the turn gets none"
+        );
+        handle.submit(UserInput::from("next")).await.unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::SendMessage { text, .. })
+            if text.contains("Background job") && text.ends_with("next")),
+            "the notice rides the person's next input"
+        );
         handle.shutdown().await.unwrap();
     }
 

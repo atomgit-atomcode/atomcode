@@ -2,8 +2,33 @@
 //! No process ownership: cancellation forgets notifications and leaves polling available.
 use atomcode_capabilities::tools::bash::{observe_completion, BackgroundCompletion};
 use atomcode_kernel::tool::{ToolCall, ToolResult};
-use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+
+/// Output all background completions delivered in one wakeup share.
+const NOTICE_BUDGET_CHARS: usize = 8000;
+const NOTICE_TAIL_CHARS: usize = 2000;
+
+pub(crate) fn completion_notice(batch: &[BackgroundCompletion], goal_waiting: bool) -> String {
+    let tail = (NOTICE_BUDGET_CHARS / batch.len().max(1)).min(NOTICE_TAIL_CHARS);
+    batch
+        .iter()
+        .filter(|completion| goal_waiting || !completion.killed)
+        .filter_map(|completion| {
+            completion.notification_within(tail).or_else(|| {
+                // A terminal poll or store reclamation can remove the output
+                // before we deliver the completion to a goal parked on it.
+                goal_waiting.then(|| {
+                    format!(
+                        "Background job {} has finished (exit code: {:?}, killed: {}). Its output is no longer available to collect.",
+                        completion.job_id, completion.exit_code, completion.killed,
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
 
 #[derive(Default)]
 pub(crate) struct BackgroundJobs {
@@ -69,6 +94,16 @@ impl BackgroundJobs {
             .expect("pending job has a completion observer");
         self.pending.remove(&completion.job_id);
         completion
+    }
+    /// Completions that have already happened, taken without waiting, so the
+    /// runtime can hand a batch to the model as one notice.
+    pub fn ready(&mut self) -> Vec<BackgroundCompletion> {
+        let mut ready = Vec::new();
+        while let Some(Some(completion)) = self.waits.next().now_or_never() {
+            self.pending.remove(&completion.job_id);
+            ready.push(completion);
+        }
+        ready
     }
 }
 
@@ -239,6 +274,45 @@ pub(crate) mod tests {
         collect(&completion).await;
         assert!(completion.notification().is_none());
         assert!(!jobs.uncollected());
+    }
+
+    #[test]
+    fn a_parked_goal_gets_a_terminal_notice_even_after_the_output_is_collected() {
+        let batch = [BackgroundCompletion {
+            job_id: "already-collected".into(),
+            exit_code: None,
+            killed: true,
+        }];
+        assert!(completion_notice(&batch, false).is_empty());
+        let notice = completion_notice(&batch, true);
+        assert!(notice.contains("Background job already-collected has finished"));
+        assert!(notice.contains("killed: true"));
+        assert!(!notice.contains("bash_poll"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ready_takes_only_completions_that_already_happened() {
+        let mut jobs = BackgroundJobs::default();
+        let mut finishes = Vec::new();
+        for name in ["first", "second", "running"] {
+            let (mut call, mut result, finish) = job(true).await;
+            call.id = name.into();
+            result.call_id = name.into();
+            jobs.started(&call);
+            jobs.result(&result);
+            finishes.push(finish);
+        }
+        assert!(jobs.ready().is_empty(), "nothing has finished yet");
+        finishes[0].cancel();
+        finishes[1].cancel();
+        let first = jobs.next().await;
+        let rest = jobs.ready();
+        assert_eq!(rest.len(), 1, "the other finished job joins the batch");
+        assert_ne!(rest[0].job_id, first.job_id);
+        assert!(jobs.pending(), "the running job is still observed");
+        finishes[2].cancel();
+        jobs.next().await;
+        assert!(!jobs.pending());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -133,6 +133,12 @@ pub struct CodingAgentConfig {
     /// headless/daemon/ACP paths do not incur a hidden model request before they
     /// implement the corresponding UI. The interactive TUI opts in explicitly.
     pub next_prompt_suggestions: bool,
+    /// Whether this driver stays attached after a turn ends and shows the turn a
+    /// background completion starts, so the model may end its response instead of
+    /// polling for a `bash_start` job. Default false: `-p` exits at its first turn
+    /// terminal and ACP only forwards the turns it prompted, so there the model is
+    /// told to wait with `bash_poll`. The interactive TUI opts in.
+    pub background_wakeups: bool,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/5 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -376,6 +382,8 @@ pub struct CodingRuntimeConfig {
     /// Driver opt-in for ephemeral next-prompt sampling. Default false;
     /// currently only the interactive TUI renders and accepts the result.
     pub next_prompt_suggestions: bool,
+    /// Driver opt-in: see [`CodingAgentConfig::background_wakeups`].
+    pub background_wakeups: bool,
     pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
     pub dap: atomcode_capabilities::tools::debug::Settings,
@@ -769,6 +777,7 @@ impl CodingRuntimeConfig {
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
+            background_wakeups: false,
             lsp: {
                 let mut lsp = lsp_settings_from_config(&config.lsp);
                 lsp.config_dir = Some(dirs.user().to_path_buf());
@@ -851,6 +860,7 @@ impl CodingRuntimeConfig {
         config.permission_rules = self.permission_rules.clone();
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
+        config.background_wakeups = self.background_wakeups;
         config.lsp = self.lsp.clone();
         config.dap = self.dap.clone();
         config.web_search_provider = self.web_search_provider.clone();
@@ -1331,6 +1341,7 @@ impl CodingAgentConfig {
             repeat_stop_rounds: None,
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
+            background_wakeups: false,
             interactive: false,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),

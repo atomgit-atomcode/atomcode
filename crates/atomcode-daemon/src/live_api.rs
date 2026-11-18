@@ -379,6 +379,8 @@ pub(crate) fn chat_runtime_config(
         // WebUI/daemon projection is intentionally deferred; avoid a hidden
         // auxiliary model request until that driver renders the suggestion.
         next_prompt_suggestions: false,
+        // `/chat` answers one request; only `/live` (below) shows later turns.
+        background_wakeups: false,
         lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
         dap: atomcode_coding::config::dap_settings_from_config(&config.dap),
         web_search_provider: atomcode_coding::config::web_search_from_config(&config.web_search).0,
@@ -396,6 +398,9 @@ pub(crate) fn live_runtime_config(
 ) -> atomcode_coding::CodingRuntimeConfig {
     let mut runtime = chat_runtime_config(config, provider_name, working_dir, telemetry);
     runtime.interactive = true;
+    // The live hub shows turns it did not submit (`live_hub`: a turn started
+    // outside `submit`), so a background completion's turn reaches the page.
+    runtime.background_wakeups = true;
     runtime
 }
 
@@ -3814,6 +3819,10 @@ mod tests {
             telemetry,
         );
         assert!(runtime.interactive);
+        assert!(
+            runtime.agent_config().background_wakeups,
+            "the live page shows a turn a background completion starts"
+        );
         assert!(runtime.agent_config().architecture_topology);
         assert_eq!(
             runtime.agent_config().auto_review,
