@@ -3997,6 +3997,11 @@ body {
 /* Successful file mutations, deduped for a complete user turn. Paths wrap on
    mobile; the card links to the existing workspace diff rather than duplicating it. */
 .turn-artifacts {
+  /* .timeline-message aligns children to flex-start; stretch only this card to
+     the conversation column so short paths don't shrink it. */
+  align-self: stretch;
+  box-sizing: border-box;
+  width: 100%;
   min-width: 0;
   overflow: hidden;
   border: 1px solid var(--app-border-subtle);
@@ -4010,7 +4015,8 @@ body {
 .turn-artifacts-icon { flex: none; }
 .turn-artifacts-changes { flex: none; border: 1px solid var(--app-border-subtle); border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
 .turn-artifacts-list { list-style: none; margin: 0; padding: 6px 0; }
-.turn-artifacts-list li { margin: 0; padding: 0; }
+.turn-artifacts-list li { display: flex; align-items: center; margin: 0; padding: 0; }
+.turn-artifact-diff { flex: none; margin-right: 12px; border: 1px solid var(--app-border-subtle); border-radius: 8px; padding: 4px 10px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
 .turn-artifact-chip {
   display: flex;
   align-items: baseline;
@@ -4030,14 +4036,15 @@ body {
 .turn-artifact-stats { display: flex; gap: 6px; flex: none; font-variant-numeric: tabular-nums; }
 .turn-artifact-added { color: var(--app-diff-addition-foreground, #168344); color: light-dark(#168344, #74c991); }
 .turn-artifact-removed { color: var(--app-diff-deletion-foreground, #c43131); color: light-dark(#c43131, #f14c4c); }
-.turn-artifact-chip:hover, .turn-artifacts-changes:hover, .turn-artifact-more:hover { background: var(--app-hover-background); }
-.turn-artifact-chip:focus-visible, .turn-artifacts-changes:focus-visible, .turn-artifact-more:focus-visible { outline: 2px solid var(--app-brand); outline-offset: -2px; }
+.turn-artifact-chip:hover, .turn-artifacts-changes:hover, .turn-artifact-diff:hover, .turn-artifact-more:hover { background: var(--app-hover-background); }
+.turn-artifact-chip:focus-visible, .turn-artifacts-changes:focus-visible, .turn-artifact-diff:focus-visible, .turn-artifact-more:focus-visible { outline: 2px solid var(--app-brand); outline-offset: -2px; }
 .turn-artifact-more { display: flex; align-items: center; gap: 8px; border: 0; padding: 10px 16px 14px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
 @media (max-width: 767px) {
   .turn-artifacts-header { flex-wrap: wrap; padding: 12px; gap: 8px; }
   .turn-artifacts-header strong { flex-basis: calc(100% - 32px); }
   .turn-artifacts-changes { margin-left: 30px; min-height: 36px; }
   .turn-artifact-chip { padding: 10px 12px; }
+  .turn-artifact-diff { margin-right: 8px; min-height: 36px; }
   .turn-artifact-more { padding: 10px 12px 12px; }
 }
 

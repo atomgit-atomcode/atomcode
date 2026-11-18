@@ -1,8 +1,8 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
-import { useEffect, useMemo, useState } from 'preact/hooks';
-import { FilePreviewDialog } from './FilePreviewDialog';
+import { useContext, useMemo } from 'preact/hooks';
 import { localFilePath } from '../lib/fileLinks';
+import { FileViewerContext } from '../lib/fileViewer';
 import { createMathExtensions } from '../lib/markdownMath';
 
 marked.setOptions({ gfm: true, breaks: false });
@@ -84,8 +84,10 @@ function highlightHtml(html: string, search: string): string {
 export function Markdown({ content, search, sessionId, documentPath }: {
   content: string; search?: string; sessionId?: string | null; documentPath?: string;
 }) {
-  const [selected, setSelected] = useState<{ sessionId: string; path: string } | null>(null);
-  useEffect(() => setSelected(null), [sessionId]);
+  // Local links open in the owning session's workspace viewer. Without a
+  // session or a viewer route they stay plain text: never browser navigation.
+  const viewer = useContext(FileViewerContext);
+  const linkable = Boolean(sessionId && viewer);
   const { html, files } = useMemo(() => {
     const files: string[] = [];
     const links = new marked.Renderer();
@@ -95,7 +97,7 @@ export function Markdown({ content, search, sessionId, documentPath }: {
       const path = localFilePath(href, documentPath);
       if (path === null) return originalLink(href, title, text);
       // Keep local destinations out of browser navigation without relaxing sanitization.
-      if (!sessionId) return `<span>${text}</span>`;
+      if (!linkable) return `<span>${text}</span>`;
       const index = files.push(path) - 1;
       return originalLink('#', title, text).replace('<a ', `<a data-local-file="${index}" `);
     };
@@ -112,14 +114,14 @@ export function Markdown({ content, search, sessionId, documentPath }: {
     clean.querySelectorAll('a:not([href])').forEach(link => link.replaceWith(...link.childNodes));
     const sanitized = clean.innerHTML;
     return { html: search?.trim() ? highlightHtml(sanitized, search) : sanitized, files };
-  }, [content, search, sessionId, documentPath]);
+  }, [content, search, linkable, documentPath]);
 
   function onClick(e: MouseEvent) {
     const link = (e.target as HTMLElement)?.closest<HTMLAnchorElement>('a[data-local-file]');
     if (link) {
       e.preventDefault();
       const path = files[Number(link.dataset.localFile)];
-      if (path !== undefined && sessionId) setSelected({ sessionId, path });
+      if (path !== undefined && sessionId) viewer?.open({ sessionId, path, view: 'content' });
       return;
     }
     const t = (e.target as HTMLElement)?.closest('.copy-button') as HTMLElement | null;
@@ -133,13 +135,12 @@ export function Markdown({ content, search, sessionId, documentPath }: {
     }
   }
 
-  return (<>
+  return (
     <div
       class="markdown-root assistant-message-content"
       onClick={onClick}
       onAuxClick={event => { if ((event.target as HTMLElement)?.closest('a[data-local-file]')) event.preventDefault(); }}
       dangerouslySetInnerHTML={{ __html: html }}
     />
-    {selected && selected.sessionId === sessionId && <FilePreviewDialog key={`${selected.sessionId}/${selected.path}`} sessionId={selected.sessionId} path={selected.path} onClose={() => setSelected(null)} />}
-  </>);
+  );
 }

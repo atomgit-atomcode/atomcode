@@ -9,12 +9,9 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
-  'filePreview.title': '文件预览',
-  'filePreview.close': '关闭文件预览',
   'filePreview.download': '下载',
   'filePreview.loading': '正在加载文件…',
   'filePreview.failed': '无法预览此文件',
-  'filePreview.noSession': '无法确定文件所属会话，请重新打开会话后重试。',
   'filePreview.invalidImage': '图片无法解码，文件可能已损坏。',
   'chat.loadEarlierHistory': '加载更早的记录',
   'chat.previewImage': '放大查看图片 {n}',
@@ -371,6 +368,8 @@ const zh = {
   'chat.artifacts': '产物',
   'chat.modifiedFiles': '本轮修改 {count} 个文件',
   'chat.viewChanges': '查看变更',
+  'chat.viewFileDiff': '差异',
+  'chat.viewFileDiffTitle': '在工作区查看 {path} 当前的 Git 差异',
   'chat.moreFiles': '再显示 {count} 个文件',
   'chat.collapseFiles': '收起文件列表',
   'chat.artifactOpenFailed': '无法打开产物：{msg}',
@@ -867,12 +866,9 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
-  'filePreview.title': 'File preview',
-  'filePreview.close': 'Close file preview',
   'filePreview.download': 'Download',
   'filePreview.loading': 'Loading file…',
   'filePreview.failed': 'Unable to preview this file',
-  'filePreview.noSession': 'The file has no owning session. Reopen the conversation and try again.',
   'filePreview.invalidImage': 'The image could not be decoded. The file may be damaged.',
   'chat.loadEarlierHistory': 'Load earlier messages',
   'chat.previewImage': 'Enlarge image {n}',
@@ -1230,6 +1226,8 @@ const en: Record<MsgKey, string> = {
   'chat.artifacts': 'Files',
   'chat.modifiedFiles': 'Files modified this turn: {count}',
   'chat.viewChanges': 'View changes',
+  'chat.viewFileDiff': 'Diff',
+  'chat.viewFileDiffTitle': 'Show the current Git diff of {path} in the workspace',
   'chat.moreFiles': 'Show {count} more files',
   'chat.collapseFiles': 'Show fewer files',
   'chat.artifactOpenFailed': 'Could not open file: {msg}',

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { artifactDisplayPath, artifactsByAssistantIndex } from './turnArtifacts.ts';
+import { artifactDisplayPath, artifactsByAssistantIndex, workspaceRelativePath } from './turnArtifacts.ts';
 
 test('artifact labels use the workspace boundary and preserve outside paths', () => {
   assert.equal(artifactDisplayPath('/repo/src/file.ts', '/repo'), 'src/file.ts');
@@ -96,4 +96,22 @@ test('archived tool metadata preserves full-turn artifact links without resident
     { role: 'assistant' as const, parts: [] },
   ];
   assert.deepEqual(artifactsByAssistantIndex(messages).get(1), [{ path: '/project/a.ts', label: 'a.ts' }]);
+});
+
+
+test('workspace opening stays inside the owning cwd across platform path forms', () => {
+  for (const [path, cwd, expected] of [
+    ['/repo/src/a.ts', '/repo', 'src/a.ts'],
+    ['./src/a.ts', '/repo', 'src/a.ts'],
+    ['docs/notes/../image.png', '/repo', null],
+    ['/repo/docs/../image.png', '/repo', null],
+    ['C:\\Repo\\src\\a.ts', 'c:/repo', 'src/a.ts'],
+    ['/repository/a.ts', '/repo', null],
+    ['../a.ts', '/repo', null],
+    ['/repo/src/../../a.ts', '/repo', null],
+    ['~/a.ts', '/repo', null],
+    ['//server/share/a.ts', '/repo', null],
+    ['.', '/repo', null],
+    ['/repo/中文 图片.png', '/repo', '中文 图片.png'],
+  ] as const) assert.equal(workspaceRelativePath(path, cwd), expected, path);
 });

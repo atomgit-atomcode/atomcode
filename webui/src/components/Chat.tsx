@@ -1,6 +1,5 @@
 import { PromptHistory, promptHistoryDirection } from '../lib/promptHistory';
 import { HistoryLoading } from './HistoryLoading';
-import { FilePreviewDialog } from './FilePreviewDialog';
 import { TurnArtifactsCard } from './TurnArtifactsCard';
 import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
@@ -5165,8 +5164,6 @@ function AssistantMessageView({
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
-  const [previewFile, setPreviewFile] = useState<{sessionId: string | null; path: string} | null>(null);
-  useEffect(() => setPreviewFile(null), [sessionId]);
   const [copyError, setCopyError] = useState(false);
 
   function handleCopy() {
@@ -5240,10 +5237,8 @@ function AssistantMessageView({
         </>
       )}
       {isLastInTurn && !streaming && artifacts.length > 0 && (
-        <TurnArtifactsCard artifacts={artifacts} sessionId={sessionId}
-          onPreview={path => setPreviewFile({sessionId, path})} />
+        <TurnArtifactsCard artifacts={artifacts} sessionId={sessionId} />
       )}
-      {previewFile && previewFile.sessionId === sessionId && <FilePreviewDialog key={`${previewFile.sessionId}/${previewFile.path}`} sessionId={previewFile.sessionId} path={previewFile.path} onClose={() => setPreviewFile(null)} />}
       {!busy && msg.retryDiagnostics?.length ? (
         <details class="provider-diagnostics">
           <summary>{t('chat.requestDiagnostics')}</summary>
