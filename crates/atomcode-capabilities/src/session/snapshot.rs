@@ -269,7 +269,14 @@ impl SnapshotHook {
                 ),
             };
             match checkpoint {
-                Ok(cp) => (Some(Arc::new(cp)), None),
+                Ok(cp) => {
+                    // Each session has its own store; bound them all as one opens.
+                    super::rewind_retention::sweep_in_background(
+                        dirs.user().to_path_buf(),
+                        session_id.clone(),
+                    );
+                    (Some(Arc::new(cp)), None)
+                }
                 Err(e) => (
                     None,
                     Some(CodeRewindUnavailable::SetupFailed(e.to_string())),

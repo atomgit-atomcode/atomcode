@@ -31,6 +31,7 @@ pub mod recall;
 mod recovery;
 pub mod reference;
 pub mod rewind;
+mod rewind_retention;
 pub mod session_list;
 pub mod snapshot;
 pub mod status_reminder;
