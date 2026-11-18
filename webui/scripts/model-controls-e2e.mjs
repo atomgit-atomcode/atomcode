@@ -108,7 +108,9 @@ try {
     assert.equal(effortWrites.at(-1).reasoning_effort, null);
     const label = page.locator('.unified-model-selector .model-selector-label');
     assert.equal(await label.evaluate(el => getComputedStyle(el).textOverflow), 'ellipsis');
-    assert.ok((await trigger.boundingBox()).width <= 221, 'model trigger keeps a fixed width');
+    const longTrigger = await trigger.boundingBox();
+    assert.ok(longTrigger.width <= 221, 'the long model name respects the trigger width cap');
+    assert.ok(await label.evaluate(el => el.scrollWidth > el.clientWidth), 'the long model name is truncated');
     assert.match(await trigger.getAttribute('title'), /glm-5.3-flash-provider-qualified-preview/);
     if (mobile) assert.ok((await trigger.boundingBox()).height >= 44, 'mobile touch target stays accessible');
     assert.ok(await page.locator('.model-effort-name span').first().evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'full model name inside card');
@@ -122,6 +124,9 @@ try {
     await page.locator('.model-item').filter({hasText:'lumen-alpha'}).click();
     await page.locator('.model-effort-panel').waitFor();
     await page.waitForFunction(()=>document.querySelector('.model-effort-name')?.textContent.includes('lumen-alpha'));
+    const shortTrigger = await trigger.boundingBox();
+    assert.ok(shortTrigger.width + 1 < longTrigger.width, `a short model name shrinks the trigger at ${width}px (${shortTrigger.width}px vs ${longTrigger.width}px)`);
+    assert.ok(await label.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'the short model name fits');
     assert.equal(await slider.count(),0,'a model without adjustable effort still returns to its card');
     assert.ok(await page.locator('.model-effort-hint').isVisible());
     await page.locator('.model-effort-name').click();

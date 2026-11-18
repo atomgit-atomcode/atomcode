@@ -3495,14 +3495,7 @@ body {
   }
   .input-footer-actions > .model-controls {
     width: 100%;
-  }
-  .input-footer-actions .model-controls > .model-selector:not(.effort-selector) {
-    flex: 1 1 0;
-    max-width: none;
-  }
-  .input-footer-actions .model-controls > .model-selector:not(.effort-selector) .model-selector-trigger {
-    width: 100%;
-    max-width: none;
+    justify-content: flex-end;
   }
   .input-footer-actions .model-selector-trigger,
   .input-turn-controls > .btn-send,
@@ -4509,9 +4502,8 @@ body {
 
 /* A bounded, single-line trigger; the card retains the full model name. */
 .input-footer .model-controls > .unified-model-selector {
-  width: 220px;
-  max-width: 100%;
-  flex: 0 1 220px;
+  width: max-content;
+  max-width: min(220px, 100%);
 }
 .unified-model-selector .model-selector-trigger {
   width: 100%;
