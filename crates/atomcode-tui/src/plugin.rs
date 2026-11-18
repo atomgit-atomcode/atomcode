@@ -5466,6 +5466,9 @@ impl Tui {
             if lines.is_empty() && !ran.output.trim().is_empty() {
                 lines = ran.output.trim_end().lines().map(str::to_string).collect();
             }
+            if ran.failed() && !ran_in.is_empty() {
+                lines.push(t(Msg::ShellWorkingDir { dir: &ran_in }).into_owned());
+            }
             let tail = match (ran.timed_out, ran.code) {
                 (true, _) => Some(
                     t(Msg::ShellTimedOut {

@@ -773,21 +773,19 @@ impl Content for UserSaid {
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        // The `!` commands that rode along are the model's reading, not what
-        // was typed: the person's words lead the bar, and each command follows
-        // as one muted `! command` row — said, so a resumed session still shows
-        // that the message carried it, but not as the tags the model reads.
         let (ran, said) = crate::shell::split_context(&self.0);
         let mut rows = user_bar(said, ctx.width);
-        let room = (ctx.width as usize).saturating_sub(4);
-        for command in ran {
-            rows.extend(input_bar(
-                &clip(&command, room),
+        if !ran.is_empty() && ctx.width > 0 {
+            rows.push(Line::default());
+            rows.extend(wrapped(
+                &t(Msg::ShellContextHeading),
                 ctx.width,
-                "  ! ",
-                None,
                 muted(),
+                "  ",
             ));
+            for command in ran {
+                rows.extend(wrapped(&command, ctx.width, muted(), "  ! "));
+            }
         }
         rows
     }
@@ -6235,9 +6233,7 @@ mod tests {
         assert!(rows[1].contains("⎿ $ make ·"), "{rows:?}");
     }
 
-    /// The `!` commands a message carried are not drawn as the tags the model
-    /// reads: the person's words lead the bar, each command follows as a muted
-    /// `! command` row.
+    /// A message's local command context is labelled below the user bar.
     #[test]
     fn a_message_that_carried_a_shell_command_shows_the_words_and_the_command() {
         let text = format!(
@@ -6251,8 +6247,10 @@ mod tests {
             .collect();
         assert!(!rows.iter().any(|r| r.contains("bash-")), "{rows:?}");
         assert!(rows[0].contains("分析下这个项目"), "{rows:?}");
+        assert!(rows[1].is_empty(), "{rows:?}");
+        assert_eq!(rows[2].trim(), t(Msg::ShellContextHeading));
         assert!(
-            rows[1].trim_end().ends_with("! rm -rf pelican-bike.html"),
+            rows[3].trim_end().ends_with("! rm -rf pelican-bike.html"),
             "{rows:?}"
         );
         assert!(rows.iter().all(|r| width::str_width(r) <= 60), "{rows:?}");

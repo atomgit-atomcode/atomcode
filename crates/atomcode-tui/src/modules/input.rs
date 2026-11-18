@@ -275,7 +275,11 @@ fn shown(moment: &crate::moment::Moment) -> (std::borrow::Cow<'_, str>, usize) {
 /// What the host needs to decide whether an up-arrow is "one row up" or "the
 /// previous thing I said": inside the text it moves, at the edge it hands over.
 pub fn caret_row(input: &str, caret: usize, width: u16) -> (usize, usize, usize) {
-    let (rows, (row, col), _) = lay(input, caret, body_width(width));
+    let (rows, (row, col), _) = lay(
+        input,
+        caret,
+        draft_width(width, crate::shell::in_shell_mode(input)),
+    );
     (row, col, rows.len())
 }
 
@@ -285,7 +289,7 @@ pub fn caret_row(input: &str, caret: usize, width: u16) -> (usize, usize, usize)
 /// again returns to where it started — as long as nothing was typed in between,
 /// which is exactly the guarantee a person expects from an arrow key.
 pub fn offset_at(input: &str, row: usize, col: usize, width: u16) -> usize {
-    let body = body_width(width);
+    let body = draft_width(width, crate::shell::in_shell_mode(input));
     let (rows, _, starts) = lay(input, 0, body);
     let row = row.min(rows.len().saturating_sub(1));
     let start = starts.get(row).copied().unwrap_or(0).min(input.len());
@@ -315,7 +319,9 @@ pub fn offset_at_cell(
     if moment.secret.is_some() {
         return None;
     }
-    let body = body_width(rect.w);
+    let shell = shell_draft(moment);
+    let prompt = prompt_width(shell);
+    let body = draft_width(rect.w, shell);
     let (rows, (caret_row, _), _) = lay(&moment.input, moment.caret, body);
     let room = typed_room(rect.h);
     let first = caret_row.saturating_sub(room.saturating_sub(1));
@@ -323,7 +329,7 @@ pub fn offset_at_cell(
 
     let within = (y.saturating_sub(rect.y) as usize).saturating_sub(RULE);
     let row = first + within.min(shown - 1);
-    let col = (x.saturating_sub(rect.x) as usize).saturating_sub(PROMPT);
+    let col = (x.saturating_sub(rect.x) as usize).saturating_sub(prompt);
     Some(offset_at(&moment.input, row, col, rect.w))
 }
 
@@ -334,10 +340,12 @@ pub fn selection_without_prompt(
     rect: crate::frame::Rect,
     mut selection: crate::moment::Selection,
 ) -> crate::moment::Selection {
-    if moment.secret.is_some() || rect.w <= PROMPT as u16 {
+    let shell = shell_draft(moment);
+    let prompt = prompt_width(shell) as u16;
+    if moment.secret.is_some() || rect.w <= prompt {
         return selection;
     }
-    let (rows, (caret_row, _), _) = lay(&moment.input, moment.caret, body_width(rect.w));
+    let (rows, (caret_row, _), _) = lay(&moment.input, moment.caret, draft_width(rect.w, shell));
     let room = typed_room(rect.h);
     let first = caret_row.saturating_sub(room.saturating_sub(1));
     let shown = room.min(rows.len().saturating_sub(first)).max(1);
@@ -361,7 +369,7 @@ pub fn selection_without_prompt(
         )
     };
     if selection_range(moment, rect, selection).is_some() {
-        let left = rect.x + PROMPT as u16;
+        let left = rect.x + prompt;
         let original = selection;
         selection.anchor.0 = selection.anchor.0.max(left);
         selection.head.0 = selection.head.0.max(left);
@@ -388,7 +396,8 @@ pub fn selection_range(
     if selection.is_empty() || moment.secret.is_some() {
         return None;
     }
-    let body = body_width(rect.w);
+    let shell = shell_draft(moment);
+    let body = draft_width(rect.w, shell);
     if moment
         .input
         .split('\n')
@@ -403,7 +412,7 @@ pub fn selection_range(
     let shown = room.min(rows.len().saturating_sub(first)).max(1);
     let text_top = rect.y + RULE as u16;
     let text_bottom = text_top + shown as u16;
-    let text_left = rect.x + PROMPT as u16;
+    let text_left = rect.x + prompt_width(shell) as u16;
     let valid =
         |(x, y): (u16, u16)| x >= rect.x && x < rect.right() && y >= text_top && y < text_bottom;
     if !valid(selection.anchor) || !valid(selection.head) {
@@ -447,10 +456,26 @@ pub fn selection_range(
     Some(range)
 }
 
-/// The cells inside the prompt. One definition, because `render`, `caret` and
-/// every caller that moves by rows must measure the same field.
+/// The width available for a conversation draft after its prompt.
 pub fn body_width(width: u16) -> usize {
-    (width as usize).saturating_sub(PROMPT).max(1)
+    draft_width(width, false)
+}
+
+/// Shared by rendering, caret positioning, and movement between rows.
+fn draft_width(width: u16, shell: bool) -> usize {
+    (width as usize).saturating_sub(prompt_width(shell)).max(1)
+}
+
+fn prompt_width(shell: bool) -> usize {
+    if shell {
+        0
+    } else {
+        PROMPT
+    }
+}
+
+fn shell_draft(moment: &crate::moment::Moment) -> bool {
+    moment.secret.is_none() && crate::shell::in_shell_mode(&moment.input)
 }
 
 pub struct Input;
@@ -489,15 +514,12 @@ impl View for Input {
         // Idle: the accent, ready. Working: the terminal's own foreground (white
         // on dark) — a running turn is not a warning, so it is no longer the
         // warning yellow. The spinner and live line still say "busy".
-        // `!` shell mode: a leading `!` turns the box — both rules, the prompt and
-        // the `!` itself — to the product's own colour, so the whole field reads
+        // A leading `!` replaces the prompt and colours both rules, so the field reads
         // "this runs here, not in the agent" before Enter is pressed. Derived from
         // the line each frame, so it arms and reverts with the `!`, as tuix's
         // does. Never over a password: what is on the line then is not a draft.
-        let shell = vp.moment.secret.is_none() && crate::shell::in_shell_mode(&vp.moment.input);
-        let arrow = theme::fg(if shell {
-            Role::Brand
-        } else if vp.moment.activity == Activity::Working {
+        let shell = shell_draft(vp.moment);
+        let arrow = theme::fg(if vp.moment.activity == Activity::Working {
             Role::Secondary
         } else {
             Role::Accent
@@ -558,7 +580,7 @@ impl View for Input {
         // caret in view — `caret` below windows it the same way, from the same
         // walk, so the cursor cannot land off the text.
         let prompt = format!("{} ", vp.moment.caps.g(crate::caps::Glyph::Prompt));
-        let body = body_width(w);
+        let body = draft_width(w, shell);
         let (text, at) = shown(vp.moment);
         let (typed, (caret_row, _), _) = lay(&text, at, body);
         let room = typed_room(vp.rect.h);
@@ -568,11 +590,14 @@ impl View for Input {
             // the text. Marking the text's first row meant a field scrolled
             // past it had no prompt anywhere — ten rows of bare text between
             // two rules, which does not read as somewhere you can type.
-            let lead = if i == 0 { prompt.clone() } else { "  ".into() };
+            let mut row = Vec::new();
+            if !shell {
+                let lead = if i == 0 { prompt.clone() } else { "  ".into() };
+                row.push(El::styled(lead, arrow));
+            }
             // The typed text is the terminal's own foreground — what you are
             // composing is the one thing on this screen you are actively working
             // on, so it reads at full strength, not dimmed.
-            let mut row = vec![El::styled(lead, arrow)];
             // In shell mode only the `!` takes the colour; the command after it
             // stays the terminal's foreground, so it reads as what it is.
             let piece: &str = match (shell && i + first == 0, piece.strip_prefix('!')) {
@@ -642,7 +667,7 @@ impl View for Input {
     /// what pinned the composer at one row: a pasted stack trace went into the
     /// buffer whole and was sent whole, but only its first line was ever drawn.
     fn height(_state: &State, moment: &crate::moment::Moment, width: u16) -> Height {
-        let body = body_width(width);
+        let body = draft_width(width, shell_draft(moment));
         let (text, at) = shown(moment);
         let typed = lay(&text, at, body).0.len().min(MAX_ROWS);
         // The guess at what to say next adds no row: it is drawn inside the
@@ -654,14 +679,15 @@ impl View for Input {
 /// Where the caret should sit — from the same walk and the same window
 /// `render` used, so it cannot drift off the character it belongs to.
 pub fn caret(moment: &crate::moment::Moment, rect: crate::frame::Rect) -> (u16, u16) {
-    let body = body_width(rect.w);
+    let shell = shell_draft(moment);
+    let body = draft_width(rect.w, shell);
     let (text, at) = shown(moment);
     let (_, (row, col), _) = lay(&text, at, body);
     let room = typed_room(rect.h);
     let first = row.saturating_sub(room.saturating_sub(1));
-    // The prompt eats two cells; the rule above eats one row.
+    // The rule above takes one row. Shell drafts start at the left edge.
     (
-        rect.x + PROMPT as u16 + col as u16,
+        rect.x + prompt_width(shell) as u16 + col as u16,
         rect.y + RULE as u16 + (row - first) as u16,
     )
 }
@@ -709,6 +735,30 @@ mod tests {
         let row = &draw(&state, &moment, 60, 3)[1];
         assert!(row.contains("My draft"));
         assert!(!row.contains(placeholder.as_ref()));
+    }
+
+    #[test]
+    fn a_shell_draft_uses_the_bang_as_its_only_prompt() {
+        let mut moment = Moment {
+            input: "!echo".into(),
+            caret: 5,
+            ..Moment::default()
+        };
+        let rect = Rect::sized(7, 3);
+        let state = State::default();
+        assert_eq!(draw(&state, &moment, rect.w, rect.h)[1].trim_end(), "!echo");
+        assert_eq!(caret(&moment, rect), (5, 1));
+        assert_eq!(offset_at_cell(&moment, rect, 1, 1), Some(1));
+        let selection = crate::moment::Selection {
+            anchor: (0, 1),
+            head: (1, 1),
+        };
+        assert_eq!(selection_range(&moment, rect, selection), Some(0..2));
+
+        moment.input = "echo".into();
+        moment.caret = 4;
+        assert!(draw(&state, &moment, rect.w, rect.h)[1].starts_with(moment.caps.g(Glyph::Prompt)));
+        assert_eq!(caret(&moment, rect), (6, 1));
     }
 
     /// A search counts over what it matched: "搜索 'cargo' 2/3" is the second of

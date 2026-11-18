@@ -749,6 +749,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ShellTimedOut { secs } => format!("(跑了 {secs} 秒还没完,已停止)").into(),
         Msg::ShellFailed { code } => format!("(退出码 {code})").into(),
+        Msg::ShellContextHeading => "已执行的本地命令".into(),
+        Msg::ShellWorkingDir { dir } => format!("工作目录：{dir}").into(),
         Msg::ShellSaidNothing => "(命令已完成,没有输出)".into(),
         Msg::CompactionInterrupted => "压缩被打断了 —— 上下文还是原来那么长".into(),
         Msg::RuntimeStopped { how } => format!("运行时停了:{how}。这个会话不会再有新的东西。").into(),

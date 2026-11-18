@@ -1124,6 +1124,10 @@ pub enum Msg<'a> {
     ShellFailed {
         code: &'a str,
     },
+    ShellContextHeading,
+    ShellWorkingDir {
+        dir: &'a str,
+    },
     ShellSaidNothing,
     CostNothingYet,
     CostTokens {

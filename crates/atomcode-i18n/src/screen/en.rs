@@ -803,6 +803,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ShellTimedOut { secs } => format!("(still going after {secs}s — stopped)").into(),
         Msg::ShellFailed { code } => format!("(exit {code})").into(),
+        Msg::ShellContextHeading => "Previously run locally".into(),
+        Msg::ShellWorkingDir { dir } => format!("Working directory: {dir}").into(),
         Msg::ShellSaidNothing => "(completed with no output)".into(),
         Msg::CompactionInterrupted => {
             "the compaction was interrupted — the context is as long as it was".into()
