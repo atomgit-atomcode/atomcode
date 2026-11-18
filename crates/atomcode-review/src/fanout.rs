@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 
 use crate::review_tool::{cmp_finding, paths_match};
 use crate::Finding;
@@ -530,7 +530,10 @@ mod tests {
         assert_eq!(merged.len(), 1, "overlapping near-duplicate collapses");
         // Higher-priority (P1) content wins; both dimensions are credited.
         assert_eq!(merged[0].finding.priority, "P1");
-        assert_eq!(merged[0].dimensions, smallvec!["correctness", "security"]);
+        assert_eq!(
+            merged[0].dimensions.as_slice(),
+            &["correctness", "security"]
+        );
     }
 
     #[test]
