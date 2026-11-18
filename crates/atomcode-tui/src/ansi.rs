@@ -52,10 +52,13 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// next prompt. With it the terminal wraps the text in markers and it arrives
 /// as one event, which is what `Input::Paste` was always written for.
 ///
+/// DECSCUSR selects a blinking bar for the composer. The terminal handles
+/// blinking between frames, and leaving the UI resets the cursor style.
+///
 /// The keyboard protocol is not in here: it is [`KEYS_ON`], asked for only
 /// where the input reader can read what it turns on
 /// (`crate::caps::wants_keyboard_protocol`).
-pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?25l";
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?25l\x1b[5 q";
 /// Ask the terminal to *disambiguate* keys (the keyboard protocol's flag 1).
 /// Without it a terminal sends the same byte — a carriage return — for enter,
 /// shift-enter and ctrl-enter, so "shift-enter inserts a newline" is not
@@ -81,7 +84,7 @@ pub const KEYS_ON: &str = "\x1b[>1u";
 /// sees every key in a form it does not expect. Popped whether or not they were
 /// pushed — a pop with nothing pushed changes nothing, and one that finds flags
 /// left behind clears them.
-pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
+pub const LEAVE: &str = "\x1b[0 q\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
 /// Off the alternate screen for `/raw`, with line wrap back on: what is
 /// printed next goes where the shell left off and into the terminal's own
 /// scrollback. Raw mode, bracketed paste and the keyboard flags stay, because a
@@ -91,14 +94,14 @@ pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?104
 /// terminal keeps one stack per screen, and [`TRANSCRIPT_BACK`]'s caller pushes
 /// them again, so the depth comes out the same however the terminal treats
 /// the two stacks.
-pub const TRANSCRIPT_OUT: &str = "\x1b[<u\x1b[?7h\x1b[?1049l";
+pub const TRANSCRIPT_OUT: &str = "\x1b[0 q\x1b[<u\x1b[?7h\x1b[?1049l";
 /// Leaving the alternate screen — the tail of [`LEAVE`], which a way out that
 /// is already on the ordinary screen leaves off.
 pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 /// Back onto the alternate screen after `/raw`, cleared, line wrap off again —
 /// the half of [`ENTER`] that [`TRANSCRIPT_OUT`] undid. The pointer mode is
 /// said by the surface, which knows which one is in force.
-pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[H\x1b[2J";
+pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[5 q\x1b[H\x1b[2J";
 /// Ask a terminal on the alternate screen to translate wheel motion into
 /// cursor keys. HarmonyOS HiShell does not report mouse events, so this is the
 /// only path by which its wheel can reach the application.
@@ -1428,6 +1431,8 @@ mod tests {
         );
         assert!(TRANSCRIPT_OUT.contains("1049l") && TRANSCRIPT_OUT.contains("?7h"));
         assert!(TRANSCRIPT_BACK.contains("1049h") && TRANSCRIPT_BACK.contains("?7l"));
+        assert!(TRANSCRIPT_OUT.contains("\x1b[0 q"));
+        assert!(TRANSCRIPT_BACK.contains("\x1b[5 q"));
         let text = transcript(
             &[Line::from_spans(vec![crate::frame::Span::styled(
                 "hello".to_string(),
@@ -1447,6 +1452,7 @@ mod tests {
         // A UI that leaves a shell in the alternate screen is worse than no UI.
         assert!(ENTER.contains("1049h") && LEAVE.contains("1049l"));
         assert!(ENTER.contains("25l") && LEAVE.contains("25h"));
+        assert!(ENTER.contains("\x1b[5 q") && LEAVE.contains("\x1b[0 q"));
         // Auto-wrap: off while we own the screen, back on when we hand it
         // back. Leaving a shell with wrap off is as rude as leaving it in raw
         // mode — every long command line would overwrite its own last column.
