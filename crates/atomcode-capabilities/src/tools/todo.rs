@@ -81,9 +81,11 @@ pub fn render_todos_text(todos: &[TodoItem], unicode: bool) -> String {
         .join("\n")
 }
 
-/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. This is the shape the
-/// TUI title cache (`parse_todo_titles_into`) reads to learn `id → title`, so an incremental
-/// `todo update id=N` row can render the task NAME, not just `#N`. Empty list → "(no tasks)".
+/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. The coding crate's
+/// plan-continuity reminder re-renders the live plan with this, so `id → content` stays
+/// readable wherever the list is quoted. The TUI derives task titles from the
+/// transcript-derived plan itself (`plan.title_as_of`), not from this shape.
+/// Empty list → "(no tasks)".
 pub fn render_todos_numbered(todos: &[TodoItem], unicode: bool) -> String {
     if todos.is_empty() {
         return "(no tasks)".to_string();
@@ -548,13 +550,53 @@ impl Tool for TodoTool {
                 return err(error);
             }
         }
-        // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
-        // into the transcript; the renderer draws the pretty version separately). The
-        // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
-        // id=N` rows show task names.
+        // Full-list (re)plan shape. The model's own call arguments already
+        // carry the full list — echoing it back doubles the round's footprint
+        // and rides every later full-context resend of this session. The ids
+        // are 1-based in list order (derivable from the arguments), and the
+        // TUI seeds task titles from the transcript-derived plan
+        // (`named_todo_update` → `plan.title_as_of`), so the echo only needs
+        // the confirmation, the status counts and the in-progress ids.
         if v.get("todos").is_some() && !is_incremental_action(&v) {
             return match validate_new_todo_plan(args) {
-                Ok(todos) => ok(render_todos_numbered(&todos, false)),
+                Ok(todos) if todos.is_empty() => ok("Plan cleared: no tasks.".to_string()),
+                Ok(todos) => {
+                    let mut pending = Vec::new();
+                    let mut in_progress = Vec::new();
+                    let mut completed = 0usize;
+                    for (i, t) in todos.iter().enumerate() {
+                        match t.status {
+                            TodoStatus::Pending => pending.push(i + 1),
+                            TodoStatus::InProgress => in_progress.push(i + 1),
+                            TodoStatus::Completed => completed += 1,
+                        }
+                    }
+                    let ids = |v: &[usize]| {
+                        v.iter()
+                            .map(|i| format!("#{i}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let mut parts = Vec::new();
+                    if !in_progress.is_empty() {
+                        parts.push(format!(
+                            "{} in_progress ({})",
+                            in_progress.len(),
+                            ids(&in_progress)
+                        ));
+                    }
+                    parts.push(format!("{} pending", pending.len()));
+                    if completed > 0 {
+                        parts.push(format!("{} completed", completed));
+                    }
+                    let items = if todos.len() == 1 { "item" } else { "items" };
+                    ok(format!(
+                        "Plan updated: {} {} — {}. Ids are 1-based in list order; update one with action=update.",
+                        todos.len(),
+                        items,
+                        parts.join(", ")
+                    ))
+                }
                 Err(e) => err(e),
             };
         }
@@ -1281,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_echoes_normalized_list() {
+    async fn execute_confirms_plan_without_echoing_list() {
         let t = TodoTool::new();
         let r = t
             .execute(
@@ -1290,8 +1332,23 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
+        // Same contract as above: the confirmation without the list — the
+        // names ride in the call arguments of the same round.
+        assert!(r.content.contains("1 item — 1 pending"), "{}", r.content);
         assert!(
-            r.content.contains("verify scheduler registration"),
+            !r.content.contains("verify scheduler registration"),
+            "the echo must not repeat the list: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_confirms_cleared_plan() {
+        let t = TodoTool::new();
+        let r = t.execute(r#"{"todos":[]}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Plan cleared: no tasks."),
             "{}",
             r.content
         );
@@ -1306,9 +1363,17 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
+        // The echo is a confirmation, not a second copy of the list: the
+        // model's own call arguments already carry the task names in the same
+        // round.
         assert!(
-            result.content.contains("verify scheduler registration"),
+            result.content.contains("1 item — 1 pending"),
             "{}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("verify scheduler registration"),
+            "the echo must not repeat the list: {}",
             result.content
         );
     }
@@ -1333,22 +1398,25 @@ mod tests {
     }
 
     #[test]
-    fn todowrite_result_is_numbered_for_title_cache() {
-        // The result must carry `<glyph> <id>. <content>` so the TUI title cache learns ids.
+    fn render_todos_numbered_lists_id_and_content() {
+        // The reminder path re-renders the live plan with ids: `<glyph> <id>. <content>`.
         let out = render_todos_numbered(&parse_todos(PLAN3).unwrap(), false);
         assert!(out.contains("] 1. a"), "{out}");
         assert!(out.contains("] 3. c"), "{out}");
     }
 
     #[tokio::test]
-    async fn todowrite_accepts_full_list_shape() {
+    async fn todowrite_full_plan_gets_compact_confirmation() {
         let t = TodoTool::new();
         assert_eq!(t.name(), "todowrite");
         let r = t.execute(PLAN3, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
+        // The confirmation counts and carries open ids; the list itself stays in
+        // the call arguments of the same round.
+        assert!(r.content.contains("3 items — 3 pending"), "{}", r.content);
         assert!(
-            r.content.contains("1. a"),
-            "numbered list echoed: {}",
+            !r.content.contains("1. a"),
+            "the echo must not repeat the list: {}",
             r.content
         );
     }
