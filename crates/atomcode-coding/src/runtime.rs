@@ -1989,6 +1989,7 @@ pub async fn compact_snapshot(
             used_tokens,
             utilization,
             sacred_floor: floor,
+            parent: None,
         })
         .await;
     let mutation = snapshot_mutation(&conversation, &plan);

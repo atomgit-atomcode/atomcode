@@ -3719,6 +3719,7 @@ mod tests {
             used_tokens: 500,
             utilization: 0.5,
             sacred_floor: floor,
+            parent: None,
         };
         let provider: atomcode_review::SharedReviewProvider =
             std::sync::Arc::new(std::sync::RwLock::new(None));

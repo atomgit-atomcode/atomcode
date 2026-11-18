@@ -81,7 +81,7 @@ async fn every_segment_including_middle_dialogue_reaches_the_model_and_carries_t
         "字".repeat(80_000),
         "z".repeat(160_000)
     ))];
-    let result = summarize_span(&provider, &span, None).await.unwrap();
+    let result = summarize_span(&provider, &span, None, None).await.unwrap();
     let sent = provider.sent.lock().unwrap();
     assert!(sent.len() > 2);
     let mut transcript = String::new();
@@ -113,7 +113,7 @@ async fn context_rejection_halves_the_actual_input_and_still_covers_the_whole_tr
         ..Default::default()
     };
     let span = vec![Message::user("detail 字\n".repeat(30_000))];
-    summarize_span(&provider, &span, None).await.unwrap();
+    summarize_span(&provider, &span, None, None).await.unwrap();
     let sent = provider.sent.lock().unwrap();
     assert!(sent[1][1].text.len() < sent[0][1].text.len());
     let mut accepted = String::new();
@@ -145,7 +145,7 @@ async fn a_learned_window_includes_the_growing_summary_not_only_new_transcript()
         ..Default::default()
     };
     let span = vec![Message::user("dialogue detail\n".repeat(20_000))];
-    summarize_span(&provider, &span, None).await.unwrap();
+    summarize_span(&provider, &span, None, None).await.unwrap();
     let sent = provider.sent.lock().unwrap();
     let size = |prompt: &Vec<Message>| prompt.iter().map(|m| m.text.len()).sum::<usize>();
     let first_success = sent
@@ -190,7 +190,7 @@ async fn transient_partial_output_is_discarded_before_one_bounded_retry() {
         ])),
         ..Default::default()
     };
-    let result = summarize_span(&provider, &[Message::user("design")], None)
+    let result = summarize_span(&provider, &[Message::user("design")], None, None)
         .await
         .unwrap();
     assert!(result.ends_with("COMPLETE"));
@@ -209,7 +209,7 @@ async fn repeated_transient_failure_stops_after_two_calls_and_preserves_the_reas
         ])),
         ..Default::default()
     };
-    let error = summarize_span(&provider, &[Message::user("design")], None)
+    let error = summarize_span(&provider, &[Message::user("design")], None, None)
         .await
         .unwrap_err();
     assert_eq!(
@@ -241,7 +241,7 @@ async fn summary_http_failures_are_actionable_and_terminal_rejections_never_retr
             })])),
             ..Default::default()
         };
-        let error = summarize_span(&provider, &[Message::user("retained history")], None)
+        let error = summarize_span(&provider, &[Message::user("retained history")], None, None)
             .await
             .unwrap_err();
         assert_eq!(error.diagnostic(), diagnostic);
@@ -261,9 +261,11 @@ async fn terminal_failures_are_not_retried() {
             replies: Mutex::new(VecDeque::from([reply])),
             ..Default::default()
         };
-        assert!(summarize_span(&provider, &[Message::user("design")], None)
-            .await
-            .is_err());
+        assert!(
+            summarize_span(&provider, &[Message::user("design")], None, None)
+                .await
+                .is_err()
+        );
         assert_eq!(provider.sent.lock().unwrap().len(), 1);
     }
     let provider = Probe {
@@ -274,9 +276,11 @@ async fn terminal_failures_are_not_retried() {
         })])),
         ..Default::default()
     };
-    assert!(summarize_span(&provider, &[Message::user("design")], None)
-        .await
-        .is_err());
+    assert!(
+        summarize_span(&provider, &[Message::user("design")], None, None)
+            .await
+            .is_err()
+    );
     assert_eq!(
         provider.sent.lock().unwrap().len(),
         1,
@@ -318,6 +322,7 @@ async fn a_later_window_failure_keeps_the_entire_original_history_in_every_mode(
                 used_tokens: 0,
                 utilization: 1.0,
                 sacred_floor: floor,
+                parent: None,
             })
             .await;
         assert_eq!(provider.sent.lock().unwrap().len(), 2);
@@ -379,6 +384,7 @@ async fn twenty_minutes_of_progress_can_complete_in_all_compaction_modes() {
                 used_tokens: 0,
                 utilization: 1.0,
                 sacred_floor: 2,
+                parent: None,
             })
             .await;
         assert!(plan.summary.unwrap().ends_with("complete design"));
@@ -392,11 +398,68 @@ async fn twenty_minutes_of_progress_can_complete_in_all_compaction_modes() {
 async fn dropping_an_active_summary_cancels_it_without_a_partial_result() {
     let result = tokio::time::timeout(
         Duration::from_secs(500),
-        summarize_span(&LongThinking, &[Message::user("design")], None),
+        summarize_span(&LongThinking, &[Message::user("design")], None, None),
     )
     .await;
     assert!(
         result.is_err(),
         "caller cancellation drops the active summary future"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn summarize_span_fork_replays_the_parent_prefix() {
+    let provider = Probe {
+        replies: Mutex::new(VecDeque::from([answer("the summary")])),
+        ..Default::default()
+    };
+    let parent = ParentPromptContext {
+        system_prompt: "parent persona".to_string(),
+        tools: Arc::new([]),
+    };
+    let span = vec![Message::user("q"), Message::assistant("a", vec![])];
+    let body = summarize_span(&provider, &span, Some("errors"), Some(&parent))
+        .await
+        .unwrap();
+    // The parent's prefix is replayed verbatim: system prompt first, the span
+    // messages in the middle, the instruction last — the request shares the
+    // parent conversation's prefix from token 0, so the warm cache covers the
+    // history.
+    let sent = provider.sent.lock().unwrap();
+    assert_eq!(sent[0][0].text, "parent persona");
+    assert_eq!(sent[0][1].text, "q");
+    assert_eq!(sent[0][2].text, "a");
+    assert!(
+        sent[0].last().unwrap().text.contains("errors"),
+        "{}",
+        sent[0].last().unwrap().text
+    );
+    assert_eq!(sent[0].len(), span.len() + 2);
+    assert!(body.contains("the summary"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn summarize_span_fork_overflows_into_the_transcript_path() {
+    // The fork replays the span verbatim; a span that never fit the window
+    // overflows the fork and falls back to the rendered-transcript summarizer
+    // (whose first request re-runs with the dedicated summarizer prompt).
+    let provider = Probe {
+        replies: Mutex::new(VecDeque::from([
+            Err(failure("context_length_exceeded", false)),
+            answer("recovered summary"),
+        ])),
+        ..Default::default()
+    };
+    let parent = ParentPromptContext {
+        system_prompt: "parent persona".to_string(),
+        tools: Arc::new([]),
+    };
+    let span = vec![Message::user("q")];
+    let body = summarize_span(&provider, &span, Some("errors"), Some(&parent))
+        .await
+        .unwrap();
+    assert!(body.contains("recovered summary"));
+    let sent = provider.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1][0].text, SUMMARY_SYSTEM_PROMPT);
 }

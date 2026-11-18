@@ -6,7 +6,7 @@ use crate::hook::{
 };
 use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
-    MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
+    MessageMeta, NoCompaction, ParentPromptContext, SessionSnapshot, SNAPSHOT_VERSION,
 };
 use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
@@ -1405,6 +1405,10 @@ impl RunningAgent {
             used_tokens,
             utilization,
             sacred_floor: floor,
+            parent: Some(ParentPromptContext {
+                system_prompt: self.persona.clone(),
+                tools: self.tools.snapshot().defs_arc(),
+            }),
         }));
         if attempted_stages[stage] {
             return;
@@ -1457,6 +1461,10 @@ impl RunningAgent {
                 used_tokens,
                 utilization,
                 sacred_floor: floor,
+                parent: Some(ParentPromptContext {
+                    system_prompt: self.persona.clone(),
+                    tools: self.tools.snapshot().defs_arc(),
+                }),
             };
             // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
             // show a "compacting…" progress line — but ONLY if the strategy will

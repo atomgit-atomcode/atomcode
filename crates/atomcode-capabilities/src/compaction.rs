@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::{
-    CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
+    CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message,
+    ParentPromptContext, Role,
 };
 use atomcode_kernel::provider::{
     ChatOptions, LlmProvider, RateLimitRetryOwner, RequestRecoveryBudget,
@@ -34,6 +35,7 @@ use atomcode_kernel::stream::{
     ProviderError, StreamEvent, OPEN_TIMEOUT_CODE, STREAM_IDLE_TIMEOUT_CODE,
     STREAM_TRANSPORT_INTERRUPTED_CODE,
 };
+use atomcode_kernel::tool::ToolDef;
 use futures::StreamExt;
 
 /// Tool results at or below this byte size are left alone. A produced stub is far under
@@ -431,7 +433,10 @@ impl OverflowCompaction {
                 // A configured summarizer failing cannot authorize losing dialogue,
                 // even in emergency recovery. Keep any tool-result savings; the
                 // bounded overflow ladder reports failure if that still cannot fit.
-                let summary = match self.summarize(&msgs[floor..drain_to], None).await {
+                let summary = match self
+                    .summarize(&msgs[floor..drain_to], None, view.parent.as_ref())
+                    .await
+                {
                     Ok(summary) => summary,
                     Err(error) => {
                         tracing::warn!(
@@ -484,7 +489,10 @@ impl OverflowCompaction {
             return self.inner.plan(view).await;
         }
         // A configured summarizer failing never authorizes draining dialogue.
-        let summary = match self.summarize(&msgs[floor..drain_to], focus).await {
+        let summary = match self
+            .summarize(&msgs[floor..drain_to], focus, view.parent.as_ref())
+            .await
+        {
             Ok(summary) => summary,
             Err(error) => {
                 tracing::warn!(
@@ -518,11 +526,12 @@ impl OverflowCompaction {
         &self,
         span: &[Message],
         focus: Option<&str>,
+        parent: Option<&ParentPromptContext>,
     ) -> Result<Option<String>, SummaryError> {
         let Some(provider) = self.summary_provider.as_ref() else {
             return Ok(None);
         };
-        summarize_span(provider.as_ref(), span, focus)
+        summarize_span(provider.as_ref(), span, focus, parent)
             .await
             .map(Some)
     }
@@ -588,7 +597,24 @@ pub async fn summarize_span(
     provider: &dyn LlmProvider,
     span: &[Message],
     focus: Option<&str>,
+    parent: Option<&ParentPromptContext>,
 ) -> Result<String, SummaryError> {
+    // Cache-safe fork: replaying the parent's system prompt, advertised tool
+    // set and the span messages verbatim shares the parent conversation's
+    // prefix from token 0, so the provider's warm cache covers the history.
+    if let Some(parent) = parent {
+        match summarize_span_fork(provider, span, focus, parent).await {
+            Ok(body) => {
+                return Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"));
+            }
+            Err(SummaryError::Provider(e)) if e.is_context_overflow() => {
+                // A span that never fit the window (resumed sessions, unknown
+                // windows) overflows the fork; fall back to the rendered
+                // transcript summarizer below.
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let window = match provider.context_window() {
         0 => 128_000,
         n => n,
@@ -630,7 +656,7 @@ pub async fn summarize_span(
             }
         }
         let prompt = summary_prompt(previous.as_deref(), &remaining[..end], focus);
-        match summarize_window(provider, &prompt, max_output).await {
+        match summarize_window(provider, &prompt, &[], max_output).await {
             Ok(summary) => {
                 previous = Some(summary);
                 remaining = &remaining[end..];
@@ -647,6 +673,30 @@ pub async fn summarize_span(
     }
     let body = previous.ok_or(SummaryError::Incomplete)?;
     Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"))
+}
+
+/// The cache-safe fork: replay the parent's system prompt and advertised tool
+/// set verbatim ahead of the span messages, with the summary instruction as
+/// the final user message — the request then shares the parent conversation's
+/// prefix from token 0, so the provider's warm prompt cache covers the
+/// history instead of billing it at the cold rate. Only returned text enters
+/// the checkpoint; any tool calls in the stream are ignored.
+async fn summarize_span_fork(
+    provider: &dyn LlmProvider,
+    span: &[Message],
+    focus: Option<&str>,
+    parent: &ParentPromptContext,
+) -> Result<String, SummaryError> {
+    let window = match provider.context_window() {
+        0 => 128_000,
+        n => n,
+    };
+    let max_output = (window / 8).clamp(1, MAX_SUMMARY_TOKENS);
+    let mut prompt = Vec::with_capacity(span.len() + 2);
+    prompt.push(Message::system(parent.system_prompt.clone()));
+    prompt.extend(span.iter().cloned());
+    prompt.push(Message::user(build_summary_prompt(None, "", focus)));
+    summarize_window(provider, &prompt, &parent.tools, max_output).await
 }
 
 fn summary_prompt(previous: Option<&str>, transcript: &str, focus: Option<&str>) -> Vec<Message> {
@@ -677,6 +727,7 @@ fn summary_retryable(error: &ProviderError) -> bool {
 async fn summarize_window(
     provider: &dyn LlmProvider,
     prompt: &[Message],
+    tools: &[ToolDef],
     max_output: u32,
 ) -> Result<String, SummaryError> {
     // One owner for transient retries, including adapter authentication replays.
@@ -690,7 +741,7 @@ async fn summarize_window(
     };
     loop {
         budget.try_attempt().map_err(|_| SummaryError::Incomplete)?;
-        let result = collect_summary(provider, prompt, &options).await;
+        let result = collect_summary(provider, prompt, tools, &options).await;
         if let Err(SummaryError::Provider(error)) = &result {
             // Replaying a summary has no tool side effects. Never replay auth,
             // malformed/truncated output, or an unchanged oversized request.
@@ -709,10 +760,11 @@ async fn summarize_window(
 async fn collect_summary(
     provider: &dyn LlmProvider,
     prompt: &[Message],
+    tools: &[ToolDef],
     options: &ChatOptions,
 ) -> Result<String, SummaryError> {
     let mut stream = provider
-        .chat_stream(prompt, &[], options)
+        .chat_stream(prompt, tools, options)
         .await
         .map_err(SummaryError::Provider)?;
     let mut out = String::new();
@@ -1784,6 +1836,7 @@ mod tests {
             used_tokens: 500,
             utilization: 0.5,
             sacred_floor,
+            parent: None,
         }
     }
 
@@ -1866,6 +1919,7 @@ mod tests {
             used_tokens: ctx_window,
             utilization: 1.0,
             sacred_floor: floor,
+            parent: None,
         }
     }
 
@@ -1883,6 +1937,7 @@ mod tests {
             used_tokens: 100,
             utilization: 0.0125,
             sacred_floor: floor,
+            parent: None,
         }
     }
 
@@ -2890,6 +2945,7 @@ mod tests {
             used_tokens: (1000.0 * utilization) as u32,
             utilization,
             sacred_floor: floor,
+            parent: None,
         }
     }
 
@@ -2912,6 +2968,7 @@ mod tests {
             used_tokens: 200_000,
             utilization: 0.2,
             sacred_floor: conv.sacred_floor(),
+            parent: None,
         };
         let default = OverflowCompaction::new(
             StubCompaction::default(),
@@ -3025,6 +3082,7 @@ mod tests {
             used_tokens: 460_800,
             utilization: 0.9,
             sacred_floor: floor,
+            parent: None,
         };
         assert!(
             strategy.will_summarize(&view),
@@ -3324,7 +3382,7 @@ mod tests {
             Message::assistant("done", vec![]),
         ];
         let out = strat
-            .summarize(&span, Some("errors"))
+            .summarize(&span, Some("errors"), None)
             .await
             .expect("summary request succeeds")
             .expect("configured provider returns a summary");
@@ -4549,7 +4607,7 @@ mod tests {
         for prior in [Message::synthetic_user(text.clone()), note] {
             let provider = CapturingProvider(Default::default());
             let span = vec![prior, Message::user("q3"), Message::assistant("a3", vec![])];
-            summarize_span(&provider, &span, None)
+            summarize_span(&provider, &span, None, None)
                 .await
                 .expect("a summary");
             let sent = provider.0.lock().unwrap();

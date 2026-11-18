@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::stream::TokenUsage;
-use crate::tool::ToolCall;
+use crate::tool::{ToolCall, ToolDef};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -949,6 +951,18 @@ pub enum CompactTrigger {
 }
 
 /// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
+/// The byte-exact parent-prefix facts a cache-safe compaction fork replays:
+/// the session's system prompt (pushed as `Message::system(persona)` at
+/// conversation construction) and the turn's advertised tool set. A summary
+/// request built from these plus the verbatim span messages shares the parent
+/// conversation's prefix from token 0, so the provider's warm prompt cache
+/// covers the history instead of billing it at the cold rate.
+#[derive(Clone, Debug)]
+pub struct ParentPromptContext {
+    pub system_prompt: String,
+    pub tools: Arc<[ToolDef]>,
+}
+
 /// history plus the pressure facts the kernel already records, and the
 /// kernel-computed `sacred_floor`. A strategy reads these to PLAN a drain; it can
 /// never mutate the conversation (the kernel is the sole writer via `apply_plan`).
@@ -961,6 +975,12 @@ pub struct CompactionView<'a> {
     /// The number of leading messages the strategy must NOT propose draining (the
     /// kernel re-enforces this anyway by clamping in `apply_plan`).
     pub sacred_floor: usize,
+    /// The parent conversation's byte-exact prefix context (system prompt +
+    /// advertised tools), when the engine can supply it. `Some` lets the
+    /// strategy fork the summary request onto the parent's prefix so the
+    /// provider's warm cache covers the history; `None` falls back to the
+    /// rendered-transcript summarizer.
+    pub parent: Option<ParentPromptContext>,
 }
 
 /// Why a safe compaction could not provide the requested reduction. Display-only:
@@ -2030,6 +2050,7 @@ mod tests {
                 used_tokens: 0,
                 utilization: 0.0,
                 sacred_floor: floor,
+                parent: None,
             };
             let plan = SummarizeOldestStrategy { keep_recent }.plan(&view).await;
             c.apply_plan(plan, floor);
@@ -2293,6 +2314,7 @@ mod tests {
             used_tokens: 900,
             utilization: 0.9,
             sacred_floor: 2,
+            parent: None,
         };
         let plan = NoCompaction.plan(&view).await;
         assert!(plan.is_noop(), "NoCompaction must return a noop plan");
