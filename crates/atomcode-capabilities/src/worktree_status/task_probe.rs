@@ -27,11 +27,22 @@ impl WorktreeStatus {
     }
 }
 
-struct Output {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(super) struct Output {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub(super) struct OutputLimit;
+
+impl std::fmt::Display for OutputLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Git output limit exceeded")
+    }
+}
+
+impl std::error::Error for OutputLimit {}
 
 async fn read_capped(stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -40,18 +51,28 @@ async fn read_capped(stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Resu
         .read_to_end(&mut bytes)
         .await?;
     if bytes.len() > OUTPUT_LIMIT {
-        return Err(std::io::Error::other("Git output limit exceeded"));
+        return Err(std::io::Error::other(OutputLimit));
     }
     Ok(bytes)
 }
 
-async fn git(cwd: &Path, args: &[&str]) -> std::io::Result<Output> {
+pub(super) async fn git_with_config(
+    cwd: &Path,
+    args: &[&str],
+    overrides: &[String],
+) -> std::io::Result<Output> {
     let mut command = tokio::process::Command::new("git");
+    command.args(["--no-optional-locks", "-c", "core.fsmonitor=false"]);
+    for config in overrides {
+        command.arg("-c").arg(config);
+    }
     command
-        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(cwd)
         .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -67,6 +88,10 @@ async fn git(cwd: &Path, args: &[&str]) -> std::io::Result<Output> {
         stdout,
         stderr,
     })
+}
+
+async fn git(cwd: &Path, args: &[&str]) -> std::io::Result<Output> {
+    git_with_config(cwd, args, &[]).await
 }
 
 fn classify_status(output: Output) -> WorktreeStatus {
