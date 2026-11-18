@@ -2487,6 +2487,99 @@ pub fn report_symlink_cycle() -> String {
 pub fn report_entry_unusable(reason: &str) -> String {
     t(Msg::MigrationReportEntryUnusable { reason }).into_owned()
 }
+
+pub fn agents_blocked() -> String {
+    t(Msg::MigrationAgentsBlocked).into_owned()
+}
+
+pub fn hooks_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationHooksCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn instructions_active() -> String {
+    t(Msg::MigrationInstructionsActive).into_owned()
+}
+
+pub fn instructions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationInstructionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn instructions_empty() -> String {
+    t(Msg::MigrationInstructionsEmpty).into_owned()
+}
+
+pub fn instructions_shadowed(by: &str) -> String {
+    t(Msg::MigrationInstructionsShadowed { by }).into_owned()
+}
+
+pub fn mcp_active(count: usize) -> String {
+    t(Msg::MigrationMcpActive { count }).into_owned()
+}
+
+pub fn mcp_all_disabled(count: usize) -> String {
+    t(Msg::MigrationMcpAllDisabled { count }).into_owned()
+}
+
+pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
+    t(Msg::MigrationMcpCopyable {
+        count,
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn opencode_plaintext_credentials() -> String {
+    t(Msg::MigrationOpencodePlaintextCredentials).into_owned()
+}
+
+pub fn permissions_active() -> String {
+    t(Msg::MigrationPermissionsActive).into_owned()
+}
+
+pub fn permissions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationPermissionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn plugins_blocked() -> String {
+    t(Msg::MigrationPluginsBlocked).into_owned()
+}
+
+pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> String {
+    t(Msg::MigrationProviderCopyable {
+        base_url: base_url.unwrap_or("-"),
+        key: key_kind.unwrap_or("-"),
+    })
+    .into_owned()
+}
+
+pub fn provider_name_unusable(name: &str) -> String {
+    t(Msg::MigrationProviderNameUnusable { name }).into_owned()
+}
+
+pub fn provider_nothing_to_connect_to() -> String {
+    t(Msg::MigrationProviderNothingToConnectTo).into_owned()
+}
+
+pub fn provider_protocol_unsupported(protocol: &str) -> String {
+    t(Msg::MigrationProviderProtocolUnsupported { protocol }).into_owned()
+}
+
+pub fn rules_rejected() -> String {
+    t(Msg::MigrationRulesRejected).into_owned()
+}
+
+pub fn sessions_blocked(count: usize) -> String {
+    t(Msg::MigrationSessionsBlocked { count }).into_owned()
+}
 ```
 
 `crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
@@ -2880,7 +2973,7 @@ use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 // `probe_file` / `probe_dir` live in the parent module. A child module may
 // reach a parent's private items, but it has to **name** them — an unqualified
 // `probe_file(...)` would not resolve.
-use super::{probe_dir, probe_file, MigrationSource, ScanContext};
+use super::{probe_dir, probe_file, MigrationSource, ScanContext, SkillTruth};
 use std::path::Path;
 
 pub struct ClaudeSource;
@@ -3072,10 +3165,9 @@ impl MigrationSource for ClaudeSource {
                     // REJECT is not "in effect" either — the loader fails the
                     // whole file (`permission_settings.rs:345-353`), so none
                     // of its rules apply.
-                    Ok(value) if !permission_rules_are_valid(&value) => (
-                        AssetStatus::Blocked,
-                        super::text::rules_rejected(),
-                    ),
+                    Ok(value) if !permission_rules_are_valid(&value) => {
+                        (AssetStatus::Blocked, super::text::rules_rejected())
+                    }
                     Ok(_) => match scope {
                         // The project one is merged into our own permission rules.
                         AssetScope::Project => {
@@ -3183,9 +3275,7 @@ impl MigrationSource for ClaudeSource {
                     path: user_settings,
                     scope: AssetScope::User,
                     status: AssetStatus::Actionable,
-                    detail: super::text::hooks_copyable(
-                        &ctx.product.user().join("hooks.json"),
-                    ),
+                    detail: super::text::hooks_copyable(&ctx.product.user().join("hooks.json")),
                 }),
                 Ok(false) => {}
                 Err(reason) => out.push(AssetReport {
@@ -3311,7 +3401,6 @@ impl MigrationSource for ClaudeSource {
     }
 }
 
-
 /// How many `mcpServers` a JSON file declares.
 ///
 /// `Ok(0)` means the file parsed and declares none. `Err` means the file could
@@ -3321,8 +3410,7 @@ impl MigrationSource for ClaudeSource {
 /// or parsed — again, not the same as "there are none".
 fn settings_hooks(path: &Path) -> Result<bool, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     Ok(value.get("hooks").map(|h| !h.is_null()).unwrap_or(false))
 }
 
@@ -3486,6 +3574,285 @@ fn session_file_count(projects: &Path) -> Result<usize, String> {
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+    // `PathBuf` is not in scope through `super::*` — the module under test
+    // imports only `Path`.
+    use std::path::PathBuf;
+
+    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
+        ScanContext {
+            os_home: home.to_path_buf(),
+            project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        }
+    }
+
+    /// The registry's facts, loaded the way `scan()` loads them.
+    ///
+    /// **The same load the report uses** — so a fixture sees what the report
+    /// sees. A fixture that loaded its own registry could disagree with the
+    /// report for reasons that have nothing to do with the behaviour under
+    /// test.
+    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
+        super::super::SkillTruth::load(&ctx(home, project))
+    }
+
+    fn skill_at(root: &std::path::Path, name: &str) {
+        let dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
+    }
+
+    /// Write a file, creating its parent directory first.
+    ///
+    /// A fixture that writes `<home>/.claude/settings.json` into a directory
+    /// that does not exist yet fails at the write, not at the assertion — and
+    /// the failure says nothing about the behaviour being checked.
+    fn write_file(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn a_user_skill_is_active_because_we_read_that_path_today() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        skill_at(&home.path().join(".claude"), "web-access");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let skill = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills && a.name == "web-access")
+            .expect("the skill is reported");
+        assert_eq!(skill.status, AssetStatus::Active);
+        assert_eq!(skill.scope, AssetScope::User);
+    }
+
+    #[test]
+    fn a_project_instruction_file_is_active() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Active);
+        assert_eq!(instructions.scope, AssetScope::Project);
+    }
+
+    #[test]
+    fn a_user_instruction_file_is_actionable_because_the_global_layer_cannot_see_it() {
+        // The global instruction tier reads <product user tree>/ATOMCODE.md, not
+        // ~/.claude/CLAUDE.md — so this one has to be copied, not merely read.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Actionable);
+        assert_eq!(instructions.scope, AssetScope::User);
+    }
+
+    #[test]
+    fn a_project_instruction_file_shadowed_by_agents_md_is_not_active() {
+        // The project tier takes the FIRST existing name in order, so a
+        // CLAUDE.md next to an AGENTS.md is never loaded. Calling it "already
+        // in effect" would be a lie.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("AGENTS.md"), "# rules");
+        write_file(&project.path().join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Blocked);
+        assert!(
+            instructions.detail.contains("AGENTS.md"),
+            "it says what shadows it: {}",
+            instructions.detail
+        );
+    }
+
+    #[test]
+    fn a_user_settings_file_is_actionable_and_the_project_one_is_active() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("settings.json"), "{}");
+        write_file(&project.path().join(".claude").join("settings.json"), "{}");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let permissions: Vec<_> = assets
+            .iter()
+            .filter(|a| a.kind == AssetKind::Permissions)
+            .collect();
+        assert_eq!(permissions.len(), 2);
+        assert!(permissions
+            .iter()
+            .any(|p| p.scope == AssetScope::User && p.status == AssetStatus::Actionable));
+        assert!(permissions
+            .iter()
+            .any(|p| p.scope == AssetScope::Project && p.status == AssetStatus::Active));
+    }
+
+    #[test]
+    fn a_broken_settings_file_is_blocked_not_active() {
+        // Our own loader refuses a broken policy (`permission_settings.rs:296`),
+        // so a broken file must not be reported as already in effect.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &project.path().join(".claude").join("settings.json"),
+            "{not json",
+        );
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let permissions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Permissions)
+            .expect("the broken file is reported");
+        assert_eq!(permissions.status, AssetStatus::Blocked);
+    }
+
+    #[test]
+    fn a_project_mcp_file_is_active_and_the_global_one_is_actionable() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"mcp-fs"}}}"#,
+        );
+        write_file(
+            &home.path().join(".claude.json"),
+            r#"{"mcpServers":{"gh":{"command":"mcp-gh"}}}"#,
+        );
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let mcp: Vec<_> = assets
+            .iter()
+            .filter(|a| a.kind == AssetKind::McpServers)
+            .collect();
+        assert_eq!(mcp.len(), 2);
+        assert!(mcp
+            .iter()
+            .any(|m| m.scope == AssetScope::Project && m.status == AssetStatus::Active));
+        assert!(mcp
+            .iter()
+            .any(|m| m.scope == AssetScope::User && m.status == AssetStatus::Actionable));
+    }
+
+    #[test]
+    fn an_actionable_row_names_the_path_to_copy_it_to() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert!(
+            instructions.detail.contains("ATOMCODE.md"),
+            "the row says where to put it: {}",
+            instructions.detail
+        );
+    }
+
+    #[test]
+    fn a_subagent_definition_is_blocked_because_the_formats_differ() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reviewer.md"), "---").unwrap();
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let agent = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Agents)
+            .expect("the agent definition is reported");
+        assert_eq!(agent.status, AssetStatus::Blocked);
+    }
+
+    #[test]
+    fn a_broken_settings_file_does_not_stop_the_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &home.path().join(".claude").join("settings.json"),
+            "{not json",
+        );
+        skill_at(&home.path().join(".claude"), "web-access");
+
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        // The skill is still found, and the broken file is reported as blocked
+        // rather than taking the whole scan down.
+        assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
+        assert!(assets
+            .iter()
+            .any(|a| a.kind == AssetKind::Permissions && a.status == AssetStatus::Blocked));
+    }
+
+    #[test]
+    fn no_claude_directory_means_no_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let assets = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        assert!(assets.is_empty());
+    }
 }
 ```
 

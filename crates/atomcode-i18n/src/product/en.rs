@@ -844,7 +844,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeOptForce => "Reinstall the latest version".into(),
         Msg::UpgradeOptRollback => "Roll back to the previous version".into(),
 
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider: {}\n  Config: {}\n\n", provider, path).into(),
@@ -1813,7 +1812,81 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::ResumeHintBackground { cmd } => {
             format!("To resume the background session, run: {cmd}").into()
         }
-    }
+
+        Msg::MigrationInstructionsActive => {
+            "Read directly from this project — already in effect".into()
+        }
+        Msg::MigrationInstructionsCopyable { target } => {
+            format!("Copy it to {target} to make it apply to every project").into()
+        }
+        Msg::MigrationInstructionsShadowed { by } => {
+            format!("Not read: {by} takes precedence in this project").into()
+        }
+        Msg::MigrationInstructionsEmpty => {
+            "The file is empty, so nothing is loaded from it".into()
+        }
+        Msg::MigrationPermissionsActive => {
+            "Merged into this project's permission rules — already in effect".into()
+        }
+        Msg::MigrationPermissionsCopyable { target } => {
+            format!("Copy it to {target} to make it a global permission rule").into()
+        }
+        Msg::MigrationMcpCopyable { count, target } => {
+            format!("{count} MCP server(s) — copy them into {target}").into()
+        }
+        Msg::MigrationMcpActive { count } => {
+            format!("{count} MCP server(s) — read directly from this project").into()
+        }
+        Msg::MigrationMcpAllDisabled { count } => {
+            format!("{count} MCP server(s) are configured but disabled — none of them run").into()
+        }
+        Msg::MigrationRulesRejected => {
+            "Our loader would reject this file, so none of its rules apply".into()
+        }
+        Msg::MigrationHooksCopyable { target } => {
+            format!("Copy them into {target}").into()
+        }
+        Msg::MigrationProviderCopyable { base_url, key } => {
+            format!(
+                "Provider settings (endpoint {base_url}, credential {key}) can be imported — \
+                 review them before writing"
+            )
+            .into()
+        }
+        Msg::MigrationProviderNameUnusable { name } => {
+            format!("{name}: this name cannot be an account id — not imported").into()
+        }
+        Msg::MigrationProviderProtocolUnsupported { protocol } => {
+            format!("This endpoint speaks {protocol}, which we do not support — not imported")
+                .into()
+        }
+        Msg::MigrationProviderNothingToConnectTo => {
+            "This provider names no endpoint and no credential — there is nothing to connect to"
+                .into()
+        }
+        Msg::MigrationCredentialHasDollar => {
+            "This key contains `$`, which the configuration would expand — not imported".into()
+        }
+        Msg::MigrationCredentialAmbiguous => {
+            "An environment variable of the same name is set, so this key cannot be written \
+             unambiguously — not imported"
+                .into()
+        }
+        Msg::MigrationOpencodePlaintextCredentials => {
+            "This file holds plaintext keys — they are not moved, only reported".into()
+        }
+        Msg::MigrationAgentsBlocked => {
+            "Our role files need `permission` and `difficulty` frontmatter, which these do not \
+             have — not migrated"
+                .into()
+        }
+        Msg::MigrationPluginsBlocked => {
+            "The plugin manifest format is theirs, not ours — not migrated".into()
+        }
+        Msg::MigrationSessionsBlocked { count } => {
+            format!("{count} session file(s) — converting history is lossy, not done yet").into()
+        }
+}
 }
 
 #[cfg(test)]

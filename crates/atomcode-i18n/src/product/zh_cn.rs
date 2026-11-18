@@ -816,7 +816,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeOptForce => "重新安装最新版本".into(),
         Msg::UpgradeOptRollback => "回退到上一版本".into(),
 
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider：{}\n  配置文件：{}\n\n", provider, path).into(),
@@ -1745,7 +1744,64 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         // ── resuming from the shell (`atomcode-cli`) ──
         Msg::ResumeHint { cmd } => format!("继续此会话，运行：{cmd}").into(),
         Msg::ResumeHintBackground { cmd } => format!("继续后台会话，运行：{cmd}").into(),
-    }
+
+        Msg::MigrationInstructionsActive => "直接读取本项目的这个文件 —— 已经生效".into(),
+        Msg::MigrationInstructionsCopyable { target } => {
+            format!("复制到 {target} 后对所有项目生效").into()
+        }
+        Msg::MigrationInstructionsShadowed { by } => {
+            format!("不会被读取：本项目中 {by} 的优先级更高").into()
+        }
+        Msg::MigrationInstructionsEmpty => "这个文件是空的，因此没有加载任何内容".into(),
+        Msg::MigrationPermissionsActive => "已并入本项目的权限规则 —— 已经生效".into(),
+        Msg::MigrationPermissionsCopyable { target } => {
+            format!("复制到 {target} 后即成为全局权限规则").into()
+        }
+        Msg::MigrationMcpCopyable { count, target } => {
+            format!("{count} 个 MCP 服务 —— 可复制到 {target}").into()
+        }
+        Msg::MigrationMcpActive { count } => {
+            format!("{count} 个 MCP 服务 —— 直接读取本项目的这个文件").into()
+        }
+        Msg::MigrationMcpAllDisabled { count } => {
+            format!("{count} 个 MCP 服务已配置但被禁用 —— 都没有在运行").into()
+        }
+        Msg::MigrationRulesRejected => "我们的加载器会拒绝这个文件，因此其中规则都不生效".into(),
+        Msg::MigrationHooksCopyable { target } => {
+            format!("可复制到 {target}").into()
+        }
+        Msg::MigrationProviderCopyable { base_url, key } => {
+            format!("其中的 provider 设置可以导入（endpoint {base_url}，凭据 {key}）—— 写入前请先确认")
+                .into()
+        }
+        Msg::MigrationProviderNameUnusable { name } => {
+            format!("{name}：这个名字不能作为账号 id —— 未导入").into()
+        }
+        Msg::MigrationProviderProtocolUnsupported { protocol } => {
+            format!("这个端点说的是 {protocol}，我们不支持 —— 未导入").into()
+        }
+        Msg::MigrationProviderNothingToConnectTo => {
+            "这个 provider 没有写端点也没有写凭据 —— 没有可连接的对象".into()
+        }
+        Msg::MigrationCredentialHasDollar => {
+            "这个密钥里含有 `$`，配置会把它展开 —— 未导入".into()
+        }
+        Msg::MigrationCredentialAmbiguous => {
+            "同名环境变量已设置，这个密钥无法唯一确定 —— 未导入".into()
+        }
+        Msg::MigrationOpencodePlaintextCredentials => {
+            "这个文件里是明文密钥 —— 只报告，不搬运".into()
+        }
+        Msg::MigrationAgentsBlocked => {
+            "我们的角色文件需要 permission 与 difficulty 前置元数据，Claude 的 subagent 文件没有 \
+             —— 未迁移"
+                .into()
+        }
+        Msg::MigrationPluginsBlocked => "插件清单格式是对方的 —— 未迁移".into(),
+        Msg::MigrationSessionsBlocked { count } => {
+            format!("{count} 个会话文件 —— 历史转换有损，本期未做").into()
+        }
+}
 }
 
 #[cfg(test)]

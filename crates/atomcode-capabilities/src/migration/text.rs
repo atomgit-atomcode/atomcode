@@ -83,3 +83,96 @@ pub fn report_symlink_cycle() -> String {
 pub fn report_entry_unusable(reason: &str) -> String {
     t(Msg::MigrationReportEntryUnusable { reason }).into_owned()
 }
+
+pub fn agents_blocked() -> String {
+    t(Msg::MigrationAgentsBlocked).into_owned()
+}
+
+pub fn hooks_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationHooksCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn instructions_active() -> String {
+    t(Msg::MigrationInstructionsActive).into_owned()
+}
+
+pub fn instructions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationInstructionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn instructions_empty() -> String {
+    t(Msg::MigrationInstructionsEmpty).into_owned()
+}
+
+pub fn instructions_shadowed(by: &str) -> String {
+    t(Msg::MigrationInstructionsShadowed { by }).into_owned()
+}
+
+pub fn mcp_active(count: usize) -> String {
+    t(Msg::MigrationMcpActive { count }).into_owned()
+}
+
+pub fn mcp_all_disabled(count: usize) -> String {
+    t(Msg::MigrationMcpAllDisabled { count }).into_owned()
+}
+
+pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
+    t(Msg::MigrationMcpCopyable {
+        count,
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn opencode_plaintext_credentials() -> String {
+    t(Msg::MigrationOpencodePlaintextCredentials).into_owned()
+}
+
+pub fn permissions_active() -> String {
+    t(Msg::MigrationPermissionsActive).into_owned()
+}
+
+pub fn permissions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationPermissionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+
+pub fn plugins_blocked() -> String {
+    t(Msg::MigrationPluginsBlocked).into_owned()
+}
+
+pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> String {
+    t(Msg::MigrationProviderCopyable {
+        base_url: base_url.unwrap_or("-"),
+        key: key_kind.unwrap_or("-"),
+    })
+    .into_owned()
+}
+
+pub fn provider_name_unusable(name: &str) -> String {
+    t(Msg::MigrationProviderNameUnusable { name }).into_owned()
+}
+
+pub fn provider_nothing_to_connect_to() -> String {
+    t(Msg::MigrationProviderNothingToConnectTo).into_owned()
+}
+
+pub fn provider_protocol_unsupported(protocol: &str) -> String {
+    t(Msg::MigrationProviderProtocolUnsupported { protocol }).into_owned()
+}
+
+pub fn rules_rejected() -> String {
+    t(Msg::MigrationRulesRejected).into_owned()
+}
+
+pub fn sessions_blocked(count: usize) -> String {
+    t(Msg::MigrationSessionsBlocked { count }).into_owned()
+}

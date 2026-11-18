@@ -2463,4 +2463,51 @@ pub enum Msg<'a> {
     MigrationReportEntryUnusable {
         reason: &'a str,
     },
+    // External-agent asset migration (see
+    // docs/plans/2026-11-17-external-agent-asset-migration-design.md).
+    MigrationInstructionsActive,
+    MigrationInstructionsCopyable {
+        target: &'a str,
+    },
+    MigrationInstructionsShadowed {
+        by: &'a str,
+    },
+    MigrationInstructionsEmpty,
+    MigrationPermissionsActive,
+    MigrationPermissionsCopyable {
+        target: &'a str,
+    },
+    MigrationMcpCopyable {
+        count: usize,
+        target: &'a str,
+    },
+    MigrationMcpActive {
+        count: usize,
+    },
+    MigrationMcpAllDisabled {
+        count: usize,
+    },
+    MigrationRulesRejected,
+    MigrationHooksCopyable {
+        target: &'a str,
+    },
+    MigrationProviderCopyable {
+        base_url: &'a str,
+        key: &'a str,
+    },
+    MigrationProviderNameUnusable {
+        name: &'a str,
+    },
+    MigrationProviderProtocolUnsupported {
+        protocol: &'a str,
+    },
+    MigrationProviderNothingToConnectTo,
+    MigrationCredentialHasDollar,
+    MigrationCredentialAmbiguous,
+    MigrationOpencodePlaintextCredentials,
+    MigrationAgentsBlocked,
+    MigrationPluginsBlocked,
+    MigrationSessionsBlocked {
+        count: usize,
+    },
 }
