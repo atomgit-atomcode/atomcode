@@ -400,6 +400,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "Will use".into(),
         Msg::ProviderSetUse => "Use this model".into(),
         Msg::ProviderBatchChoose => "Use focused model".into(),
+        Msg::ProviderCatalogCandidates => "models.dev suggestions · account access unverified".into(),
         Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),

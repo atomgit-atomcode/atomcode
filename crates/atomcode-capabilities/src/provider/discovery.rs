@@ -14,6 +14,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+#[path = "discovery_catalog.rs"]
+pub mod catalog;
+
 /// How long a listing may take.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most of a listing read; a bigger answer is refused rather than buffered.
@@ -37,6 +40,11 @@ pub struct DiscoveredModel {
     pub reasoning_effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Public catalog default shown as a hint, never saved as a request override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catalog_only: bool,
 }
 
 /// Everything in one call: the listing of the endpoint at `base_url`, spoken in
@@ -44,6 +52,19 @@ pub struct DiscoveredModel {
 /// lists nothing, the URL is unusable, the endpoint refused or did not answer,
 /// or the answer was not a listing.
 pub async fn discover(
+    base_url: &str,
+    provider_type: &str,
+    transport: &DiscoveryTransport,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let result = discover_endpoint(base_url, provider_type, transport).await;
+    if matches!(&result, Ok(models) if models.iter().all(|model| !catalog::needs_metadata(model)) && !models.is_empty())
+    {
+        return result;
+    }
+    catalog::merge_listing(result, catalog::models(base_url, provider_type).await)
+}
+
+async fn discover_endpoint(
     base_url: &str,
     provider_type: &str,
     transport: &DiscoveryTransport,
@@ -283,6 +304,8 @@ pub fn parse_discovered_models(
                         .filter(|v| e.supported_levels.contains(v))
                 }),
                 reasoning_effort_levels: entry.effort.map(|e| e.supported_levels),
+                catalog_default_effort: None,
+                catalog_only: false,
             })
             .collect()
     };
@@ -295,10 +318,13 @@ enum DiscoveryReadError {
     Transport(reqwest::Error),
 }
 
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, DiscoveryReadError> {
+async fn read_bounded_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, DiscoveryReadError> {
     if response
         .content_length()
-        .is_some_and(|size| size > DISCOVERY_MAX_RESPONSE_BYTES as u64)
+        .is_some_and(|size| size > limit as u64)
     {
         return Err(DiscoveryReadError::ResponseTooLarge);
     }
@@ -306,7 +332,7 @@ async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, D
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(DiscoveryReadError::Transport)?;
-        if body.len().saturating_add(chunk.len()) > DISCOVERY_MAX_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(DiscoveryReadError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
@@ -519,7 +545,7 @@ pub async fn fetch_discovery_body(
             response.status().as_u16(),
         ));
     }
-    read_bounded_response(response)
+    read_bounded_response(response, DISCOVERY_MAX_RESPONSE_BYTES)
         .await
         .map_err(|error| match error {
             DiscoveryReadError::ResponseTooLarge => DiscoveryRequestError::ResponseTooLarge,

@@ -365,6 +365,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "当前将使用".into(),
         Msg::ProviderSetUse => "设为使用模型".into(),
         Msg::ProviderBatchChoose => "设为使用模型".into(),
+        Msg::ProviderCatalogCandidates => "models.dev 目录候选 · 账号可用性未验证".into(),
         Msg::ProviderNotProvided => "未提供".into(),
         Msg::ProviderManualAdd => "手动添加".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::ProviderMenuEdit),

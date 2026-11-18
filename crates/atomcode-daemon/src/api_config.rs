@@ -120,7 +120,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                         label: atomcode_config::provider_book::account_label(config, &id),
                         preset_name: preset.display_name.to_string(),
                         custom: is_generic_protocol(preset.id),
-                        discoverable: crate::api_provider::discovery_protocol(wire).is_some(),
+                        discoverable: supports_model_listing(wire, base_url.as_deref()),
                         probeable: wire == "openai",
                         id: id.clone(),
                         header_names: account.headers.names(),
@@ -184,6 +184,12 @@ fn is_generic_protocol(id: &str) -> bool {
     GENERIC_PROTOCOLS.contains(&id)
 }
 
+fn supports_model_listing(wire: &str, base_url: Option<&str>) -> bool {
+    use atomcode_capabilities::provider::discovery::{catalog, discovery_protocol};
+    discovery_protocol(wire).is_some()
+        || base_url.is_some_and(|url| catalog::supports_lookup(url, wire))
+}
+
 fn preset_info(
     preset: &atomcode_config::config::provider_preset::ProviderPreset,
 ) -> ProviderPresetInfo {
@@ -200,8 +206,7 @@ fn preset_info(
             ModelSource::Manual => "manual",
         }
         .to_string(),
-        discoverable: crate::api_provider::discovery_protocol(preset.provider_type.wire())
-            .is_some(),
+        discoverable: supports_model_listing(preset.provider_type.wire(), preset.default_base_url),
         connections: atomcode_config::config::provider_preset::connections(preset.id)
             .iter()
             .map(|choice| crate::ProviderConnectionInfo {

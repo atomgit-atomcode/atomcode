@@ -193,6 +193,11 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                 cursor,
             } => {
                 rows.push(Row::PickFilter);
+                if items.iter().any(|item| item.catalog_only) {
+                    rows.push(Row::DiscoveryMessage(
+                        t(Msg::ProviderCatalogCandidates).into_owned(),
+                    ));
+                }
                 let listed = picked_rows(items, query).len();
                 if listed == 0 {
                     rows.push(Row::Nothing);
@@ -514,7 +519,11 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
                     .filter(|levels| !levels.is_empty())
                     .map(|levels| levels.join("/"))
                     .unwrap_or_else(|| unknown.to_string());
-                let effort = item.effort.as_deref().unwrap_or(&unknown);
+                let effort = item
+                    .effort
+                    .as_deref()
+                    .or(item.catalog_default_effort.as_deref())
+                    .unwrap_or(&unknown);
                 format!(
                     "{} {} · {} {} · {} {}",
                     t(Msg::FieldVision),

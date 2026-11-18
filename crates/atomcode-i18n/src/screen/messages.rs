@@ -535,6 +535,7 @@ pub enum Msg<'a> {
     CmdAboutMouse,
     /// `/provider`'s model picker: the listing had nothing the account lacks.
     ProviderDiscoverNothingNew,
+    ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
