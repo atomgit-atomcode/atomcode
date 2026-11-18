@@ -3,6 +3,7 @@
 
 use crate::config::ReviewAgentConfig;
 use crate::persona::review_persona;
+use crate::timing::ReviewTiming;
 use atomcode_capabilities::codeintel::lang::Lang;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use std::path::Path;
@@ -121,6 +122,15 @@ pub fn build_review_agent_with_cancel(
     provider: Arc<dyn LlmProvider>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> (Agent, ReportFindingTool) {
+    build_review_agent_inner(cfg, provider, cancel_token, None)
+}
+
+pub(crate) fn build_review_agent_inner(
+    cfg: &ReviewAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    timing: Option<&ReviewTiming>,
+) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
     // Auto-degrade the code-graph on huge repos when the caller set a bound. Default
@@ -137,7 +147,18 @@ pub fn build_review_agent_with_cancel(
         }
         mount
     };
-    let tools = mount_review_tools(&cfg.dirs, &report, cfg.no_web, mount_graph, &cfg.skill_dirs);
+    let tools = mount_review_tools(
+        &cfg.dirs,
+        &report,
+        cfg.no_web,
+        mount_graph,
+        &cfg.skill_dirs,
+        timing,
+    );
+    let provider = match timing {
+        Some(timing) => timing.provider(provider),
+        None => provider,
+    };
     let persona = compose_persona(cfg);
     let mut builder = Agent::builder()
         .provider(provider)
@@ -228,6 +249,7 @@ fn mount_review_tools(
     no_web: bool,
     mount_graph: bool,
     skill_dirs: &[PathBuf],
+    timing: Option<&ReviewTiming>,
 ) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg, &dirs); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
@@ -245,7 +267,16 @@ fn mount_review_tools(
         atomcode_capabilities::skills::register_skill_tools(&mut reg, skills);
         names.extend_from_slice(atomcode_capabilities::skills::skill_tool_names());
     }
-    reg.mount(&names)
+    let mounted = reg.mount(&names);
+    if let Some(timing) = timing {
+        for name in &names {
+            if let Some(tool) = mounted.get(name) {
+                reg.register(timing.tool(tool));
+            }
+        }
+        return reg.mount(&names);
+    }
+    mounted
 }
 
 /// Final system prompt: full override wins (else the built-in reviewer persona), then the

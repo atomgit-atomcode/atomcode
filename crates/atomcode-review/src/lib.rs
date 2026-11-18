@@ -42,6 +42,7 @@ mod assemble;
 mod confine;
 mod review_tool;
 mod round_budget;
+mod timing;
 
 pub use assemble::{
     build_review_agent, build_review_agent_with, build_review_agent_with_cancel,

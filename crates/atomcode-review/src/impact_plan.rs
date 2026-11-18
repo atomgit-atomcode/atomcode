@@ -4,7 +4,7 @@
 //! stable: changed symbols and high-risk lifecycle/API seams from the diff, not whatever
 //! file the model happens to grep first.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Render a compact impact-oriented review plan for the provided unified diff.
 pub fn render_review_impact_plan(diff: &str) -> String {
@@ -15,7 +15,7 @@ pub fn render_review_impact_plan(diff: &str) -> String {
     let mut out = String::from(
         "## Review impact plan (deterministic, code-graph guided)\n\n\
          Use this plan to keep exploration bounded. Prefer code-intelligence tools over \
-         broad grep/read loops. The DIFF remains authoritative.\n\n",
+         broad grep/read loops. Batch independent tool calls and reuse evidence already supplied. The DIFF remains authoritative.\n\n",
     );
 
     if files.is_empty() {
@@ -26,6 +26,8 @@ pub fn render_review_impact_plan(diff: &str) -> String {
             out.push_str(&format!("  - {f}\n"));
         }
     }
+
+    render_shared_blob_evidence(&mut out, diff);
 
     if targets.is_empty() {
         render_contract_checks(&mut out, &contract_checks);
@@ -48,6 +50,66 @@ pub fn render_review_impact_plan(diff: &str) -> String {
         ));
     }
     out
+}
+
+/// Compare Git's full post-image object IDs once for all reviewers. Equal IDs
+/// establish equal Git blob content, independent of path or file mode.
+fn render_shared_blob_evidence(out: &mut String, diff: &str) {
+    let mut groups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for section in diff.split("\ndiff --git ") {
+        let header = section
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("@@"));
+        let mut mode = None;
+        let mut blob = None;
+        let mut path = None;
+        for line in header {
+            if let Some(index) = line.strip_prefix("index ") {
+                let mut fields = index.split_whitespace();
+                blob = fields
+                    .next()
+                    .and_then(|range| range.split_once(".."))
+                    .map(|(_, oid)| oid);
+                mode = fields.next().or(mode);
+            } else if let Some(new_mode) = line
+                .strip_prefix("new file mode ")
+                .or_else(|| line.strip_prefix("new mode "))
+            {
+                mode = Some(new_mode);
+            } else if let Some(post_image) = line.strip_prefix("+++ b/") {
+                path = Some(post_image);
+                break;
+            }
+        }
+        if !matches!(mode, Some("100644" | "100755")) {
+            continue;
+        }
+        let blob = blob.filter(|oid| {
+            matches!(oid.len(), 40 | 64)
+                && oid.bytes().all(|c| c.is_ascii_hexdigit())
+                && oid.bytes().any(|c| c != b'0')
+        });
+        if let (Some(blob), Some(path)) = (blob, path) {
+            groups
+                .entry(blob)
+                .or_default()
+                .insert(path.trim_end_matches('\t'));
+        }
+    }
+
+    let mut identical = groups.values().filter(|paths| paths.len() > 1).peekable();
+    if identical.peek().is_none() {
+        return;
+    }
+    out.push_str("\nGit evidence already checked for this diff. The following groups share a post-change Git blob. Reuse this evidence for content-equality checks. Still check path-specific behavior, file modes, and comparisons to external sources where relevant.\n");
+    for group in identical.take(8) {
+        out.push_str("- Same post-change Git content:");
+        for path in group.iter().take(8) {
+            out.push_str(&format!(" {path:?}"));
+        }
+        out.push('\n');
+    }
 }
 
 fn render_contract_checks(out: &mut String, checks: &[String]) {

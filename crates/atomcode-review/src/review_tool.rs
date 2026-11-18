@@ -32,6 +32,7 @@ use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::assemble::build_review_agent_inner;
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
@@ -41,7 +42,8 @@ use crate::fanout::{
 };
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
-use crate::{build_review_agent_with_cancel, Finding};
+use crate::timing::ReviewTiming;
+use crate::Finding;
 
 /// Prefix for ephemeral review activity. It deliberately matches the existing sub-agent
 /// activity convention so terminal drivers can update one latest-wins line instead of adding
@@ -581,6 +583,7 @@ impl Tool for ReviewTool {
         // launching the child when the deterministic preflight says the scope is large.
         ctx.progress
             .emit(format!("{REVIEW_ACTIVITY_MARKER}review · preparing diff"));
+        let preparing = tokio::time::Instant::now();
         let scoped = match git_diff(&ctx.working_dir, &scope, &a.paths) {
             Ok(d) => d,
             Err(e) => return err(format!("code_review: {e}")),
@@ -647,6 +650,12 @@ impl Tool for ReviewTool {
 
         // One existing cancellation deadline covers dimensions AND verification;
         // verification must not restart a fresh full-length time allowance.
+        let timing = ReviewTiming::new(ctx.progress.source_id());
+        timing.prepared(
+            preparing.elapsed().as_millis() as u64,
+            files.len(),
+            diff.len(),
+        );
         let started = tokio::time::Instant::now();
         let deadline = crate::shared_review_deadline(self.max_turn_duration);
         let make_cfg = || {
@@ -673,14 +682,15 @@ impl Tool for ReviewTool {
 
         if !a.is_deep() {
             // --- single-agent path ---
-            let (agent, report) =
-                build_review_agent_with_cancel(&make_cfg(), provider, deadline.clone());
-            let (stop, run_error) = tokio::select! {
-                _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-                outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                    (outcome.stop, outcome.error)
-                }
-            };
+            let (stop, run_error, report) = run_review_pass(
+                &make_cfg(),
+                provider,
+                &deadline,
+                &ctx.cancel,
+                &timing.pass("single", None),
+                task,
+            )
+            .await;
             let run_error =
                 review_failure_reason(&stop, run_error, &deadline, self.max_turn_duration);
             let mut findings = report.findings();
@@ -708,17 +718,13 @@ impl Tool for ReviewTool {
             let deadline = deadline.clone();
             let duration = self.max_turn_duration;
             let progress = ctx.progress.clone();
+            let pass = timing.pass(dim.id, None);
             async move {
                 let dimension_started = tokio::time::Instant::now();
                 cfg.progress_label = Some(dim.id.to_string());
                 cfg = cfg.with_persona_append(dim.lens);
-                let (agent, report) = build_review_agent_with_cancel(&cfg, provider, deadline.clone());
-                let (stop, run_error) = tokio::select! {
-                    _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-                    outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                        (outcome.stop, outcome.error)
-                    }
-                };
+                let (stop, run_error, report) =
+                    run_review_pass(&cfg, provider, &deadline, &cancel, &pass, task).await;
                 let completed = stop == StopReason::Stopped && run_error.is_none();
                 let status = if completed { "finished" } else { "incomplete" };
                 let elapsed = dimension_started.elapsed().as_secs_f64();
@@ -757,6 +763,7 @@ impl Tool for ReviewTool {
                 let provider = provider.clone();
                 let candidate = candidates[i].clone();
                 let scoped = verification_diffs.for_path(&candidate.file_path);
+                let timing = timing.clone();
                 let full = full.clone();
                 let rules = rules.clone();
                 let instructions = instructions.clone();
@@ -785,14 +792,18 @@ impl Tool for ReviewTool {
                         };
                         pass_cfg.max_turn_duration =
                             duration.map(|d| d.saturating_sub(started.elapsed()));
-                        let (agent, report) = build_review_agent_with_cancel(
-                            &pass_cfg, provider.clone(), deadline.clone(),
-                        );
-                        let outcome = tokio::select! {
-                            _ = cancel.cancelled() => return (i, true),
-                            outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => outcome,
-                        };
-                        if outcome.stop != StopReason::Stopped || outcome.error.is_some() {
+                        let stage = if scoped { "verify_file" } else { "verify_full" };
+                        let pass = timing.pass(stage, Some(i + 1));
+                        let (stop, error, report) = run_review_pass(
+                            &pass_cfg,
+                            provider.clone(),
+                            &deadline,
+                            &cancel,
+                            &pass,
+                            task,
+                        )
+                        .await;
+                        if stop != StopReason::Stopped || error.is_some() {
                             return (i, true);
                         }
                         let confirmed = verify_reconfirms(&candidate, &report.findings());
@@ -837,6 +848,29 @@ impl Tool for ReviewTool {
 // ---------------------------------------------------------------------------
 // Helpers (pure where possible, testable)
 // ---------------------------------------------------------------------------
+
+async fn run_review_pass(
+    cfg: &ReviewAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+    deadline: &Option<tokio_util::sync::CancellationToken>,
+    cancel: &tokio_util::sync::CancellationToken,
+    timing: &ReviewTiming,
+    task: String,
+) -> (StopReason, Option<String>, crate::ReportFindingTool) {
+    let mut timer = timing.start();
+    let (agent, report) = build_review_agent_inner(cfg, provider, deadline.clone(), Some(timing));
+    let (stop, error) = tokio::select! {
+        _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
+        outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => (outcome.stop, outcome.error),
+    };
+    timer.finish(match stop {
+        StopReason::Stopped if error.is_none() => "completed",
+        _ if cancel.is_cancelled() => "cancelled",
+        _ if deadline.as_ref().is_some_and(|token| token.is_cancelled()) => "deadline",
+        _ => "incomplete",
+    });
+    (stop, error, report)
+}
 
 fn review_failure_reason(
     stop: &StopReason,
@@ -982,7 +1016,8 @@ impl<'a> VerificationDiffs<'a> {
 
 fn git_diff(dir: &Path, scope: &ReviewScope, paths: &[String]) -> Result<ScopedDiff, String> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(dir).arg("diff").arg("--no-color");
+    cmd.current_dir(dir)
+        .args(["diff", "--no-color", "--full-index"]);
     let (label, commit_count) = match scope {
         ReviewScope::WorkingTree => {
             cmd.arg("HEAD");
@@ -2276,6 +2311,83 @@ mod tests {
         assert!(d.is_deep() && !d.wants_verify());
         let s: Args = serde_json::from_str("{}").unwrap();
         assert!(!s.is_deep() && !s.wants_verify());
+    }
+
+    #[test]
+    fn embedded_review_diff_supplies_shared_git_blob_evidence() {
+        let dir = repo_with_working_tree_change();
+        let root = dir.path();
+        let a = std::fs::read(root.join("a.rs")).unwrap();
+        std::fs::write(root.join("mirror.rs"), a).unwrap();
+        std::fs::write(root.join("different.rs"), "fn different() {}\n").unwrap();
+        git(root, &["add", "mirror.rs", "different.rs"]);
+
+        let diff = git_diff(root, &ReviewScope::WorkingTree, &[]).unwrap().diff;
+        let plan = render_review_impact_plan(&diff);
+        let evidence = plan
+            .lines()
+            .find(|line| line.contains("Same post-change Git content"));
+        assert_eq!(
+            evidence,
+            Some(r#"- Same post-change Git content: "a.rs" "mirror.rs""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn review_trace_correlates_pass_model_tool_and_verification() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let tool = ReviewTool::new(provider, ReviewToolConfig::default(), test_dirs());
+        let mut context = ctx_in(dir.path());
+        context.progress = ProgressSink::with_source_id("review-source", Arc::new(|_| {}));
+        let result = tool
+            .execute(
+                r#"{"depth":"deep+verify","instructions":"review-test-private-text"}"#,
+                &context,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let log = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        for (stage, operation) in [
+            ("security", "review pass"),
+            ("performance", "model request"),
+            ("correctness", "tool execution"),
+            ("verify_full", "review pass"),
+        ] {
+            assert!(
+                log.lines().any(|line| line.contains("review-source")
+                    && line.contains(stage)
+                    && line.contains(operation)
+                    && line.contains("elapsed_ms=")),
+                "missing {stage} {operation} in {log}"
+            );
+        }
+        assert!(log.contains("review model first content"));
+        assert!(log.contains("candidate=1"));
+        assert!(!log.contains("review-test-private-text"));
     }
 
     struct ScopedVerificationProvider {
