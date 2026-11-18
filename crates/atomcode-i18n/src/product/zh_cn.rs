@@ -1801,6 +1801,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::MigrationSessionsBlocked { count } => {
             format!("{count} 个会话文件 —— 历史转换有损，本期未做").into()
         }
+
+        Msg::MigrationUnreadableConfig => "这个配置文件无法解析，因此其中内容都没读到".into(),
 }
 }
 

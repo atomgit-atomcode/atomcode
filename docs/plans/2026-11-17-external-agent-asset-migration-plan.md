@@ -2580,6 +2580,10 @@ pub fn rules_rejected() -> String {
 pub fn sessions_blocked(count: usize) -> String {
     t(Msg::MigrationSessionsBlocked { count }).into_owned()
 }
+
+pub fn unreadable_config() -> String {
+    t(Msg::MigrationUnreadableConfig).into_owned()
+}
 ```
 
 `crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
@@ -4378,8 +4382,8 @@ Expected: FAIL —— 找不到资产。
 //! Read-only: this looks and reports, it never writes.
 
 use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
-use super::{MigrationSource, ScanContext, SkillTruth};
-use std::path::{Path, PathBuf};
+use super::{probe_dir, MigrationSource, ScanContext, SkillTruth};
+use std::path::Path;
 
 pub struct CodexSource;
 
@@ -4406,9 +4410,7 @@ impl MigrationSource for CodexSource {
                 path: agents,
                 scope: AssetScope::User,
                 status: AssetStatus::Actionable,
-                detail: super::text::instructions_copyable(
-                    &ctx.product.user().join("ATOMCODE.md"),
-                ),
+                detail: super::text::instructions_copyable(&ctx.product.user().join("ATOMCODE.md")),
             });
         }
 
@@ -4436,11 +4438,10 @@ impl MigrationSource for CodexSource {
                     crate::instructions::InstructionState::Empty => {
                         (AssetStatus::Blocked, super::text::instructions_empty())
                     }
-                    crate::instructions::InstructionState::Unreadable => {
-                        (AssetStatus::Blocked, super::text::unreadable_file(
-                            "the file could not be read",
-                        ))
-                    }
+                    crate::instructions::InstructionState::Unreadable => (
+                        AssetStatus::Blocked,
+                        super::text::unreadable_file("the file could not be read"),
+                    ),
                     crate::instructions::InstructionState::Missing => {
                         unreachable!("handled above")
                     }
@@ -4491,9 +4492,18 @@ impl MigrationSource for CodexSource {
             if !path.is_file() {
                 continue;
             }
-            match std::fs::read_to_string(&path).ok().and_then(|raw| {
-                raw.parse::<toml::Value>().ok()
-            }) {
+            // **`toml::from_str`, not `raw.parse::<toml::Value>()`** — the
+            // two are NOT the same path. `FromStr` for `toml::Value` rejects
+            // a table header with a dot in it, and Codex's own config is
+            // full of those: `[mcp_servers.fs]`. The `FromStr` path would
+            // report every real Codex config as unparseable — and the
+            // person would be told to fix a file that is perfectly fine.
+            // The serde path (`from_str`) takes the dotted key as a nested
+            // table, which is what the file means.
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+            {
                 Some(value) => {
                     if let Some(count) = mcp_server_count(&value) {
                         out.push(AssetReport {
@@ -4666,6 +4676,132 @@ fn session_file_count(sessions: &Path) -> Result<usize, String> {
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+    use std::path::PathBuf;
+
+    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
+        ScanContext {
+            os_home: home.to_path_buf(),
+            project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        }
+    }
+
+    /// The registry's facts, loaded the way `scan()` loads them.
+    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
+        super::super::SkillTruth::load(&ctx(home, project))
+    }
+
+    /// Write a file, creating its parent directory first.
+    ///
+    /// A fixture that writes `<home>/.codex/config.toml` into a directory that
+    /// does not exist yet fails at the write, not at the assertion — and the
+    /// failure says nothing about the behaviour being checked.
+    fn write_file(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn the_global_agents_file_is_actionable() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".codex").join("AGENTS.md"), "# rules");
+
+        let assets = CodexSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Actionable);
+        assert_eq!(instructions.scope, AssetScope::User);
+    }
+
+    #[test]
+    fn codex_skills_are_actionable_because_we_do_not_scan_that_path() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".codex").join("skills").join("deploy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
+
+        let assets = CodexSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let skill = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills)
+            .expect("the skill is reported");
+        assert_eq!(skill.status, AssetStatus::Actionable);
+        assert_eq!(skill.name, "deploy");
+    }
+
+    #[test]
+    fn a_broken_config_toml_is_reported_without_taking_the_scan_down() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &home.path().join(".codex").join("config.toml"),
+            "this is not = = toml",
+        );
+        let dir = home.path().join(".codex").join("skills").join("deploy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
+
+        let assets = CodexSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
+        assert!(assets
+            .iter()
+            .any(|a| a.kind == AssetKind::ProviderConfig && a.status == AssetStatus::Blocked));
+    }
+
+    #[test]
+    fn mcp_servers_in_the_config_are_actionable() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &home.path().join(".codex").join("config.toml"),
+            "[mcp_servers.fs]\ncommand = \"mcp-fs\"\n",
+        );
+
+        let assets = CodexSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let mcp = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::McpServers)
+            .expect("the MCP servers are reported");
+        assert_eq!(mcp.status, AssetStatus::Actionable);
+    }
+
+    #[test]
+    fn no_codex_directory_means_no_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let assets = CodexSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        assert!(assets.is_empty());
+    }
 }
 ```
 

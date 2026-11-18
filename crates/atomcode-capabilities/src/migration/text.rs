@@ -176,3 +176,7 @@ pub fn rules_rejected() -> String {
 pub fn sessions_blocked(count: usize) -> String {
     t(Msg::MigrationSessionsBlocked { count }).into_owned()
 }
+
+pub fn unreadable_config() -> String {
+    t(Msg::MigrationUnreadableConfig).into_owned()
+}

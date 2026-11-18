@@ -2510,4 +2510,5 @@ pub enum Msg<'a> {
     MigrationSessionsBlocked {
         count: usize,
     },
+    MigrationUnreadableConfig,
 }

@@ -1886,6 +1886,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::MigrationSessionsBlocked { count } => {
             format!("{count} session file(s) — converting history is lossy, not done yet").into()
         }
+
+        Msg::MigrationUnreadableConfig => {
+            "This config file could not be parsed, so nothing could be read from it".into()
+        }
 }
 }
 
