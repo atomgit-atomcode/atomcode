@@ -1,7 +1,8 @@
 # 一键迁移其他 AI Coding Agent 的资产 —— 设计（第一期 + 第二期）
 
 - 日期：2026-11-17
-- 状态：设计已定（brainstorming 结论），待实施计划
+- 状态：设计已定（brainstorming 结论）；实施计划见
+  `docs/plans/2026-11-17-external-agent-asset-migration-plan.md`（9 个 Task，尚未开工）
 - 参照：OpenAI Codex 的 `codex-rs/external-agent-migration`（16681 行，「检测 → 迁移 → 残留兜底」三段式）
 - 关联 Issue：[Feature] 一键迁移其他 AI Coding Agent 的资产（指令/技能/配置/会话）
 
@@ -75,10 +76,11 @@ Issue 正文说的「兼容基础已打好」与代码有出入。核实结果�
 
 ```
 crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
-    mod.rs        公共 API：scan / 报告类型 / 来源注册表
-    source.rs     MigrationSource trait
+    mod.rs        公共 API：scan / MigrationSource trait / 报告类型 / 来源注册表
     claude.rs     ClaudeSource
     codex.rs      CodexSource
+    opencode.rs   OpenCodeSource
+    text.rs       文案助手（pub(crate)，不进公共 API）
     report.rs     AssetKind / AssetStatus / AssetReport / MigrationReport
     provider.rs   第二期：外部 provider 配置 → 中立 ProviderAccountDraft
 ```
@@ -139,7 +141,7 @@ pub trait MigrationSource: Send + Sync {
     fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport>;
 }
 
-/// 内置来源注册表：Claude Code、Codex。
+/// 内置来源注册表：Claude Code、Codex、OpenCode。
 pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>>;
 
 /// 扫一遍所有来源。
@@ -214,6 +216,25 @@ pub struct MigrationReport {
 >
 > **目录读不出来 ≠ 目录是空的**：读不了就是 `Blocked`（附上原因），不是「没发现」。Codex 的「残留兜底」在这里对应的就是这条 —— 探测到的每一项都在报告里，一项都不静默消失。
 
+**OpenCode**（`~/.config/opencode` + `<project>/.opencode`）
+
+| 资产 | 路径 | 状态 |
+|---|---|---|
+| 技能 | `~/.config/opencode/skills/*`、`<project>/.opencode/skills/*` | `Actionable`（同格式，复制即可） |
+| 命令 | `~/.config/opencode/commands/*`、`<project>/.opencode/commands/*` | `Actionable` |
+| 共享技能 | `~/.agents/skills/*`、`<project>/.agents/skills/*` | `Active`（我们**已经读**那个目录） |
+| 共享命令 | `~/.agents/commands/*`、`<project>/.agents/commands/*` | `Actionable` —— **我们不读这个目录**（见下） |
+| provider | `~/.config/opencode/opencode.json` 的 `provider.*` | `Actionable`（第二期） |
+| MCP | `~/.config/opencode/opencode.jsonc` 的 `mcp.*` | `Actionable` |
+| 凭据 | `~/.local/share/opencode/auth.json` | `Blocked` —— **明文密钥，只报不搬** |
+
+> OpenCode 的目录遵循 XDG（`$XDG_CONFIG_HOME` / `$XDG_DATA_HOME`），由**宿主**解析。
+>
+> **`.agents/commands` 我们不读** —— 技能注册表的标准目录表里只有 `.agents/skills`
+> （`skills/registry.rs:585`、`:590`），没有 `.agents/commands`。所以那一份命令
+> **不是「已经在生效」，而是「可以搬过来」**：同格式，复制到产品用户树的
+> `commands/` 即可。技能那一半（`.agents/skills`）才是 `Active`。
+
 ### 3.5 第二期：provider 账号导入
 
 **映射**（`migration/provider.rs` 只产出中立草案，不写盘）：
@@ -225,6 +246,8 @@ pub struct MigrationReport {
 | Claude | `settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | 同上 |
 | Codex | `config.toml` → `[model_providers.<id>].base_url` | `provider_accounts.<id>.base_url` |
 | Codex | `config.toml` → `[model_providers.<id>].env_key`（**变量名**） | `provider_accounts.<id>.api_key = "${VAR_NAME}"` |
+| OpenCode | `opencode.json` → `provider.<id>.options.apiKey`（**明文**） | `provider_accounts.<id>.api_key`（**逐项确认后**才写） |
+| OpenCode | `opencode.json` → `provider.<id>.options.baseURL` | `provider_accounts.<id>.base_url` |
 | Codex | `config.toml` → `model` | `models.<id>.model` |
 | Codex | `config.toml` → `model_providers.<id>.wire_api` | `provider_accounts.<id>.provider`（`openai-responses` / `openai-compatible` / `anthropic-compatible`） |
 | Codex | `config.toml` → `[model_providers.<id>].wire_api`（**不认识的**值） | **不导入** —— 报 `Blocked` 并写明是哪个协议。`create_account` 会把未知 preset 静默降级成 `openai-compatible`（`config/provider_preset.rs:381`），那就是「用错的线协议连上了」 |

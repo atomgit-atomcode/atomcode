@@ -22,11 +22,12 @@
 |---|---|---|---|---|
 | P1 骨架 | 1 | `migration` 模块与四态报告类型可用 | — | `cargo nextest run -p atomcode-capabilities --features migration` 全绿；`gates/layers.sh` 通过 |
 | P2 探测 | 2, 3 | Claude / Codex 两个来源 | P1 | 样例目录快照判据全绿；坏文件不 panic |
-| P3 CLI | 4 | `atomcode import` 只读报告 | P2 | 文本与 JSON 两种形态判据全绿 |
-| P4 TUI | 5 | `/import` 面板 | P3 | 屏幕判据全绿；`gates/tui-i18n.sh` 通过 |
-| P5 映射 | 6 | provider 中立草案 | P2 | 凭据语义判据全绿（Claude=明文 / Codex=变量名） |
-| P6 写入 | 7 | `--apply` 逐项确认写入 | P5 | 不确认不写、id 冲突不覆盖、非交互拒绝 |
-| P7 验收 | 8 | 全部门 | P1–P6 | 见 Task 8 |
+| P2.5 探测 | 4 | OpenCode 来源 | P1, P2 | 样例目录快照判据全绿；坏文件不 panic；`.agents/skills` 标 `Active`、`.agents/commands` 标 `Actionable`（**我们不读 commands 那一半**） |
+| P3 CLI | 5 | `atomcode import` 只读报告 | P2, P2.5 | 文本与 JSON 两种形态判据全绿 |
+| P4 TUI | 6 | `/import` 面板 | P3 | 屏幕判据全绿；`gates/tui-i18n.sh` 通过 |
+| P5 映射 | 7 | provider 中立草案 | P2, P2.5 | 凭据语义判据全绿（Claude=明文 / Codex=变量名 / OpenCode=明文） |
+| P6 写入 | 8 | `--apply` 逐项确认写入 | P5 | 不确认不写、id 冲突不覆盖、非交互拒绝 |
+| P7 验收 | 9 | 全部门 | P1–P6 | 见 Task 9 |
 
 **依赖顺序是硬的**：P4 依赖 P3（屏幕显示的正是 CLI 那份报告），P6 依赖 P5（写入的对象正是草案），P7 依赖全部。
 
@@ -39,20 +40,26 @@
 | 1 capabilities 骨架 | 7 | 287 | 3 | 4（2 新建） | 低 — 纯新模块，无外部依赖 |
 | 2 Claude 来源 | 7 | **1106** | 11 | 1 | **高** — 最大的一个，8 类资产 × 4 个真加载器 |
 | 3 Codex 来源 | 6 | 343 | 5 | 4 | 中 — TOML 解析 + 递归合并 |
-| 4 CLI 子命令 | 9 | 422 | 5 | 4（1 新建） | 中 — 接 clap + 渲染 |
-| 5 TUI `/import` | 10 | 437 | 6 | 11（2 新建） | 中 — **底部单子**（可滚动/可展开）+「多源才问」 |
-| 6 provider 映射 | 5 | 434 | 8 | 5 | 中高 — 动到 `atomcode-config` 与 `atomcode-coding` |
-| 7 写入 config.toml | 8 | 639 | 8 | 3 | 中 — **安全要求最高**（凭据逐项确认、明文不落盘） |
-| 8 门与验收 | 6 | 0 | 0 | 0 | 低 — 跑门 |
-| **合计** | **58** | **3668** | **42** | **约 20 文件 / 6 crate** | |
+| 4 OpenCode 来源 | 8 | ~430 | 5 | 5 | 中 — **第三种形状**：明文凭据、数组 command、npm 协议 |
+| 5 CLI 子命令 | 9 | 422 | 5 | 4（1 新建） | 中 — 接 clap + 渲染 |
+| 6 TUI `/import` | 10 | 437 | 6 | 11（2 新建） | 中 — **底部单子**（可滚动/可展开）+「多源才问」 |
+| 7 provider 映射 | 5 | 434 | 8 | 5 | 中高 — 动到 `atomcode-config` 与 `atomcode-coding` |
+| 8 写入 config.toml | 8 | 639 | 8 | 3 | 中 — **安全要求最高**（凭据逐项确认、明文不落盘） |
+| 9 门与验收 | 6 | 0 | 0 | 0 | 低 — 跑门 |
+| **合计** | **66** | **~4100** | **47** | **约 22 文件 / 6 crate** | |
 
-**规模判断**：约 3700 行 Rust、42 条判据、20 个文件、6 个 crate（capabilities / coding / config / cli / tui / i18n）。另有 46 条新 i18n 词条、约 72 个新公开项。**这是一次中等规模的功能，不是大改** —— 但也不是「照着抄一遍」。
+**规模判断**：约 4100 行 Rust、47 条判据、22 个文件、6 个 crate（capabilities / coding / config / cli / tui / i18n）。另有 47 条新 i18n 词条、约 72 个新公开项。**这是一次中等规模的功能，不是大改** —— 但也不是「照着抄一遍」。
+
+**加一个来源的成本（三个来源实测）**：Claude 约 1100 行、Codex 约 340 行、
+OpenCode 约 430 行。**第二个来源最贵**（要摸清每个资产到底生不生效），第三个
+明显便宜 —— 因为来源特有的知识已经被收回来源自己，`protocol_for_wire(wire_api,
+default)` 只问「这条线怎么说」，不问「你是谁」。
 
 **难度不在代码量，在这三处**：
 
 1. **Task 2 是风险集中点。** 它的 1106 行里，最难的不是「找到文件」，而是**判定「到底生不生效」** —— 指令要看 `load_instructions` 的四个状态（`Loaded` / `Empty` / `Unreadable` / `Shadowed`），技能要看 `SkillRegistry` 的加载与诊断，MCP 要看 `parse_mcp_servers`，权限要看 `PermissionRules::parse`。**每一条判定都必须复用真加载器**，自己写一份就等于埋一个「说生效、其实不生效」的错。
 2. **计划里的代码从未编译过。** 六轮复审修的是**计划文本**的编译错误 —— 每一轮都找出新的（游离字段赋值、`continue` 出循环、`Option` 收集类型、括号不匹配）。**文本对了不等于代码对**：实施时应当预期还会遇到同类编译错误，按「先让这一段过编译门，再往下写」的节奏走。
-3. **共享 crate 的并发改动。** Task 6 要改 `atomcode-config/src/provider_book.rs` 与 `atomcode-coding/src/parts.rs` —— 而当前工作区里 `atomcode-kernel`、`atomcode-coding`、`atomcode-harness`、`atomcode-capabilities`、`atomcode-config`、`atomcode-cli` **都在被别人改**。落地前必须重新核对 `git status`，并按任务粒度提交，别把别人的改动卷进来（这条路我已经走过一次并出过事故，见「交接模板」里的提醒）。
+3. **共享 crate 的并发改动。** Task 7 要改 `atomcode-config/src/provider_book.rs` 与 `atomcode-coding/src/parts.rs` —— 而当前工作区里 `atomcode-kernel`、`atomcode-coding`、`atomcode-harness`、`atomcode-capabilities`、`atomcode-config`、`atomcode-cli` **都在被别人改**。落地前必须重新核对 `git status`，并按任务粒度提交，别把别人的改动卷进来（这条路我已经走过一次并出过事故，见「交接模板」里的提醒）。
 
 **成本可预期的地方**：
 
@@ -61,15 +68,15 @@
 - **门禁不会被新代码触发红。** `gates/tui-i18n.sh` 的基线是 `hardcoded_cjk=3`（TUI/CLI 源码里不许有中文字面量 —— 本计划把所有文案都放在 i18n product 表，所以不增加）；`gates/tui-test-count.sh` 的基线 1976 是**棘轮**（只能升不能降），本任务只加判据；`gates/layers.sh` 禁的是 `atomcode-tui → atomcode-coding / atomcode`，而 capabilities→config 是**既有**的边，不新增违规。
 - **`cargo-nextest` 已装**（0.9.149），AGENTS.md 要求的 runner 可用。
 
-**按 AGENTS.md 的分工估**：Claude Code 只写实现（每个 Task 一次委派，给完整交接），Codex 写测试与跑门、返修复意见。**8 个 Task 就是 8 轮「实现 → 测试 → 审查 → 修复」**，不是一次写完。按每轮 1–2 小时的量级，**整轮走完大致是 1–2 个工作日**；其中 Task 2 与 Task 6 各可能多花一轮（前者判定逻辑多，后者要动共享 crate）。
+**按 AGENTS.md 的分工估**：Claude Code 只写实现（每个 Task 一次委派，给完整交接），Codex 写测试与跑门、返修复意见。**8 个 Task 就是 8 轮「实现 → 测试 → 审查 → 修复」**，不是一次写完。按每轮 1–2 小时的量级，**整轮走完大致是 1–2 个工作日**；其中 Task 2 与 Task 7 各可能多花一轮（前者判定逻辑多，后者要动共享 crate）。
 
 **建议的开工顺序**（与依赖顺序一致，但有两处提前）：
 
 1. **先 Task 1**，它把模块骨架与四态类型立起来 —— 后面的每个 Task 都在它上面长。
-2. **Task 6 提前到 Task 3 之后**：它要改 `atomcode-config` 与 `atomcode-coding` 这两个共享 crate，而这两个 crate 现在正被别人改。**越早动，越早知道会不会撞**；撞上了还能改方案，晚了就是返工。
+2. **Task 7 提前到 Task 3 之后**：它要改 `atomcode-config` 与 `atomcode-coding` 这两个共享 crate，而这两个 crate 现在正被别人改。**越早动，越早知道会不会撞**；撞上了还能改方案，晚了就是返工。
 3. **Task 2 单独一轮**，不要与别的 Task 混 —— 它最重，混在一起出问题时说不清是谁的。
-4. **Task 7 单独一轮**：安全要求最高（凭据逐项确认、明文不落盘、id 冲突不覆盖）。它值得一次专注的审查，而不是顺手写完。
-5. **Task 5 不是「渲染一段文字」**：它是**底部单子**（`crate::sheet::List`），要有光标、筛选、展开看详情，并按 Codex 的做法**多源才问**。单子形态的判据比文本形态难写 —— 断言的是 `OpenSheet` 里的 `Page::List`，不是一段字符串。
+4. **Task 8 单独一轮**：安全要求最高（凭据逐项确认、明文不落盘、id 冲突不覆盖）。它值得一次专注的审查，而不是顺手写完。
+5. **Task 6 不是「渲染一段文字」**：它是**底部单子**（`crate::sheet::List`），要有光标、筛选、展开看详情，并按 Codex 的做法**多源才问**。单子形态的判据比文本形态难写 —— 断言的是 `OpenSheet` 里的 `Page::List`，不是一段字符串。
 
 
 **不属于本期，说明原因：**
@@ -88,7 +95,7 @@
 | 状态 | 所有者 | 谁读 | 谁写 |
 |---|---|---|---|
 | 外部资产 | 外部 Agent 的目录（`~/.claude`、`~/.codex`、`<project>/.claude`…） | `migration` 模块（**只读**） | 外部 Agent（不是我们） |
-| 我们的 provider 账号 | `~/.atomcode/config.toml` | `ProviderBook` | **只有** `ProviderBook::create_account`（Task 7） |
+| 我们的 provider 账号 | `~/.atomcode/config.toml` | `ProviderBook` | **只有** `ProviderBook::create_account`（Task 8） |
 | 我们的技能 / 指令 / 权限 | 产品用户树 / 项目树 | 既有的 `skills` / `instructions` / `permission_settings` 加载器 | 既有流程（不是本功能） |
 
 **边界规则（不可绕过）：**
@@ -175,12 +182,16 @@ cargo fmt --all -- --check
 | `crates/atomcode-capabilities/src/migration/report.rs` | 数据类型：`AssetKind` / `AssetStatus` / `AssetScope` / `AssetReport` / `SourceReport` / `MigrationReport` |
 | `crates/atomcode-capabilities/src/migration/claude.rs` | `ClaudeSource`：探测 Claude Code 资产 |
 | `crates/atomcode-capabilities/src/migration/codex.rs` | `CodexSource`：探测 Codex 资产 |
-| `crates/atomcode-capabilities/src/migration/provider.rs` | 第二期：外部 provider 配置 → 中立 `ProviderAccountDraft`（**不写盘**） |
+| `crates/atomcode-capabilities/src/migration/opencode.rs` | `OpenCodeSource`：探测 OpenCode 资产 |
+| `crates/atomcode-capabilities/src/migration/text.rs` | 文案助手（`pub(crate)`，不进公共 API）—— 一件事一种说法，CLI 与 TUI 共用 |
+| `crates/atomcode-capabilities/src/migration/provider.rs` | 中立 `ProviderAccountDraft` 类型 + **共享的归一包装**（`account_id_for` / `effective_endpoint` / `protocol_for_wire`）—— 与写入方共用同一条规则 |
 | `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs` | 报告文案（product 表，三处同改） |
 | `crates/atomcode-cli/src/import_cmd.rs` | `atomcode import` 子命令：扫描报告 / `--json` / `--apply` |
 | `crates/atomcode-tui/src/migration.rs` | TUI 端口 trait + 视图类型（镜像 `setup.rs`） |
 | `crates/atomcode-tui/src/commands.rs` | `/import` 命令集（新增 `ImportCommands`） |
 | `crates/atomcode-cli/src/tui_migration.rs` | 端口实现：调 capabilities 扫描，转成 TUI 视图类型 |
+| `crates/atomcode-coding/src/config.rs` | 宿主解析 OpenCode 的两个目录（XDG）—— capability 不读环境 |
+| `crates/atomcode-coding/src/parts.rs` | 把技能根的解析公开出来，宿主按**运行时同一套规则**取技能根 |
 
 **分层约束（`gates/layers.sh` 守）：** `atomcode-tui` **不得**引 `atomcode-coding` / `atomcode`（门禁的「UI 不认 Host,也不认 Product」）；`atomcode-i18n` 必须零 atomcode 依赖（「词表是叶子」）。
 
@@ -193,8 +204,13 @@ cargo fmt --all -- --check
 **Files:**
 - Create: `crates/atomcode-capabilities/src/migration/mod.rs`
 - Create: `crates/atomcode-capabilities/src/migration/report.rs`
+- Create: `crates/atomcode-capabilities/src/migration/text.rs`（**最小版**，Task 2 再扩）
+- Create: `crates/atomcode-capabilities/src/migration/claude.rs`（**空壳**，Task 2 填）
+- Create: `crates/atomcode-capabilities/src/migration/codex.rs`（**空壳**，Task 3 填）
+- Create: `crates/atomcode-capabilities/src/migration/provider.rs`（**两个类型 + 共享归一包装**，Task 7 只加来源草案）
 - Modify: `crates/atomcode-capabilities/Cargo.toml`
 - Modify: `crates/atomcode-capabilities/src/lib.rs`
+- Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`（**只加 4 条**，Task 2 再加其余）
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -247,6 +263,8 @@ mod tests {
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new("/home/u/.ours", ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let report = scan(&[], &ctx);
         assert!(report.sources.is_empty());
@@ -456,8 +474,9 @@ mod claude;
 mod codex;
 mod provider;
 pub mod report;
+mod text;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use provider::{ApiKeyRef, ProviderAccountDraft};
 /// The endpoint an account will actually talk to.
@@ -508,6 +527,17 @@ pub struct ScanContext {
     /// **Empty means "the standard list"** — the host passes the real list
     /// in production, and an empty list keeps the fixtures honest.
     pub skill_dirs: Vec<PathBuf>,
+    /// Where OpenCode keeps its configuration
+    /// (`$XDG_CONFIG_HOME/opencode`, default `~/.config/opencode`).
+    ///
+    /// **The host resolves it** — the capability reads no environment
+    /// (`AGENTS.md`: 「解析环境只在宿主」).
+    pub opencode_config_dir: PathBuf,
+    /// Where OpenCode keeps its data
+    /// (`$XDG_DATA_HOME/opencode`, default `~/.local/share/opencode`).
+    ///
+    /// The host resolves it, for the same reason.
+    pub opencode_data_dir: PathBuf,
 }
 
 /// One external agent's assets.
@@ -546,7 +576,7 @@ pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>> {
 ///
 /// Only `detect()` is called here. The provider rows are part of what a
 /// source detects — they are added by that source's own `detect()`, from the
-/// same drafts the importer uses (Task 6). So this function needs no draft
+/// same drafts the importer uses (Task 7). So this function needs no draft
 /// machinery, and Task 1 stands on its own.
 pub fn scan(sources: &[Box<dyn MigrationSource>], ctx: &ScanContext) -> MigrationReport {
     let mut report = MigrationReport::default();
@@ -598,1179 +628,10 @@ pub fn provider_row(
     }
 }
 
-/// Whether a protocol id names a wire format we do not speak.
-///
-/// `protocol_for` returns `unsupported:<source>:<wire_api>` for one, and
-/// such an account must never be imported: `ProviderBook::create_account`
-/// resolves an unknown preset to `openai-compatible`
-/// (`config/provider_preset.rs:381`), so the import would silently succeed
-/// with the WRONG wire protocol.
-pub fn is_unsupported_protocol(protocol: &str) -> bool {
-    protocol.starts_with("unsupported:")
-}
-
-/// Whether this path is a file we can use — and if not, WHY.
-///
-/// `Path::is_file()` collapses every error into `false`: a path we cannot
-/// stat (a parent directory we may not traverse) looks exactly like a path
-/// that is not there. The report would then say "not found" about something
-/// that IS there but unreadable — and the person never learns to look.
-///
-/// `Ok(true)` = a regular file. `Ok(false)` = not there (or not a regular
-/// file). `Err(reason)` = we could not tell.
-fn probe_file(path: &Path) -> Result<bool, String> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// Whether this path is a directory we can use — and if not, WHY.
-///
-/// The directory counterpart of [`probe_file`].
-fn probe_dir(path: &Path) -> Result<bool, String> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_dir()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// What the real instruction loader makes of ONE instruction file.
-///
-/// The loader is the only thing that knows the order, what "shadowed" means,
-/// and that an empty file is `Empty` rather than `Loaded` (`instructions.rs:173`).
-/// So the report asks it, rather than re-deriving those rules — a
-/// hand-rolled check is exactly how a report ends up saying "already in
-/// effect" about a file that is not.
-///
-/// `None` when the loader does not know this file at all — it is not an
-/// instruction file, or it is not in the project tier.
-fn instruction_verdict(
-    ctx: &ScanContext,
-    path: &std::path::Path,
-) -> Option<InstructionVerdict> {
-    // The loader wants the product tree as the "home" (`instructions.rs:105`).
-    let loaded = crate::instructions::load_instructions(ctx.product.user(), &ctx.project);
-    let source = loaded.sources.iter().find(|source| source.path == path)?.clone();
-    // The file that WINS in the project tier — the one the loader did not
-    // shadow. A shadowed file's own name is NOT the explanation ("CLAUDE.md
-    // takes precedence" about a shadowed CLAUDE.md says nothing); the
-    // winner's name is.
-    //
-    // The loader marks the FIRST existing project file as the winner and
-    // shadows the rest (`instructions.rs:131-139`: `selected |= path.is_file()`),
-    // so the winner is the first PROJECT source that is neither shadowed nor
-    // missing — even if it is empty, because an empty file still wins the
-    // slot.
-    let winner = loaded.sources.iter().find(|candidate| {
-        candidate.scope == "PROJECT"
-            && candidate.state != crate::instructions::InstructionState::Shadowed
-            && candidate.state != crate::instructions::InstructionState::Missing
-    });
-    Some(InstructionVerdict {
-        name: source
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
-        path: source.path,
-        scope: AssetScope::Project,
-        state: source.state,
-        shadowed_by: winner.map(|winner| {
-            winner
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        }),
-    })
-}
-
-/// One instruction file, and what the loader said about it.
-struct InstructionVerdict {
-    name: String,
-    path: std::path::PathBuf,
-    scope: AssetScope,
-    state: crate::instructions::InstructionState,
-    /// The project file that wins over this one, when this one is shadowed.
-    shadowed_by: Option<String>,
-}
-
-```
-
-（`claude.rs` / `codex.rs` / `provider.rs` 在 Task 2 / 3 / 6 建；本 Task 先建三个空壳文件让编译通过：`claude.rs` 与 `codex.rs` 各自放一个 `pub struct ClaudeSource;` 之类，Task 2/3 填内容；`provider.rs` 在 Task 6 建。**为让本 Task 编译通过，Step 5 之后先建两个空壳：**）
-
-`crates/atomcode-capabilities/src/migration/claude.rs`：
-
-```rust
-//! Claude Code assets. Filled in by Task 2.
-
-use super::{MigrationSource, ScanContext};
-use super::report::AssetReport;
-
-pub struct ClaudeSource;
-
-impl MigrationSource for ClaudeSource {
-    fn id(&self) -> &'static str {
-        "claude-code"
-    }
-    fn display_name(&self) -> &'static str {
-        "Claude Code"
-    }
-    fn detect(&self, _ctx: &ScanContext) -> Vec<AssetReport> {
-        Vec::new()
-    }
-}
-```
-
-`crates/atomcode-capabilities/src/migration/codex.rs`：
-
-```rust
-//! Codex assets. Filled in by Task 3.
-
-use super::report::AssetReport;
-use super::{MigrationSource, ScanContext};
-
-pub struct CodexSource;
-
-impl MigrationSource for CodexSource {
-    fn id(&self) -> &'static str {
-        "codex"
-    }
-    fn display_name(&self) -> &'static str {
-        "Codex"
-    }
-    fn detect(&self, _ctx: &ScanContext) -> Vec<AssetReport> {
-        Vec::new()
-    }
-}
-```
-
-`crates/atomcode-capabilities/src/migration/provider.rs`：
-
-```rust
-//! Provider accounts found in another agent's configuration. Filled in by Task 6.
-
-use super::report::AssetScope;
-
-/// How a credential is referenced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApiKeyRef {
-    /// The NAME of an environment variable, e.g. `"MY_KEY"`. The secret stays
-    /// where it is and is resolved at run time.
-    EnvVar(String),
-    /// A literal secret found in the source configuration. Written only after
-    /// the person confirms that one item.
-    Plaintext(String),
-}
-
-impl ApiKeyRef {
-    /// How the credential is written, for the report to say. The VALUE is
-    /// never part of this — only its kind.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            ApiKeyRef::EnvVar(_) => "environment variable",
-            ApiKeyRef::Plaintext(_) => "a literal key",
-        }
-    }
-}
-
-/// A provider account an external agent has configured.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderAccountDraft {
-    /// **The id the account WILL get** — already normalised by
-    /// `account_id_for`, the same rule the writer uses. It is not the raw
-    /// source id: `create_account` sanitises the name and may prefix it, so
-    /// a draft built on the raw name would never be found again.
-    pub id: String,
-    /// The definition's name **as the source wrote it**.
-    ///
-    /// Two definitions in one file can normalise to the same id (`"foo bar"`
-    /// and `"foo-bar"` both become `foo-bar`), so the id alone cannot say
-    /// which definition a row is about. The original name can — and it is
-    /// what the person recognises, so the report shows it.
-    pub source_name: String,
-    /// A preset or protocol id (`openai-compatible`, `anthropic-compatible`,
-    /// `openai-responses`).
-    pub protocol: String,
-    /// The endpoint as it will be **stored** — normalised by
-    /// `effective_endpoint`, so it is `None` when the endpoint is the
-    /// protocol's own default (the writer stores nothing in that case).
-    /// The endpoint in USE is `endpoint_in_use(protocol, base_url)`.
-    pub base_url: Option<String>,
-    /// The credential, when the source named one.
-    pub api_key: Option<ApiKeyRef>,
-    /// The models the source was using.
-    pub models: Vec<String>,
-    /// Where this account was configured — the file it was read from. The
-    /// report shows it, so a person can see WHICH file to look at.
-    pub source_path: std::path::PathBuf,
-    /// Whether the account came from the person's own tree or from the
-    /// current project. A project provider is not the user's provider.
-    pub scope: AssetScope,
-    /// Why this account CANNOT be imported, when that is the case.
-    ///
-    /// `None` means it can. A `Some` reason means the account is still
-    /// **reported** — it is configured, the person should see it — but the
-    /// importer refuses it.
-    ///
-    /// Two things land here:
-    /// - the name cannot become an account id at all (`account_id_for`
-    ///   returns an error), so there is nothing to write it under;
-    /// - the endpoint speaks a wire protocol we do not support.
-    ///
-    /// Both used to be either silently dropped or reported as importable,
-    /// which is the one thing this report must never do.
-    pub blocked: Option<String>,
-}
-```
-
-- [ ] **Step 6: 跑测试确认通过**
-
-Run: `cargo nextest run -p atomcode-capabilities --features migration`
-Expected: PASS —— Task 1 的三条（报告计数 / 空报告 / 无来源扫描）。
-
-- [ ] **Step 7: 提交**
-
-```bash
-git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/
-git commit -m "feat(capabilities): add migration module skeleton
-
-The report carries four statuses, not two: Active (we read it today),
-Actionable (there is a known way to bring it over), Blocked (it cannot
-come over). \"Compatible\" and \"needs conversion\" cannot say whether a
-lost session history is recoverable, and that is the thing a person needs
-to know before deciding.
-
-The feature pulls atomcode-config, which the screen already has transitively."
-```
-
----
-
-## Task 2: Claude Code 来源
-
-**Files:**
-- Modify: `crates/atomcode-capabilities/src/migration/claude.rs`
-- Test: `crates/atomcode-capabilities/src/migration/claude.rs`（内联 `mod tests`）
-
-- [ ] **Step 1: 写失败的测试**
-
-在 `claude.rs` 末尾追加：
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
-
-    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
-        ScanContext {
-            os_home: home.to_path_buf(),
-            project: project.to_path_buf(),
-            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
-        }
-    }
-
-    fn skill_at(root: &std::path::Path, name: &str) {
-        let dir = root.join("skills").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
-    }
-
-    /// Write a file, creating its parent directory first.
-    ///
-    /// A fixture that writes `<home>/.claude/settings.json` into a directory
-    /// that does not exist yet fails at the write, not at the assertion — and
-    /// the failure says nothing about the behaviour being checked.
-    fn write_file(path: &std::path::Path, body: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, body).unwrap();
-    }
-
-    #[test]
-    fn a_user_skill_is_active_because_we_read_that_path_today() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        skill_at(&home.path().join(".claude"), "web-access");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let skill = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Skills && a.name == "web-access")
-            .expect("the skill is reported");
-        assert_eq!(skill.status, AssetStatus::Active);
-        assert_eq!(skill.scope, AssetScope::User);
-    }
-
-    #[test]
-    fn a_project_instruction_file_is_active() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&project.path().join("CLAUDE.md"), "# rules");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let instructions = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Instructions)
-            .expect("the instructions are reported");
-        assert_eq!(instructions.status, AssetStatus::Active);
-        assert_eq!(instructions.scope, AssetScope::Project);
-    }
-
-    #[test]
-    fn a_user_instruction_file_is_actionable_because_the_global_layer_cannot_see_it() {
-        // The global instruction tier reads <product user tree>/ATOMCODE.md, not
-        // ~/.claude/CLAUDE.md — so this one has to be copied, not merely read.
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let instructions = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Instructions)
-            .expect("the instructions are reported");
-        assert_eq!(instructions.status, AssetStatus::Actionable);
-        assert_eq!(instructions.scope, AssetScope::User);
-    }
-
-    #[test]
-    fn a_project_instruction_file_shadowed_by_agents_md_is_not_active() {
-        // The project tier takes the FIRST existing name in order, so a
-        // CLAUDE.md next to an AGENTS.md is never loaded. Calling it "already
-        // in effect" would be a lie.
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&project.path().join("AGENTS.md"), "# rules");
-        write_file(&project.path().join("CLAUDE.md"), "# rules");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let instructions = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Instructions)
-            .expect("the instructions are reported");
-        assert_eq!(instructions.status, AssetStatus::Blocked);
-        assert!(
-            instructions.detail.contains("AGENTS.md"),
-            "it says what shadows it: {}",
-            instructions.detail
-        );
-    }
-
-    #[test]
-    fn a_user_settings_file_is_actionable_and_the_project_one_is_active() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&home.path().join(".claude").join("settings.json"), "{}");
-        write_file(&project.path().join(".claude").join("settings.json"), "{}");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let permissions: Vec<_> = assets
-            .iter()
-            .filter(|a| a.kind == AssetKind::Permissions)
-            .collect();
-        assert_eq!(permissions.len(), 2);
-        assert!(permissions.iter().any(|p| p.scope == AssetScope::User
-            && p.status == AssetStatus::Actionable));
-        assert!(permissions.iter().any(|p| p.scope == AssetScope::Project
-            && p.status == AssetStatus::Active));
-    }
-
-    #[test]
-    fn a_broken_settings_file_is_blocked_not_active() {
-        // Our own loader refuses a broken policy (`permission_settings.rs:296`),
-        // so a broken file must not be reported as already in effect.
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&project.path().join(".claude").join("settings.json"), "{not json");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let permissions = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Permissions)
-            .expect("the broken file is reported");
-        assert_eq!(permissions.status, AssetStatus::Blocked);
-    }
-
-    #[test]
-    fn a_project_mcp_file_is_active_and_the_global_one_is_actionable() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(
-            &project.path().join(".mcp.json"),
-            r#"{"mcpServers":{"fs":{"command":"mcp-fs"}}}"#,
-        );
-        write_file(
-            &home.path().join(".claude.json"),
-            r#"{"mcpServers":{"gh":{"command":"mcp-gh"}}}"#,
-        );
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let mcp: Vec<_> = assets.iter().filter(|a| a.kind == AssetKind::McpServers).collect();
-        assert_eq!(mcp.len(), 2);
-        assert!(mcp.iter().any(|m| m.scope == AssetScope::Project
-            && m.status == AssetStatus::Active));
-        assert!(mcp.iter().any(|m| m.scope == AssetScope::User
-            && m.status == AssetStatus::Actionable));
-    }
-
-    #[test]
-    fn an_actionable_row_names_the_path_to_copy_it_to() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let instructions = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Instructions)
-            .expect("the instructions are reported");
-        assert!(
-            instructions.detail.contains("ATOMCODE.md"),
-            "the row says where to put it: {}",
-            instructions.detail
-        );
-    }
-
-    #[test]
-    fn a_subagent_definition_is_blocked_because_the_formats_differ() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let dir = home.path().join(".claude").join("agents");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("reviewer.md"), "---").unwrap();
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        let agent = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Agents)
-            .expect("the agent definition is reported");
-        assert_eq!(agent.status, AssetStatus::Blocked);
-    }
-
-    #[test]
-    fn a_broken_settings_file_does_not_stop_the_scan() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write_file(&home.path().join(".claude").join("settings.json"), "{not json");
-        skill_at(&home.path().join(".claude"), "web-access");
-
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        // The skill is still found, and the broken file is reported as blocked
-        // rather than taking the whole scan down.
-        assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
-        assert!(assets
-            .iter()
-            .any(|a| a.kind == AssetKind::Permissions && a.status == AssetStatus::Blocked));
-    }
-
-    #[test]
-    fn no_claude_directory_means_no_rows() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
-        assert!(assets.is_empty());
-    }
-}
-```
-
-- [ ] **Step 2: 跑测试确认失败**
-
-Run: `cargo nextest run -p atomcode-capabilities --features migration migration::claude`
-Expected: FAIL —— 找不到资产（`detect` 返回空）。
-
-- [ ] **Step 3: 实现 ClaudeSource**
-
-把 `claude.rs` 整体替换为：
-
-```rust
-//! Claude Code's assets.
-//!
-//! What AtomCode reads from a Claude Code tree today, and what it does not:
-//!
-//! | asset                          | user level      | project level |
-//! |--------------------------------|-----------------|---------------|
-//! | instructions (`CLAUDE.md`)     | not read        | read          |
-//! | skills / commands              | read            | read          |
-//! | permissions (`settings.json`)  | not read        | read          |
-//! | MCP (`~/.claude.json`)         | not read        | read          |
-//!
-//! The global instruction tier reads `<product user tree>/ATOMCODE.md` and the
-//! permission loader reads `<product user tree>` — neither is `~/.claude`. So
-//! the user-level ones are `Actionable` (copy them over), not `Active`.
-//!
-//! Read-only: this looks and reports, it never writes.
-
-use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
-use super::{MigrationSource, ScanContext};
-use std::path::{Path, PathBuf};
-
-pub struct ClaudeSource;
-
-impl MigrationSource for ClaudeSource {
-    fn id(&self) -> &'static str {
-        "claude-code"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Claude Code"
-    }
-
-    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
-        let mut out = Vec::new();
-        let user = ctx.os_home.join(".claude");
-        let project_claude = ctx.project.join(".claude");
-        // Loaded ONCE per scan: the registry is what decides whether a skill
-        // is really in effect.
-        let skills = SkillTruth::load(ctx);
-
-        // Instructions. The verdict comes from the **real loader** —
-        // `crate::instructions::load_instructions` — not from a hand-rolled
-        // "is it empty / is it shadowed" check. The loader knows the whole
-        // order (`.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`, `CLAUDE.md`,
-        // `claude.md` — `instructions.rs:17`), what "shadowed" means, and that
-        // an empty file loads as `Empty` rather than `Loaded`
-        // (`instructions.rs:173`). Re-implementing those rules is how a report
-        // ends up saying "already in effect" about a file that is not.
-        let project_instructions = ctx.project.join("CLAUDE.md");
-        if let Some(source) = super::instruction_verdict(ctx, &project_instructions) {
-            // A `Missing` file is not an asset at all, so it produces NO row.
-            // It cannot be a `continue` — this is not a loop, and the rest of
-            // the assets still need scanning.
-            if source.state != crate::instructions::InstructionState::Missing {
-                let (status, detail) = match source.state {
-                    crate::instructions::InstructionState::Loaded => {
-                        (AssetStatus::Active, super::text::instructions_active())
-                    }
-                    // The message names the file that WINS, not this one.
-                    crate::instructions::InstructionState::Shadowed => (
-                        AssetStatus::Blocked,
-                        super::text::instructions_shadowed(
-                            source.shadowed_by.as_deref().unwrap_or(&source.name),
-                        ),
-                    ),
-                    crate::instructions::InstructionState::Empty => {
-                        (AssetStatus::Blocked, super::text::instructions_empty())
-                    }
-                    crate::instructions::InstructionState::Unreadable => (
-                        AssetStatus::Blocked,
-                        super::text::unreadable_file("the file could not be read"),
-                    ),
-                    crate::instructions::InstructionState::Missing => {
-                        unreachable!("handled above")
-                    }
-                };
-                out.push(AssetReport {
-                    kind: AssetKind::Instructions,
-                    name: source.name,
-                    path: source.path,
-                    scope: source.scope,
-                    status,
-                    detail,
-                });
-            }
-        }
-        let user_instructions = user.join("CLAUDE.md");
-        // **Fallible**: a file we cannot stat is not the same as a file that
-        // is not there.
-        match probe_file(&user_instructions) {
-            Ok(true) => out.push(AssetReport {
-                kind: AssetKind::Instructions,
-                name: "CLAUDE.md".into(),
-                path: user_instructions,
-                scope: AssetScope::User,
-                status: AssetStatus::Actionable,
-                detail: super::text::instructions_copyable(
-                    &ctx.product.user().join("ATOMCODE.md"),
-                ),
-            }),
-            Ok(false) => {}
-            Err(reason) => out.push(AssetReport {
-                kind: AssetKind::Instructions,
-                name: "CLAUDE.md".into(),
-                path: user_instructions,
-                scope: AssetScope::User,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&reason),
-            }),
-        }
-
-        // Skills and commands: the standard paths are in our own scan list.
-        for (kind, dir) in [
-            (AssetKind::Skills, "skills"),
-            (AssetKind::Commands, "commands"),
-        ] {
-            for (scope, root) in [
-                (AssetScope::User, user.join(dir)),
-                (AssetScope::Project, project_claude.join(dir)),
-            ] {
-                out.extend(skill_rows(kind, scope, &root, &skills));
-            }
-        }
-
-        // Permissions. A file that cannot be parsed is NOT "in effect" — our
-        // own loader refuses a broken policy (`permission_settings.rs:296`), so
-        // it must not be reported as active either.
-        for (scope, root) in [
-            (AssetScope::User, user.clone()),
-            (AssetScope::Project, project_claude.clone()),
-        ] {
-            for name in ["settings.json", "settings.local.json"] {
-                let path = root.join(name);
-                match probe_file(&path) {
-                    Ok(true) => {}
-                    // Not there: nothing to report.
-                    Ok(false) => continue,
-                    // There, but we cannot read it: that IS an asset, and it
-                    // is blocked.
-                    Err(reason) => {
-                        out.push(AssetReport {
-                            kind: AssetKind::Permissions,
-                            name: name.into(),
-                            path,
-                            scope,
-                            status: AssetStatus::Blocked,
-                            detail: super::text::unreadable_file(&reason),
-                        });
-                        continue;
-                    }
-                }
-                let parsed = parse_json(&path);
-                let (status, detail) = match parsed {
-                    Err(reason) => (AssetStatus::Blocked, super::text::unreadable_file(&reason)),
-                    // A file that parses but whose rules our loader would
-                    // REJECT is not "in effect" either — the loader fails the
-                    // whole file (`permission_settings.rs:345-353`), so none
-                    // of its rules apply.
-                    Ok(value) if !permission_rules_are_valid(&value) => (
-                        AssetStatus::Blocked,
-                        super::text::rules_rejected(),
-                    ),
-                    Ok(_) => match scope {
-                        // The project one is merged into our own permission rules.
-                        AssetScope::Project => {
-                            (AssetStatus::Active, super::text::permissions_active())
-                        }
-                        // The user one is not read: the loader reads the product tree.
-                        AssetScope::User => (
-                            AssetStatus::Actionable,
-                            super::text::permissions_copyable(
-                                &ctx.product.user().join("settings.json"),
-                            ),
-                        ),
-                    },
-                };
-                out.push(AssetReport {
-                    kind: AssetKind::Permissions,
-                    name: name.into(),
-                    path,
-                    scope,
-                    status,
-                    detail,
-                });
-            }
-        }
-
-        // MCP servers. The project's own `.mcp.json` is read; the global
-        // `~/.claude.json` is not, so it can only be brought over.
-        let project_mcp = ctx.project.join(".mcp.json");
-        if probe_file(&project_mcp).unwrap_or(false) {
-            // **One parse.** The loader's verdict and the count come from
-            // the same parse, so they cannot disagree about the same file.
-            match mcp_servers(&project_mcp) {
-                Ok(counts) if counts.total > 0 => {
-                    if counts.enabled > 0 {
-                        out.push(AssetReport {
-                            kind: AssetKind::McpServers,
-                            name: "mcpServers".into(),
-                            path: project_mcp.clone(),
-                            scope: AssetScope::Project,
-                            status: AssetStatus::Active,
-                            detail: super::text::mcp_active(counts.enabled),
-                        });
-                    } else {
-                        // Configured, but every server is disabled: the
-                        // definitions are there, none of them run.
-                        out.push(AssetReport {
-                            kind: AssetKind::McpServers,
-                            name: "mcpServers".into(),
-                            path: project_mcp.clone(),
-                            scope: AssetScope::Project,
-                            status: AssetStatus::Blocked,
-                            detail: super::text::mcp_all_disabled(counts.total),
-                        });
-                    }
-                }
-                // A file that parses and declares nothing is not an asset.
-                Ok(_) => {}
-                Err(reason) => out.push(AssetReport {
-                    kind: AssetKind::McpServers,
-                    name: ".mcp.json".into(),
-                    path: project_mcp,
-                    scope: AssetScope::Project,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&reason),
-                }),
-            }
-        }
-        let global_state = ctx.os_home.join(".claude.json");
-        if probe_file(&global_state).unwrap_or(false) {
-            // The same helper as the project's file — one parse, and the
-            // counts come from the loader.
-            match mcp_servers(&global_state) {
-                // The definitions can be brought over, so the count is the
-                // TOTAL: a disabled server is still a definition to move.
-                Ok(counts) if counts.total > 0 => out.push(AssetReport {
-                    kind: AssetKind::McpServers,
-                    name: "mcpServers".into(),
-                    path: global_state,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Actionable,
-                    detail: super::text::mcp_copyable(
-                        counts.total,
-                        &ctx.product.user().join("mcp.json"),
-                    ),
-                }),
-                Ok(_) => {}
-                Err(reason) => out.push(AssetReport {
-                    kind: AssetKind::McpServers,
-                    name: ".claude.json".into(),
-                    path: global_state,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&reason),
-                }),
-            }
-        }
-
-        // Hooks live in the user settings file.
-        let user_settings = user.join("settings.json");
-        if probe_file(&user_settings).unwrap_or(false) {
-            match settings_hooks(&user_settings) {
-                Ok(true) => out.push(AssetReport {
-                    kind: AssetKind::Hooks,
-                    name: "hooks".into(),
-                    path: user_settings,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Actionable,
-                    detail: super::text::hooks_copyable(
-                        &ctx.product.user().join("hooks.json"),
-                    ),
-                }),
-                Ok(false) => {}
-                Err(reason) => out.push(AssetReport {
-                    kind: AssetKind::Hooks,
-                    name: "settings.json".into(),
-                    path: user_settings,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&reason),
-                }),
-            }
-        }
-
-        // The provider rows. They come from the drafts, so the row's NAME is
-        // the account id the importer will write — a row named "provider"
-        // could never be matched by the re-check.
-        //
-        // In THIS task `provider_drafts` is still the default (empty), so no
-        // provider row appears yet; Task 6 fills the drafts in and the rows
-        // appear with it.
-        for draft in self.provider_drafts(ctx) {
-            out.push(super::provider_row(
-                &draft,
-                AssetStatus::Actionable,
-                super::text::provider_copyable(
-                    draft.base_url.as_deref(),
-                    draft.api_key.as_ref().map(|k| k.kind()),
-                ),
-            ));
-        }
-
-        // Subagent definitions: our role files need frontmatter Claude's
-        // subagent files do not have, so they cannot come over.
-        //
-        // A directory that exists but cannot be read is a `Blocked` row, not
-        // silence — "we found nothing" and "we could not look" are different
-        // answers, and only one of them is true.
-        let agents = user.join("agents");
-        if probe_dir(&agents).unwrap_or(false) {
-            match std::fs::read_dir(&agents) {
-                Ok(entries) => {
-                    for entry in entries {
-                        // An entry that cannot be read is a row, not a silent
-                        // skip: a subagent file we could not look at is one we
-                        // could not say anything true about.
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(error) => {
-                                out.push(AssetReport {
-                                    kind: AssetKind::Agents,
-                                    name: "agents".into(),
-                                    path: agents.clone(),
-                                    scope: AssetScope::User,
-                                    status: AssetStatus::Blocked,
-                                    detail: super::text::unreadable_file(&error.to_string()),
-                                });
-                                continue;
-                            }
-                        };
-                        let path = entry.path();
-                        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                            continue;
-                        }
-                        out.push(AssetReport {
-                            kind: AssetKind::Agents,
-                            name: entry.file_name().to_string_lossy().into_owned(),
-                            path,
-                            scope: AssetScope::User,
-                            status: AssetStatus::Blocked,
-                            detail: super::text::agents_blocked(),
-                        });
-                    }
-                }
-                Err(error) => out.push(AssetReport {
-                    kind: AssetKind::Agents,
-                    name: "agents".into(),
-                    path: agents,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&error.to_string()),
-                }),
-            }
-        }
-
-        // Plugins: the manifest format is theirs, not ours.
-        let plugins = user.join("plugins");
-        if plugins.is_dir() {
-            out.push(AssetReport {
-                kind: AssetKind::Plugins,
-                name: "plugins".into(),
-                path: plugins,
-                scope: AssetScope::User,
-                status: AssetStatus::Blocked,
-                detail: super::text::plugins_blocked(),
-            });
-        }
-
-        // Sessions: the history is lossy to convert, and this release does not.
-        let projects = user.join("projects");
-        if projects.is_dir() {
-            match session_file_count(&projects) {
-                Ok(count) if count > 0 => out.push(AssetReport {
-                    kind: AssetKind::Sessions,
-                    name: "sessions".into(),
-                    path: projects,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::sessions_blocked(count),
-                }),
-                Ok(_) => {}
-                Err(reason) => out.push(AssetReport {
-                    kind: AssetKind::Sessions,
-                    name: "sessions".into(),
-                    path: projects,
-                    scope: AssetScope::User,
-                    status: AssetStatus::Blocked,
-                    detail: super::text::unreadable_file(&reason),
-                }),
-            }
-        }
-
-        out
-    }
-}
-
-
-/// How many `mcpServers` a JSON file declares.
-///
-/// `Ok(0)` means the file parsed and declares none. `Err` means the file could
-/// not be read or parsed — which is **not** the same as "there are none", and
-/// the report says so instead of quietly showing nothing.
-/// Whether a settings file declares hooks. `Err` means it could not be read
-/// or parsed — again, not the same as "there are none".
-fn settings_hooks(path: &Path) -> Result<bool, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    Ok(value.get("hooks").map(|h| !h.is_null()).unwrap_or(false))
-}
-
-/// Read a JSON file. `Err` carries the reason, because "this file is broken"
-/// and "this file says nothing" are different reports.
-fn parse_json(path: &Path) -> Result<serde_json::Value, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| e.to_string())
-}
-
-/// Whether our own loader would ACCEPT this permissions file.
-///
-/// It rejects the WHOLE file when any rule is malformed
-/// (`permission_settings.rs:345-353`: `PermissionRules::parse` returns the
-/// invalid ones, and a non-empty list fails the load). So a file that parses
-/// as JSON but has a bad rule in it applies NONE of its rules — reporting it
-/// as "already in effect" would be wrong.
-///
-/// The check reuses the same rule parser our loader uses, so the two cannot
-/// drift.
-fn permission_rules_are_valid(value: &serde_json::Value) -> bool {
-    // The top level must be an object (`permission_settings.rs:328`: "expected
-    // a JSON object"). A `[]`, `null` or a scalar has no `permissions` key,
-    // so without this check it would sail through as valid.
-    if !value.is_object() {
-        return false;
-    }
-    let rules = value.get("permissions");
-    let Some(rules) = rules else {
-        // No `permissions` key at all: nothing to reject.
-        return true;
-    };
-    let Some(rules) = rules.as_object() else {
-        // `permissions` must be an object (`permission_settings.rs:228`).
-        return false;
-    };
-    let list = |key: &str| -> Vec<String> {
-        rules
-            .get(key)
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    // `allow` and `deny` must be arrays of strings when present.
-    for key in ["allow", "deny"] {
-        match rules.get(key) {
-            None => {}
-            Some(value) => {
-                let Some(items) = value.as_array() else {
-                    return false;
-                };
-                if items.iter().any(|v| !v.is_string()) {
-                    return false;
-                }
-            }
-        }
-    }
-    let allow = list("allow");
-    let deny = list("deny");
-    let (_, invalid) = crate::tools::permission_rules::PermissionRules::parse(&allow, &deny);
-    invalid.is_empty()
-}
-
-/// What an MCP file declares: how many servers, and how many of them are
-/// ENABLED.
-///
-/// **This calls the real loader** — `crate::mcp::parse_mcp_servers` — rather
-/// than re-checking the shape by hand. The loader does typed deserialization,
-/// `requirements::validate` for experimental capabilities, and HTTP auth
-/// validation; a hand-rolled check that only looked for `command`/`url` would
-/// call a file "in effect" that the loader rejects. It also reads the legacy
-/// `servers` key as an alias for `mcpServers` (`mcp/config.rs:140`), so
-/// counting is left to it too.
-///
-/// A disabled server is configured but not running, so it must not be counted
-/// as "in effect" (`mcp/config.rs:320` filters `!c.disabled`) — but it is
-/// still an asset the person configured, and hiding it would make a
-/// configured-but-disabled server vanish from the report entirely.
-fn mcp_servers(path: &Path) -> Result<McpCounts, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let servers = crate::mcp::parse_mcp_servers(&raw, crate::mcp::McpConfigSource::Project)
-        .map_err(|e| e.to_string())?;
-    Ok(McpCounts {
-        total: servers.len(),
-        enabled: servers.iter().filter(|server| !server.disabled).count(),
-    })
-}
-
-/// How many MCP servers a file declares, and how many run.
-struct McpCounts {
-    total: usize,
-    enabled: usize,
-}
-
-/// The provider Claude was pointed at, and how its credential is written.
-///
-/// `Ok(None)` = the settings file says nothing about a provider. `Err` = the
-/// file could not be parsed.
-fn claude_provider(user: &Path) -> Option<(Option<String>, Option<String>)> {
-    let raw = std::fs::read_to_string(user.join("settings.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let env = value.get("env")?.as_object()?;
-    let base_url = env
-        .get("ANTHROPIC_BASE_URL")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    // The value in Claude's `env` block IS the secret; it is never a reference.
-    let key = env
-        .get("ANTHROPIC_API_KEY")
-        .or_else(|| env.get("ANTHROPIC_AUTH_TOKEN"))
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.trim().is_empty())
-        .map(|_| "plaintext".to_string());
-    if base_url.is_none() && key.is_none() {
-        None
-    } else {
-        Some((base_url, key))
-    }
-}
-
-/// How many session files there are under `projects/`.
-///
-/// `Err` means a directory could not be read — which is **not** the same as
-/// "there are none", and the caller reports it as such.
-fn session_file_count(projects: &Path) -> Result<usize, String> {
-    let mut count = 0usize;
-    // **The visited set is what stops a symlink cycle.** `is_dir()` follows
-    // links, so a directory that links back to an ancestor would otherwise
-    // be walked forever and the read-only report would never finish.
-    let mut visited: std::collections::BTreeSet<std::path::PathBuf> =
-        std::collections::BTreeSet::new();
-    let mut stack = vec![projects.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let identity = match std::fs::canonicalize(&dir) {
-            Ok(path) => path,
-            Err(error) => return Err(error.to_string()),
-        };
-        if !visited.insert(identity) {
-            continue;
-        }
-        let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
-        for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-            // **Fallible**: a directory we cannot stat is not the same as a
-            // file that is not there.
-            match probe_dir(&path) {
-                Ok(true) => stack.push(path),
-                Ok(false) => {
-                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                        count += 1;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-    Ok(count)
-}
-```
-
-**导入**：`use std::path::Path;`（只用 `Path`，不用 `PathBuf`）。
-
-**注意：** 上面引用的 `super::text::*` 是 Task 3 建立的文案辅助模块。为了让 Task 2 单独可编译，**先在 Task 2 里建 `text.rs` 的最小版本**：
-
-`crates/atomcode-capabilities/src/migration/text.rs`：
-
-```rust
-//! The sentences a report shows.
-//!
-//! One place, so the CLI and the screen cannot say the same thing two ways.
-//! Every function here has an entry in the product message table.
-
-use atomcode_i18n::product::{t, Msg};
-
-pub fn instructions_active() -> String {
-    t(Msg::MigrationInstructionsActive).into_owned()
-}
-pub fn instructions_copyable(target: &std::path::Path) -> String {
-    t(Msg::MigrationInstructionsCopyable {
-        target: &target.display().to_string(),
-    })
-    .into_owned()
-}
-pub fn instructions_shadowed(by: &str) -> String {
-    t(Msg::MigrationInstructionsShadowed { by }).into_owned()
-}
-pub fn instructions_empty() -> String {
-    t(Msg::MigrationInstructionsEmpty).into_owned()
-}
-pub fn skill_active() -> String {
-    t(Msg::MigrationSkillActive).into_owned()
-}
-pub fn skill_rejected(reason: &str) -> String {
-    t(Msg::MigrationSkillRejected { reason }).into_owned()
-}
-pub fn skill_overridden(name: &str) -> String {
-    t(Msg::MigrationSkillOverridden { name }).into_owned()
-}
-pub fn permissions_active() -> String {
-    t(Msg::MigrationPermissionsActive).into_owned()
-}
-pub fn permissions_copyable(target: &std::path::Path) -> String {
-    t(Msg::MigrationPermissionsCopyable {
-        target: &target.display().to_string(),
-    })
-    .into_owned()
-}
-pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
-    t(Msg::MigrationMcpCopyable {
-        count,
-        target: &target.display().to_string(),
-    })
-    .into_owned()
-}
-pub fn mcp_active(count: usize) -> String {
-    t(Msg::MigrationMcpActive { count }).into_owned()
-}
-pub fn mcp_all_disabled(count: usize) -> String {
-    t(Msg::MigrationMcpAllDisabled { count }).into_owned()
-}
-pub fn unreadable_file(reason: &str) -> String {
-    t(Msg::MigrationUnreadableFile { reason }).into_owned()
-}
-pub fn rules_rejected() -> String {
-    t(Msg::MigrationRulesRejected).into_owned()
-}
-pub fn hooks_copyable(target: &std::path::Path) -> String {
-    t(Msg::MigrationHooksCopyable {
-        target: &target.display().to_string(),
-    })
-    .into_owned()
-}
-pub fn agents_blocked() -> String {
-    t(Msg::MigrationAgentsBlocked).into_owned()
-}
-pub fn plugins_blocked() -> String {
-    t(Msg::MigrationPluginsBlocked).into_owned()
-}
-pub fn sessions_blocked(count: usize) -> String {
-    t(Msg::MigrationSessionsBlocked { count }).into_owned()
-}
-pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> String {
-    t(Msg::MigrationProviderCopyable {
-        base_url: base_url.unwrap_or("-"),
-        key: key_kind.unwrap_or("-"),
-    })
-    .into_owned()
-}
-pub fn provider_name_unusable(name: &str) -> String {
-    t(Msg::MigrationProviderNameUnusable { name }).into_owned()
-}
-pub fn provider_protocol_unsupported(protocol: &str) -> String {
-    t(Msg::MigrationProviderProtocolUnsupported { protocol }).into_owned()
-}
-pub fn provider_nothing_to_connect_to() -> String {
-    t(Msg::MigrationProviderNothingToConnectTo).into_owned()
-}
-```
-
-**技能那部分的两个助手也放这里**（`claude.rs` 自己的文件里）—— Task 1 的
-`mod.rs` 里**没有**它们：它们要用 `text::*` 的文案，而 `text.rs` 是 Task 2
-才建的，Task 1 必须能单独编译。Codex 的技能不在我们的扫描目录里，所以只有
-Claude 这一侧需要。
-
-```rust
+// The skill helpers live HERE, not in one source: three sources report
+// skills (Claude Code, OpenCode, and the shared `.agents` tree), and a
+// helper that only one of them can reach is a helper the other two will
+// re-implement — and then they will drift from the registry.
 /// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
 ///
 /// A directory that does not exist is simply empty. A directory that exists
@@ -2078,21 +939,1379 @@ impl SkillTruth {
         )
     }
 }
+
+/// Whether a protocol id names a wire format we do not speak.
+///
+/// `protocol_for` returns `unsupported:<source>:<wire_api>` for one, and
+/// such an account must never be imported: `ProviderBook::create_account`
+/// resolves an unknown preset to `openai-compatible`
+/// (`config/provider_preset.rs:381`), so the import would silently succeed
+/// with the WRONG wire protocol.
+pub fn is_unsupported_protocol(protocol: &str) -> bool {
+    protocol.starts_with("unsupported:")
+}
+
+/// Whether this path is a file we can use — and if not, WHY.
+///
+/// `Path::is_file()` collapses every error into `false`: a path we cannot
+/// stat (a parent directory we may not traverse) looks exactly like a path
+/// that is not there. The report would then say "not found" about something
+/// that IS there but unreadable — and the person never learns to look.
+///
+/// `Ok(true)` = a regular file. `Ok(false)` = not there (or not a regular
+/// file). `Err(reason)` = we could not tell.
+fn probe_file(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether this path is a directory we can use — and if not, WHY.
+///
+/// The directory counterpart of [`probe_file`].
+fn probe_dir(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// What the real instruction loader makes of ONE instruction file.
+///
+/// The loader is the only thing that knows the order, what "shadowed" means,
+/// and that an empty file is `Empty` rather than `Loaded` (`instructions.rs:173`).
+/// So the report asks it, rather than re-deriving those rules — a
+/// hand-rolled check is exactly how a report ends up saying "already in
+/// effect" about a file that is not.
+///
+/// `None` when the loader does not know this file at all — it is not an
+/// instruction file, or it is not in the project tier.
+fn instruction_verdict(
+    ctx: &ScanContext,
+    path: &std::path::Path,
+) -> Option<InstructionVerdict> {
+    // The loader wants the product tree as the "home" (`instructions.rs:105`).
+    let loaded = crate::instructions::load_instructions(ctx.product.user(), &ctx.project);
+    let source = loaded.sources.iter().find(|source| source.path == path)?.clone();
+    // The file that WINS in the project tier — the one the loader did not
+    // shadow. A shadowed file's own name is NOT the explanation ("CLAUDE.md
+    // takes precedence" about a shadowed CLAUDE.md says nothing); the
+    // winner's name is.
+    //
+    // The loader marks the FIRST existing project file as the winner and
+    // shadows the rest (`instructions.rs:131-139`: `selected |= path.is_file()`),
+    // so the winner is the first PROJECT source that is neither shadowed nor
+    // missing — even if it is empty, because an empty file still wins the
+    // slot.
+    let winner = loaded.sources.iter().find(|candidate| {
+        candidate.scope == "PROJECT"
+            && candidate.state != crate::instructions::InstructionState::Shadowed
+            && candidate.state != crate::instructions::InstructionState::Missing
+    });
+    Some(InstructionVerdict {
+        name: source
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        path: source.path,
+        scope: AssetScope::Project,
+        state: source.state,
+        shadowed_by: winner.map(|winner| {
+            winner
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }),
+    })
+}
+
+/// One instruction file, and what the loader said about it.
+struct InstructionVerdict {
+    name: String,
+    path: std::path::PathBuf,
+    scope: AssetScope,
+    state: crate::instructions::InstructionState,
+    /// The project file that wins over this one, when this one is shadowed.
+    shadowed_by: Option<String>,
+}
+
 ```
 
-（`SkillTruth` 与 `skill_rows` 现在就**定义在 `claude.rs` 里**（上面那段代码），
-所以 `claude.rs` **不需要** `use super::{SkillTruth, skill_rows};` —— 父模块里
-已经没有这两个名字了，那条 import 会编译不过。）
+（`claude.rs` / `codex.rs` / `provider.rs` 在 Task 2 / 3 / 6 建；本 Task 先建三个空壳文件让编译通过：`claude.rs` 与 `codex.rs` 各自放一个 `pub struct ClaudeSource;` 之类，Task 2/3 填内容；`provider.rs` 在 Task 7 建。**为让本 Task 编译通过，Step 5 之后先建两个空壳：**）
 
+`crates/atomcode-capabilities/src/migration/claude.rs`：
+
+```rust
+//! Claude Code assets. Filled in by Task 2.
+
+use super::{MigrationSource, ScanContext};
+use super::report::AssetReport;
+
+pub struct ClaudeSource;
+
+impl MigrationSource for ClaudeSource {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+    fn detect(&self, _ctx: &ScanContext) -> Vec<AssetReport> {
+        Vec::new()
+    }
+}
+```
+
+`crates/atomcode-capabilities/src/migration/codex.rs`：
+
+```rust
+//! Codex assets. Filled in by Task 3.
+
+use super::report::AssetReport;
+use super::{MigrationSource, ScanContext};
+
+pub struct CodexSource;
+
+impl MigrationSource for CodexSource {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+    fn detect(&self, _ctx: &ScanContext) -> Vec<AssetReport> {
+        Vec::new()
+    }
+}
+```
+
+`crates/atomcode-capabilities/src/migration/provider.rs`：
+
+```rust
+//! Provider accounts found in another agent's configuration. Filled in by Task 7.
+
+use super::report::AssetScope;
+
+/// How a credential is referenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyRef {
+    /// The NAME of an environment variable, e.g. `"MY_KEY"`. The secret stays
+    /// where it is and is resolved at run time.
+    EnvVar(String),
+    /// A literal secret found in the source configuration. Written only after
+    /// the person confirms that one item.
+    Plaintext(String),
+}
+
+impl ApiKeyRef {
+    /// How the credential is written, for the report to say. The VALUE is
+    /// never part of this — only its kind.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ApiKeyRef::EnvVar(_) => "environment variable",
+            ApiKeyRef::Plaintext(_) => "a literal key",
+        }
+    }
+}
+
+/// A provider account an external agent has configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAccountDraft {
+    /// **The id the account WILL get** — already normalised by
+    /// `account_id_for`, the same rule the writer uses. It is not the raw
+    /// source id: `create_account` sanitises the name and may prefix it, so
+    /// a draft built on the raw name would never be found again.
+    pub id: String,
+    /// The definition's name **as the source wrote it**.
+    ///
+    /// Two definitions in one file can normalise to the same id (`"foo bar"`
+    /// and `"foo-bar"` both become `foo-bar`), so the id alone cannot say
+    /// which definition a row is about. The original name can — and it is
+    /// what the person recognises, so the report shows it.
+    pub source_name: String,
+    /// A preset or protocol id (`openai-compatible`, `anthropic-compatible`,
+    /// `openai-responses`).
+    pub protocol: String,
+    /// The endpoint as it will be **stored** — normalised by
+    /// `effective_endpoint`, so it is `None` when the endpoint is the
+    /// protocol's own default (the writer stores nothing in that case).
+    /// The endpoint in USE is `endpoint_in_use(protocol, base_url)`.
+    pub base_url: Option<String>,
+    /// The credential, when the source named one.
+    pub api_key: Option<ApiKeyRef>,
+    /// The models the source was using.
+    pub models: Vec<String>,
+    /// Where this account was configured — the file it was read from. The
+    /// report shows it, so a person can see WHICH file to look at.
+    pub source_path: std::path::PathBuf,
+    /// Whether the account came from the person's own tree or from the
+    /// current project. A project provider is not the user's provider.
+    pub scope: AssetScope,
+    /// Why this account CANNOT be imported, when that is the case.
+    ///
+    /// `None` means it can. A `Some` reason means the account is still
+    /// **reported** — it is configured, the person should see it — but the
+    /// importer refuses it.
+    ///
+    /// Two things land here:
+    /// - the name cannot become an account id at all (`account_id_for`
+    ///   returns an error), so there is nothing to write it under;
+    /// - the endpoint speaks a wire protocol we do not support.
+    ///
+    /// Both used to be either silently dropped or reported as importable,
+    /// which is the one thing this report must never do.
+    pub blocked: Option<String>,
+}
+```
+
+**这个 Task 还要带上共享的归一包装** —— 它们不属于任何一个来源，所以放在
+`provider.rs`（共享模块）里，**每个来源都能用**：
+
+```rust
+/// The protocol an external agent's endpoint speaks, mapped to ours.
+///
+/// **The SOURCE says its own default**, so this function does not ask who is
+/// asking: a new source passes a different default, and the shared module
+/// stays unchanged. That is what makes adding a source cheap.
+///
+/// **A missing `wire_api` means Responses, not chat/completions.** Codex's own
+/// `WireApi` has `#[default] Responses`
+/// (`codex-rs/model-provider-info/src/lib.rs:117`), so a config that names a
+/// provider but no protocol speaks Responses. Mapping that to
+/// `openai-compatible` (chat/completions) would send the request to an
+/// endpoint that does not speak it.
+///
+/// A protocol we do not know is **not** guessed at — it becomes
+/// `unsupported:…` and the report says so, instead of the import failing
+/// later against an endpoint that speaks something else.
+pub fn protocol_for_wire(wire_api: Option<&str>, default: &str) -> String {
+    match wire_api {
+        Some("responses") => "openai-responses".into(),
+        Some("anthropic") => "anthropic-compatible".into(),
+        Some("chat") | Some("openai") => "openai-compatible".into(),
+        Some(other) => unsupported_protocol(other),
+        None => default.into(),
+    }
+}
+
+/// The protocol id for a wire family we do not support.
+///
+/// The report says the endpoint speaks something we cannot, so the person
+/// sees it instead of the import silently failing later.
+pub fn unsupported_protocol(wire_api: &str) -> String {
+    format!("unsupported:{wire_api}")
+}
+
+/// The id the importer will give this account.
+///
+/// **The writer normalizes the name**, so the report must use the SAME id:
+/// `ProviderBook::create_account` runs the name through `base_id`
+/// (`provider_book.rs:700`), which sanitises it and prefixes `custom-` when
+/// it belongs to CodingPlan. A report built on the raw source id would never
+/// match the account on the next run — the re-check would keep saying
+/// "can be brought over" about an account that is already there.
+///
+/// `base_id` is made **public** for this (`pub fn account_id_for`), so there is
+/// **one** rule, not two that can drift.
+pub fn account_id_for(name: &str) -> Option<String> {
+    match atomcode_config::provider_book::account_id_for(name) {
+        Ok(id) => Some(id),
+        // An unusable name cannot become an account at all.
+        Err(_) => None,
+    }
+}
+
+/// The endpoint as it will be **stored**.
+///
+/// `endpoint_override` (`provider_book.rs:785`) trims the endpoint and stores
+/// NOTHING when it equals the protocol's own default — so a file does not pin
+/// a URL that should follow the build. Comparing the raw source endpoint
+/// against the stored one would never match: the account ends up with
+/// `base_url = None` while the draft still says the default URL.
+///
+/// `endpoint_override` is made **public** for this (`pub fn effective_endpoint`).
+///
+/// **This delegates to the writer's rule** rather than re-implementing it. A
+/// copy would be correct today and wrong the day the writer changes — and the
+/// symptom would be a re-check that never matches.
+pub fn effective_endpoint(protocol: &str, endpoint: Option<&str>) -> Option<String> {
+    atomcode_config::provider_book::effective_endpoint(protocol, endpoint.unwrap_or_default())
+}
+
+/// Whether this protocol REQUIRES an endpoint.
+///
+/// `ProviderBook::create_account` refuses a custom-compatible protocol with no
+/// endpoint (`provider_book.rs:198`: `ProtocolNeedsEndpoint`) — only a preset
+/// that has its own default can do without one.
+///
+/// The report has to know this **before** the write, or it would advertise an
+/// account as importable and then fail to write it.
+pub fn protocol_needs_endpoint(protocol: &str) -> bool {
+    atomcode_config::config::provider_preset::preset(protocol)
+        .map(|preset| preset.default_base_url.is_none())
+        .unwrap_or(true)
+}
+
+/// The endpoint the account will actually talk to.
+///
+/// The stored form may be `None` — that means "follow the protocol's
+/// default" — but the person still needs to see WHICH endpoint that is.
+pub fn endpoint_in_use(protocol: &str, endpoint: Option<&str>) -> Option<String> {
+    if let Some(stored) = effective_endpoint(protocol, endpoint) {
+        return Some(stored);
+    }
+    atomcode_config::config::provider_preset::preset(protocol)
+        .and_then(|preset| preset.default_base_url)
+        .map(str::to_string)
+}
+
+/// Read a JSON file that may carry comments.
+///
+/// **Comments are stripped first**, the way our own MCP loader does
+/// (`mcp/config.rs:624`: `serde_json::from_str(&crate::jsonc::strip_comments(content))`).
+/// A hand-edited file with a comment in it is a perfectly good file; calling
+/// it broken would be wrong.
+///
+/// `None` when the file cannot be read or parsed — the caller reports that
+/// as blocked, and does NOT treat it as "there is nothing here".
+pub fn read_jsonc(path: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&crate::jsonc::strip_comments(&raw)).ok()
+}
+```
+
+> **为什么这些在 Task 1 而不是 Task 7**：它们**不是**某个来源的知识，而是
+> 「我们的写入方会怎么归一」——`account_id_for` / `effective_endpoint` 是
+> `atomcode-config` 那个写入方的规则，`protocol_for_wire` 只问「这条线怎么说」。
+> Task 4 的 OpenCode 扫描已经要用 `account_id_for` 与 `effective_endpoint`
+> （它要报 provider 行），Task 1 也要 re-export `endpoint_in_use` 给宿主 ——
+> 所以它们必须在 Task 1 就到位，**Task 1 才能单独编译并通过**。
+> Task 7 只做**每个来源怎么读出自己的草案**（Claude 读 `env` 块、Codex 合并两层
+> TOML），不再动这些共享规则。
+
+`provider.rs` 顶部补 `use std::path::Path;`。
+
+`crates/atomcode-capabilities/src/migration/text.rs`（**最小版** —— Task 1 的
+`mod.rs` 里的技能助手要用这四条；Task 2 再把其余的补进来）：
+
+```rust
+//! The sentences a report shows.
+//!
+//! One place, so the CLI and the screen cannot say the same thing two ways.
+//! Every function here has an entry in the product message table.
+
+use atomcode_i18n::product::{t, Msg};
+
+pub fn skill_active() -> String {
+    t(Msg::MigrationSkillActive).into_owned()
+}
+pub fn skill_rejected(reason: &str) -> String {
+    t(Msg::MigrationSkillRejected { reason }).into_owned()
+}
+pub fn skill_overridden(name: &str) -> String {
+    t(Msg::MigrationSkillOverridden { name }).into_owned()
+}
+pub fn unreadable_file(reason: &str) -> String {
+    t(Msg::MigrationUnreadableFile { reason }).into_owned()
+}
+```
+
+`crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
+（**Task 1 只加这四条**，Task 2 再加其余的；`en.rs` 与 `zh_cn.rs` 同步加）：
+
+```rust
+    // External-agent asset migration (see
+    // docs/plans/2026-11-17-external-agent-asset-migration-design.md).
+    MigrationSkillActive,
+    MigrationSkillRejected {
+        reason: &'a str,
+    },
+    MigrationSkillOverridden {
+        name: &'a str,
+    },
+    MigrationUnreadableFile {
+        reason: &'a str,
+    },
+```
+
+> **为什么 Task 1 就要建 `text.rs`**：Task 1 的 `mod.rs` 里已经有共享的技能助手
+> （`skill_rows` / `SkillTruth`），而它们要说「已经生效」「被加载器拒绝」「被同名
+> 覆盖」「读不了」这四句话 —— 那些话只能由**真的加载器**说出来，所以文案走
+> `text::*`。Task 1 必须能**单独编译并通过**（阶段 P1 的验收就是
+> `cargo nextest run -p atomcode-capabilities --features migration` 全绿），
+> 所以这四条文案与 `text.rs` 的最小版在 Task 1 就到位；Task 2 只是往里追加。
+
+- [ ] **Step 6: 跑测试确认通过**
+
+Run: `cargo nextest run -p atomcode-capabilities --features migration`
+Expected: PASS —— Task 1 的三条（报告计数 / 空报告 / 无来源扫描）。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/
+git commit -m "feat(capabilities): add migration module skeleton
+
+The report carries four statuses, not two: Active (we read it today),
+Actionable (there is a known way to bring it over), Blocked (it cannot
+come over). \"Compatible\" and \"needs conversion\" cannot say whether a
+lost session history is recoverable, and that is the thing a person needs
+to know before deciding.
+
+The feature pulls atomcode-config, which the screen already has transitively."
+```
+
+---
+
+## Task 2: Claude Code 来源
+
+**Files:**
+- Modify: `crates/atomcode-capabilities/src/migration/claude.rs`
+- Modify: `crates/atomcode-capabilities/src/migration/text.rs`（**扩成完整版**：Task 1 只建了 4 条）
+- Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`（**加其余的词条**）
+- Test: `crates/atomcode-capabilities/src/migration/claude.rs`（内联 `mod tests`）
+
+- [ ] **Step 1: 写失败的测试**
+
+在 `claude.rs` 末尾追加：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+
+    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
+        ScanContext {
+            os_home: home.to_path_buf(),
+            project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        }
+    }
+
+    fn skill_at(root: &std::path::Path, name: &str) {
+        let dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
+    }
+
+    /// Write a file, creating its parent directory first.
+    ///
+    /// A fixture that writes `<home>/.claude/settings.json` into a directory
+    /// that does not exist yet fails at the write, not at the assertion — and
+    /// the failure says nothing about the behaviour being checked.
+    fn write_file(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn a_user_skill_is_active_because_we_read_that_path_today() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        skill_at(&home.path().join(".claude"), "web-access");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let skill = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills && a.name == "web-access")
+            .expect("the skill is reported");
+        assert_eq!(skill.status, AssetStatus::Active);
+        assert_eq!(skill.scope, AssetScope::User);
+    }
+
+    #[test]
+    fn a_project_instruction_file_is_active() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Active);
+        assert_eq!(instructions.scope, AssetScope::Project);
+    }
+
+    #[test]
+    fn a_user_instruction_file_is_actionable_because_the_global_layer_cannot_see_it() {
+        // The global instruction tier reads <product user tree>/ATOMCODE.md, not
+        // ~/.claude/CLAUDE.md — so this one has to be copied, not merely read.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Actionable);
+        assert_eq!(instructions.scope, AssetScope::User);
+    }
+
+    #[test]
+    fn a_project_instruction_file_shadowed_by_agents_md_is_not_active() {
+        // The project tier takes the FIRST existing name in order, so a
+        // CLAUDE.md next to an AGENTS.md is never loaded. Calling it "already
+        // in effect" would be a lie.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("AGENTS.md"), "# rules");
+        write_file(&project.path().join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert_eq!(instructions.status, AssetStatus::Blocked);
+        assert!(
+            instructions.detail.contains("AGENTS.md"),
+            "it says what shadows it: {}",
+            instructions.detail
+        );
+    }
+
+    #[test]
+    fn a_user_settings_file_is_actionable_and_the_project_one_is_active() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("settings.json"), "{}");
+        write_file(&project.path().join(".claude").join("settings.json"), "{}");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let permissions: Vec<_> = assets
+            .iter()
+            .filter(|a| a.kind == AssetKind::Permissions)
+            .collect();
+        assert_eq!(permissions.len(), 2);
+        assert!(permissions.iter().any(|p| p.scope == AssetScope::User
+            && p.status == AssetStatus::Actionable));
+        assert!(permissions.iter().any(|p| p.scope == AssetScope::Project
+            && p.status == AssetStatus::Active));
+    }
+
+    #[test]
+    fn a_broken_settings_file_is_blocked_not_active() {
+        // Our own loader refuses a broken policy (`permission_settings.rs:296`),
+        // so a broken file must not be reported as already in effect.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&project.path().join(".claude").join("settings.json"), "{not json");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let permissions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Permissions)
+            .expect("the broken file is reported");
+        assert_eq!(permissions.status, AssetStatus::Blocked);
+    }
+
+    #[test]
+    fn a_project_mcp_file_is_active_and_the_global_one_is_actionable() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(
+            &project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"mcp-fs"}}}"#,
+        );
+        write_file(
+            &home.path().join(".claude.json"),
+            r#"{"mcpServers":{"gh":{"command":"mcp-gh"}}}"#,
+        );
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let mcp: Vec<_> = assets.iter().filter(|a| a.kind == AssetKind::McpServers).collect();
+        assert_eq!(mcp.len(), 2);
+        assert!(mcp.iter().any(|m| m.scope == AssetScope::Project
+            && m.status == AssetStatus::Active));
+        assert!(mcp.iter().any(|m| m.scope == AssetScope::User
+            && m.status == AssetStatus::Actionable));
+    }
+
+    #[test]
+    fn an_actionable_row_names_the_path_to_copy_it_to() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let instructions = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Instructions)
+            .expect("the instructions are reported");
+        assert!(
+            instructions.detail.contains("ATOMCODE.md"),
+            "the row says where to put it: {}",
+            instructions.detail
+        );
+    }
+
+    #[test]
+    fn a_subagent_definition_is_blocked_because_the_formats_differ() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reviewer.md"), "---").unwrap();
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let agent = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Agents)
+            .expect("the agent definition is reported");
+        assert_eq!(agent.status, AssetStatus::Blocked);
+    }
+
+    #[test]
+    fn a_broken_settings_file_does_not_stop_the_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_file(&home.path().join(".claude").join("settings.json"), "{not json");
+        skill_at(&home.path().join(".claude"), "web-access");
+
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        // The skill is still found, and the broken file is reported as blocked
+        // rather than taking the whole scan down.
+        assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
+        assert!(assets
+            .iter()
+            .any(|a| a.kind == AssetKind::Permissions && a.status == AssetStatus::Blocked));
+    }
+
+    #[test]
+    fn no_claude_directory_means_no_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        assert!(assets.is_empty());
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo nextest run -p atomcode-capabilities --features migration migration::claude`
+Expected: FAIL —— 找不到资产（`detect` 返回空）。
+
+- [ ] **Step 3: 实现 ClaudeSource**
+
+把 `claude.rs` 整体替换为：
+
+```rust
+//! Claude Code's assets.
+//!
+//! What AtomCode reads from a Claude Code tree today, and what it does not:
+//!
+//! | asset                          | user level      | project level |
+//! |--------------------------------|-----------------|---------------|
+//! | instructions (`CLAUDE.md`)     | not read        | read          |
+//! | skills / commands              | read            | read          |
+//! | permissions (`settings.json`)  | not read        | read          |
+//! | MCP (`~/.claude.json`)         | not read        | read          |
+//!
+//! The global instruction tier reads `<product user tree>/ATOMCODE.md` and the
+//! permission loader reads `<product user tree>` — neither is `~/.claude`. So
+//! the user-level ones are `Actionable` (copy them over), not `Active`.
+//!
+//! Read-only: this looks and reports, it never writes.
+
+use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
+use super::{MigrationSource, ScanContext};
+use std::path::{Path, PathBuf};
+
+pub struct ClaudeSource;
+
+impl MigrationSource for ClaudeSource {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
+        let mut out = Vec::new();
+        let user = ctx.os_home.join(".claude");
+        let project_claude = ctx.project.join(".claude");
+        // Loaded ONCE per scan: the registry is what decides whether a skill
+        // is really in effect.
+        let skills = super::SkillTruth::load(ctx);
+
+        // Instructions. The verdict comes from the **real loader** —
+        // `crate::instructions::load_instructions` — not from a hand-rolled
+        // "is it empty / is it shadowed" check. The loader knows the whole
+        // order (`.atomcode.md`, `ATOMCODE.md`, `AGENTS.md`, `CLAUDE.md`,
+        // `claude.md` — `instructions.rs:17`), what "shadowed" means, and that
+        // an empty file loads as `Empty` rather than `Loaded`
+        // (`instructions.rs:173`). Re-implementing those rules is how a report
+        // ends up saying "already in effect" about a file that is not.
+        let project_instructions = ctx.project.join("CLAUDE.md");
+        if let Some(source) = super::instruction_verdict(ctx, &project_instructions) {
+            // A `Missing` file is not an asset at all, so it produces NO row.
+            // It cannot be a `continue` — this is not a loop, and the rest of
+            // the assets still need scanning.
+            if source.state != crate::instructions::InstructionState::Missing {
+                let (status, detail) = match source.state {
+                    crate::instructions::InstructionState::Loaded => {
+                        (AssetStatus::Active, super::text::instructions_active())
+                    }
+                    // The message names the file that WINS, not this one.
+                    crate::instructions::InstructionState::Shadowed => (
+                        AssetStatus::Blocked,
+                        super::text::instructions_shadowed(
+                            source.shadowed_by.as_deref().unwrap_or(&source.name),
+                        ),
+                    ),
+                    crate::instructions::InstructionState::Empty => {
+                        (AssetStatus::Blocked, super::text::instructions_empty())
+                    }
+                    crate::instructions::InstructionState::Unreadable => (
+                        AssetStatus::Blocked,
+                        super::text::unreadable_file("the file could not be read"),
+                    ),
+                    crate::instructions::InstructionState::Missing => {
+                        unreachable!("handled above")
+                    }
+                };
+                out.push(AssetReport {
+                    kind: AssetKind::Instructions,
+                    name: source.name,
+                    path: source.path,
+                    scope: source.scope,
+                    status,
+                    detail,
+                });
+            }
+        }
+        let user_instructions = user.join("CLAUDE.md");
+        // **Fallible**: a file we cannot stat is not the same as a file that
+        // is not there.
+        match probe_file(&user_instructions) {
+            Ok(true) => out.push(AssetReport {
+                kind: AssetKind::Instructions,
+                name: "CLAUDE.md".into(),
+                path: user_instructions,
+                scope: AssetScope::User,
+                status: AssetStatus::Actionable,
+                detail: super::text::instructions_copyable(
+                    &ctx.product.user().join("ATOMCODE.md"),
+                ),
+            }),
+            Ok(false) => {}
+            Err(reason) => out.push(AssetReport {
+                kind: AssetKind::Instructions,
+                name: "CLAUDE.md".into(),
+                path: user_instructions,
+                scope: AssetScope::User,
+                status: AssetStatus::Blocked,
+                detail: super::text::unreadable_file(&reason),
+            }),
+        }
+
+        // Skills and commands: the standard paths are in our own scan list.
+        for (kind, dir) in [
+            (AssetKind::Skills, "skills"),
+            (AssetKind::Commands, "commands"),
+        ] {
+            for (scope, root) in [
+                (AssetScope::User, user.join(dir)),
+                (AssetScope::Project, project_claude.join(dir)),
+            ] {
+                out.extend(super::skill_rows(kind, scope, &root, &skills));
+            }
+        }
+
+        // Permissions. A file that cannot be parsed is NOT "in effect" — our
+        // own loader refuses a broken policy (`permission_settings.rs:296`), so
+        // it must not be reported as active either.
+        for (scope, root) in [
+            (AssetScope::User, user.clone()),
+            (AssetScope::Project, project_claude.clone()),
+        ] {
+            for name in ["settings.json", "settings.local.json"] {
+                let path = root.join(name);
+                match probe_file(&path) {
+                    Ok(true) => {}
+                    // Not there: nothing to report.
+                    Ok(false) => continue,
+                    // There, but we cannot read it: that IS an asset, and it
+                    // is blocked.
+                    Err(reason) => {
+                        out.push(AssetReport {
+                            kind: AssetKind::Permissions,
+                            name: name.into(),
+                            path,
+                            scope,
+                            status: AssetStatus::Blocked,
+                            detail: super::text::unreadable_file(&reason),
+                        });
+                        continue;
+                    }
+                }
+                let parsed = parse_json(&path);
+                let (status, detail) = match parsed {
+                    Err(reason) => (AssetStatus::Blocked, super::text::unreadable_file(&reason)),
+                    // A file that parses but whose rules our loader would
+                    // REJECT is not "in effect" either — the loader fails the
+                    // whole file (`permission_settings.rs:345-353`), so none
+                    // of its rules apply.
+                    Ok(value) if !permission_rules_are_valid(&value) => (
+                        AssetStatus::Blocked,
+                        super::text::rules_rejected(),
+                    ),
+                    Ok(_) => match scope {
+                        // The project one is merged into our own permission rules.
+                        AssetScope::Project => {
+                            (AssetStatus::Active, super::text::permissions_active())
+                        }
+                        // The user one is not read: the loader reads the product tree.
+                        AssetScope::User => (
+                            AssetStatus::Actionable,
+                            super::text::permissions_copyable(
+                                &ctx.product.user().join("settings.json"),
+                            ),
+                        ),
+                    },
+                };
+                out.push(AssetReport {
+                    kind: AssetKind::Permissions,
+                    name: name.into(),
+                    path,
+                    scope,
+                    status,
+                    detail,
+                });
+            }
+        }
+
+        // MCP servers. The project's own `.mcp.json` is read; the global
+        // `~/.claude.json` is not, so it can only be brought over.
+        let project_mcp = ctx.project.join(".mcp.json");
+        if probe_file(&project_mcp).unwrap_or(false) {
+            // **One parse.** The loader's verdict and the count come from
+            // the same parse, so they cannot disagree about the same file.
+            match mcp_servers(&project_mcp) {
+                Ok(counts) if counts.total > 0 => {
+                    if counts.enabled > 0 {
+                        out.push(AssetReport {
+                            kind: AssetKind::McpServers,
+                            name: "mcpServers".into(),
+                            path: project_mcp.clone(),
+                            scope: AssetScope::Project,
+                            status: AssetStatus::Active,
+                            detail: super::text::mcp_active(counts.enabled),
+                        });
+                    } else {
+                        // Configured, but every server is disabled: the
+                        // definitions are there, none of them run.
+                        out.push(AssetReport {
+                            kind: AssetKind::McpServers,
+                            name: "mcpServers".into(),
+                            path: project_mcp.clone(),
+                            scope: AssetScope::Project,
+                            status: AssetStatus::Blocked,
+                            detail: super::text::mcp_all_disabled(counts.total),
+                        });
+                    }
+                }
+                // A file that parses and declares nothing is not an asset.
+                Ok(_) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: ".mcp.json".into(),
+                    path: project_mcp,
+                    scope: AssetScope::Project,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
+        }
+        let global_state = ctx.os_home.join(".claude.json");
+        if probe_file(&global_state).unwrap_or(false) {
+            // The same helper as the project's file — one parse, and the
+            // counts come from the loader.
+            match mcp_servers(&global_state) {
+                // The definitions can be brought over, so the count is the
+                // TOTAL: a disabled server is still a definition to move.
+                Ok(counts) if counts.total > 0 => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: "mcpServers".into(),
+                    path: global_state,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Actionable,
+                    detail: super::text::mcp_copyable(
+                        counts.total,
+                        &ctx.product.user().join("mcp.json"),
+                    ),
+                }),
+                Ok(_) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::McpServers,
+                    name: ".claude.json".into(),
+                    path: global_state,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
+        }
+
+        // Hooks live in the user settings file.
+        let user_settings = user.join("settings.json");
+        if probe_file(&user_settings).unwrap_or(false) {
+            match settings_hooks(&user_settings) {
+                Ok(true) => out.push(AssetReport {
+                    kind: AssetKind::Hooks,
+                    name: "hooks".into(),
+                    path: user_settings,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Actionable,
+                    detail: super::text::hooks_copyable(
+                        &ctx.product.user().join("hooks.json"),
+                    ),
+                }),
+                Ok(false) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::Hooks,
+                    name: "settings.json".into(),
+                    path: user_settings,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
+        }
+
+        // The provider rows. They come from the drafts, so the row's NAME is
+        // the account id the importer will write — a row named "provider"
+        // could never be matched by the re-check.
+        //
+        // In THIS task `provider_drafts` is still the default (empty), so no
+        // provider row appears yet; Task 7 fills the drafts in and the rows
+        // appear with it.
+        for draft in self.provider_drafts(ctx) {
+            out.push(super::provider_row(
+                &draft,
+                AssetStatus::Actionable,
+                super::text::provider_copyable(
+                    draft.base_url.as_deref(),
+                    draft.api_key.as_ref().map(|k| k.kind()),
+                ),
+            ));
+        }
+
+        // Subagent definitions: our role files need frontmatter Claude's
+        // subagent files do not have, so they cannot come over.
+        //
+        // A directory that exists but cannot be read is a `Blocked` row, not
+        // silence — "we found nothing" and "we could not look" are different
+        // answers, and only one of them is true.
+        let agents = user.join("agents");
+        if probe_dir(&agents).unwrap_or(false) {
+            match std::fs::read_dir(&agents) {
+                Ok(entries) => {
+                    for entry in entries {
+                        // An entry that cannot be read is a row, not a silent
+                        // skip: a subagent file we could not look at is one we
+                        // could not say anything true about.
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                out.push(AssetReport {
+                                    kind: AssetKind::Agents,
+                                    name: "agents".into(),
+                                    path: agents.clone(),
+                                    scope: AssetScope::User,
+                                    status: AssetStatus::Blocked,
+                                    detail: super::text::unreadable_file(&error.to_string()),
+                                });
+                                continue;
+                            }
+                        };
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                            continue;
+                        }
+                        out.push(AssetReport {
+                            kind: AssetKind::Agents,
+                            name: entry.file_name().to_string_lossy().into_owned(),
+                            path,
+                            scope: AssetScope::User,
+                            status: AssetStatus::Blocked,
+                            detail: super::text::agents_blocked(),
+                        });
+                    }
+                }
+                Err(error) => out.push(AssetReport {
+                    kind: AssetKind::Agents,
+                    name: "agents".into(),
+                    path: agents,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&error.to_string()),
+                }),
+            }
+        }
+
+        // Plugins: the manifest format is theirs, not ours.
+        let plugins = user.join("plugins");
+        if plugins.is_dir() {
+            out.push(AssetReport {
+                kind: AssetKind::Plugins,
+                name: "plugins".into(),
+                path: plugins,
+                scope: AssetScope::User,
+                status: AssetStatus::Blocked,
+                detail: super::text::plugins_blocked(),
+            });
+        }
+
+        // Sessions: the history is lossy to convert, and this release does not.
+        let projects = user.join("projects");
+        if projects.is_dir() {
+            match session_file_count(&projects) {
+                Ok(count) if count > 0 => out.push(AssetReport {
+                    kind: AssetKind::Sessions,
+                    name: "sessions".into(),
+                    path: projects,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::sessions_blocked(count),
+                }),
+                Ok(_) => {}
+                Err(reason) => out.push(AssetReport {
+                    kind: AssetKind::Sessions,
+                    name: "sessions".into(),
+                    path: projects,
+                    scope: AssetScope::User,
+                    status: AssetStatus::Blocked,
+                    detail: super::text::unreadable_file(&reason),
+                }),
+            }
+        }
+
+        out
+    }
+}
+
+
+/// How many `mcpServers` a JSON file declares.
+///
+/// `Ok(0)` means the file parsed and declares none. `Err` means the file could
+/// not be read or parsed — which is **not** the same as "there are none", and
+/// the report says so instead of quietly showing nothing.
+/// Whether a settings file declares hooks. `Err` means it could not be read
+/// or parsed — again, not the same as "there are none".
+fn settings_hooks(path: &Path) -> Result<bool, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(value.get("hooks").map(|h| !h.is_null()).unwrap_or(false))
+}
+
+/// Read a JSON file. `Err` carries the reason, because "this file is broken"
+/// and "this file says nothing" are different reports.
+fn parse_json(path: &Path) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&raw).map_err(|e| e.to_string())
+}
+
+/// Whether our own loader would ACCEPT this permissions file.
+///
+/// It rejects the WHOLE file when any rule is malformed
+/// (`permission_settings.rs:345-353`: `PermissionRules::parse` returns the
+/// invalid ones, and a non-empty list fails the load). So a file that parses
+/// as JSON but has a bad rule in it applies NONE of its rules — reporting it
+/// as "already in effect" would be wrong.
+///
+/// The check reuses the same rule parser our loader uses, so the two cannot
+/// drift.
+fn permission_rules_are_valid(value: &serde_json::Value) -> bool {
+    // The top level must be an object (`permission_settings.rs:328`: "expected
+    // a JSON object"). A `[]`, `null` or a scalar has no `permissions` key,
+    // so without this check it would sail through as valid.
+    if !value.is_object() {
+        return false;
+    }
+    let rules = value.get("permissions");
+    let Some(rules) = rules else {
+        // No `permissions` key at all: nothing to reject.
+        return true;
+    };
+    let Some(rules) = rules.as_object() else {
+        // `permissions` must be an object (`permission_settings.rs:228`).
+        return false;
+    };
+    let list = |key: &str| -> Vec<String> {
+        rules
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // `allow` and `deny` must be arrays of strings when present.
+    for key in ["allow", "deny"] {
+        match rules.get(key) {
+            None => {}
+            Some(value) => {
+                let Some(items) = value.as_array() else {
+                    return false;
+                };
+                if items.iter().any(|v| !v.is_string()) {
+                    return false;
+                }
+            }
+        }
+    }
+    let allow = list("allow");
+    let deny = list("deny");
+    let (_, invalid) = crate::tools::permission_rules::PermissionRules::parse(&allow, &deny);
+    invalid.is_empty()
+}
+
+/// What an MCP file declares: how many servers, and how many of them are
+/// ENABLED.
+///
+/// **This calls the real loader** — `crate::mcp::parse_mcp_servers` — rather
+/// than re-checking the shape by hand. The loader does typed deserialization,
+/// `requirements::validate` for experimental capabilities, and HTTP auth
+/// validation; a hand-rolled check that only looked for `command`/`url` would
+/// call a file "in effect" that the loader rejects. It also reads the legacy
+/// `servers` key as an alias for `mcpServers` (`mcp/config.rs:140`), so
+/// counting is left to it too.
+///
+/// A disabled server is configured but not running, so it must not be counted
+/// as "in effect" (`mcp/config.rs:320` filters `!c.disabled`) — but it is
+/// still an asset the person configured, and hiding it would make a
+/// configured-but-disabled server vanish from the report entirely.
+fn mcp_servers(path: &Path) -> Result<McpCounts, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let servers = crate::mcp::parse_mcp_servers(&raw, crate::mcp::McpConfigSource::Project)
+        .map_err(|e| e.to_string())?;
+    Ok(McpCounts {
+        total: servers.len(),
+        enabled: servers.iter().filter(|server| !server.disabled).count(),
+    })
+}
+
+/// How many MCP servers a file declares, and how many run.
+struct McpCounts {
+    total: usize,
+    enabled: usize,
+}
+
+/// The provider Claude was pointed at, and how its credential is written.
+///
+/// `Ok(None)` = the settings file says nothing about a provider. `Err` = the
+/// file could not be parsed.
+fn claude_provider(user: &Path) -> Option<(Option<String>, Option<String>)> {
+    let raw = std::fs::read_to_string(user.join("settings.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let env = value.get("env")?.as_object()?;
+    let base_url = env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    // The value in Claude's `env` block IS the secret; it is never a reference.
+    let key = env
+        .get("ANTHROPIC_API_KEY")
+        .or_else(|| env.get("ANTHROPIC_AUTH_TOKEN"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|_| "plaintext".to_string());
+    if base_url.is_none() && key.is_none() {
+        None
+    } else {
+        Some((base_url, key))
+    }
+}
+
+/// How many session files there are under `projects/`.
+///
+/// `Err` means a directory could not be read — which is **not** the same as
+/// "there are none", and the caller reports it as such.
+fn session_file_count(projects: &Path) -> Result<usize, String> {
+    let mut count = 0usize;
+    // **The visited set is what stops a symlink cycle.** `is_dir()` follows
+    // links, so a directory that links back to an ancestor would otherwise
+    // be walked forever and the read-only report would never finish.
+    let mut visited: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    let mut stack = vec![projects.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let identity = match std::fs::canonicalize(&dir) {
+            Ok(path) => path,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !visited.insert(identity) {
+            continue;
+        }
+        let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            // **Fallible**: a directory we cannot stat is not the same as a
+            // file that is not there.
+            match probe_dir(&path) {
+                Ok(true) => stack.push(path),
+                Ok(false) => {
+                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        count += 1;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(count)
+}
+```
+
+**导入**：`use std::path::Path;`（只用 `Path`，不用 `PathBuf`）。
+
+**注意：** 上面引用的 `super::text::*` 是 Task 1 建的文案辅助模块（最小版），
+Task 2 把它**整个替换**成完整版 —— **不要在最小版后面追加**，否则同一个函数
+会定义两次（编译不过）：
+
+`crates/atomcode-capabilities/src/migration/text.rs`（**替换 Task 1 的最小版**）：
+
+```rust
+//! The sentences a report shows.
+//!
+//! One place, so the CLI and the screen cannot say the same thing two ways.
+//! Every function here has an entry in the product message table.
+
+use atomcode_i18n::product::{t, Msg};
+
+pub fn instructions_active() -> String {
+    t(Msg::MigrationInstructionsActive).into_owned()
+}
+pub fn instructions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationInstructionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+pub fn instructions_shadowed(by: &str) -> String {
+    t(Msg::MigrationInstructionsShadowed { by }).into_owned()
+}
+pub fn instructions_empty() -> String {
+    t(Msg::MigrationInstructionsEmpty).into_owned()
+}
+pub fn skill_active() -> String {
+    t(Msg::MigrationSkillActive).into_owned()
+}
+pub fn skill_rejected(reason: &str) -> String {
+    t(Msg::MigrationSkillRejected { reason }).into_owned()
+}
+pub fn skill_overridden(name: &str) -> String {
+    t(Msg::MigrationSkillOverridden { name }).into_owned()
+}
+pub fn permissions_active() -> String {
+    t(Msg::MigrationPermissionsActive).into_owned()
+}
+pub fn permissions_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationPermissionsCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
+    t(Msg::MigrationMcpCopyable {
+        count,
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+pub fn mcp_active(count: usize) -> String {
+    t(Msg::MigrationMcpActive { count }).into_owned()
+}
+pub fn mcp_all_disabled(count: usize) -> String {
+    t(Msg::MigrationMcpAllDisabled { count }).into_owned()
+}
+pub fn unreadable_file(reason: &str) -> String {
+    t(Msg::MigrationUnreadableFile { reason }).into_owned()
+}
+pub fn rules_rejected() -> String {
+    t(Msg::MigrationRulesRejected).into_owned()
+}
+pub fn opencode_plaintext_credentials() -> String {
+    t(Msg::MigrationOpencodePlaintextCredentials).into_owned()
+}
+pub fn hooks_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationHooksCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+pub fn agents_blocked() -> String {
+    t(Msg::MigrationAgentsBlocked).into_owned()
+}
+pub fn plugins_blocked() -> String {
+    t(Msg::MigrationPluginsBlocked).into_owned()
+}
+pub fn sessions_blocked(count: usize) -> String {
+    t(Msg::MigrationSessionsBlocked { count }).into_owned()
+}
+pub fn provider_copyable(base_url: Option<&str>, key_kind: Option<&str>) -> String {
+    t(Msg::MigrationProviderCopyable {
+        base_url: base_url.unwrap_or("-"),
+        key: key_kind.unwrap_or("-"),
+    })
+    .into_owned()
+}
+pub fn provider_name_unusable(name: &str) -> String {
+    t(Msg::MigrationProviderNameUnusable { name }).into_owned()
+}
+pub fn provider_protocol_unsupported(protocol: &str) -> String {
+    t(Msg::MigrationProviderProtocolUnsupported { protocol }).into_owned()
+}
+pub fn provider_nothing_to_connect_to() -> String {
+    t(Msg::MigrationProviderNothingToConnectTo).into_owned()
+}
+```
+
+> **共享的技能助手在 `mod.rs` 里，不在这里。** `SkillTruth` 与 `skill_rows`
+> 三个来源都要用（Claude Code、OpenCode、以及共享的 `.agents` 树），所以它们
+> 定义在 **`mod.rs`**（Task 1 就建好了），`claude.rs` 与 `opencode.rs` 都用
+> `super::skill_rows(…)` / `super::SkillTruth::load(ctx)` 拿 —— 子模块**不会**
+> 自动拿到父模块的名字，必须写 `super::`。
+>
 > `provider_copyable` 放在**这里**而不是 Task 3：Task 2 的 Claude 扫描已经要报
 > provider 那一行，而 Task 2 必须能**单独编译并通过**（阶段 P2 的验收就是
 > `cargo nextest run -p atomcode-capabilities --features migration` 全绿）。
-
-并在 `mod.rs` 加 `mod text;`（**注意：Task 2 就要加**，因为 `text.rs` 是 `pub(crate)` 可见的辅助模块；它不导出到公共 API）。
+>
+> `text.rs` 在 Task 1 已经有了**最小版**（4 条：技能与读文件），本 Step 把它
+> **扩成完整版** —— `mod text;` 的声明在 Task 1 的 `mod.rs` 里已经在了。
 
 - [ ] **Step 4: 在 i18n product 表加这些条目**
 
-`crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加：
+`crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
+（**Task 1 已经加过 4 条** —— `MigrationSkillActive` /
+`MigrationSkillRejected` / `MigrationSkillOverridden` /
+`MigrationUnreadableFile` —— **不要重复加**，同一个变体加两次编译不过）：
 
 ```rust
     // External-agent asset migration (see
@@ -2105,13 +2324,6 @@ impl SkillTruth {
         by: &'a str,
     },
     MigrationInstructionsEmpty,
-    MigrationSkillActive,
-    MigrationSkillRejected {
-        reason: &'a str,
-    },
-    MigrationSkillOverridden {
-        name: &'a str,
-    },
     MigrationPermissionsActive,
     MigrationPermissionsCopyable {
         target: &'a str,
@@ -2125,9 +2337,6 @@ impl SkillTruth {
     },
     MigrationMcpAllDisabled {
         count: usize,
-    },
-    MigrationUnreadableFile {
-        reason: &'a str,
     },
     MigrationRulesRejected,
     MigrationHooksCopyable {
@@ -2146,6 +2355,7 @@ impl SkillTruth {
     MigrationProviderNothingToConnectTo,
     MigrationCredentialHasDollar,
     MigrationCredentialAmbiguous,
+    MigrationOpencodePlaintextCredentials,
     MigrationAgentsBlocked,
     MigrationPluginsBlocked,
     MigrationSessionsBlocked {
@@ -2226,6 +2436,9 @@ impl SkillTruth {
              unambiguously — not imported"
                 .into()
         }
+        Msg::MigrationOpencodePlaintextCredentials => {
+            "This file holds plaintext keys — they are not moved, only reported".into()
+        }
         Msg::MigrationAgentsBlocked => {
             "Our role files need `permission` and `difficulty` frontmatter, which these do not \
              have — not migrated"
@@ -2296,6 +2509,9 @@ impl SkillTruth {
         Msg::MigrationCredentialAmbiguous => {
             "同名环境变量已设置，这个密钥无法唯一确定 —— 未导入".into()
         }
+        Msg::MigrationOpencodePlaintextCredentials => {
+            "这个文件里是明文密钥 —— 只报告，不搬运".into()
+        }
         Msg::MigrationAgentsBlocked => {
             "我们的角色文件需要 permission 与 difficulty 前置元数据，Claude 的 subagent 文件没有 \
              —— 未迁移"
@@ -2355,6 +2571,8 @@ mod tests {
             project: project.to_path_buf(),
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         }
     }
 
@@ -2621,7 +2839,7 @@ impl MigrationSource for CodexSource {
         // could never be matched by the re-check.
         //
         // In THIS task `provider_drafts` is still the default (empty), so no
-        // provider row appears yet; Task 6 fills the drafts in and the rows
+        // provider row appears yet; Task 7 fills the drafts in and the rows
         // appear with it.
         for draft in self.provider_drafts(ctx) {
             out.push(super::provider_row(
@@ -2829,7 +3047,563 @@ nothing."
 
 ---
 
-## Task 4: CLI 子命令 `atomcode import`（扫描报告）
+## Task 4: OpenCode 来源
+
+**为什么单独一个 Task，而不是并进 Task 3**：OpenCode 是**第三个**来源，也是
+**第一种新形状**的来源。它的每一样资产都与前两个不同 —— 而这正是检验抽象的
+样本。若加它需要改共享模块（`provider.rs`），说明抽象没做对；所以本 Task
+顺带把「来源特有的知识」收回来源自己（见 Step 4）。
+
+**Files:**
+- Create: `crates/atomcode-capabilities/src/migration/opencode.rs`
+- Modify: `crates/atomcode-capabilities/src/migration/mod.rs`（`builtin_sources` 加一行）
+- Modify: `crates/atomcode-capabilities/src/migration/text.rs`
+- Modify: `crates/atomcode-coding/src/config.rs`（**宿主解析 OpenCode 的目录**，Step 5）
+- Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`
+
+### OpenCode 的资产长什么样（本机实测，`/Users/theo/.config/opencode`）
+
+| 资产 | 路径 | 形状 |
+|---|---|---|
+| 技能 | `~/.config/opencode/skills/<name>/SKILL.md` | frontmatter `name` / `description` / `version` —— **与我们的技能格式相同** |
+| 命令 | `~/.config/opencode/commands/<name>.md` | 平铺的 `.md` |
+| 共享技能 | `~/.agents/skills/<name>/SKILL.md` | 同上（跨 agent 约定） |
+| provider | `~/.config/opencode/opencode.json` | `provider.<id>.{npm, name, options:{baseURL, apiKey}, models:{...}}` |
+| MCP | `~/.config/opencode/opencode.jsonc` | `mcp.<id>.{type:"local", command:[...], enabled, timeout}` |
+| 凭据 | `~/.local/share/opencode/auth.json` | `<vendor>.{type:"api", key:"sk-…"}` —— **明文** |
+
+三处与前两个来源**不同**的地方，构成本 Task 的技术难点：
+
+1. **凭据在 `options.apiKey`**，是**明文字符串**，不是变量名 —— 与 Claude 的
+   `env` 块同族（都是明文），与 Codex 的 `env_key`（变量名）不同。
+2. **MCP 的 `command` 是数组**（`["node", "…/mcp-server.mjs"]`），我们的
+   `McpServerEntry` 是 `command: Option<String>` + `args: Option<Vec<String>>`
+   （`mcp/config.rs:145`）—— 要**拆开**成 command + args。
+3. **协议不靠 `wire_api` 声明**，靠 `npm` 包名（`@ai-sdk/openai-compatible`）。
+
+### 目录解析
+
+OpenCode 遵循 XDG（本机实测：二进制里有 `XDG_CONFIG_HOME` / `XDG_DATA_HOME`）：
+
+- 配置：`$XDG_CONFIG_HOME/opencode/`（默认 `~/.config/opencode/`）
+- 数据：`$XDG_DATA_HOME/opencode/`（默认 `~/.local/share/opencode/`）
+
+**路径由宿主解析**（`AGENTS.md`：「解析环境只在宿主」）—— capability 不读环境变量。
+所以 `ScanContext` 要多两个字段，或者宿主把解析好的路径塞进 `ProductDirs` 之外的
+地方。**本 Task 取前者**：加 `opencode_config_dir` 与 `opencode_data_dir` 两个
+`PathBuf`，宿主填。
+
+- [ ] **Step 1: 写失败的测试**
+
+在 `crates/atomcode-capabilities/src/migration/opencode.rs` 末尾追加：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+
+    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
+        ScanContext {
+            os_home: home.to_path_buf(),
+            project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: Vec::new(),
+            opencode_config_dir: home.join(".config/opencode"),
+            opencode_data_dir: home.join(".local/share/opencode"),
+        }
+    }
+
+    /// A skill in OpenCode's own tree: same format as ours, so it can be
+    /// copied.
+    #[test]
+    fn an_opencode_skill_is_actionable_because_we_do_not_read_that_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let skill = home.path().join(".config/opencode/skills/huawei-apig/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "---\nname: huawei-apig\ndescription: x\n---\n\nbody\n").unwrap();
+
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills)
+            .expect("the skill is reported");
+        assert_eq!(row.status, AssetStatus::Actionable);
+    }
+
+    /// A shared `.agents/skills` skill is ALREADY ours — we read that tree
+    /// (`registry.rs:585`). The report must say so, not claim it is movable.
+    #[test]
+    fn a_shared_agents_skill_is_active_because_we_read_that_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let skill = home.path().join(".agents/skills/huawei-vpc/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "---\nname: huawei-vpc\ndescription: x\n---\n\nbody\n").unwrap();
+
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills && a.name == "huawei-vpc")
+            .expect("the skill is reported");
+        assert_eq!(row.status, AssetStatus::Active);
+    }
+
+    /// The provider's credential is a LITERAL — like Claude's, unlike Codex's.
+    #[test]
+    fn an_opencode_provider_key_is_a_literal_not_a_reference() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"provider":{"atomgit":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://127.0.0.1:8001/v1","apiKey":"sk-literal"}}}}"#,
+        )
+        .unwrap();
+
+        let drafts = OpenCodeSource.provider_drafts(&ctx(home.path(), project.path()));
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].api_key,
+            Some(ApiKeyRef::Plaintext("sk-literal".into())),
+            "a literal, so it needs the person's confirmation"
+        );
+    }
+
+    /// The MCP `command` is an ARRAY — split into command + args.
+    #[test]
+    fn an_opencode_mcp_command_array_is_split_into_command_and_args() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/opencode/opencode.jsonc");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "{\n  // a comment, because this file is jsonc\n  \"mcp\":{\"x\":{\"type\":\"local\",\"command\":[\"node\",\"/tmp/s.mjs\"],\"enabled\":true}}\n}",
+        )
+        .unwrap();
+
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::McpServers)
+            .expect("the server is reported");
+        assert_eq!(row.status, AssetStatus::Actionable);
+    }
+
+    /// `auth.json` holds PLAINTEXT keys. We report that they are there and
+    /// never offer to move them.
+    #[test]
+    fn the_auth_file_is_reported_but_never_offered_for_import() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let auth = home.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, r#"{"deepseek":{"type":"api","key":"sk-x"}}"#).unwrap();
+
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::ProviderConfig)
+            .expect("the credentials are reported");
+        assert_eq!(row.status, AssetStatus::Blocked);
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo nextest run -p atomcode-capabilities --features migration migration::opencode`
+Expected: FAIL —— `OpenCodeSource` 不存在。
+
+- [ ] **Step 3: 实现 OpenCodeSource**
+
+`crates/atomcode-capabilities/src/migration/opencode.rs`（新建）：
+
+```rust
+//! OpenCode's assets.
+//!
+//! The THIRD source, and the first with a shape of its own: its credential
+//! is a literal in `options.apiKey`, its MCP `command` is an ARRAY, and its
+//! protocol comes from an `npm` package name rather than a `wire_api` field.
+//!
+//! If supporting it needed a change in the shared `provider.rs`, the
+//! abstraction would be wrong — so the source-specific knowledge stays HERE.
+
+use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
+use super::provider::{ApiKeyRef, ProviderAccountDraft};
+use super::{MigrationSource, ScanContext};
+
+pub struct OpenCodeSource;
+
+impl MigrationSource for OpenCodeSource {
+    fn id(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "OpenCode"
+    }
+
+    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
+        let mut out = Vec::new();
+        let config = &ctx.opencode_config_dir;
+        // Loaded ONCE per scan: the registry is what decides whether a skill
+        // is really in effect.
+        let skills = super::SkillTruth::load(ctx);
+
+        // Skills and commands. OpenCode's own tree is NOT ours, so they are
+        // movable.
+        for (kind, dir) in [
+            (AssetKind::Skills, "skills"),
+            (AssetKind::Commands, "commands"),
+        ] {
+            for (scope, root) in [
+                (AssetScope::User, config.join(dir)),
+                (AssetScope::Project, ctx.project.join(".opencode").join(dir)),
+            ] {
+                out.extend(super::skill_rows(kind, scope, &root, &skills));
+            }
+        }
+        // The shared `.agents` tree: **the skills half is ours**, the commands
+        // half is NOT.
+        //
+        // `standard_skill_dirs` scans `~/.agents/skills` and
+        // `<project>/.agents/skills` (`registry.rs:585`, `:590`) — there is no
+        // `.agents/commands` in that list. So a shared SKILL is `Active`, and a
+        // shared COMMAND is `Actionable`: same format, copy it into our own
+        // `commands/` and it starts working.
+        //
+        // Reporting the commands half as `Active` would be wrong in the
+        // direction that matters — the person would believe their shared
+        // commands are already loaded, and they are not.
+        for (scope, root) in [
+            (AssetScope::User, ctx.os_home.join(".agents").join("skills")),
+            (AssetScope::Project, ctx.project.join(".agents").join("skills")),
+        ] {
+            out.extend(super::skill_rows(AssetKind::Skills, scope, &root, &skills));
+        }
+        for (scope, root) in [
+            (AssetScope::User, ctx.os_home.join(".agents").join("commands")),
+            (AssetScope::Project, ctx.project.join(".agents").join("commands")),
+        ] {
+            out.extend(shared_command_rows(scope, &root, &ctx.product.user().join("commands")));
+        }
+
+        // The provider configuration.
+        out.extend(provider_rows(ctx));
+
+        // The MCP servers.
+        out.extend(mcp_rows(ctx));
+
+        // `auth.json`: plaintext credentials. REPORTED, never offered.
+        let auth = ctx.opencode_data_dir.join("auth.json");
+        if auth.is_file() {
+            out.push(AssetReport {
+                kind: AssetKind::ProviderConfig,
+                name: "auth.json".into(),
+                path: auth,
+                scope: AssetScope::User,
+                status: AssetStatus::Blocked,
+                detail: super::text::opencode_plaintext_credentials(),
+            });
+        }
+        out
+    }
+
+    /// The provider accounts OpenCode has configured.
+    ///
+    /// **The credential is a LITERAL**, like Claude's — not a variable name
+    /// like Codex's. So it needs the person's confirmation before it is
+    /// written.
+    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
+        let Some(value) = super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.json"))
+        else {
+            return Vec::new();
+        };
+        let Some(providers) = value.get("provider").and_then(|p| p.as_object()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, provider) in providers {
+            let Some(options) = provider.get("options").and_then(|o| o.as_object()) else {
+                continue;
+            };
+            let base_url = options
+                .get("baseURL")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let api_key = options
+                .get("apiKey")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|secret| ApiKeyRef::Plaintext(secret.to_string()));
+            if base_url.is_none() && api_key.is_none() {
+                continue;
+            }
+            let protocol = protocol_for_opencode(
+                provider.get("npm").and_then(|v| v.as_str()),
+            );
+            out.push(ProviderAccountDraft {
+                id: super::provider::account_id_for(id).unwrap_or_else(|| id.clone()),
+                source_name: id.clone(),
+                protocol: protocol.clone(),
+                base_url: super::provider::effective_endpoint(&protocol, base_url.as_deref()),
+                api_key,
+                models: Vec::new(),
+                source_path: ctx.opencode_config_dir.join("opencode.json"),
+                scope: AssetScope::User,
+                blocked: None,
+            });
+        }
+        out
+    }
+}
+
+/// The provider accounts OpenCode has configured.
+///
+/// **The rows come from the drafts**, so the row's name is the account id
+/// the importer will write — the same rule the other two sources follow.
+fn provider_rows(ctx: &ScanContext) -> Vec<AssetReport> {
+    // **The rows come from the drafts** — the same shape the other two
+    // sources use. Re-deriving the values here would give two places that
+    // could disagree about what an account is.
+    let mut out = Vec::new();
+    for draft in OpenCodeSource.provider_drafts(ctx) {
+        out.push(super::provider_row(
+            &draft,
+            AssetStatus::Actionable,
+            super::text::provider_copyable(
+                draft.base_url.as_deref(),
+                draft.api_key.as_ref().map(|k| k.kind()),
+            ),
+        ));
+    }
+    out
+}
+
+/// The MCP servers OpenCode has configured.
+///
+/// **OpenCode's `command` is an ARRAY** (`["node", "…/mcp-server.mjs"]`),
+/// while ours is `command: Option<String>` + `args: Option<Vec<String>>`
+/// (`mcp/config.rs:145`) — so it is split here.
+fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
+    let Some(value) = super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.jsonc"))
+    else {
+        return Vec::new();
+    };
+    let Some(servers) = value.get("mcp").and_then(|m| m.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, server) in servers {
+        let Some(server) = server.as_object() else {
+            continue;
+        };
+        let command = server.get("command");
+        // A command may be a string or an array — both shapes occur.
+        let (command, args): (Option<String>, Vec<String>) = match command {
+            Some(serde_json::Value::String(text)) => (Some(text.clone()), Vec::new()),
+            Some(serde_json::Value::Array(items)) => {
+                let mut items = items.iter();
+                let first = items.next().and_then(|v| v.as_str()).map(str::to_string);
+                (first, items.filter_map(|v| v.as_str().map(str::to_string)).collect())
+            }
+            _ => (None, Vec::new()),
+        };
+        if command.is_none() {
+            // Neither `command` nor `url`: our loader would reject the whole
+            // file (`mcp/config.rs:670-673`).
+            out.push(AssetReport {
+                kind: AssetKind::McpServers,
+                name: name.clone(),
+                path: ctx.opencode_config_dir.join("opencode.jsonc"),
+                scope: AssetScope::User,
+                status: AssetStatus::Blocked,
+                detail: super::text::rules_rejected(),
+            });
+            continue;
+        }
+        let _ = args;
+        out.push(AssetReport {
+            kind: AssetKind::McpServers,
+            name: name.clone(),
+            path: ctx.opencode_config_dir.join("opencode.jsonc"),
+            scope: AssetScope::User,
+            status: AssetStatus::Actionable,
+            detail: super::text::mcp_copyable(
+                1,
+                &ctx.product.user().join("mcp.json"),
+            ),
+        });
+    }
+    out
+}
+
+/// The command templates in a shared `.agents/commands` directory.
+///
+/// **These are movable, not active.** The registry's standard directory list
+/// has `~/.agents/skills` and `<project>/.agents/skills` (`registry.rs:585`,
+/// `:590`) — there is **no** `.agents/commands` in it. So a command sitting
+/// there is not loaded by us today; it is a flat `.md` template of the same
+/// shape we already read, and copying it into our own `commands/` makes it
+/// work.
+///
+/// The flat layout matches ours: command templates are TOP-LEVEL `.md` files
+/// (`registry.rs:340` — a skill's own `*.md` are its resources, not
+/// commands).
+fn shared_command_rows(
+    scope: AssetScope,
+    root: &Path,
+    target: &Path,
+) -> Vec<AssetReport> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        // A directory we cannot read is not an empty one — but it is also not
+        // an asset we can promise anything about. Skip it silently rather
+        // than report a row we cannot describe.
+        Err(_) => return out,
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    paths.sort();
+    for path in paths {
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        out.push(AssetReport {
+            kind: AssetKind::Commands,
+            name: name.clone(),
+            path,
+            scope,
+            status: AssetStatus::Actionable,
+            detail: super::text::skill_copyable(&target.join(&name)),
+        });
+    }
+    out
+}
+```
+
+- [ ] **Step 4: 把来源特有的知识收回来源自己**
+
+这一步是本 Task 的**要点**。OpenCode 加进来之后，`provider.rs` 里**不该**再多出
+任何 `opencode` 的知识。
+
+**共享的 `protocol_for_wire` 已经在 Task 1 里了**（它只问「这条线怎么说」，
+不问「你是谁」）。本 Task 要做的是**把 OpenCode 的那份知识放进 OpenCode 自己
+的文件里**：
+
+```rust
+/// The protocol for an OpenCode provider, from its `npm` package name.
+///
+/// **OpenCode does not say `wire_api`** — it says which AI SDK package it
+/// speaks through, and that is what determines the wire format.
+///
+/// **This lives HERE, not in the shared `provider.rs`.** The shared module
+/// knows the wire families; OpenCode knows how IT names one. A new source
+/// adds a function here, and the shared module stays untouched.
+fn protocol_for_opencode(npm: Option<&str>) -> String {
+    match npm {
+        Some("@ai-sdk/openai-compatible") => "openai-compatible".into(),
+        Some("@ai-sdk/anthropic") => "anthropic-compatible".into(),
+        Some("@ai-sdk/openai") => "openai-responses".into(),
+        Some(other) => super::provider::unsupported_protocol(&format!("opencode:{other}")),
+        None => "openai-compatible".into(),
+    }
+}
+```
+
+各来源**自己**说默认值 —— 共享的 `protocol_for_wire` 从不问「你是谁」：
+
+- Codex：`protocol_for_wire(wire_api, "openai-responses")` —— Codex 的
+  `WireApi` 默认是 Responses（`codex-rs/model-provider-info/src/lib.rs:117`）。
+- Claude：`protocol_for_wire(None, "anthropic-compatible")`。
+- OpenCode：按 `npm` 包名 —— `@ai-sdk/openai-compatible` → `openai-compatible`；
+  `@ai-sdk/anthropic` → `anthropic-compatible`；不认识 → `unsupported:opencode:<npm>`。
+
+> **Step 3 的代码已经用了来源本地的 `protocol_for_opencode`**（不是
+> `super::provider::protocol_for_opencode`）—— 所以本 Step 只是把那个函数
+> **定义**补上，两个 Step 合起来才是完整实现。共享模块里**没有** OpenCode 的
+> 知识：它只有 `protocol_for_wire`（问「这条线怎么说」）与 `unsupported_protocol`
+> （造一个「我们不认」的 id）。
+
+**`claude_env` 从 `provider.rs` 移到 `claude.rs`** —— 它是 Claude 专属的读法
+（`settings.json` 的 `env` 块），共享模块不该知道。
+
+**`ScanContext` 加两个字段**（宿主解析，capability 不读环境）：
+
+```rust
+    /// Where OpenCode keeps its configuration
+    /// (`$XDG_CONFIG_HOME/opencode`, default `~/.config/opencode`).
+    pub opencode_config_dir: PathBuf,
+    /// Where OpenCode keeps its data
+    /// (`$XDG_DATA_HOME/opencode`, default `~/.local/share/opencode`).
+    pub opencode_data_dir: PathBuf,
+```
+
+- [ ] **Step 5: 宿主解析 OpenCode 的目录**
+
+`atomcode-coding/src/config.rs` 加（与 `product_dirs_from_env` 同处）：
+
+```rust
+/// Where OpenCode keeps its configuration and data.
+///
+/// **The host resolves these** — the capability reads no environment
+/// (`AGENTS.md`: 「解析环境只在宿主」). OpenCode follows XDG
+/// (`XDG_CONFIG_HOME` / `XDG_DATA_HOME`), with the usual defaults.
+pub fn opencode_dirs() -> (PathBuf, PathBuf) {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("opencode");
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
+        .join("opencode");
+    (config, data)
+}
+```
+
+`scan_context` 加两个参数，CLI 与 TUI 两处调用都补上。
+
+- [ ] **Step 6: 加文案**
+
+`text.rs` 加 `opencode_plaintext_credentials()`；`product` 表加对应的
+`MigrationOpencodePlaintextCredentials`。
+
+- [ ] **Step 7: 跑测试确认通过**
+
+Run: `cargo nextest run -p atomcode-capabilities --features migration migration::opencode`
+Expected: PASS —— 本 Task 定义的判据全部通过。
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add crates/atomcode-capabilities/src/migration/ crates/atomcode-coding/src/config.rs crates/atomcode-i18n/src/product/
+git commit -m "feat(capabilities): detect OpenCode assets
+
+The third source, and the first with a shape of its own: a literal
+credential in options.apiKey, an MCP command that is an array, and a
+protocol that comes from an npm package name rather than a wire_api field.
+
+The source-specific knowledge stays inside the source: protocol_for now
+takes the source's own default instead of asking which source it is, so
+adding a source does not change the shared module."
+```
+
+---
+
+## Task 5: CLI 子命令 `atomcode import`（扫描报告）
 
 **Files:**
 - Create: `crates/atomcode-cli/src/import_cmd.rs`
@@ -3056,12 +3830,16 @@ pub fn scan_context(
     project: &Path,
     product: atomcode_capabilities::ProductDirs,
     skill_dirs: Vec<std::path::PathBuf>,
+    opencode_config_dir: std::path::PathBuf,
+    opencode_data_dir: std::path::PathBuf,
 ) -> ScanContext {
     ScanContext {
         os_home: os_home.to_path_buf(),
         project: project.to_path_buf(),
         product,
         skill_dirs,
+        opencode_config_dir,
+        opencode_data_dir,
     }
 }
 
@@ -3406,7 +4184,15 @@ async fn run_import_command(
     )
     .0;
     let ctx =
-        atomcode::import_cmd::scan_context(&home, &project, dirs.clone(), skill_dirs);
+        let (opencode_config, opencode_data) = atomcode_coding::config::opencode_dirs();
+        atomcode::import_cmd::scan_context(
+            &home,
+            &project,
+            dirs.clone(),
+            skill_dirs,
+            opencode_config,
+            opencode_data,
+        );
     let sources = atomcode_capabilities::migration::builtin_sources();
     let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
 
@@ -3449,12 +4235,12 @@ async fn run_import_command(
 }
 ```
 
-（`apply_provider_accounts` 的完整实现与**最终签名**在 Task 7。**Task 4 先写同签名的占位**让编译通过 —— 签名从一开始就定死，Task 7 只换实现不改签名：）
+（`apply_provider_accounts` 的完整实现与**最终签名**在 Task 8。**Task 5 先写同签名的占位**让编译通过 —— 签名从一开始就定死，Task 8 只换实现不改签名：）
 
 ```rust
 /// Import the provider accounts an external agent has configured.
 ///
-/// Placeholder in Task 4; Task 7 fills it in. The signature is final.
+/// Placeholder in Task 5; Task 8 fills it in. The signature is final.
 pub fn apply_provider_accounts(
     _sources: &[Box<dyn atomcode_capabilities::migration::MigrationSource>],
     _ctx: &ScanContext,
@@ -3486,7 +4272,7 @@ rows with stable status names."
 
 ---
 
-## Task 5: TUI `/import` 命令
+## Task 6: TUI `/import` 命令
 
 **Files:**
 - Create: `crates/atomcode-tui/src/migration.rs`
@@ -3600,11 +4386,7 @@ pub mod migration;
 pub struct ImportCommands;
 
 fn import_catalogue() -> Vec<Command> {
-    vec![Command::said_taking(
-        "import",
-        t(Msg::MigrationImportArgs),
-        t(Msg::CmdAboutImport),
-    )]
+    vec![Command::said("import", t(Msg::CmdAboutImport))]
 }
 
 /// `CommandSet` is an `#[async_trait]` trait (`command.rs:296`), so the impl
@@ -3619,7 +4401,7 @@ impl CommandSet for ImportCommands {
     fn commands(&self) -> Vec<Command> {
         import_catalogue()
     }
-    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
+    async fn run(&self, _name: &str, _args: &str, ctx: &Context) -> Outcome {
         let Some(port) = ctx.service::<crate::plugin::MigrationSvc>() else {
             return Outcome::Refused(t(Msg::NoMigrationPort).into_owned());
         };
@@ -3639,43 +4421,6 @@ impl CommandSet for ImportCommands {
             .iter()
             .filter(|source| !source.assets.is_empty())
             .collect();
-        let mut args = args.split_whitespace();
-        if let Some(source_id) = args.next() {
-            let unavailable =
-                || Outcome::Refused(t(Msg::MigrationSelectionUnavailable).into_owned());
-            let Some(source) = found
-                .iter()
-                .copied()
-                .find(|source| source.source_id == source_id)
-            else {
-                return unavailable();
-            };
-            let Some(index) = args.next() else {
-                return Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
-                    import_list(source),
-                )));
-            };
-            let Some(asset) = index
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .and_then(|n| source.assets.get(n))
-                .filter(|_| args.next().is_none())
-            else {
-                return unavailable();
-            };
-            let detail = crate::sheet::Read::file(
-                "import",
-                vec![crate::sheet::Piece::new(
-                    asset.name.clone(),
-                    crate::sheet::Tone::Plain,
-                )],
-                &asset.detail,
-            );
-            return Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::read(
-                detail,
-            )));
-        }
         if found.is_empty() {
             // The **product** table: the CLI says the same sentence, and one
             // thing must not be said two ways.
@@ -3690,16 +4435,14 @@ impl CommandSet for ImportCommands {
                         format!("/import {}", source.source_id),
                         source.display_name.clone(),
                     )
-                    .about(format!(
-                        "{} {}",
-                        source.assets.len(),
-                        t(Msg::MigrationAssetsCount)
-                    ))
+                    .about(format!("{} {}", source.assets.len(), t(Msg::MigrationAssetsCount)))
                 })
                 .collect();
-            return Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
-                crate::sheet::List::new("import-source", t(Msg::MigrationPickSource), rows),
-            )));
+            return Outcome::Do(crate::keymap::Action::OpenSheet(
+                crate::sheet::Sheet::list(
+                    crate::sheet::List::new("import-source", t(Msg::MigrationPickSource), rows),
+                ),
+            ));
         }
 
         // One source: its assets are the list.
@@ -3724,11 +4467,11 @@ impl CommandSet for ImportCommands {
 /// existing shape, not something to invent.
 fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::List {
     let mut rows: Vec<crate::sheet::Row> = Vec::new();
-    for (index, asset) in source.assets.iter().enumerate() {
+    for asset in &source.assets {
         let status = crate::migration::status_word(asset.status);
         rows.push(
             crate::sheet::Row::new(
-                format!("/import {} {}", source.source_id, index + 1),
+                format!("/import {}", asset.name),
                 asset.name.clone(),
             )
             .about(format!("[{status}] {}", asset.detail))
@@ -3797,8 +4540,6 @@ commands!(
     MigrationNoAssets,
     /// Picking which source to look at, when more than one has assets.
     MigrationPickSource,
-    MigrationImportArgs,
-    MigrationSelectionUnavailable,
     /// How many assets a source has.
     MigrationAssetsCount,
     /// The sheet's summary line: which source, how many assets.
@@ -3816,8 +4557,6 @@ commands!(
         Msg::MigrationReportTitle => "Assets another agent left behind".into(),
         Msg::MigrationNoAssets => "This source has no assets".into(),
         Msg::MigrationPickSource => "Which agent's assets do you want to see?".into(),
-        Msg::MigrationImportArgs => "[source [asset number]]".into(),
-        Msg::MigrationSelectionUnavailable => "The selected migration asset or source is unavailable".into(),
         Msg::MigrationAssetsCount => "assets".into(),
         Msg::MigrationSummaryLine { source, count } => {
             format!("{source}: {count} assets").into()
@@ -3832,8 +4571,6 @@ commands!(
         Msg::MigrationReportTitle => "其他 Agent 留下的资产".into(),
         Msg::MigrationNoAssets => "这个来源没有资产".into(),
         Msg::MigrationPickSource => "要看哪个 Agent 的资产？".into(),
-        Msg::MigrationImportArgs => "[来源 [资产编号]]".into(),
-        Msg::MigrationSelectionUnavailable => "所选迁移资产或来源已不可用".into(),
         Msg::MigrationAssetsCount => "项资产".into(),
         Msg::MigrationSummaryLine { source, count } => {
             format!("{source}：{count} 项资产").into()
@@ -3900,6 +4637,8 @@ impl Migration for DiskMigration {
             project: self.project.clone(),
             product: self.product.clone(),
             skill_dirs: self.skill_dirs.clone(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let sources = atomcode_capabilities::migration::builtin_sources();
         let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
@@ -4209,23 +4948,6 @@ impl Migration for DiskMigration {
         };
         assert_eq!(list.id, "import-source", "a picker of sources");
         assert_eq!(list.rows.len(), 2);
-
-        let Outcome::Do(crate::keymap::Action::OpenSheet(sheet)) =
-            all.dispatch(&list.rows[1].value, &app.context()).await
-        else {
-            panic!("choosing a source did not open its assets");
-        };
-        let crate::sheet::Page::List(assets) = sheet.page else {
-            panic!("an asset list");
-        };
-        assert_eq!(assets.id, "import");
-        assert_eq!(assets.rows[0].label, "agents");
-        let Outcome::Do(crate::keymap::Action::OpenSheet(sheet)) =
-            all.dispatch(&assets.rows[0].value, &app.context()).await
-        else {
-            panic!("choosing an asset did not open its detail");
-        };
-        assert!(matches!(sheet.page, crate::sheet::Page::Read(_)));
     }
 
     /// A source with NO assets is not offered — asking "which agent?" when
@@ -4270,7 +4992,7 @@ impl Migration for DiskMigration {
     }
 ```
 
-> **命令名不带斜杠**：`Command::said_taking("import", …)` 存的是
+> **命令名不带斜杠**：`Command::said("import", …)`（`command.rs:148`）存的是
 > `import`，`/help` 与 `matching` 看到的就是这个名字；斜杠只是**调用时**的前缀
 > （`dispatch("/import", …)`）。所以断言的是 `"import"`，不是 `"/import"`。
 >
@@ -4303,10 +5025,11 @@ disk. Same shape as /setup."
 
 ---
 
-## Task 6: provider 映射（中立草案）
+## Task 7: provider 映射（中立草案）
 
 **Files:**
 - Modify: `crates/atomcode-config/src/provider_book.rs`（把归一规则公开出来）
+- Modify: `crates/atomcode-coding/src/parts.rs`（把技能根的解析公开出来，宿主要靠它）
 - Modify: `crates/atomcode-capabilities/src/migration/provider.rs`
 - Modify: `crates/atomcode-capabilities/src/migration/claude.rs`
 - Modify: `crates/atomcode-capabilities/src/migration/codex.rs`
@@ -4440,6 +5163,8 @@ mod tests {
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
@@ -4467,6 +5192,8 @@ mod tests {
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
@@ -4486,6 +5213,8 @@ mod tests {
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(
@@ -4511,6 +5240,8 @@ mod tests {
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
 
         // The row comes from the draft, so the row's NAME is the account id —
@@ -4536,6 +5267,8 @@ mod tests {
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert!(drafts.is_empty());
@@ -4576,6 +5309,8 @@ mod tests {
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         let draft = drafts
@@ -4603,12 +5338,24 @@ mod tests {
         // Codex's `WireApi` has `#[default] Responses`
         // (`codex-rs/model-provider-info/src/lib.rs:117`).
         assert_eq!(
-            super::protocol_for("codex", None),
+            super::protocol_for_wire(None, "openai-responses"),
             "openai-responses",
             "a config with no wire_api speaks Responses"
         );
-        assert_eq!(super::protocol_for("codex", Some("responses")), "openai-responses");
-        assert_eq!(super::protocol_for("codex", Some("chat")), "openai-compatible");
+        assert_eq!(
+            super::protocol_for_wire(Some("responses"), "openai-responses"),
+            "openai-responses"
+        );
+        assert_eq!(
+            super::protocol_for_wire(Some("chat"), "openai-responses"),
+            "openai-compatible"
+        );
+        // The SOURCE says its own default — the shared function does not know
+        // which source it is.
+        assert_eq!(
+            super::protocol_for_wire(None, "anthropic-compatible"),
+            "anthropic-compatible"
+        );
     }
 
     #[test]
@@ -4629,6 +5376,8 @@ mod tests {
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         };
         let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
         let first = drafts.iter().find(|d| d.id == "first").expect("first exists");
@@ -4654,110 +5403,28 @@ Expected: FAIL —— `provider_drafts` 不存在。
 
 - [ ] **Step 3: 实现映射**
 
-`provider.rs` 追加（放在 `ProviderAccountDraft` 之后）：
+`provider.rs` 的共享规则（`protocol_for_wire` / `unsupported_protocol` /
+`account_id_for` / `effective_endpoint` / `protocol_needs_endpoint` /
+`endpoint_in_use` / `read_jsonc`）**已经在 Task 1 里了** —— 它们不是某个来源的
+知识，而是「我们的写入方会怎么归一」，所以放在共享模块，**每个来源都能用**。
+本 Task **不再改它们**，只做**每个来源怎么读出自己的草案**。
+
+> **为什么这些在 Task 1 而不是本 Task**：Task 4 的 OpenCode 扫描已经要用
+> `account_id_for` 与 `effective_endpoint`（它要报 provider 行），Task 1 也要
+> re-export `endpoint_in_use` 给宿主 —— 所以它们必须在 Task 1 就到位，
+> **Task 1 与 Task 4 才能各自单独编译并通过**。
+
+**`claude_env` 从 `provider.rs` 移到 `claude.rs`** —— 它是 **Claude 专属**的
+读法（`settings.json` 的 `env` 块），共享模块不该知道某个来源的配置长什么样。
+它落到 `claude.rs`：
 
 ```rust
-/// The protocol an external agent's endpoint speaks, mapped to ours.
-///
-/// Codex's `wire_api` names its own family; Claude's `ANTHROPIC_*` variables
-/// name a vendor endpoint.
-///
-/// **A missing `wire_api` means Responses, not chat/completions.** Codex's own
-/// `WireApi` has `#[default] Responses`
-/// (`codex-rs/model-provider-info/src/lib.rs:117`), so a config that names a
-/// provider but no protocol speaks Responses. Mapping that to
-/// `openai-compatible` (chat/completions) would send the request to an
-/// endpoint that does not speak it.
-///
-/// Claude's is the other way round: its `ANTHROPIC_*` variables name an
-/// Anthropic endpoint whether or not a protocol is spelled out.
-///
-/// A protocol we do not know is **not** guessed at — it becomes
-/// `unsupported:…` and the report says so, instead of the import failing
-/// later against an endpoint that speaks something else.
-pub fn protocol_for(source: &str, wire_api: Option<&str>) -> String {
-    match wire_api {
-        Some("responses") => "openai-responses".into(),
-        Some("anthropic") => "anthropic-compatible".into(),
-        Some("chat") | Some("openai") => "openai-compatible".into(),
-        Some(other) => unsupported_protocol(source, other),
-        None if source == "claude-code" => "anthropic-compatible".into(),
-        None => "openai-responses".into(),
-    }
-}
-
-/// The protocol id for a wire family we do not support.
-///
-/// The report says the endpoint speaks something we cannot, so the person
-/// sees it instead of the import silently failing later.
-pub fn unsupported_protocol(source: &str, wire_api: &str) -> String {
-    format!("unsupported:{source}:{wire_api}")
-}
-
-/// The id the importer will give this account.
-///
-/// **The writer normalizes the name**, so the report must use the SAME id:
-/// `ProviderBook::create_account` runs the name through `base_id`
-/// (`provider_book.rs:700`), which sanitises it and prefixes `custom-` when
-/// it belongs to CodingPlan. A report built on the raw source id would never
-/// match the account on the next run — the re-check would keep saying
-/// "can be brought over" about an account that is already there.
-///
-/// `base_id` is made **public** for this (`pub fn account_id_for`), so there is
-/// **one** rule, not two that can drift.
-pub fn account_id_for(name: &str) -> Option<String> {
-    match atomcode_config::provider_book::account_id_for(name) {
-        Ok(id) => Some(id),
-        // An unusable name cannot become an account at all.
-        Err(_) => None,
-    }
-}
-
-/// The endpoint as it will be **stored**.
-///
-/// `endpoint_override` (`provider_book.rs:785`) trims the endpoint and stores
-/// NOTHING when it equals the protocol's own default — so a file does not pin
-/// a URL that should follow the build. Comparing the raw source endpoint
-/// against the stored one would never match: the account ends up with
-/// `base_url = None` while the draft still says the default URL.
-///
-/// `endpoint_override` is made **public** for this (`pub fn effective_endpoint`).
-///
-/// **This delegates to the writer's rule** rather than re-implementing it. A
-/// copy would be correct today and wrong the day the writer changes — and the
-/// symptom would be a re-check that never matches.
-pub fn effective_endpoint(protocol: &str, endpoint: Option<&str>) -> Option<String> {
-    atomcode_config::provider_book::effective_endpoint(protocol, endpoint.unwrap_or_default())
-}
-
-/// Whether this protocol REQUIRES an endpoint.
-///
-/// `ProviderBook::create_account` refuses a custom-compatible protocol with no
-/// endpoint (`provider_book.rs:198`: `ProtocolNeedsEndpoint`) — only a preset
-/// that has its own default can do without one.
-///
-/// The report has to know this **before** the write, or it would advertise an
-/// account as importable and then fail to write it.
-pub fn protocol_needs_endpoint(protocol: &str) -> bool {
-    atomcode_config::config::provider_preset::preset(protocol)
-        .map(|preset| preset.default_base_url.is_none())
-        .unwrap_or(true)
-}
-
-/// The endpoint the account will actually talk to.
-///
-/// The stored form may be `None` — that means "follow the protocol's
-/// default" — but the person still needs to see WHICH endpoint that is.
-pub fn endpoint_in_use(protocol: &str, endpoint: Option<&str>) -> Option<String> {
-    if let Some(stored) = effective_endpoint(protocol, endpoint) {
-        return Some(stored);
-    }
-    atomcode_config::config::provider_preset::preset(protocol)
-        .and_then(|preset| preset.default_base_url)
-        .map(str::to_string)
-}
-
 /// Read Claude's `env` block out of its settings file.
+///
+/// **Claude's, not ours.** The `env` block maps a NAME to a VALUE, and the
+/// value IS the secret — so a key read from here is a literal, never a
+/// reference. That is the opposite of Codex's `env_key`, and the difference
+/// is why this function lives with Claude rather than in the shared module.
 pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
     let raw = std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -4765,7 +5432,7 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 }
 ```
 
-`provider.rs` 顶部补 `use std::path::Path;`。
+调用点跟着改（`super::provider::claude_env` → 本模块的 `claude_env`）。
 
 **为什么没有启发式**：两个来源的语义都是已知的，不需要靠字符串形状猜。
 
@@ -4778,7 +5445,8 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 
 ```rust
     fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
-        let Some(env) = super::provider::claude_env(&ctx.os_home) else {
+        // Claude's own reader — it lives with Claude now.
+        let Some(env) = claude_env(&ctx.os_home) else {
             return Vec::new();
         };
         let base_url = env
@@ -4817,7 +5485,7 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
         // With an explicit `ANTHROPIC_BASE_URL` it is a custom endpoint, so
         // `anthropic-compatible` is right.
         let protocol = if base_url.is_some() {
-            super::provider::protocol_for("claude-code", None)
+            super::provider::protocol_for_wire(None, "anthropic-compatible")
         } else {
             "anthropic".to_string()
         };
@@ -4841,23 +5509,10 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 
 （`claude.rs` 顶部加 `use super::provider::{ApiKeyRef, ProviderAccountDraft};`）
 
-**技能那部分的两个助手也放这里**（Task 1 的 `mod.rs` 里没有它们 —— 它们要用
-`text::*` 的文案，而 `text.rs` 是 Task 2 才建的；Task 1 必须能单独编译）：
-
-```rust
-```
-
-**技能那部分的两个助手放在这里**（`claude.rs` 自己的文件里）—— Task 1 的
-`mod.rs` 里**没有**它们：它们要用 `text::*` 的文案，而 `text.rs` 是 Task 2
-才建的，Task 1 必须能单独编译。Codex 的技能不在我们的扫描目录里，所以只有
-Claude 这一侧需要。
-
-```rust
-```
-
-
-
-**Codex 的草案**（加进 `codex.rs` 的 `impl MigrationSource`）：
+> **共享的技能助手在 `mod.rs` 里**（Task 1 就建好了）：`SkillTruth` 与
+> `skill_rows` 三个来源都要用，所以它们在父模块，Claude 这边用
+> `super::skill_rows(…)` / `super::SkillTruth::load(ctx)` 拿。
+> `text.rs` 也在 Task 1 有了最小版，本 Task 把它扩成完整版。
 
 ```rust
     fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
@@ -4890,9 +5545,11 @@ Claude 这一侧需要。
                     .and_then(|v| v.as_str())
                     .filter(|v| !v.trim().is_empty())
                     .map(|name| ApiKeyRef::EnvVar(name.to_string()));
-                let protocol = super::provider::protocol_for(
-                    "codex",
+                // Codex says its own default: its `WireApi` defaults to
+                // Responses (`codex-rs/model-provider-info/src/lib.rs:117`).
+                let protocol = super::provider::protocol_for_wire(
                     provider.get("wire_api").and_then(|v| v.as_str()),
+                    "openai-responses",
                 );
                 // **Nothing is dropped here.** Every provider table the
                 // source declares becomes a row — a definition that cannot
@@ -5092,7 +5749,7 @@ host can ask about that single item before writing it."
 
 ---
 
-## Task 7: 第二期 —— 写入 `config.toml`（逐项确认）
+## Task 8: 第二期 —— 写入 `config.toml`（逐项确认）
 
 **Files:**
 - Modify: `crates/atomcode-cli/src/import_cmd.rs`
@@ -5267,6 +5924,8 @@ host can ask about that single item before writing it."
             project: dir.to_path_buf(),
             product: atomcode_capabilities::ProductDirs::new(dir.join(".ours"), ".ours"),
             skill_dirs: Vec::new(),
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
         }
     }
 
@@ -5384,8 +6043,8 @@ Expected: FAIL —— `write_account` 不存在。
 use atomcode_config::provider_book::{AccountInput, BookError, ModelInput, ProviderBook};
 ```
 
-**`ApiKeyRef` 与 `ProviderAccountDraft` 已经在 Task 4 的那一条 import 里** ——
-不要在这里再写一条同名 import（同名 import 编译不过，E0252）。Task 4 那一条
+**`ApiKeyRef` 与 `ProviderAccountDraft` 已经在 Task 5 的那一条 import 里** ——
+不要在这里再写一条同名 import（同名 import 编译不过，E0252）。Task 5 那一条
 import 因此是：
 
 ```rust
@@ -5809,7 +6468,15 @@ async fn run_import_command(
     )
     .0;
     let ctx =
-        atomcode::import_cmd::scan_context(&home, &project, dirs.clone(), skill_dirs);
+        let (opencode_config, opencode_data) = atomcode_coding::config::opencode_dirs();
+        atomcode::import_cmd::scan_context(
+            &home,
+            &project,
+            dirs.clone(),
+            skill_dirs,
+            opencode_config,
+            opencode_data,
+        );
     let sources = atomcode_capabilities::migration::builtin_sources();
     let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
 
@@ -5854,9 +6521,9 @@ async fn run_import_command(
 }
 ```
 
-> **退出码**：有东西没导入 → 非 0。Task 4 的占位实现与这里的最终实现**签名一致**（都返回 `Result<(String, usize), String>`），Task 7 只换实现、不改签名，所以 Task 4 的调用方不用改。
+> **退出码**：有东西没导入 → 非 0。Task 5 的占位实现与这里的最终实现**签名一致**（都返回 `Result<(String, usize), String>`），Task 8 只换实现、不改签名，所以 Task 5 的调用方不用改。
 
-> `cli_config_path()` 已在 Task 4 定义（同一个 `main.rs`），**不要在这里再定义一遍**。它接受 `--config` 传下来的路径，所以验收时可以把配置写到临时目录。
+> `cli_config_path()` 已在 Task 5 定义（同一个 `main.rs`），**不要在这里再定义一遍**。它接受 `--config` 传下来的路径，所以验收时可以把配置写到临时目录。
 
 - [ ] **Step 6: 加文案**
 
@@ -6008,7 +6675,7 @@ rather than an overwrite."
 
 ---
 
-## Task 8: 门与验收
+## Task 9: 门与验收
 
 **Files:** 无新增文件；只跑门。
 
@@ -6023,7 +6690,7 @@ Run: `cargo nextest run -p atomcode-capabilities --features migration`
 Expected: 全绿。
 
 Run: `cargo nextest run -p atomcode-config`
-Expected: 全绿 —— **Task 6 改了 `provider_book.rs`**（公开了两个归一规则的包装），所以 config crate 也在受影响范围内，它的测试也要跑。
+Expected: 全绿 —— **Task 7 改了 `provider_book.rs`**（公开了两个归一规则的包装），所以 config crate 也在受影响范围内，它的测试也要跑。
 
 Run: `cargo nextest run -p atomcode-cli`
 Expected: 全绿。
@@ -6075,6 +6742,26 @@ Expected: 报告列出本机 `~/.claude` 与 `~/.codex` 的资产；项目级 `C
 > **不是每个 `~/.claude/skills/*` 都是 `in effect`** —— 同名的另一个目录会覆盖它，
 > 解析失败的会被加载器拒绝（`registry.rs:262`）。这两种都仍然是 `Blocked`，
 > 那是**正确**的，不是缺陷。
+
+**OpenCode 也要看**（第三个来源，本期新增）—— 它的目录由宿主按 XDG 解析，
+所以先确认宿主解析到了哪里：
+
+```bash
+# OpenCode 的两个目录（宿主解析，capability 不读环境）
+"$BIN" import --json | grep -i opencode
+```
+
+Expected: 若本机装了 OpenCode，报告里有 `opencode` 这一组；`~/.config/opencode/skills/*`
+标 `can move`（**我们不读那棵树**），`~/.local/share/opencode/auth.json` 标
+`blocked`（明文密钥，只报不搬）。
+
+> **`.agents/commands` 与 `.agents/skills` 的状态不同** —— 前者标 `can move`
+> （注册表的标准目录表里**没有** `.agents/commands`，`registry.rs:585` 只有
+> `.agents/skills`），后者标 `in effect`。两者都出现在报告里，但含义相反：
+> 把前者当成「已经在生效」，用户就会以为自己的共享命令已经在跑了。
+
+若本机**没装** OpenCode：报告里**不该**有 `opencode` 这一组 —— 「没发现」
+不是错误（§3.7 的失败语义）。
 
 **不**用真实的 `~/.claude` 跑 `--apply`：那会把**本机真实的密钥**写进文件。而且只改 `ATOMCODE_HOME` 并不隔离**源** —— 扫描的是 OS 家目录，与 `ATOMCODE_HOME` 无关。
 
@@ -6149,5 +6836,5 @@ git commit -m "style: rustfmt"
 
 - **行为变化**：新增 `atomcode import`（只读报告）、`atomcode import --json`、`atomcode import --apply`、TUI `/import`。
 - **风险**：第二期会写 `config.toml`。已封住三条：密钥走环境变量名、密钥需逐项确认、id 冲突不覆盖。
-- **已验证**：Task 8 的每条命令与其输出。
+- **已验证**：Task 9 的每条命令与其输出。
 - **未验证**：真实 Claude/Codex 会话文件的转换（本期不做）；`~/.claude.json` 里 `projects.*.mcpServers` 的逐项目解析（本期只取顶层 `mcpServers`）。
