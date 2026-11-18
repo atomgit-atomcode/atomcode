@@ -14,6 +14,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `MergedFinding::dimensions` 的 inline 存储：元素上界 = REVIEW_DIMENSIONS.len() = 4，
+# 用 SmallVec<[&'static str; 4]> 省掉 merge_findings 热路径里每条 finding 的一次堆分配。
+smallvec = "1"
 # turn 总时长软上限：经 kernel cancel_token seam 定时 cancel（不改 kernel）。
 tokio-util = "0.7"
 

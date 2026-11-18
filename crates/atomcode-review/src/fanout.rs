@@ -4,6 +4,8 @@
 
 use std::cmp::Ordering;
 
+use smallvec::{SmallVec, smallvec};
+
 use crate::review_tool::{cmp_finding, paths_match};
 use crate::Finding;
 
@@ -59,7 +61,7 @@ pub const REVIEW_DIMENSIONS: &[ReviewDimension] = &[
 /// A finding that survived dedup, tagged with every dimension that reported it.
 pub struct MergedFinding {
     pub finding: Finding,
-    pub dimensions: Vec<&'static str>,
+    pub dimensions: SmallVec<[&'static str; 4]>,
 }
 
 /// Collapse per-dimension findings into a deduped set. Two findings are the same
@@ -84,7 +86,7 @@ pub fn merge_findings(per_dim: Vec<(&'static str, Vec<Finding>)>) -> Vec<MergedF
                 }
                 None => merged.push(MergedFinding {
                     finding,
-                    dimensions: vec![dim],
+                    dimensions: smallvec![dim],
                 }),
             }
         }
@@ -528,7 +530,7 @@ mod tests {
         assert_eq!(merged.len(), 1, "overlapping near-duplicate collapses");
         // Higher-priority (P1) content wins; both dimensions are credited.
         assert_eq!(merged[0].finding.priority, "P1");
-        assert_eq!(merged[0].dimensions, vec!["correctness", "security"]);
+        assert_eq!(merged[0].dimensions, smallvec!["correctness", "security"]);
     }
 
     #[test]
