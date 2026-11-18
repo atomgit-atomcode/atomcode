@@ -2511,4 +2511,17 @@ pub enum Msg<'a> {
         count: usize,
     },
     MigrationUnreadableConfig,
+    MigrationReportEmpty,
+    MigrationSummary {
+        total: usize,
+        active: usize,
+        imported: usize,
+        actionable: usize,
+        blocked: usize,
+    },
+    MigrationStatusActive,
+    MigrationStatusImported,
+    MigrationStatusActionable,
+    MigrationStatusBlocked,
+    MigrationAlreadyImported,
 }

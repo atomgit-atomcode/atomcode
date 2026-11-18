@@ -270,6 +270,23 @@ pub struct CodingAgentConfig {
 /// place in the runtime that reads the environment for a directory, and it is
 /// called by the host, explicitly, where it builds the config. A program
 /// embedding the runtime under another name builds its own `ProductDirs`.
+/// Where OpenCode keeps its configuration and data.
+///
+/// **The host resolves these** — the capability reads no environment
+/// (`AGENTS.md`: 「解析环境只在宿主」). OpenCode follows XDG
+/// (`XDG_CONFIG_HOME` / `XDG_DATA_HOME`), with the usual defaults.
+pub fn opencode_dirs() -> (PathBuf, PathBuf) {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("opencode");
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
+        .join("opencode");
+    (config, data)
+}
+
 pub fn product_dirs_from_env() -> atomcode_capabilities::ProductDirs {
     atomcode_capabilities::ProductDirs::new(
         atomcode_config::config::Config::config_dir(),

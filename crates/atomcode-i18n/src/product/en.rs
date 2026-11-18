@@ -1890,6 +1890,28 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::MigrationUnreadableConfig => {
             "This config file could not be parsed, so nothing could be read from it".into()
         }
+
+        Msg::MigrationReportEmpty => {
+            "No assets from another AI coding agent were found.".into()
+        }
+        Msg::MigrationSummary {
+            total,
+            active,
+            imported,
+            actionable,
+            blocked,
+        } => format!(
+            "\n{total} assets: {active} already in effect, {imported} already imported, \
+             {actionable} can be brought over, {blocked} cannot.\n"
+        )
+        .into(),
+        Msg::MigrationStatusActive => "in effect".into(),
+        Msg::MigrationStatusImported => "already imported".into(),
+        Msg::MigrationStatusActionable => "can move".into(),
+        Msg::MigrationStatusBlocked => "cannot move".into(),
+        Msg::MigrationAlreadyImported => {
+            "Already in your configuration — nothing left to bring over".into()
+        }
 }
 }
 

@@ -1803,6 +1803,24 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         }
 
         Msg::MigrationUnreadableConfig => "这个配置文件无法解析，因此其中内容都没读到".into(),
+
+        Msg::MigrationReportEmpty => "没有发现其他 AI 编码 Agent 留下的资产。".into(),
+        Msg::MigrationSummary {
+            total,
+            active,
+            imported,
+            actionable,
+            blocked,
+        } => format!(
+            "\n共 {total} 项资产：{active} 项已经生效，{imported} 项已导入，\
+             {actionable} 项可以带走，{blocked} 项带不走。\n"
+        )
+        .into(),
+        Msg::MigrationStatusActive => "已经生效".into(),
+        Msg::MigrationStatusImported => "已导入".into(),
+        Msg::MigrationStatusActionable => "可以带走".into(),
+        Msg::MigrationStatusBlocked => "带不走".into(),
+        Msg::MigrationAlreadyImported => "已在你的配置里 —— 没有需要带过来的了".into(),
 }
 }
 

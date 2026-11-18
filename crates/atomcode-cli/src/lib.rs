@@ -31,6 +31,7 @@ pub mod browser_cmd;
 pub mod desktop;
 pub mod git_auth_cmd;
 pub mod grape_connect;
+pub mod import_cmd;
 mod mcp_setup;
 pub mod project_setup;
 pub mod relay;

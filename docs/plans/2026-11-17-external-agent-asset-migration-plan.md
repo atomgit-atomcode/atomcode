@@ -5680,9 +5680,10 @@ pub fn mark_already_imported(
             //
             // The row keeps the definition's ORIGINAL name, so the drafts
             // are matched on that too.
-            let Some(draft) = drafts.iter().find(|d| {
-                d.source_name == asset.name && d.source_path == asset.path
-            }) else {
+            let Some(draft) = drafts
+                .iter()
+                .find(|d| d.source_name == asset.name && d.source_path == asset.path)
+            else {
                 continue;
             };
             let Some(account) = accounts.get(&draft.id) else {
@@ -5690,9 +5691,10 @@ pub fn mark_already_imported(
             };
             if same_account(account, models, draft) {
                 asset.status = AssetStatus::Imported;
-                asset.detail =
-                    atomcode_i18n::product::t(atomcode_i18n::product::Msg::MigrationAlreadyImported)
-                        .into_owned();
+                asset.detail = atomcode_i18n::product::t(
+                    atomcode_i18n::product::Msg::MigrationAlreadyImported,
+                )
+                .into_owned();
             }
         }
     }
@@ -5710,8 +5712,11 @@ pub fn mark_already_imported(
 /// id, not a wildcard: an account speaking the Responses API is a different
 /// account from one speaking chat/completions, even at the same endpoint.
 fn same_account(
-    account: &atomcode_config::config::ProviderAccountConfig,
-    models: &std::collections::HashMap<String, atomcode_config::config::ModelProfileConfig>,
+    account: &atomcode_config::config::provider::ProviderAccountConfig,
+    models: &std::collections::HashMap<
+        String,
+        atomcode_config::config::provider::ModelProfileConfig,
+    >,
     draft: &ProviderAccountDraft,
 ) -> bool {
     // **A blocked draft is never "already imported".** A blocked draft is one
@@ -5837,13 +5842,13 @@ mod tests {
         // The state words come from the message table, so they are compared
         // against the table rather than against a literal in this file.
         assert!(
-            text.contains(&atomcode_i18n::product::t(
+            text.contains(&*atomcode_i18n::product::t(
                 atomcode_i18n::product::Msg::MigrationStatusActive
             )),
             "{text}"
         );
         assert!(
-            text.contains(&atomcode_i18n::product::t(
+            text.contains(&*atomcode_i18n::product::t(
                 atomcode_i18n::product::Msg::MigrationStatusBlocked
             )),
             "{text}"
@@ -5866,7 +5871,7 @@ mod tests {
         let text = render(&MigrationReport::default(), false);
         assert!(!text.trim().is_empty());
         assert!(
-            text.contains(&atomcode_i18n::product::t(
+            text.contains(&*atomcode_i18n::product::t(
                 atomcode_i18n::product::Msg::MigrationReportEmpty
             )),
             "{text}"
@@ -5893,7 +5898,7 @@ mod tests {
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
-            source_name: id.into(),
+            source_name: "gateway".into(),
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -5937,7 +5942,7 @@ mod tests {
             source_path: "/home/u/.codex/config.toml".into(),
             scope: AssetScope::User,
             blocked: None,
-            source_name: id.into(),
+            source_name: "gateway".into(),
         };
         let mut report = MigrationReport {
             sources: vec![atomcode_capabilities::migration::SourceReport {
@@ -5960,6 +5965,21 @@ mod tests {
             "a different endpoint is not the same account"
         );
     }
+}
+
+/// Import the provider accounts an external agent has configured.
+///
+/// **The signature is final** — Task 8 fills in the body without changing
+/// it, so the caller never has to move. The second number is how many items
+/// were left out on purpose; something left out is not a success.
+pub fn apply_provider_accounts(
+    _sources: &[Box<dyn atomcode_capabilities::migration::MigrationSource>],
+    _ctx: &ScanContext,
+    _yes: bool,
+    _config_path: &std::path::Path,
+    _interactive: bool,
+) -> Result<(String, usize), String> {
+    Err("provider import is not wired up yet".into())
 }
 ```
 

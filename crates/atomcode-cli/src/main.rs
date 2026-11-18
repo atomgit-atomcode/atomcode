@@ -770,6 +770,20 @@ enum HeadlessOutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Look at the assets another AI coding agent left behind: instructions,
+    /// skills, MCP servers, provider settings. Read-only unless --apply.
+    Import {
+        /// Print the report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Import the provider accounts, asking before each one.
+        #[arg(long)]
+        apply: bool,
+        /// Do not ask; import every provider account that needs no confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Configure an externally installed isolated browser MCP.
     #[command(subcommand)]
     Browser(browser_cmd::BrowserCli),
@@ -1917,6 +1931,15 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     };
     if let Some(cmd) = cli.command {
         match cmd {
+            Commands::Import { json, apply, yes } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let exit_code = run_import_command(json, apply, yes, cli.config.as_deref()).await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return Ok(exit_code);
+            }
+
             // Not a terminal command: fall through to the TUI/headless launch with
             // `resume_selector` already captured above (interactive by default; add
             // `-p` to run headless resumed).
@@ -2350,7 +2373,9 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 return Ok(code);
             }
             other => {
-                let result = handle_command(other, &telemetry).await.map(|_| 0);
+                let result = handle_command(other, &telemetry, cli.config.as_deref())
+                    .await
+                    .map(|_| 0);
                 // Flush any events emitted by the subcommand (e.g. login_success)
                 // before the process exits. Bounded by the same 500ms budget as
                 // other exit paths.
@@ -4061,6 +4086,93 @@ pub(crate) async fn run_native_headless_detailed(
 }
 
 /// Seed bootstrap and capability setup share the same local service as the TUI.
+/// Where our configuration lives.
+///
+/// The host owns this path. `--config` wins when it is given, the same way it
+/// does everywhere else in this binary (`main.rs:1801`); otherwise it is the
+/// default location — the same file `atomcode login` writes to.
+fn cli_config_path(cli_config: Option<&std::path::Path>) -> std::path::PathBuf {
+    match cli_config {
+        Some(path) => path.to_path_buf(),
+        None => atomcode_config::config::Config::default_path(),
+    }
+}
+
+async fn run_import_command(
+    json: bool,
+    apply: bool,
+    yes: bool,
+    cli_config: Option<&std::path::Path>,
+) -> i32 {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    // The configuration we are importing INTO — it also says where our
+    // skills live (`[skills].extra_dirs`).
+    let config =
+        atomcode_config::config::Config::load(&cli_config_path(cli_config)).unwrap_or_default();
+    // The skill roots the RUNTIME uses — the user's configured `extra_dirs`
+    // come first, and a skill there can win a same-name collision. Resolving
+    // them here (rather than letting the capability fall back to the
+    // standard list) is what makes the report agree with the runtime.
+    let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
+        &config.skills.extra_dirs,
+        &project,
+        &dirs,
+        Some(home.as_path()),
+        None,
+    )
+    .0;
+    let (opencode_config, opencode_data) = atomcode_coding::config::opencode_dirs();
+    let ctx = atomcode::import_cmd::scan_context(
+        &home,
+        &project,
+        dirs.clone(),
+        Some(skill_dirs),
+        opencode_config,
+        opencode_data,
+    );
+    let sources = atomcode_capabilities::migration::builtin_sources();
+    let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
+
+    // The re-check: what is already in OUR configuration is not "to be
+    // brought over" — it is already there.
+    let drafts: Vec<_> = sources
+        .iter()
+        .flat_map(|source| source.provider_drafts(&ctx))
+        .collect();
+    let config_path = cli_config_path(cli_config);
+    atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &config_path);
+
+    if !apply {
+        println!("{}", atomcode::import_cmd::render(&report, json));
+        return 0;
+    }
+
+    // Phase two: provider accounts. `--apply` without `--yes` asks per item.
+    match atomcode::import_cmd::apply_provider_accounts(
+        &sources,
+        &ctx,
+        yes,
+        &config_path,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    ) {
+        Ok((text, skipped)) => {
+            println!("{text}");
+            // Something was left out on purpose: that is not a success.
+            if skipped > 0 {
+                1
+            } else {
+                0
+            }
+        }
+        Err(error) => {
+            eprintln!("import: {error}");
+            1
+        }
+    }
+}
+
 async fn run_setup_command(
     force: bool,
     check: bool,
@@ -4123,13 +4235,27 @@ async fn run_setup_command(
 }
 
 /// Handle subcommands (login, logout, status)
-async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) -> Result<()> {
+async fn handle_command(
+    cmd: Commands,
+    telemetry: &std::sync::Arc<Telemetry>,
+    cli_config: Option<&std::path::Path>,
+) -> Result<()> {
     // Subcommands never enter TUI, so tell the panic hook to skip terminal
     // cleanup — otherwise `disable_raw_mode` panics on Windows with
     // "initial console mode not set" because raw mode was never enabled.
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
     match cmd {
+        Commands::Import { json, apply, yes } => {
+            HEADLESS_MODE.store(true, Ordering::Relaxed);
+            // The exit code is the command's own answer: "something was left
+            // out" is not a success, and a script reading the exit code must
+            // not be told everything went in when it did not. `handle_command`
+            // speaks `Result<()>`, so the code leaves through the process
+            // status — there is no other channel for it here.
+            let exit_code = run_import_command(json, apply, yes, cli_config).await;
+            std::process::exit(exit_code);
+        }
         Commands::Login => {
             // `run()` intercepts Login (and its Codingplan alias) before
             // handle_command is called, running the full OAuth + setup
