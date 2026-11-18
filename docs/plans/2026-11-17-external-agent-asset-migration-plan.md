@@ -208,9 +208,30 @@ cargo fmt --all -- --check
 - Create: `crates/atomcode-capabilities/src/migration/claude.rs`（**空壳**，Task 2 填）
 - Create: `crates/atomcode-capabilities/src/migration/codex.rs`（**空壳**，Task 3 填）
 - Create: `crates/atomcode-capabilities/src/migration/provider.rs`（**两个类型 + 共享归一包装**，Task 7 只加来源草案）
+- Modify: `crates/atomcode-capabilities/src/skills/registry.rs`（**记录它发现了什么** —— 报告只依据这份记录裁决，见下）
+- Modify: `crates/atomcode-capabilities/src/skills/mod.rs`（导出 `DiscoveredTemplate` 和 `EntryKind`）
 - Modify: `crates/atomcode-capabilities/Cargo.toml`
 - Modify: `crates/atomcode-capabilities/src/lib.rs`
-- Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`（**只加 4 条**，Task 2 再加其余）
+- Modify: `crates/atomcode-config/src/provider_book.rs`（供 provider 草案复用归一规则）
+- Modify: `gates/compile.sh`（把 `migration` 加入 feature 编译门）
+- Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`（**只加 15 条**，Task 2 再加其余）
+
+> **为什么注册表也要改**：「让真加载器说出来」的字面意思是**它说什么就是什么**，
+> 报告不许自己再推断一遍。注册表**走过一遍**目录，它知道自己在哪一层停下了、
+> 跳过了哪些目录、受什么深度上限约束、**哪一份同名定义赢了** —— 而报告若自己
+> 再走一遍去推算「注册表会不会走到这个条目」，两遍遍历在符号链接、别名路径、
+> 忽略目录上会给出**不同答案**。
+>
+> 所以注册表要**记录它发现了什么**（含被同名的另一份顶掉的那一份），报告先查这份记录，再查诊断。没有匹配的记录或诊断时，
+> `Scanned` 候选按「没有生效，加载器没有给出原因」处理；`Foreign` 候选按解析结果审查复制建议。
+>
+> 这一步是**纯增量**：新增发现记录和入口形态类型、记录向量、两个按索引槽追踪胜者的映射及一个访问器，`insert_parsed` 的既有
+> 行为（覆盖诊断只在定义不同时记、警告的记录、`diagnose` 的调用）一字不变。
+> 但 `skills/registry.rs` 是**运行时也在用**的模块，所以验收要跑
+> `cargo nextest run -p atomcode-capabilities`（**默认 feature**）。
+>
+> 规格见 `docs/plans/2026-11-19-task1-architecture-handoff.md`。
+
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -224,6 +245,7 @@ mod tests {
     #[test]
     fn a_report_with_no_assets_is_empty_not_an_error() {
         let report = MigrationReport::default();
+
         assert!(report.sources.is_empty());
         assert_eq!(report.total_assets(), 0);
     }
@@ -232,6 +254,11 @@ mod tests {
     fn the_report_counts_assets_across_sources() {
         let report = MigrationReport {
             sources: vec![
+                SourceReport {
+                    source_id: "codex",
+                    display_name: "Codex",
+                    assets: vec![],
+                },
                 SourceReport {
                     source_id: "claude-code",
                     display_name: "Claude Code",
@@ -244,13 +271,9 @@ mod tests {
                         detail: "directly read".into(),
                     }],
                 },
-                SourceReport {
-                    source_id: "codex",
-                    display_name: "Codex",
-                    assets: vec![],
-                },
             ],
         };
+
         assert_eq!(report.total_assets(), 1);
         assert_eq!(report.assets_with_status(AssetStatus::Active), 1);
         assert_eq!(report.assets_with_status(AssetStatus::Blocked), 0);
@@ -259,15 +282,17 @@ mod tests {
     #[test]
     fn scanning_with_no_sources_produces_an_empty_report() {
         let ctx = ScanContext {
-            os_home: std::path::PathBuf::from("/home/u"),
-            project: std::path::PathBuf::from("/work"),
+            os_home: PathBuf::from("/home/u"),
+            project: PathBuf::from("/work"),
             product: crate::ProductDirs::new("/home/u/.ours", ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
         let report = scan(&[], &ctx);
+
         assert!(report.sources.is_empty());
+        assert_eq!(report.total_assets(), 0);
     }
 }
 ```
@@ -349,7 +374,7 @@ pub mod migration;
 ```rust
 //! What a scan found: one row per asset, each carrying a status.
 //!
-//! Three statuses, not two. "Compatible" and "needs conversion" cannot say the
+//! Four statuses, not two. "Compatible" and "needs conversion" cannot say the
 //! one thing a person most needs to know before deciding: whether the asset
 //! can come over at all. A lost session history and a skill directory that
 //! only needs copying are both "not native", but only one of them is
@@ -453,6 +478,11 @@ impl MigrationReport {
 
 - [ ] **Step 5: 写 mod.rs 的骨架**
 
+Task 1 提供 `identity`、`same_file` 与 `file_id`，供 Task 2 的跨层指令去重使用。
+`same_file` 依次比较原路径、规范路径、设备号与 inode。设备号和 inode 比较仅覆盖 Unix。
+
+应用下方骨架时保留 Step 1 的测试模块。
+
 `crates/atomcode-capabilities/src/migration/mod.rs`：
 
 ```rust
@@ -470,6 +500,10 @@ impl MigrationReport {
 //! Opt-in `migration` feature. See
 //! `docs/plans/2026-11-17-external-agent-asset-migration-design.md`.
 
+// The sources land one per task; each helper here is used by the source that
+// comes next. The allow comes off when the last source is in.
+#![allow(dead_code)]
+
 mod claude;
 mod codex;
 mod provider;
@@ -478,16 +512,16 @@ mod text;
 
 use std::path::{Path, PathBuf};
 
-pub use provider::{ApiKeyRef, ProviderAccountDraft};
-/// The endpoint an account will actually talk to.
-///
-/// Re-exported because `provider` is a **private** module: the host needs
-/// this to name the endpoint in its confirmation prompt, and the host cannot
-/// reach into a private module.
-pub use provider::endpoint_in_use;
-pub use report::{
-    AssetKind, AssetReport, AssetScope, AssetStatus, MigrationReport, SourceReport,
-};
+// The FORM the registry's walk found an entry in — a skill directory or a
+// flat file. The INDEX cannot say this: both forms go into the skill index.
+use crate::skills::EntryKind;
+
+// `endpoint_in_use` is the endpoint an account will actually talk to. It is
+// re-exported because `provider` is a **private** module: the host needs it
+// to name the endpoint in its confirmation prompt, and the host cannot reach
+// into a private module.
+pub use provider::{endpoint_in_use, ApiKeyRef, ProviderAccountDraft};
+pub use report::{AssetKind, AssetReport, AssetScope, AssetStatus, MigrationReport, SourceReport};
 
 /// Where to look. The host resolves all of it — this crate reads no environment.
 ///
@@ -524,9 +558,16 @@ pub struct ScanContext {
     /// DIFFERENT winner for a same-named skill than the runtime does — while
     /// the report claimed to be saying "the way the runtime does".
     ///
-    /// **Empty means "the standard list"** — the host passes the real list
-    /// in production, and an empty list keeps the fixtures honest.
-    pub skill_dirs: Vec<PathBuf>,
+    /// **`None` and `Some(vec![])` mean different things.**
+    ///
+    /// - `None` = the host gave no list → the standard list
+    ///   (`standard_skill_dirs`) is used.
+    /// - `Some(vec![])` = the host EXPLICITLY asked for **no** skill roots —
+    ///   the runtime has its skill tools turned off. The report must not
+    ///   fall back to the standard list and then claim `~/.claude/skills/foo`
+    ///   is `Active`: nothing is loading it.
+    /// - `Some(dirs)` = exactly these roots, in this order.
+    pub skill_dirs: Option<Vec<PathBuf>>,
     /// Where OpenCode keeps its configuration
     /// (`$XDG_CONFIG_HOME/opencode`, default `~/.config/opencode`).
     ///
@@ -547,9 +588,14 @@ pub trait MigrationSource: Send + Sync {
     /// The name a person knows this agent by.
     fn display_name(&self) -> &'static str;
     /// Look, and report. Must not write anything.
-    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport>;
+    ///
+    /// `truth` is the registry load `scan()` did — **the ONE load for the
+    /// whole report**. A source that loaded its own would see a different
+    /// moment of the same disk than the source next to it, and the report
+    /// would contradict itself.
+    fn detect(&self, ctx: &ScanContext, truth: &SkillTruth) -> Vec<AssetReport>;
     /// The provider accounts this agent has configured, if any.
-    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
+    fn provider_drafts(&self, _ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
         Vec::new()
     }
     /// Why the provider accounts could NOT be read, when that is the case.
@@ -566,10 +612,7 @@ pub trait MigrationSource: Send + Sync {
 
 /// The agents we know how to read.
 pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>> {
-    vec![
-        Box::new(claude::ClaudeSource),
-        Box::new(codex::CodexSource),
-    ]
+    vec![Box::new(claude::ClaudeSource), Box::new(codex::CodexSource)]
 }
 
 /// Scan every source. A source that finds nothing contributes no rows.
@@ -580,8 +623,13 @@ pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>> {
 /// machinery, and Task 1 stands on its own.
 pub fn scan(sources: &[Box<dyn MigrationSource>], ctx: &ScanContext) -> MigrationReport {
     let mut report = MigrationReport::default();
+    // **ONE registry load for the whole report.** The registry is the
+    // authority on what is in effect; loading it per source would let two
+    // sources in one report see two different moments of the same disk — and
+    // the report would contradict itself.
+    let truth = SkillTruth::load(ctx);
     for source in sources {
-        let assets = source.detect(ctx);
+        let assets = source.detect(ctx, &truth);
         if assets.is_empty() {
             continue;
         }
@@ -596,9 +644,12 @@ pub fn scan(sources: &[Box<dyn MigrationSource>], ctx: &ScanContext) -> Migratio
 
 /// The report row for a provider account.
 ///
-/// **The row's NAME is the account id** — the same id the importer will
-/// write. A row named "provider" or "config.toml" could never be matched by
-/// the re-check, and the re-check would never fire. Every source builds its
+/// **The row's NAME is the name the source wrote**, and the normalized
+/// account id the importer will write is in `draft.id` — that id, not the
+/// row's name, is what the re-check matches. The name stays the source's own
+/// because two definitions can normalize to the same id (`"foo bar"` and
+/// `"foo-bar"` both become `foo-bar`): only the original name tells them
+/// apart, and it is the one the person recognises. Every source builds its
 /// provider rows through this one function, so the rule lives in one place.
 ///
 /// The `detail` is passed in rather than built here: this module has no
@@ -628,81 +679,393 @@ pub fn provider_row(
     }
 }
 
+/// The last component of a path, for a report row's name.
+fn last_component(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default();
+    name.to_string_lossy().into_owned()
+}
+
+/// A tree of skills: do we scan it, or is it someone else's?
+///
+/// **The tree decides where the CANDIDATES come from.**
+///
+/// - [`SkillTree::Scanned`] — a tree the REGISTRY scans. The candidates are
+///   the registry's own discoveries; the report does not walk the disk a
+///   second time. An asset the registry never found is **not in the report
+///   at all**: the registry does not think it is an asset, and neither does
+///   the report.
+/// - [`SkillTree::Foreign`] — a tree NOBODY scans. The report walks it
+///   itself, with the report's own limits and the report's own sentences
+///   about them.
+///
+/// `Clone`, not `Copy`: `Foreign` owns a `PathBuf`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillTree {
+    /// We scan this tree — the registry does. Its discoveries are the
+    /// candidates, and its verdicts decide whether each one is really in
+    /// effect — or merely shadowed, or rejected.
+    Scanned,
+    /// We do NOT scan this tree. Nothing in it is in effect — unless the
+    /// registry happens to load this tree anyway (a host that put it in the
+    /// skill roots), in which case the registry's own word wins. Otherwise
+    /// every row says where to bring it over.
+    ///
+    /// `target` is the directory to copy into (`skills/` or `commands/`)
+    /// itself — no further `skills`/`commands` component is added. Each row
+    /// joins its own name onto it, shaped like the asset: `<name>` for a
+    /// skill directory, `<name>.md` for a flat command file.
+    Foreign { target: PathBuf },
+}
+
+impl SkillTree {
+    /// The depth-limit sentence — **WHO** stopped the walk.
+    ///
+    /// The registry has a depth limit of its own, and it says so in its own
+    /// words — but only for a tree it scans. In a tree it never scanned, the
+    /// **report's** walk is what stopped, and saying "the skill loader
+    /// rejected it" would put words in the loader's mouth about a file the
+    /// loader never looked at.
+    fn depth_limit_detail(&self) -> String {
+        match self {
+            SkillTree::Scanned => text::skill_rejected(&text::skill_depth_limit()),
+            SkillTree::Foreign { .. } => text::report_depth_limit(),
+        }
+    }
+
+    /// The symlink-cycle sentence — **WHO** stopped the walk. The same
+    /// split as [`Self::depth_limit_detail`].
+    fn symlink_cycle_detail(&self) -> String {
+        match self {
+            SkillTree::Scanned => text::skill_rejected(&text::skill_symlink_cycle()),
+            SkillTree::Foreign { .. } => text::report_symlink_cycle(),
+        }
+    }
+    /// The status and sentence for one skill found in a FOREIGN tree.
+    ///
+    /// `path` is the skill directory or the flat command file; `name` is the
+    /// registry's name for it (for a command file, already without `.md`).
+    /// `parses` is whether the registry's own parser accepts the file.
+    ///
+    /// **Only for a tree the registry does NOT scan** — a tree it scans gets
+    /// its candidates from the registry itself, and the registry's own
+    /// verdict (see [`registry_rows`]).
+    fn judge(
+        &self,
+        registry: &SkillTruth,
+        name: &str,
+        path: &Path,
+        parses: bool,
+    ) -> (AssetStatus, String) {
+        match self {
+            SkillTree::Scanned => registry.verdict(name, path, parses),
+            SkillTree::Foreign { target } => {
+                // A tree the registry does NOT scan can still hold an asset
+                // the registry DID load: a host that put this tree in its
+                // skill roots loaded it, and it is in effect right now. Then
+                // "copy it over" is nonsense — the registry says what is
+                // true, and we say that.
+                let is_skill_dir = probe_dir(path).unwrap_or(false);
+                if let Some(verdict) = registry.registry_says(name, path, is_skill_dir) {
+                    return verdict;
+                }
+                // The registry found this asset and could not load it — with
+                // its own reason. Copying it over would only move the
+                // failure.
+                if let Some((reason, rejected)) = registry.registry_failure(path, is_skill_dir) {
+                    return if rejected {
+                        (AssetStatus::Blocked, text::skill_rejected(&reason))
+                    } else {
+                        (AssetStatus::Blocked, text::report_entry_unusable(&reason))
+                    };
+                }
+                // A file the loader cannot parse will not load there either:
+                // copying it over only moves the failure. (The registry never
+                // looked at this file, so this is not the loader's word — it
+                // is ours.)
+                if !parses {
+                    return (AssetStatus::Blocked, text::foreign_unparseable());
+                }
+                // The registry loads flat commands as top-level `*.md` files
+                // (`registry.rs:340`): a copy named `<name>` without the
+                // extension would never be scanned, and the advice would not
+                // work. A skill directory's name is its directory name.
+                let is_command_file =
+                    path.extension().and_then(|e| e.to_str()) == Some("md") && !is_skill_dir;
+                let destination = if is_command_file {
+                    target.join(format!("{name}.md"))
+                } else {
+                    target.join(name)
+                };
+                // "Bring it over" — an ACTION, not a promise: whether it wins
+                // against a same-named higher-priority definition is not ours
+                // to promise.
+                (AssetStatus::Actionable, text::skill_copyable(&destination))
+            }
+        }
+    }
+}
+
 // The skill helpers live HERE, not in one source: three sources report
 // skills (Claude Code, OpenCode, and the shared `.agents` tree), and a
 // helper that only one of them can reach is a helper the other two will
 // re-implement — and then they will drift from the registry.
 /// One row per skill directory (`<name>/SKILL.md`) or command file (`<name>.md`).
 ///
-/// A directory that does not exist is simply empty. A directory that exists
-/// but cannot be read is NOT empty — it is a problem the person should see,
-/// so it becomes a `Blocked` row rather than silence.
+/// **Where the CANDIDATES come from depends on the tree.**
+///
+/// - [`SkillTree::Scanned`] — a tree the registry scans. The candidates are
+///   **the registry's own discoveries**: it walked that tree, so it knows
+///   what is under it. The report does **not** walk the disk a second time:
+///   two walks of the same disk disagree (a symlink, an ignored directory, a
+///   depth limit), and the report's answer must be the runtime's answer. So
+///   an asset the registry never found is **not in the report at all** — it
+///   is not ours, and listing it would mean explaining "why it is not in
+///   effect", which is itself a guess.
+/// - [`SkillTree::Foreign`] — a tree the registry does NOT scan. Nobody else
+///   knows what is under it, so the report walks it itself. That walk is the
+///   REPORT's own, with the report's own limits and the report's own
+///   sentences about them.
 ///
 /// **Whether the asset is really in effect is decided by the real registry**,
 /// not by "the file exists". Two things make existence insufficient: a
-/// `SKILL.md` that fails to parse is skipped (`registry.rs:262`), and a skill
-/// with the same name in an earlier directory **overrides** this one
-/// (`registry.rs:250` records "overridden by …"). A report that says "already
-/// in the skill catalog" about an overridden file is wrong.
+/// `SKILL.md` that fails to parse is skipped, and a skill with the same name
+/// in a **later, higher-priority** directory overrides this one — the
+/// registry loads directories from low to high priority, so the last one
+/// loaded wins. A report that says "already in the skill catalog" about an
+/// overridden file is wrong.
+///
+/// **The row's name is the name the registry uses** — the `name:` in the
+/// frontmatter, else the directory name or file stem, normalized — so the
+/// report and the registry cannot disagree about what a skill is called.
 fn skill_rows(
+    kind: AssetKind,
+    scope: AssetScope,
+    root: &Path,
+    registry: &SkillTruth,
+    tree: SkillTree,
+) -> Vec<AssetReport> {
+    match tree {
+        // A tree the registry scans: the registry's discoveries ARE the
+        // candidates.
+        SkillTree::Scanned => registry_rows(kind, scope, root, registry),
+        // A tree nobody else scans: the report walks it itself.
+        SkillTree::Foreign { .. } => foreign_rows(kind, scope, root, registry, &tree),
+    }
+}
+
+/// The path the CALLER named, for an asset the registry found under a root.
+///
+/// The registry walks the LITERAL root it was handed, and the caller may
+/// have named the same directory another way (the same path spelled two
+/// ways — `/var` and `/private/var` on macOS). The report shows the path
+/// the caller named, not the registry's spelling of it.
+///
+/// So: take the part of the asset's path that lies under the registry's
+/// root, and re-attach it to the caller's root.
+///
+/// `None` when the asset is not under the registry's root at all — the
+/// caller keeps its own path then.
+fn re_spelled(root: &Path, registry_root: &Path, asset: &Path) -> Option<PathBuf> {
+    let relative = asset.strip_prefix(registry_root).ok()?;
+    Some(root.join(relative))
+}
+
+/// The rows for a tree the REGISTRY scans — its own discoveries.
+///
+/// **The candidates are the registry's**, filtered to the ones found under
+/// THIS root: the root is what the caller named, and the registry says which
+/// root found each entry.
+///
+/// **One row per DISCOVERY RECORD**, not per asset: the same directory
+/// reached through two roots is two records, and the registry resolved them
+/// against each other — the earlier one lost its name slot. Reporting the
+/// loser as "in effect" would be the report's guess about which of two
+/// records the runtime kept.
+fn registry_rows(
     kind: AssetKind,
     scope: AssetScope,
     root: &Path,
     registry: &SkillTruth,
 ) -> Vec<AssetReport> {
     let mut out = Vec::new();
-    if !root.is_dir() {
-        return out;
+    let root_identity = identity(root);
+    for found in &registry.discovered {
+        // **Under THIS root?** The root is the one the caller named; the
+        // registry may have spelled it another way (the same directory under
+        // another name), so the identity settles it.
+        if found.root != root_identity {
+            continue;
+        }
+        // The row's PATH is the ASSET: the bundle directory for a skill
+        // directory, the file for a flat template. **Spelled the way the
+        // CALLER named it** — the registry may have spelled the same
+        // directory another way, and the report shows the path the person
+        // gave us.
+        let path = re_spelled(root, &found.root_path, &found.asset_path)
+            .unwrap_or_else(|| found.asset_path.clone());
+        // **The registry's own verdict for THIS record**: it kept the record
+        // that holds the name, and marked the others displaced. The flag was
+        // set by the registry's slot resolution, not inferred here.
+        let (status, detail) = if found.replaced {
+            (AssetStatus::Blocked, text::skill_overridden(&found.name))
+        } else {
+            (AssetStatus::Active, text::skill_active())
+        };
+        out.push(AssetReport {
+            kind,
+            name: found.name.clone(),
+            path,
+            scope,
+            status,
+            detail,
+        });
     }
-    // **Grouping directories are walked**, the way the registry walks them
-    // (`registry.rs:288`): `skills/group/deploy/SKILL.md` is a real skill, and
-    // a report that only looked at the immediate children would drop it —
-    // a valid, active skill that vanishes from the report.
-    //
-    // The walk mirrors the registry's rules: the same depth bound, the same
-    // ignored cache directories, and the same symlink-cycle guard. A file
-    // error becomes a `Blocked` row rather than a silent skip.
+    // **The assets the walk found but could NOT load.** They are assets too:
+    // the file is there, the walk reached it, and the loader refused it.
+    // Without a row they would vanish — and no asset may vanish.
+    for failed in &registry.failed {
+        if failed.root != root_identity {
+            continue;
+        }
+        let (status, detail, path) =
+            if matches!(failed.failure, crate::skills::LoadFailure::Rejected) {
+                // The LOADER's own words: it read the file and refused it.
+                // The row points at the ASSET — the bundle directory — the
+                // same place a loaded skill's row points.
+                let asset = re_spelled(root, &failed.root_path, &failed.asset_path)
+                    .unwrap_or_else(|| failed.asset_path.clone());
+                (
+                    AssetStatus::Blocked,
+                    text::skill_rejected(&failed.reason),
+                    asset,
+                )
+            } else {
+                // A fact about the ENTRY: the loader never treated it as a
+                // skill at all, so this is not the loader's story to tell.
+                // The row points at the ENTRY — that is the thing the person
+                // has to look at.
+                let entry = re_spelled(root, &failed.root_path, &failed.entry_path)
+                    .unwrap_or_else(|| failed.entry_path.clone());
+                (
+                    AssetStatus::Blocked,
+                    text::report_entry_unusable(&failed.reason),
+                    entry,
+                )
+            };
+        out.push(AssetReport {
+            kind,
+            name: failed.name.clone(),
+            path,
+            scope,
+            status,
+            detail,
+        });
+    }
+    out
+}
+
+/// The rows for a tree NOBODY scans — the report walks it itself.
+///
+/// **The report's own walk**, with the report's own limits: the depth
+/// bound, the ignored cache directories, the symlink-cycle guard. These are
+/// not guesses about what the registry found — the registry never looked at
+/// this tree — they are the boundaries of what the report can reach.
+fn foreign_rows(
+    kind: AssetKind,
+    scope: AssetScope,
+    root: &Path,
+    registry: &SkillTruth,
+    tree: &SkillTree,
+) -> Vec<AssetReport> {
+    let mut out = Vec::new();
+    // Not `is_dir()`: it reports a directory we may not read as absent.
+    match probe_dir(root) {
+        Ok(true) => {}
+        Ok(false) => {
+            // "Not a directory" is not the same as "not there". A root that
+            // IS there but is not a directory we can walk — a dangling
+            // symlink, a regular file — is a row, not silence: the person
+            // has to see that their tree is not what they think it is.
+            if entry_exists(root) {
+                out.push(AssetReport {
+                    kind,
+                    name: last_component(root),
+                    path: root.to_path_buf(),
+                    scope,
+                    status: AssetStatus::Blocked,
+                    detail: if is_broken_link(root) {
+                        text::broken_link()
+                    } else {
+                        text::not_a_directory()
+                    },
+                });
+            }
+            return out;
+        }
+        Err(reason) => {
+            out.push(AssetReport {
+                kind,
+                name: last_component(root),
+                path: root.to_path_buf(),
+                scope,
+                status: AssetStatus::Blocked,
+                detail: text::unreadable_file(&reason),
+            });
+            return out;
+        }
+    }
+    // **Grouping directories are walked**: `skills/group/deploy/SKILL.md` is a
+    // real skill, and a report that only looked at the immediate children
+    // would drop it — a valid, active skill that vanishes from the report.
     const MAX_DEPTH: usize = 8;
-    let mut ancestors: std::collections::BTreeSet<std::path::PathBuf> =
-        std::collections::BTreeSet::new();
+    let mut ancestors: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     collect_skill_rows(
         kind,
         scope,
-        root,
         root,
         0,
         MAX_DEPTH,
         &mut ancestors,
         registry,
+        tree,
         &mut out,
     );
     out
 }
 
-/// Walk one skill directory, mirroring the registry's discovery rules.
+/// Walk one FOREIGN skill directory — the REPORT's own walk.
+///
+/// **Only for a tree the registry does NOT scan.** A tree it scans gets its
+/// candidates from the registry's own discoveries, so this walk would be a
+/// second, disagreeing answer to the same question.
+///
+/// The limits here (the depth bound, the ignored cache directories, the
+/// symlink-cycle guard) are **the report's own reach** — not a guess about
+/// what the registry found, because the registry never looked at this tree.
 #[allow(clippy::too_many_arguments)]
 fn collect_skill_rows(
     kind: AssetKind,
     scope: AssetScope,
-    root: &Path,
     dir: &Path,
     depth: usize,
     max_depth: usize,
-    ancestors: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    ancestors: &mut std::collections::BTreeSet<PathBuf>,
     registry: &SkillTruth,
+    tree: &SkillTree,
     out: &mut Vec<AssetReport>,
 ) {
+    // A row about `dir` itself. The name matches the PATH this row reports
+    // (`dir`), not the skills root it was found under.
+    let blocked = |detail: String| AssetReport {
+        kind,
+        name: last_component(dir),
+        path: dir.to_path_buf(),
+        scope,
+        status: AssetStatus::Blocked,
+        detail,
+    };
     if depth > max_depth {
-        out.push(AssetReport {
-            kind,
-            // The name matches the PATH this row reports (`dir`), not the
-            // skills root it was found under.
-            name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-            path: dir.to_path_buf(),
-            scope,
-            status: AssetStatus::Blocked,
-            detail: super::text::skill_rejected("the grouping depth limit was exceeded"),
-        });
+        out.push(blocked(tree.depth_limit_detail()));
         return;
     }
     // The cycle guard: a symlink back to an ancestor would otherwise be
@@ -710,71 +1073,117 @@ fn collect_skill_rows(
     let identity = match std::fs::canonicalize(dir) {
         Ok(path) => path,
         Err(error) => {
-            out.push(AssetReport {
-                kind,
-                name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                path: dir.to_path_buf(),
-                scope,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&error.to_string()),
-            });
+            out.push(blocked(text::unreadable_file(&error.to_string())));
             return;
         }
     };
     if !ancestors.insert(identity.clone()) {
-        out.push(AssetReport {
-            kind,
-            name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-            path: dir.to_path_buf(),
-            scope,
-            status: AssetStatus::Blocked,
-            detail: super::text::skill_rejected("a symlink cycle was detected"),
-        });
+        out.push(blocked(tree.symlink_cycle_detail()));
         return;
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
-            out.push(AssetReport {
-                kind,
-                name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                path: dir.to_path_buf(),
-                scope,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&error.to_string()),
-            });
+            out.push(blocked(text::unreadable_file(&error.to_string())));
             ancestors.remove(&identity);
             return;
         }
     };
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     // An entry that cannot be read is a row, not a silent skip: a skill we
     // could not look at is one we could not promise works.
     for entry in entries {
         match entry {
             Ok(entry) => paths.push(entry.path()),
-            Err(error) => out.push(AssetReport {
-                kind,
-                name: dir.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                path: dir.to_path_buf(),
-                scope,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&error.to_string()),
-            }),
+            Err(error) => out.push(blocked(text::unreadable_file(&error.to_string()))),
         }
     }
     paths.sort();
+    // A row about one entry we could not tell the type of. The scan goes on
+    // with the rest.
+    let blocked_entry = |path: &Path, reason: String| AssetReport {
+        kind,
+        name: last_component(path),
+        path: path.to_path_buf(),
+        scope,
+        status: AssetStatus::Blocked,
+        detail: text::unreadable_file(&reason),
+    };
     for path in paths {
-        if path.is_file() {
+        // Not `is_file()` / `is_dir()`: they report an entry we may not stat
+        // as absent, and the entry would vanish from the report.
+        let is_file = match probe_file(&path) {
+            Ok(is_file) => is_file,
+            Err(reason) => {
+                out.push(blocked_entry(&path, reason));
+                continue;
+            }
+        };
+        let is_dir = if is_file {
+            false
+        } else {
+            match probe_dir(&path) {
+                Ok(is_dir) => is_dir,
+                Err(reason) => {
+                    out.push(blocked_entry(&path, reason));
+                    continue;
+                }
+            }
+        };
+        if !is_file && !is_dir {
+            // The entry is there, but it is neither a regular file nor a
+            // directory. It is NOT absent — and an absent entry would be
+            // skipped, but a present one that cannot be used must be a row:
+            // a dangling symlink (the target is gone), a FIFO, a socket.
+            //
+            // `metadata` FOLLOWS the link, so a link whose target is gone
+            // reads as "not there" — and the asset would vanish from the
+            // report. `symlink_metadata` does not follow it, so the entry
+            // itself is still visible.
+            if !entry_exists(&path) {
+                continue;
+            }
+            let name = if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                last_component(&path)
+            };
+            // Computed BEFORE `path` moves into the row: the link has to be
+            // asked about while the path is still ours.
+            let detail = if is_broken_link(&path) {
+                text::broken_link()
+            } else {
+                text::not_a_regular_file()
+            };
+            out.push(AssetReport {
+                kind,
+                name,
+                path,
+                scope,
+                status: AssetStatus::Blocked,
+                detail,
+            });
+            continue;
+        }
+        if is_file {
             // Flat command templates are TOP-LEVEL only (`registry.rs:340`):
             // a skill's own `*.md` files are its resources, not commands.
             if depth == 0 && path.extension().and_then(|e| e.to_str()) == Some("md") {
-                let name = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                let (status, detail) = registry.verdict(&name, &path);
+                // The name the registry gives it (`registry.rs:342` parses
+                // flat command files the same way). If it does not parse,
+                // fall back to the stem; the registry's diagnostic for this
+                // path then says why it is not in effect.
+                let (name, parses) = match crate::skills::skill::parse_skill_file(&path, None) {
+                    Ok(parsed) => (parsed.skill.name, true),
+                    Err(_) => {
+                        let stem = path.file_stem().unwrap_or_default();
+                        (stem.to_string_lossy().into_owned(), false)
+                    }
+                };
+                let (status, detail) = tree.judge(registry, &name, &path, parses);
                 out.push(AssetReport {
                     kind,
                     name,
@@ -784,17 +1193,87 @@ fn collect_skill_rows(
                     detail,
                 });
             }
-        } else if path.is_dir() {
+        } else if is_dir {
             // The registry skips dependency/cache directories
             // (`registry.rs:13`) — the report must skip them too, or it
             // would report thousands of vendored files as skills.
             if is_ignored_skill_directory(&path) {
                 continue;
             }
+            // Not `is_file()`: a `SKILL.md` we may not stat would look like no
+            // `SKILL.md` at all, the directory would be walked as a grouping
+            // directory, and the report would blame the depth limit for what
+            // is really an unreadable file.
             let skill_md = path.join("SKILL.md");
-            if skill_md.is_file() {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                let (status, detail) = registry.verdict(&name, &path);
+            // "No `SKILL.md`" and "a `SKILL.md` that is not a regular file"
+            // are different: only the first is a grouping directory. A
+            // `SKILL.md` that is itself a directory would otherwise be walked
+            // as a group, find nothing, and the asset would vanish from the
+            // report without a word.
+            match probe_dir(&skill_md) {
+                Ok(false) => {}
+                Ok(true) => {
+                    // **The report's own finding** — the loader never
+                    // treated this as a skill at all.
+                    out.push(AssetReport {
+                        kind,
+                        name: last_component(&path),
+                        path: skill_md,
+                        scope,
+                        status: AssetStatus::Blocked,
+                        detail: text::report_entry_unusable("SKILL.md is a directory, not a file"),
+                    });
+                    continue;
+                }
+                Err(reason) => {
+                    out.push(blocked_entry(&path, reason));
+                    continue;
+                }
+            }
+            let is_skill = match probe_file(&skill_md) {
+                Ok(is_skill) => is_skill,
+                Err(reason) => {
+                    out.push(blocked_entry(&path, reason));
+                    continue;
+                }
+            };
+            if !is_skill && entry_exists(&skill_md) {
+                // The `SKILL.md` ENTRY is there, but it is not a regular file:
+                // a dangling symlink (the target is gone), a FIFO, a socket.
+                // `metadata` FOLLOWS the link, so a link whose target is gone
+                // reads as "not there" — and the whole skill would vanish
+                // from the report, walked as a grouping directory that finds
+                // nothing.
+                //
+                // Computed BEFORE `skill_md` moves into the row: the link has
+                // to be asked about while the path is still ours.
+                let detail = if is_broken_link(&skill_md) {
+                    text::broken_link()
+                } else {
+                    text::report_entry_unusable("SKILL.md is not a regular file")
+                };
+                out.push(AssetReport {
+                    kind,
+                    name: last_component(&path),
+                    path: skill_md,
+                    scope,
+                    status: AssetStatus::Blocked,
+                    detail,
+                });
+                continue;
+            }
+            if is_skill {
+                // The name the registry gives it (`registry.rs:354` parses
+                // skill directories the same way, with no namespace for a
+                // standard directory). If it does not parse, fall back to
+                // the directory name; the registry's diagnostic for this
+                // path then says why it is not in effect.
+                let (name, parses) =
+                    match crate::skills::skill::parse_skill_dir(&path, &skill_md, None) {
+                        Ok(parsed) => (parsed.skill.name, true),
+                        Err(_) => (last_component(&path), false),
+                    };
+                let (status, detail) = tree.judge(registry, &name, &path, parses);
                 out.push(AssetReport {
                     kind,
                     name,
@@ -808,12 +1287,12 @@ fn collect_skill_rows(
                 collect_skill_rows(
                     kind,
                     scope,
-                    root,
                     &path,
                     depth + 1,
                     max_depth,
                     ancestors,
                     registry,
+                    tree,
                     out,
                 );
             }
@@ -841,108 +1320,407 @@ fn is_ignored_skill_directory(path: &Path) -> bool {
         ".tox",
         ".nox",
     ];
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| IGNORED.iter().any(|ignored| name.eq_ignore_ascii_case(ignored)))
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    IGNORED
+        .iter()
+        .any(|ignored| name.eq_ignore_ascii_case(ignored))
 }
 
 /// What the real skill registry makes of the skills we found.
 ///
-/// The registry is loaded ONCE per scan, from the same directory list our own
-/// loader uses (`standard_skill_dirs`), so it sees the same collisions the
-/// runtime will see.
-struct SkillTruth {
-    /// The `SKILL.md` (or command file) each loaded skill came from.
-    loaded: Vec<std::path::PathBuf>,
-    /// Every diagnostic the registry produced, with its reason.
-    diagnostics: Vec<(std::path::PathBuf, String)>,
+/// The registry is loaded ONCE per scan, from the same directory list the
+/// runtime uses (the host's list, or `standard_skill_dirs` when it gave
+/// none), so it sees the same collisions the runtime will see.
+///
+/// **Every path here is an [`identity`]**, not the string the registry
+/// stored: the registry keeps paths literally (`skill.rs:759`,
+/// `registry.rs:225`), and the same file can be spelled two ways (`/var` and
+/// `/private/var` on macOS). Comparisons use identities; the report still
+/// shows the path WE scanned, never one of these.
+///
+/// **Public because it appears in a public trait's method.** Every source
+/// gets the ONE registry load `scan()` did — two sources in one report must
+/// not see two different moments of the same disk.
+pub struct SkillTruth {
+    /// Every entry the registry's walk found.
+    ///
+    /// **The walk's own record.** The report asks the registry what it saw
+    /// rather than walking the disk a second time: two walks of the same
+    /// disk can disagree (a symlink, an ignored directory, a depth limit),
+    /// and a report that re-derives the answer is answering a different
+    /// question than the runtime will.
+    discovered: Vec<DiscoveredAsset>,
+    /// Every asset the walk found but could NOT load.
+    ///
+    /// **Separate from `discovered`**: a failed asset has no registration,
+    /// so it has no name in any index and no "was it displaced" question —
+    /// but it IS an asset the walk found, and the report has to say so.
+    failed: Vec<FailedTruthAsset>,
+    /// The skills map (`registry.all()`): the name each skill was registered
+    /// under, and the identity of the `SKILL.md` it came from.
+    skills: Vec<(String, PathBuf)>,
+    /// The flat command templates (`registry.slash_commands()`), the same
+    /// way. A **separate index**, as in the registry (`registry.rs:56`): a
+    /// skill and a command with the same name do not collide there, so they
+    /// must not collide here either.
+    commands: Vec<(String, PathBuf)>,
+}
+
+/// One asset the registry's walk found.
+///
+/// **The ASSET identity is the key.** A skill directory is its BUNDLE
+/// directory, not its `SKILL.md`: two bundles may ship the same `SKILL.md`
+/// (a symlink to one file), and they are two assets that happen to share a
+/// body. Matching the file alone would report both as one.
+struct DiscoveredAsset {
+    /// The ASSET's identity — the bundle directory for a skill directory, the
+    /// file itself for a flat template.
+    asset: PathBuf,
+    /// The ASSET's path as the REGISTRY spelled it. The report shows the
+    /// path the CALLER named — the two can differ (the same directory under
+    /// two names), and only the registry knows where the asset really is.
+    asset_path: PathBuf,
+    /// The name it was registered under.
+    name: String,
+    /// The FORM it was found in.
+    entry: EntryKind,
+    /// The scanned root that found it — the root EXACTLY as handed to the
+    /// registry.
+    root: PathBuf,
+    /// The same root as the registry spelled it.
+    root_path: PathBuf,
+    /// Whether a later same-name entry displaced it.
+    replaced: bool,
+    /// The diagnostics the registry recorded for THIS asset: its reason and
+    /// whether it is a warning.
+    ///
+    /// **On the asset, not on the file.** A flat candidate and a skill
+    /// directory can sit at the same path; a diagnostic about one is not
+    /// about the other.
+    diagnostics: Vec<(String, bool)>,
+}
+
+/// One asset the registry's walk found but could NOT load.
+///
+/// **The ASSET's identity, not the file's** — a skill directory that fails
+/// to parse is still the asset that directory is.
+struct FailedTruthAsset {
+    /// The ASSET's identity.
+    asset: PathBuf,
+    /// The ASSET's path as the registry spelled it.
+    asset_path: PathBuf,
+    /// The ENTRY's path as the registry spelled it — the `SKILL.md` for a
+    /// skill directory, the file itself for a flat template.
+    ///
+    /// **The entry is where the problem is** when the entry itself is
+    /// unusable (a dangling link, a FIFO): the row shows it, because that
+    /// is the thing the person has to look at.
+    entry_path: PathBuf,
+    /// The name it would have been registered under.
+    name: String,
+    /// The FORM it was found in.
+    entry: EntryKind,
+    /// The scanned root that found it.
+    root: PathBuf,
+    /// The same root as the registry spelled it.
+    root_path: PathBuf,
+    /// Why it could not be loaded — and WHOSE words the reason is.
+    failure: crate::skills::LoadFailure,
+    /// The reason, in the registry's own words.
+    reason: String,
+}
+
+/// The path's identity — the single source of truth for "is this the same file".
+///
+/// `pathnorm::canonicalize` is the crate's one definition of path identity
+/// (`pathnorm.rs:74`): on macOS `/var` and `/private/var` are the same
+/// directory, and a caller may hand us either spelling. Comparing the
+/// strings would say "different files"; the disk says otherwise.
+///
+/// A path that cannot be resolved falls back to itself: two identical
+/// strings are the same file.
+fn identity(path: &Path) -> PathBuf {
+    crate::pathnorm::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether two paths name the same file.
+///
+/// **The disk is the only authority on this.** The same file can be spelled
+/// two ways — `/var/folders/...` and `/private/var/folders/...` are the same
+/// directory on macOS — and two *different* paths can be the same file too
+/// (a hard link). Comparing the strings settles neither.
+///
+/// Three tiers, cheapest first:
+/// 1. the literal paths — no syscall, and it settles the common case where
+///    the caller handed us the same path twice;
+/// 2. the [identities](identity) — the same path spelled two ways;
+/// 3. the file itself — two different paths that are one inode.
+///
+/// A path we cannot resolve stays unproven: `None` is not "different", but
+/// it is not "the same" either, and the caller must not treat it as proof.
+fn same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    if identity(left) == identity(right) {
+        return true;
+    }
+    match (file_id(left), file_id(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The file's identity on disk: its device and inode.
+///
+/// `None` when the platform has no such notion, or the path cannot be
+/// stat'd — a path we could not read is not proven to be anything.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 impl SkillTruth {
     /// Load the registry the way the runtime does.
     fn load(ctx: &ScanContext) -> Self {
-        // **The host's list**, not `standard_skill_dirs` — the runtime puts
-        // the user's configured `extra_skill_dirs` FIRST, and a skill there
-        // can win a same-name collision. Recomputing the standard list here
-        // would make the report pick a different winner than the runtime.
+        // **The host's list**, not `standard_skill_dirs` — the runtime may
+        // add the user's configured `extra_skill_dirs`, and the report has
+        // to see the SAME directories the runtime sees, or it picks a
+        // different winner than the runtime does.
+        //
+        // **The order is the runtime's order.** `resolve_skill_dirs_at`
+        // (`coding/src/parts.rs`) puts the extras FIRST and the standard
+        // roots after them; the registry loads a list front to back and the
+        // LAST one wins a same-name collision — so the standard roots
+        // outrank the extras. Passing the host's list verbatim keeps that
+        // order; recomputing the standard list here would drop the extras
+        // and change which skill wins.
         //
         // An empty list means "the standard list" — the host passes the real
         // list in production, and the fixtures use the default.
-        let dirs = if ctx.skill_dirs.is_empty() {
-            crate::skills::standard_skill_dirs(crate::skills::SkillRoots {
+        //
+        // **`None` and `Some(vec![])` are different.** `None` = the host gave
+        // no list → the standard list. `Some(vec![])` = the host EXPLICITLY
+        // asked for no skill roots (the runtime's skill tools are off) →
+        // scan nothing. Falling back to the standard list there would make
+        // the report claim `~/.claude/skills/foo` is `Active` while nothing
+        // is loading it.
+        let dirs = match ctx.skill_dirs.clone() {
+            Some(dirs) => dirs,
+            None => crate::skills::standard_skill_dirs(crate::skills::SkillRoots {
                 home: &ctx.os_home,
                 project: &ctx.project,
                 dirs: &ctx.product,
-            })
-        } else {
-            ctx.skill_dirs.clone()
+            }),
         };
         let registry = crate::skills::SkillRegistry::load_with_explicit(&dirs, &[]);
-        // **Both** maps: `all()` is the SKILLS map, and the flat command
-        // templates live in a separate one (`slash_commands()`,
+        // **Both** maps, kept APART: `all()` is the SKILLS map, and the flat
+        // command templates live in a separate one (`slash_commands()`,
         // `registry.rs:467`). Looking only at `all()` would make every
-        // command file look overridden.
-        let loaded = registry
-            .all()
-            .iter()
-            .chain(registry.slash_commands().iter())
-            .map(|skill| skill.source_path.clone())
-            .collect();
-        // **Every** diagnostic is kept, not just the non-warning ones. The
-        // registry marks a PARSE FAILURE as a warning (`registry.rs:262`)
-        // and an OVERRIDE as non-warning (`registry.rs:250`) — so filtering
-        // out the warnings kept the overrides and threw away the failures,
-        // which is exactly backwards: a skill that failed to load was being
-        // reported as a name collision.
-        //
-        // The verdict decides which is which (see below): a path that IS
-        // loaded is active even if it also carries a non-fatal warning.
-        let diagnostics = registry
-            .diagnostics()
+        // command file look overridden; merging them would make a skill
+        // look overridden by a command of the same name — a collision the
+        // registry never resolved, because the two never compete.
+        let index = |templates: &[std::sync::Arc<crate::skills::Skill>]| -> Vec<(String, PathBuf)> {
+            templates
+                .iter()
+                .map(|skill| (skill.name.clone(), identity(&skill.source_path)))
+                .collect()
+        };
+        let skills = index(&registry.all());
+        let commands = index(&registry.slash_commands());
+        // **The walk's own record.** The registry says what it found: its
+        // ASSET identity, under which name, in which FORM, under which root,
+        // and which of those a later same-name entry displaced. The report
+        // reads this instead of walking the disk again.
+        let discovered = registry
+            .discovered()
             .into_iter()
-            .map(|diagnostic| (diagnostic.path, diagnostic.reason))
+            .map(|entry| DiscoveredAsset {
+                asset: identity(&entry.asset),
+                asset_path: entry.asset,
+                name: entry.name,
+                entry: entry.entry,
+                root: identity(&entry.root),
+                root_path: entry.root,
+                replaced: entry.replaced,
+                diagnostics: entry.diagnostics,
+            })
             .collect();
-        Self { loaded, diagnostics }
+        // **The assets the walk found but could not load.** Their reason, and
+        // WHOSE words it is: the loader's (a rejection) or a fact about the
+        // ENTRY (a dangling link, an entry that is not a regular file).
+        let failed = registry
+            .failed()
+            .into_iter()
+            .map(|asset| FailedTruthAsset {
+                asset: identity(&asset.asset),
+                asset_path: asset.asset,
+                entry_path: asset.path,
+                name: asset.name,
+                entry: asset.entry,
+                root: identity(&asset.root),
+                root_path: asset.root,
+                failure: asset.failure,
+                reason: asset.reason,
+            })
+            .collect();
+        Self {
+            discovered,
+            failed,
+            skills,
+            commands,
+        }
+    }
+
+    /// What the registry says about this asset, if it says anything.
+    ///
+    /// `Some` means the registry has a FACT about this path — it found it (or
+    /// displaced it). `None` means the registry never walked it, so it has
+    /// nothing to say.
+    ///
+    /// Matching is by **ASSET identity** (the bundle directory for a skill
+    /// directory, the file itself for a flat template) **and by name** (the
+    /// same asset registered under another name is not this asset) **and by
+    /// FORM** (a flat `*.md` candidate is not the skill directory that
+    /// happens to sit at the same path — both go into the skill index, so the
+    /// index cannot tell them apart).
+    fn registry_says(
+        &self,
+        name: &str,
+        path: &Path,
+        is_skill_dir: bool,
+    ) -> Option<(AssetStatus, String)> {
+        // The ASSET a candidate stands for: the bundle directory for a skill
+        // directory, the file itself for a flat template. Two bundles may
+        // ship the same `SKILL.md`; they are two assets that share a body,
+        // and matching the file would report both as one.
+        let asset = identity(path);
+        let entry = if is_skill_dir {
+            EntryKind::SkillDir
+        } else {
+            EntryKind::FlatFile
+        };
+        // Everything the registry found AS this asset, in this form, under
+        // any name.
+        let at_this_asset: Vec<&DiscoveredAsset> = self
+            .discovered
+            .iter()
+            .filter(|found| found.asset == asset && found.entry == entry)
+            .collect();
+        if at_this_asset.is_empty() {
+            // The registry never walked this asset. It has no fact about it,
+            // and a second traversal is a different question.
+            return None;
+        }
+        // The entries registered under OUR name.
+        let ours: Vec<&DiscoveredAsset> = at_this_asset
+            .into_iter()
+            .filter(|found| found.name == name)
+            .collect();
+        if ours.is_empty() {
+            // The registry found this asset, but under ANOTHER name: it is in
+            // effect, but it is not in effect AS OUR ASSET. Saying "active"
+            // here would be a claim about someone else's row.
+            return None;
+        }
+        // One of our entries survived → it is the one in effect.
+        if ours.iter().any(|found| !found.replaced) {
+            return Some((AssetStatus::Active, text::skill_active()));
+        }
+        // All of them were displaced by a later same-name entry.
+        Some((AssetStatus::Blocked, text::skill_overridden(name)))
+    }
+
+    /// The failure the registry recorded for this asset, if it recorded one.
+    ///
+    /// **By ASSET identity** — a flat candidate and a skill directory can
+    /// sit at the same path, and a failure about one is not about the other.
+    fn registry_failure(&self, path: &Path, is_skill_dir: bool) -> Option<(String, bool)> {
+        let asset = identity(path);
+        let entry = if is_skill_dir {
+            EntryKind::SkillDir
+        } else {
+            EntryKind::FlatFile
+        };
+        self.failed
+            .iter()
+            .find(|failed| failed.asset == asset && failed.entry == entry)
+            .map(|failed| {
+                (
+                    failed.reason.clone(),
+                    matches!(failed.failure, crate::skills::LoadFailure::Rejected),
+                )
+            })
     }
 
     /// Whether this file is the one that is actually in effect.
     ///
-    /// **The order matters.** A path that IS loaded is active, even if it
-    /// also carries a diagnostic (the registry reports a bad `args:` value
-    /// as a warning while the skill still loads, `registry.rs:229`). Only a
-    /// path that is NOT loaded is classified by its diagnostic — and then the
-    /// diagnostic's own words say why.
-    fn verdict(&self, name: &str, path: &Path) -> (AssetStatus, String) {
-        let file = if path.is_dir() {
-            path.join("SKILL.md")
-        } else {
-            path.to_path_buf()
-        };
-        if self.loaded.contains(&file) {
-            return (AssetStatus::Active, super::text::skill_active());
+    /// `name` is the name the registry gives this skill (see
+    /// [`skill_rows`]). Paths are compared by [`identity`]. **The order
+    /// matters**: what the registry SAID about our asset comes before what we
+    /// infer from names, and every answer but the last rests on something the
+    /// registry actually did:
+    ///
+    /// 1. The registry's own record of this asset says it is the one in
+    ///    effect, or that a later same-name entry displaced it. **A fact, not
+    ///    an inference** — the registry walked these paths; we did not walk
+    ///    them a second time to find out. This covers the case the registry
+    ///    records no diagnostic for: two IDENTICAL definitions, where it
+    ///    keeps the later one and says nothing, because nothing is wrong.
+    /// 2. The registry rejected it → the loader's own words, with the
+    ///    loader's own reason. A definite cause; a same-name winner
+    ///    elsewhere is only an inference and must not hide it — the fix is
+    ///    the file, not the priority order.
+    /// 3. Nothing says why → say exactly that. Claiming "overridden" here
+    ///    would be a guess: the registry never found this asset, so it never
+    ///    weighed it against a winner.
+    fn verdict(&self, name: &str, path: &Path, parses: bool) -> (AssetStatus, String) {
+        // If we cannot tell whether the path is a directory, treat it as the
+        // file itself: the lookups below then simply find nothing for it, and
+        // the verdict falls through to "not in effect" rather than inventing a
+        // reason.
+        let is_skill_dir = probe_dir(path).unwrap_or(false);
+        // 1. What the registry ACTUALLY found. It walked these paths; we did
+        //    not walk them a second time to find out.
+        if let Some(verdict) = self.registry_says(name, path, is_skill_dir) {
+            return verdict;
         }
-        // Not loaded. The registry's own diagnostic says why: either the
-        // loader rejected it, or another directory's skill of the same name
-        // won.
-        if let Some((_, reason)) = self
-            .diagnostics
-            .iter()
-            .find(|(diagnostic, _)| *diagnostic == file)
-        {
-            return (AssetStatus::Blocked, super::text::skill_rejected(reason));
+        // 2. The registry said the loader could not use it — with the
+        //    loader's own reason. Believed only when the file really does
+        //    not parse: for a file that parses, a warning is a non-fatal
+        //    one, not a rejection.
+        if !parses {
+            if let Some((reason, rejected)) = self.registry_failure(path, is_skill_dir) {
+                if rejected {
+                    return (AssetStatus::Blocked, text::skill_rejected(&reason));
+                }
+                // Not the loader's story: a fact about the ENTRY (a dangling
+                // link, an entry that is not a regular file). The loader
+                // never treated it as a skill at all.
+                return (AssetStatus::Blocked, text::report_entry_unusable(&reason));
+            }
         }
-        // The file exists but is not the one in effect — another directory
-        // has a skill of the same name and wins.
-        (
-            AssetStatus::Blocked,
-            super::text::skill_overridden(name),
-        )
+        // 3. Nothing says why → say exactly that. The registry never found
+        //    this asset, so it never weighed it against a winner: claiming
+        //    "overridden" here would be a guess.
+        (AssetStatus::Blocked, text::skill_not_in_effect())
     }
 }
 
 /// Whether a protocol id names a wire format we do not speak.
 ///
-/// `protocol_for` returns `unsupported:<source>:<wire_api>` for one, and
+/// `provider::unsupported_protocol` builds `unsupported:<wire_api>` for one, and
 /// such an account must never be imported: `ProviderBook::create_account`
 /// resolves an unknown preset to `openai-compatible`
 /// (`config/provider_preset.rs:381`), so the import would silently succeed
@@ -968,6 +1746,39 @@ fn probe_file(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Whether this path's ENTRY is there, whatever it is.
+///
+/// **`std::fs::metadata` follows the link**, so a dangling symlink reads as
+/// "not there" — and the asset would vanish from the report, and no asset
+/// may vanish. `symlink_metadata` does NOT follow it, so the entry itself is
+/// still visible.
+///
+/// The mirror image of [`probe_file`]: that one says whether the path is
+/// USABLE, this one says whether there is anything there at all.
+fn entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Whether this path is a DANGLING symlink — the entry is there, but
+/// following it does not reach anything.
+///
+/// A symlink whose target IS there is not broken — it resolves to a regular
+/// file or a directory, and the probes already say so.
+fn is_broken_link(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    // The link is there; is the target? `NotFound` is the dangling case —
+    // any other error (a permission we may not read through) is not.
+    matches!(
+        std::fs::metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Whether this path is a directory we can use — and if not, WHY.
 ///
 /// The directory counterpart of [`probe_file`].
@@ -989,13 +1800,16 @@ fn probe_dir(path: &Path) -> Result<bool, String> {
 ///
 /// `None` when the loader does not know this file at all — it is not an
 /// instruction file, or it is not in the project tier.
-fn instruction_verdict(
-    ctx: &ScanContext,
-    path: &std::path::Path,
-) -> Option<InstructionVerdict> {
+fn instruction_verdict(ctx: &ScanContext, path: &Path) -> Option<InstructionVerdict> {
     // The loader wants the product tree as the "home" (`instructions.rs:105`).
     let loaded = crate::instructions::load_instructions(ctx.product.user(), &ctx.project);
-    let source = loaded.sources.iter().find(|source| source.path == path)?.clone();
+    // Project tier only (`instructions.rs:137`). The global file
+    // (`<product tree>/ATOMCODE.md`, scope `"GLOBAL"`) would otherwise match
+    // too and come back labelled `AssetScope::Project`.
+    let source = loaded
+        .sources
+        .iter()
+        .find(|source| source.scope == "PROJECT" && source.path == path)?;
     // The file that WINS in the project tier — the one the loader did not
     // shadow. A shadowed file's own name is NOT the explanation ("CLAUDE.md
     // takes precedence" about a shadowed CLAUDE.md says nothing); the
@@ -1012,47 +1826,315 @@ fn instruction_verdict(
             && candidate.state != crate::instructions::InstructionState::Missing
     });
     Some(InstructionVerdict {
-        name: source
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
-        path: source.path,
+        name: last_component(&source.path),
+        path: source.path.clone(),
         scope: AssetScope::Project,
         state: source.state,
-        shadowed_by: winner.map(|winner| {
-            winner
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        }),
+        shadowed_by: winner.map(|winner| last_component(&winner.path)),
     })
 }
 
 /// One instruction file, and what the loader said about it.
 struct InstructionVerdict {
     name: String,
-    path: std::path::PathBuf,
+    path: PathBuf,
     scope: AssetScope,
     state: crate::instructions::InstructionState,
     /// The project file that wins over this one, when this one is shadowed.
     shadowed_by: Option<String>,
 }
-
 ```
 
-（`claude.rs` / `codex.rs` / `provider.rs` 在 Task 2 / 3 / 6 建；本 Task 先建三个空壳文件让编译通过：`claude.rs` 与 `codex.rs` 各自放一个 `pub struct ClaudeSource;` 之类，Task 2/3 填内容；`provider.rs` 在 Task 7 建。**为让本 Task 编译通过，Step 5 之后先建两个空壳：**）
+注册表记录成功解析的路径、注册名称、索引与覆盖状态。报告通过
+`discovered()` 查询这些事实，通过 `diagnostics()` 补充诊断。报告自己的遍历仍决定
+哪些路径会生成候选行，当前仍有自己的深度限制、忽略目录清单和循环检测。
+
+`skills/registry.rs` 中的发现记录及索引字段：
+
+```rust
+/// How the walk found an entry — the FORM it was found in.
+///
+/// **Not the index.** A skill directory (`<dir>/SKILL.md`) and a flat `*.md`
+/// file can BOTH go into the skill index (`registry.rs:341` and
+/// `registry.rs:353`), so the index cannot tell them apart. A caller that
+/// matched a flat-file candidate against a directory skill's record would be
+/// borrowing a fact about a different asset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A skill directory: found at its `SKILL.md`.
+    SkillDir,
+    /// A flat template file: found at the file itself.
+    FlatFile,
+}
+
+/// Why an asset the walk found could not be loaded.
+///
+/// **Whose words the reason is.** A `Rejected` failure is the LOADER's own
+/// words: it read the file and refused it. The other two are facts about the
+/// ENTRY — the loader never treated it as a skill at all, so putting its
+/// words in its mouth would send the person to fix the wrong thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadFailure {
+    /// The loader read it and refused it.
+    Rejected,
+    /// The entry is a symlink whose target is gone.
+    BrokenLink,
+    /// The entry is there, but it is not a regular file (a FIFO, a socket).
+    NotARegularFile,
+}
+
+/// One entry the registry's walk found.
+///
+/// **The walk's own record.** A caller that needs to know what the registry
+/// actually saw — not what a second traversal would find — reads this. Two
+/// traversals of the same disk can disagree (a symlink, an ignored
+/// directory, a depth limit), so a caller that re-derives the answer is
+/// answering a different question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredTemplate {
+    /// The path the walk found it at: the `SKILL.md` for a skill directory,
+    /// the file itself for a flat command template.
+    pub path: PathBuf,
+    /// The ASSET this entry is — the thing a person would call "this skill".
+    ///
+    /// **A skill directory is its BUNDLE directory, not its `SKILL.md`.** Two
+    /// bundles may ship the same `SKILL.md` (a symlink to one file); they are
+    /// two assets that happen to share a body. Matching the file alone would
+    /// report both as one.
+    ///
+    /// For a flat template file this is the file itself.
+    pub asset: PathBuf,
+    /// The name it was registered under.
+    pub name: String,
+    /// Which index it went into.
+    pub kind: TemplateKind,
+    /// The FORM it was found in — a skill directory or a flat file. The
+    /// index cannot say this: both forms go into the skill index.
+    pub entry: EntryKind,
+    /// The scanned root this entry was found under — the root EXACTLY as
+    /// handed to the registry.
+    ///
+    /// A caller enumerates a tree by its root; this says which root found
+    /// the entry, so "the assets under THIS root" is a question the registry
+    /// answers.
+    pub root: PathBuf,
+    /// Whether a later same-name entry displaced it.
+    ///
+    /// **A same-name entry displaces the earlier one even when the two
+    /// definitions are identical** — the registry keeps the later one and
+    /// says nothing, because nothing is wrong. A caller reporting "which one
+    /// is in effect" needs to know the earlier one lost, and only the
+    /// registry knows.
+    pub replaced: bool,
+    /// The diagnostics the registry recorded for THIS asset: its reason and
+    /// whether it is a warning.
+    ///
+    /// **On the asset, not on the file.** A flat candidate and a skill
+    /// directory can sit at the same path; a diagnostic about one is not
+    /// about the other.
+    pub diagnostics: Vec<(String, bool)>,
+}
+
+/// An asset the walk found but could NOT load.
+///
+/// **The asset's identity, not the file's.** A skill directory that fails to
+/// parse is still the asset that directory is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedAsset {
+    /// The path the walk found it at: the `SKILL.md` for a skill directory,
+    /// the file itself for a flat template.
+    pub path: PathBuf,
+    /// The ASSET this is — the bundle directory for a skill directory, the
+    /// file itself for a flat template.
+    pub asset: PathBuf,
+    /// The name it would have been registered under.
+    pub name: String,
+    /// The FORM it was found in.
+    pub entry: EntryKind,
+    /// The scanned root it was found under — the root EXACTLY as handed to
+    /// the registry.
+    pub root: PathBuf,
+    /// Why it could not be loaded.
+    pub failure: LoadFailure,
+    /// The reason, in the registry's own words. Meaningful for
+    /// [`LoadFailure::Rejected`].
+    pub reason: String,
+}
+```
+
+在 `impl SkillRegistry` 中添加访问器，并更新 `insert_parsed`：
+
+```rust
+    /// Every entry the walk found, in the order it found them.
+    ///
+    /// **The walk's own record.** A caller that needs to know what the registry
+    /// actually saw reads this, rather than walking the disk a second time and
+    /// hoping the two walks agree.
+    pub fn discovered(&self) -> Vec<DiscoveredTemplate> {
+        self.read().discovered.clone()
+    }
+```
+
+用下列实现替换原有 `insert_parsed`：
+
+```rust
+    fn insert_parsed(
+        &self,
+        parsed: Result<Parsed, String>,
+        path: &Path,
+        kind: TemplateKind,
+        entry: EntryKind,
+    ) {
+        match parsed {
+            Ok(parsed) => {
+                let mut index = self.write();
+                let skill = parsed.skill;
+                let name = skill.name.clone();
+                let source = skill.source_path.clone();
+                // A bad `args:` value is a warning, not a load failure: the
+                // skill still loads with its default, so the typo is reported
+                // without dropping the command from the menu.
+                for warning in parsed.warnings {
+                    index.diagnostics.push(SkillDiagnostic {
+                        path: path.to_path_buf(),
+                        reason: warning,
+                        warning: true,
+                    });
+                }
+                // Compare loaded definitions, not current disk contents: a file
+                // may have changed since the earlier source was scanned.
+                let same_definition = match kind {
+                    TemplateKind::Skill => index.skills.get(&name),
+                    TemplateKind::Command => index.commands.get(&name),
+                }
+                .is_some_and(|previous| {
+                    previous.display_name == skill.display_name
+                        && previous.description == skill.description
+                        && previous.template == skill.template
+                        && previous.allowed_tools == skill.allowed_tools
+                        && previous.user_invocable == skill.user_invocable
+                        && previous.args_requirement == skill.args_requirement
+                });
+                // The SLOT that holds this name now — and, before it, the one
+                // that used to. The slot is what says which record actually
+                // won: the same file can be found twice (the same root listed
+                // twice, one directory reached through two roots), and the
+                // same path can sit in BOTH indexes — so looking the loser up
+                // by path would find the wrong record.
+                //
+                // Read BEFORE the slot is moved below.
+                let displaced = match kind {
+                    TemplateKind::Skill => index.skill_records.get(&name).copied(),
+                    TemplateKind::Command => index.command_records.get(&name).copied(),
+                };
+                let previous = match kind {
+                    TemplateKind::Skill => index.skills.insert(name.clone(), Arc::new(skill)),
+                    TemplateKind::Command => index.commands.insert(name.clone(), Arc::new(skill)),
+                };
+                // The walk's own record of what it found. The report reads it
+                // instead of walking the disk a second time.
+                let record = index.discovered.len();
+                index.discovered.push(DiscoveredTemplate {
+                    path: path.to_path_buf(),
+                    name: name.clone(),
+                    kind,
+                    entry,
+                    replaced: false,
+                });
+                match kind {
+                    TemplateKind::Skill => {
+                        index.skill_records.insert(name.clone(), record);
+                    }
+                    TemplateKind::Command => {
+                        index.command_records.insert(name.clone(), record);
+                    }
+                }
+                // The slot MOVED, so the record that used to hold this name
+                // lost it — even when the new record is the SAME file (the
+                // same root listed twice) and even when the two definitions
+                // are identical. Both are displacements: the earlier record
+                // is not the one in effect any more.
+                //
+                // The registry keeps the later one and says nothing, because
+                // nothing is wrong — but a caller reporting "which one is in
+                // effect" needs to know the earlier one lost, and only the
+                // registry knows.
+                if let Some(slot) = displaced {
+                    if let Some(displaced_entry) = index.discovered.get_mut(slot) {
+                        displaced_entry.replaced = true;
+                    }
+                }
+                if let Some(previous) = previous {
+                    // The OVERRIDE DIAGNOSTIC's condition is unchanged: an
+                    // identical definition is not a problem, so it is not
+                    // reported. The same path re-loaded is not an override
+                    // either.
+                    if previous.source_path != source && !same_definition {
+                        index.diagnostics.push(SkillDiagnostic {
+                            path: previous.source_path.clone(),
+                            reason: format!("overridden by {}", source.display()),
+                            warning: false,
+                        });
+                    }
+                }
+            }
+            Err(error) => self.diagnose(path, error, true),
+        }
+    }
+```
+
+`skills/mod.rs` 导出发现记录：
+
+```rust
+    skill_install_dirs, standard_skill_dirs, DiscoveredTemplate, EntryKind, SkillDiagnostic,
+    SkillRegistry, SkillRoots, TemplateDirectory, TemplateKind,
+```
+
+注册表遍历的两个插入点要分别传入对应的入口形态：
+
+```rust
+        for p in entries {
+            if p.is_file() {
+                if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
+                    self.insert_parsed(
+                        parse_skill_file(&p, namespace),
+                        &p,
+                        kind,
+                        EntryKind::FlatFile,
+                    );
+                }
+            } else if p.is_dir() {
+                // Explicit roots remain usable, including .system bundles and
+                // symlinked installs. Only incidental dependency/cache children
+                // are skipped; do not blanket-ignore hidden grouping directories.
+                if ignored_discovery_directory(&p) {
+                    continue;
+                }
+                let skill_md = p.join("SKILL.md");
+                if skill_md.is_file() {
+                    self.insert_parsed(
+                        parse_skill_dir(&p, &skill_md, namespace),
+                        &skill_md,
+                        TemplateKind::Skill,
+                        EntryKind::SkillDir,
+                    );
+                } else {
+                    self.scan_skill_dir(&p, namespace, depth + 1, kind, ancestors);
+                }
+            }
+        }
+```
+
+本 Task 创建 `claude.rs` 和 `codex.rs` 的占位实现，并定义 `provider.rs` 的共享类型
+与助手。Task 2、3、7 再补各来源的资产检测和 provider 草案。
 
 `crates/atomcode-capabilities/src/migration/claude.rs`：
 
 ```rust
 //! Claude Code assets. Filled in by Task 2.
 
-use super::{MigrationSource, ScanContext};
 use super::report::AssetReport;
+use super::{MigrationSource, ScanContext, SkillTruth};
 
 pub struct ClaudeSource;
 
@@ -1063,7 +2145,7 @@ impl MigrationSource for ClaudeSource {
     fn display_name(&self) -> &'static str {
         "Claude Code"
     }
-    fn detect(&self, _ctx: &ScanContext) -> Vec<AssetReport> {
+    fn detect(&self, _ctx: &ScanContext, _truth: &SkillTruth) -> Vec<AssetReport> {
         Vec::new()
     }
 }
@@ -1075,7 +2157,7 @@ impl MigrationSource for ClaudeSource {
 //! Codex assets. Filled in by Task 3.
 
 use super::report::AssetReport;
-use super::{MigrationSource, ScanContext};
+use super::{MigrationSource, ScanContext, SkillTruth};
 
 pub struct CodexSource;
 
@@ -1086,7 +2168,7 @@ impl MigrationSource for CodexSource {
     fn display_name(&self) -> &'static str {
         "Codex"
     }
-    fn detect(&self, _ctx: &ScanContext) -> Vec<AssetReport> {
+    fn detect(&self, _ctx: &ScanContext, _truth: &SkillTruth) -> Vec<AssetReport> {
         Vec::new()
     }
 }
@@ -1097,10 +2179,15 @@ impl MigrationSource for CodexSource {
 ```rust
 //! Provider accounts found in another agent's configuration. Filled in by Task 7.
 
+use std::path::Path;
+
 use super::report::AssetScope;
 
 /// How a credential is referenced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand: a derived one would print a literal key in
+/// every `{:?}`, `dbg!` and `unwrap()` panic message.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ApiKeyRef {
     /// The NAME of an environment variable, e.g. `"MY_KEY"`. The secret stays
     /// where it is and is resolved at run time.
@@ -1121,7 +2208,21 @@ impl ApiKeyRef {
     }
 }
 
+impl std::fmt::Debug for ApiKeyRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The variable's NAME, not a secret.
+            ApiKeyRef::EnvVar(name) => f.debug_tuple("EnvVar").field(name).finish(),
+            // The value IS the secret: only its kind is shown.
+            ApiKeyRef::Plaintext(_) => f.debug_tuple("Plaintext").field(&"<redacted>").finish(),
+        }
+    }
+}
+
 /// A provider account an external agent has configured.
+///
+/// The derived `Debug` is safe: `api_key` goes through `ApiKeyRef`'s own
+/// redacting `Debug`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountDraft {
     /// **The id the account WILL get** — already normalised by
@@ -1162,7 +2263,7 @@ pub struct ProviderAccountDraft {
     ///
     /// Two things land here:
     /// - the name cannot become an account id at all (`account_id_for`
-    ///   returns an error), so there is nothing to write it under;
+    ///   returns `None`), so there is nothing to write it under;
     /// - the endpoint speaks a wire protocol we do not support.
     ///
     /// Both used to be either silently dropped or reported as importable,
@@ -1218,8 +2319,8 @@ pub fn unsupported_protocol(wire_api: &str) -> String {
 /// match the account on the next run — the re-check would keep saying
 /// "can be brought over" about an account that is already there.
 ///
-/// `base_id` is made **public** for this (`pub fn account_id_for`), so there is
-/// **one** rule, not two that can drift.
+/// `base_id` is exposed for this (`provider_book::account_id_for`), so there
+/// is **one** rule, not two that can drift.
 pub fn account_id_for(name: &str) -> Option<String> {
     match atomcode_config::provider_book::account_id_for(name) {
         Ok(id) => Some(id),
@@ -1236,7 +2337,8 @@ pub fn account_id_for(name: &str) -> Option<String> {
 /// against the stored one would never match: the account ends up with
 /// `base_url = None` while the draft still says the default URL.
 ///
-/// `endpoint_override` is made **public** for this (`pub fn effective_endpoint`).
+/// `endpoint_override` is exposed for this
+/// (`provider_book::effective_endpoint`).
 ///
 /// **This delegates to the writer's rule** rather than re-implementing it. A
 /// copy would be correct today and wrong the day the writer changes — and the
@@ -1296,10 +2398,8 @@ pub fn read_jsonc(path: &Path) -> Option<serde_json::Value> {
 > Task 7 只做**每个来源怎么读出自己的草案**（Claude 读 `env` 块、Codex 合并两层
 > TOML），不再动这些共享规则。
 
-`provider.rs` 顶部补 `use std::path::Path;`。
-
 `crates/atomcode-capabilities/src/migration/text.rs`（**最小版** —— Task 1 的
-`mod.rs` 里的技能助手要用这四条；Task 2 再把其余的补进来）：
+`mod.rs` 里的技能助手要用这 15 条；Task 2 再把其余的补进来）：
 
 ```rust
 //! The sentences a report shows.
@@ -1321,10 +2421,76 @@ pub fn skill_overridden(name: &str) -> String {
 pub fn unreadable_file(reason: &str) -> String {
     t(Msg::MigrationUnreadableFile { reason }).into_owned()
 }
+pub fn skill_depth_limit() -> String {
+    t(Msg::MigrationSkillDepthLimit).into_owned()
+}
+pub fn skill_symlink_cycle() -> String {
+    t(Msg::MigrationSkillSymlinkCycle).into_owned()
+}
+/// A `SKILL.md` that exists but is not a regular file (a directory, say).
+pub fn skill_md_not_a_file() -> String {
+    t(Msg::MigrationSkillMdNotAFile).into_owned()
+}
+/// The asset is in someone else's tree: it is not in effect, and this is
+/// where to put it to bring it over.
+///
+/// **The wording promises the ACTION, not the outcome** — whether the copy
+/// wins against a same-named higher-priority definition is not ours to
+/// promise.
+pub fn skill_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationSkillCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+/// The asset is not in effect and nothing says why.
+pub fn skill_not_in_effect() -> String {
+    t(Msg::MigrationSkillNotInEffect).into_owned()
+}
+/// The file cannot be parsed, so copying it over would only move the
+/// failure. The registry never looked at this file — this is our own
+/// reading of it.
+pub fn foreign_unparseable() -> String {
+    t(Msg::MigrationForeignUnparseable).into_owned()
+}
+/// The entry is a symlink whose target is gone.
+pub fn broken_link() -> String {
+    t(Msg::MigrationBrokenLink).into_owned()
+}
+/// The entry is there, but it is not a regular file — a FIFO, a socket.
+pub fn not_a_regular_file() -> String {
+    t(Msg::MigrationNotARegularFile).into_owned()
+}
+/// The tree root is there, but it is not a directory we can walk.
+pub fn not_a_directory() -> String {
+    t(Msg::MigrationNotADirectory).into_owned()
+}
+/// **The report's own walk** stopped at the depth limit — not the loader's.
+///
+/// The loader has a depth limit of its own and says so in its own words,
+/// but only about a tree it scans. In a tree it never scanned, the REPORT's
+/// walk is what stopped, and "the skill loader rejected it" would put words
+/// in the loader's mouth about a file the loader never looked at.
+pub fn report_depth_limit() -> String {
+    t(Msg::MigrationReportDepthLimit).into_owned()
+}
+/// **The report's own walk** found a symlink cycle — not the loader's.
+pub fn report_symlink_cycle() -> String {
+    t(Msg::MigrationReportSymlinkCycle).into_owned()
+}
+/// The ENTRY is there, but it is not something the loader can use — a
+/// dangling symlink, a FIFO, a socket.
+///
+/// **The report's own finding, not the loader's.** The loader never treated
+/// this entry as a skill at all, so putting its words in its mouth would
+/// send the person to fix the wrong thing.
+pub fn report_entry_unusable(reason: &str) -> String {
+    t(Msg::MigrationReportEntryUnusable { reason }).into_owned()
+}
 ```
 
 `crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
-（**Task 1 只加这四条**，Task 2 再加其余的；`en.rs` 与 `zh_cn.rs` 同步加）：
+（**Task 1 只加这 15 条**，Task 2 再加其余的；`en.rs` 与 `zh_cn.rs` 同步加）：
 
 ```rust
     // External-agent asset migration (see
@@ -1341,27 +2507,84 @@ pub fn unreadable_file(reason: &str) -> String {
     },
 ```
 
+`crates/atomcode-i18n/src/product/en.rs` 的 `match` 里追加：
+
+```rust
+        Msg::MigrationSkillActive => "已经生效：直接读取，无需迁移。".into(),
+        Msg::MigrationSkillRejected { reason } => format!("技能加载器拒绝了它：{reason}").into(),
+        Msg::MigrationSkillOverridden { name } => {
+            format!("已被覆盖：另一个目录里同名的「{name}」优先生效。").into()
+        }
+        Msg::MigrationUnreadableFile { reason } => format!("文件读取失败：{reason}").into(),
+        Msg::MigrationSkillDepthLimit => "分组目录层级超出上限".into(),
+        Msg::MigrationSkillSymlinkCycle => "检测到符号链接环".into(),
+        Msg::MigrationSkillMdNotAFile => "这里的 SKILL.md 不是普通文件，该技能无法加载。".into(),
+        Msg::MigrationSkillCopyable { target } => {
+            format!("尚未生效。复制到 {target} 就能搬过来。").into()
+        }
+        Msg::MigrationSkillNotInEffect => "没有生效，技能加载器也没有给出原因。".into(),
+        Msg::MigrationForeignUnparseable => {
+            "这个文件本身无法解析，即使复制过去也加载不了。".into()
+        }
+        Msg::MigrationBrokenLink => "这是一个断链：目标已经不存在，任何东西都无法加载它。".into(),
+        Msg::MigrationNotARegularFile => "这不是普通文件，无法作为技能加载。".into(),
+        Msg::MigrationNotADirectory => "这不是目录，无法在其中扫描技能。".into(),
+        Msg::MigrationReportDepthLimit => "扫描在此停止：分组目录层级超出上限".into(),
+        Msg::MigrationReportSymlinkCycle => "扫描在此停止：检测到符号链接环".into(),
+        Msg::MigrationReportEntryUnusable { reason } => {
+            format!("这个条目无法作为技能使用：{reason}").into()
+        }
+```
+
+`crates/atomcode-i18n/src/product/zh_cn.rs` 的 `match` 里追加：
+
+```rust
+        Msg::MigrationSkillActive => "已经生效：直接读取，无需迁移。".into(),
+        Msg::MigrationSkillRejected { reason } => format!("技能加载器拒绝了它：{reason}").into(),
+        Msg::MigrationSkillOverridden { name } => {
+            format!("已被覆盖：另一个目录里同名的「{name}」优先生效。").into()
+        }
+        Msg::MigrationUnreadableFile { reason } => format!("文件读取失败：{reason}").into(),
+        Msg::MigrationSkillDepthLimit => "分组目录层级超出上限".into(),
+        Msg::MigrationSkillSymlinkCycle => "检测到符号链接环".into(),
+        Msg::MigrationSkillMdNotAFile => "这里的 SKILL.md 不是普通文件，该技能无法加载。".into(),
+        Msg::MigrationSkillCopyable { target } => {
+            format!("尚未生效。复制到 {target} 就能搬过来。").into()
+        }
+        Msg::MigrationSkillNotInEffect => "没有生效，技能加载器也没有给出原因。".into(),
+        Msg::MigrationForeignUnparseable => {
+            "这个文件本身无法解析，即使复制过去也加载不了。".into()
+        }
+        Msg::MigrationBrokenLink => "这是一个断链：目标已经不存在，任何东西都无法加载它。".into(),
+        Msg::MigrationNotARegularFile => "这不是普通文件，无法作为技能加载。".into(),
+        Msg::MigrationNotADirectory => "这不是目录，无法在其中扫描技能。".into(),
+        Msg::MigrationReportDepthLimit => "扫描在此停止：分组目录层级超出上限".into(),
+        Msg::MigrationReportSymlinkCycle => "扫描在此停止：检测到符号链接环".into(),
+```
+
 > **为什么 Task 1 就要建 `text.rs`**：Task 1 的 `mod.rs` 里已经有共享的技能助手
-> （`skill_rows` / `SkillTruth`），而它们要说「已经生效」「被加载器拒绝」「被同名
-> 覆盖」「读不了」这四句话 —— 那些话只能由**真的加载器**说出来，所以文案走
-> `text::*`。Task 1 必须能**单独编译并通过**（阶段 P1 的验收就是
-> `cargo nextest run -p atomcode-capabilities --features migration` 全绿），
-> 所以这四条文案与 `text.rs` 的最小版在 Task 1 就到位；Task 2 只是往里追加。
+> （`skill_rows` / `SkillTruth`）。这 15 条文案覆盖加载结果、目录遍历错误和复制目标，
+> 均由 `text::*` 从 product 表读取。Task 1 必须能**单独编译并通过**，因此枚举、
+> 中英文 match 臂和 helper 都在此任务一起加入。Task 2 保留这 15 个 helper 和词条。
+
+从同一根扫描注册表和报告时，第 8 层分组下的技能可产生技能行，第 9 层仅产生
+分组目录的深度超限行。从第 9 层单独生成某个技能行时，保留原注册表根列表，
+其判定为「没有生效，技能加载器也没有给出原因」。
 
 - [ ] **Step 6: 跑测试确认通过**
 
-Run: `cargo nextest run -p atomcode-capabilities --features migration`
+Run: `cargo nextest run -p atomcode-capabilities --features migration -E 'test(migration::tests::)'`
 Expected: PASS —— Task 1 的三条（报告计数 / 空报告 / 无来源扫描）。
 
 - [ ] **Step 7: 提交**
 
 ```bash
-git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/
+git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/ crates/atomcode-capabilities/src/skills/{mod,registry}.rs crates/atomcode-config/src/provider_book.rs crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs gates/compile.sh
 git commit -m "feat(capabilities): add migration module skeleton
 
 The report carries four statuses, not two: Active (we read it today),
-Actionable (there is a known way to bring it over), Blocked (it cannot
-come over). \"Compatible\" and \"needs conversion\" cannot say whether a
+Imported (an earlier import already brought it over), Actionable (there is a
+known way to bring it over), and Blocked (it cannot come over). \"Compatible\" and \"needs conversion\" cannot say whether a
 lost session history is recoverable, and that is the thing a person needs
 to know before deciding.
 
@@ -1374,9 +2597,13 @@ The feature pulls atomcode-config, which the screen already has transitively."
 
 **Files:**
 - Modify: `crates/atomcode-capabilities/src/migration/claude.rs`
-- Modify: `crates/atomcode-capabilities/src/migration/text.rs`（**扩成完整版**：Task 1 只建了 4 条）
+- Modify: `crates/atomcode-capabilities/src/migration/text.rs`（**扩成完整版**：保留 Task 1 的 11 个 helper）
 - Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`（**加其余的词条**）
 - Test: `crates/atomcode-capabilities/src/migration/claude.rs`（内联 `mod tests`）
+
+前置条件是 Task 1 Step 5 的 `same_file` 和 `file_id` 已落地。用户级探测失败时，
+仅在已有路径信息足以证明同一文件时去重。若两个不同路径都无法解析身份，保留
+用户级 `Blocked` 行及原始错误。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1387,16 +2614,29 @@ The feature pulls atomcode-config, which the screen already has transitively."
 mod tests {
     use super::*;
     use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+    // `PathBuf` is not in scope through `super::*` — the module under test
+    // imports only `Path`.
+    use std::path::PathBuf;
 
     fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
         ScanContext {
             os_home: home.to_path_buf(),
             project: project.to_path_buf(),
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         }
+    }
+
+    /// The registry's facts, loaded the way `scan()` loads them.
+    ///
+    /// **The same load the report uses** — so a fixture sees what the report
+    /// sees. A fixture that loaded its own registry could disagree with the
+    /// report for reasons that have nothing to do with the behaviour under
+    /// test.
+    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
+        super::super::SkillTruth::load(&ctx(home, project))
     }
 
     fn skill_at(root: &std::path::Path, name: &str) {
@@ -1423,7 +2663,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         skill_at(&home.path().join(".claude"), "web-access");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let skill = assets
             .iter()
             .find(|a| a.kind == AssetKind::Skills && a.name == "web-access")
@@ -1438,7 +2678,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write_file(&project.path().join("CLAUDE.md"), "# rules");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let instructions = assets
             .iter()
             .find(|a| a.kind == AssetKind::Instructions)
@@ -1455,7 +2695,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let instructions = assets
             .iter()
             .find(|a| a.kind == AssetKind::Instructions)
@@ -1474,7 +2714,7 @@ mod tests {
         write_file(&project.path().join("AGENTS.md"), "# rules");
         write_file(&project.path().join("CLAUDE.md"), "# rules");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let instructions = assets
             .iter()
             .find(|a| a.kind == AssetKind::Instructions)
@@ -1494,7 +2734,7 @@ mod tests {
         write_file(&home.path().join(".claude").join("settings.json"), "{}");
         write_file(&project.path().join(".claude").join("settings.json"), "{}");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let permissions: Vec<_> = assets
             .iter()
             .filter(|a| a.kind == AssetKind::Permissions)
@@ -1514,7 +2754,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write_file(&project.path().join(".claude").join("settings.json"), "{not json");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let permissions = assets
             .iter()
             .find(|a| a.kind == AssetKind::Permissions)
@@ -1535,7 +2775,7 @@ mod tests {
             r#"{"mcpServers":{"gh":{"command":"mcp-gh"}}}"#,
         );
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let mcp: Vec<_> = assets.iter().filter(|a| a.kind == AssetKind::McpServers).collect();
         assert_eq!(mcp.len(), 2);
         assert!(mcp.iter().any(|m| m.scope == AssetScope::Project
@@ -1550,7 +2790,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write_file(&home.path().join(".claude").join("CLAUDE.md"), "# rules");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let instructions = assets
             .iter()
             .find(|a| a.kind == AssetKind::Instructions)
@@ -1570,7 +2810,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("reviewer.md"), "---").unwrap();
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let agent = assets
             .iter()
             .find(|a| a.kind == AssetKind::Agents)
@@ -1585,7 +2825,7 @@ mod tests {
         write_file(&home.path().join(".claude").join("settings.json"), "{not json");
         skill_at(&home.path().join(".claude"), "web-access");
 
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         // The skill is still found, and the broken file is reported as blocked
         // rather than taking the whole scan down.
         assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
@@ -1598,7 +2838,7 @@ mod tests {
     fn no_claude_directory_means_no_rows() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()));
+        let assets = ClaudeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         assert!(assets.is_empty());
     }
 }
@@ -1612,6 +2852,11 @@ Expected: FAIL —— 找不到资产（`detect` 返回空）。
 - [ ] **Step 3: 实现 ClaudeSource**
 
 把 `claude.rs` 整体替换为：
+
+> **保留 Step 1 写的测试。** 下面这个替换块**不含** `#[cfg(test)] mod tests` ——
+> 整体替换会把 Step 1 的判据一起删掉，于是 Step 5 的「跑测试确认通过」跑的是
+> **零条**判据，看起来全绿，其实什么都没验。替换时把 Step 1 的测试模块**追加到
+> 文件末尾**（或把替换块的末尾与测试模块合并成一次写入）。
 
 ```rust
 //! Claude Code's assets.
@@ -1632,8 +2877,11 @@ Expected: FAIL —— 找不到资产（`detect` 返回空）。
 //! Read-only: this looks and reports, it never writes.
 
 use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
-use super::{MigrationSource, ScanContext};
-use std::path::{Path, PathBuf};
+// `probe_file` / `probe_dir` live in the parent module. A child module may
+// reach a parent's private items, but it has to **name** them — an unqualified
+// `probe_file(...)` would not resolve.
+use super::{probe_dir, probe_file, MigrationSource, ScanContext};
+use std::path::Path;
 
 pub struct ClaudeSource;
 
@@ -1646,13 +2894,14 @@ impl MigrationSource for ClaudeSource {
         "Claude Code"
     }
 
-    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
+    fn detect(&self, ctx: &ScanContext, truth: &SkillTruth) -> Vec<AssetReport> {
         let mut out = Vec::new();
         let user = ctx.os_home.join(".claude");
         let project_claude = ctx.project.join(".claude");
-        // Loaded ONCE per scan: the registry is what decides whether a skill
-        // is really in effect.
-        let skills = super::SkillTruth::load(ctx);
+        // The registry's facts come from the ONE load `scan()` did — not a
+        // load of our own. Two sources in one report must not see two
+        // different moments of the same disk.
+        let skills = truth;
 
         // Instructions. The verdict comes from the **real loader** —
         // `crate::instructions::load_instructions` — not from a hand-rolled
@@ -1662,67 +2911,110 @@ impl MigrationSource for ClaudeSource {
         // an empty file loads as `Empty` rather than `Loaded`
         // (`instructions.rs:173`). Re-implementing those rules is how a report
         // ends up saying "already in effect" about a file that is not.
-        let project_instructions = ctx.project.join("CLAUDE.md");
-        if let Some(source) = super::instruction_verdict(ctx, &project_instructions) {
-            // A `Missing` file is not an asset at all, so it produces NO row.
-            // It cannot be a `continue` — this is not a loop, and the rest of
-            // the assets still need scanning.
-            if source.state != crate::instructions::InstructionState::Missing {
-                let (status, detail) = match source.state {
-                    crate::instructions::InstructionState::Loaded => {
-                        (AssetStatus::Active, super::text::instructions_active())
-                    }
-                    // The message names the file that WINS, not this one.
-                    crate::instructions::InstructionState::Shadowed => (
-                        AssetStatus::Blocked,
-                        super::text::instructions_shadowed(
-                            source.shadowed_by.as_deref().unwrap_or(&source.name),
+        // **Both spellings.** The loader's project tier knows five names
+        // (`instructions.rs:17`), and two of them are Claude's: `CLAUDE.md`
+        // and `claude.md`. On a case-sensitive filesystem only the lowercase
+        // one may exist — and the loader reads it. Asking for one spelling
+        // would leave the other unmentioned: the file is there, it IS in
+        // effect, and the report would not say so.
+        //
+        // The loader deduplicates the two when they name the same file
+        // (`instructions.rs:132`), so the report must too — otherwise one
+        // file would get two rows.
+        for name in ["CLAUDE.md", "claude.md"] {
+            let project_instructions = ctx.project.join(name);
+            if let Some(source) = super::instruction_verdict(ctx, &project_instructions) {
+                // Only report instruction files the loader found.
+                if source.state != crate::instructions::InstructionState::Missing {
+                    let (status, detail) = match source.state {
+                        crate::instructions::InstructionState::Loaded => {
+                            (AssetStatus::Active, super::text::instructions_active())
+                        }
+                        // The message names the file that WINS, not this one.
+                        crate::instructions::InstructionState::Shadowed => (
+                            AssetStatus::Blocked,
+                            super::text::instructions_shadowed(
+                                source.shadowed_by.as_deref().unwrap_or(&source.name),
+                            ),
                         ),
-                    ),
-                    crate::instructions::InstructionState::Empty => {
-                        (AssetStatus::Blocked, super::text::instructions_empty())
-                    }
-                    crate::instructions::InstructionState::Unreadable => (
-                        AssetStatus::Blocked,
-                        super::text::unreadable_file("the file could not be read"),
-                    ),
-                    crate::instructions::InstructionState::Missing => {
-                        unreachable!("handled above")
-                    }
-                };
-                out.push(AssetReport {
-                    kind: AssetKind::Instructions,
-                    name: source.name,
-                    path: source.path,
-                    scope: source.scope,
-                    status,
-                    detail,
-                });
+                        crate::instructions::InstructionState::Empty => {
+                            (AssetStatus::Blocked, super::text::instructions_empty())
+                        }
+                        crate::instructions::InstructionState::Unreadable => (
+                            AssetStatus::Blocked,
+                            super::text::unreadable_file("the file could not be read"),
+                        ),
+                        crate::instructions::InstructionState::Missing => {
+                            unreachable!("handled above")
+                        }
+                    };
+                    out.push(AssetReport {
+                        kind: AssetKind::Instructions,
+                        name: source.name,
+                        path: source.path,
+                        scope: source.scope,
+                        status,
+                        detail,
+                    });
+                }
             }
         }
         let user_instructions = user.join("CLAUDE.md");
         // **Fallible**: a file we cannot stat is not the same as a file that
         // is not there.
+        //
+        // **The same file can be both.** `ctx.project` may BE `~/.claude`
+        // (a project that happens to live there) — then the user-level path
+        // and the project-level path are the same file, and reporting it
+        // twice would say both "already in effect" and "can be brought
+        // over" about one file.
+        //
+        // **One file, one row** — and the check covers BOTH branches below,
+        // because the two can fail differently: the project tier may have
+        // read the file fine while the user-level probe hits a permission
+        // error (or the file changed between the two probes). Comparing by
+        // **file identity** (the same path spelled two ways, or a hard link
+        // under a different name) settles it — a string comparison would
+        // call a hard link two files.
+        let already_reported = |path: &std::path::Path| {
+            out.iter().any(|row: &AssetReport| {
+                row.kind == AssetKind::Instructions && super::same_file(&row.path, path)
+            })
+        };
         match probe_file(&user_instructions) {
-            Ok(true) => out.push(AssetReport {
-                kind: AssetKind::Instructions,
-                name: "CLAUDE.md".into(),
-                path: user_instructions,
-                scope: AssetScope::User,
-                status: AssetStatus::Actionable,
-                detail: super::text::instructions_copyable(
-                    &ctx.product.user().join("ATOMCODE.md"),
-                ),
-            }),
+            Ok(true) => {
+                // Already reported as the project-level file: it is one file,
+                // and it already has a row.
+                if !already_reported(&user_instructions) {
+                    out.push(AssetReport {
+                        kind: AssetKind::Instructions,
+                        name: "CLAUDE.md".into(),
+                        path: user_instructions,
+                        scope: AssetScope::User,
+                        status: AssetStatus::Actionable,
+                        detail: super::text::instructions_copyable(
+                            &ctx.product.user().join("ATOMCODE.md"),
+                        ),
+                    });
+                }
+            }
             Ok(false) => {}
-            Err(reason) => out.push(AssetReport {
-                kind: AssetKind::Instructions,
-                name: "CLAUDE.md".into(),
-                path: user_instructions,
-                scope: AssetScope::User,
-                status: AssetStatus::Blocked,
-                detail: super::text::unreadable_file(&reason),
-            }),
+            Err(reason) => {
+                // The file could not be read. If the project tier already
+                // reported it, that row stands — one file, one row. If not,
+                // this is the only thing we know about it, and the error is
+                // the reason it is not in effect.
+                if !already_reported(&user_instructions) {
+                    out.push(AssetReport {
+                        kind: AssetKind::Instructions,
+                        name: "CLAUDE.md".into(),
+                        path: user_instructions,
+                        scope: AssetScope::User,
+                        status: AssetStatus::Blocked,
+                        detail: super::text::unreadable_file(&reason),
+                    });
+                }
+            }
         }
 
         // Skills and commands: the standard paths are in our own scan list.
@@ -1734,7 +3026,15 @@ impl MigrationSource for ClaudeSource {
                 (AssetScope::User, user.join(dir)),
                 (AssetScope::Project, project_claude.join(dir)),
             ] {
-                out.extend(super::skill_rows(kind, scope, &root, &skills));
+                // These paths ARE ours — the registry scans them, so its
+                // verdict says whether each one is really in effect.
+                out.extend(super::skill_rows(
+                    kind,
+                    scope,
+                    &root,
+                    &skills,
+                    super::SkillTree::Scanned,
+                ));
             }
         }
 
@@ -2205,6 +3505,55 @@ Task 2 把它**整个替换**成完整版 —— **不要在最小版后面追�
 
 use atomcode_i18n::product::{t, Msg};
 
+pub fn skill_active() -> String {
+    t(Msg::MigrationSkillActive).into_owned()
+}
+pub fn skill_rejected(reason: &str) -> String {
+    t(Msg::MigrationSkillRejected { reason }).into_owned()
+}
+pub fn skill_overridden(name: &str) -> String {
+    t(Msg::MigrationSkillOverridden { name }).into_owned()
+}
+pub fn unreadable_file(reason: &str) -> String {
+    t(Msg::MigrationUnreadableFile { reason }).into_owned()
+}
+pub fn skill_depth_limit() -> String {
+    t(Msg::MigrationSkillDepthLimit).into_owned()
+}
+pub fn skill_symlink_cycle() -> String {
+    t(Msg::MigrationSkillSymlinkCycle).into_owned()
+}
+/// A `SKILL.md` that exists but is not a regular file (a directory, say).
+pub fn skill_md_not_a_file() -> String {
+    t(Msg::MigrationSkillMdNotAFile).into_owned()
+}
+/// The asset is in someone else's tree: it is not in effect, and this is
+/// where to put it to bring it over.
+///
+/// **The wording promises the ACTION, not the outcome** — whether the copy
+/// wins against a same-named higher-priority definition is not ours to
+/// promise.
+pub fn skill_copyable(target: &std::path::Path) -> String {
+    t(Msg::MigrationSkillCopyable {
+        target: &target.display().to_string(),
+    })
+    .into_owned()
+}
+/// The asset is not in effect and nothing says why.
+pub fn skill_not_in_effect() -> String {
+    t(Msg::MigrationSkillNotInEffect).into_owned()
+}
+/// The file cannot be parsed, so copying it over would only move the
+/// failure. The registry never looked at this file — this is our own
+/// reading of it.
+pub fn foreign_unparseable() -> String {
+    t(Msg::MigrationForeignUnparseable).into_owned()
+}
+/// The entry is a symlink whose target is gone.
+pub fn broken_link() -> String {
+    t(Msg::MigrationBrokenLink).into_owned()
+}
+
 pub fn instructions_active() -> String {
     t(Msg::MigrationInstructionsActive).into_owned()
 }
@@ -2219,15 +3568,6 @@ pub fn instructions_shadowed(by: &str) -> String {
 }
 pub fn instructions_empty() -> String {
     t(Msg::MigrationInstructionsEmpty).into_owned()
-}
-pub fn skill_active() -> String {
-    t(Msg::MigrationSkillActive).into_owned()
-}
-pub fn skill_rejected(reason: &str) -> String {
-    t(Msg::MigrationSkillRejected { reason }).into_owned()
-}
-pub fn skill_overridden(name: &str) -> String {
-    t(Msg::MigrationSkillOverridden { name }).into_owned()
 }
 pub fn permissions_active() -> String {
     t(Msg::MigrationPermissionsActive).into_owned()
@@ -2250,9 +3590,6 @@ pub fn mcp_active(count: usize) -> String {
 }
 pub fn mcp_all_disabled(count: usize) -> String {
     t(Msg::MigrationMcpAllDisabled { count }).into_owned()
-}
-pub fn unreadable_file(reason: &str) -> String {
-    t(Msg::MigrationUnreadableFile { reason }).into_owned()
 }
 pub fn rules_rejected() -> String {
     t(Msg::MigrationRulesRejected).into_owned()
@@ -2296,22 +3633,25 @@ pub fn provider_nothing_to_connect_to() -> String {
 > **共享的技能助手在 `mod.rs` 里，不在这里。** `SkillTruth` 与 `skill_rows`
 > 三个来源都要用（Claude Code、OpenCode、以及共享的 `.agents` 树），所以它们
 > 定义在 **`mod.rs`**（Task 1 就建好了），`claude.rs` 与 `opencode.rs` 都用
-> `super::skill_rows(…)` / `super::SkillTruth::load(ctx)` 拿 —— 子模块**不会**
-> 自动拿到父模块的名字，必须写 `super::`。
+> `super::skill_rows(…)` 拿 —— 子模块**不会**自动拿到父模块的名字，必须写
+> `super::`。
+>
+> **`SkillTruth` 由 `scan()` 加载一次并传进来**（`detect` 的第二个参数），
+> **不要**在来源里自己 `SkillTruth::load(ctx)` —— 同一份报告里两个来源看到两个
+> 不同时刻的加载状态，报告就会自相矛盾。
 >
 > `provider_copyable` 放在**这里**而不是 Task 3：Task 2 的 Claude 扫描已经要报
 > provider 那一行，而 Task 2 必须能**单独编译并通过**（阶段 P2 的验收就是
 > `cargo nextest run -p atomcode-capabilities --features migration` 全绿）。
 >
-> `text.rs` 在 Task 1 已经有了**最小版**（4 条：技能与读文件），本 Step 把它
+> `text.rs` 在 Task 1 已经有了**最小版**（11 条：技能、复制目标、读取失败与断链），本 Step 把它
 > **扩成完整版** —— `mod text;` 的声明在 Task 1 的 `mod.rs` 里已经在了。
 
 - [ ] **Step 4: 在 i18n product 表加这些条目**
 
 `crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
-（**Task 1 已经加过 4 条** —— `MigrationSkillActive` /
-`MigrationSkillRejected` / `MigrationSkillOverridden` /
-`MigrationUnreadableFile` —— **不要重复加**，同一个变体加两次编译不过）：
+（保留 Task 1 的 11 个变体及中英文 match 臂，包括
+`MigrationUnreadableFile`、`MigrationForeignUnparseable` 和 `MigrationBrokenLink`）：
 
 ```rust
     // External-agent asset migration (see
@@ -2378,14 +3718,6 @@ pub fn provider_nothing_to_connect_to() -> String {
         Msg::MigrationInstructionsEmpty => {
             "The file is empty, so nothing is loaded from it".into()
         }
-        Msg::MigrationSkillActive => "Read directly — already in the skill catalog".into(),
-        Msg::MigrationSkillRejected { reason } => {
-            format!("Our loader rejects this skill: {reason}").into()
-        }
-        Msg::MigrationSkillOverridden { name } => {
-            format!("Another skill named {name} takes precedence — this one is not in effect")
-                .into()
-        }
         Msg::MigrationPermissionsActive => {
             "Merged into this project's permission rules — already in effect".into()
         }
@@ -2400,9 +3732,6 @@ pub fn provider_nothing_to_connect_to() -> String {
         }
         Msg::MigrationMcpAllDisabled { count } => {
             format!("{count} MCP server(s) are configured but disabled — none of them run").into()
-        }
-        Msg::MigrationUnreadableFile { reason } => {
-            format!("This file could not be read: {reason}").into()
         }
         Msg::MigrationRulesRejected => {
             "Our loader would reject this file, so none of its rules apply".into()
@@ -2463,13 +3792,6 @@ pub fn provider_nothing_to_connect_to() -> String {
             format!("不会被读取：本项目中 {by} 的优先级更高").into()
         }
         Msg::MigrationInstructionsEmpty => "这个文件是空的，因此没有加载任何内容".into(),
-        Msg::MigrationSkillActive => "直接读取 —— 已在技能目录里".into(),
-        Msg::MigrationSkillRejected { reason } => {
-            format!("我们的加载器会拒绝这个技能：{reason}").into()
-        }
-        Msg::MigrationSkillOverridden { name } => {
-            format!("另一个名为 {name} 的技能优先 —— 这个没有生效").into()
-        }
         Msg::MigrationPermissionsActive => "已并入本项目的权限规则 —— 已经生效".into(),
         Msg::MigrationPermissionsCopyable { target } => {
             format!("复制到 {target} 后即成为全局权限规则").into()
@@ -2482,9 +3804,6 @@ pub fn provider_nothing_to_connect_to() -> String {
         }
         Msg::MigrationMcpAllDisabled { count } => {
             format!("{count} 个 MCP 服务已配置但被禁用 —— 都没有在运行").into()
-        }
-        Msg::MigrationUnreadableFile { reason } => {
-            format!("这个文件无法读取：{reason}").into()
         }
         Msg::MigrationRulesRejected => "我们的加载器会拒绝这个文件，因此其中规则都不生效".into(),
         Msg::MigrationHooksCopyable { target } => {
@@ -2526,7 +3845,7 @@ pub fn provider_nothing_to_connect_to() -> String {
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::claude`
-Expected: PASS —— 本 Task 定义的全部 `migration::claude` 判据（指令 / 技能 / 权限 / MCP / hooks / subagent / provider 各若干，**以实际条数为准**，关键是全绿）。
+Expected: PASS —— 当前 Step 1 有 11 条判据，覆盖指令、技能、权限、MCP、子 agent 与空来源。后续增加判据时，以实际执行条数为准。
 
 - [ ] **Step 6: 跑 i18n 编译检查**
 
@@ -2570,10 +3889,15 @@ mod tests {
             os_home: home.to_path_buf(),
             project: project.to_path_buf(),
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         }
+    }
+
+    /// The registry's facts, loaded the way `scan()` loads them.
+    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
+        super::super::SkillTruth::load(&ctx(home, project))
     }
 
     /// Write a file, creating its parent directory first.
@@ -2594,7 +3918,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         write_file(&home.path().join(".codex").join("AGENTS.md"), "# rules");
 
-        let assets = CodexSource.detect(&ctx(home.path(), project.path()));
+        let assets = CodexSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let instructions = assets
             .iter()
             .find(|a| a.kind == AssetKind::Instructions)
@@ -2611,7 +3935,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
 
-        let assets = CodexSource.detect(&ctx(home.path(), project.path()));
+        let assets = CodexSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let skill = assets
             .iter()
             .find(|a| a.kind == AssetKind::Skills)
@@ -2632,7 +3956,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
 
-        let assets = CodexSource.detect(&ctx(home.path(), project.path()));
+        let assets = CodexSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
         assert!(assets
             .iter()
@@ -2648,7 +3972,7 @@ mod tests {
             "[mcp_servers.fs]\ncommand = \"mcp-fs\"\n",
         );
 
-        let assets = CodexSource.detect(&ctx(home.path(), project.path()));
+        let assets = CodexSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let mcp = assets
             .iter()
             .find(|a| a.kind == AssetKind::McpServers)
@@ -2660,7 +3984,7 @@ mod tests {
     fn no_codex_directory_means_no_rows() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let assets = CodexSource.detect(&ctx(home.path(), project.path()));
+        let assets = CodexSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         assert!(assets.is_empty());
     }
 }
@@ -2687,7 +4011,7 @@ Expected: FAIL —— 找不到资产。
 //! Read-only: this looks and reports, it never writes.
 
 use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
-use super::{MigrationSource, ScanContext};
+use super::{MigrationSource, ScanContext, SkillTruth};
 use std::path::{Path, PathBuf};
 
 pub struct CodexSource;
@@ -2701,7 +4025,7 @@ impl MigrationSource for CodexSource {
         "Codex"
     }
 
-    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
+    fn detect(&self, ctx: &ScanContext, truth: &SkillTruth) -> Vec<AssetReport> {
         let mut out = Vec::new();
         let user = ctx.os_home.join(".codex");
         let project_codex = ctx.project.join(".codex");
@@ -2768,29 +4092,28 @@ impl MigrationSource for CodexSource {
         // Skills. Codex installs them in GROUPING directories
         // (`~/.codex/skills/.system/<name>/SKILL.md`), so only the immediate
         // children would miss the installed ones — a real skill vanishing
-        // from the report. The walk is bounded and cycle-guarded, like the
-        // registry's own.
+        // from the report.
+        //
+        // **Through the shared helper, not a walk of our own.** The helper
+        // knows how to descend grouping directories, and — more importantly —
+        // it asks the registry first: a host that put `~/.codex/skills` in its
+        // skill roots has those skills ALREADY in effect, and "copy it over"
+        // would be nonsense. A walk of our own that answered `Actionable`
+        // unconditionally would say that even about a skill that is running
+        // right now.
         for (scope, root) in [
             (AssetScope::User, user.join("skills")),
             (AssetScope::Project, project_codex.join("skills")),
         ] {
-            let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
-            let mut ancestors: std::collections::BTreeSet<std::path::PathBuf> =
-                std::collections::BTreeSet::new();
-            collect_codex_skills(&root, 0, MAX_SKILL_DEPTH, &mut ancestors, &mut found);
-            found.sort();
-            for (name, path) in found {
-                out.push(AssetReport {
-                    kind: AssetKind::Skills,
-                    name: name.clone(),
-                    path,
-                    scope,
-                    status: AssetStatus::Actionable,
-                    detail: super::text::skill_copyable(
-                        &ctx.product.user().join("skills").join(&name),
-                    ),
-                });
-            }
+            out.extend(super::skill_rows(
+                AssetKind::Skills,
+                scope,
+                &root,
+                truth,
+                super::SkillTree::Foreign {
+                    target: ctx.product.user().join("skills"),
+                },
+            ));
         }
 
         // The TOML config: MCP servers and the provider setup.
@@ -2984,12 +4307,6 @@ fn session_file_count(sessions: &Path) -> Result<usize, String> {
 `text.rs` 追加：
 
 ```rust
-pub fn skill_copyable(target: &std::path::Path) -> String {
-    t(Msg::MigrationSkillCopyable {
-        target: &target.display().to_string(),
-    })
-    .into_owned()
-}
 pub fn unreadable_config() -> String {
     t(Msg::MigrationUnreadableConfig).into_owned()
 }
@@ -2998,18 +4315,12 @@ pub fn unreadable_config() -> String {
 `messages.rs` 追加：
 
 ```rust
-    MigrationSkillCopyable {
-        target: &'a str,
-    },
     MigrationUnreadableConfig,
 ```
 
 `en.rs` 追加：
 
 ```rust
-        Msg::MigrationSkillCopyable { target } => {
-            format!("Copy it to {target} to make it load").into()
-        }
         Msg::MigrationUnreadableConfig => {
             "This config file could not be parsed, so nothing could be read from it".into()
         }
@@ -3018,15 +4329,15 @@ pub fn unreadable_config() -> String {
 `zh_cn.rs` 追加：
 
 ```rust
-        Msg::MigrationSkillCopyable { target } => {
-            format!("复制到 {target} 后即可加载").into()
-        }
         Msg::MigrationUnreadableConfig => "这个配置文件无法解析，因此其中内容都没读到".into(),
 ```
 
+> **`MigrationSkillCopyable` 不在这里加** —— Task 1 已经加过这条臂（它服务的是
+> 共享的技能助手）。重复的枚举变体会触发编译错误，重复的 match 臂会触发不可达模式告警。
+> `text.rs` 里 `skill_copyable()` 也已在 Task 1 定义，**不要重复定义**（E0428）。
+>
 > `MigrationProviderCopyable` **不在这里加** —— Task 2 已经加过这条臂（它服务的是
-> Claude 与 Codex 两个来源的 provider 行），再加一次就是**重复的 match 臂**，
-> 编译不过（E0081）。
+> Claude 与 Codex 两个来源的 provider 行）。
 
 - [ ] **Step 5: 跑测试确认通过**
 
@@ -3056,10 +4367,8 @@ nothing."
 
 **Files:**
 - Create: `crates/atomcode-capabilities/src/migration/opencode.rs`
-- Modify: `crates/atomcode-capabilities/src/migration/mod.rs`（`builtin_sources` 加一行）
-- Modify: `crates/atomcode-capabilities/src/migration/text.rs`
+- Modify: `crates/atomcode-capabilities/src/migration/mod.rs`（声明模块并在 `builtin_sources` 注册）
 - Modify: `crates/atomcode-coding/src/config.rs`（**宿主解析 OpenCode 的目录**，Step 5）
-- Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`
 
 ### OpenCode 的资产长什么样（本机实测，`/Users/theo/.config/opencode`）
 
@@ -3108,10 +4417,15 @@ mod tests {
             os_home: home.to_path_buf(),
             project: project.to_path_buf(),
             product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: home.join(".config/opencode"),
             opencode_data_dir: home.join(".local/share/opencode"),
         }
+    }
+
+    /// The registry's facts, loaded the way `scan()` loads them.
+    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
+        super::super::SkillTruth::load(&ctx(home, project))
     }
 
     /// A skill in OpenCode's own tree: same format as ours, so it can be
@@ -3124,7 +4438,7 @@ mod tests {
         std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
         std::fs::write(&skill, "---\nname: huawei-apig\ndescription: x\n---\n\nbody\n").unwrap();
 
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let row = assets
             .iter()
             .find(|a| a.kind == AssetKind::Skills)
@@ -3142,7 +4456,7 @@ mod tests {
         std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
         std::fs::write(&skill, "---\nname: huawei-vpc\ndescription: x\n---\n\nbody\n").unwrap();
 
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let row = assets
             .iter()
             .find(|a| a.kind == AssetKind::Skills && a.name == "huawei-vpc")
@@ -3185,7 +4499,7 @@ mod tests {
         )
         .unwrap();
 
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let row = assets
             .iter()
             .find(|a| a.kind == AssetKind::McpServers)
@@ -3203,7 +4517,7 @@ mod tests {
         std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
         std::fs::write(&auth, r#"{"deepseek":{"type":"api","key":"sk-x"}}"#).unwrap();
 
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()));
+        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
         let row = assets
             .iter()
             .find(|a| a.kind == AssetKind::ProviderConfig)
@@ -3220,6 +4534,9 @@ Expected: FAIL —— `OpenCodeSource` 不存在。
 
 - [ ] **Step 3: 实现 OpenCodeSource**
 
+`mod.rs` 加 `mod opencode;`，并在 `builtin_sources()` 的列表末尾追加
+`Box::new(opencode::OpenCodeSource)`。将 Step 1 的测试模块保留在 `opencode.rs` 末尾。
+
 `crates/atomcode-capabilities/src/migration/opencode.rs`（新建）：
 
 ```rust
@@ -3234,7 +4551,7 @@ Expected: FAIL —— `OpenCodeSource` 不存在。
 
 use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 use super::provider::{ApiKeyRef, ProviderAccountDraft};
-use super::{MigrationSource, ScanContext};
+use super::{MigrationSource, ScanContext, SkillTruth};
 
 pub struct OpenCodeSource;
 
@@ -3247,15 +4564,16 @@ impl MigrationSource for OpenCodeSource {
         "OpenCode"
     }
 
-    fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport> {
+    fn detect(&self, ctx: &ScanContext, truth: &SkillTruth) -> Vec<AssetReport> {
         let mut out = Vec::new();
         let config = &ctx.opencode_config_dir;
-        // Loaded ONCE per scan: the registry is what decides whether a skill
-        // is really in effect.
-        let skills = super::SkillTruth::load(ctx);
+        // The registry's facts come from the ONE load `scan()` did — not a
+        // load of our own. Two sources in one report must not see two
+        // different moments of the same disk.
+        let skills = truth;
 
-        // Skills and commands. OpenCode's own tree is NOT ours, so they are
-        // movable.
+        // Skills and commands. Prefer discoveries already in the registry;
+        // otherwise check whether the candidate can be brought over.
         for (kind, dir) in [
             (AssetKind::Skills, "skills"),
             (AssetKind::Commands, "commands"),
@@ -3264,32 +4582,45 @@ impl MigrationSource for OpenCodeSource {
                 (AssetScope::User, config.join(dir)),
                 (AssetScope::Project, ctx.project.join(".opencode").join(dir)),
             ] {
-                out.extend(super::skill_rows(kind, scope, &root, &skills));
+                out.extend(super::skill_rows(
+                    kind,
+                    scope,
+                    &root,
+                    &skills,
+                    super::SkillTree::Foreign {
+                        target: ctx.product.user().join(dir),
+                    },
+                ));
             }
         }
-        // The shared `.agents` tree: **the skills half is ours**, the commands
-        // half is NOT.
-        //
-        // `standard_skill_dirs` scans `~/.agents/skills` and
-        // `<project>/.agents/skills` (`registry.rs:585`, `:590`) — there is no
-        // `.agents/commands` in that list. So a shared SKILL is `Active`, and a
-        // shared COMMAND is `Actionable`: same format, copy it into our own
-        // `commands/` and it starts working.
-        //
-        // Reporting the commands half as `Active` would be wrong in the
-        // direction that matters — the person would believe their shared
-        // commands are already loaded, and they are not.
+        // Shared skills are standard roots. Shared commands may also be
+        // configured by the host, so consult the same registry snapshot
+        // before offering a copy.
         for (scope, root) in [
             (AssetScope::User, ctx.os_home.join(".agents").join("skills")),
             (AssetScope::Project, ctx.project.join(".agents").join("skills")),
         ] {
-            out.extend(super::skill_rows(AssetKind::Skills, scope, &root, &skills));
+            out.extend(super::skill_rows(
+                AssetKind::Skills,
+                scope,
+                &root,
+                &skills,
+                super::SkillTree::Scanned,
+            ));
         }
         for (scope, root) in [
             (AssetScope::User, ctx.os_home.join(".agents").join("commands")),
             (AssetScope::Project, ctx.project.join(".agents").join("commands")),
         ] {
-            out.extend(shared_command_rows(scope, &root, &ctx.product.user().join("commands")));
+            out.extend(super::skill_rows(
+                AssetKind::Commands,
+                scope,
+                &root,
+                &skills,
+                super::SkillTree::Foreign {
+                    target: ctx.product.user().join("commands"),
+                },
+            ));
         }
 
         // The provider configuration.
@@ -3442,56 +4773,6 @@ fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
     }
     out
 }
-
-/// The command templates in a shared `.agents/commands` directory.
-///
-/// **These are movable, not active.** The registry's standard directory list
-/// has `~/.agents/skills` and `<project>/.agents/skills` (`registry.rs:585`,
-/// `:590`) — there is **no** `.agents/commands` in it. So a command sitting
-/// there is not loaded by us today; it is a flat `.md` template of the same
-/// shape we already read, and copying it into our own `commands/` makes it
-/// work.
-///
-/// The flat layout matches ours: command templates are TOP-LEVEL `.md` files
-/// (`registry.rs:340` — a skill's own `*.md` are its resources, not
-/// commands).
-fn shared_command_rows(
-    scope: AssetScope,
-    root: &Path,
-    target: &Path,
-) -> Vec<AssetReport> {
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        // A directory we cannot read is not an empty one — but it is also not
-        // an asset we can promise anything about. Skip it silently rather
-        // than report a row we cannot describe.
-        Err(_) => return out,
-    };
-    let mut paths: Vec<std::path::PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .collect();
-    paths.sort();
-    for path in paths {
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let name = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        out.push(AssetReport {
-            kind: AssetKind::Commands,
-            name: name.clone(),
-            path,
-            scope,
-            status: AssetStatus::Actionable,
-            detail: super::text::skill_copyable(&target.join(&name)),
-        });
-    }
-    out
-}
 ```
 
 - [ ] **Step 4: 把来源特有的知识收回来源自己**
@@ -3537,10 +4818,7 @@ fn protocol_for_opencode(npm: Option<&str>) -> String {
 > 知识：它只有 `protocol_for_wire`（问「这条线怎么说」）与 `unsupported_protocol`
 > （造一个「我们不认」的 id）。
 
-**`claude_env` 从 `provider.rs` 移到 `claude.rs`** —— 它是 Claude 专属的读法
-（`settings.json` 的 `env` 块），共享模块不该知道。
-
-**`ScanContext` 加两个字段**（宿主解析，capability 不读环境）：
+**复用 Task 1 已声明的 `ScanContext` 字段**（宿主解析，capability 不读环境）：
 
 ```rust
     /// Where OpenCode keeps its configuration
@@ -3576,10 +4854,10 @@ pub fn opencode_dirs() -> (PathBuf, PathBuf) {
 
 `scan_context` 加两个参数，CLI 与 TUI 两处调用都补上。
 
-- [ ] **Step 6: 加文案**
+- [ ] **Step 6: 核对文案**
 
-`text.rs` 加 `opencode_plaintext_credentials()`；`product` 表加对应的
-`MigrationOpencodePlaintextCredentials`。
+复用 Task 2 已添加的 `text::opencode_plaintext_credentials()` 与
+`MigrationOpencodePlaintextCredentials` 的中英文文案。
 
 - [ ] **Step 7: 跑测试确认通过**
 
@@ -3829,7 +5107,7 @@ pub fn scan_context(
     os_home: &Path,
     project: &Path,
     product: atomcode_capabilities::ProductDirs,
-    skill_dirs: Vec<std::path::PathBuf>,
+    skill_dirs: Option<Vec<std::path::PathBuf>>,
     opencode_config_dir: std::path::PathBuf,
     opencode_data_dir: std::path::PathBuf,
 ) -> ScanContext {
@@ -4601,10 +5879,11 @@ pub struct DiskMigration {
     ///
     /// **The host must supply them**: the screen cannot resolve them itself —
     /// it may not depend on `atomcode-coding` (the layering gate forbids it),
-    /// and the resolution rule lives there. An empty list would fall back to
-    /// the standard list, and then the screen would disagree with the CLI
-    /// about which same-named skill wins.
-    skill_dirs: Vec<PathBuf>,
+    /// and the resolution rule lives there. `None` means "the host did not
+    /// say" and the standard list is used; `Some(dirs)` means exactly these.
+    /// An empty list would fall back to the standard list, and then the
+    /// screen would disagree with the CLI about which same-named skill wins.
+    skill_dirs: Option<Vec<PathBuf>>,
     /// Where OUR configuration lives — the screen's re-check compares against
     /// it, so an account that was imported shows as "already imported" in the
     /// screen too, not just in the CLI.
@@ -4617,7 +5896,7 @@ impl DiskMigration {
         project: PathBuf,
         product: atomcode_capabilities::ProductDirs,
         config_path: PathBuf,
-        skill_dirs: Vec<PathBuf>,
+        skill_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
         Self {
             home,
@@ -5162,7 +6441,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5191,7 +6470,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5212,7 +6491,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5239,7 +6518,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5266,7 +6545,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: std::path::PathBuf::from("/work"),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5308,7 +6587,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5375,7 +6654,7 @@ mod tests {
             os_home: home.path().to_path_buf(),
             project: project.path().to_path_buf(),
             product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         };
@@ -5511,7 +6790,8 @@ pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Val
 
 > **共享的技能助手在 `mod.rs` 里**（Task 1 就建好了）：`SkillTruth` 与
 > `skill_rows` 三个来源都要用，所以它们在父模块，Claude 这边用
-> `super::skill_rows(…)` / `super::SkillTruth::load(ctx)` 拿。
+> `super::skill_rows(…)` 拿；`SkillTruth` 由 `scan()` 加载一次传进来
+> （`detect` 的第二个参数），**不要**在来源里自己 `SkillTruth::load(ctx)`。
 > `text.rs` 也在 Task 1 有了最小版，本 Task 把它扩成完整版。
 
 ```rust
@@ -5889,6 +7169,7 @@ host can ask about that single item before writing it."
         fn detect(
             &self,
             _ctx: &atomcode_capabilities::migration::ScanContext,
+            _truth: &atomcode_capabilities::migration::SkillTruth,
         ) -> Vec<atomcode_capabilities::migration::AssetReport> {
             Vec::new()
         }
@@ -5923,7 +7204,7 @@ host can ask about that single item before writing it."
             os_home: dir.to_path_buf(),
             project: dir.to_path_buf(),
             product: atomcode_capabilities::ProductDirs::new(dir.join(".ours"), ".ours"),
-            skill_dirs: Vec::new(),
+            skill_dirs: None,
             opencode_config_dir: PathBuf::new(),
             opencode_data_dir: PathBuf::new(),
         }

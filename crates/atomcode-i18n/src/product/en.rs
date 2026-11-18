@@ -1522,6 +1522,48 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdCatalogRememberUsage => "[--topic <topic>] [--source <source>] [--pin] [--ttl-days N] <what to remember>".into(),
         Msg::CmdCatalogForget => "Delete one of the lines you remembered".into(),
         Msg::CmdCatalogForgetUsage => "<keyword> | --id <ID>".into(),
+        Msg::MigrationSkillActive => "Already in effect: read directly, nothing to move.".into(),
+        Msg::MigrationSkillRejected { reason } => {
+            format!("The skill loader rejected it: {reason}").into()
+        }
+        Msg::MigrationSkillOverridden { name } => {
+            format!("Overridden by a \"{name}\" in another directory.").into()
+        }
+        Msg::MigrationUnreadableFile { reason } => {
+            format!("The file could not be read: {reason}").into()
+        }
+        Msg::MigrationSkillDepthLimit => "the grouping depth limit was exceeded".into(),
+        Msg::MigrationSkillSymlinkCycle => "a symlink cycle was detected".into(),
+        Msg::MigrationSkillMdNotAFile => {
+            "SKILL.md here is not a regular file, so this skill cannot load.".into()
+        }
+        Msg::MigrationSkillCopyable { target } => {
+            format!("Not in effect yet. Copy it to {target} to bring it over.").into()
+        }
+        Msg::MigrationSkillNotInEffect => {
+            "Not in effect, and the skill loader gives no reason why.".into()
+        }
+        Msg::MigrationForeignUnparseable => {
+            "This file cannot be parsed, so it would not load even if it were copied over.".into()
+        }
+        Msg::MigrationBrokenLink => {
+            "This is a broken symlink: its target is gone, so nothing can load it.".into()
+        }
+        Msg::MigrationNotARegularFile => {
+            "This is not a regular file, so it cannot be loaded as a skill.".into()
+        }
+        Msg::MigrationNotADirectory => {
+            "This is not a directory, so it cannot be scanned for skills.".into()
+        }
+        Msg::MigrationReportDepthLimit => {
+            "the scan stopped here: the grouping depth limit was exceeded".into()
+        }
+        Msg::MigrationReportSymlinkCycle => {
+            "the scan stopped here: a symlink cycle was detected".into()
+        }
+        Msg::MigrationReportEntryUnusable { reason } => {
+            format!("This entry cannot be used as a skill: {reason}").into()
+        }
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \

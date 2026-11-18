@@ -2424,4 +2424,43 @@ pub enum Msg<'a> {
     CmdCatalogRememberUsage,
     CmdCatalogForget,
     CmdCatalogForgetUsage,
+    // External-agent asset migration (see
+    // docs/plans/2026-11-17-external-agent-asset-migration-design.md).
+    MigrationSkillActive,
+    MigrationSkillRejected {
+        reason: &'a str,
+    },
+    MigrationSkillOverridden {
+        name: &'a str,
+    },
+    MigrationUnreadableFile {
+        reason: &'a str,
+    },
+    MigrationSkillDepthLimit,
+    MigrationSkillSymlinkCycle,
+    MigrationSkillMdNotAFile,
+    MigrationSkillCopyable {
+        target: &'a str,
+    },
+    MigrationSkillNotInEffect,
+    /// The file itself cannot be parsed, so copying it over would only move
+    /// the failure — the registry never looked at this file.
+    MigrationForeignUnparseable,
+    /// The entry is a symlink whose target is gone.
+    MigrationBrokenLink,
+    /// The entry is there, but it is not a regular file (a FIFO, a socket).
+    MigrationNotARegularFile,
+    /// The tree root is there, but it is not a directory we can walk.
+    MigrationNotADirectory,
+    /// **The report's own walk** hit the grouping-depth limit — the skill
+    /// loader never looked at this tree.
+    MigrationReportDepthLimit,
+    /// **The report's own walk** found a symlink cycle — the skill loader
+    /// never looked at this tree.
+    MigrationReportSymlinkCycle,
+    /// The entry is there, but it is not something the loader can use. The
+    /// loader never treated it as a skill at all.
+    MigrationReportEntryUnusable {
+        reason: &'a str,
+    },
 }

@@ -254,6 +254,25 @@ plugin = [
     "dep:atomcode-auth", "dep:atomcode-config",
     "skills",
 ]
+# Scan assets left behind by other AI coding agents (Claude Code / Codex) and
+# report what we already read natively, what can be brought over, and what is
+# blocked. Read-only; the provider-account draft it produces is written by the
+# host, never here.
+#
+# It DOES pull `atomcode-config`, for two reasons: the id and the endpoint
+# have to be normalised by the SAME rule the writer uses (otherwise the
+# re-check never matches), and the real loaders' verdicts are what say
+# "already in effect". `ProductDirs` lives in THIS crate (`product_dirs.rs`),
+# so the trees still cost no dependency.
+migration = [
+    "tools",
+    "instructions",
+    "mcp",
+    "skills",
+    "dep:atomcode-i18n",
+    "dep:atomcode-config",
+    "dep:toml",
+]
 
 [target.'cfg(unix)'.dependencies]
 # Askpass (the `askpass` module): a Unix-socket server + wrapper script that route

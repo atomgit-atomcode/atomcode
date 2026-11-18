@@ -708,6 +708,17 @@ fn base_id(name: &str) -> Result<String, BookError> {
     })
 }
 
+/// The id an account with this name would get.
+///
+/// The same rule `create_account` applies, so a caller that needs to refer
+/// to an account before it exists (a migration report, say) names it the
+/// way it will be written.
+///
+/// An error when the name cannot become an account at all.
+pub fn account_id_for(name: &str) -> Result<String, BookError> {
+    base_id(name)
+}
+
 fn write_planned(
     document: &mut toml_edit::DocumentMut,
     account: &str,
@@ -789,6 +800,14 @@ fn endpoint_override<'a>(endpoint: &'a str, preset_id: &str) -> Option<&'a str> 
     }
     let default = provider_preset::preset(preset_id).and_then(|p| p.default_base_url);
     (Some(endpoint) != default).then_some(endpoint)
+}
+
+/// The endpoint worth storing for this protocol.
+///
+/// `None` when the endpoint is empty or is the protocol's own default — the
+/// same rule `create_account` applies.
+pub fn effective_endpoint(protocol: &str, endpoint: &str) -> Option<String> {
+    endpoint_override(endpoint, protocol).map(str::to_string)
 }
 
 /// What an account already says it speaks, so setting a key does not also move

@@ -103,6 +103,16 @@ crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
 
   自己再写一份校验，迟早与真加载器不一致 —— 而「说生效、其实不生效」正是这个报告最不能有的错。
 
+  **「让真加载器说出来」的字面意思：它说什么就是什么，报告不许自己再推断一遍。**
+  尤其对技能：注册表**走过一遍**目录，它知道自己在哪一层停下了（遇到技能目录
+  就停）、跳过了哪些目录（`node_modules` 等）、受什么深度上限约束、以及**哪一份
+  同名定义赢了**。报告若自己再走一遍去推算「注册表会不会走到这个条目」，两遍
+  遍历在符号链接、别名路径、忽略目录上会给出**不同答案** —— 而「注册表说它没
+  发现」与「报告说它被覆盖」之间，只有前者是真的。
+
+  所以：**注册表记录它发现了什么**（含被同名的另一份顶掉的那一份），报告**只
+  依据这份记录**裁决。没有记录 = 注册表从没走过 = 「没有生效」。
+
   `toml` 用来读 Codex 的 `config.toml`。`atomcode-i18n` 是零 atomcode 依赖的叶子（`gates/layers.sh` 守它），所以 capabilities 引它不破坏分层（`memory` 模块已是同样做法）。`atomcode-config` 这条边 capabilities **本来就有**（`provider` / `mcp` / `instructions` / `session` 等 feature 都拉它），门禁也不禁这条 —— 门禁禁的是 `atomcode-tui → atomcode-coding / atomcode`。
 - 报告的**结构化数据**在 capabilities，**文案**在 `atomcode-i18n` 的 **product 表**（CLI、daemon、setup 流程共用那张）。CLI 与 TUI 都读 product 表 → 一件事一种说法，不写两遍。
 

@@ -1481,6 +1481,30 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdCatalogRememberUsage => "[--topic <主题>] [--source <来源>] [--pin] [--ttl-days N] <要记住的话>".into(),
         Msg::CmdCatalogForget => "把记住的某句话删掉".into(),
         Msg::CmdCatalogForgetUsage => "<关键词> | --id <ID>".into(),
+        Msg::MigrationSkillActive => "已经生效：直接读取，无需迁移。".into(),
+        Msg::MigrationSkillRejected { reason } => format!("技能加载器拒绝了它：{reason}").into(),
+        Msg::MigrationSkillOverridden { name } => {
+            format!("已被覆盖：另一个目录里同名的「{name}」优先生效。").into()
+        }
+        Msg::MigrationUnreadableFile { reason } => format!("文件读取失败：{reason}").into(),
+        Msg::MigrationSkillDepthLimit => "分组目录层级超出上限".into(),
+        Msg::MigrationSkillSymlinkCycle => "检测到符号链接环".into(),
+        Msg::MigrationSkillMdNotAFile => "这里的 SKILL.md 不是普通文件，该技能无法加载。".into(),
+        Msg::MigrationSkillCopyable { target } => {
+            format!("尚未生效。复制到 {target} 就能搬过来。").into()
+        }
+        Msg::MigrationSkillNotInEffect => "没有生效，技能加载器也没有给出原因。".into(),
+        Msg::MigrationForeignUnparseable => {
+            "这个文件本身无法解析，即使复制过去也加载不了。".into()
+        }
+        Msg::MigrationBrokenLink => "这是一个断链：目标已经不存在，任何东西都无法加载它。".into(),
+        Msg::MigrationNotARegularFile => "这不是普通文件，无法作为技能加载。".into(),
+        Msg::MigrationNotADirectory => "这不是目录，无法在其中扫描技能。".into(),
+        Msg::MigrationReportDepthLimit => "扫描在此停止：分组目录层级超出上限".into(),
+        Msg::MigrationReportSymlinkCycle => "扫描在此停止：检测到符号链接环".into(),
+        Msg::MigrationReportEntryUnusable { reason } => {
+            format!("这个条目无法作为技能使用：{reason}").into()
+        }
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
