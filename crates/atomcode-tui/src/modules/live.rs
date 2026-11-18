@@ -460,13 +460,14 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 ///
 /// The order is what a person does with them: the clock answers "is it stuck",
 /// the two token counts answer "is it getting anywhere", the cache share answers
-/// "is the context being re-sent or re-read". Estimated generation throughput
-/// follows the authoritative token counts and cache share. On a
-/// narrow screen, the trailing figures are dropped whole.
+/// "is the context being re-sent or re-read". Decode speed sits between the
+/// token counts and the cache share. On a narrow screen, the trailing figures
+/// are dropped whole.
 ///
 /// Input is the latest context size; output and cache reuse cover the whole
-/// turn. Speed follows current generation and retains its last completed reading during tools and waits.
-/// Elapsed time includes waiting and tools; generation time does not.
+/// turn. Speed covers the turn's decode windows (first output to end of each
+/// request) and holds through tools and first-output waits. Elapsed time
+/// includes waiting and tools; speed does not.
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     // Compacting keeps the cumulative goal clock, or its own phase clock for
@@ -518,7 +519,7 @@ fn append_usage(out: &mut Vec<String>, state: &State, moment: &Moment) {
     };
     let mut figures = crate::content::usage_parts(input, output, cached);
     if moment.compacting_since.is_none() {
-        if let Some(rate) = moment.generation.rate(moment.now) {
+        if let Some(rate) = moment.generation.rate() {
             // usage_parts emits input, output, then optional cache share.
             let before_cache = usize::from(input > 0) + usize::from(output > 0);
             figures.insert(before_cache, t(Msg::LiveSpeed { rate }).into_owned());
@@ -1418,18 +1419,20 @@ mod tests {
             },
             Timestamp::millis(0),
         );
-        moment.generation.absorb(
-            &SessionEvent::AssistantChunk {
-                turn: 1,
-                round: 1,
-                delta: "a".repeat(400),
-                reasoning: true,
-            },
-            Timestamp::millis(10_000),
-        );
+        for at in [10_000, 12_000] {
+            moment.generation.absorb(
+                &SessionEvent::AssistantChunk {
+                    turn: 1,
+                    round: 1,
+                    delta: "a".repeat(800),
+                    reasoning: true,
+                },
+                Timestamp::millis(at),
+            );
+        }
         let line = line_at(&state, &moment, 180);
         assert!(
-            line.contains("↑ 150.7K · ↓ 20.1K · 8 tok/s · 缓存 96.49%"),
+            line.contains("↑ 150.7K · ↓ 20.1K · 100 tok/s · 缓存 96.49%"),
             "{line}"
         );
         assert!(!line.contains("均速"), "{line}");
@@ -1446,7 +1449,7 @@ mod tests {
                 round: 1,
                 usage: TokenUsage {
                     prompt: 100,
-                    completion: 200,
+                    completion: 400,
                     cached: 50,
                 },
             },
@@ -1463,9 +1466,9 @@ mod tests {
         moment.now = Timestamp::millis(120_000);
         let waiting = line_at(&state, &moment, 180);
         assert!(waiting.contains("正在等待模型"), "{waiting}");
-        assert!(waiting.contains("8 tok/s"), "{waiting}");
+        assert!(waiting.contains("100 tok/s"), "{waiting}");
         assert!(
-            waiting.find("8 tok/s").unwrap() < waiting.find("缓存").unwrap(),
+            waiting.find("100 tok/s").unwrap() < waiting.find("缓存").unwrap(),
             "{waiting}"
         );
         assert!(
