@@ -18,6 +18,7 @@
 
 mod claude;
 mod codex;
+mod opencode;
 mod provider;
 pub mod report;
 mod text;
@@ -124,7 +125,11 @@ pub trait MigrationSource: Send + Sync {
 
 /// The agents we know how to read.
 pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>> {
-    vec![Box::new(claude::ClaudeSource), Box::new(codex::CodexSource)]
+    vec![
+        Box::new(claude::ClaudeSource),
+        Box::new(codex::CodexSource),
+        Box::new(opencode::OpenCodeSource),
+    ]
 }
 
 /// Scan every source. A source that finds nothing contributes no rows.

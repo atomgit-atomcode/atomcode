@@ -5052,8 +5052,8 @@ Expected: FAIL —— `OpenCodeSource` 不存在。
 //! If supporting it needed a change in the shared `provider.rs`, the
 //! abstraction would be wrong — so the source-specific knowledge stays HERE.
 
-use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 use super::provider::{ApiKeyRef, ProviderAccountDraft};
+use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 use super::{MigrationSource, ScanContext, SkillTruth};
 
 pub struct OpenCodeSource;
@@ -5101,7 +5101,10 @@ impl MigrationSource for OpenCodeSource {
         // before offering a copy.
         for (scope, root) in [
             (AssetScope::User, ctx.os_home.join(".agents").join("skills")),
-            (AssetScope::Project, ctx.project.join(".agents").join("skills")),
+            (
+                AssetScope::Project,
+                ctx.project.join(".agents").join("skills"),
+            ),
         ] {
             out.extend(super::skill_rows(
                 AssetKind::Skills,
@@ -5112,8 +5115,14 @@ impl MigrationSource for OpenCodeSource {
             ));
         }
         for (scope, root) in [
-            (AssetScope::User, ctx.os_home.join(".agents").join("commands")),
-            (AssetScope::Project, ctx.project.join(".agents").join("commands")),
+            (
+                AssetScope::User,
+                ctx.os_home.join(".agents").join("commands"),
+            ),
+            (
+                AssetScope::Project,
+                ctx.project.join(".agents").join("commands"),
+            ),
         ] {
             out.extend(super::skill_rows(
                 AssetKind::Commands,
@@ -5153,7 +5162,8 @@ impl MigrationSource for OpenCodeSource {
     /// like Codex's. So it needs the person's confirmation before it is
     /// written.
     fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
-        let Some(value) = super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.json"))
+        let Some(value) =
+            super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.json"))
         else {
             return Vec::new();
         };
@@ -5178,9 +5188,7 @@ impl MigrationSource for OpenCodeSource {
             if base_url.is_none() && api_key.is_none() {
                 continue;
             }
-            let protocol = protocol_for_opencode(
-                provider.get("npm").and_then(|v| v.as_str()),
-            );
+            let protocol = protocol_for_opencode(provider.get("npm").and_then(|v| v.as_str()));
             out.push(ProviderAccountDraft {
                 id: super::provider::account_id_for(id).unwrap_or_else(|| id.clone()),
                 source_name: id.clone(),
@@ -5244,7 +5252,12 @@ fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
             Some(serde_json::Value::Array(items)) => {
                 let mut items = items.iter();
                 let first = items.next().and_then(|v| v.as_str()).map(str::to_string);
-                (first, items.filter_map(|v| v.as_str().map(str::to_string)).collect())
+                (
+                    first,
+                    items
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                )
             }
             _ => (None, Vec::new()),
         };
@@ -5268,13 +5281,169 @@ fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
             path: ctx.opencode_config_dir.join("opencode.jsonc"),
             scope: AssetScope::User,
             status: AssetStatus::Actionable,
-            detail: super::text::mcp_copyable(
-                1,
-                &ctx.product.user().join("mcp.json"),
-            ),
+            detail: super::text::mcp_copyable(1, &ctx.product.user().join("mcp.json")),
         });
     }
     out
+}
+
+/// The protocol for an OpenCode provider, from its `npm` package name.
+///
+/// **OpenCode does not say `wire_api`** — it says which AI SDK package it
+/// speaks through, and that is what determines the wire format.
+///
+/// **This lives HERE, not in the shared `provider.rs`.** The shared module
+/// knows the wire families; OpenCode knows how IT names one. A new source
+/// adds a function here, and the shared module stays untouched.
+fn protocol_for_opencode(npm: Option<&str>) -> String {
+    match npm {
+        Some("@ai-sdk/openai-compatible") => "openai-compatible".into(),
+        Some("@ai-sdk/anthropic") => "anthropic-compatible".into(),
+        Some("@ai-sdk/openai") => "openai-responses".into(),
+        Some(other) => super::provider::unsupported_protocol(&format!("opencode:{other}")),
+        None => "openai-compatible".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+
+    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
+        ScanContext {
+            os_home: home.to_path_buf(),
+            project: project.to_path_buf(),
+            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: home.join(".config/opencode"),
+            opencode_data_dir: home.join(".local/share/opencode"),
+        }
+    }
+
+    /// The registry's facts, loaded the way `scan()` loads them.
+    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
+        super::super::SkillTruth::load(&ctx(home, project))
+    }
+
+    /// A skill in OpenCode's own tree: same format as ours, so it can be
+    /// copied.
+    #[test]
+    fn an_opencode_skill_is_actionable_because_we_do_not_read_that_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let skill = home
+            .path()
+            .join(".config/opencode/skills/huawei-apig/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: huawei-apig\ndescription: x\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let assets = OpenCodeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills)
+            .expect("the skill is reported");
+        assert_eq!(row.status, AssetStatus::Actionable);
+    }
+
+    /// A shared `.agents/skills` skill is ALREADY ours — we read that tree
+    /// (`registry.rs:585`). The report must say so, not claim it is movable.
+    #[test]
+    fn a_shared_agents_skill_is_active_because_we_read_that_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let skill = home.path().join(".agents/skills/huawei-vpc/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: huawei-vpc\ndescription: x\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let assets = OpenCodeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Skills && a.name == "huawei-vpc")
+            .expect("the skill is reported");
+        assert_eq!(row.status, AssetStatus::Active);
+    }
+
+    /// The provider's credential is a LITERAL — like Claude's, unlike Codex's.
+    #[test]
+    fn an_opencode_provider_key_is_a_literal_not_a_reference() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"provider":{"atomgit":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://127.0.0.1:8001/v1","apiKey":"sk-literal"}}}}"#,
+        )
+        .unwrap();
+
+        let drafts = OpenCodeSource.provider_drafts(&ctx(home.path(), project.path()));
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].api_key,
+            Some(ApiKeyRef::Plaintext("sk-literal".into())),
+            "a literal, so it needs the person's confirmation"
+        );
+    }
+
+    /// The MCP `command` is an ARRAY — split into command + args.
+    #[test]
+    fn an_opencode_mcp_command_array_is_split_into_command_and_args() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config = home.path().join(".config/opencode/opencode.jsonc");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "{\n  // a comment, because this file is jsonc\n  \"mcp\":{\"x\":{\"type\":\"local\",\"command\":[\"node\",\"/tmp/s.mjs\"],\"enabled\":true}}\n}",
+        )
+        .unwrap();
+
+        let assets = OpenCodeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::McpServers)
+            .expect("the server is reported");
+        assert_eq!(row.status, AssetStatus::Actionable);
+    }
+
+    /// `auth.json` holds PLAINTEXT keys. We report that they are there and
+    /// never offer to move them.
+    #[test]
+    fn the_auth_file_is_reported_but_never_offered_for_import() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let auth = home.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, r#"{"deepseek":{"type":"api","key":"sk-x"}}"#).unwrap();
+
+        let assets = OpenCodeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let row = assets
+            .iter()
+            .find(|a| a.kind == AssetKind::ProviderConfig)
+            .expect("the credentials are reported");
+        assert_eq!(row.status, AssetStatus::Blocked);
+    }
 }
 ```
 
