@@ -1168,6 +1168,12 @@ fn error_type(err: &serde_json::Value) -> Option<String> {
 /// (and same rationale) as `openai_compat`'s `MAX_TOOL_CALLS`.
 const MAX_BLOCKS: usize = 256;
 
+/// Upper bound on one SSE line, and on the unterminated tail kept between
+/// chunks. Same defensive limit as `openai_compat::MAX_SSE_LINE_BYTES`: an
+/// endpoint that never sends `\n` must not grow [`AnthropicSseDecoder::buf`]
+/// until the process is OOM-killed.
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// In-flight state for one content block (by index).
 #[derive(Default)]
 struct BlockState {
@@ -1201,6 +1207,9 @@ struct AnthropicSseDecoder {
     /// `message_stop`. After this a trailing transport EOF is benign.
     seen_stop: bool,
     response_id_seen: bool,
+    /// Largest one line (or its unterminated tail) may grow before the decoder
+    /// refuses the stream. See [`MAX_SSE_LINE_BYTES`].
+    max_line_bytes: usize,
 }
 
 impl AnthropicSseDecoder {
@@ -1217,24 +1226,100 @@ impl AnthropicSseDecoder {
             done: false,
             seen_stop: false,
             response_id_seen: false,
+            max_line_bytes: MAX_SSE_LINE_BYTES,
         }
     }
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
     /// across arbitrary chunk boundaries (UTF-8 is only decoded on whole lines).
+    ///
+    /// Framing is linear in received bytes, including lines fragmented across
+    /// chunks: only new bytes are scanned, and a complete line already in the
+    /// chunk is borrowed instead of copied into `buf`.
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let raw: Vec<u8> = self.buf.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&raw);
-            let text = text.trim_end_matches('\n').trim_end_matches('\r');
-            self.process_line(text, &mut out);
-            if self.done {
-                break;
-            }
+        if self.done {
+            return out;
         }
+        let mut start = 0;
+        while let Some(offset) = chunk[start..].iter().position(|&b| b == b'\n') {
+            let end = start + offset;
+            let part = &chunk[start..end];
+            // Check before appending, so an oversized chunk is never copied
+            // into the line buffer just to be rejected afterwards.
+            if part.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+                out.extend(self.line_too_large());
+                return out;
+            }
+            if self.buf.is_empty() {
+                let text = String::from_utf8_lossy(part);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+            } else {
+                self.buf.extend_from_slice(part);
+                let mut line = std::mem::take(&mut self.buf);
+                let text = String::from_utf8_lossy(&line);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+                line.clear();
+                if !self.done {
+                    // Reuse storage for the next fragmented line.
+                    self.buf = line;
+                }
+            }
+            if self.done {
+                self.buf = Vec::new();
+                return out;
+            }
+            start = end + 1;
+        }
+        let rest = &chunk[start..];
+        if rest.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+            out.extend(self.line_too_large());
+            return out;
+        }
+        self.buf.extend_from_slice(rest);
         out
+    }
+
+    /// Refuse a line the provider never terminated (or sent longer than the
+    /// cap) instead of growing `buf` without bound. The stream is terminal:
+    /// there is no safe point to resume a line whose start was dropped.
+    fn line_too_large(&mut self) -> Vec<StreamEvent> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        self.buf = Vec::new();
+        // Never silently dropped: a refused line is traced so a provider that
+        // batched its SSE stays distinguishable from a transport truncation.
+        tracing::warn!(
+            error_origin = "sse_line_too_large",
+            "provider stream diagnostic"
+        );
+        let mut out = Vec::new();
+        // A failed response still consumed the usage the provider reported.
+        if self.has_usage() {
+            out.push(StreamEvent::Usage(self.usage()));
+        }
+        out.push(StreamEvent::Error(ProviderError {
+            retryable: false,
+            message: format!(
+                "provider stream line exceeded the {}-byte limit; the response was \
+                 refused instead of buffering it without bound",
+                self.max_line_bytes
+            ),
+            http_status: None,
+            code: Some("sse_line_too_large".into()),
+            retry_after_secs: None,
+        }));
+        out
+    }
+
+    /// Test-only override for the line cap, so the boundary can be exercised
+    /// without allocating a production-sized (16 MiB) line.
+    #[cfg(test)]
+    fn with_line_cap(mut self, cap: usize) -> Self {
+        self.max_line_bytes = cap;
+        self
     }
 
     /// True once a `stop_reason` has arrived (see `seen_stop`). After this a
@@ -1249,7 +1334,9 @@ impl AnthropicSseDecoder {
         if self.done {
             return out;
         }
-        if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
+        // `feed` keeps the tail at or below `max_line_bytes`, and a tail above
+        // it was refused there, so there is nothing left to reject here.
+        if self.has_usage() {
             out.push(StreamEvent::Usage(self.usage()));
         }
         out.push(StreamEvent::Done {
@@ -1261,6 +1348,18 @@ impl AnthropicSseDecoder {
 
     fn cached_total(&self) -> u32 {
         self.cache_read
+    }
+
+    /// True when the provider reported any usage worth delivering. `usage()`
+    /// folds `cache_creation` into `prompt`, so a check that looks only at
+    /// `input_tokens`, `output_tokens`, and `cache_read` drops a response whose
+    /// whole prompt was a cache write. Both the refused-line and EOF paths use
+    /// this, so they keep the same rule.
+    fn has_usage(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cached_total() > 0
+            || self.cache_creation > 0
     }
 
     fn usage(&self) -> TokenUsage {
@@ -2994,6 +3093,188 @@ mod tests {
         // stream EOF without message_stop → finish() flushes a Done.
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
+    }
+
+    // ---- line cap (untrusted provider input) ----
+
+    #[test]
+    fn sse_complete_line_over_cap_is_refused() {
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        let mut chunk = vec![b'x'; 33];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        // The stream is terminal: no Done, and later chunks are ignored.
+        assert!(d.finish().is_empty());
+        assert!(d.feed(b"data: {}\n").is_empty());
+    }
+
+    #[test]
+    fn sse_unterminated_line_over_cap_is_refused() {
+        // A provider that never sends '\n' must not grow the tail forever.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        assert!(d.feed(b"data: {").is_empty());
+        let mut ev = Vec::new();
+        for _ in 0..4 {
+            ev.extend(d.feed(&[b'x'; 10]));
+        }
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn sse_fragmented_line_over_cap_is_refused() {
+        // The cap covers the WHOLE line: a tail already held in `buf` plus this
+        // chunk is refused even though this chunk alone stays under the cap.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        assert!(d.feed(&[b'x'; 20]).is_empty());
+        let mut chunk = vec![b'x'; 20];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        assert!(d.finish().is_empty());
+    }
+
+    #[test]
+    fn sse_line_exactly_at_cap_is_accepted() {
+        // The check refuses a line LONGER than the cap, not one equal to it.
+        // Cover both sides of the boundary: a whole line that is exactly the
+        // cap, and a held tail that fills the cap before its newline arrives.
+        let body = format!(
+            "data: {}",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}})
+        );
+        let cap = body.len();
+
+        // Whole line in one chunk: `part.len() == cap`, `buf` empty.
+        let mut whole = AnthropicSseDecoder::new().with_line_cap(cap);
+        let ev = whole.feed(format!("{body}\n").as_bytes());
+        assert!(
+            matches!(ev.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{ev:?}"
+        );
+
+        // Tail fills the cap exactly (`rest.len() == cap`), then its newline
+        // completes the line from a full buffer.
+        let mut split = AnthropicSseDecoder::new().with_line_cap(cap);
+        assert!(split.feed(body.as_bytes()).is_empty());
+        let ev = split.feed(b"\n");
+        assert!(
+            matches!(ev.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn sse_line_over_cap_still_reports_usage() {
+        let mut d = AnthropicSseDecoder::new().with_line_cap(128);
+        let start = line(
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":7}}}),
+        );
+        assert!(start.len() < 128);
+        d.feed(start.as_bytes());
+        let ev = d.feed(&[b'x'; 129]);
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 7),
+            "{ev:?}"
+        );
+        assert!(matches!(ev.last(), Some(StreamEvent::Error(_))), "{ev:?}");
+    }
+
+    #[test]
+    fn sse_line_over_cap_reports_cache_creation_only_usage() {
+        // A fully cached prompt can report only `cache_creation_input_tokens`:
+        // input, output, and cache_read all stay zero. The refused stream still
+        // consumed those tokens, so the usage must survive the refusal.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(128);
+        let start = line(
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":9}}}),
+        );
+        assert!(start.len() < 128);
+        d.feed(start.as_bytes());
+        let ev = d.feed(&[b'x'; 129]);
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 9),
+            "{ev:?}"
+        );
+        assert!(matches!(ev.last(), Some(StreamEvent::Error(_))), "{ev:?}");
+    }
+
+    #[test]
+    fn sse_finish_reports_cache_creation_only_usage() {
+        // The EOF path shares the rule with the refused-line path.
+        let mut d = AnthropicSseDecoder::new();
+        d.feed(
+            line(
+                "message_start",
+                json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":9}}}),
+            )
+            .as_bytes(),
+        );
+        let ev = d.finish();
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 9),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn sse_small_cap_keeps_fragmented_and_multi_line_chunks() {
+        let one = line(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}),
+        );
+        let two = line(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}),
+        );
+        let payload = [one.as_bytes(), two.as_bytes()].concat();
+        let texts = |ev: &[StreamEvent]| -> Vec<String> {
+            ev.iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let cap = one.len() + two.len();
+        let start = line(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+
+        // One chunk, two lines: ordered.
+        let mut whole = AnthropicSseDecoder::new().with_line_cap(cap);
+        whole.feed(start.as_bytes());
+        let ev = whole.feed(&payload);
+        // Fragmented across chunks: same events.
+        let mut split = AnthropicSseDecoder::new().with_line_cap(cap);
+        split.feed(start.as_bytes());
+        let mut split_ev = Vec::new();
+        for chunk in payload.chunks(7) {
+            split_ev.extend(split.feed(chunk));
+        }
+        assert_eq!(texts(&ev), vec!["a", "b"]);
+        assert_eq!(format!("{ev:?}"), format!("{split_ev:?}"));
     }
 
     // ---- mid-stream re-open (v1 parity) ----
