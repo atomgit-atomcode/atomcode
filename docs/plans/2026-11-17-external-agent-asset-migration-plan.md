@@ -30,6 +30,47 @@
 
 **依赖顺序是硬的**：P4 依赖 P3（屏幕显示的正是 CLI 那份报告），P6 依赖 P5（写入的对象正是草案），P7 依赖全部。
 
+### 落地难度与工作量评估
+
+开工前先读这一节。数字是**从本计划文本量出来的**，不是估的。
+
+| Task | 步骤 | 代码行 | 判据 | 改动文件 | 难度 |
+|---|---|---|---|---|---|
+| 1 capabilities 骨架 | 7 | 287 | 3 | 4（2 新建） | 低 — 纯新模块，无外部依赖 |
+| 2 Claude 来源 | 7 | **1106** | 11 | 1 | **高** — 最大的一个，8 类资产 × 4 个真加载器 |
+| 3 Codex 来源 | 6 | 343 | 5 | 4 | 中 — TOML 解析 + 递归合并 |
+| 4 CLI 子命令 | 9 | 422 | 5 | 4（1 新建） | 中 — 接 clap + 渲染 |
+| 5 TUI `/import` | 10 | 256 | 2 | 11（2 新建） | 中 — 改动面最广，但每处都小 |
+| 6 provider 映射 | 5 | 434 | 8 | 5 | 中高 — 动到 `atomcode-config` 与 `atomcode-coding` |
+| 7 写入 config.toml | 8 | 250 | 8 | 3 | 中 — 代码量最小，**安全要求最高** |
+| 8 门与验收 | 6 | 0 | 0 | 0 | 低 — 跑门 |
+| **合计** | **58** | **3098** | **42** | **约 20 文件 / 6 crate** | |
+
+**规模判断**：约 3100 行 Rust、42 条判据、20 个文件、6 个 crate（capabilities / coding / config / cli / tui / i18n）。另有 41 条新 i18n 词条、约 72 个新公开项。**这是一次中等规模的功能，不是大改** —— 但也不是「照着抄一遍」。
+
+**难度不在代码量，在这三处**：
+
+1. **Task 2 是风险集中点。** 它的 1106 行里，最难的不是「找到文件」，而是**判定「到底生不生效」** —— 指令要看 `load_instructions` 的四个状态（`Loaded` / `Empty` / `Unreadable` / `Shadowed`），技能要看 `SkillRegistry` 的加载与诊断，MCP 要看 `parse_mcp_servers`，权限要看 `PermissionRules::parse`。**每一条判定都必须复用真加载器**，自己写一份就等于埋一个「说生效、其实不生效」的错。
+2. **计划里的代码从未编译过。** 六轮复审修的是**计划文本**的编译错误 —— 每一轮都找出新的（游离字段赋值、`continue` 出循环、`Option` 收集类型、括号不匹配）。**文本对了不等于代码对**：实施时应当预期还会遇到同类编译错误，按「先让这一段过编译门，再往下写」的节奏走。
+3. **共享 crate 的并发改动。** Task 6 要改 `atomcode-config/src/provider_book.rs` 与 `atomcode-coding/src/parts.rs` —— 而当前工作区里 `atomcode-kernel`、`atomcode-coding`、`atomcode-harness`、`atomcode-capabilities`、`atomcode-config`、`atomcode-cli` **都在被别人改**。落地前必须重新核对 `git status`，并按任务粒度提交，别把别人的改动卷进来（这条路我已经走过一次并出过事故，见「交接模板」里的提醒）。
+
+**成本可预期的地方**：
+
+- **不新增传递依赖。** `migration` feature 要的 `instructions` / `mcp` / `skills` / `tools` / `atomcode-config` / `atomcode-i18n` / `toml` 全都是 `atomcode-capabilities` **已有的 optional 依赖**；CLI 已启 `mcp`，TUI 经 `session`/`harness` 已启 `instructions` / `mcp` / `skills` / `tools`。所以**前端的依赖图不变**。
+- **`Cargo.lock` 不该变。** 上面那些包都已在 lock 里。AGENTS.md 的污染判据（`hkdf` / `hmac` / `zeroize_derive` 三个 package 名为 0）当前是 0，实现后要复查仍是 0。
+- **门禁不会被新代码触发红。** `gates/tui-i18n.sh` 的基线是 `hardcoded_cjk=3`（TUI/CLI 源码里不许有中文字面量 —— 本计划把所有文案都放在 i18n product 表，所以不增加）；`gates/tui-test-count.sh` 的基线 1976 是**棘轮**（只能升不能降），本任务只加判据；`gates/layers.sh` 禁的是 `atomcode-tui → atomcode-coding / atomcode`，而 capabilities→config 是**既有**的边，不新增违规。
+- **`cargo-nextest` 已装**（0.9.149），AGENTS.md 要求的 runner 可用。
+
+**按 AGENTS.md 的分工估**：Claude Code 只写实现（每个 Task 一次委派，给完整交接），Codex 写测试与跑门、返修复意见。**8 个 Task 就是 8 轮「实现 → 测试 → 审查 → 修复」**，不是一次写完。按每轮 1–2 小时的量级，**整轮走完大致是 1–2 个工作日**；其中 Task 2 与 Task 6 各可能多花一轮（前者判定逻辑多，后者要动共享 crate）。
+
+**建议的开工顺序**（与依赖顺序一致，但有两处提前）：
+
+1. **先 Task 1**，它把模块骨架与四态类型立起来 —— 后面的每个 Task 都在它上面长。
+2. **Task 6 提前到 Task 3 之后**：它要改 `atomcode-config` 与 `atomcode-coding` 这两个共享 crate，而这两个 crate 现在正被别人改。**越早动，越早知道会不会撞**；撞上了还能改方案，晚了就是返工。
+3. **Task 2 单独一轮**，不要与别的 Task 混 —— 它最重，混在一起出问题时说不清是谁的。
+4. **Task 7 单独一轮**：代码量最小但安全要求最高（凭据逐项确认、明文不落盘、id 冲突不覆盖）。它值得一次专注的审查，而不是顺手写完。
+
+
 **不属于本期，说明原因：**
 
 - **会话历史转换**（第三期）—— 信息有损，且需要 kernel event 格式的写入契约；本期只在报告里计数并标 `Blocked`。
@@ -3692,6 +3733,14 @@ pub struct DiskMigration {
     home: PathBuf,
     project: PathBuf,
     product: atomcode_capabilities::ProductDirs,
+    /// The skill roots the RUNTIME uses, resolved by the host.
+    ///
+    /// **The host must supply them**: the screen cannot resolve them itself —
+    /// it may not depend on `atomcode-coding` (the layering gate forbids it),
+    /// and the resolution rule lives there. An empty list would fall back to
+    /// the standard list, and then the screen would disagree with the CLI
+    /// about which same-named skill wins.
+    skill_dirs: Vec<PathBuf>,
     /// Where OUR configuration lives — the screen's re-check compares against
     /// it, so an account that was imported shows as "already imported" in the
     /// screen too, not just in the CLI.
@@ -3704,12 +3753,14 @@ impl DiskMigration {
         project: PathBuf,
         product: atomcode_capabilities::ProductDirs,
         config_path: PathBuf,
+        skill_dirs: Vec<PathBuf>,
     ) -> Self {
         Self {
             home,
             project,
             product,
             config_path,
+            skill_dirs,
         }
     }
 }
@@ -3721,7 +3772,7 @@ impl Migration for DiskMigration {
             os_home: self.home.clone(),
             project: self.project.clone(),
             product: self.product.clone(),
-            skill_dirs: Vec::new(),
+            skill_dirs: self.skill_dirs.clone(),
         };
         let sources = atomcode_capabilities::migration::builtin_sources();
         let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
@@ -3772,7 +3823,27 @@ impl Migration for DiskMigration {
 
 - [ ] **Step 7: 装配端口**
 
-`crates/atomcode-cli/src/lib.rs` 的 `launch::Ports { ... }` 加一项：
+`crates/atomcode-cli/src/lib.rs` 的 `launch::Ports { ... }` 加一项。
+
+**先算出技能根**（就在 `launch::Ports` 之前，`config` 还在手上时）：
+
+```rust
+        // The skill roots the RUNTIME uses. The screen may not depend on
+        // `atomcode-coding` (the layering gate forbids it), so the HOST
+        // resolves them and hands them over — the same list the CLI's own
+        // report uses, so the two front ends agree about which same-named
+        // skill wins.
+        let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
+            &config.extra_skill_dirs,
+            &working_dir,
+            &dirs,
+            dirs::home_dir().as_deref(),
+            None,
+        )
+        .0;
+```
+
+然后加一项：
 
 ```rust
                 migration: Some(Arc::new(crate::tui_migration::DiskMigration::new(
@@ -3780,6 +3851,7 @@ impl Migration for DiskMigration {
                     working_dir.clone(),
                     dirs.clone(),
                     config_path.clone(),
+                    skill_dirs.clone(),
                 ))),
 ```
 
