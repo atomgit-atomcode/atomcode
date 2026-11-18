@@ -1656,21 +1656,43 @@ pub struct RateLimitPause {
     pub server_message: Option<String>,
 }
 
+/// The head/tail preview budgets for oversized stubbed tool results: the head
+/// carries what ran, the tail carries how it ended (exit codes, error
+/// diagnostics), and the omission marker accounts for the cut middle — the
+/// dsh-context-guard balanced policy (head 1792 / tail 448 ≈ 2.3K chars).
+const STUB_PREVIEW_HEAD: usize = 1_792;
+const STUB_PREVIEW_TAIL: usize = 448;
+
 /// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]`. For a bash
 /// result whose first line is the `[elapsed: …]` metadata prefix, the SECOND line is used
 /// so `first:` surfaces real output, not the exit-code banner.
+///
+/// Oversized results (over head+tail) instead keep a bounded head + tail
+/// preview with the omission marker: the replayed middle is the bulk of the
+/// stub cost, while the head/tail retain what ran and how it ended.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let line_count = output.lines().count();
-    let first_line: String = {
-        let mut iter = output.lines();
-        let l1 = iter.next().unwrap_or("(empty)");
-        let chosen = if l1.starts_with("[elapsed:") {
-            iter.next().unwrap_or(l1)
-        } else {
-            l1
-        };
-        chosen.chars().take(80).collect()
-    };
     let status = if success { "ok" } else { "FAILED" };
-    format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]")
+    let chars: Vec<char> = output.chars().collect();
+    let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL;
+    if chars.len() <= budget {
+        let first_line: String = {
+            let mut iter = output.lines();
+            let l1 = iter.next().unwrap_or("(empty)");
+            let chosen = if l1.starts_with("[elapsed:") {
+                iter.next().unwrap_or(l1)
+            } else {
+                l1
+            };
+            chosen.chars().take(80).collect()
+        };
+        return format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]");
+    }
+    // The oversized output keeps a bounded head (what ran) and tail (how it
+    // ended — exit codes, error diagnostics) so the exit diagnostics survive
+    // the cut, while the replayed middle is the bulk of the stub savings.
+    let head: String = chars[..STUB_PREVIEW_HEAD].iter().collect();
+    let tail: String = chars[chars.len() - STUB_PREVIEW_TAIL..].iter().collect();
+    let omitted = chars.len() - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
+    format!("[{tool_name} {status}: {line_count} lines, head: {head} … [omitted {omitted} chars] … {tail}]")
 }

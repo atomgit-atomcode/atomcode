@@ -1887,6 +1887,27 @@ mod tests {
     }
 
     #[test]
+    fn stub_of_oversized_output_keeps_head_tail_and_omission_marker() {
+        // The oversized result keeps a bounded head (what ran) and tail (how
+        // it ended) with the omission marker — measured on the real corpus:
+        // 22K tool results × 2.2KB avg, where the replayed middle is the bulk
+        // of the per-round stub cost.
+        let output = format!("{}TAIL-MARKER exit: 0", "x".repeat(3_000));
+        let stub = build_compact_stub("bash", &output, true);
+        assert!(stub.starts_with("[bash ok: 1 lines, head: "), "{}", stub);
+        assert!(
+            stub.contains("TAIL-MARKER exit: 0]"),
+            "the tail rides the preview: {}",
+            stub
+        );
+        assert!(
+            stub.contains("[omitted "),
+            "the omission marker accounts for the cut middle: {}",
+            stub
+        );
+    }
+
+    #[test]
     fn stub_format_matches_core() {
         assert_eq!(
             build_compact_stub("bash", "line1\nline2\nline3", true),
