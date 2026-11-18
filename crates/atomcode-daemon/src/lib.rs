@@ -3024,7 +3024,7 @@ fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TurnTimestamp {
     started_at: Option<u64>,
-    completed_at: u64,
+    completed_at: Option<u64>,
 }
 
 pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, TurnTimestamp>;
@@ -3040,9 +3040,10 @@ fn load_turn_timestamps_blocking(project_hash: &str, session_id: &str) -> TurnTi
         Ok(timestamps) => timestamps
             .into_iter()
             .filter_map(|(turn_id, timestamp)| {
-                let completed_at = u64::try_from(timestamp.completed_at)
-                    .ok()
-                    .filter(|timestamp| *timestamp > 0)?;
+                let completed_at = timestamp
+                    .completed_at
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|timestamp| *timestamp > 0);
                 let started_at = timestamp
                     .started_at
                     .and_then(|value| u64::try_from(value).ok())
@@ -3107,11 +3108,33 @@ fn snapshot_message_timestamp(
         .filter(|turn_id| *turn_id != 0);
     let timestamp = direct_turn_id
         .or(positional_turn_id)
+        .or_else(|| {
+            // A new human message has no round meta and the current TurnStat is
+            // not committed yet. Only associate it with a unique open log turn
+            // beyond the valid completed prefix; never infer from wall time.
+            if message.role != atomcode_kernel::message::Role::User
+                || meta.turn_stats.iter().any(|stat| !stat.position_valid)
+                || index
+                    < meta
+                        .turn_stats
+                        .iter()
+                        .map(|stat| stat.after_message)
+                        .max()
+                        .unwrap_or(0)
+            {
+                return None;
+            }
+            let mut open = turn_timestamps
+                .iter()
+                .filter(|(_, time)| time.started_at.is_some() && time.completed_at.is_none());
+            let (turn, _) = open.next()?;
+            open.next().is_none().then_some(*turn)
+        })
         .and_then(|turn_id| turn_timestamps.get(&turn_id).copied())?;
     Some(match message.role {
         atomcode_kernel::message::Role::User => timestamp.started_at?,
         atomcode_kernel::message::Role::Assistant | atomcode_kernel::message::Role::Tool => {
-            timestamp.completed_at
+            return timestamp.completed_at;
         }
         atomcode_kernel::message::Role::System => return None,
     })
@@ -3309,7 +3332,7 @@ fn merge_catalog_session_messages_for_display(
                     DisplayAnchor::AtStart => None,
                     DisplayAnchor::AfterTurn { turn_id } => turn_timestamps
                         .get(&turn_id)
-                        .map(|timestamp| timestamp.completed_at),
+                        .and_then(|timestamp| timestamp.completed_at),
                 },
             });
         }
@@ -3376,7 +3399,7 @@ fn merge_catalog_session_messages_for_display(
                     DisplayAnchor::AtStart => None,
                     DisplayAnchor::AfterTurn { turn_id } => turn_timestamps
                         .get(&turn_id)
-                        .map(|timestamp| timestamp.completed_at),
+                        .and_then(|timestamp| timestamp.completed_at),
                 },
             });
         }
@@ -8898,7 +8921,7 @@ mod tests {
             model_usage: Vec::new(),
         };
         meta.turn_stats = vec![stat(1, 2), stat(2, 4)];
-        let session = crate::legacy_convert::CatalogSessionView {
+        let mut session = crate::legacy_convert::CatalogSessionView {
             snapshot: SessionSnapshot::new(vec![
                 Message::user("first"),
                 Message::assistant("one", vec![]),
@@ -8913,14 +8936,14 @@ mod tests {
                 1,
                 TurnTimestamp {
                     started_at: Some(1_699_999_990_000),
-                    completed_at: 1_700_000_000_000,
+                    completed_at: Some(1_700_000_000_000),
                 },
             ),
             (
                 2,
                 TurnTimestamp {
                     started_at: Some(1_700_000_090_000),
-                    completed_at: 1_700_000_100_000,
+                    completed_at: Some(1_700_000_100_000),
                 },
             ),
         ]);
@@ -8948,6 +8971,43 @@ mod tests {
         assert_eq!(displayed[1].created_at, Some(1_700_000_000_000));
         assert_eq!(displayed[2].created_at, Some(1_700_000_090_000));
         assert_eq!(displayed[3].created_at, Some(1_700_000_100_000));
+        // The same projection serves HTTP browsing and live snapshots. An open
+        // turn keeps its real start clock, never a fabricated completion clock.
+        let mut running = timestamps.clone();
+        running.get_mut(&2).unwrap().completed_at = None;
+        session.meta.turn_stats.pop(); // Current human input has no completed TurnStat yet.
+        attach_snapshot_message_timestamps(
+            &mut live_messages,
+            &session.snapshot,
+            &session.meta,
+            &running,
+        );
+        assert_eq!(live_messages[2].created_at, Some(1_700_000_090_000));
+        assert_eq!(live_messages[3].created_at, None);
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &running, None).unwrap();
+        assert_eq!(displayed[1].created_at, Some(1_700_000_000_000));
+        assert_eq!(displayed[2].created_at, Some(1_700_000_090_000));
+        assert_eq!(displayed[3].created_at, None);
+        running.insert(
+            3,
+            TurnTimestamp {
+                started_at: Some(1_700_000_095_000),
+                completed_at: None,
+            },
+        );
+        assert_eq!(
+            snapshot_message_timestamp(&session.meta, &session.snapshot.messages[2], 2, &running),
+            None,
+            "ambiguous open turns must not manufacture a start clock"
+        );
+        running.remove(&3);
+        session.meta.turn_stats[0].position_valid = false;
+        assert_eq!(
+            snapshot_message_timestamp(&session.meta, &session.snapshot.messages[2], 2, &running),
+            None,
+            "a rewritten positional prefix is not a reliable clock boundary"
+        );
     }
 
     #[test]

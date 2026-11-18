@@ -4259,7 +4259,7 @@ impl SessionManager {
                 record.turn_id,
                 TurnTimestamp {
                     started_at: record.started_at,
-                    completed_at: record.ts,
+                    completed_at: Some(record.ts),
                 },
             );
             Ok(())
@@ -6112,9 +6112,9 @@ mod tests {
         let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
         assert_eq!(timestamps.len(), 2);
         assert_eq!(timestamps[&7].started_at, Some(1_700_000_000_000));
-        assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
+        assert_eq!(timestamps[&7].completed_at, Some(1_700_000_000_123));
         assert_eq!(timestamps[&8].started_at, None);
-        assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
+        assert_eq!(timestamps[&8].completed_at, Some(1_700_000_001_123));
     }
 
     #[test]

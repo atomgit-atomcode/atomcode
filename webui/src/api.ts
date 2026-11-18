@@ -328,8 +328,9 @@ export interface SessionMessage {
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
   images?: ImageData[];
-  /** Epoch ms for the message's completed turn. Older sessions without a native
-   *  transcript omit it; the UI must not replace it with the current wall clock. */
+  /** Epoch ms: a user's real turn start, or an assistant/tool's real completion.
+   *  In-progress replies and older sessions may omit it; never replace it with
+   *  the browser's current wall clock. */
   created_at?: number;
 }
 

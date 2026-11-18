@@ -14,6 +14,8 @@ import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
 import { processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
+import { BrowseActivityStatus } from './BrowseActivityStatus';
+import { browseActiveTurn } from '../lib/browseTurn';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
 import { groupedTimelinePage } from '../lib/groupedTimeline.ts';
@@ -4496,8 +4498,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     return withInteraction(<>
       <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession}
         live={held === 'running' || held === 'waiting'}
-        renderMessages={(raw, viewport) => <BrowseMessagesView messages={sessionMessagesToDisplay(raw, false)}
-          sessionId={browseSession.id} viewport={viewport} />} />
+        renderMessages={(raw, viewport, executing) => <BrowseMessagesView messages={sessionMessagesToDisplay(raw, false)}
+          sessionId={browseSession.id} viewport={viewport} executing={executing}
+          activity={held === 'waiting' ? 'waiting' : held === 'running' ? 'running' : 'syncing'} />} />
       <div class="input-container session-browse-composer">
         <div class="session-browse-notice session-browse-card" role="status">
           <svg class="session-browse-lock" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -4945,14 +4948,16 @@ function TodoProgressPanel({ items, projectHash, sessionId, sourceRevision }: { 
 }
 
 /** Display history with the live message components, without projecting runtime state. */
-function BrowseMessagesView({ messages, sessionId, viewport }: {
+function BrowseMessagesView({ messages, sessionId, viewport, executing, activity }: {
   messages: Message[]; sessionId: string; viewport: () => HTMLElement | null;
+  executing: boolean; activity: 'running' | 'waiting' | 'syncing';
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [active, setActive] = useState(0);
   const refs = useRef<(HTMLElement | null)[]>([]);
   const turns = deriveTurnNavigation(messages);
-  const processes = turnProcesses(messages);
+  const processes = turnProcesses(messages, executing);
+  const current = browseActiveTurn(messages, executing);
   const ends = assistantTurnEndFlags(messages.map(message => message.role));
   const artifacts = artifactsByAssistantIndex(messages);
   const polls = groupEmptyPolls(messages);
@@ -4998,7 +5003,7 @@ function BrowseMessagesView({ messages, sessionId, viewport }: {
       if (folded && process && index !== process.last) return <Fragment key={key}>{toggle}</Fragment>;
       const display = folded && process ? { ...msg, parts: process.finalParts } : msg;
       return <Fragment key={key}>{toggle}<AssistantMessageView msg={display}
-        isLast={index === messages.length - 1} busy={false} lastIdx={messages.length - 1}
+        isLast={index === messages.length - 1 || index === current.assistant} busy={executing} lastIdx={messages.length - 1}
         isLastInTurn={ends[index]} copyText={() => {
           const turn = turns.find(turn => index >= turn.messageIndex && index <= turn.endIndex);
           return Promise.resolve(messages.slice(turn ? turn.messageIndex + 1 : index, index + 1)
@@ -5006,7 +5011,8 @@ function BrowseMessagesView({ messages, sessionId, viewport }: {
         }} artifacts={artifacts.get(index) ?? []} sessionId={sessionId} searchRef={ref}
         timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} pollGroups={polls} /></Fragment>;
     })}
-    {host && createPortal(<TurnNavRail items={turns} activeIndex={active} streaming={false}
+    {executing && <BrowseActivityStatus state={activity} startedAt={current.startedAt} />}
+    {host && createPortal(<TurnNavRail items={turns} activeIndex={active} streaming={executing}
       onNavigate={index => {
         const el = viewport(); const node = refs.current[index];
         if (el && node) el.scrollTo({ top: el.scrollTop + node.getBoundingClientRect().top - el.getBoundingClientRect().top - 20 });

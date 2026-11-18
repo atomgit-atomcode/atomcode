@@ -13,7 +13,7 @@ const LIVE_REFRESH_MS = 3_000;
  *  so the view follows the log that runtime is writing. */
 export function SessionBrowse({ session, renderMessages, live = false }: {
   session: SessionMetaWithProject;
-  renderMessages: (messages: SessionMessage[], viewport: () => HTMLDivElement | null) => ComponentChildren;
+  renderMessages: (messages: SessionMessage[], viewport: () => HTMLDivElement | null, unsettled: boolean) => ComponentChildren;
   live?: boolean;
 }) {
   const t = useT();
@@ -22,6 +22,8 @@ export function SessionBrowse({ session, renderMessages, live = false }: {
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [retry, setRetry] = useState(0);
+  // Do not render a completed footer against the last pre-terminal page.
+  const [unsettled, setUnsettled] = useState(live);
   const reader = useRef<AbortController | null>(null);
   const loadingRef = useRef(false);
   const lastScroll = useRef(0);
@@ -53,6 +55,7 @@ export function SessionBrowse({ session, renderMessages, live = false }: {
   useEffect(() => {
     if (!session.project_hash) return;
     const hash = session.project_hash;
+    if (live) setUnsettled(true);
     if (!live && wasLive.current) finalRefreshPending.current = true;
     wasLive.current = live;
     const ready = () => {
@@ -67,6 +70,7 @@ export function SessionBrowse({ session, renderMessages, live = false }: {
       read: signal => getSessionPage(hash, session.id, signal),
       apply: detail => {
         finalRefreshPending.current = false;
+        setUnsettled(live);
         const el = viewport.current;
         const atBottom = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         const text = JSON.stringify(detail.messages);
@@ -123,6 +127,6 @@ export function SessionBrowse({ session, renderMessages, live = false }: {
   }}><div class="timeline-inner">
     {older && <button class="history-load-more" disabled={loading} onClick={() => void loadOlder()}>{loading ? '…' : t('chat.loadEarlierHistory')}</button>}
     {failed && <div role="alert">{t('chat.historyFailed')}<button onClick={() => older ? void loadOlder() : setRetry(n => n + 1)}>{t('chat.historyRetry')}</button></div>}
-    {messages === null ? !failed && <div role="status">{t('chat.historyLoading')}</div> : renderMessages(messages, () => viewport.current)}
+    {messages === null ? !failed && <div role="status">{t('chat.historyLoading')}</div> : renderMessages(messages, () => viewport.current, live || unsettled)}
   </div></div>;
 }

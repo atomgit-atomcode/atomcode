@@ -19,6 +19,8 @@ let onHeldRequest;
 let heldActivity='running';
 let heldHistoryFailures=0;
 let heldAnswer='Held task is still running';
+let heldStarted=Date.now()-20000;
+let heldCompleted=heldStarted+1000;
 const clients = new Set();
 const snapshot = () => ({type:'snapshot',session_id:current.id,session_name:current.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages});
 const server = createServer(async(req,res) => {
@@ -53,7 +55,15 @@ const server = createServer(async(req,res) => {
   if(path===`/projects/fixture/sessions/${heldBranch.id}`)return json({...heldBranch,messages});
   if(path===`/projects/fixture/sessions/${source.id}`) {
     if(heldMode&&heldHistoryFailures>0){heldHistoryFailures--;res.statusCode=503;return json({error:'retry final refresh'});}
-    return json({...source,messages:heldMode?[messages[0],{role:'assistant',content:heldAnswer}]:messages});
+    return json({...source,messages:heldMode?[
+      {role:'user',content:'Previous completed question',created_at:heldStarted-20000},
+      {role:'assistant',content:'Previous completed answer',created_at:heldStarted-10000},
+      {...messages[0],created_at:heldStarted},
+      {role:'assistant',content:'Checkpoint inspection',tool_calls:[{id:'checkpoint-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'checkpoint-tool',success:true,summary:'/fixture',line_count:1}},
+      // Simulate an older daemon exposing a checkpoint timestamp mid-turn.
+      {role:'assistant',content:heldAnswer,created_at:heldCompleted},
+    ]:messages});
   }
   if(path===`/projects/fixture/sessions/${branch.id}`)return json({...branch,messages});
   if(path.endsWith('/transcript'))return json({session_id:current.id,turns:[]});
@@ -110,6 +120,7 @@ try {
   for(const leave of [true,false]) {
     releaseHeldFork=undefined;
     heldActivity='running';heldAnswer='Held task is still running';
+    heldStarted=Date.now()-20000;heldCompleted=heldStarted+1000;
     const page=await browser.newPage({viewport:{width:1200,height:900}});
     page.setDefaultTimeout(10000);
     await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
@@ -117,10 +128,29 @@ try {
     await page.locator('.session-title-text').filter({hasText:branch.name}).waitFor();
     await page.locator('.session-item-main').filter({hasText:source.name}).filter({hasNotText:'(fork)'}).click();
     await page.getByText('Held task is still running',{exact:true}).waitFor();
+    await page.locator('.browse-activity-status').filter({hasText:'Running'}).waitFor();
+    assert.equal(await page.locator('.timeline-message .msg-time').count(),1,'only the earlier completed turn has a terminal footer');
+    await page.getByText('Checkpoint inspection',{exact:true}).waitFor();
+    const elapsed=await page.locator('.browse-elapsed').textContent();
+    await page.waitForFunction(previous=>document.querySelector('.browse-elapsed')?.textContent!==previous,elapsed,{timeout:2500});
     if(leave) {
+      await page.locator('.browse-activity-status').scrollIntoViewIfNeeded();
+      await page.screenshot({path:'/tmp/atomcode-browse-running-status.png'});
+    }
+    if(leave) {
+      heldActivity='waiting';
+      await page.locator('.browse-activity-status').filter({hasText:'Waiting'}).waitFor();
+      assert.equal(await page.locator('.timeline-message .msg-time').count(),1);
       // A failed final read must be retried after the activity becomes idle.
-      heldActivity='open';heldAnswer='Held task finished';heldHistoryFailures=1;
+      // Hold failures until the activity poll has observed idle, rather than
+      // racing the independent content poll's first final read.
+      heldActivity='open';heldAnswer='Held task finished';heldHistoryFailures=100;heldCompleted=Date.now();
+      await page.locator('.browse-activity-status').filter({hasText:'Syncing final result'}).waitFor();
+      assert.equal(await page.locator('.timeline-message .msg-time').count(),1,'stale page is not shown as a completed answer');
+      heldHistoryFailures=0;
       await page.getByText('Held task finished',{exact:true}).waitFor();
+      await page.locator('.browse-activity-status').waitFor({state:'detached'});
+      assert.equal(await page.locator('.timeline-message .msg-time').count(),2);
     }
     const received=new Promise(resolve=>{onHeldRequest=resolve;});
     await page.getByRole('button',{name:'Fork and continue',exact:true}).click();

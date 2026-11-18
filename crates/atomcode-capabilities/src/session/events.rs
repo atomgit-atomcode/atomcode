@@ -1224,7 +1224,7 @@ impl SessionManager {
                     out.entry(turn)
                         .or_insert(super::transcript::TurnTimestamp {
                             started_at: None,
-                            completed_at: at,
+                            completed_at: None,
                         })
                         .started_at = Some(at);
                 }
@@ -1232,9 +1232,9 @@ impl SessionManager {
                     out.entry(turn)
                         .or_insert(super::transcript::TurnTimestamp {
                             started_at: None,
-                            completed_at: at,
+                            completed_at: None,
                         })
-                        .completed_at = at;
+                        .completed_at = Some(at);
                 }
                 _ => {}
             }
@@ -1767,9 +1767,11 @@ fn stamp_turn_times(
         let Some(time) = times.get(&logged.event.turn()) else {
             continue;
         };
-        let at = match logged.event {
+        let Some(at) = (match logged.event {
             SessionEvent::TurnEnd { .. } => time.completed_at,
-            _ => time.started_at.unwrap_or(time.completed_at),
+            _ => time.started_at.or(time.completed_at),
+        }) else {
+            continue;
         };
         logged.at = u64::try_from(at).unwrap_or(0);
     }
@@ -2927,6 +2929,21 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn a_running_turn_has_no_completion_timestamp_until_turn_end() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        let events = a_turn();
+        manager.append_events(&lease, &events[..4]).unwrap();
+        let times = manager.load_transcript_timestamps("s1").unwrap();
+        assert_eq!(times[&1].started_at, Some(10));
+        assert_eq!(times[&1].completed_at, None);
+        manager.append_events(&lease, &events[4..]).unwrap();
+        let times = manager.load_transcript_timestamps("s1").unwrap();
+        assert_eq!(times[&1].started_at, Some(10));
+        assert_eq!(times[&1].completed_at, Some(14));
+    }
+
     /// An event session keeps its facts — not the chunks — with their numbers
     /// and times; a snapshot read of it is the projection of those facts; its
     /// turn times come from them; and the catalog lists it.
@@ -2958,7 +2975,7 @@ mod tests {
 
         let times = manager.load_transcript_timestamps("s1").unwrap();
         assert_eq!(times[&1].started_at, Some(10));
-        assert_eq!(times[&1].completed_at, 14);
+        assert_eq!(times[&1].completed_at, Some(14));
 
         let scan = SessionManager::scan_catalog(dir.path());
         assert!(
