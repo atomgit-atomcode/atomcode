@@ -1406,7 +1406,6 @@ impl RunningAgent {
             utilization,
             sacred_floor: floor,
             parent: Some(ParentPromptContext {
-                system_prompt: self.persona.clone(),
                 tools: self.tools.snapshot().defs_arc(),
             }),
         }));
@@ -1462,7 +1461,6 @@ impl RunningAgent {
                 utilization,
                 sacred_floor: floor,
                 parent: Some(ParentPromptContext {
-                    system_prompt: self.persona.clone(),
                     tools: self.tools.snapshot().defs_arc(),
                 }),
             };

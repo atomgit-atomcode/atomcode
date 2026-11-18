@@ -950,22 +950,21 @@ pub enum CompactTrigger {
     Overflow { attempt: u8 },
 }
 
-/// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
-/// The byte-exact parent-prefix facts a cache-safe compaction fork replays:
-/// the session's system prompt (pushed as `Message::system(persona)` at
-/// conversation construction) and the turn's advertised tool set. A summary
-/// request built from these plus the verbatim span messages shares the parent
-/// conversation's prefix from token 0, so the provider's warm prompt cache
-/// covers the history instead of billing it at the cold rate.
+/// The advertised tool set a cache-safe compaction fork replays with the
+/// parent conversation's own messages: the summary request then shares the
+/// parent conversation's prefix from token 0, so the provider's warm prompt
+/// cache covers the history instead of billing it at the cold rate. The
+/// system prompt needs no separate capture — the replayed span carries it.
 #[derive(Clone, Debug)]
 pub struct ParentPromptContext {
-    pub system_prompt: String,
     pub tools: Arc<[ToolDef]>,
 }
 
-/// history plus the pressure facts the kernel already records, and the
-/// kernel-computed `sacred_floor`. A strategy reads these to PLAN a drain; it can
-/// never mutate the conversation (the kernel is the sole writer via `apply_plan`).
+/// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
+/// conversation messages, the trigger, the pressure facts the kernel already
+/// records, and the kernel-computed `sacred_floor`. A strategy reads these to
+/// PLAN a drain; it can never mutate the conversation (the kernel is the sole
+/// writer via `apply_plan`).
 pub struct CompactionView<'a> {
     pub messages: &'a [Message],
     pub trigger: CompactTrigger,
@@ -975,9 +974,9 @@ pub struct CompactionView<'a> {
     /// The number of leading messages the strategy must NOT propose draining (the
     /// kernel re-enforces this anyway by clamping in `apply_plan`).
     pub sacred_floor: usize,
-    /// The parent conversation's byte-exact prefix context (system prompt +
-    /// advertised tools), when the engine can supply it. `Some` lets the
-    /// strategy fork the summary request onto the parent's prefix so the
+    /// The parent conversation's advertised tool set, when the engine can
+    /// supply it. `Some` lets the strategy fork the summary request onto the
+    /// parent's prefix — the span already carries the system prompt — so the
     /// provider's warm cache covers the history; `None` falls back to the
     /// rendered-transcript summarizer.
     pub parent: Option<ParentPromptContext>,
