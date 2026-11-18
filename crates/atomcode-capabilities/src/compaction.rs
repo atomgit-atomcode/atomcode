@@ -1746,9 +1746,10 @@ fn call_id_to_tool(msgs: &[Message]) -> HashMap<String, String> {
 }
 
 /// The one-line stub a stubbed tool result is replaced with. Byte-for-byte port of core's
-/// The one-line stub a compacted tool result becomes. Part of the session
-/// projection, so the kernel's (`docs/adr/0024` §6); re-exported here where
-/// compaction has always called it.
+/// The stub a compacted tool result becomes — the first-line shape for
+/// results within the preview budget, the head+tail preview for oversized
+/// ones. Part of the session projection, so the kernel's (`docs/adr/0024`
+/// §6); re-exported here where compaction has always called it.
 pub use atomcode_kernel::session::build_compact_stub;
 
 #[cfg(test)]
@@ -1884,6 +1885,23 @@ mod tests {
             utilization: 0.0125,
             sacred_floor: floor,
         }
+    }
+
+    #[test]
+    fn stub_is_idempotent_and_never_inflates() {
+        // Re-stubbing an already-stubbed result passes it through unchanged —
+        // no nested envelope, no second prefix-cache bust.
+        let stub = build_compact_stub("bash", &"x".repeat(3_000), true);
+        assert_eq!(build_compact_stub("bash", &stub, true), stub);
+        // A result inside the preview budget + marker overhead keeps the
+        // first-line shape: compacting it must not grow the projection.
+        let borderline = "y".repeat(1_800);
+        let small = build_compact_stub("bash", &borderline, true);
+        assert!(
+            !small.contains("[omitted "),
+            "a borderline result must not inflate into a preview: {}",
+            small
+        );
     }
 
     #[test]

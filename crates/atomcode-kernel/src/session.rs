@@ -323,8 +323,9 @@ pub enum SessionEvent {
         round: u32,
         usage: TokenUsage,
     },
-    /// Tool results at or below `through` are shown to the model as a one-line
-    /// stub from here on.
+    /// Tool results at or below `through` are shown to the model as a stub
+    /// from here on — the first-line shape within the preview budget, the
+    /// head+tail preview for oversized ones.
     ///
     /// No longer written: [`SessionEvent::MessagesRewritten`] carries the text
     /// itself. Still projected, so a log that holds one replays as it ran.
@@ -1659,23 +1660,50 @@ pub struct RateLimitPause {
 /// The head/tail preview budgets for oversized stubbed tool results: the head
 /// carries what ran, the tail carries how it ended (exit codes, error
 /// diagnostics), and the omission marker accounts for the cut middle — the
-/// dsh-context-guard balanced policy (head 1792 / tail 448 ≈ 2.3K chars).
-const STUB_PREVIEW_HEAD: usize = 1_792;
-const STUB_PREVIEW_TAIL: usize = 448;
+/// dsh-context-guard balanced policy scaled so the total stub stays under the
+/// 2,000-char envelope the collapse chain and provider-refusal handling treat
+/// as "folded far enough" in a single pass.
+const STUB_PREVIEW_HEAD: usize = 1_400;
+const STUB_PREVIEW_TAIL: usize = 400;
+/// The header, marker and spacing overhead a preview stub adds beyond
+/// head+tail; results at or below `HEAD + TAIL + OVERHEAD` chars are left as
+/// the first-line shape instead of being "compacted" into something larger.
+const STUB_PREVIEW_OVERHEAD: usize = 64;
 
-/// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]`. For a bash
-/// result whose first line is the `[elapsed: …]` metadata prefix, the SECOND line is used
-/// so `first:` surfaces real output, not the exit-code banner.
+/// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]` for
+/// results within the preview budget; oversized results instead keep a
+/// bounded head + tail preview with the omission marker, so exit codes and
+/// error tails survive the cut while the replayed middle — the bulk of the
+/// stub cost — does not. For a bash result whose first line is the
+/// `[elapsed: …]` metadata prefix, the SECOND line is used so `first:`
+/// surfaces real output, not the exit-code banner.
 ///
-/// Oversized results (over head+tail) instead keep a bounded head + tail
-/// preview with the omission marker: the replayed middle is the bulk of the
-/// stub cost, while the head/tail retain what ran and how it ended.
+/// The function is idempotent: an already-stubbed result passes through
+/// unchanged, so a second compaction pass neither nests envelopes nor
+/// re-busts the prefix cache the first stub paid for.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
-    let line_count = output.lines().count();
     let status = if success { "ok" } else { "FAILED" };
-    let chars: Vec<char> = output.chars().collect();
-    let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL;
-    if chars.len() <= budget {
+    // Idempotency guard: either status counts — a message's success flag can't
+    // change between passes, only its text shape does.
+    let prefix = format!("[{tool_name} ");
+    if output.starts_with(&prefix)
+        && output
+            .get(prefix.len()..)
+            .is_some_and(|rest| rest.starts_with("ok: ") || rest.starts_with("FAILED: "))
+    {
+        return output.to_string();
+    }
+    let line_count = output.lines().count();
+    // The preview split only pays off past the budget plus its marker
+    // overhead. The byte length is a cheap pre-filter (it never under-counts
+    // chars); the exact char split happens only when previewing.
+    let chars: Vec<char> =
+        if output.len() > STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL + STUB_PREVIEW_OVERHEAD {
+            output.chars().collect()
+        } else {
+            Vec::new()
+        };
+    if chars.len() <= STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL {
         let first_line: String = {
             let mut iter = output.lines();
             let l1 = iter.next().unwrap_or("(empty)");
@@ -1688,9 +1716,6 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
         };
         return format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]");
     }
-    // The oversized output keeps a bounded head (what ran) and tail (how it
-    // ended — exit codes, error diagnostics) so the exit diagnostics survive
-    // the cut, while the replayed middle is the bulk of the stub savings.
     let head: String = chars[..STUB_PREVIEW_HEAD].iter().collect();
     let tail: String = chars[chars.len() - STUB_PREVIEW_TAIL..].iter().collect();
     let omitted = chars.len() - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
