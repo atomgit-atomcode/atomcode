@@ -13,9 +13,8 @@
 //!
 //! Deep mode: `{"depth":"deep"}` fans out one read-only reviewer per concern
 //! dimension (see `crate::fanout`) and merges/dedups their findings;
-//! `{"depth":"deep+verify"}` additionally runs one verify pass per finding to
-//! cull false positives (single vote, biased toward keep). The default
-//! single-reviewer path is unchanged.
+//! `{"depth":"deep+verify"}` additionally verifies findings to cull false
+//! positives, escalating to the entire diff when file-level evidence is insufficient.
 
 use std::path::Path;
 use std::process::Command;
@@ -33,8 +32,6 @@ use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
-#[cfg(test)]
-use crate::build_review_agent_with;
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
@@ -50,6 +47,8 @@ use crate::{build_review_agent_with_cancel, Finding};
 /// activity convention so terminal drivers can update one latest-wins line instead of adding
 /// every child round/tool to scrollback.
 pub const REVIEW_ACTIVITY_MARKER: char = '\u{1e}';
+
+const SCOPED_VERIFY_LENS: &str = "\n\nFor this initial check, the diff covers only the candidate's file. Re-report only when the supplied evidence confirms the finding. If evidence is insufficient or the change in another file matters, defer by reporting nothing. A full-diff verifier will handle the deferred candidate.";
 
 pub(crate) struct ReviewProgressHook {
     progress: ProgressSink,
@@ -557,7 +556,7 @@ impl Tool for ReviewTool {
                 "instructions": { "type": "string", "description": "User review focus and constraints, verbatim. Include report-only/no-edit requirements and any authorized follow-up work so the background session retains them. Does not grant the read-only reviewer permission to edit." },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
                 "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
-                "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth — choose by the change's risk/scope. `single` (default, omit): routine or low-risk edits (docs, formatting, small localized fixes, config). `deep`: substantive multi-file / logic changes, refactors, or concurrency — fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings. `deep+verify`: high-risk, security-sensitive, or correctness-critical changes, or when the user asks for a thorough/high-confidence review — additionally runs one verify pass per finding to cull false positives. `deep`/`deep+verify` cost several× more, so escalate only when warranted." }
+                "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth — choose by the change's risk/scope. `single` (default, omit): routine or low-risk edits (docs, formatting, small localized fixes, config). `deep`: substantive multi-file / logic changes, refactors, or concurrency — fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings. `deep+verify`: high-risk, security-sensitive, or correctness-critical changes, or when the user asks for a thorough/high-confidence review — additionally verifies each finding and expands to the full diff when needed. `deep`/`deep+verify` cost several× more, so escalate only when warranted." }
             }
         })
     }
@@ -708,7 +707,9 @@ impl Tool for ReviewTool {
             let cancel = ctx.cancel.clone();
             let deadline = deadline.clone();
             let duration = self.max_turn_duration;
+            let progress = ctx.progress.clone();
             async move {
+                let dimension_started = tokio::time::Instant::now();
                 cfg.progress_label = Some(dim.id.to_string());
                 cfg = cfg.with_persona_append(dim.lens);
                 let (agent, report) = build_review_agent_with_cancel(&cfg, provider, deadline.clone());
@@ -718,66 +719,90 @@ impl Tool for ReviewTool {
                         (outcome.stop, outcome.error)
                     }
                 };
+                let completed = stop == StopReason::Stopped && run_error.is_none();
+                let status = if completed { "finished" } else { "incomplete" };
+                let elapsed = dimension_started.elapsed().as_secs_f64();
+                progress.emit(format!(
+                    "{REVIEW_ACTIVITY_MARKER}review [{}] · {status} in {elapsed:.1}s",
+                    dim.id
+                ));
                 DimensionOutcome {
                     dimension: dim.id,
                     findings: report.findings(),
-                    completed: stop == StopReason::Stopped && run_error.is_none(),
+                    completed,
                     error: review_failure_reason(&stop, run_error, &deadline, duration),
                 }
             }
         })
         .await;
 
-        // Merge the fan-out outcomes; optionally cull false positives with a
-        // single verify pass per surviving finding.
+        // Merge the fan-out outcomes before verifying each surviving finding.
         let (mut merged, deduped) = merge_deep_findings(&outcomes, &files);
         let (completed, failed) = dimension_coverage(&outcomes);
         let mut verify_dropped = None;
         let mut verify_incomplete = 0;
         if a.wants_verify() && !merged.is_empty() {
-            // One verify agent per finding, capped. Keep a finding when its verify
-            // agent re-reports a corresponding finding (or fails open on error/cancel).
-            // Snapshot only the candidate findings (cheap Finding clones); the task —
-            // which embeds the whole diff — is rendered lazily inside each closure, so
-            // at most `VERIFY_CONCURRENCY` copies of the diff are live at once.
+            ctx.progress.emit(format!(
+                "{REVIEW_ACTIVITY_MARKER}review · verifying {} finding(s)",
+                merged.len()
+            ));
             let candidates: Vec<Finding> = merged.iter().map(|m| m.finding.clone()).collect();
+            let verification_diffs = VerificationDiffs::new(&annotated);
+            let full: Arc<str> = Arc::from(annotated.as_str());
+            let rules: Arc<str> = Arc::from(rules);
+            let instructions: Arc<str> = Arc::from(instructions);
             let verified = Arc::new(AtomicU32::new(0));
             let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
                 let verified = verified.clone();
                 let provider = provider.clone();
                 let candidate = candidates[i].clone();
-                let vtask = format!(
-                    "{instructions}\n\n{}",
-                    render_verify_task(&candidate, &rules, &annotated)
-                );
-                let mut cfg = make_cfg();
+                let scoped = verification_diffs.for_path(&candidate.file_path);
+                let full = full.clone();
+                let rules = rules.clone();
+                let instructions = instructions.clone();
+                let mut cfg = make_cfg().with_persona_append(VERIFY_LENS);
+                cfg.progress_label = Some("verify".to_string());
+                let duration = self.max_turn_duration;
                 let cancel = ctx.cancel.clone();
                 let deadline = deadline.clone();
                 async move {
-                    // Do not instantiate another reviewer after the common deadline.
-                    // Unverified findings remain present and are explicitly labeled below.
-                    if cancel.is_cancelled() || deadline.as_ref().is_some_and(|t| t.is_cancelled()) {
-                        return (i, true);
-                    }
-                    cfg.progress_label = Some("verify".to_string());
-                    cfg = cfg.with_persona_append(VERIFY_LENS);
-                    let (agent, report) = build_review_agent_with_cancel(&cfg, provider, deadline);
-                    let (stop, run_error) = tokio::select! {
-                        _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-                        outcome = agent.run_to_completion(vtask, AutoRespond::AllowAll) => {
-                            (outcome.stop, outcome.error)
+                    for (input, scoped) in scoped
+                        .into_iter()
+                        .map(|range| (&full[range], true))
+                        .chain(std::iter::once((full.as_ref(), false)))
+                    {
+                        if cancel.is_cancelled()
+                            || deadline.as_ref().is_some_and(|t| t.is_cancelled())
+                        {
+                            return (i, true);
                         }
-                    };
-                    // Fail-open: keep on error/cancel; else keep iff the verifier
-                    // re-reported a finding corresponding to THIS candidate.
-                    let clean = stop == StopReason::Stopped && run_error.is_none();
-                    if clean { verified.fetch_add(1, Ordering::Relaxed); }
-                    let kept = if clean {
-                        verify_reconfirms(&candidate, &report.findings())
-                    } else {
-                        true
-                    };
-                    (i, kept)
+                        let task = render_verify_task(&candidate, &rules, input);
+                        let task = format!("{instructions}\n\n{task}");
+                        let mut pass_cfg = if scoped {
+                            cfg.clone().with_persona_append(SCOPED_VERIFY_LENS)
+                        } else {
+                            cfg.clone()
+                        };
+                        pass_cfg.max_turn_duration =
+                            duration.map(|d| d.saturating_sub(started.elapsed()));
+                        let (agent, report) = build_review_agent_with_cancel(
+                            &pass_cfg, provider.clone(), deadline.clone(),
+                        );
+                        let outcome = tokio::select! {
+                            _ = cancel.cancelled() => return (i, true),
+                            outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => outcome,
+                        };
+                        if outcome.stop != StopReason::Stopped || outcome.error.is_some() {
+                            return (i, true);
+                        }
+                        let confirmed = verify_reconfirms(&candidate, &report.findings());
+                        // A scoped negative is inconclusive. Only full evidence can drop it.
+                        if confirmed || !scoped {
+                            verified.fetch_add(1, Ordering::Relaxed);
+                            return (i, confirmed);
+                        }
+                    }
+                    (i, true)
                 }
             })
             .await;
@@ -908,6 +933,51 @@ struct ScopedDiff {
     diff: String,
     label: String,
     commit_count: Option<usize>,
+}
+
+/// Borrow whole file sections from the authoritative diff. If Git's headers
+/// cannot identify a unique section, use the full diff for that finding.
+struct VerificationDiffs<'a> {
+    files: Vec<(&'a str, std::ops::Range<usize>)>,
+}
+
+impl<'a> VerificationDiffs<'a> {
+    fn new(diff: &'a str) -> Self {
+        let sections: Vec<_> = diff
+            .split_inclusive('\n')
+            .scan(0, |offset, line| {
+                let start = *offset;
+                *offset += line.len();
+                Some((start, line))
+            })
+            .filter_map(|(start, line)| line.starts_with("diff --git ").then_some(start))
+            .chain(std::iter::once(diff.len()))
+            .collect();
+        let mut files = Vec::new();
+        if sections.len() > 2 && sections[0] == 0 {
+            for offsets in sections.windows(2) {
+                let section = &diff[offsets[0]..offsets[1]];
+                let Some(path) = section
+                    .lines()
+                    .take_while(|line| !line.starts_with("@@"))
+                    .find_map(|line| line.strip_prefix("+++ b/"))
+                else {
+                    return Self { files: Vec::new() };
+                };
+                files.push((path.trim_end_matches('\t'), offsets[0]..offsets[1]));
+            }
+        }
+        Self { files }
+    }
+
+    fn for_path(&self, path: &str) -> Option<std::ops::Range<usize>> {
+        let mut matches = self
+            .files
+            .iter()
+            .filter(|(file, _)| paths_match(file, path));
+        let (_, section) = matches.next()?;
+        matches.next().is_none().then(|| section.clone())
+    }
 }
 
 fn git_diff(dir: &Path, scope: &ReviewScope, paths: &[String]) -> Result<ScopedDiff, String> {
@@ -2206,6 +2276,83 @@ mod tests {
         assert!(d.is_deep() && !d.wants_verify());
         let s: Args = serde_json::from_str("{}").unwrap();
         assert!(!s.is_deep() && !s.wants_verify());
+    }
+
+    struct ScopedVerificationProvider {
+        defer: bool,
+        inputs: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScopedVerificationProvider {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            if let Some(task) = messages
+                .iter()
+                .find(|m| m.role == Role::User && m.text.contains("CANDIDATE FINDING:"))
+            {
+                if !messages.iter().any(|m| m.role == Role::Tool) {
+                    let full = task.text.contains("+fn cross_file_evidence()");
+                    assert!(task.text.contains("+fn main()"));
+                    self.inputs.lock().unwrap().push(full);
+                    if self.defer && !full {
+                        return Ok(stream::iter(vec![
+                            StreamEvent::TextDelta("Need the other file's change.".into()),
+                            StreamEvent::Done { truncated: false },
+                        ])
+                        .boxed());
+                    }
+                }
+            }
+            ScriptedReviewProvider
+                .chat_stream(messages, tools, options)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_verify_uses_full_diff_only_when_file_evidence_does_not_confirm() {
+        for defer in [false, true] {
+            let dir = repo_with_working_tree_change();
+            std::fs::write(dir.path().join("b.rs"), "fn cross_file_evidence() {}\n").unwrap();
+            git(dir.path(), &["add", "b.rs"]);
+            let observed = Arc::new(ScopedVerificationProvider {
+                defer,
+                inputs: Default::default(),
+            });
+            let provider: SharedReviewProvider = Arc::new(RwLock::new(Some(observed.clone())));
+            let tool = ReviewTool::new(provider, ReviewToolConfig::default(), test_dirs());
+            let result = tool
+                .execute(r#"{"depth":"deep+verify"}"#, &ctx_in(dir.path()))
+                .await;
+            assert!(!result.is_error, "{}", result.content);
+            assert!(
+                result.content.contains("verify dropped 0"),
+                "{}",
+                result.content
+            );
+            let inputs = observed.inputs.lock().unwrap();
+            let expected: &[bool] = if defer { &[false, true] } else { &[false] };
+            assert_eq!(inputs.as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn verification_scope_uses_full_diff_if_the_file_is_ambiguous() {
+        let diff = "diff --git a/a/helpers.rs b/a/helpers.rs\n+++ b/a/helpers.rs\n@@ -1 +1 @@\ndiff --git a/b/helpers.rs b/b/helpers.rs\n+++ b/b/helpers.rs\n@@ -1 +1 @@\n";
+        let sections = VerificationDiffs::new(diff);
+        assert!(sections.for_path("helpers.rs").is_none());
+        let range = sections.for_path("b/helpers.rs").unwrap();
+        assert!(diff[range].starts_with("diff --git a/b/helpers.rs"));
+        assert!(sections.for_path("missing.rs").is_none());
     }
 
     #[tokio::test]
