@@ -993,6 +993,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adaptive_receipts_preserve_the_full_plan_reminder_and_task_identity() {
+        use atomcode_capabilities::tools::{
+            todo::{parse_todos, render_todos_numbered},
+            TodoTool,
+        };
+        use atomcode_kernel::tool::{Tool, ToolContext};
+        for count in [1, 20] {
+            let tasks: Vec<_> = (1..=count)
+                .map(|id| {
+                    serde_json::json!({
+                        "content":format!("verify parser behavior {id}"), "status":"pending"
+                    })
+                })
+                .collect();
+            let args = serde_json::json!({"todos":tasks}).to_string();
+            let tool_ctx = ToolContext {
+                working_dir: "/fixture".into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: Default::default(),
+                requester: None,
+            };
+            let result = TodoTool::new().execute(&args, &tool_ctx).await;
+            assert!(!result.is_error);
+            assert_eq!(result.content.starts_with("Plan updated:"), count == 20);
+            let legacy = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+            let mut reminders = Vec::new();
+            for receipt in [legacy, result.content] {
+                let mut messages = vec![
+                    Message::user("implement the complete plan"),
+                    todowrite_msg(&args),
+                    Message::tool_result("1", receipt, false),
+                ];
+                TodoHook::default()
+                    .pre_request(&mut messages, &TurnCtx::default())
+                    .await;
+                let reminder = messages.last().unwrap().text.clone();
+                for id in 1..=count {
+                    assert!(reminder.contains(&format!("{id}. verify parser behavior {id}")));
+                }
+                reminders.push(reminder);
+            }
+            assert_eq!(
+                reminders[0], reminders[1],
+                "the request's authoritative plan must not depend on receipt wording"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn drive_rules_ride_only_after_a_full_write_not_a_single_update() {
         let list = r#"{"todos":[{"content":"step one","status":"in_progress"},{"content":"step two","status":"pending"}]}"#;
         // Right after a full (re)plan: the drive rules ARE included.
