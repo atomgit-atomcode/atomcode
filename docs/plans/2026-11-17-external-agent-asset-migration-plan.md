@@ -40,13 +40,13 @@
 | 2 Claude 来源 | 7 | **1106** | 11 | 1 | **高** — 最大的一个，8 类资产 × 4 个真加载器 |
 | 3 Codex 来源 | 6 | 343 | 5 | 4 | 中 — TOML 解析 + 递归合并 |
 | 4 CLI 子命令 | 9 | 422 | 5 | 4（1 新建） | 中 — 接 clap + 渲染 |
-| 5 TUI `/import` | 10 | 256 | 2 | 11（2 新建） | 中 — 改动面最广，但每处都小 |
+| 5 TUI `/import` | 10 | 437 | 6 | 11（2 新建） | 中 — **底部单子**（可滚动/可展开）+「多源才问」 |
 | 6 provider 映射 | 5 | 434 | 8 | 5 | 中高 — 动到 `atomcode-config` 与 `atomcode-coding` |
-| 7 写入 config.toml | 8 | 250 | 8 | 3 | 中 — 代码量最小，**安全要求最高** |
+| 7 写入 config.toml | 8 | 639 | 8 | 3 | 中 — **安全要求最高**（凭据逐项确认、明文不落盘） |
 | 8 门与验收 | 6 | 0 | 0 | 0 | 低 — 跑门 |
-| **合计** | **58** | **3098** | **42** | **约 20 文件 / 6 crate** | |
+| **合计** | **58** | **3668** | **42** | **约 20 文件 / 6 crate** | |
 
-**规模判断**：约 3100 行 Rust、42 条判据、20 个文件、6 个 crate（capabilities / coding / config / cli / tui / i18n）。另有 41 条新 i18n 词条、约 72 个新公开项。**这是一次中等规模的功能，不是大改** —— 但也不是「照着抄一遍」。
+**规模判断**：约 3700 行 Rust、42 条判据、20 个文件、6 个 crate（capabilities / coding / config / cli / tui / i18n）。另有 46 条新 i18n 词条、约 72 个新公开项。**这是一次中等规模的功能，不是大改** —— 但也不是「照着抄一遍」。
 
 **难度不在代码量，在这三处**：
 
@@ -68,7 +68,8 @@
 1. **先 Task 1**，它把模块骨架与四态类型立起来 —— 后面的每个 Task 都在它上面长。
 2. **Task 6 提前到 Task 3 之后**：它要改 `atomcode-config` 与 `atomcode-coding` 这两个共享 crate，而这两个 crate 现在正被别人改。**越早动，越早知道会不会撞**；撞上了还能改方案，晚了就是返工。
 3. **Task 2 单独一轮**，不要与别的 Task 混 —— 它最重，混在一起出问题时说不清是谁的。
-4. **Task 7 单独一轮**：代码量最小但安全要求最高（凭据逐项确认、明文不落盘、id 冲突不覆盖）。它值得一次专注的审查，而不是顺手写完。
+4. **Task 7 单独一轮**：安全要求最高（凭据逐项确认、明文不落盘、id 冲突不覆盖）。它值得一次专注的审查，而不是顺手写完。
+5. **Task 5 不是「渲染一段文字」**：它是**底部单子**（`crate::sheet::List`），要有光标、筛选、展开看详情，并按 Codex 的做法**多源才问**。单子形态的判据比文本形态难写 —— 断言的是 `OpenSheet` 里的 `Page::List`，不是一段字符串。
 
 
 **不属于本期，说明原因：**
@@ -3618,44 +3619,90 @@ impl CommandSet for ImportCommands {
         let Some(port) = ctx.service::<crate::plugin::MigrationSvc>() else {
             return Outcome::Refused(t(Msg::NoMigrationPort).into_owned());
         };
-        match port.report().await {
-            Ok(report) => Outcome::Said(render_import_report(&report)),
-            Err(error) => Outcome::Refused(error),
+        let report = match port.report().await {
+            Ok(report) => report,
+            Err(error) => return Outcome::Refused(error),
+        };
+
+        // **多源才问**（Codex 的做法，`codex-rs/tui/src/external_agent_config_
+        // migration/flow.rs:300`）：先检测**全部**来源，只把**检测到东西的**
+        // 来源放进选择屏；只有一个来源时**不打扰**用户，直接进面板。
+        //
+        // 问「你要导入 Claude Code 还是 Codex」而用户只装了一个，是白问一遍
+        // —— Codex 的 `detected_sources.len() == 1` 分支正是为此。
+        let found: Vec<_> = report
+            .sources
+            .iter()
+            .filter(|source| !source.assets.is_empty())
+            .collect();
+        if found.is_empty() {
+            // The **product** table: the CLI says the same sentence, and one
+            // thing must not be said two ways.
+            use crate::i18n::product::{t as pt, Msg as PMsg};
+            return Outcome::Said(pt(PMsg::MigrationReportEmpty).into_owned());
         }
+        if found.len() > 1 {
+            let rows: Vec<crate::sheet::Row> = found
+                .iter()
+                .map(|source| {
+                    crate::sheet::Row::new(
+                        format!("/import {}", source.source_id),
+                        source.display_name.clone(),
+                    )
+                    .about(format!("{} {}", source.assets.len(), t(Msg::MigrationAssetsCount)))
+                })
+                .collect();
+            return Outcome::Do(crate::keymap::Action::OpenSheet(
+                crate::sheet::Sheet::list(
+                    crate::sheet::List::new("import-source", t(Msg::MigrationPickSource), rows),
+                ),
+            ));
+        }
+
+        // One source: its assets are the list.
+        Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+            import_list(&found[0]),
+        )))
     }
 }
 
-/// The report as lines: one heading per source, one line per asset.
+/// The assets of one source, as a list the person can walk.
 ///
-/// The empty case reuses the product table's sentence — the CLI says it too,
-/// and a sentence this build already says is not written twice.
-fn render_import_report(report: &crate::migration::MigrationReportView) -> String {
-    use crate::i18n::product::{t as pt, Msg as PMsg};
-    if report.sources.is_empty() {
-        // `product::t` returns a `Cow<'static, str>`, so it needs `.into_owned()`
-        // to become the `String` this returns.
-        return pt(PMsg::MigrationReportEmpty).into_owned();
+/// **This is a bottom sheet (`crate::sheet`), not an overlay.** `overlay.rs`'s
+/// own module note says it: a modal is "a flow rather than a list", and a
+/// list to pick from is the bottom sheet, which rises from the foot of the
+/// screen like every other working panel instead of covering the
+/// conversation.
+///
+/// The sheet gives us, for free: a cursor (↑/↓/PgUp/PgDn/Home/End), a filter
+/// box, and — the reason we want a sheet rather than a text dump —
+/// **`Row::preview`**: the lines shown under the list when the cursor rests on
+/// a row (`sheet.rs:127`). So "expand one item to read what it says" is the
+/// existing shape, not something to invent.
+fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::List {
+    let mut rows: Vec<crate::sheet::Row> = Vec::new();
+    for asset in &source.assets {
+        let status = crate::migration::status_word(asset.status);
+        rows.push(
+            crate::sheet::Row::new(
+                format!("/import {}", asset.name),
+                asset.name.clone(),
+            )
+            .about(format!("[{status}] {}", asset.detail))
+            // The preview is what the row's own sentence says, in full —
+            // the `about` is the short form.
+            .preview(vec![asset.detail.clone()]),
+        );
     }
-    let mut out = String::new();
-    for source in &report.sources {
-        out.push_str(&source.display_name);
-        out.push('\n');
-        for asset in &source.assets {
-            // The status word is part of what the row means, so it is shown —
-            // and it comes from the SAME shared product message the CLI uses,
-            // so the two cannot say the same state two ways.
-            //
-            // `crate::migration::` — `commands.rs` is a SIBLING module, so it
-            // does not see `migration`'s private items.
-            out.push_str(&format!(
-                "  [{}] {} — {}\n",
-                crate::migration::status_word(asset.status),
-                asset.name,
-                asset.detail
-            ));
-        }
-    }
-    out
+    crate::sheet::List::new("import", t(Msg::MigrationReportTitle), rows)
+        .summary(vec![crate::sheet::Piece::new(
+            t(Msg::MigrationSummaryLine {
+                source: &source.display_name,
+                count: source.assets.len(),
+            }),
+            crate::sheet::Tone::Plain,
+        )])
+        .empty(t(Msg::MigrationNoAssets))
 }
 ```
 
@@ -3692,11 +3739,28 @@ commands!(
 
 **只有屏幕自己的话进 screen 表。** 「没有发现其他 AI 编码 Agent 留下的资产」这句话 CLI 也会说（`product` 表的 `MigrationReportEmpty`），所以屏幕**复用 product 那一条**，不在 screen 表里写第二遍。
 
+**面板自己的话进 screen 表**；CLI 也会说的那句（「没有发现其他 AI 编码 Agent
+留下的资产」）**复用 product 表的 `MigrationReportEmpty`**，不在 screen 表里写
+第二遍。
+
 `crates/atomcode-i18n/src/screen/messages.rs` 的 `pub enum Msg` 加：
 
 ```rust
     CmdAboutImport,
     NoMigrationPort,
+    /// The sheet's title: the assets another agent left behind.
+    MigrationReportTitle,
+    /// The sheet when the chosen source has no assets.
+    MigrationNoAssets,
+    /// Picking which source to look at, when more than one has assets.
+    MigrationPickSource,
+    /// How many assets a source has.
+    MigrationAssetsCount,
+    /// The sheet's summary line: which source, how many assets.
+    MigrationSummaryLine {
+        source: &'a str,
+        count: usize,
+    },
 ```
 
 `crates/atomcode-i18n/src/screen/en.rs` 加：
@@ -3704,6 +3768,13 @@ commands!(
 ```rust
         Msg::CmdAboutImport => "Look at the assets another AI coding agent left behind".into(),
         Msg::NoMigrationPort => "No migration service is available".into(),
+        Msg::MigrationReportTitle => "Assets another agent left behind".into(),
+        Msg::MigrationNoAssets => "This source has no assets".into(),
+        Msg::MigrationPickSource => "Which agent's assets do you want to see?".into(),
+        Msg::MigrationAssetsCount => "assets".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}: {count} assets").into()
+        }
 ```
 
 `crates/atomcode-i18n/src/screen/zh_cn.rs` 加：
@@ -3711,6 +3782,13 @@ commands!(
 ```rust
         Msg::CmdAboutImport => "查看其他 AI 编码 Agent 留下的资产".into(),
         Msg::NoMigrationPort => "迁移服务不可用".into(),
+        Msg::MigrationReportTitle => "其他 Agent 留下的资产".into(),
+        Msg::MigrationNoAssets => "这个来源没有资产".into(),
+        Msg::MigrationPickSource => "要看哪个 Agent 的资产？".into(),
+        Msg::MigrationAssetsCount => "项资产".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}：{count} 项资产").into()
+        }
 ```
 
 - [ ] **Step 6: 写端口实现**
@@ -3903,29 +3981,36 @@ impl Migration for DiskMigration {
 
 ```rust
     #[test]
-    fn the_import_report_lists_each_source_and_its_assets() {
-        let report = crate::migration::MigrationReportView {
-            sources: vec![crate::migration::MigrationSourceView {
-                source_id: "claude-code".into(),
-                display_name: "Claude Code".into(),
-                assets: vec![crate::migration::MigrationAssetView {
-                    name: "web-access".into(),
-                    status: crate::migration::AssetStatusView::Active,
-                    detail: "Read directly".into(),
-                }],
+    fn the_import_list_carries_each_asset_of_the_source() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "claude-code".into(),
+            display_name: "Claude Code".into(),
+            assets: vec![crate::migration::MigrationAssetView {
+                name: "web-access".into(),
+                status: crate::migration::AssetStatusView::Active,
+                detail: "Read directly".into(),
             }],
         };
-        let text = super::render_import_report(&report);
-        assert!(text.contains("Claude Code"), "{text}");
-        assert!(text.contains("web-access"), "{text}");
+        let list = super::import_list(&source);
+        let rows = list.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "web-access");
+        // The status word is part of what the row means.
+        assert!(rows[0].about.contains("in effect"), "{:?}", rows[0].about);
+        // The preview is the row's own sentence, in full — that is what
+        // "expand one item to read it" shows.
+        assert_eq!(rows[0].preview, vec!["Read directly".to_string()]);
     }
 
     #[test]
-    fn an_empty_import_report_says_so() {
-        let text = super::render_import_report(&crate::migration::MigrationReportView {
-            sources: vec![],
-        });
-        assert!(!text.trim().is_empty());
+    fn an_import_list_with_no_assets_says_so() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "codex".into(),
+            display_name: "Codex".into(),
+            assets: vec![],
+        };
+        let list = super::import_list(&source);
+        assert!(!list.empty.trim().is_empty());
     }
 ```
 
@@ -3990,12 +4075,132 @@ impl Migration for DiskMigration {
             "/import is not registered: {names:?}"
         );
 
-        // It RUNS: the port is reached and its report is rendered.
-        let Outcome::Said(said) = all.dispatch("/import", &app.context()).await else {
-            panic!("/import said nothing");
+        // It RUNS: the port is reached and its report becomes a SHEET.
+        let Outcome::Do(crate::keymap::Action::OpenSheet(sheet)) =
+            all.dispatch("/import", &app.context()).await
+        else {
+            panic!("/import did not open a sheet");
         };
-        assert!(said.contains("Claude Code"), "{said}");
-        assert!(said.contains("web-access"), "{said}");
+        let crate::sheet::Page::List(list) = sheet.page else {
+            panic!("a list");
+        };
+        assert_eq!(list.rows.len(), 1);
+        assert_eq!(list.rows[0].label, "web-access");
+    }
+
+    /// **多源才问**（Codex 的做法，`flow.rs:300`）：一个来源有资产时**不打扰**
+    /// 用户，直接进面板。
+    #[tokio::test]
+    async fn one_source_with_assets_goes_straight_to_the_list() {
+        let app = bare();
+        let _ = app.context().provide::<crate::plugin::MigrationSvc>(Arc::new(FakeMigration {
+            report: crate::migration::MigrationReportView {
+                sources: vec![crate::migration::MigrationSourceView {
+                    source_id: "claude-code".into(),
+                    display_name: "Claude Code".into(),
+                    assets: vec![crate::migration::MigrationAssetView {
+                        name: "web-access".into(),
+                        status: crate::migration::AssetStatusView::Active,
+                        detail: "Read directly".into(),
+                    }],
+                }],
+            },
+        }));
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ImportCommands));
+        let Outcome::Do(crate::keymap::Action::OpenSheet(sheet)) =
+            all.dispatch("/import", &app.context()).await
+        else {
+            panic!("/import did not open a sheet");
+        };
+        // The list of the SOURCE's assets — not a picker of sources.
+        let crate::sheet::Page::List(list) = sheet.page else {
+            panic!("a list");
+        };
+        assert_eq!(list.id, "import");
+    }
+
+    /// Two sources with assets → ask which one.
+    #[tokio::test]
+    async fn two_sources_with_assets_ask_which_one() {
+        let app = bare();
+        let _ = app.context().provide::<crate::plugin::MigrationSvc>(Arc::new(FakeMigration {
+            report: crate::migration::MigrationReportView {
+                sources: vec![
+                    crate::migration::MigrationSourceView {
+                        source_id: "claude-code".into(),
+                        display_name: "Claude Code".into(),
+                        assets: vec![crate::migration::MigrationAssetView {
+                            name: "web-access".into(),
+                            status: crate::migration::AssetStatusView::Active,
+                            detail: "Read directly".into(),
+                        }],
+                    },
+                    crate::migration::MigrationSourceView {
+                        source_id: "codex".into(),
+                        display_name: "Codex".into(),
+                        assets: vec![crate::migration::MigrationAssetView {
+                            name: "agents".into(),
+                            status: crate::migration::AssetStatusView::Actionable,
+                            detail: "Copy it somewhere".into(),
+                        }],
+                    },
+                ],
+            },
+        }));
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ImportCommands));
+        let Outcome::Do(crate::keymap::Action::OpenSheet(sheet)) =
+            all.dispatch("/import", &app.context()).await
+        else {
+            panic!("/import did not open a sheet");
+        };
+        let crate::sheet::Page::List(list) = sheet.page else {
+            panic!("a list");
+        };
+        assert_eq!(list.id, "import-source", "a picker of sources");
+        assert_eq!(list.rows.len(), 2);
+    }
+
+    /// A source with NO assets is not offered — asking "which agent?" when
+    /// only one of them has anything is a question with an obvious answer.
+    #[tokio::test]
+    async fn a_source_with_no_assets_is_not_offered() {
+        let app = bare();
+        let _ = app.context().provide::<crate::plugin::MigrationSvc>(Arc::new(FakeMigration {
+            report: crate::migration::MigrationReportView {
+                sources: vec![
+                    crate::migration::MigrationSourceView {
+                        source_id: "claude-code".into(),
+                        display_name: "Claude Code".into(),
+                        assets: vec![crate::migration::MigrationAssetView {
+                            name: "web-access".into(),
+                            status: crate::migration::AssetStatusView::Active,
+                            detail: "Read directly".into(),
+                        }],
+                    },
+                    crate::migration::MigrationSourceView {
+                        source_id: "codex".into(),
+                        display_name: "Codex".into(),
+                        assets: vec![],
+                    },
+                ],
+            },
+        }));
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ImportCommands));
+        let Outcome::Do(crate::keymap::Action::OpenSheet(sheet)) =
+            all.dispatch("/import", &app.context()).await
+        else {
+            panic!("/import did not open a sheet");
+        };
+        let crate::sheet::Page::List(list) = sheet.page else {
+            panic!("a list");
+        };
+        assert_eq!(
+            list.id, "import",
+            "only the source WITH assets is offered, so no picker"
+        );
     }
 ```
 
@@ -4003,13 +4208,19 @@ impl Migration for DiskMigration {
 > `import`，`/help` 与 `matching` 看到的就是这个名字；斜杠只是**调用时**的前缀
 > （`dispatch("/import", …)`）。所以断言的是 `"import"`，不是 `"/import"`。
 >
-> 判据的**名字**里有 `import`，所以 `cargo nextest run -p atomcode-tui import`
-> 这一条过滤能同时跑到它与渲染那两条。
+> 判据的**名字**里都有 `import`，所以 `cargo nextest run -p atomcode-tui import`
+> 这一条过滤能同时跑到它们全部。
+>
+> **这些判据断言的是「底部单子」，不是一段文本。** `/import` 走
+> `Outcome::Do(Action::OpenSheet(…))`（`keymap.rs:321`），所以断言的是
+> `OpenSheet` 里的 `Page::List` —— 单子的 id、行数、每行的 label 与 preview。
+> 一段文本（`Outcome::Said`）在一屏放不下时会被截断，而清单被截断等于清单没了。
 
 - [ ] **Step 9: 跑测试**
 
 Run: `cargo nextest run -p atomcode-tui import`
-Expected: PASS —— 3 tests（两条渲染 + 一条注册与执行）。
+Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数为准**：两条列表判据 +
+一条注册与执行 + 三条「多源才问」）。
 
 Run: `cargo check -p atomcode-cli`
 Expected: 退出 0。
@@ -5116,6 +5327,8 @@ use atomcode_capabilities::migration::{
     self, ApiKeyRef, AssetKind, AssetStatus, MigrationReport, ProviderAccountDraft, ScanContext,
 };
 ```
+
+```rust
 
 /// Why this credential cannot be written, if it cannot.
 ///

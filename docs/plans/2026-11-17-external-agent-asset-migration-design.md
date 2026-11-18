@@ -278,6 +278,22 @@ atomcode import --apply      # 第二期：逐项确认后写入 provider 账号
 /import                      # 报告面板：按来源分组，逐项显示状态
 ```
 
+**TUI 侧是「底部单子」，不是一段文本。** 报告是一份**清单**，而一段文本在一屏
+放不下时会被截断 —— 清单被截断等于清单没了。所以 `/import` 走
+`Outcome::Do(Action::OpenSheet(…))`（`keymap.rs:321`），用 `crate::sheet::List`：
+光标（↑/↓/PgUp/PgDn/Home/End）、筛选框，以及 `Row::preview`（光标停在那行时
+单子下面显示的详情）—— 「展开一项看它到底说什么」是既有的形状，不用自己造。
+
+`overlay.rs` 的模块注释正好说了这件事：模态是「一段流程，不是一张单子」；要挑
+的列表是底部单子，它从屏幕底部升起来，像别的干活面板一样，而不盖住对话。
+
+**多源才问**（Codex 的做法，`codex-rs/tui/src/external_agent_config_migration/
+flow.rs:300`）：先检测**全部**来源，只把**检测到东西的**来源放进选择屏；**只有
+一个来源时不打扰**用户，直接进面板。
+
+问「你要看 Claude Code 还是 Codex」而用户只装了一个，是白问一遍。Codex 的
+`detected_sources.len() == 1` 分支正是为此。
+
 TUI 通过 `atomcode-tui` 新增的 `migration.rs` 端口 trait（镜像 `setup.rs` / `tui_setup.rs` 的形状）拿到数据；实现在 `atomcode-cli/src/tui_migration.rs`。
 
 端口的形状与 `Setup` 完全同形：
