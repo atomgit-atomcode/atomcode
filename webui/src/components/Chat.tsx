@@ -11,7 +11,7 @@ import { TaskSpecifications } from './TaskSpecifications';
 import { ApiCallError, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
-import { processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
+import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
 import { BrowseActivityStatus } from './BrowseActivityStatus';
 import { browseActiveTurn } from '../lib/browseTurn';
@@ -5135,11 +5135,7 @@ function AssistantMessageView({
 }) {
   const t = useT();
   const text = messageText(msg);
-  const isError =
-    text.includes('[错误:') ||
-    text.includes('[连接错误:') ||
-    text.includes('[Error:') ||
-    text.includes('[Connection error:');
+  const isError = hasChatErrorNotice(text);
   const streaming = isLast && busy;
   // 三点 loading 覆盖整个回合：思考（无可见输出）和文本输出阶段都显示，
   // 直到回合结束（busy 变 false）才消失。不再使用闪烁光标。

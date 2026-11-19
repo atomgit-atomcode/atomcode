@@ -104,6 +104,16 @@ export class ApiTransportError extends Error {
   }
 }
 
+/** The response arrived, but its body stopped arriving before the reader finished. */
+export class ApiStreamInterruptedError extends Error {
+  constructor() {
+    super(relayPage
+      ? 'The WebUI relay connection dropped while receiving a reply. Reconnect and refresh to check the turn. / 正在接收回复时，WebUI 中继连接中断。重新连接后刷新页面，查看当前回合状态。'
+      : 'The connection to the AtomCode service dropped while receiving a reply. Refresh after reconnecting to check the turn. / 正在接收回复时，与 AtomCode 服务的连接中断。连接恢复后刷新页面，查看当前回合状态。');
+    this.name = 'ApiStreamInterruptedError';
+  }
+}
+
 /** An unpaired relay page must ask for a fresh link instead of falling back
  * to endpoints on the relay server as though it were the local daemon. */
 export function createApiFetch(

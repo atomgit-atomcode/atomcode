@@ -11,6 +11,11 @@ export interface ProcessMessage {
   retainedHistory?: boolean;
   processSummary?: ReturnType<typeof processSummary>;
 }
+
+export function hasChatErrorNotice(text: string): boolean {
+  return /\[(?:错误|连接错误|Error|Connection error|WebUI 与 AtomCode 服务通信失败|WebUI communication with the AtomCode service failed):/.test(text);
+}
+
 /** Small, browser-only archive metadata. Never use preview text as an answer. */
 export function processSummary(message: ProcessMessage) {
   let finalStart = 0;
@@ -22,7 +27,7 @@ export function processSummary(message: ProcessMessage) {
     if (part.kind === 'tool') {
       tools++; firstTool ??= part.tool.id;
       if (['pending', 'waiting_approval', 'incomplete'].includes(part.tool.status)) unsafe = true;
-    } else if (part.kind !== 'text' || /\[(?:错误|连接错误|Error|Connection error):/.test(part.text)) unsafe = true;
+    } else if (part.kind !== 'text' || hasChatErrorNotice(part.text)) unsafe = true;
   });
   return { tools, firstTool, unsafe, finalStart, parts: message.parts.length,
     hasAnswer: message.parts.slice(finalStart).some(part => part.kind === 'text' && Boolean(part.text.trim())) };
