@@ -316,7 +316,7 @@ impl LlmProvider for OllamaProvider {
                             return;
                         }
                         Ok(Some(Ok(chunk))) => {
-                            let mut saw_done = false;
+                            let mut terminal = false;
                             for ev in dec.feed(chunk.as_ref()) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
@@ -329,12 +329,12 @@ impl LlmProvider for OllamaProvider {
                                 }
                                 watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                if matches!(ev, StreamEvent::Done { .. }) {
-                                    saw_done = true;
+                                if matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_)) {
+                                    terminal = true;
                                 }
                                 yield ev;
                             }
-                            if saw_done { return; }
+                            if terminal { return; }
                         }
                     }
                 }

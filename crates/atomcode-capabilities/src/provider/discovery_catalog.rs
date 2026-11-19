@@ -1,6 +1,8 @@
 //! Public model metadata. Provider credentials never cross this boundary.
 
-use super::{discovery_client, read_bounded_response, DiscoveredModel, DiscoveryTransport};
+use super::{
+    discovery_client, read_bounded_response, DiscoveredModel, DiscoveryError, DiscoveryTransport,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -282,15 +284,15 @@ pub fn fill_missing(model: &mut DiscoveredModel, catalog: &DiscoveredModel) {
     }
 }
 
-pub fn merge_listing<E>(
-    result: Result<Vec<DiscoveredModel>, E>,
+pub(super) fn merge_listing(
+    result: Result<Vec<DiscoveredModel>, DiscoveryError>,
     catalog: Vec<DiscoveredModel>,
-) -> Result<Vec<DiscoveredModel>, E> {
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
     if catalog.is_empty() {
         return result;
     }
     match result {
-        Ok(mut models) if !models.is_empty() => {
+        Ok(mut models) => {
             let indexed: BTreeMap<_, _> = catalog
                 .iter()
                 .map(|model| (model.id.as_str(), model))
@@ -302,7 +304,8 @@ pub fn merge_listing<E>(
             }
             Ok(models)
         }
-        _ => Ok(catalog),
+        Err(error) if error.allows_catalog_candidates() => Ok(catalog),
+        Err(error) => Err(error),
     }
 }
 
@@ -358,7 +361,7 @@ mod tests {
             id: "new-not-in-catalog".into(),
             ..Default::default()
         };
-        let live = merge_listing::<()>(Ok(vec![verified, other.clone()]), entries.clone()).unwrap();
+        let live = merge_listing(Ok(vec![verified, other.clone()]), entries.clone()).unwrap();
         assert_eq!(live[0].context_window, Some(128_000));
         assert_eq!(live[0].supports_vision, Some(false));
         assert_eq!(live[0].max_tokens, Some(131_072));
@@ -375,12 +378,15 @@ mod tests {
         assert_eq!(disabled.reasoning_effort, None);
         assert!(!live[0].catalog_only);
         assert_eq!(live[1], other);
-        assert!(merge_listing(Err(()), entries.clone()).unwrap()[0].catalog_only);
-        assert!(merge_listing::<()>(Ok(vec![]), entries).unwrap()[0].catalog_only);
-        assert_eq!(
-            merge_listing(Err("unavailable"), vec![]),
-            Err("unavailable")
+        assert!(
+            merge_listing(Err(DiscoveryError::Unsupported), entries.clone()).unwrap()[0]
+                .catalog_only
         );
+        assert!(merge_listing(Ok(vec![]), entries).unwrap().is_empty());
+        assert!(matches!(
+            merge_listing(Err(DiscoveryError::Unsupported), vec![]),
+            Err(DiscoveryError::Unsupported)
+        ));
     }
 
     #[test]

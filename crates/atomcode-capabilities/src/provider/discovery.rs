@@ -65,9 +65,8 @@ pub async fn discover(
 
 fn use_public_catalog(result: &Result<Vec<DiscoveredModel>, DiscoveryError>) -> bool {
     match result {
-        Err(DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(401 | 403))) => false,
-        Ok(models) if !models.is_empty() => models.iter().any(catalog::needs_metadata),
-        _ => true,
+        Ok(models) => models.iter().any(catalog::needs_metadata),
+        Err(error) => error.allows_catalog_candidates(),
     }
 }
 
@@ -93,6 +92,16 @@ pub enum DiscoveryError {
     Request(DiscoveryRequestError),
     /// It answered, and not with a listing.
     NotAListing,
+}
+
+impl DiscoveryError {
+    fn allows_catalog_candidates(&self) -> bool {
+        // 只有协议缺少列表能力，或端点明确表示没有对应路由或方法，才提供候选。
+        matches!(
+            self,
+            Self::Unsupported | Self::Request(DiscoveryRequestError::UpstreamStatus(404 | 405))
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,14 +538,7 @@ pub async fn fetch_discovery_body(
     let client = discovery_client(transport, timeout, true, proxy.as_ref())
         .or_else(|_| discovery_client(transport, timeout, false, proxy.as_ref()))
         .map_err(|_| DiscoveryRequestError::Transport)?;
-    let request = discovery_auth(
-        client.get(url.clone()).header("accept", "application/json"),
-        &url,
-        protocol,
-        transport.api_key.as_deref(),
-    );
-    let request = super::apply_account_headers(request, &transport.headers)
-        .map_err(|_| DiscoveryRequestError::Transport)?;
+    let request = discovery_request(&client, &url, protocol, transport)?;
     let proxy_may_apply = protocol == "ollama" && discovery_proxy_may_apply(&url, proxy.as_ref());
     let response = request.send().await.map_err(|error| {
         ollama_connection_failure(&url, protocol, &error, proxy_may_apply).unwrap_or_else(|| {
@@ -563,6 +565,28 @@ pub async fn fetch_discovery_body(
         })
 }
 
+fn discovery_request(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    protocol: &str,
+    transport: &DiscoveryTransport,
+) -> Result<reqwest::RequestBuilder, DiscoveryRequestError> {
+    let key = transport.api_key.as_deref().map(str::trim);
+    let key = if protocol == "anthropic" {
+        super::anthropic::default_auth_key(key, &transport.headers)
+    } else {
+        key
+    };
+    let request = discovery_auth(
+        client.get(url.clone()).header("accept", "application/json"),
+        url,
+        protocol,
+        key,
+    );
+    super::apply_account_headers(request, &transport.headers)
+        .map_err(|_| DiscoveryRequestError::Transport)
+}
+
 pub fn normalize_discovered_models(mut models: Vec<DiscoveredModel>) -> Vec<DiscoveredModel> {
     models.retain(|model| !model.id.trim().is_empty());
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -576,14 +600,74 @@ mod metadata_tests {
     use super::*;
 
     #[test]
-    fn public_catalog_never_replaces_an_authentication_refusal() {
-        for status in [401, 403] {
+    fn public_catalog_candidates_require_an_explicitly_unsupported_listing() {
+        let candidates = vec![DiscoveredModel {
+            id: "public-model".into(),
+            catalog_only: true,
+            ..Default::default()
+        }];
+        for status in [401, 403, 429, 500, 501, 503] {
             let result = Err(DiscoveryError::Request(
                 DiscoveryRequestError::UpstreamStatus(status),
             ));
             assert!(!use_public_catalog(&result));
+            assert!(matches!(
+                catalog::merge_listing(result, candidates.clone()),
+                Err(DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(actual)))
+                    if actual == status
+            ));
         }
-        assert!(use_public_catalog(&Err(DiscoveryError::Unsupported)));
+        let timeout = Err(DiscoveryError::Request(DiscoveryRequestError::Timeout));
+        assert!(!use_public_catalog(&timeout));
+        assert!(matches!(
+            catalog::merge_listing(timeout, candidates.clone()),
+            Err(DiscoveryError::Request(DiscoveryRequestError::Timeout))
+        ));
+        assert!(!use_public_catalog(&Err(DiscoveryError::NotAListing)));
+        assert!(!use_public_catalog(&Ok(vec![])));
+        for error in [
+            DiscoveryError::Unsupported,
+            DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(404)),
+            DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(405)),
+        ] {
+            let result = Err(error);
+            assert!(use_public_catalog(&result));
+            assert_eq!(
+                catalog::merge_listing(result, candidates.clone()).unwrap(),
+                candidates
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_discovery_does_not_add_bearer_to_an_explicit_api_key_header() {
+        let client = reqwest::Client::new();
+        for base in [
+            "https://api.longcat.chat/anthropic",
+            "https://tokenhub.tencentmaas.com",
+        ] {
+            let url = discovery_url(base, "anthropic").unwrap();
+            let mut transport = DiscoveryTransport {
+                api_key: Some("default-test-key".into()),
+                ..Default::default()
+            };
+            let default = discovery_request(&client, &url, "anthropic", &transport)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(
+                default.headers()["authorization"],
+                "Bearer default-test-key"
+            );
+            transport.headers =
+                serde_json::from_str(r#"{"X-API-Key":"explicit-test-key"}"#).unwrap();
+            let explicit = discovery_request(&client, &url, "anthropic", &transport)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(explicit.headers()["x-api-key"], "explicit-test-key");
+            assert!(!explicit.headers().contains_key("authorization"));
+        }
     }
 
     #[test]

@@ -641,6 +641,76 @@ async fn retry_replays_the_request_even_when_server_read_it_fully() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_oversized_stream_line_terminates_without_reopening_the_request() {
+    use atomcode_capabilities::provider::{
+        AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, ResponsesProvider,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (wire, code) in [
+        ("anthropic", "sse_line_too_large"),
+        ("ollama", "ndjson_line_too_large"),
+        ("responses", "sse_line_too_large"),
+    ] {
+        // The large TCP transfer needs real socket readiness. An idle
+        // current-thread runtime can otherwise advance the paused watchdog
+        // before the next socket wakeup, even though the server is writing.
+        tokio::time::resume();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let line = vec![b'x'; 16 * 1024 * 1024 + 1];
+            // 声明多一个字节，关闭连接时客户端会收到传输错误。
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                line.len() + 1
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&line).await.unwrap();
+            (listener, socket)
+        });
+        let provider: Box<dyn LlmProvider> = match wire {
+            "anthropic" => Box::new(
+                AnthropicProvider::new(AnthropicConfig::new("test-key", &base, "test-model"))
+                    .unwrap(),
+            ),
+            "ollama" => {
+                Box::new(OllamaProvider::new(OllamaConfig::new(&base, "test-model")).unwrap())
+            }
+            _ => Box::new(
+                ResponsesProvider::new(OpenAiCompatConfig::new("test-key", &base, "test-model"))
+                    .unwrap(),
+            ),
+        };
+        let mut stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the local gateway should deliver the oversized line");
+        assert!(
+            matches!(&event, Some(StreamEvent::Error(error))
+                if !error.retryable && error.code.as_deref() == Some(code)),
+            "{wire} must report a terminal line limit error, got {event:?}"
+        );
+        let (listener, mut connection) = gateway.await.unwrap();
+        connection.shutdown().await.unwrap();
+        // Any erroneous reconnect or retry after the terminal event can
+        // advance virtual time and fail the assertion without a wall-clock wait.
+        tokio::time::pause();
+        tokio::select! {
+            biased;
+            _ = listener.accept() => panic!("{wire} reopened after a terminal error"),
+            next = stream.next() => assert!(next.is_none(), "{wire} yielded {next:?}"),
+        }
+    }
+}
+
 /// Accepts the connection but never responds and never closes — an upstream that
 /// hangs with no first byte.
 fn black_hole_gateway() -> String {

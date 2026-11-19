@@ -89,7 +89,7 @@ async fn every_chat_wire_sends_account_headers_and_redacts_echoed_credentials() 
                     r.headers.get("anthropic-version").unwrap(),
                     "custom-version"
                 );
-                if wire == "anthropic" && key.is_empty() {
+                if wire == "anthropic" {
                     assert!(r.headers.get("x-api-key").is_none());
                 }
             }

@@ -400,7 +400,7 @@ impl LlmProvider for AnthropicProvider {
                             return;
                         }
                         Ok(Some(Ok(chunk))) => {
-                            let mut saw_done = false;
+                            let mut terminal = false;
                             for ev in dec.feed(chunk.as_ref()) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
@@ -413,12 +413,12 @@ impl LlmProvider for AnthropicProvider {
                                 }
                                 watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                if matches!(ev, StreamEvent::Done { .. }) {
-                                    saw_done = true;
+                                if matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_)) {
+                                    terminal = true;
                                 }
                                 yield ev;
                             }
-                            if saw_done { return; }
+                            if terminal { return; }
                         }
                     }
                 }
@@ -523,6 +523,19 @@ pub(super) fn authenticate(
     }
 }
 
+pub(super) fn default_auth_key<'a>(
+    key: Option<&'a str>,
+    headers: &atomcode_config::provider_headers::ProviderHeaders,
+) -> Option<&'a str> {
+    // 显式鉴权头优先，避免默认凭据以另一种头部发给同一端点。
+    key.filter(|key| {
+        !key.is_empty()
+            && !headers
+                .iter()
+                .any(|(name, _)| matches!(name, "authorization" | "x-api-key"))
+    })
+}
+
 async fn open_stream_attempts(
     client: &super::openai_compat::SwappableClient,
     url: &str,
@@ -545,8 +558,8 @@ async fn open_stream_attempts(
             .header("anthropic-version", anthropic_version)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes.clone());
-        if !api_key.is_empty() {
-            req = authenticate(req, url, api_key);
+        if let Some(key) = default_auth_key(Some(api_key), &client.headers) {
+            req = authenticate(req, url, key);
         }
         req = with_session_headers(req, url, session_id);
         req = super::apply_account_headers(req, &client.headers)?;
