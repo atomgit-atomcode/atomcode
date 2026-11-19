@@ -2524,4 +2524,32 @@ pub enum Msg<'a> {
     MigrationStatusActionable,
     MigrationStatusBlocked,
     MigrationAlreadyImported,
+    MigrationImportDone {
+        imported: &'a str,
+    },
+    MigrationImportSkipped {
+        skipped: &'a str,
+    },
+    MigrationImportNone,
+    MigrationProvidersUnreadable {
+        reasons: &'a str,
+    },
+    MigrationImportAlreadyThere {
+        already: &'a str,
+    },
+    MigrationImportConflict {
+        id: &'a str,
+    },
+    MigrationImportConfirm {
+        id: &'a str,
+        protocol: &'a str,
+        endpoint: &'a str,
+        models: &'a str,
+        /// What will happen to the credential: `plaintext`, `env:NAME`, or
+        /// `none`. The prompt must say which — the person is agreeing to
+        /// copy a literal secret into a file, not to "import a key".
+        credential: &'a str,
+        /// The file the account will be written into.
+        destination: &'a str,
+    },
 }

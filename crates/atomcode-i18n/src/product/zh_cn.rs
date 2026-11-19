@@ -1821,6 +1821,48 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::MigrationStatusActionable => "可以带走".into(),
         Msg::MigrationStatusBlocked => "带不走".into(),
         Msg::MigrationAlreadyImported => "已在你的配置里 —— 没有需要带过来的了".into(),
+
+        Msg::MigrationImportDone { imported } => format!("已导入：{imported}。").into(),
+        Msg::MigrationImportSkipped { skipped } => format!("未导入：{skipped}。").into(),
+        Msg::MigrationImportNone => "没有发现可导入的 provider 账号。".into(),
+        Msg::MigrationProvidersUnreadable { reasons } => {
+            format!("无法读取 provider 配置：{reasons}").into()
+        }
+        Msg::MigrationImportAlreadyThere { already } => {
+            format!("已经在配置里：{already}。").into()
+        }
+        Msg::MigrationImportConflict { id } => {
+            format!("{id}：已存在同名但不同的账号 —— 没有覆盖。").into()
+        }
+        Msg::MigrationImportConfirm {
+            id,
+            protocol,
+            endpoint,
+            models,
+            credential,
+            destination,
+        } => {
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!("，模型 {models}")
+            };
+            // **凭据的下场要说清楚。** 明文密钥要说明「会被**复制进**这个文件」，
+            // 并写出是哪个文件。
+            let credential = match credential.strip_prefix("plaintext") {
+                Some(_) => format!("，并把其中的**明文密钥**复制进 {destination}"),
+                None => match credential.strip_prefix("env:") {
+                    Some(name) => {
+                        format!("，并使用环境变量 {name}（密钥留在原地）")
+                    }
+                    None => String::new(),
+                },
+            };
+            format!(
+                "要导入账号 `{id}`（{protocol} -> {endpoint}）{models}{credential}吗？[y/N] "
+            )
+            .into()
+        }
 }
 }
 

@@ -1912,6 +1912,50 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::MigrationAlreadyImported => {
             "Already in your configuration — nothing left to bring over".into()
         }
+
+        Msg::MigrationImportDone { imported } => format!("Imported: {imported}.").into(),
+        Msg::MigrationImportSkipped { skipped } => format!("Not imported: {skipped}.").into(),
+        Msg::MigrationImportNone => "No provider accounts were found to import.".into(),
+        Msg::MigrationProvidersUnreadable { reasons } => {
+            format!("The provider configuration could not be read: {reasons}").into()
+        }
+        Msg::MigrationImportAlreadyThere { already } => {
+            format!("Already there: {already}.").into()
+        }
+        Msg::MigrationImportConflict { id } => {
+            format!("{id}: an account with that id exists but differs — not overwritten").into()
+        }
+        Msg::MigrationImportConfirm {
+            id,
+            protocol,
+            endpoint,
+            models,
+            credential,
+            destination,
+        } => {
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!(" with models {models}")
+            };
+            // **The credential's fate is spelled out.** For a literal it
+            // says the secret is COPIED INTO the file, and names the file.
+            let credential = match credential.strip_prefix("plaintext") {
+                Some(_) => format!(
+                    " and copy its PLAINTEXT KEY into {destination}"
+                ),
+                None => match credential.strip_prefix("env:") {
+                    Some(name) => {
+                        format!(" and use the environment variable {name} (the secret stays put)")
+                    }
+                    None => String::new(),
+                },
+            };
+            format!(
+                "Import account `{id}` ({protocol} -> {endpoint}){models}{credential}? [y/N] "
+            )
+            .into()
+        }
 }
 }
 
