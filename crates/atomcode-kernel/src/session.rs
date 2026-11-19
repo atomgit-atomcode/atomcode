@@ -1657,16 +1657,42 @@ pub struct RateLimitPause {
     pub server_message: Option<String>,
 }
 
-/// True iff `text` already carries the compact-stub envelope for `tool_name`
-/// (`[<tool> ok: ` or `[<tool> FAILED: `). Compaction strategies use this to
-/// skip already-stubbed results, so a second pass stays a no-op: re-stubbing
-/// would nest envelopes and re-bust the prefix cache the first stub paid for.
-pub fn text_is_compact_stub(tool_name: &str, text: &str) -> bool {
-    let prefix = format!("[{tool_name} ");
-    text.starts_with(&prefix)
-        && text
-            .get(prefix.len()..)
-            .is_some_and(|rest| rest.starts_with("ok: ") || rest.starts_with("FAILED: "))
+/// True iff `text` already carries a compact-stub envelope
+/// (`[<tool> ok|FAILED: <N> lines, first:|head: …]` for any tool name).
+/// Compaction strategies use this to skip already-stubbed results, so a
+/// second pass stays a no-op: re-stubbing would nest envelopes and re-bust
+/// the prefix cache the first stub paid for. The detection is tool-name
+/// agnostic on purpose — a strategy whose tool lookup falls back to a
+/// generic name must still recognize a stub produced under the real name —
+/// and requires the `lines,` + preview-marker segments, so a real tool
+/// output that merely opens with a bracket-plus-status rarely matches.
+pub fn text_is_compact_stub(text: &str) -> bool {
+    let rest = match text.strip_prefix('[') {
+        Some(rest) => rest,
+        None => return false,
+    };
+    let (name, tail) = match rest.split_once(' ') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let after_status = match tail
+        .strip_prefix("ok: ")
+        .or_else(|| tail.strip_prefix("FAILED: "))
+    {
+        Some(after) => after,
+        None => return false,
+    };
+    let (digits, after_count) = match after_status.split_once(' ') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    digits.chars().all(|c| c.is_ascii_digit())
+        && !digits.is_empty()
+        && after_count.starts_with("lines, ")
+        && (after_count.contains("first: ") || after_count.contains("head: "))
 }
 
 /// The head/tail preview budgets for oversized stubbed tool results: the head
@@ -1677,10 +1703,10 @@ pub fn text_is_compact_stub(tool_name: &str, text: &str) -> bool {
 /// as "folded far enough" in a single pass.
 const STUB_PREVIEW_HEAD: usize = 1_400;
 const STUB_PREVIEW_TAIL: usize = 400;
-/// The header, marker and spacing overhead a preview stub adds beyond
-/// head+tail; results at or below `HEAD + TAIL + OVERHEAD` chars are left as
-/// the first-line shape instead of being "compacted" into something larger.
-const STUB_PREVIEW_OVERHEAD: usize = 64;
+/// The preview only fires when the cut middle is at least half the head: a
+/// near-threshold rewrite would bust the prefix cache for almost no saving,
+/// and the corpus's mean tool result sits right in that dead zone.
+const STUB_PREVIEW_MIN_OMITTED: usize = 896;
 
 /// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]` for
 /// results within the preview budget; oversized results instead keep a
@@ -1695,49 +1721,48 @@ const STUB_PREVIEW_OVERHEAD: usize = 64;
 /// re-busts the prefix cache the first stub paid for.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let status = if success { "ok" } else { "FAILED" };
-    if text_is_compact_stub(tool_name, output) {
+    if text_is_compact_stub(output) {
         return output.to_string();
     }
     let line_count = output.lines().count();
-    // Chars are the single unit of decision: the preview fires only when the
-    // original has more chars than the preview could ever occupy (head + tail
-    // + the marker overhead), so a stub never grows past the text it
-    // replaces. The byte length is only a cheap pre-filter for the char count
-    // (it never under-counts chars), and the oversized branch slices on char
-    // boundaries instead of materializing the whole output.
-    let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL + STUB_PREVIEW_OVERHEAD;
-    let char_count = if output.len() > budget {
-        output.chars().count()
-    } else {
-        0
-    };
-    if char_count <= budget {
-        let first_line: String = {
-            let mut iter = output.lines();
-            let l1 = iter.next().unwrap_or("(empty)");
-            let chosen = if l1.starts_with("[elapsed:") {
-                iter.next().unwrap_or(l1)
-            } else {
-                l1
-            };
-            chosen.chars().take(80).collect()
-        };
-        return format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]");
+    // The preview fires only when the cut middle is at least half the head
+    // (a near-threshold rewrite busts the prefix cache for almost no
+    // saving), and the candidate is compared against the original: one that
+    // is not strictly shorter falls back to the first-line shape, so no
+    // fixed overhead approximation can ever let a stub grow past the text
+    // it replaces.
+    let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL;
+    let char_count = output.chars().count();
+    if char_count > budget + STUB_PREVIEW_MIN_OMITTED {
+        let head_end = output
+            .char_indices()
+            .nth(STUB_PREVIEW_HEAD)
+            .map(|(i, _)| i)
+            .unwrap_or(output.len());
+        let tail_start = output
+            .char_indices()
+            .nth(char_count - STUB_PREVIEW_TAIL)
+            .map(|(i, _)| i)
+            .unwrap_or(output.len());
+        let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
+        let candidate = format!(
+            "[{tool_name} {status}: {line_count} lines, head: {} … [omitted {omitted} chars] … {}]",
+            &output[..head_end],
+            &output[tail_start..]
+        );
+        if candidate.chars().count() < char_count {
+            return candidate;
+        }
     }
-    let head_end = output
-        .char_indices()
-        .nth(STUB_PREVIEW_HEAD)
-        .map(|(i, _)| i)
-        .unwrap_or(output.len());
-    let tail_start = output
-        .char_indices()
-        .nth(char_count - STUB_PREVIEW_TAIL)
-        .map(|(i, _)| i)
-        .unwrap_or(output.len());
-    let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
-    format!(
-        "[{tool_name} {status}: {line_count} lines, head: {} … [omitted {omitted} chars] … {}]",
-        &output[..head_end],
-        &output[tail_start..]
-    )
+    let first_line: String = {
+        let mut iter = output.lines();
+        let l1 = iter.next().unwrap_or("(empty)");
+        let chosen = if l1.starts_with("[elapsed:") {
+            iter.next().unwrap_or(l1)
+        } else {
+            l1
+        };
+        chosen.chars().take(80).collect()
+    };
+    format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]")
 }

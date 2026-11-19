@@ -123,7 +123,7 @@ impl CompactionStrategy for StubCompaction {
                 continue; // protected prefix (kernel re-enforces; skip early)
             }
             if m.role != Role::Tool || m.text.len() <= MIN_COLLAPSE_SIZE {
-                continue; // not a (big enough) tool result; already-small = idempotent
+                continue; // not a tool result; already-small rides the envelope guard below
             }
             let tool = m
                 .tool_call_id
@@ -134,7 +134,7 @@ impl CompactionStrategy for StubCompaction {
             if self.exempt_read_file && tool == "read_file" {
                 continue;
             }
-            if text_is_compact_stub(tool, &m.text) {
+            if text_is_compact_stub(&m.text) {
                 continue; // already stubbed: a second pass stays a no-op
             }
             // Tool RESULT success = NOT is_error.
@@ -321,7 +321,7 @@ impl OverflowCompaction {
             if tool == "read_file" && i >= read_exempt_from {
                 continue; // recent read → keep full (working context)
             }
-            if text_is_compact_stub(tool, &m.text) {
+            if text_is_compact_stub(&m.text) {
                 continue; // already stubbed: a second pass stays a no-op
             }
             out.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
@@ -2164,6 +2164,22 @@ mod tests {
             !rw.iter().any(|(i, _)| *i == 6),
             "recent read (at/above boundary) must be exempt: {rw:?}"
         );
+    }
+
+    #[test]
+    fn preview_stub_is_strictly_shorter_even_with_long_tool_names() {
+        // 刚过预览阈值 + FAILED + 长 MCP 限定名：候选 stub 也必须严格短于
+        // 原文——候选实长比较保证不存在「压缩变膨胀」的输入。
+        let tool = "mcp__some_server__a_very_long_tool_name";
+        let output = "y".repeat(2_700);
+        let stub = build_compact_stub(tool, &output, false);
+        assert!(
+            stub.chars().count() < output.chars().count(),
+            "a preview stub must be strictly shorter than its source: {} chars",
+            stub.chars().count()
+        );
+        // And the envelope guard recognizes its own output.
+        assert!(text_is_compact_stub(&stub));
     }
 
     #[test]
