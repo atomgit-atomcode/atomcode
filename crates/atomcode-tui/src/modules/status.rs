@@ -1050,11 +1050,7 @@ mod tests {
         assert_eq!(none, busy);
     }
 
-    /// The allowance is only spoken about once it is close to spent.
-    ///
-    /// The whole point is that it is silent the rest of the time: a row that
-    /// always carried the figure would be one more thing to read past, and it
-    /// would stop meaning anything when it mattered.
+    /// The idle-beat gate: near enough to matter, and the window still alive.
     #[test]
     fn the_row_is_remembered_only_while_the_figure_is_near_and_alive() {
         let now = crate::moment::Timestamp::millis(1_000);
@@ -1076,6 +1072,11 @@ mod tests {
         ));
     }
 
+    /// The allowance is only spoken about once it is close to spent.
+    ///
+    /// The whole point is that it is silent the rest of the time: a row that
+    /// always carried the figure would be one more thing to read past, and it
+    /// would stop meaning anything when it mattered.
     #[test]
     fn the_allowance_is_only_said_once_it_is_worth_saying() {
         let now = crate::moment::Timestamp::millis(0);

@@ -1206,8 +1206,9 @@ async fn answer_prompts(
 /// The least time between two questions about the allowance.
 ///
 /// The figure only moves when a turn spends something, and the question costs a
-/// round trip on the account — so it is asked after a turn and then held off
-/// for this long. The number is the one `atomcode-tuix` settled on.
+/// round trip on the account — so it is asked after a turn, on the idle beat
+/// while a badge is actually on the row (`tick_beat`), and then held off for
+/// this long. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
@@ -1706,7 +1707,8 @@ pub struct Tui {
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// When the allowance was last asked about, so it is not asked again for
-    /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
+    /// [`ALLOWANCE_EVERY`]. `None` until the first ask — the end of a turn, or
+    /// the first idle beat while a badge is on the row.
     allowance_checked: Mutex<Option<std::time::Instant>>,
     /// Invalidates quota requests issued before the active model was replaced.
     allowance_generation: Arc<AtomicU64>,
@@ -18395,7 +18397,10 @@ mod allowance_switch_tests {
             let mut m = host.moment.write().unwrap();
             m.allowance = crate::moment::Allowance::nearest(&spent, m.now);
         }
-        tui.check_allowance();
+        // Through the idle beat — the contract this PR adds is "Tick re-asks a
+        // visible badge", so the test must drive that path, not the bare ask.
+        *tui.allowance_checked.lock().unwrap() = None;
+        tui.tick_beat();
         let ask = pending.recv().await.unwrap();
         // The account was refreshed underneath the window: the row must
         // follow the new figure instead of keeping the stale one up.
@@ -18438,9 +18443,7 @@ mod allowance_switch_tests {
                 label: "5h".into(),
                 percent: 99,
                 resets_at: String::new(),
-                resets_by: Some(crate::moment::Timestamp::millis(
-                    now.as_millis() as u64 + 60_000,
-                )),
+                resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
             });
         }
         *tui.allowance_checked.lock().unwrap() = None;
@@ -18456,7 +18459,7 @@ mod allowance_switch_tests {
                 percent: 99,
                 resets_at: String::new(),
                 resets_by: Some(crate::moment::Timestamp::millis(
-                    now.as_millis().saturating_sub(1) as u64,
+                    now.as_millis().saturating_sub(1),
                 )),
             });
         }
