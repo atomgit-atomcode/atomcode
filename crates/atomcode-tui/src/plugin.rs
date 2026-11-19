@@ -147,6 +147,7 @@ plexus_service!(PlacesSvc => dyn crate::places::Places, "tui-places", Seam, "The
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and
 // `/setup` on a brand-new machine is the one thing that needs more than that.
 plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Inspecting project capabilities, reviewing setup actions, and bootstrapping seed skills");
+plexus_service!(MigrationSvc => dyn crate::migration::Migration, "tui-migration", Seam, "Read the assets another AI coding agent left behind");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -1263,6 +1264,13 @@ enum Wake {
         message: String,
     },
     Fact,
+    ProviderModelsEnriched {
+        original: crate::providers::Step,
+        drafts: Vec<crate::providers::ModelDraft>,
+        before: Option<crate::providers::Panel>,
+        after: Option<crate::providers::Panel>,
+        session: String,
+    },
     SessionReferences,
     Foreground {
         request: u64,
@@ -2426,6 +2434,38 @@ impl UserInterface for Tui {
                     if client.take_remark() {
                         self.refresh_providers();
                     }
+                }
+                Wake::ProviderModelsEnriched {
+                    original,
+                    mut drafts,
+                    before,
+                    after,
+                    session,
+                } => {
+                    use crate::providers::Step;
+                    let still_here = self.client.session() == session
+                        && self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .providers_panel
+                            == after;
+                    if !still_here {
+                        for draft in &mut drafts {
+                            draft.use_now = false;
+                        }
+                    }
+                    let step = match original {
+                        Step::SaveModel { id: None, draft } => Step::SaveModel {
+                            id: None,
+                            draft: drafts.pop().unwrap_or(draft),
+                        },
+                        Step::SaveModels { .. } => Step::SaveModels { drafts },
+                        step => step,
+                    };
+                    self.finish_provider_step(step, before.filter(|_| still_here));
+                    stale = true;
                 }
                 // Most of what arrives here moves nothing on the screen: a
                 // streamed delta is already in the transcript by the time it is
@@ -4254,6 +4294,50 @@ impl Tui {
         let Some(step) = asked else {
             return changed;
         };
+        use crate::providers::Step;
+        let drafts = match &step {
+            Step::SaveModel { id: None, draft } => std::slice::from_ref(draft),
+            Step::SaveModels { drafts } => drafts.as_slice(),
+            _ => &[],
+        };
+        if !drafts.is_empty() {
+            let ctx = self.ctx.lock().expect("ctx poisoned").clone();
+            let wake = self.wake.lock().expect("wake poisoned").clone();
+            if let Some((job, wake)) = ctx
+                .and_then(|ctx| ctx.service::<ProvidersSvc>())
+                .and_then(|port| port.enrich_models(drafts))
+                .zip(wake)
+            {
+                let after = self
+                    .host
+                    .moment
+                    .read()
+                    .expect("moment poisoned")
+                    .providers_panel
+                    .clone();
+                let session = self.client.session();
+                tokio::spawn(async move {
+                    let drafts = job.await;
+                    let _ = wake.send(Wake::ProviderModelsEnriched {
+                        original: step,
+                        drafts,
+                        before,
+                        after,
+                        session,
+                    });
+                });
+                return true;
+            }
+        }
+        self.finish_provider_step(step, before);
+        true
+    }
+
+    fn finish_provider_step(
+        &self,
+        step: crate::providers::Step,
+        before: Option<crate::providers::Panel>,
+    ) {
         let key = match &step {
             crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
             crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
@@ -4281,7 +4365,6 @@ impl Tui {
             }
         }
         self.refresh_providers();
-        true
     }
 
     /// Send one change over the providers seam, then tell the runtime.

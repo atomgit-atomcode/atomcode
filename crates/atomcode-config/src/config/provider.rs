@@ -6,6 +6,9 @@ pub struct ProviderConfig {
     pub provider_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// This runtime projection already resolved the credential against its account.
+    #[serde(skip)]
+    pub api_key_is_resolved: bool,
     pub model: String,
     pub base_url: Option<String>,
     pub system_prompt: Option<String>,
@@ -120,6 +123,9 @@ pub struct ProviderAccountConfig {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Keep this account's credential independent of process-wide defaults.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_api_key_fallback: bool,
     /// Overrides the preset's default base URL. Required for custom-compatible
     /// providers (which have no preset default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,6 +316,7 @@ impl ResolvedModelConfig {
         ProviderConfig {
             provider_type: self.provider_type.clone(),
             api_key: self.api_key.clone(),
+            api_key_is_resolved: true,
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             system_prompt: self.system_prompt.clone(),
@@ -354,6 +361,9 @@ impl ProviderConfig {
     ///    a. Check provider-type specific environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_API_KEY`).
     ///    b. Check general environment variable `ATOMCODE_API_KEY`.
     pub fn resolved_api_key(&self) -> Option<String> {
+        if self.api_key_is_resolved {
+            return self.api_key.clone();
+        }
         if let Some(key_str) = self.api_key.as_deref() {
             let trimmed = key_str.trim();
             if !trimmed.is_empty() {
@@ -621,6 +631,7 @@ mod tests {
     #[test]
     fn skip_tls_verify_not_serialized_when_false() {
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
             model: "gpt-4o".into(),
@@ -654,6 +665,7 @@ mod tests {
     #[test]
     fn skip_tls_verify_serialized_when_true() {
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
             model: "gpt-4o".into(),
@@ -736,6 +748,7 @@ mod tests {
         std::env::set_var("TEST_API_KEY_ENV", "sk-from-env-var");
 
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("$TEST_API_KEY_ENV".into()),
             model: "gpt-4o".into(),
@@ -768,6 +781,7 @@ mod tests {
         std::env::set_var("MY_CUSTOM_KEY_NAME", "sk-custom-123");
 
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("MY_CUSTOM_KEY_NAME".into()),
             model: "gpt-4o".into(),
@@ -800,6 +814,7 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "sk-openai-std");
 
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: None,
             model: "gpt-4o".into(),

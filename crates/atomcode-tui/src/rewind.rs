@@ -70,8 +70,7 @@ pub struct Point {
     pub turn: u64,
     /// 开这一回合的那句话,列表要的短版本。
     pub prompt: String,
-    /// 这一回合动过的文件。空着就是「没有代码改动」,而那句话要说出来——列表里一条
-    /// 没有第二行的条目,读起来是「还没算完」。
+    /// 这一回合记录到的文件改动。只有保留了代码快照时，空列表才表示没有代码改动。
     pub changes: Vec<Change>,
     /// 工作区能不能退回到它之前。
     pub code: bool,
@@ -170,13 +169,15 @@ impl RewindView {
 
     /// 这一回合为什么不能连代码一起回,能的话是 `None`。
     ///
-    /// 两个理由分开说:整棵树回不去(宿主给的原话)和这一回合本来就没动过文件,是两件
-    /// 不同的事,人要据此做的决定也不同。
+    /// 分别显示会话未录制代码、本轮缺少快照，以及已录制但没有改动。
     pub fn code_why_not(&self, point: &Point) -> Option<String> {
         if let Some(why) = self.code_unavailable.as_ref() {
             return Some(why.say());
         }
-        if !point.code || point.changes.is_empty() {
+        if !point.code {
+            return Some(t(Msg::RewindPanelTurnNoCheckpoint).into_owned());
+        }
+        if point.changes.is_empty() {
             return Some(t(Msg::RewindPanelTurnNoFiles).into_owned());
         }
         None

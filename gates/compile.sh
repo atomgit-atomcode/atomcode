@@ -59,7 +59,7 @@ rm -f /tmp/atomcode-compile-gate.$$
 # —— e2e 与 lsp-e2e 都要真实的外部服务。
 echo "→ feature 门控的测试也能编译"
 # Compile the opt-in bench target too; never run or threshold its timings here.
-FEATURE_GATED='session,memory,setup,e2e,mcp,lsp-e2e,bench'
+FEATURE_GATED='session,memory,setup,e2e,mcp,lsp-e2e,bench,migration'
 if cargo check -p atomcode-capabilities --all-targets \
      --features "$FEATURE_GATED" \
      >/tmp/atomcode-feature-gate.$$ 2>&1; then
@@ -77,8 +77,10 @@ rm -f /tmp/atomcode-feature-gate.$$
 # `tests/` 下再删掉 —— 这样走的是 `--all-targets` 真正会去编的那条路,而不是另起一个
 # 只在这里存在的构造。
 echo "→ 闸门自身会判红"
-canary="crates/atomcode-host-api/tests/__gate_canary.rs"
-cleanup() { rm -f "$canary"; }
+# PID 用下划线分隔：Cargo 将文件名用作测试 crate 名，crate 名不能含点。
+canary="crates/atomcode-host-api/tests/__gate_canary_$$.rs"
+canary_out=$(mktemp) || exit 1
+cleanup() { rm -f "$canary" "$canary_out"; }
 trap cleanup EXIT
 cat > "$canary" <<'RS'
 // 阴性对照用,由 gates/compile.sh 写入并立刻删除。留在树里说明上一次跑被打断了。
@@ -87,8 +89,11 @@ fn this_must_not_compile() {
     let _: u32 = "gate canary";
 }
 RS
-if cargo check --workspace --all-targets >/dev/null 2>&1; then
+if cargo check --workspace --all-targets >"$canary_out" 2>&1; then
   printf '  \033[31mFAIL\033[0m 闸门判不出编译错误 —— 它现在什么也没在挡\n'
+  fail=1
+elif ! grep -Fq -- "--> $canary:" "$canary_out"; then
+  printf '  \033[31mFAIL\033[0m 闸门报红，但本次阴性对照没有产生诊断\n'
   fail=1
 else
   printf '  \033[32mok\033[0m   闸门自身会判红\n'
@@ -112,8 +117,9 @@ trap - EXIT
 # 时,新门的红不能算作「判得出」;旧门因别的原因本来就红时,也不能说成「新门没盖住
 # 新地方」。
 echo "→ feature 门控的闸门自身会判红（旧门对它应当无感）"
-feature_canary="crates/atomcode-capabilities/tests/__feature_gate_canary.rs"
-feature_out=$(mktemp)
+# 同样用下划线分隔 PID，并且只认本次阴性对照的源文件诊断。
+feature_canary="crates/atomcode-capabilities/tests/__feature_gate_canary_$$.rs"
+feature_out=$(mktemp) || exit 1
 feature_cleanup() { rm -f "$feature_canary" "$feature_out"; }
 trap feature_cleanup EXIT
 cat > "$feature_canary" <<'RS'
@@ -128,12 +134,12 @@ if cargo check -p atomcode-capabilities --all-targets \
      --features "$FEATURE_GATED" >"$feature_out" 2>&1; then
   printf '  \033[31mFAIL\033[0m feature 门控的闸门判不出编译错误\n'
   fail=1
-elif ! grep -q "__feature_gate_canary" "$feature_out"; then
+elif ! grep -Fq -- "--> $feature_canary:" "$feature_out"; then
   printf '  \033[31mFAIL\033[0m feature 门报红,但不是阴性对照引起的 —— feature 门后面的代码本来就坏着,这一条判不了\n'
   fail=1
 elif cargo check --workspace --all-targets >"$feature_out" 2>&1; then
   printf '  \033[32mok\033[0m   feature 门控的闸门自身会判红（旧门对它无感）\n'
-elif grep -q "__feature_gate_canary" "$feature_out"; then
+elif grep -Fq -- "--> $feature_canary:" "$feature_out"; then
   printf '  \033[31mFAIL\033[0m 旧门也看见了阴性对照 —— 这条新门没盖住新地方\n'
   fail=1
 else

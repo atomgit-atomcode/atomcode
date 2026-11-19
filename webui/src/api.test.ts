@@ -472,6 +472,76 @@ test('streamChat accepts done, stopped, and error as authoritative terminals', a
   }
 });
 
+test('streamChat preserves partial output and identifies a disconnected response body', async () => {
+  const originalFetch = globalThis.fetch;
+  const body = interruptedStreamAfter({ type: 'text', content: 'partial' });
+  globalThis.fetch = async () => new Response(body);
+  try {
+    const { streamChat } = await import('./api.ts');
+    const events: unknown[] = [];
+    await assert.rejects(() => streamChat({ message: 'hello' }, event => events.push(event)), error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, 'ApiStreamInterruptedError');
+      assert.match(error.message, /正在接收回复时/);
+      assert.doesNotMatch(error.message, /network error/);
+      return true;
+    });
+    assert.deepEqual(events, [{ type: 'text', content: 'partial' }]);
+    assert.equal(body.locked, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a disconnected response body cannot undo a terminal chat event', async () => {
+  const originalFetch = globalThis.fetch;
+  const { streamChat } = await import('./api.ts');
+  try {
+    for (const terminal of [
+      { type: 'done', session_id: 'session-1', tokens: null },
+      { type: 'stopped' },
+      { type: 'error', message: 'provider failed' },
+    ]) {
+      const body = interruptedStreamAfter(terminal);
+      globalThis.fetch = async () => new Response(body);
+      const events: unknown[] = [];
+      await streamChat({ message: 'hello' }, event => events.push(event));
+      assert.deepEqual(events, [terminal]);
+      assert.equal(body.locked, false);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an aborted chat response body stays an abort', async () => {
+  const originalFetch = globalThis.fetch;
+  const abort = new DOMException('aborted', 'AbortError');
+  const body = interruptedStreamAfter({ type: 'text', content: 'partial' }, abort);
+  globalThis.fetch = async () => new Response(body);
+  try {
+    const { streamChat } = await import('./api.ts');
+    await assert.rejects(() => streamChat({ message: 'hello' }, () => {}), error => error === abort);
+    assert.equal(body.locked, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+function interruptedStreamAfter(event: object, failure: Error = new TypeError('network error')): ReadableStream<Uint8Array> {
+  let sent = false;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) {
+        controller.error(failure);
+        return;
+      }
+      sent = true;
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+    },
+  }, { highWaterMark: 0 });
+}
+
 test('cancelDetachedChat aborts the local stream and uses the existing stop protocol', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;
@@ -692,7 +762,7 @@ test('live stream unlocks its body on normal close and failed reads', async () =
       } });
       globalThis.fetch = (async () => new Response(body)) as typeof fetch;
       const events: unknown[] = [];
-      if (fail) await assert.rejects(streamLive(e => events.push(e)), /disconnected/);
+      if (fail) await assert.rejects(streamLive(e => events.push(e)), { name: 'ApiStreamInterruptedError' });
       else { await streamLive(e => events.push(e)); assert.equal(events.length, 1); }
       assert.equal(body.locked, false);
     }

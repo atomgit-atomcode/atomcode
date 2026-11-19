@@ -235,3 +235,12 @@ pub mod memory;
 
 /// Shared offline model evaluation data and explicit identity matching.
 pub mod model_cards;
+
+/// Scan the assets other AI coding agents left behind, and report what we
+/// already read natively, what can be brought over, and what is blocked.
+///
+/// Opt-in `migration` feature. Read-only: the provider-account draft this
+/// produces is written by the host, not here. See
+/// `docs/plans/2026-11-17-external-agent-asset-migration-design.md`.
+#[cfg(feature = "migration")]
+pub mod migration;

@@ -1,7 +1,10 @@
 # 一键迁移其他 AI Coding Agent 的资产 —— 设计（第一期 + 第二期）
 
 - 日期：2026-11-17
-- 状态：设计已定（brainstorming 结论），待实施计划
+- 状态：**已实现**（9 个 Task 全部完成并提交）。实施计划见
+  `docs/plans/2026-11-17-external-agent-asset-migration-plan.md`。
+  关键决定：报告的**候选也来自注册表** —— 报告只在注册表根本不知道的树
+  （别人的树）上自己遍历，于是「资产」这个概念只有一个来源。
 - 参照：OpenAI Codex 的 `codex-rs/external-agent-migration`（16681 行，「检测 → 迁移 → 残留兜底」三段式）
 - 关联 Issue：[Feature] 一键迁移其他 AI Coding Agent 的资产（指令/技能/配置/会话）
 
@@ -75,10 +78,11 @@ Issue 正文说的「兼容基础已打好」与代码有出入。核实结果�
 
 ```
 crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
-    mod.rs        公共 API：scan / 报告类型 / 来源注册表
-    source.rs     MigrationSource trait
+    mod.rs        公共 API：scan / MigrationSource trait / 报告类型 / 来源注册表
     claude.rs     ClaudeSource
     codex.rs      CodexSource
+    opencode.rs   OpenCodeSource
+    text.rs       文案助手（pub(crate)，不进公共 API）
     report.rs     AssetKind / AssetStatus / AssetReport / MigrationReport
     provider.rs   第二期：外部 provider 配置 → 中立 ProviderAccountDraft
 ```
@@ -100,6 +104,16 @@ crates/atomcode-capabilities/src/migration/     ← 新增，feature "migration"
   | `dep:atomcode-config` | `provider_book::account_id_for` / `effective_endpoint` | 账号 id 与 endpoint **写成什么样** |
 
   自己再写一份校验，迟早与真加载器不一致 —— 而「说生效、其实不生效」正是这个报告最不能有的错。
+
+  **「让真加载器说出来」的字面意思：它说什么就是什么，报告不许自己再推断一遍。**
+  尤其对技能：注册表**走过一遍**目录，它知道自己在哪一层停下了（遇到技能目录
+  就停）、跳过了哪些目录（`node_modules` 等）、受什么深度上限约束、以及**哪一份
+  同名定义赢了**。报告若自己再走一遍去推算「注册表会不会走到这个条目」，两遍
+  遍历在符号链接、别名路径、忽略目录上会给出**不同答案** —— 而「注册表说它没
+  发现」与「报告说它被覆盖」之间，只有前者是真的。
+
+  所以：**注册表记录它发现了什么**（含被同名的另一份顶掉的那一份），报告**只
+  依据这份记录**裁决。没有记录 = 注册表从没走过 = 「没有生效」。
 
   `toml` 用来读 Codex 的 `config.toml`。`atomcode-i18n` 是零 atomcode 依赖的叶子（`gates/layers.sh` 守它），所以 capabilities 引它不破坏分层（`memory` 模块已是同样做法）。`atomcode-config` 这条边 capabilities **本来就有**（`provider` / `mcp` / `instructions` / `session` 等 feature 都拉它），门禁也不禁这条 —— 门禁禁的是 `atomcode-tui → atomcode-coding / atomcode`。
 - 报告的**结构化数据**在 capabilities，**文案**在 `atomcode-i18n` 的 **product 表**（CLI、daemon、setup 流程共用那张）。CLI 与 TUI 都读 product 表 → 一件事一种说法，不写两遍。
@@ -139,7 +153,7 @@ pub trait MigrationSource: Send + Sync {
     fn detect(&self, ctx: &ScanContext) -> Vec<AssetReport>;
 }
 
-/// 内置来源注册表：Claude Code、Codex。
+/// 内置来源注册表：Claude Code、Codex、OpenCode。
 pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>>;
 
 /// 扫一遍所有来源。
@@ -214,6 +228,25 @@ pub struct MigrationReport {
 >
 > **目录读不出来 ≠ 目录是空的**：读不了就是 `Blocked`（附上原因），不是「没发现」。Codex 的「残留兜底」在这里对应的就是这条 —— 探测到的每一项都在报告里，一项都不静默消失。
 
+**OpenCode**（`~/.config/opencode` + `<project>/.opencode`）
+
+| 资产 | 路径 | 状态 |
+|---|---|---|
+| 技能 | `~/.config/opencode/skills/*`、`<project>/.opencode/skills/*` | `Actionable`（同格式，复制即可） |
+| 命令 | `~/.config/opencode/commands/*`、`<project>/.opencode/commands/*` | `Actionable` |
+| 共享技能 | `~/.agents/skills/*`、`<project>/.agents/skills/*` | `Active`（我们**已经读**那个目录） |
+| 共享命令 | `~/.agents/commands/*`、`<project>/.agents/commands/*` | `Actionable` —— **我们不读这个目录**（见下） |
+| provider | `~/.config/opencode/opencode.json` 的 `provider.*` | `Actionable`（第二期） |
+| MCP | `~/.config/opencode/opencode.jsonc` 的 `mcp.*` | `Actionable` |
+| 凭据 | `~/.local/share/opencode/auth.json` | `Blocked` —— **明文密钥，只报不搬** |
+
+> OpenCode 的目录遵循 XDG（`$XDG_CONFIG_HOME` / `$XDG_DATA_HOME`），由**宿主**解析。
+>
+> **`.agents/commands` 我们不读** —— 技能注册表的标准目录表里只有 `.agents/skills`
+> （`skills/registry.rs:585`、`:590`），没有 `.agents/commands`。所以那一份命令
+> **不是「已经在生效」，而是「可以搬过来」**：同格式，复制到产品用户树的
+> `commands/` 即可。技能那一半（`.agents/skills`）才是 `Active`。
+
 ### 3.5 第二期：provider 账号导入
 
 **映射**（`migration/provider.rs` 只产出中立草案，不写盘）：
@@ -222,9 +255,12 @@ pub struct MigrationReport {
 |---|---|---|
 | Claude | `settings.json` → `env.ANTHROPIC_BASE_URL` | `provider_accounts.<id>.base_url` |
 | Claude | `settings.json` → `env.ANTHROPIC_API_KEY`（**值就是密钥**） | `provider_accounts.<id>.api_key`（**逐项确认后**才写） |
-| Claude | `settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | 同上 |
+| Claude | `settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | `provider_accounts.<id>.headers.authorization`，保留 Bearer 认证，逐项确认后写入 |
 | Codex | `config.toml` → `[model_providers.<id>].base_url` | `provider_accounts.<id>.base_url` |
 | Codex | `config.toml` → `[model_providers.<id>].env_key`（**变量名**） | `provider_accounts.<id>.api_key = "${VAR_NAME}"` |
+| OpenCode | `opencode.json(c)` → `provider.<id>.options.apiKey` / `providers.<id>.settings.apiKey` | 明文逐项确认，`{env:NAME}` 写成 `${NAME}`，文件引用阻塞 |
+| OpenCode | `provider(s).<id>.models` | 用显式 wire model ID 或表键建立模型条目 |
+| OpenCode | `opencode.json` → `provider.<id>.options.baseURL` | `provider_accounts.<id>.base_url` |
 | Codex | `config.toml` → `model` | `models.<id>.model` |
 | Codex | `config.toml` → `model_providers.<id>.wire_api` | `provider_accounts.<id>.provider`（`openai-responses` / `openai-compatible` / `anthropic-compatible`） |
 | Codex | `config.toml` → `[model_providers.<id>].wire_api`（**不认识的**值） | **不导入** —— 报 `Blocked` 并写明是哪个协议。`create_account` 会把未知 preset 静默降级成 `openai-compatible`（`config/provider_preset.rs:381`），那就是「用错的线协议连上了」 |
@@ -243,13 +279,9 @@ pub struct MigrationReport {
    **`--yes` 不构成这个确认。** `--yes` 回答的是「把这些账号导进来」，不是「把你没见过的密钥写进文件」—— 带明文密钥的账号**每次都要问**，即使有 `--yes`。没有终端可问时，这类账号**一个都不写**。
    
    **「文件逐字节不变」只在没有任何账号被写时成立。** 一批里既有需要回答的、又有不需要的，前者被跳过、后者照写，文件就**会变** —— 变的是被写的那部分。见 §3.7 的失败语义表。
-4. **写得出来的形式只有两种，且不重叠。** `resolved_api_key`（`config/provider.rs:356`）对 `api_key` 有三个分支：含 `$` 的按环境变量展开；与某个活着的环境变量同名的取那个变量；其余当密钥本身。同一个字符串可能因此有两种含义，所以写出去的形式必须唯一：
-   - **引用**写成 `${NAME}`。展开无歧义：变量没设置就展开成空，**不会**把字符串 `NAME` 当成密钥。写成裸名字会落到「当密钥本身」那个分支，把 `NAME` 当成密钥 —— 那是错得最离谱的一种：文件看着像引用，跑起来拿的是字符串 `NAME`。
+4. **导入账号只用账号自身的凭据。** `disable_api_key_fallback = true` 保存在账号表中。环境引用展开为空时，选用此账号的模型会报配置错误。未声明凭据的账号使用匿名连接或账号自己的请求头。明文 API key 仍拒绝包含 `$` 的值。Claude Code 同时配置 API key 和 Bearer token 时要求手动选择认证方式。
 
-     **但展开成空不等于「没有密钥」。** `resolved_api_key` 展开后若为空，会**继续往下找**平台凭据：`OPENAI_API_KEY`（openai / responses）、`ANTHROPIC_API_KEY`（anthropic）、`ATOMCODE_API_KEY`（`config/provider.rs:375-396`）。所以一个没设置 `${NAME}` 的账号，可能拿到**另一个**凭据去连新端点 —— 迁移来的端点收到不属于它的密钥。
-
-     这不是说 `${NAME}` 不能用：它是**唯一**不把变量名当密钥的写法，而且这正是我们要的（明文密钥原样搬过来更糟）。但**报告与文案不能说「展开成空就没有密钥」** —— 那是不实的。真要严格绑定某个变量，得改 `resolved_api_key` 的解析语义，那是另一个改动，不在本期。
-   - **明文**写成它自己，但前提是不能被读成别的东西：不含 `$`（否则会被展开），也没有同名的活环境变量（否则那个变量会盖过它）。不满足就**拒绝写**并说明原因 —— 写一个有两种含义的文件比不写更糟。
+5. **项目级账号逐项确认。** 提示同时显示来源文件和生效 endpoint。即使项目只覆盖了用户层账号的一个字段，`--yes` 仍不能批准该账号。
 
 **写入**：复用 `atomcode_config::provider_book::ProviderBook::create_account`（`provider_book.rs:192`）。它自带文件锁、`toml_edit` 逐键 patch（保住用户在文件里的注释与排版）、原子替换。**不新造写入逻辑。**
 
@@ -258,7 +290,7 @@ pub struct MigrationReport {
 **确认粒度**：**逐项**。
 
 - **带明文密钥的账号**：每次都问。交互式逐条问；**没有终端可问时一个都不写**（管道 / CI 场景），退出码非 0。
-- **只引用变量名、不含密钥的账号**：`--yes` 直接写；没有 `--yes` 但有终端时也逐条问；**既没有 `--yes` 又没有终端时也不写**（同样没人可问），退出码非 0。
+- **只引用变量名或未指定凭据的用户级账号**：`--yes` 直接写；没有 `--yes` 但有终端时也逐条问；**既没有 `--yes` 又没有终端时也不写**（同样没人可问），退出码非 0。
 
 也就是说：**没有终端可问时，需要回答的账号一个都不写**，其余照写。退出码非 0（有东西没导）。
 
@@ -299,7 +331,7 @@ TUI 通过 `atomcode-tui` 新增的 `migration.rs` 端口 trait（镜像 `setup.
 端口的形状与 `Setup` 完全同形：
 
 - `atomcode-tui/src/migration.rs` 定义**自己的**视图类型（`MigrationReportView` / `MigrationSourceView` / `MigrationAssetView`），**不复用** `capabilities::migration` 的类型 —— 与 `setup.rs` 定义自己的 `CapabilityReport` / `CapabilityEntry` 同一做法，TUI 的依赖面保持最小。
-- 端口方法：`fn report(&self) -> Result<MigrationReportView, String>`（只读，无副作用）。
+- 端口方法：`report(&self, project: &Path)`。每次查询从宿主取当前项目目录，再解析项目技能根。
 - 实现在 `atomcode-cli/src/tui_migration.rs`：调 `capabilities::migration::scan`（CLI 有 `atomcode-config` 与家目录解析），把结果**转成**端口的视图类型。
 
 **文案只出一处**：`capabilities::migration` 产出的每项资产**已带本地化好的 `detail`**（用 `atomcode_i18n::product`）。两个前端都只**显示**它，不各自拼句子 → 一件事一种说法。TUI 面板的标题 / 空态等**界面文案**走 screen 表。
@@ -314,6 +346,7 @@ TUI 通过 `atomcode-tui` 新增的 `migration.rs` 端口 trait（镜像 `setup.
 | 外部文件格式损坏（坏 JSON / 坏 TOML） | 该项报 `Blocked`，`detail` 说明「文件无法解析」，**不 panic、不中断整次扫描** |
 | 外部目录存在但读不了 | 报 `Blocked` 并附上原因 —— **不是**「没发现」。读不了与没有是两件事。 |
 | 单个资产探测出错 | 其余资产照常报告；错误变成那一项的 `detail` |
+| provider 配置层不可读 | 暂停该来源的账号写入，其他来源继续；`--apply` 报出文件并返回非 0 |
 | 扫描期间文件被删 | 视同不存在 |
 | `--apply` 时配置已被别的进程改过 | `ProviderBook` 在锁内读最新文档再决策（`provider_book.rs:165` `write_deciding`），**合并**而不是拒绝；只有 id 冲突才拒绝 |
 | `--apply` 遇到带明文密钥的账号 | **每次都问**（`--yes` 也不代替这个确认）；没有终端可问时**不写**，退出码非 0 |

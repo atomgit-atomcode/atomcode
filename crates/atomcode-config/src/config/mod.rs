@@ -1592,6 +1592,9 @@ impl Config {
             .clone()
             .or_else(|| preset.default_base_url.map(str::to_string));
         let api_key = resolve_account_api_key(account, preset);
+        if account.disable_api_key_fallback && account.api_key.is_some() && api_key.is_none() {
+            return Err(MissingBoundApiKey(model.account.clone()).into());
+        }
         Ok(ResolvedModelConfig {
             selection_id,
             account_id: model.account.clone(),
@@ -1737,6 +1740,22 @@ pub struct ReasoningFieldsMut<'a> {
     pub reasoning_effort: &'a mut Option<String>,
 }
 
+/// The account requires its own configured key, which could not be resolved.
+#[derive(Debug)]
+pub struct MissingBoundApiKey(String);
+
+impl std::fmt::Display for MissingBoundApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "account `{}` has no value for its configured API key",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for MissingBoundApiKey {}
+
 /// See [`Config::account_endpoint`]. `Debug` redacts the key.
 #[derive(Clone)]
 pub struct AccountEndpoint {
@@ -1768,6 +1787,14 @@ fn resolve_account_api_key(
     account: &ProviderAccountConfig,
     preset: &provider_preset::ProviderPreset,
 ) -> Option<String> {
+    if account.disable_api_key_fallback {
+        let value = account.api_key.as_deref()?.trim();
+        if value.contains('$') {
+            let expanded = provider::expand_env_vars(value);
+            return (!expanded.trim().is_empty()).then_some(expanded);
+        }
+        return (!value.is_empty()).then(|| value.to_owned());
+    }
     if let Some(raw) = account.api_key.as_deref() {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -2127,6 +2154,7 @@ fn codingplan_shares_group_gateway(base_url: Option<&str>) -> bool {
 /// Project a legacy provider into a synthetic [`ProviderAccountConfig`].
 fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
     ProviderAccountConfig {
+        disable_api_key_fallback: p.api_key_is_resolved,
         provider: legacy_provider_to_preset_id(&p.provider_type).to_string(),
         display_name: None,
         api_key: p.api_key.clone(),
@@ -4173,6 +4201,7 @@ model = "missing-type"
         cfg.providers.insert(
             "p".to_string(),
             ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".to_string(),
                 api_key: Some("k".to_string()),
                 model: "m".to_string(),
@@ -4398,6 +4427,7 @@ model = "missing-type"
         cfg.providers.insert(
             "p".to_string(),
             ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".to_string(),
                 api_key: Some("k".to_string()),
                 model: "m".to_string(),
@@ -4500,6 +4530,7 @@ model = "missing-type"
         providers.insert(
             "active".to_string(),
             crate::config::provider::ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".into(),
                 api_key: Some("sk-test".into()),
                 model: active_model.into(),
@@ -4637,6 +4668,7 @@ model = "missing-type"
         cfg.providers.insert(
             "vl-helper".into(),
             crate::config::provider::ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".into(),
                 api_key: Some("sk-vl".into()),
                 model: "Qwen/Qwen3-VL-32B-Instruct".into(),
@@ -4856,6 +4888,46 @@ capable_model = 5
 "#;
 
     #[test]
+    fn imported_accounts_never_resolve_an_unrelated_api_key() {
+        let previous = std::env::var_os("ATOMCODE_API_KEY");
+        std::env::set_var("ATOMCODE_API_KEY", "ambient-key");
+        let config: Config = toml::from_str(
+            r#"
+[provider_accounts.explicit]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+disable_api_key_fallback = true
+api_key = "${ATOMCODE_TEST_MIGRATION_UNSET_KEY}"
+[models.explicit-model]
+account = "explicit"
+model = "demo"
+
+[provider_accounts.anonymous]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+disable_api_key_fallback = true
+[models.anonymous-model]
+account = "anonymous"
+model = "demo"
+"#,
+        )
+        .unwrap();
+        let missing = config.resolve_model(Some("explicit-model"));
+        let explicit_endpoint = config.account_endpoint("explicit").unwrap();
+        let anonymous = config.resolve_model(Some("anonymous-model")).unwrap();
+        let projected_key = anonymous.to_provider_config().resolved_api_key();
+        match previous {
+            Some(value) => std::env::set_var("ATOMCODE_API_KEY", value),
+            None => std::env::remove_var("ATOMCODE_API_KEY"),
+        }
+
+        assert!(missing.unwrap_err().is::<MissingBoundApiKey>());
+        assert!(explicit_endpoint.api_key.is_none());
+        assert!(anonymous.api_key.is_none());
+        assert!(projected_key.is_none());
+    }
+
+    #[test]
     fn new_schema_parses_accounts_models_and_default_model() {
         let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
         assert_eq!(cfg.provider_accounts.len(), 1);
@@ -4895,6 +4967,7 @@ capable_model = 5
         cfg.provider_accounts.insert(
             "oauth-live".into(),
             provider::ProviderAccountConfig {
+                disable_api_key_fallback: false,
                 provider: "openai".into(),
                 display_name: None,
                 api_key: Some("sk-runtime-only".into()),
@@ -4950,6 +5023,7 @@ capable_model = 5
         cfg.provider_accounts.insert(
             "corp".into(),
             provider::ProviderAccountConfig {
+                disable_api_key_fallback: false,
                 provider: "openai-compatible".into(), // no default endpoint…
                 display_name: None,
                 api_key: None,
@@ -5169,6 +5243,7 @@ context_window = 131072
         legacy2.provider_accounts.insert(
             "MyDeepSeek".into(),
             provider::ProviderAccountConfig {
+                disable_api_key_fallback: false,
                 provider: "deepseek".into(),
                 display_name: None,
                 api_key: None,

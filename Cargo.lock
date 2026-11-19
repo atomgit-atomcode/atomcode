@@ -421,6 +421,7 @@ dependencies = [
  "base64",
  "chardetng",
  "chrono",
+ "chrono-tz",
  "ctor",
  "dirs",
  "encoding_rs",

@@ -40,6 +40,7 @@ fn every_command_this_screen_offers_is_described_in_both_languages() {
             Box::new(atomcode_tui::commands::TakeAwayCommands),
             Box::new(atomcode_tui::commands::ToolCommands),
             Box::new(atomcode_tui::commands::SetupCommands),
+            Box::new(atomcode_tui::commands::ImportCommands),
         ] {
             for command in set.commands().into_iter().chain(set.hidden()) {
                 out.push((command.name.to_string(), command.about.to_string()));

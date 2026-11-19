@@ -1034,10 +1034,12 @@ pub struct ModelForm {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Discovered {
     pub id: String,
+    pub catalog_only: bool,
     pub name: Option<String>,
     pub max_tokens: Option<usize>,
     pub vision: Option<bool>,
     pub effort: Option<String>,
+    pub catalog_default_effort: Option<String>,
     pub levels: Option<Vec<String>>,
     /// The context window the listing gave, when it gave one.
     pub window: Option<usize>,
@@ -2668,6 +2670,11 @@ pub trait Providers: Send + Sync {
         Err("Batch model saving is unavailable".into())
     }
 
+    /// Resolve public catalog metadata before the synchronous config write.
+    fn enrich_models(&self, _drafts: &[ModelDraft]) -> Option<EnrichModelsFuture> {
+        None
+    }
+
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String>;
 
     fn delete_model(&self, id: &str) -> Result<(), String>;
@@ -2704,6 +2711,9 @@ pub trait Providers: Send + Sync {
 pub type DiscoverFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Vec<Discovered>, String>> + Send + 'static>,
 >;
+
+pub type EnrichModelsFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ModelDraft>> + Send + 'static>>;
 
 /// See [`Providers::probe`]: what to say, and whether all is well.
 pub type ProbeFuture =
@@ -3945,6 +3955,8 @@ mod tests {
         form.advanced = false;
         let item = Discovered {
             id: "flash".into(),
+            catalog_only: false,
+            catalog_default_effort: None,
             name: Some("Flash".into()),
             window: Some(1048576),
             max_tokens: Some(393216),

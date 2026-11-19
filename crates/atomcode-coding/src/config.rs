@@ -676,15 +676,22 @@ impl CodingRuntimeConfig {
             .filter(|name| !name.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| config.effective_model_selection().unwrap_or_default());
-        let resolved = config.resolve_model(Some(&requested)).ok().or_else(|| {
-            let mut ids: Vec<String> = config.logical_models().into_keys().collect();
-            ids.sort();
-            ids.into_iter()
-                .find_map(|id| config.resolve_model(Some(&id)).ok())
-        });
-        let r = resolved.as_ref();
         let (permission_rules, mut startup_warnings) =
             permission_rules_from_config(&config.permissions);
+        let resolved = match config.resolve_model(Some(&requested)) {
+            Ok(resolved) => Some(resolved),
+            Err(error) if error.is::<atomcode_config::config::MissingBoundApiKey>() => {
+                startup_warnings.push(error.to_string());
+                None
+            }
+            Err(_) => {
+                let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+                ids.sort();
+                ids.into_iter()
+                    .find_map(|id| config.resolve_model(Some(&id)).ok())
+            }
+        };
+        let r = resolved.as_ref();
         // The external agents are resolved again at each spawn site
         // (`parts::prepare_from_config`); what they said about the file is said
         // once, here.
@@ -891,8 +898,9 @@ pub fn apply_provider_config(
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
-    if let Some(api_key) = provider.resolved_api_key() {
-        config.api_key = api_key;
+    let api_key = provider.resolved_api_key();
+    if provider.api_key_is_resolved || api_key.is_some() {
+        config.api_key = api_key.unwrap_or_default();
     }
     config.context_window = provider.context_window as u32;
     config.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);

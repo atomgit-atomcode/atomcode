@@ -1,4 +1,4 @@
-import { apiFetch } from './lib/transport.ts';
+import { apiFetch, ApiStreamInterruptedError } from './lib/transport.ts';
 
 // Task 12 — API client for atomcode webui
 
@@ -185,7 +185,7 @@ export async function cancelDetachedChat(
 async function readEventStream<T>(
   response: Response,
   onEvent: (event: T) => void,
-  options: { onActivity?: () => void; flushTrailing?: boolean } = {},
+  options: { onActivity?: () => void; flushTrailing?: boolean; signal?: AbortSignal } = {},
 ): Promise<void> {
   if (!response.ok) throw await failure(response);
   const reader = response.body!.getReader();
@@ -201,7 +201,12 @@ async function readEventStream<T>(
   };
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        if (options.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw error;
+        }
+        throw new ApiStreamInterruptedError();
+      });
       if (done) break;
       options.onActivity?.();
       buffer += decoder.decode(value, { stream: true });
@@ -234,16 +239,22 @@ export async function streamChat(
   });
 
   let terminalSeen = false;
-  await readEventStream<SSEEvent>(resp, event => {
-    // Preserve /chat's existing callback isolation; /live dispatch errors
-    // propagate so its caller can reconnect rather than appear healthy.
-    try {
-      if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
-        terminalSeen = true;
-      }
-      onEvent(event);
-    } catch { /* legacy /chat dispatch isolation */ }
-  }, { flushTrailing: true });
+  try {
+    await readEventStream<SSEEvent>(resp, event => {
+      // Preserve /chat's existing callback isolation; /live dispatch errors
+      // propagate so its caller can reconnect rather than appear healthy.
+      try {
+        if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
+          terminalSeen = true;
+        }
+        onEvent(event);
+      } catch { /* legacy /chat dispatch isolation */ }
+    }, { flushTrailing: true, signal });
+  } catch (error) {
+    // An authoritative terminal has already settled the turn. A late
+    // transport failure cannot put the chat back into detached recovery.
+    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError)) throw error;
+  }
 
   if (signal?.aborted) {
     const error = new Error('chat stream aborted');
@@ -561,6 +572,8 @@ export interface ProviderPresetInfo {
 
 export interface DiscoveredModelInfo {
   id: string;
+  catalog_only?: boolean;
+  catalog_default_effort?: string;
   supports_vision?: boolean;
   reasoning_effort_levels?: string[];
   reasoning_effort?: string;
@@ -1186,7 +1199,7 @@ export async function streamLive(
 ): Promise<void> {
   const params = sessionId ? `?recent=true&session_id=${encodeURIComponent(sessionId)}` : '?recent=true';
   const resp = await apiFetch(`/live${params}`, { headers: authHeaders(), signal });
-  await readEventStream(resp, onEvent, { onActivity });
+  await readEventStream(resp, onEvent, { onActivity, signal });
 }
 
 export async function postLiveMessage(

@@ -894,6 +894,7 @@ fn list_key(list: &mut List, press: KeyPress) -> Step {
             Step::Stay
         }
         (Key::Enter, _) => match list.selected() {
+            Some(row) if row.value.is_empty() => Step::Stay,
             Some(row) => Step::Chose(row.value.clone()),
             // 一条都没筛出来,而这张单子认打的字:打的就是答案。
             None => match (&list.typed, list.query.trim()) {

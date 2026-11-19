@@ -132,6 +132,7 @@ toml = { version = "1", optional = true }
 # timestamps, current-date injection, recall date filtering). dirs resolves
 # $ATOMCODE_HOME/sessions; fs2 serializes per-session meta read-modify-write.
 chrono = { version = "0.4", optional = true }
+chrono-tz = { version = "0.10", optional = true }
 # `setup` also uses fs2 for its install lock; thiserror provides typed setup errors.
 # anyhow/sha2/chrono/serde/serde_json/tempfile are shared with other
 # capabilities (or already non-optional). Optional so a non-setup embedder skips them.
@@ -156,7 +157,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper", "dep:socket2"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:tempfile", "dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "dep:image", "dep:tracing", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:tempfile", "dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "dep:image", "dep:tracing", "dep:chrono", "dep:chrono-tz", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
@@ -253,6 +254,25 @@ plugin = [
     "dep:chrono",
     "dep:atomcode-auth", "dep:atomcode-config",
     "skills",
+]
+# Scan assets left behind by other AI coding agents (Claude Code / Codex) and
+# report what we already read natively, what can be brought over, and what is
+# blocked. Read-only; the provider-account draft it produces is written by the
+# host, never here.
+#
+# It DOES pull `atomcode-config`, for two reasons: the id and the endpoint
+# have to be normalised by the SAME rule the writer uses (otherwise the
+# re-check never matches), and the real loaders' verdicts are what say
+# "already in effect". `ProductDirs` lives in THIS crate (`product_dirs.rs`),
+# so the trees still cost no dependency.
+migration = [
+    "tools",
+    "instructions",
+    "mcp",
+    "skills",
+    "dep:atomcode-i18n",
+    "dep:atomcode-config",
+    "dep:toml",
 ]
 
 [target.'cfg(unix)'.dependencies]

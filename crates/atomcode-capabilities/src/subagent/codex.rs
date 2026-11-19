@@ -219,6 +219,19 @@ fn codex_final_message_from_json_line(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn codex_turn_failure(line: &str) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    if event.get("type")?.as_str()? != "turn.failed" {
+        return None;
+    }
+    Some(
+        event["error"]["message"]
+            .as_str()
+            .unwrap_or("Codex reported a failed turn")
+            .to_owned(),
+    )
+}
+
 /// Truncate on a char boundary with an ellipsis.
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -249,6 +262,9 @@ impl SubagentBackend for CodexBackend {
         if self.permission.is_dangerous() && !self.allow_dangerous {
             return Err(SubagentError::DangerousModeRefused);
         }
+        if req.cancel.is_cancelled() {
+            return Ok(result(String::new(), SubagentStopReason::Cancelled));
+        }
         let out = TempOutput::new();
         let argv = codex_argv(self.permission, self.model.as_deref(), &req.cwd, &out.path);
         let mut spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
@@ -263,6 +279,7 @@ impl SubagentBackend for CodexBackend {
         // file; the captured message covers the case where `-o` is empty.
         // Unparseable lines are skipped.
         let mut final_msg = String::new();
+        let mut turn_failure = None;
         let (outcome, stderr_tail) =
             drain_and_wait(&mut child, self.timeout, &req.cancel, |line| {
                 if let Some(activity) = codex_activity_from_json_line(&line) {
@@ -270,6 +287,9 @@ impl SubagentBackend for CodexBackend {
                 }
                 if let Some(msg) = codex_final_message_from_json_line(&line) {
                     final_msg = msg;
+                }
+                if let Some(error) = codex_turn_failure(&line) {
+                    turn_failure = Some(error);
                 }
             })
             .await
@@ -287,13 +307,20 @@ impl SubagentBackend for CodexBackend {
         };
 
         match outcome {
+            WaitOutcome::Exited(_) if turn_failure.is_some() => {
+                let failure = turn_failure.unwrap_or_default();
+                Err(super::failure::permission_denied(&failure)
+                    .or_else(|| super::failure::permission_denied(&stderr_tail))
+                    .unwrap_or(SubagentError::AgentError(failure)))
+            }
             WaitOutcome::Exited(status) if status.success() => {
                 Ok(result(output(&final_msg), SubagentStopReason::Completed))
             }
-            WaitOutcome::Exited(status) => Err(SubagentError::NonZeroExit {
-                code: status.code(),
-                stderr_tail,
-            }),
+            WaitOutcome::Exited(status) => Err(super::failure::permission_denied(&stderr_tail)
+                .unwrap_or(SubagentError::NonZeroExit {
+                    code: status.code(),
+                    stderr_tail,
+                })),
             WaitOutcome::TimedOut => Ok(result(output(&final_msg), SubagentStopReason::Timeout)),
             WaitOutcome::Cancelled => Ok(result(output(&final_msg), SubagentStopReason::Cancelled)),
         }
@@ -358,6 +385,27 @@ mod tests {
             Err(SubagentError::DangerousModeRefused) => {}
             other => panic!("expected DangerousModeRefused, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_classifies_permission_failure_from_the_codex_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("codex-stub");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' 'Error: Operation not permitted (os error 1)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend = CodexBackend::new("codex-stub", PermissionMode::ReadOnly).with_program(stub);
+
+        assert!(matches!(
+            backend.run(SubagentRun::new("review", dir.path())).await,
+            Err(SubagentError::PermissionDenied(message)) if message.contains("os error 1")
+        ));
     }
 
     #[test]

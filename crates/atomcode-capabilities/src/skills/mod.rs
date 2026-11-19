@@ -22,8 +22,8 @@ pub mod use_skill;
 
 pub use catalog_hook::SkillCatalogHook;
 pub use registry::{
-    skill_install_dirs, standard_skill_dirs, SkillDiagnostic, SkillRegistry, SkillRoots,
-    TemplateDirectory, TemplateKind,
+    skill_install_dirs, standard_skill_dirs, DiscoveredTemplate, EntryKind, FailedAsset,
+    LoadFailure, SkillDiagnostic, SkillRegistry, SkillRoots, TemplateDirectory, TemplateKind,
 };
 pub use render::{render_skill_catalog, CatalogEntry};
 pub use skill::{AutoLoad, Skill};

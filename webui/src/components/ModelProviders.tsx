@@ -45,6 +45,7 @@ import {
   modelsBlocker,
   modelBody,
   adoptPicked,
+  updateModelDraft,
   parseTokens,
   providerHost,
   formatTokens,
@@ -900,7 +901,7 @@ function ModelRowsEditor({
   }, [discoveryIdentity, autoDiscover]);
 
   const update = (i: number, patch: Partial<ModelDraft>) =>
-    setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    setRows(rows.map((r, j) => (j === i ? updateModelDraft(r, patch) : r)));
 
   return (
     <div class="add-model-field">
@@ -1136,6 +1137,9 @@ function ModelPicker({
         </div>
         <div class="modal-body">
           <div class="model-discovery-picker model-discovery-picker-multi">
+            {models.some((model) => model.catalog_only) && (
+              <p class="field-hint">{t('providers.catalogCandidates')}</p>
+            )}
             <input
               class="menu-input"
               type="search"
@@ -1178,6 +1182,7 @@ function ModelPicker({
                     {m.context_window ? <small>{formatTokens(m.context_window)}</small> : null}
                     {m.supports_vision === true && <small>{t('providers.visionOn')}</small>}
                     {!!m.reasoning_effort_levels?.length && <small>{m.reasoning_effort_levels.join(' / ')}</small>}
+                    {m.catalog_default_effort && <small>{t('providers.reasoningDefault')} {m.catalog_default_effort}</small>}
                     {exists && <small>{t('providers.pickAlready')}</small>}
                   </button>
                 );

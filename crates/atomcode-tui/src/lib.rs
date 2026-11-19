@@ -54,6 +54,7 @@ pub mod frame;
 pub mod history;
 pub mod host;
 pub mod image_cache;
+pub mod migration;
 mod tmux_mouse;
 
 pub mod i18n;

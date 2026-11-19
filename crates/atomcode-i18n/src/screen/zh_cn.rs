@@ -287,6 +287,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelCurrent => "（当前）".into(),
         Msg::RewindPanelNoCodeChanges => "没有代码改动".into(),
         Msg::RewindPanelFiles { files } => format!("{files} 个文件").into(),
+        Msg::RewindPanelTurnNoCheckpoint => "本轮未保留代码回退点。".into(),
         Msg::RewindPanelScopeAsk => "  回到那儿，把什么一起带回去？".into(),
         Msg::RewindCodeNotEnabled => "工作区回退已被 ATOMCODE_CODE_REWIND 关闭，去掉这个环境变量即可开启".into(),
         Msg::RewindCodeNoSession => "这次会话不落盘，工作区回不去".into(),
@@ -365,6 +366,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "当前将使用".into(),
         Msg::ProviderSetUse => "设为使用模型".into(),
         Msg::ProviderBatchChoose => "设为使用模型".into(),
+        Msg::ProviderCatalogCandidates => "models.dev 目录候选 · 账号可用性未验证".into(),
         Msg::ProviderNotProvided => "未提供".into(),
         Msg::ProviderManualAdd => "手动添加".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::ProviderMenuEdit),
@@ -1621,7 +1623,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "{path} 有 {size}，粘不进来（上限 {cap}）。编辑区里的东西每一轮都要重发；             让模型自己去读这个文件，它只会读要用的那几行。"
         )
         .into(),
-    }
+
+        Msg::CmdAboutImport => "查看其他 AI 编码 Agent 留下的资产".into(),
+        Msg::NoMigrationPort => "迁移服务不可用".into(),
+        Msg::MigrationReportTitle => "其他 Agent 留下的资产".into(),
+        Msg::MigrationNoAssets => "这个来源没有资产".into(),
+        Msg::MigrationSourceUnavailable => "当前项目没有这个 Agent 的可报告资产。".into(),
+        Msg::MigrationPickSource => "要看哪个 Agent 的资产？".into(),
+        Msg::MigrationAssetsCount => "项资产".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}：{count} 项资产").into()
+        }
+}
 }
 
 /// `团队 · 2 名成员 · 1 个后台任务`, leaving out a count that is zero.

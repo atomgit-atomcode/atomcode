@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod claude_code;
 pub mod codex;
+mod failure;
 pub mod proc;
 mod read_only_cli;
 pub mod tool;
@@ -272,6 +273,16 @@ pub struct SubagentResult {
 /// for driver-level failures (spawn/protocol/exit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubagentError {
+    /// The working directory or a required file cannot be read before launch.
+    WorkspaceUnavailable(String),
+    /// The launcher or external CLI reported a permission refusal.
+    PermissionDenied(String),
+    /// The provider exhausted its quota. The retry deadline can be absent
+    /// when the provider did not supply an unambiguous time.
+    RateLimited {
+        message: String,
+        retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// The external binary could not be found on `PATH`.
     BinaryNotFound { binary: String },
     /// Spawning the child process failed.
@@ -294,6 +305,15 @@ pub enum SubagentError {
 impl fmt::Display for SubagentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WorkspaceUnavailable(e) => write!(f, "workspace unavailable: {e}"),
+            Self::PermissionDenied(e) => write!(f, "permission denied: {e}"),
+            Self::RateLimited { message, retry_at } => {
+                write!(f, "rate limited: {message}")?;
+                if let Some(retry_at) = retry_at {
+                    write!(f, " (retry at or after {})", retry_at.to_rfc3339())?;
+                }
+                Ok(())
+            }
             Self::BinaryNotFound { binary } => {
                 write!(f, "external agent binary `{binary}` not found on PATH")
             }

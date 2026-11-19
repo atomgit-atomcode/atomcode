@@ -14,6 +14,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+#[path = "discovery_catalog.rs"]
+pub mod catalog;
+
 /// How long a listing may take.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most of a listing read; a bigger answer is refused rather than buffered.
@@ -37,6 +40,11 @@ pub struct DiscoveredModel {
     pub reasoning_effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Public catalog default shown as a hint, never saved as a request override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catalog_only: bool,
 }
 
 /// Everything in one call: the listing of the endpoint at `base_url`, spoken in
@@ -44,6 +52,26 @@ pub struct DiscoveredModel {
 /// lists nothing, the URL is unusable, the endpoint refused or did not answer,
 /// or the answer was not a listing.
 pub async fn discover(
+    base_url: &str,
+    provider_type: &str,
+    transport: &DiscoveryTransport,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let result = discover_endpoint(base_url, provider_type, transport).await;
+    if !use_public_catalog(&result) {
+        return result;
+    }
+    catalog::merge_listing(result, catalog::models(base_url, provider_type).await)
+}
+
+fn use_public_catalog(result: &Result<Vec<DiscoveredModel>, DiscoveryError>) -> bool {
+    match result {
+        Err(DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(401 | 403))) => false,
+        Ok(models) if !models.is_empty() => models.iter().any(catalog::needs_metadata),
+        _ => true,
+    }
+}
+
+async fn discover_endpoint(
     base_url: &str,
     provider_type: &str,
     transport: &DiscoveryTransport,
@@ -283,6 +311,8 @@ pub fn parse_discovered_models(
                         .filter(|v| e.supported_levels.contains(v))
                 }),
                 reasoning_effort_levels: entry.effort.map(|e| e.supported_levels),
+                catalog_default_effort: None,
+                catalog_only: false,
             })
             .collect()
     };
@@ -295,10 +325,13 @@ enum DiscoveryReadError {
     Transport(reqwest::Error),
 }
 
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, DiscoveryReadError> {
+async fn read_bounded_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, DiscoveryReadError> {
     if response
         .content_length()
-        .is_some_and(|size| size > DISCOVERY_MAX_RESPONSE_BYTES as u64)
+        .is_some_and(|size| size > limit as u64)
     {
         return Err(DiscoveryReadError::ResponseTooLarge);
     }
@@ -306,7 +339,7 @@ async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, D
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(DiscoveryReadError::Transport)?;
-        if body.len().saturating_add(chunk.len()) > DISCOVERY_MAX_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(DiscoveryReadError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
@@ -519,7 +552,7 @@ pub async fn fetch_discovery_body(
             response.status().as_u16(),
         ));
     }
-    read_bounded_response(response)
+    read_bounded_response(response, DISCOVERY_MAX_RESPONSE_BYTES)
         .await
         .map_err(|error| match error {
             DiscoveryReadError::ResponseTooLarge => DiscoveryRequestError::ResponseTooLarge,
@@ -541,6 +574,17 @@ pub fn normalize_discovered_models(mut models: Vec<DiscoveredModel>) -> Vec<Disc
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn public_catalog_never_replaces_an_authentication_refusal() {
+        for status in [401, 403] {
+            let result = Err(DiscoveryError::Request(
+                DiscoveryRequestError::UpstreamStatus(status),
+            ));
+            assert!(!use_public_catalog(&result));
+        }
+        assert!(use_public_catalog(&Err(DiscoveryError::Unsupported)));
+    }
 
     #[test]
     fn aliyun_anthropic_lists_models_on_its_same_origin_openai_endpoint() {
