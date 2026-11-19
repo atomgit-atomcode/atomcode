@@ -171,6 +171,155 @@ fn select(
     }
 }
 
+struct RouteTable<'a> {
+    introduction: &'a str,
+    header: [&'a str; 2],
+    rows: Vec<&'a str>,
+}
+
+fn route_cells(line: &str) -> Option<[&str; 4]> {
+    let mut cells = line.strip_prefix('|')?.strip_suffix('|')?.split('|');
+    let cells4 = [
+        cells.next()?.trim(),
+        cells.next()?.trim(),
+        cells.next()?.trim(),
+        cells.next()?.trim(),
+    ];
+    (cells.next().is_none() && cells4.iter().all(|cell| !cell.is_empty())).then_some(cells4)
+}
+
+impl<'a> RouteTable<'a> {
+    fn parse(text: &'a str, truncated_row: bool) -> Option<Self> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let mut lines = text.trim_end().split_inclusive('\n');
+        let mut start = 0;
+        let heading = loop {
+            let line = lines.next()?;
+            let trimmed = line.trim();
+            if trimmed.starts_with('|') {
+                break trimmed;
+            }
+            // Keep examples inside fenced code on the plain-text path.
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                return None;
+            }
+            start += line.len();
+        };
+        if route_cells(heading)? != ["主题", "适用范围", "关联理由", "文件"] {
+            return None;
+        }
+        let delimiter = lines.next()?.trim();
+        if !route_cells(delimiter)?.iter().all(|cell| {
+            let dashes = cell.strip_prefix(':').unwrap_or(cell);
+            let dashes = dashes.strip_suffix(':').unwrap_or(dashes);
+            dashes.len() >= 3 && dashes.bytes().all(|byte| byte == b'-')
+        }) {
+            return None;
+        }
+        let rows: Vec<_> = lines
+            .map(str::trim)
+            .map(|line| route_cells(line).map(|_| line))
+            .collect::<Option<_>>()?;
+        (!rows.is_empty() || truncated_row).then_some(Self {
+            introduction: text[..start].trim(),
+            header: [heading, delimiter],
+            rows,
+        })
+    }
+
+    fn render(&self, budget: usize) -> (String, bool) {
+        let mut table = self.header.join("\n");
+        let mut remaining = budget.saturating_sub(table.chars().count());
+        let mut limited = false;
+        let mut has_row = false;
+        for row in &self.rows {
+            let cost = row.chars().count() + 1;
+            if cost <= remaining {
+                remaining -= cost;
+                table.push('\n');
+                table.push_str(row);
+                has_row = true;
+            } else {
+                limited = true;
+            }
+        }
+        if !has_row {
+            return (String::new(), true);
+        }
+        let mut intro = String::new();
+        remaining = remaining.min(INDEX_CHARS / 2);
+        for line in self.introduction.lines() {
+            let cost = line.chars().count() + 1;
+            if cost >= remaining {
+                limited = true;
+                break;
+            }
+            remaining -= cost;
+            intro.push_str(line);
+            intro.push('\n');
+        }
+        if !intro.is_empty() {
+            intro.push('\n');
+        }
+        intro.push_str(&table);
+        (intro, limited)
+    }
+}
+
+fn select_index(path: &Path, source: Source, budget: &mut usize) -> KnowledgeIndex {
+    let mut knowledge = KnowledgeIndex {
+        path: path.into(),
+        injected: String::new(),
+        limited: source.limited,
+        error: source.error,
+    };
+    let text = source.text.trim();
+    if text.is_empty() {
+        return knowledge;
+    }
+    // A capped read may end midway through a row, even on a valid UTF-8 boundary.
+    let (complete_lines, truncated_row) = if source.limited && !source.text.ends_with('\n') {
+        source
+            .text
+            .rsplit_once('\n')
+            .map_or(("", false), |(lines, tail)| {
+                (lines, tail.trim_start().starts_with('|'))
+            })
+    } else {
+        (source.text.as_str(), false)
+    };
+    let block = if let Some(routes) = RouteTable::parse(complete_lines, truncated_row) {
+        let partial =
+            "\n[Partial index: read the complete index above for omitted routes or notes.]";
+        let prefix = format!(
+            "\n[Knowledge index: {}]\nL1 routes: match the task to each route's applicability. Read the linked L2 summary, then its L3 evidence when needed using file/search tools.\n",
+            path.display()
+        );
+        let available = budget.saturating_sub(prefix.chars().count() + 1);
+        let (mut content, limited) = routes.render(available.min(INDEX_CHARS));
+        knowledge.limited |= limited;
+        if knowledge.limited {
+            let available = available.saturating_sub(partial.chars().count());
+            content = routes.render(available.min(INDEX_CHARS)).0;
+        }
+        let notice = if knowledge.limited { partial } else { "" };
+        format!("{prefix}{content}{notice}\n")
+    } else {
+        let partial = "\n[Partial index: read the complete index above before following an incomplete route.]";
+        let content: String = text.chars().take(INDEX_CHARS).collect();
+        knowledge.limited |= text.chars().count() > INDEX_CHARS;
+        let notice = if knowledge.limited { partial } else { "" };
+        format!("\n[Knowledge index: {}]\nRouting index only. Read relevant linked files with file/search tools when needed; do not load the whole library.\n{content}{notice}\n", path.display())
+    };
+    if block.chars().count() <= *budget {
+        *budget -= block.chars().count();
+        knowledge.injected = block;
+    } else {
+        knowledge.limited = true;
+    }
+    knowledge
+}
+
 impl MemoryContext {
     /// `index` is an optional file, not a directory to recursively inject.
     /// Links inside it are plain text, read only through existing file tools.
@@ -223,32 +372,10 @@ impl MemoryContext {
                 }
             })
             .collect();
-        let source = read_source(index, false);
-        let mut knowledge = KnowledgeIndex {
-            path: index.into(),
-            injected: String::new(),
-            limited: source.limited,
-            error: source.error,
-        };
         let header = "=== MEMORY ===\nHistorical facts and preferences; verify changeable claims against current sources. Follow current user instructions when memory conflicts.\n";
         let mut budget = CHAR_BUDGET - header.chars().count() - 512; // labels + bounded warning
         select(&mut scopes, &mut budget, true, now);
-        if !source.text.trim().is_empty() {
-            let content: String = source.text.trim().chars().take(INDEX_CHARS).collect();
-            knowledge.limited |= source.text.trim().chars().count() > INDEX_CHARS;
-            let partial = if knowledge.limited {
-                "\n[Partial index: read the complete index above before following an incomplete route.]"
-            } else {
-                ""
-            };
-            let block = format!("\n[Knowledge index: {}]\nRouting index only. Read relevant linked files with file/search tools when needed; do not load the whole library.\n{content}{partial}\n", index.display());
-            if block.chars().count() <= budget {
-                budget -= block.chars().count();
-                knowledge.injected = block;
-            } else {
-                knowledge.limited = true;
-            }
-        }
+        let knowledge = select_index(index, read_source(index, false), &mut budget);
         select(&mut scopes, &mut budget, false, now);
         let omitted = scopes
             .iter()
@@ -509,6 +636,124 @@ mod tests {
         assert!(context.prompt.chars().count() <= CHAR_BUDGET);
         assert!(context.warning.is_some());
     }
+    #[test]
+    fn documented_routes_work_with_windows_line_endings() {
+        let template = include_str!("../../../../docs/memory.md")
+            .lines()
+            .skip_while(|line| *line != "```markdown")
+            .skip(1)
+            .take_while(|line| *line != "```")
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("knowledge")).unwrap();
+        fs::write(
+            dir.path().join("knowledge/INDEX.md"),
+            format!("\u{feff}{template}"),
+        )
+        .unwrap();
+
+        let context = load(dir.path());
+        assert!(context.knowledge.injected.contains("Read the linked L2"));
+        assert!(context.knowledge.injected.contains("仅旧快照格式"));
+        assert!(context
+            .knowledge
+            .injected
+            .contains(".atomcode/knowledge/concepts/session.md |"));
+        assert!(!context.knowledge.limited);
+        assert!(context.warning.is_none());
+    }
+
+    const ROUTE_HEADER: &str = "| 主题 | 适用范围 | 关联理由 | 文件 |\n| --- | --- | --- | --- |";
+
+    #[test]
+    fn unrecognized_indexes_keep_the_legacy_text_path() {
+        for content in [
+            "# Custom notes\nRead SKILL.md".into(),
+            "| 主题 | 适用场景 | 文件 |\n| --- | --- | --- |\n| 构建 | 本地 | build.md |".into(),
+            format!("{ROUTE_HEADER}\n| 构建 | 本地 | build.md |"),
+            format!("{ROUTE_HEADER}\n| 构建 | 本地 |  | build.md |"),
+            format!("```markdown\n{ROUTE_HEADER}\n| 构建 | 本地 | 入口 | build.md |\n```"),
+        ] {
+            let mut budget = CHAR_BUDGET;
+            let index = select_index(
+                Path::new("INDEX.md"),
+                Source {
+                    text: content.clone(),
+                    ..Source::default()
+                },
+                &mut budget,
+            );
+            assert!(index.injected.contains("Routing index only."));
+            assert!(index.injected.ends_with(&format!("{content}\n")));
+            assert!(!index.limited);
+        }
+    }
+
+    #[test]
+    fn routes_fit_the_actual_remaining_budget_as_whole_rows() {
+        let oversized = format!("| 超长 | 本地 | {} | long.md |", "说".repeat(2000));
+        let rows: Vec<_> = (0..12)
+            .map(|i| format!("| 主题{i} | 仅测试 | 验证入口 | 知识/验证{i}.md |"))
+            .collect();
+        let content = format!(
+            "# 项目知识\n{}\n{ROUTE_HEADER}\n{oversized}\n{}",
+            "说".repeat(600),
+            rows.join("\n")
+        );
+        let mut budget = 400;
+        let index = select_index(
+            Path::new("INDEX.md"),
+            Source {
+                text: content,
+                ..Source::default()
+            },
+            &mut budget,
+        );
+        assert!(index.limited);
+        assert!(index.injected.contains("for omitted routes or notes"));
+        assert_eq!(index.injected.chars().count() + budget, 400);
+        let selected: Vec<_> = index
+            .injected
+            .lines()
+            .filter(|line| line.starts_with("| 主题") && !ROUTE_HEADER.contains(line))
+            .collect();
+        assert!(!selected.is_empty());
+        assert!(selected.len() < rows.len());
+        assert!(selected
+            .iter()
+            .zip(&rows)
+            .all(|(selected, row)| *selected == row));
+        assert!(!index.injected.contains("超长"));
+    }
+
+    #[test]
+    fn structured_index_ignores_the_row_cut_at_the_file_read_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("knowledge")).unwrap();
+        for complete_row in ["", "| 构建 | 本地 | 验证入口 | build.md |\n"] {
+            fs::write(
+                dir.path().join("knowledge/INDEX.md"),
+                format!(
+                    "{ROUTE_HEADER}\n{complete_row}| 末行 | 本地 | {} | late.md |",
+                    "语".repeat(30000)
+                ),
+            )
+            .unwrap();
+            let context = load(dir.path());
+            let index = context.knowledge;
+            assert!(index.limited);
+            assert!(index.error.is_none());
+            assert!(index.injected.contains("Read the linked L2"));
+            assert!(index.injected.contains("read the complete index above"));
+            assert_eq!(
+                index.injected.contains("build.md |"),
+                !complete_row.is_empty()
+            );
+            assert!(!index.injected.contains("末行"));
+        }
+    }
+
     #[test]
     fn malformed_and_non_file_sources_are_visible_failures() {
         let _locale = atomcode_i18n::test_lock();
