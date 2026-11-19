@@ -186,6 +186,24 @@ pub struct ModelEntry {
     /// builtin fallback so effort switching still works before the server ships this field.
     #[serde(default)]
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias advertised by `models-v3` (e.g. `"智速模式"` for
+    /// `smart-speed`). `None` (field omitted on older / production servers)
+    /// keeps today's behaviour: pickers show the raw `display_model_name`.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Human-readable marketing / usage description advertised by
+    /// `models-v3`. Persisted verbatim so UI surfaces can show it without a
+    /// second round-trip; `None` means the server sent nothing.
+    #[serde(default)]
+    pub desc: Option<String>,
+    /// English display alias advertised by `models-v3`. Shown when the
+    /// interface language is English; `None` falls back to [`Self::alias`].
+    #[serde(default)]
+    pub alias_en: Option<String>,
+    /// English description advertised by `models-v3`, selected the same way
+    /// as [`Self::alias_en`].
+    #[serde(default)]
+    pub desc_en: Option<String>,
     /// Credential for gateways that authenticate with an API key rather than
     /// the OAuth bearer. `None` ⇒ the model keeps today's behaviour: no key is
     /// persisted and the gateway is reached with the login token.

@@ -277,6 +277,10 @@ fn models(config: &Config) -> Vec<ModelRow> {
                 // by "the one I am on" — see `ProvidersView::with_current`.
                 current: default.as_deref() == Some(id.as_str()),
                 managed: config.selection_is_codingplan_managed(id),
+                alias: model.alias.clone(),
+                desc: model.desc.clone(),
+                alias_en: model.alias_en.clone(),
+                desc_en: model.desc_en.clone(),
             })
         })
         .collect()

@@ -118,9 +118,41 @@ pub struct ModelRow {
     pub current: bool,
     /// Under a managed account: shown, never edited.
     pub managed: bool,
+    /// Display alias advertised by the CodingPlan gateway (`models-v3`).
+    /// Shown instead of the wire name when set; `None` keeps the raw name.
+    pub alias: Option<String>,
+    /// Human-readable description advertised by the CodingPlan gateway,
+    /// shown under the model's row in the picker. `None` adds no line.
+    pub desc: Option<String>,
+    /// English alias / description advertised by the CodingPlan gateway.
+    /// Shown when the interface language is English; `None` falls back to
+    /// [`Self::alias`].
+    pub alias_en: Option<String>,
+    pub desc_en: Option<String>,
 }
 
 impl ModelRow {
+    /// The alias to show for the interface language in force: the English one
+    /// the server advertised when the UI is in English, the Chinese one
+    /// otherwise. Neither has a fallback — when the language's own alias is
+    /// absent the raw model name stands, so an English UI never shows a
+    /// Chinese alias it was not given.
+    pub fn localized_alias(&self) -> Option<&str> {
+        match crate::i18n::current_locale() {
+            crate::i18n::Locale::En => self.alias_en.as_deref(),
+            _ => self.alias.as_deref(),
+        }
+    }
+
+    /// The description to show, selected the same way as
+    /// [`Self::localized_alias`].
+    pub fn localized_desc(&self) -> Option<&str> {
+        match crate::i18n::current_locale() {
+            crate::i18n::Locale::En => self.desc_en.as_deref(),
+            _ => self.desc.as_deref(),
+        }
+    }
+
     /// Only explicitly declared, known levels are offered when switching models.
     /// A stored default or a single configured value is not a level catalog.
     pub fn effort_pick(&self) -> Option<Vec<String>> {
@@ -2803,6 +2835,10 @@ mod tests {
             levels: Vec::new(),
             current: false,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         }
     }
 

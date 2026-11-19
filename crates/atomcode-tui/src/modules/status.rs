@@ -312,11 +312,26 @@ impl View for Status {
         } else {
             "atomcode".to_string()
         };
+        // The gateway's display alias wins when the live model has one: the
+        // footer names the model the way the picker does, by the alias the
+        // server advertises, not the wire id. The prefix match below still
+        // asks about the wire name — aliases do not disambiguate accounts.
+        let wire_name = model_str.clone();
+        if let Some(alias) = vp
+            .moment
+            .providers
+            .models()
+            .iter()
+            .find(|m| m.model == model_str || m.id == model_str)
+            .and_then(|m| m.localized_alias().map(str::to_string))
+        {
+            model_str = alias;
+        }
         // Which account is answering, said only where the bare name cannot: the
         // name goes in front, so it reads as the qualified name the way the
         // model picker lists it. Asked of the name alone — the level is not
         // part of what any row carries, so it must not be in what is matched.
-        let prefix = provider_prefix(&vp.moment.providers, &model_str);
+        let prefix = provider_prefix(&vp.moment.providers, &wire_name);
         if !prefix.is_empty() {
             model_str.insert_str(0, &prefix);
         }
@@ -1831,7 +1846,12 @@ mod tests {
             levels: Vec::new(),
             current,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         };
+
         let moment_of = |model: &str, providers: ProvidersView| Moment {
             model: model.into(),
             providers,
