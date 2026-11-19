@@ -2684,12 +2684,12 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Skil
         // steering for one round, and a log full of nudges is a log nobody can
         // read. The loop's "model-visible content is logged" invariant is
         // checked on the assembled messages before the request is built, so a
-        // tail added here is outside it by construction.
-        req.messages
-            .push(atomcode_capabilities::reminder::synthetic_system_reminder(
-                crate::skill_first::SKILL_FIRST_BODY,
-            ));
-        next.run(req).await
+        // tail added here is outside it by construction. Taken off again after,
+        // so a request sent again carries it once.
+        let reminder = atomcode_capabilities::reminder::synthetic_system_reminder(
+            crate::skill_first::SKILL_FIRST_BODY,
+        );
+        atomcode_harness::tail::with_tail(req, vec![reminder], next).await
     }
 }
 
