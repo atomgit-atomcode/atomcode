@@ -2561,9 +2561,12 @@ impl Plugin for CapabilityCommandsPlugin {
                  and tests, use bash_start (notify_on_exit defaults to true). Keep the real \
                  operation in that tracked job so its exit status and output are available. \
                  While it runs, do independent work if useful; otherwise end your response. \
-                 The completion notification is delivered only after your response ends and \
-                 starts your next turn, so keeping the turn open to wait — repeated bash_poll \
-                 waits, shell sleep, ls, pgrep — only delays it. After the notification, \
+                 Ending your response does not end the task, even when the next step needs \
+                 the job's result: the completion notification starts your next turn with \
+                 that result and you continue the remaining steps from there. The \
+                 notification is delivered only after your response ends, so keeping the \
+                 turn open to wait — repeated bash_poll waits, shell sleep, ls, pgrep — only \
+                 delays it. After the notification, \
                  collect each finished job once with bash_poll and wait_ms 0, then check the \
                  result. A file existing or a process disappearing does not prove success. \
                  Leave completion notifications off for servers and watchers. If a job was \

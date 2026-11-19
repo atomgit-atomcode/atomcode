@@ -819,15 +819,16 @@ impl Tool for BashStartTool {
         };
         match start(&self.world, &a.command, ctx).await {
             // The prefix up to "Collect output with bash_poll " is parsed back by
-            // the coding runtime (`discipline::started_job`).
+            // the coding runtime (`discipline::started_job`). How to wait is the
+            // host's call (its background completion policy): a concrete wait
+            // command here is what a model copies, whatever the policy says.
             Ok(id) if a.notify_on_exit => ok(format!(
-                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":0}} \
-                 once the completion notification arrives, if this host resumes you when a job finishes \
-                 (see its background completion policy): meanwhile do independent work or end your \
-                 response. The notification is delivered only after your response ends, so polling to \
-                 wait only delays it. On a host that does not resume you, wait with bash_poll \
-                 {{\"job_id\":\"{id}\",\"wait_ms\":60000}} and repeat while it is running. \
-                 Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
+                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\"}} \
+                 once it has finished; wait for it the way this host's background completion policy \
+                 says. Where the host resumes you, ending your response does not end the task: the \
+                 completion notice starts your next turn and you continue the remaining steps from \
+                 there. Unless the host says it resumes you, wait with bash_poll until the job ends \
+                 before answering. Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
             )),
             Ok(id) => ok(format!(
                 "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
@@ -1858,6 +1859,32 @@ mod tests {
         assert!(second.content.ends_with("status: exited (code 0)"));
         assert_eq!(started.elapsed(), Duration::from_millis(500));
         assert!(poll(&id).is_err(), "a collected terminal job is reaped");
+    }
+
+    /// The receipt is read by every host; how to wait is the host policy's call,
+    /// so a notified job's receipt names no wait for the model to copy.
+    #[tokio::test]
+    async fn a_notified_start_leaves_the_wait_to_the_host_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = BashStartTool::default()
+            .execute(&json!({"command":"true"}).to_string(), &ctx(dir.path()))
+            .await;
+        assert!(!started.is_error, "{}", started.content);
+        let id = started
+            .content
+            .strip_prefix("Started background job ")
+            .and_then(|rest| rest.split_once(". Collect output with bash_poll "))
+            .map(|(id, _)| id.to_owned())
+            .expect("prefix parsed by the coding runtime");
+        assert!(!started.content.contains("wait_ms"), "{}", started.content);
+        assert!(started.content.contains("does not end the task"));
+        // Bundles without a completion policy still learn to wait for the job.
+        assert!(started
+            .content
+            .contains("Unless the host says it resumes you"));
+        let _ = BashKillTool
+            .execute(&json!({"job_id":id}).to_string(), &ctx(dir.path()))
+            .await;
     }
 
     #[test]

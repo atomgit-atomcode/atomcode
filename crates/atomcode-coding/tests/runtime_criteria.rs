@@ -1644,6 +1644,36 @@ async fn the_model_is_told_how_this_host_waits_for_background_work() {
             !wakeups,
             "{shown}"
         );
+        let defs = recorder.defs.lock().unwrap().last().cloned().unwrap();
+        for name in ["bash", "bash_start"] {
+            assert!(
+                defs.iter().any(|def| def.name == name),
+                "the request must advertise {name}"
+            );
+        }
+        if wakeups {
+            // A model that needs the result next reads "end your response" as
+            // giving up the task, and copies any long poll it is shown instead —
+            // in the system prompt or in a tool definition sent beside it.
+            assert!(
+                shown.contains("Ending your response does not end the task"),
+                "{shown}"
+            );
+            assert!(!shown.contains("up to 60000"), "{shown}");
+            for def in &defs {
+                assert!(
+                    !def.description.contains("up to 60000"),
+                    "{}: {}",
+                    def.name,
+                    def.description
+                );
+            }
+        } else {
+            assert!(
+                shown.contains("wait with bash_poll using a long wait_ms"),
+                "{shown}"
+            );
+        }
         runtime.handle.shutdown().await.unwrap();
         let _ = runtime.task.await;
     }

@@ -514,9 +514,10 @@ fn shell_tool_description(
              text, or rewrite the whole file with write_file — do not fall back to sed. \
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do. For long builds/tests use `bash_start`, then \
-             `bash_poll` with wait_ms (up to 60000); it collects output until exit, status change or timeout. \
-             Do not use shell sleep to wait or duplicate a running build.\n\
+             the dedicated tools can't do. For long builds/tests use `bash_start` and wait \
+             for it the way the host's background completion policy says; unless the host \
+             says it resumes you when a job finishes, wait with `bash_poll` until the job \
+             ends before answering. Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
              editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
