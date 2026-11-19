@@ -2165,7 +2165,7 @@ mod tests {
         // An already-stubbed oversized result must not be re-listed as a
         // rewrite: the plan stays a no-op and the prefix cache keeps its
         // single-bust guarantee.
-        let stub = build_compact_stub("bash", &big("bash out"), true);
+        let stub = build_compact_stub("bash", &"x".repeat(3_000), true);
         let msgs = vec![
             Message::system("persona"),
             Message::user("u1"),
