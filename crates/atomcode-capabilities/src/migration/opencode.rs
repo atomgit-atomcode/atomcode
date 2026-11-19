@@ -228,60 +228,62 @@ fn parse_credential(value: &str) -> Result<ApiKeyRef, ()> {
 
 /// The MCP servers OpenCode has configured.
 ///
-/// **OpenCode's `command` is an ARRAY** (`["node", "…/mcp-server.mjs"]`),
-/// while ours is `command: Option<String>` + `args: Option<Vec<String>>`
-/// (`mcp/config.rs:145`) — so it is split here.
+/// 与 `scan_providers` 一样先读 `opencode.json`，再读 `opencode.jsonc`。
+/// 后一个文件覆盖同名服务，每行记录服务的实际来源。
 fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
-    let Ok(Some(value)) =
-        super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.jsonc"))
-    else {
-        return Vec::new();
-    };
-    let Some(servers) = value.get("mcp").and_then(|m| m.as_object()) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for (name, server) in servers {
+    let mut servers = std::collections::BTreeMap::new();
+    for file in ["opencode.json", "opencode.jsonc"] {
+        let path = ctx.opencode_config_dir.join(file);
+        match super::provider::read_jsonc(&path) {
+            Ok(Some(value)) => {
+                if let Some(found) = value.get("mcp").and_then(|m| m.as_object()) {
+                    servers.extend(
+                        found
+                            .iter()
+                            .map(|(name, server)| (name.clone(), (server.clone(), path.clone()))),
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(()) => out.push(AssetReport {
+                kind: AssetKind::McpServers,
+                ..super::provider::unreadable_provider_file(&path, AssetScope::User)
+            }),
+        }
+    }
+
+    for (name, (server, path)) in servers {
         let Some(server) = server.as_object() else {
             continue;
         };
-        let command = server.get("command");
-        // A command may be a string or an array — both shapes occur.
-        let (command, args): (Option<String>, Vec<String>) = match command {
-            Some(serde_json::Value::String(text)) => (Some(text.clone()), Vec::new()),
-            Some(serde_json::Value::Array(items)) => {
-                let mut items = items.iter();
-                let first = items.next().and_then(|v| v.as_str()).map(str::to_string);
-                (
-                    first,
-                    items
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect(),
-                )
-            }
-            _ => (None, Vec::new()),
+        // 报告只需判断是否有可执行文件名，参数留在原配置中。
+        let command = match server.get("command") {
+            Some(serde_json::Value::String(text)) => Some(text.as_str()),
+            Some(serde_json::Value::Array(items)) => items.first().and_then(|v| v.as_str()),
+            _ => None,
         };
-        if command.is_none() {
-            // Neither `command` nor `url`: our loader would reject the whole
-            // file (`mcp/config.rs:670-673`).
-            out.push(AssetReport {
-                kind: AssetKind::McpServers,
-                name: name.clone(),
-                path: ctx.opencode_config_dir.join("opencode.jsonc"),
-                scope: AssetScope::User,
-                status: AssetStatus::Blocked,
-                detail: super::text::rules_rejected(),
-            });
-            continue;
-        }
-        let _ = args;
+        let has_url = server
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty());
+        let (status, detail) = if command.is_some_and(|command| !command.trim().is_empty()) {
+            (
+                AssetStatus::Actionable,
+                super::text::mcp_copyable(1, &ctx.product.user().join("mcp.json")),
+            )
+        } else if has_url {
+            (AssetStatus::Blocked, super::text::mcp_remote_not_copyable())
+        } else {
+            (AssetStatus::Blocked, super::text::rules_rejected())
+        };
         out.push(AssetReport {
             kind: AssetKind::McpServers,
-            name: name.clone(),
-            path: ctx.opencode_config_dir.join("opencode.jsonc"),
+            name,
+            path,
             scope: AssetScope::User,
-            status: AssetStatus::Actionable,
-            detail: super::text::mcp_copyable(1, &ctx.product.user().join("mcp.json")),
+            status,
+            detail,
         });
     }
     out
@@ -461,9 +463,9 @@ mod tests {
         assert!(file.blocked.is_some());
     }
 
-    /// The MCP `command` is an ARRAY — split into command + args.
+    /// 数组形式的命令与字符串命令一样会列为可迁移。
     #[test]
-    fn an_opencode_mcp_command_array_is_split_into_command_and_args() {
+    fn an_opencode_mcp_command_array_is_actionable() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let config = home.path().join(".config/opencode/opencode.jsonc");
@@ -483,6 +485,60 @@ mod tests {
             .find(|a| a.kind == AssetKind::McpServers)
             .expect("the server is reported");
         assert_eq!(row.status, AssetStatus::Actionable);
+    }
+
+    #[test]
+    fn mcp_servers_are_merged_by_name_and_keep_their_source_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = ctx(home.path(), home.path());
+        let dir = &ctx.opencode_config_dir;
+        std::fs::create_dir_all(dir).unwrap();
+        let json = dir.join("opencode.json");
+        let jsonc = dir.join("opencode.jsonc");
+        std::fs::write(
+            &json,
+            r#"{"mcp":{"local":{"command":["node","server.js"]},"shared":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &jsonc,
+            r#"{"mcp":{"shared":{"url":"https://mcp.example.test"},"invalid":{}}}"#,
+        )
+        .unwrap();
+
+        let rows = mcp_rows(&ctx);
+        assert_eq!(rows.len(), 3);
+        let local = rows.iter().find(|row| row.name == "local").unwrap();
+        assert_eq!(local.path, json);
+        assert_eq!(local.status, AssetStatus::Actionable);
+        let shared = rows.iter().find(|row| row.name == "shared").unwrap();
+        assert_eq!(shared.path, jsonc);
+        assert_eq!(shared.status, AssetStatus::Blocked);
+        assert_eq!(shared.detail, super::super::text::mcp_remote_not_copyable());
+        let invalid = rows.iter().find(|row| row.name == "invalid").unwrap();
+        assert_eq!(invalid.status, AssetStatus::Blocked);
+        assert_eq!(invalid.detail, super::super::text::rules_rejected());
+    }
+
+    #[test]
+    fn invalid_json_is_reported_alongside_servers_from_jsonc() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = ctx(home.path(), home.path());
+        let dir = &ctx.opencode_config_dir;
+        std::fs::create_dir_all(dir).unwrap();
+        let json = dir.join("opencode.json");
+        let jsonc = dir.join("opencode.jsonc");
+        std::fs::write(&json, "{").unwrap();
+        std::fs::write(&jsonc, r#"{"mcp":{"local":{"command":"node"}}}"#).unwrap();
+
+        let rows = mcp_rows(&ctx);
+        assert_eq!(rows.len(), 2);
+        let blocked = rows.iter().find(|row| row.path == json).unwrap();
+        assert_eq!(blocked.kind, AssetKind::McpServers);
+        assert_eq!(blocked.status, AssetStatus::Blocked);
+        assert_eq!(blocked.detail, super::super::text::unreadable_config());
+        let local = rows.iter().find(|row| row.path == jsonc).unwrap();
+        assert_eq!(local.status, AssetStatus::Actionable);
     }
 
     /// `auth.json` holds PLAINTEXT keys. We report that they are there and

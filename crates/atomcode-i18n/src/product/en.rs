@@ -1840,6 +1840,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::MigrationMcpAllDisabled { count } => {
             format!("{count} MCP server(s) are configured but disabled — none of them run").into()
         }
+        Msg::MigrationMcpRemoteNotCopyable => {
+            "A remote MCP server (url only) — it cannot be copied as a stdio command".into()
+        }
         Msg::MigrationRulesRejected => {
             "Our loader would reject this file, so none of its rules apply".into()
         }

@@ -1766,6 +1766,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::MigrationMcpAllDisabled { count } => {
             format!("{count} 个 MCP 服务已配置但被禁用 —— 都没有在运行").into()
         }
+        Msg::MigrationMcpRemoteNotCopyable => {
+            "远程 MCP 服务（只有 url）—— 无法复制为 stdio 命令".into()
+        }
         Msg::MigrationRulesRejected => "我们的加载器会拒绝这个文件，因此其中规则都不生效".into(),
         Msg::MigrationHooksCopyable { target } => {
             format!("可复制到 {target}").into()

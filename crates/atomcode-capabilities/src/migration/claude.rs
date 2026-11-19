@@ -489,17 +489,15 @@ impl MigrationSource for ClaudeSource {
     }
 }
 
-/// How many `mcpServers` a JSON file declares.
-///
-/// `Ok(0)` means the file parsed and declares none. `Err` means the file could
-/// not be read or parsed — which is **not** the same as "there are none", and
-/// the report says so instead of quietly showing nothing.
-/// Whether a settings file declares hooks. `Err` means it could not be read
-/// or parsed — again, not the same as "there are none".
+/// 仅非空对象或数组声明了 hooks。读取或解析失败由调用方报告。
 fn settings_hooks(path: &Path) -> Result<bool, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    Ok(value.get("hooks").map(|h| !h.is_null()).unwrap_or(false))
+    Ok(match value.get("hooks") {
+        Some(serde_json::Value::Object(hooks)) => !hooks.is_empty(),
+        Some(serde_json::Value::Array(hooks)) => !hooks.is_empty(),
+        _ => false,
+    })
 }
 
 /// Read a JSON file. `Err` carries the reason, because "this file is broken"
@@ -635,7 +633,7 @@ fn session_file_count(projects: &Path) -> Result<usize, String> {
                         count += 1;
                     }
                 }
-                Err(_) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -818,6 +816,37 @@ mod tests {
     }
 
     #[test]
+    fn only_nonempty_hook_collections_are_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let ctx = ctx(home.path(), project.path());
+        let truth = truth(home.path(), project.path());
+        let settings = home.path().join(".claude/settings.json");
+        for (hooks, expected) in [
+            ("{}", false),
+            ("[]", false),
+            ("true", false),
+            (
+                r#"{"PreToolUse":[{"hooks":[{"type":"command","command":"echo test"}]}]}"#,
+                true,
+            ),
+            (r#"[{"type":"command","command":"echo test"}]"#, true),
+        ] {
+            write_file(&settings, &format!(r#"{{"hooks":{hooks}}}"#));
+            let rows = ClaudeSource.detect(&ctx, &truth);
+            let status = rows
+                .iter()
+                .find(|row| row.kind == AssetKind::Hooks)
+                .map(|row| row.status);
+            assert_eq!(
+                status,
+                expected.then_some(AssetStatus::Actionable),
+                "{hooks}"
+            );
+        }
+    }
+
+    #[test]
     fn a_project_mcp_file_is_active_and_the_global_one_is_actionable() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -907,6 +936,31 @@ mod tests {
         assert!(assets
             .iter()
             .any(|a| a.kind == AssetKind::Permissions && a.status == AssetStatus::Blocked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_subtree_probe_error_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".claude/projects");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // 自指链接查询元数据时稳定失败，不依赖运行测试的用户权限。
+        let child = sessions.join("loop");
+        std::os::unix::fs::symlink("loop", &child).unwrap();
+        let reason = probe_dir(&child).unwrap_err();
+
+        let rows = ClaudeSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.kind == AssetKind::Sessions)
+            .unwrap();
+        assert_eq!(row.path, sessions);
+        assert_eq!(row.status, AssetStatus::Blocked);
+        assert_eq!(row.detail, super::super::text::unreadable_file(&reason));
     }
 
     #[test]

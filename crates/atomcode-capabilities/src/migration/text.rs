@@ -122,6 +122,10 @@ pub fn mcp_all_disabled(count: usize) -> String {
     t(Msg::MigrationMcpAllDisabled { count }).into_owned()
 }
 
+pub fn mcp_remote_not_copyable() -> String {
+    t(Msg::MigrationMcpRemoteNotCopyable).into_owned()
+}
+
 pub fn mcp_copyable(count: usize, target: &std::path::Path) -> String {
     t(Msg::MigrationMcpCopyable {
         count,

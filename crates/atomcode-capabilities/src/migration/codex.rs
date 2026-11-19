@@ -384,61 +384,6 @@ impl MigrationSource for CodexSource {
     }
 }
 
-/// The bound on how deep the Codex skill walk goes.
-///
-/// The registry's own bound is 8 (`registry.rs:296`); the same number here
-/// keeps the two from disagreeing about what exists.
-const MAX_SKILL_DEPTH: usize = 8;
-
-/// Find every Codex skill under `root`, including the ones in grouping
-/// directories (`~/.codex/skills/.system/<name>/SKILL.md`).
-///
-/// The walk is **bounded** and **cycle-guarded**: a symlink back to an
-/// ancestor would otherwise be walked forever, and the read-only report would
-/// never finish.
-fn collect_codex_skills(
-    dir: &Path,
-    depth: usize,
-    max_depth: usize,
-    ancestors: &mut std::collections::BTreeSet<std::path::PathBuf>,
-    found: &mut Vec<(String, std::path::PathBuf)>,
-) {
-    if depth > max_depth {
-        return;
-    }
-    let identity = match std::fs::canonicalize(dir) {
-        Ok(path) => path,
-        Err(_) => return,
-    };
-    if !ancestors.insert(identity.clone()) {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        paths.push(entry.path());
-    }
-    paths.sort();
-    for path in paths {
-        if path.is_dir() {
-            if path.join("SKILL.md").is_file() {
-                found.push((
-                    path.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    path,
-                ));
-            } else {
-                collect_codex_skills(&path, depth + 1, max_depth, ancestors, found);
-            }
-        }
-    }
-    ancestors.remove(&identity);
-}
-
 /// How many `[mcp_servers.*]` tables the config declares.
 fn mcp_server_count(value: &toml::Value) -> Option<usize> {
     let servers = value.get("mcp_servers")?.as_table()?;
@@ -475,7 +420,7 @@ fn session_file_count(sessions: &Path) -> Result<usize, String> {
                         count += 1;
                     }
                 }
-                Err(_) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -593,6 +538,31 @@ mod tests {
             .find(|a| a.kind == AssetKind::McpServers)
             .expect("the MCP servers are reported");
         assert_eq!(mcp.status, AssetStatus::Actionable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_subtree_probe_error_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // 自指链接查询元数据时稳定失败，不依赖运行测试的用户权限。
+        let child = sessions.join("loop");
+        std::os::unix::fs::symlink("loop", &child).unwrap();
+        let reason = probe_dir(&child).unwrap_err();
+
+        let rows = CodexSource.detect(
+            &ctx(home.path(), project.path()),
+            &truth(home.path(), project.path()),
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.kind == AssetKind::Sessions)
+            .unwrap();
+        assert_eq!(row.path, sessions);
+        assert_eq!(row.status, AssetStatus::Blocked);
+        assert_eq!(row.detail, super::super::text::unreadable_file(&reason));
     }
 
     #[test]

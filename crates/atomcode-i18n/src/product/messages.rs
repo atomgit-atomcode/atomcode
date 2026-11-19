@@ -2487,6 +2487,7 @@ pub enum Msg<'a> {
     MigrationMcpAllDisabled {
         count: usize,
     },
+    MigrationMcpRemoteNotCopyable,
     MigrationRulesRejected,
     MigrationHooksCopyable {
         target: &'a str,
