@@ -623,6 +623,7 @@ pub enum Msg<'a> {
     PatchLeadOnly,
     PatchContextChanged,
     CmdAboutConfig,
+    CmdAboutTheme,
     CmdAboutProviderPanel,
     CmdAboutCopy,
     CmdAboutSave,

@@ -294,6 +294,8 @@ pub enum Action {
     /// key is bound to it later are one implementation, and the panel is
     /// screen state, which only the screen may write.
     ToggleSettings,
+    /// Open the settings panel with a filter for the requested setting id.
+    OpenSetting(&'static str),
     /// Open the settings panel on its Usage page, opening the panel if it is
     /// not already up. What `/usage` lands on: the allowance is drawn there,
     /// with the session's context and the plan beside it — one surface, not a

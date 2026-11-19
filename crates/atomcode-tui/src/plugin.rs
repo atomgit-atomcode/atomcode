@@ -9175,6 +9175,14 @@ impl Tui {
                 self.fetch_status();
                 return false;
             }
+            Action::OpenSetting(id) => {
+                drop(m);
+                self.host.open_settings_for(id);
+                self.refresh_settings();
+                self.fetch_usage();
+                self.fetch_status();
+                return false;
+            }
             // Put another session on screen. The lock goes first: `switch_to`
             // draws that session and writes the moment, which is a lock this
             // guard still holds.
@@ -16141,6 +16149,49 @@ mod paste_habit_tests {
             let m = host.moment.read().unwrap();
             assert_eq!(m.settings_panel.as_ref().unwrap().tab, tab);
         }
+    }
+
+    #[test]
+    fn the_theme_command_selects_the_theme_setting_in_the_existing_panel() {
+        use crate::settings::{Applies, SettingKind, SettingRow, SettingsView, Step, Tab};
+        let (host, tui) = screen();
+        host.moment.write().unwrap().settings = SettingsView::new(vec![
+            SettingRow {
+                id: "ui.mouse".into(),
+                label: "Mouse".into(),
+                value: "true".into(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Restart,
+            },
+            SettingRow {
+                id: "ui.theme".into(),
+                label: "Theme".into(),
+                value: "dark".into(),
+                kind: SettingKind::Choice(vec!["auto".into(), "dark".into(), "light".into()]),
+                applies: Applies::Restart,
+            },
+        ]);
+        tui.act(Action::OpenStatus, &tui.client);
+        for _ in 0..2 {
+            tui.act(Action::OpenSetting("ui.theme"), &tui.client);
+            let moment = host.moment.read().unwrap();
+            let panel = moment.settings_panel.as_ref().unwrap();
+            assert_eq!(panel.tab, Tab::Config);
+            assert_eq!(panel.query, "ui.theme");
+            assert_eq!(panel.query_caret, panel.query.len());
+            let rows = moment.settings.matching(&panel.query);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[panel.cursor].id, "ui.theme");
+        }
+        let (_, step) =
+            host.settings_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert_eq!(
+            step,
+            Some(Step::Set {
+                id: "ui.theme".into(),
+                value: "light".into(),
+            })
+        );
     }
 
     fn typed(host: &Host) -> String {

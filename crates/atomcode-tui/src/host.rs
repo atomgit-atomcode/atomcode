@@ -3104,6 +3104,19 @@ impl Host {
         self.show_settings_tab(tab);
     }
 
+    /// Open Config with the requested setting selected.
+    pub fn open_settings_for(&self, id: &str) {
+        if !self.settings_open() {
+            self.toggle_settings();
+        }
+        let mut moment = self.moment.write().expect("moment poisoned");
+        moment.settings_panel = Some(crate::settings::Panel {
+            query: id.to_owned(),
+            query_caret: id.len(),
+            ..crate::settings::Panel::new()
+        });
+    }
+
     /// Put the settings panel away. True when it was up.
     pub fn close_settings(&self) -> bool {
         self.moment

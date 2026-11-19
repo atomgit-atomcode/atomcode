@@ -59,6 +59,7 @@ fn screen_catalogue() -> Vec<Command> {
         Command::said("team", t(Msg::CmdAboutTeam)),
         Command::said_taking("paste", t(Msg::CmdTakesPath), t(Msg::CmdAboutPaste)),
         Command::said("config", t(Msg::CmdAboutConfig)),
+        Command::said("theme", t(Msg::CmdAboutTheme)),
         Command::said("provider", t(Msg::CmdAboutProviderPanel)),
     ]
 }
@@ -176,6 +177,7 @@ impl CommandSet for ScreenCommands {
                 }
             },
             "config" => Outcome::Do(Action::ToggleSettings),
+            "theme" => Outcome::Do(Action::OpenSetting("ui.theme")),
             "provider" => Outcome::Do(Action::ToggleProviders),
             "keys" => {
                 let names = ctx
@@ -8409,6 +8411,11 @@ mod tests {
             c.dispatch("/config", &app.context()).await,
             Outcome::Do(Action::ToggleSettings)
         );
+        assert_eq!(
+            c.dispatch("/theme", &app.context()).await,
+            Outcome::Do(Action::OpenSetting("ui.theme"))
+        );
+        assert!(c.all().iter().any(|command| command.name == "theme"));
         // And `/provider` is the other panel, on the same terms. It used to be a
         // picker over `HostCommand::Providers` that could only switch between
         // the legacy `[providers.*]` entries — which is why an account in the

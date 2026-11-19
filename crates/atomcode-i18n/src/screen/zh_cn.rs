@@ -425,6 +425,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PatchReady => "请用 apply_patch 应用这份已导入的用户补丁，使用其 artifact_id 和完整 file_paths，不要复述补丁正文：".into(),
         Msg::CmdAboutPaste => "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它".into(),
         Msg::CmdAboutConfig => "拉出设置面板:搜索、改值;esc 关".into(),
+        Msg::CmdAboutTheme => "打开终端主题设置，重启后生效".into(),
         Msg::CmdAboutProviderPanel => "拉出 provider 面板:账号与模型,增改删;enter 换过去,esc 关".into(),
         Msg::CmdAboutCopy => "复制模型最后一条回复;/copy code 复制代码块(N 指定第几块,all 全要)".into(),
         Msg::CmdAboutSave => "把这段对话存成 markdown".into(),

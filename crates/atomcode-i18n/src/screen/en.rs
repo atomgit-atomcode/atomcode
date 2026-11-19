@@ -460,6 +460,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PatchReady => "Apply this imported user patch with apply_patch using its artifact_id and exact file_paths. Do not reproduce its body:".into(),
         Msg::CmdAboutPaste => "put the clipboard (or a file) into the composer; for when the terminal or the system eats Ctrl+V".into(),
         Msg::CmdAboutConfig => "open the settings panel: search, change a value; esc closes it".into(),
+        Msg::CmdAboutTheme => "open the terminal theme setting (applies after restart)".into(),
         Msg::CmdAboutProviderPanel => "open the provider panel: accounts and models, add/edit/remove; enter switches, esc closes".into(),
         Msg::CmdAboutCopy => "copy the model's last reply; /copy code copies a code block (N picks which one, all takes every one)".into(),
         Msg::CmdAboutSave => "save this conversation as markdown".into(),
