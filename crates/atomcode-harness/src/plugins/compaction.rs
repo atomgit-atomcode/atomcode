@@ -305,6 +305,7 @@ impl StrategyView {
                 ask.used_tokens as f32 / ask.window as f32
             },
             sacred_floor: self.floor,
+            parent: None,
         }
     }
 }

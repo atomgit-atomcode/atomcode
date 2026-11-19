@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::stream::TokenUsage;
-use crate::tool::ToolCall;
+use crate::tool::{ToolCall, ToolDef};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -948,10 +950,21 @@ pub enum CompactTrigger {
     Overflow { attempt: u8 },
 }
 
+/// The advertised tool set a cache-safe compaction fork replays with the
+/// parent conversation's own messages: the summary request then shares the
+/// parent conversation's prefix from token 0, so the provider's warm prompt
+/// cache covers the history instead of billing it at the cold rate. The
+/// system prompt needs no separate capture — the replayed span carries it.
+#[derive(Clone, Debug)]
+pub struct ParentPromptContext {
+    pub tools: Arc<[ToolDef]>,
+}
+
 /// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
-/// history plus the pressure facts the kernel already records, and the
-/// kernel-computed `sacred_floor`. A strategy reads these to PLAN a drain; it can
-/// never mutate the conversation (the kernel is the sole writer via `apply_plan`).
+/// conversation messages, the trigger, the pressure facts the kernel already
+/// records, and the kernel-computed `sacred_floor`. A strategy reads these to
+/// PLAN a drain; it can never mutate the conversation (the kernel is the sole
+/// writer via `apply_plan`).
 pub struct CompactionView<'a> {
     pub messages: &'a [Message],
     pub trigger: CompactTrigger,
@@ -961,6 +974,12 @@ pub struct CompactionView<'a> {
     /// The number of leading messages the strategy must NOT propose draining (the
     /// kernel re-enforces this anyway by clamping in `apply_plan`).
     pub sacred_floor: usize,
+    /// The parent conversation's advertised tool set, when the engine can
+    /// supply it. `Some` lets the strategy fork the summary request onto the
+    /// parent's prefix — the span already carries the system prompt — so the
+    /// provider's warm cache covers the history; `None` falls back to the
+    /// rendered-transcript summarizer.
+    pub parent: Option<ParentPromptContext>,
 }
 
 /// Why a safe compaction could not provide the requested reduction. Display-only:
@@ -2030,6 +2049,7 @@ mod tests {
                 used_tokens: 0,
                 utilization: 0.0,
                 sacred_floor: floor,
+                parent: None,
             };
             let plan = SummarizeOldestStrategy { keep_recent }.plan(&view).await;
             c.apply_plan(plan, floor);
@@ -2293,6 +2313,7 @@ mod tests {
             used_tokens: 900,
             utilization: 0.9,
             sacred_floor: 2,
+            parent: None,
         };
         let plan = NoCompaction.plan(&view).await;
         assert!(plan.is_noop(), "NoCompaction must return a noop plan");

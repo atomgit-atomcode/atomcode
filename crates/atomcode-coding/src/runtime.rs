@@ -1989,6 +1989,10 @@ pub async fn compact_snapshot(
             used_tokens,
             utilization,
             sacred_floor: floor,
+            // The daemon-side snapshot path has no conversation-bound tool
+            // registry here, so the fork's warm-prefix reuse stays
+            // engine-driven until the tools are threaded through this call.
+            parent: None,
         })
         .await;
     let mutation = snapshot_mutation(&conversation, &plan);
