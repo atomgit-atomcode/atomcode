@@ -10,10 +10,13 @@
 //!
 //! Why this is cache-friendly (the whole point — see core's
 //! `2026-06-09-cache-friendly-compaction-design`): the stub is COMMITTED to history and
-//! MONOTONIC. An already-stubbed result (`text.len() <= MIN_COLLAPSE_SIZE`) yields no
-//! rewrite, so a re-run is a noop (the kernel's net-loss guard refuses it, epoch unchanged).
-//! Each turn therefore breaks the provider prefix cache at most ONCE, at the TAIL (the
-//! turn that just went stale), then freezes — instead of the old ephemeral `microcompact`
+//! MONOTONIC. An already-stubbed result is detected by its envelope
+//! (`text_is_compact_stub`) and yields no rewrite, so a re-run is a noop (the kernel's
+//! net-loss guard refuses it, epoch unchanged) — note a head+tail preview stub (~1.8K
+//! chars) EXCEEDS the size thresholds below, so the envelope guard is the idempotency
+//! mechanism, not the size check. Each turn therefore breaks the provider prefix cache at
+//! most ONCE, at the TAIL (the turn that just went stale), then freezes — instead of the
+//! old ephemeral `microcompact`
 //! that re-derived stubs every render and flipped historical bytes full↔stub,炸 the
 //! prefix repeatedly. Below the trigger threshold nothing is stubbed at all → short
 //! sessions stay full-fidelity and purely append-only (perfect cache).
@@ -36,8 +39,10 @@ use atomcode_kernel::stream::{
 };
 use futures::StreamExt;
 
-/// Tool results at or below this byte size are left alone. A produced stub is far under
-/// this, which is what makes the rewrite MONOTONIC: re-running never re-stubs a stub.
+/// Tool results at or below this byte size are left alone. A produced stub is no longer
+/// guaranteed to be under this — a head+tail preview stub is ~1.8K chars — so the rewrite
+/// MONOTONICity (re-running never re-stubs a stub) is enforced by the envelope guard
+/// `text_is_compact_stub`, not by the size threshold.
 /// Mirrors core's `MIN_COLLAPSE_SIZE`.
 pub const MIN_COLLAPSE_SIZE: usize = 500;
 
@@ -118,7 +123,7 @@ impl CompactionStrategy for StubCompaction {
                 continue; // protected prefix (kernel re-enforces; skip early)
             }
             if m.role != Role::Tool || m.text.len() <= MIN_COLLAPSE_SIZE {
-                continue; // not a (big enough) tool result; already-small = idempotent
+                continue; // not a tool result; already-small rides the envelope guard below
             }
             let tool = m
                 .tool_call_id
@@ -128,6 +133,9 @@ impl CompactionStrategy for StubCompaction {
                 .unwrap_or("tool");
             if self.exempt_read_file && tool == "read_file" {
                 continue;
+            }
+            if text_is_compact_stub(&m.text) {
+                continue; // already stubbed: a second pass stays a no-op
             }
             // Tool RESULT success = NOT is_error.
             rewrites.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
@@ -148,8 +156,9 @@ impl CompactionStrategy for StubCompaction {
 }
 
 /// Tool results below this size are left alone under OVERFLOW (smaller than the normal
-/// `MIN_COLLAPSE_SIZE` — overflow is more aggressive). A produced stub is well under this,
-/// so re-running never re-stubs a stub (monotonic / idempotent).
+/// `MIN_COLLAPSE_SIZE` — overflow is more aggressive). A head+tail preview stub exceeds
+/// this, so re-running a stub is kept a no-op by the `text_is_compact_stub` envelope
+/// guard (monotonic / idempotent), not by the size threshold.
 const AGGRESSIVE_STUB_MIN: usize = 160;
 
 /// Marker appended to a hard-truncated message body. Presence of this substring makes
@@ -311,6 +320,9 @@ impl OverflowCompaction {
                 .unwrap_or("tool");
             if tool == "read_file" && i >= read_exempt_from {
                 continue; // recent read → keep full (working context)
+            }
+            if text_is_compact_stub(&m.text) {
+                continue; // already stubbed: a second pass stays a no-op
             }
             out.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
         }
@@ -1745,11 +1757,12 @@ fn call_id_to_tool(msgs: &[Message]) -> HashMap<String, String> {
     map
 }
 
-/// The one-line stub a stubbed tool result is replaced with. Byte-for-byte port of core's
-/// The one-line stub a compacted tool result becomes. Part of the session
-/// projection, so the kernel's (`docs/adr/0024` §6); re-exported here where
-/// compaction has always called it.
+/// The stub a compacted tool result becomes — the first-line shape for
+/// results within the preview budget, the head+tail preview for oversized
+/// ones. Part of the session projection, so the kernel's (`docs/adr/0024`
+/// §6); re-exported here where compaction has always called it.
 pub use atomcode_kernel::session::build_compact_stub;
+pub use atomcode_kernel::session::text_is_compact_stub;
 
 #[cfg(test)]
 mod tests {
@@ -1884,6 +1897,44 @@ mod tests {
             utilization: 0.0125,
             sacred_floor: floor,
         }
+    }
+
+    #[test]
+    fn stub_is_idempotent_and_never_inflates() {
+        // Re-stubbing an already-stubbed result passes it through unchanged —
+        // no nested envelope, no second prefix-cache bust.
+        let stub = build_compact_stub("bash", &"x".repeat(3_000), true);
+        assert_eq!(build_compact_stub("bash", &stub, true), stub);
+        // A result inside the preview budget + marker overhead keeps the
+        // first-line shape: compacting it must not grow the projection.
+        let borderline = "y".repeat(1_800);
+        let small = build_compact_stub("bash", &borderline, true);
+        assert!(
+            !small.contains("[omitted "),
+            "a borderline result must not inflate into a preview: {}",
+            small
+        );
+    }
+
+    #[test]
+    fn stub_of_oversized_output_keeps_head_tail_and_omission_marker() {
+        // The oversized result keeps a bounded head (what ran) and tail (how
+        // it ended) with the omission marker — measured on the real corpus:
+        // 22K tool results × 2.2KB avg, where the replayed middle is the bulk
+        // of the per-round stub cost.
+        let output = format!("{}TAIL-MARKER exit: 0", "x".repeat(3_000));
+        let stub = build_compact_stub("bash", &output, true);
+        assert!(stub.starts_with("[bash ok: 1 lines, head: "), "{}", stub);
+        assert!(
+            stub.contains("TAIL-MARKER exit: 0]"),
+            "the tail rides the preview: {}",
+            stub
+        );
+        assert!(
+            stub.contains("[omitted "),
+            "the omission marker accounts for the cut middle: {}",
+            stub
+        );
     }
 
     #[test]
@@ -2112,6 +2163,44 @@ mod tests {
         assert!(
             !rw.iter().any(|(i, _)| *i == 6),
             "recent read (at/above boundary) must be exempt: {rw:?}"
+        );
+    }
+
+    #[test]
+    fn preview_stub_is_strictly_shorter_even_with_long_tool_names() {
+        // 刚过预览阈值 + FAILED + 长 MCP 限定名：候选 stub 也必须严格短于
+        // 原文——候选实长比较保证不存在「压缩变膨胀」的输入。
+        let tool = "mcp__some_server__a_very_long_tool_name";
+        let output = "y".repeat(2_700);
+        let stub = build_compact_stub(tool, &output, false);
+        assert!(
+            stub.chars().count() < output.chars().count(),
+            "a preview stub must be strictly shorter than its source: {} chars",
+            stub.chars().count()
+        );
+        // And the envelope guard recognizes its own output.
+        assert!(text_is_compact_stub(&stub));
+    }
+
+    #[test]
+    fn second_pass_over_already_stubbed_results_is_a_noop() {
+        // An already-stubbed oversized result must not be re-listed as a
+        // rewrite: the plan stays a no-op and the prefix cache keeps its
+        // single-bust guarantee. The stub must come from an OVERSIZED output
+        // so it lands in the head+tail branch (> AGGRESSIVE_STUB_MIN), where
+        // the envelope guard — not the size threshold — is the only thing
+        // keeping the second pass a no-op.
+        let stub = build_compact_stub("bash", &"x".repeat(3_000), true);
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("u1"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &stub, false),
+        ];
+        let rw = OverflowCompaction::aggressive_stub_rewrites(&msgs, 0, msgs.len(), 0);
+        assert!(
+            rw.is_empty(),
+            "an already-stubbed result must not be re-stubbed: {rw:?}"
         );
     }
 
