@@ -10,6 +10,7 @@ struct Probe {
     max_prompt_bytes: Option<usize>,
     replies: Mutex<VecDeque<Reply>>,
     sent: Mutex<Vec<Vec<Message>>>,
+    sent_tools: Mutex<Vec<Vec<String>>>,
 }
 
 fn answer(text: &str) -> Reply {
@@ -37,9 +38,13 @@ impl LlmProvider for Probe {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _: &[atomcode_kernel::tool::ToolDef],
+        tools: &[atomcode_kernel::tool::ToolDef],
         options: &ChatOptions,
     ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
+        self.sent_tools
+            .lock()
+            .unwrap()
+            .push(tools.iter().map(|t| t.name.clone()).collect());
         assert!(
             options.request_recovery.is_some(),
             "caller must own retries"
@@ -426,7 +431,11 @@ async fn summarize_span_fork_replays_the_parent_prefix() {
         ..Default::default()
     };
     let parent = ParentPromptContext {
-        tools: Arc::new([]),
+        tools: Arc::new([atomcode_kernel::tool::ToolDef {
+            name: "bash".into(),
+            description: "run a command".into(),
+            parameters: serde_json::json!({}),
+        }]),
     };
     // The span IS the parent conversation's prefix (system prompt included):
     // replaying it verbatim is what makes the fork's request share the
@@ -449,6 +458,11 @@ async fn summarize_span_fork_replays_the_parent_prefix() {
         sent[0].last().unwrap().text
     );
     assert_eq!(sent[0].len(), span.len() + 1);
+    assert_eq!(
+        provider.sent_tools.lock().unwrap()[0],
+        vec!["bash".to_string()],
+        "the fork must replay the parent's advertised tool set verbatim"
+    );
     assert!(body.contains("the summary"));
 }
 

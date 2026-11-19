@@ -704,6 +704,20 @@ async fn summarize_span_fork(
         n => n,
     };
     let max_output = (window / 8).clamp(1, MAX_SUMMARY_TOKENS);
+    // Cheap size pre-estimate: a replay that cannot fit the window is a doomed
+    // billed request — skip the fork and let the transcript path window it.
+    // ~4 bytes per token plus a per-message envelope allowance.
+    let estimated_tokens: usize = prefix.iter().map(|m| m.text.len() / 4 + 64).sum::<usize>()
+        + focus.map(str::len).unwrap_or(0) / 4;
+    if estimated_tokens >= window.saturating_sub(max_output) as usize {
+        return Err(SummaryError::Provider(ProviderError {
+            retryable: false,
+            message: "the replayed prefix cannot fit the window".into(),
+            http_status: None,
+            code: Some("context_length_exceeded".into()),
+            retry_after_secs: None,
+        }));
+    }
     let mut prompt = prefix.to_vec();
     prompt.push(Message::user(build_fork_instruction(
         find_prior_anchor(prefix),
@@ -1570,33 +1584,6 @@ strings, and identifiers. Keep every section even when empty.";
 /// an UPDATE and embeds the prior anchor as a `<previous-summary>` block; otherwise a fresh
 /// CREATE. `focus` appends a steer. The new `transcript` (events to fold in) is appended last.
 /// The instructions, template, anchor and focus are not counted against the transcript cap.
-/// The fork's summary instruction: the same anchored-summary contract as
-/// `build_summary_prompt`, minus the rendered-transcript section — the history
-/// rides as the fork's own replayed messages, so there is no "Conversation
-/// history to summarize:" block to leave dangling.
-fn build_fork_instruction(previous_anchor: Option<&str>, focus: Option<&str>) -> String {
-    let mut p = String::new();
-    match previous_anchor {
-        Some(anchor) => {
-            p.push_str(
-                "Update the anchored summary below using the new conversation history. \
-                 Preserve the decisions, constraints, and file paths it records, removing \
-                 only details the new history supersedes; merge in new facts.\n\
-                 <previous-summary>\n",
-            );
-            p.push_str(&neutralize_summary_delimiters(anchor));
-            p.push_str("\n</previous-summary>\n\n");
-        }
-        None => p.push_str("Create a new anchored summary from the conversation history.\n\n"),
-    }
-    p.push_str(SUMMARY_TEMPLATE);
-    if let Some(f) = focus.map(str::trim).filter(|f| !f.is_empty()) {
-        p.push_str(&format!(
-            "\n\nPay special attention to anything related to: {f}."
-        ));
-    }
-    p
-}
 
 fn build_summary_prompt(
     previous_anchor: Option<&str>,
@@ -1627,6 +1614,44 @@ fn build_summary_prompt(
     }
     p.push_str("\n\nConversation history to summarize:\n\n");
     p.push_str(transcript);
+    p
+}
+
+/// The fork's summary instruction: the same anchored-summary contract as
+/// `build_summary_prompt`, plus the behavioral constraints the dedicated
+/// summarizer system prompt would carry (a maintenance task — never answer
+/// the conversation — in the conversation's language), because the fork
+/// replays the parent's own system prompt instead of that one. Minus the
+/// rendered-transcript section — the history rides as the fork's own replayed
+/// messages, so there is no "Conversation history to summarize:" block to
+/// leave dangling.
+fn build_fork_instruction(previous_anchor: Option<&str>, focus: Option<&str>) -> String {
+    let mut p = String::new();
+    p.push_str(
+        "This is a maintenance task, not a conversational turn: produce the anchored \
+         context summary described below and nothing else. Do not answer the \
+         conversation. Do not mention that you are summarizing or compacting. Respond \
+         in the same language as the conversation.\n\n",
+    );
+    match previous_anchor {
+        Some(anchor) => {
+            p.push_str(
+                "Update the anchored summary below using the new conversation history. \
+                 Preserve the decisions, constraints, and file paths it records, removing \
+                 only details the new history supersedes; merge in new facts.\n\
+                 <previous-summary>\n",
+            );
+            p.push_str(&neutralize_summary_delimiters(anchor));
+            p.push_str("\n</previous-summary>\n\n");
+        }
+        None => p.push_str("Create a new anchored summary from the conversation history.\n\n"),
+    }
+    p.push_str(SUMMARY_TEMPLATE);
+    if let Some(f) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+        p.push_str(&format!(
+            "\n\nPay special attention to anything related to: {f}."
+        ));
+    }
     p
 }
 
