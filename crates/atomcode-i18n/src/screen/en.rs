@@ -141,6 +141,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MentionEmpty => "  No matching items".into(),
         Msg::MentionLegend => "  enter/tab insert · esc close · up/down select · left/right category".into(),
         Msg::MentionSessions => "Sessions".into(),
+        Msg::MentionSessionsWorkspace => "Sessions · this workspace".into(),
         Msg::MentionSelected => "Selected".into(),
         Msg::MentionFilter => "Filter · Enter / Tab".into(),
         Msg::MenuFolder => "folder".into(),
