@@ -9781,6 +9781,9 @@ impl Tui {
             .input
             .clone();
         let rest = typed.strip_prefix('/')?;
+        if !rest.is_empty() && !crate::command::looks_like_command(&typed) {
+            return None;
+        }
         if let Some((name, args)) = rest.split_once(char::is_whitespace) {
             let command = self.host.commands.find(name)?;
             if command.options.is_empty() {
@@ -10053,7 +10056,7 @@ impl Tui {
     /// sits on its first row.
     ///
     /// **Tab completes and enter takes.** Tab puts the lit name on the line so
-    /// its argument can be typed; enter dispatches the lit name outright, and a
+    /// its argument can be typed; enter takes the lit name, and a
     /// command that needs an argument answers with a panel to pick it from —
     /// which is where the second level of a command comes from, not from this
     /// screen knowing what the arguments are.
@@ -10117,7 +10120,8 @@ impl Tui {
     /// business. This screen knows how to lay a list out; it does not know that
     /// `/effort` takes a level.
     ///
-    /// The one exception is a command with a closed set of values: taking its
+    /// A description-only match completes the name before dispatch. A command
+    /// with a closed set of values also completes: taking its
     /// row opens that set — one row per value — rather than running it bare,
     /// because the pick a person came for is a level below. That is [`complete`]
     /// followed by the menu recomputing into the values, the same as tab. A row
@@ -10165,15 +10169,21 @@ impl Tui {
         // has nothing after it. If the person has already typed arguments
         // (`/rename hello`), the tokens are two or more and the pick is a
         // dispatch, not a completion.
-        let line_is_bare_pick = {
-            let line = self
-                .host
-                .moment
-                .read()
-                .expect("moment poisoned")
-                .input
-                .clone();
-            line.trim_start_matches('/').split_whitespace().count() <= 1
+        let (line_is_bare_pick, description_pick) = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let description_pick = command.as_ref().is_some_and(|c| {
+                m.input
+                    .strip_prefix('/')
+                    .filter(|query| !query.contains(char::is_whitespace))
+                    .is_some_and(|query| {
+                        let query = query.to_lowercase();
+                        !c.matches_prefix(&query) && c.matches_description(&query)
+                    })
+            });
+            (
+                m.input.trim_start_matches('/').split_whitespace().count() <= 1,
+                description_pick,
+            )
         };
         // `Required` is routed here the same as `Optional`: the person's
         // first Enter on a required command asks for the argument's slot, and
@@ -10194,7 +10204,8 @@ impl Tui {
                         | atomcode_kernel::agent::ArgsRequirement::Required
                 )
         });
-        if argument_completion_bare_pick
+        if description_pick
+            || argument_completion_bare_pick
             || command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
             || option_owner.is_some_and(|c| c.require_arg && name != "skills --list")
         {
@@ -17167,6 +17178,18 @@ mod args_requirement_menu_tests {
         m.caret = line.len();
         Arc::make_mut(&mut m.history).clear();
         m.history_at = None;
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_description_match_completes_before_dispatch() {
+        let (host, tui) = screen_with(ArgsRequirement::None);
+        type_line(&host, "/thing");
+        tui.refresh_menu();
+        assert_eq!(host.menu_selected().as_deref(), Some("cmd"));
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(m.input, "/cmd");
+        assert!(m.history.is_empty());
     }
 
     #[tokio::test]

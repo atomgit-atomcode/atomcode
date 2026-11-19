@@ -659,7 +659,7 @@ const zh = {
   'cmd.reload.done': '配置已重载',
   'cmd.skills.desc': '浏览可用技能',
   'cmd.help.desc': '显示可用命令',
-  'cmd.review.desc': '使用只读审查 Agent 审查改动',
+  'cmd.review.desc': '使用只读 Agent 对当前改动进行代码审查',
   'cmd.help.title': '可用命令：',
   'cmd.mode.done': '已切换到 {mode} 模式',
   'cmd.model.openHint': '请点击底部模型选择器以切换模型',

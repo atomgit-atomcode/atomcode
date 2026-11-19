@@ -624,7 +624,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── background sessions ──
         Msg::CmdAboutBg => "后台会话:不带参数把这个会话放到后台接着跑,带任务就新开一个去做;也能看、换、丢".into(),
         Msg::CmdTakesBg => "[<任务> | list | <N> | drop <N>]".into(),
-        Msg::CmdAboutReview => "让另一个会话把这次改动审一遍——默认放后台跑,当前对话不停".into(),
+        Msg::CmdAboutReview => "在独立会话中进行代码审查，默认后台运行，当前对话可继续".into(),
         Msg::CmdTakesReview => "[deep | deep+verify] [staged | <base>] [关注点]".into(),
         Msg::ReviewWhatUncommitted => "审查未提交的改动".into(),
         Msg::ReviewWhatStaged => "审查已暂存的改动".into(),

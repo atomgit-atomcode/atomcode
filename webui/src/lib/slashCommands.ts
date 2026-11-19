@@ -27,7 +27,7 @@ export function detectSlashMenuQuery(text: string, cursor = text.length): { star
   const slash = before.lastIndexOf('/');
   if (slash < 0 || (slash > 0 && !/\s/.test(before[slash - 1]))) return null;
   const query = before.slice(slash + 1);
-  if (/\s/.test(query) || query.length > 256) return null;
+  if (query.length > 256 || (query && !NAME_RE.test(query))) return null;
   return { start: slash, query, skillsOnly: false };
 }
 
@@ -182,14 +182,24 @@ export function buildSlashMenuItems(
   skillsOnly = false,
 ): SlashMenuItem[] {
   const q = query.toLowerCase();
-  const cmdItems: SlashMenuItem[] = skillsOnly
-    ? []
-    : commands
-        .filter((c) => c.name.toLowerCase().includes(q))
-        .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
-  const skillItems: SlashMenuItem[] = skills
-    .filter((s) => s.name.toLowerCase().includes(q) || s.display_name?.toLowerCase().includes(q))
-    .map((s) => ({ name: s.name, ...(s.display_name ? { display_name: s.display_name } : {}), description: s.description ?? '', kind: 'skill' as const }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-  return [...cmdItems, ...skillItems];
+  const nameMatches: SlashMenuItem[] = [];
+  const descriptionMatches: SlashMenuItem[] = [];
+  function add(item: SlashMenuItem, names: string[]) {
+    if (names.some((name) => name.toLowerCase().includes(q))) {
+      nameMatches.push(item);
+    } else if (item.description.toLowerCase().includes(q)) {
+      descriptionMatches.push(item);
+    }
+  }
+  if (!skillsOnly) {
+    for (const command of commands) {
+      add({ name: command.name, description: t(command.descKey), kind: 'command' },
+        [command.name, ...(command.aliases ?? [])]);
+    }
+  }
+  for (const skill of [...skills].sort((a, b) => a.name.localeCompare(b.name))) {
+    add({ name: skill.name, display_name: skill.display_name, description: skill.description ?? '', kind: 'skill' },
+      [skill.name, ...(skill.display_name ? [skill.display_name] : [])]);
+  }
+  return [...nameMatches, ...descriptionMatches];
 }

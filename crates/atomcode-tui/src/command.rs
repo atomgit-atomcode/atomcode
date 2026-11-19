@@ -219,6 +219,10 @@ impl Command {
         has_prefix(&self.name) || self.aliases.iter().any(|a| has_prefix(a))
     }
 
+    pub(crate) fn matches_description(&self, typed_lower: &str) -> bool {
+        !typed_lower.is_empty() && self.about.to_lowercase().contains(typed_lower)
+    }
+
     /// True when `typed` is this command's name or one of its aliases (exact,
     /// ASCII case-insensitive) — what dispatch resolves on.
     pub fn answers_to(&self, typed: &str) -> bool {
@@ -521,8 +525,7 @@ impl Commands {
         out
     }
 
-    /// Matches for what has been typed after the slash — by command name or by
-    /// any alias, so `/ne` surfaces the `session` command while it stays one row.
+    /// Menu matches by name, alias, or the displayed description.
     ///
     /// **Ranked, not alphabetical** — the first row is the one Enter takes, so
     /// it has to be the one a person typing `/q` or `/m` means. In order:
@@ -531,34 +534,42 @@ impl Commands {
     /// 2. the commands in [`MOST_USED`], most used first;
     /// 3. the rest of this build's own commands, alphabetically;
     /// 4. the rest of the agent's catalog, alphabetically (skills live under
-    ///    the `/skills` gateway).
+    ///    the `/skills` gateway);
+    /// 5. description-only hits, in the same catalog order.
     ///
     /// Sorted by name alone, `/q` + Enter ran a skill called `quantify-agent`,
     /// `/m` opened `/mcp`, and the skills a person installed sat between the
     /// commands they came for. The classic screen kept its own order and its
     /// skills behind `/skills`, and that order is what fingers learned.
     pub fn matching(&self, prefix: &str) -> Vec<Command> {
+        self.matches(prefix, true)
+    }
+
+    fn matches(&self, prefix: &str, include_descriptions: bool) -> Vec<Command> {
         let p = prefix.to_lowercase();
-        let mut out: Vec<(Command, bool)> = Vec::new();
+        let mut out: Vec<(Command, bool, bool)> = Vec::new();
         for set in self.sets.read().expect("commands poisoned").iter() {
             let own = set.in_help();
             for command in set.commands() {
-                if !out.iter().any(|(c, _)| c.name == command.name) {
-                    out.push((command, own));
+                if !out.iter().any(|(c, _, _)| c.name == command.name) {
+                    let name_match = command.matches_prefix(&p);
+                    out.push((command, own, name_match));
                 }
             }
         }
-        out.retain(|(c, _)| c.matches_prefix(&p));
-        let rank = |(c, own): &(Command, bool)| {
+        out.retain(|(c, _, name_match)| {
+            *name_match || (include_descriptions && c.matches_description(&p))
+        });
+        let rank = |(c, own, name_match): &(Command, bool, bool)| {
             let exact = !p.is_empty() && c.answers_to(&p);
             let used = MOST_USED
                 .iter()
                 .position(|n| c.name.eq_ignore_ascii_case(n))
                 .unwrap_or(usize::MAX);
-            (!exact, used, !*own, c.name.to_lowercase())
+            (!*name_match, !exact, used, !*own, c.name.to_lowercase())
         };
         out.sort_by_cached_key(rank);
-        out.into_iter().map(|(c, _)| c).collect()
+        out.into_iter().map(|(c, _, _)| c).collect()
     }
 
     /// The command this name would run, as the registry would run it.
@@ -665,7 +676,7 @@ impl Commands {
         match owner {
             Some(set) => set.run(name, args, ctx).await,
             None => {
-                let near = self.matching(name);
+                let near = self.matches(name, false);
                 if near.is_empty() {
                     Outcome::Refused(t(Msg::CmdNoSuch { name }).into_owned())
                 } else {
@@ -1087,6 +1098,35 @@ mod tests {
             vec!["alpha", "also"]
         );
         assert!(c.matching("zz").is_empty());
+    }
+
+    #[test]
+    fn the_menu_ranks_names_and_aliases_before_localized_descriptions() {
+        const ITEMS: &[Command] = &[
+            Command::new("quit", "Exit this session · 退出会话"),
+            Command::new("session", "Start a fresh session").with_aliases(&["new"]),
+            Command::new("model", "Select a new model · 切换模型"),
+        ];
+        let commands = Commands::new();
+        commands.add(Arc::new(Fake("row", ITEMS))).unwrap();
+        let matches = |query| {
+            commands
+                .matching(query)
+                .into_iter()
+                .map(|cmd| cmd.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matches("NEW"), ["session", "model"]);
+        assert_eq!(matches("退出"), ["quit"]);
+        assert_eq!(matches("切换"), ["model"]);
+        assert!(commands.matches("切换", false).is_empty());
+    }
+
+    #[test]
+    fn chinese_code_review_keyword_finds_review() {
+        use crate::i18n::{t_with, Locale, Msg};
+        let review = Command::said("review", t_with(Locale::ZhCn, Msg::CmdAboutReview));
+        assert!(review.matches_description("代码审查"));
     }
 
     /// Every command a person runs is told to the observer, under the name it
