@@ -894,8 +894,15 @@ mod tests {
     async fn re_registering_read_file_overwrites_its_vision_flag() {
         use atomcode_kernel::tool::{ProgressSink, ToolContext};
         let d = tempfile::tempdir().unwrap();
-        // JPEG-ish blob with a NUL so `looks_binary` flags it.
-        std::fs::write(d.path().join("c.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00]).unwrap();
+        // A real (tiny) JPEG: one that does not decode is never attached.
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        std::fs::write(d.path().join("c.jpg"), jpeg).unwrap();
         let ctx = ToolContext {
             working_dir: d.path().to_path_buf(),
             cancel: Default::default(),

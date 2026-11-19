@@ -885,6 +885,13 @@ pub async fn run_upgrade(
     // A deliberate upgrade is the person saying "the new one, please": if a
     // rollback had paused automatic updates, that pause is over.
     let updates = resume_updates_after_upgrade();
+    let updates = match updates {
+        UpdatesAfterUpgrade::NotResumed(_) => updates,
+        _ => match unblock_pending_upgrades(&pending_json_path()) {
+            Ok(()) => updates,
+            Err(error) => UpdatesAfterUpgrade::NotResumed(format!("{error:#}")),
+        },
+    };
 
     let backup = backup_path(&exe);
     // NOTE: `exe` was captured *before* `replace_binary` renamed the running
@@ -1041,6 +1048,64 @@ fn pending_json_path() -> PathBuf {
     staged_dir().join("pending.json")
 }
 
+/// A directory at the pointer's path fences out workers from released builds.
+/// Their file writes and file-only cleanup both fail while the directory exists.
+fn block_pending_upgrades(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    // A worker may publish between removing its pointer and creating the fence.
+    for _ in 0..3 {
+        match std::fs::create_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if path.is_dir() {
+                    return Ok(());
+                }
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("clearing {}", path.display()))
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("blocking {}", path.display()))
+            }
+        }
+    }
+    Err(anyhow!(
+        "could not block updates at {}: the pointer kept changing",
+        path.display()
+    ))
+}
+
+/// Remove only an empty fence. A regular pending record belongs to the updater.
+fn unblock_pending_upgrades(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("unblocking {}", path.display())),
+    }
+}
+
+fn deferred_updates_allowed(config: &Path, pending: &Path) -> Result<bool> {
+    if !pending.is_dir() {
+        return Ok(true);
+    }
+    // Also covers re-enabling updates in settings or manually upgrading from a
+    // released build that could restore the setting but did not know the fence.
+    if !matches!(read_auto_update(config), Ok(true)) {
+        return Ok(false);
+    }
+    unblock_pending_upgrades(pending)?;
+    Ok(true)
+}
+
 /// Where a prepared (downloaded + verified) binary lives while it waits
 /// to be promoted. Filename mirrors the release artifact so the same
 /// `binary_filename` helper round-trips.
@@ -1048,12 +1113,13 @@ fn staged_binary_path(version: &str, target: &str) -> PathBuf {
     staged_dir().join(binary_filename(version, target))
 }
 
-/// Read `pending.json` if present. Absent file → `Ok(None)`. Corrupt JSON
+/// Read `pending.json` if present. An absent file or rollback fence gives
+/// `Ok(None)`. Corrupt JSON
 /// returns an error so callers can delete it and retry; `apply_pending_upgrade`
 /// does exactly that.
 pub fn read_pending() -> Result<Option<PendingUpgrade>> {
     let path = pending_json_path();
-    if !path.exists() {
+    if !path.exists() || path.is_dir() {
         return Ok(None);
     }
     let body =
@@ -1103,6 +1169,12 @@ pub async fn prepare_deferred_upgrade(
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<Option<PendingUpgrade>> {
     if is_package_managed() {
+        return Ok(None);
+    }
+    if !deferred_updates_allowed(
+        &atomcode_config::config::Config::default_path(),
+        &pending_json_path(),
+    )? {
         return Ok(None);
     }
     let target = detect_target().ok_or_else(|| {
@@ -1426,6 +1498,18 @@ pub fn run_rollback() -> Result<RollbackSummary> {
 pub fn rollback_and_pause() -> Result<RollbackSummary> {
     let mut summary = run_rollback()?;
     summary.updates = pause_updates_after_rollback();
+    // Establish the fence after pausing the config, before the caller can
+    // restart into the restored binary. Also catches a pointer published
+    // during the swap or the config write.
+    if let Err(error) = block_pending_upgrades(&pending_json_path()) {
+        let error = format!("{error:#}");
+        summary.updates = match summary.updates {
+            UpdatesAfterRollback::NotPaused(previous) => {
+                UpdatesAfterRollback::NotPaused(format!("{previous}\n{error}"))
+            }
+            _ => UpdatesAfterRollback::NotPaused(error),
+        };
+    }
     Ok(summary)
 }
 
@@ -1576,6 +1660,47 @@ mod tests {
             let config = dir.path().join("config.toml");
             let marker = dir.path().join("staged").join("rolled-back.json");
             (dir, config, marker)
+        }
+
+        #[test]
+        fn an_old_worker_cannot_publish_after_rollback() {
+            let (_dir, config, marker) = paths();
+            assert_eq!(
+                pause_updates_at(&config, &marker),
+                UpdatesAfterRollback::Paused
+            );
+            let pending = marker.with_file_name("pending.json");
+            // A worker published during the rollback, before the fence was in place.
+            std::fs::write(&pending, b"stale pending record").unwrap();
+            block_pending_upgrades(&pending).unwrap();
+            block_pending_upgrades(&pending).unwrap();
+
+            // These are the file operations in released workers and bootstraps.
+            assert!(std::fs::write(&pending, b"another pending record").is_err());
+            assert!(std::fs::remove_file(&pending).is_err());
+            assert!(pending.is_dir());
+            assert!(!deferred_updates_allowed(&config, &pending).unwrap());
+        }
+
+        #[test]
+        fn deferred_updates_can_resume_after_the_rollback_pause() {
+            let (_dir, config, marker) = paths();
+            assert_eq!(
+                pause_updates_at(&config, &marker),
+                UpdatesAfterRollback::Paused
+            );
+            let pending = marker.with_file_name("pending.json");
+            block_pending_upgrades(&pending).unwrap();
+            // A released build can restore the setting on explicit upgrade,
+            // but it cannot remove the fence itself.
+            assert_eq!(
+                resume_updates_at(&config, &marker),
+                UpdatesAfterUpgrade::Resumed
+            );
+            assert!(deferred_updates_allowed(&config, &pending).unwrap());
+            std::fs::write(&pending, b"new pending record").unwrap();
+            unblock_pending_upgrades(&pending).unwrap();
+            assert_eq!(std::fs::read(&pending).unwrap(), b"new pending record");
         }
 
         /// A rollback that leaves automatic updates on is undone at the next

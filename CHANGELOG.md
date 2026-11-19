@@ -22,6 +22,53 @@
   英文界面读它，某个版本没有英文节时显示这里的中文节。Issues 只写在这份里，英文界面也显示这里的。
 -->
 
+## v5.2.8 (2026-11-20)
+
+### 概览
+
+这一版把「从其他 AI 编程工具迁移过来」做成了真正可用的入口：新增 `atomcode import` 与 `/import`，扫描 Claude Code、Codex、OpenCode 留下的指令、技能、MCP 与 provider 配置，逐项说明哪些已经在生效、哪些可以带过来、哪些带不了，并可在确认后写入 provider 账号。同时补齐结构化 Git 状态、视觉预处理模型配置、托管网页搜索与多后端自动故障转移，让模型与用户都能拿到更可靠的现场信息。
+
+稳定性方面重点治理了长思考与流式传输：连续思考不再按累计时长中断、流空闲计时由思考内容刷新，SSE 行缓冲加上限且不再逐行重扫；会话、压缩、后台任务、团队与子 agent 的生命周期各自收敛了竞态与轮询空转。WebUI 与 TUI 在会话浏览、文件预览、模型选择、diff 显示上做了成片改进。
+
+### 更新内容
+
+- **导入其他 AI 编程工具的资产**：新增 `atomcode import`（`--json` 输出机器可读报告、`--apply` 逐项确认写入、`--yes` 跳过无明文凭据的确认）与 TUI `/import` 面板，扫描 Claude Code、Codex、OpenCode 的指令、技能、MCP 与 provider 账号。报告与运行时共用同一套技能目录解析规则，不会声称某个技能已生效而运行时并不读取；已在配置中的 provider 账号标记为「已导入」而不是重复导入，凭据只按类型比对、不读取明文。有意留空的部分会让退出码体现出来，脚本不会把「没导进去」读成「全部成功」。
+- **结构化 Git 状态**：新增 `git_status` 工具，一次返回分支、HEAD、upstream、领先/落后提交数以及已暂存、未暂存、未跟踪、冲突路径，路径相对仓库根且不含子模块内部改动；只读、不发起 fetch，比较不可用时返回空值而不是猜测。同步提供可配置的 diff 换行策略，窄屏终端下超长 diff 行不再被直接截断。
+- **视觉预处理与搜索**：可在 TUI 与 WebUI 配置视觉预处理模型（VL），多模态请求按配置走独立 provider 与独立流式路径；网页搜索新增托管后端与自动故障转移，按路由顺序在多个服务间切换，旧的 Exa 选择自动迁移为 auto。
+- **Provider 与模型**：新增厂商协议选择与更可靠的模型发现，模型元信息缺失时回退 models.dev；扩充阿里、小米、Kimi、腾讯等预设并区分订阅凭据与套餐地址；支持为单个模型配置输出 token 预算，CodingPlan 支持按模型指定 provider 账号并自动识别网关白名单。换模型时按新模型的上下文窗口预警：超出窗口时明说下一条消息可能装不下、达到压缩触发线时提示将触发自动压缩，触发线与压缩阈值一致；窗口未知时保持静默。
+- **代码智能与提示词**：内置 LSP 工具的 diagnostics 不再为空——Windows 上服务端返回的 URI（小写盘符与百分号编码的冒号）与打开文档时的 URI 不一致，导致整条推送被丢弃，现按文件系统路径身份归一化后匹配；系统提示词要求把重要结论落在检查过的证据上，区分观察与推断，如实报告未执行或失败的检查。
+- **长思考与流式传输**：连续思考不再按累计时长中断——只要模型持续产出思考内容就继续等待，首响应与流空闲超时仍然生效、思考内容会刷新流空闲计时，思考超时的手动与自动恢复路径一并移除。配置了思考档位的模型，其辅助调用（会话标题、压缩摘要等）会继承模型默认档位，显式指定时以显式值为准，日志记录实际下发的档位与来源。为 Anthropic、Ollama、Responses 三个解码器加 SSE 行上限，超过 16 MiB 的行或未结束尾部以终态错误结束流；只扫描新增字节，不再逐行重扫缓冲区。工具 schema 中缺省类型的标量 enum 补上类型标注，修复火山 kimi-k3-1-pro 等严格校验平台返回 400 的问题。
+- **会话、压缩与恢复**：压缩失败与「无需压缩」分开报告并保留诊断，长历史可在可恢复窗口内分段总结；恢复被拒绝的会话切换、恢复时未正常结束的回合，提示拒绝原因并保持 `Unavailable`/`Stale` 类型在嵌入边界上不丢失；回退在检查点保留失败时仍然生效；回退点存储增加保留上限，避免快照无限累积。
+- **后台任务、团队与子 agent**：后台任务等待与宿主唤醒对齐，取消等待有界，保留待处理请求并限制 git 统计开销；团队成员不再轮询空转，能解析带限定名的模型路由；子 agent 支持只读的 Grok 与 OpenCode 委派，委派前先做前置检查并明确报告阻塞原因。
+- **WebUI 与 TUI 体验**：会话浏览区分被其他运行时持有的会话（只读）并展示其活动，支持显式创建独立分叉，历史刷新串行化并在完成后重试；文件预览在工作区内统一呈现并链接到已有的 Git 面板，只读统计有界；模型选择与思考强度合并为一个控件，保留模型标签与按时间顺序的回合导航，回合高亮能越过已完成的回复尾部；移动端通过触摸点击仍可触达输入区控件，离线页面在深色模式下对比度改善；WebUI 会话中断的响应流能正确收尾，工作台 Git 面板在目录未初始化 Git 时显示空状态而不是报错。TUI 侧改用闪烁的块状光标，生成速度按流式输出统计而非整段耗时，复制用户消息时排除展示用提示，空输入框显示不可编辑的占位提示，长 diff 行按显示策略换行。
+- **IDE 插件配套改进**：VS Code 聊天面板支持 Ctrl（macOS 为 Cmd）+ 鼠标滚轮实时缩放字号，`atomcode.fontSize` 改动后立即生效，无需重载窗口；正文与代码块的字号联动缩放。
+- **代码评审与工具**：评审可追踪耗时并共享 Git 证据，候选验证范围收敛到改动文件，合并维度的标签比较按片段处理；`todowrite` 全量计划回显改为状态计数，后台评审预设任务标题以避免误报工具不可用；AtomGit 工具参数容错解析，写路径统一给出 `UN_KNOW` 自纠错提示；grep 的敏感路径检查不再逐文件做 JSON 往返，并保留单引号边界。
+- **网络与凭据**：Termux 下系统解析器不可用时改用 Termux 的 DNS 配置，修复静态链接版在读不到 `/etc/resolv.conf` 时回落到环回地址、导致无法登录的问题；保留中继诊断信息以便远端任务恢复；TUI 内可管理已保存的 SSH 凭据，能诊断无人值守场景下的凭据问题并抑制多余提示；权限规则按字面保存 Bash 规则，不再展开通配符；遥测先清洗更长的路径再上报，provider 错误在发送前脱敏。
+
+### Issues
+
+本节收录 [v5.2.8 里程碑](https://atomgit.com/atomgit_atomcode/atomcode/milestones/1101098?iid=51)下的全部 issue，不区分状态与标签。此列表用于关联跟踪，不表示所有条目均已实现或完成发布验收。
+
+- [#1412 [Bug] 手机 App（/app）发指令后立刻切换会话，指令被截胡到另一会话执行（时序竞态，稳定复现）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1412)
+- [#1600 [共创大赛][Bug] atomcode二进制文件硬编码127.0.0.1，导致在termux中无法正常登录](https://atomgit.com/atomgit_atomcode/atomcode/issues/1600)
+- [#1791 [Bug][CLI][Team] --model 不切 provider 账号导致请求打到默认后端；团队 lead 反复轮询 status 空转](https://atomgit.com/atomgit_atomcode/atomcode/issues/1791)
+- [#1792 [Bug][LSP] 内置 lsp 工具 diagnostics 恒为空：publishDiagnostics 的 URI（小写盘符 + %3A 编码）与 didOpen URI 不匹配，整条推送被丢弃](https://atomgit.com/atomgit_atomcode/atomcode/issues/1792)
+- [#1793 [Feature] WebUI 缺少 vision_preprocessor_provider（VL 视觉预处理模型）的展示与修改入口](https://atomgit.com/atomgit_atomcode/atomcode/issues/1793)
+- [#1795 webui页面滚轮操作老是往上跳，挑到前几轮会话的地方去了](https://atomgit.com/atomgit_atomcode/atomcode/issues/1795)
+- [#1796 Review — `atomcode schedule` subcommand](https://atomgit.com/atomgit_atomcode/atomcode/issues/1796)
+- [#1797 Code Review: `Background` session manager](https://atomgit.com/atomgit_atomcode/atomcode/issues/1797)
+- [#1799 更新版本以后，安卓手机app连接到CLI以后点击始终任务，在cli上不生效](https://atomgit.com/atomgit_atomcode/atomcode/issues/1799)
+- [#1800 [共创大赛][Bug] atomcode提示一直无法连接到服务器](https://atomgit.com/atomgit_atomcode/atomcode/issues/1800)
+- [#1801 增加Epistemic Discipline约束](https://atomgit.com/atomgit_atomcode/atomcode/issues/1801)
+- [#1804 [Feature] 为 diff 显示增加自动换行（wrap）选项](https://atomgit.com/atomgit_atomcode/atomcode/issues/1804)
+- [#1806 /compact 上下文一直压缩不了呢](https://atomgit.com/atomgit_atomcode/atomcode/issues/1806)
+- [#1807 [Feature] 一键迁移其他 AI Coding Agent 的资产（指令/技能/配置/会话）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1807)
+- [#1808 [Bug]: reasoning_without_output 预算不随 reasoning 增量重置，且重试成倍叠加（单轮挂起约 15 分钟、usage 全部丢失）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1808)
+- [#1809 [Bug]: 同一模型已配置 reasoning_effort = "high"，实际请求交替下发 omitted](https://atomgit.com/atomgit_atomcode/atomcode/issues/1809)
+- [#1811 feat(vscode): 聊天面板支持 Ctrl+鼠标滚轮缩放字号（atomcode.fontSize 实时生效）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1811)
+- [#1812 [Bug] debug 工具 schema 的 action 字段 enum 缺少 type，导致火山 kimi-k3-1-pro 全部请求返回 400 InvalidParameter](https://atomgit.com/atomgit_atomcode/atomcode/issues/1812)
+- [#1813 Feature: Add structured git_status tool with unpushed commit detection for AI model](https://atomgit.com/atomgit_atomcode/atomcode/issues/1813)
+
 ## v5.2.7 (2026-11-12)
 
 ### 概览

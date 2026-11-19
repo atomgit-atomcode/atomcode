@@ -2176,13 +2176,22 @@ impl UserInterface for Tui {
                 if owes_opening {
                     let described = client.described();
                     if described.is_some() || unready {
-                        let cwd = self
-                            .host
-                            .moment
-                            .read()
-                            .expect("moment poisoned")
-                            .cwd
-                            .clone();
+                        let (cwd, providers) = {
+                            let m = self.host.moment.read().expect("moment poisoned");
+                            (m.cwd.clone(), m.providers.clone())
+                        };
+                        // The welcome names the model the way the picker and the
+                        // status row do: by the gateway's display alias when the
+                        // live model has one, the wire name otherwise.
+                        let model = described.as_ref().and_then(|d| d.model.clone());
+                        let model = model.map(|name| {
+                            providers
+                                .models()
+                                .iter()
+                                .find(|m| m.model == name || m.id == name)
+                                .and_then(|m| m.localized_alias().map(str::to_string))
+                                .unwrap_or(name)
+                        });
                         let open =
                             crate::module::Opening {
                                 // Folded upstream: reading the environment is this
@@ -2194,7 +2203,7 @@ impl UserInterface for Tui {
                                 // is what `tests/guards.rs`
                                 // (`the_screen_reads_no_service_of_the_agents`)
                                 // forbids.
-                                model: described.as_ref().and_then(|d| d.model.clone()),
+                                model,
                                 version: env!("CARGO_PKG_VERSION"),
                                 commands: self.host.commands.all(),
                                 // Resolved **here**, not when the welcome producer
@@ -14845,7 +14854,12 @@ mod provider_probe_tests {
                     levels: Vec::new(),
                     current,
                     managed: false,
+                    alias: None,
+                    desc: None,
+                    alias_en: None,
+                    desc_en: None,
                 };
+
             ProvidersView::new(
                 Vec::new(),
                 vec![

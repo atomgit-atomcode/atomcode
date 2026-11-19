@@ -123,6 +123,10 @@ enum Row {
     Blank,
     /// A row of the list, by its index into [`ProvidersView::listed`].
     Listed(usize),
+    /// A model row's description, on its own line under the model — dim,
+    /// indented, and never selectable. By the model's index into
+    /// [`ProvidersView::listed`].
+    ModelDesc(usize),
     /// What a filter that matched nothing says.
     Nothing,
     /// How many rows are out of sight above and below.
@@ -323,6 +327,18 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                     }
                 }
                 entries.push(Row::Listed(at));
+                // A model the gateway gave a description to says it on the line
+                // under its own, dim and not selectable — the row budget and
+                // the scroll window treat it like any other row.
+                if let Listed::Model(i) = item {
+                    if view
+                        .models()
+                        .get(*i)
+                        .is_some_and(|m| m.localized_desc().is_some())
+                    {
+                        entries.push(Row::ModelDesc(*i));
+                    }
+                }
             }
             if entries.is_empty() {
                 rows.push(Row::Nothing);
@@ -391,6 +407,18 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             theme::fg(Role::Muted),
         ),
         Row::Listed(at) => listed_line(view, panel, at, w, caps),
+        Row::ModelDesc(i) => {
+            let Some(row) = view.models().get(i) else {
+                return Line::empty();
+            };
+            let Some(desc) = row.localized_desc() else {
+                return Line::empty();
+            };
+            Line::styled(
+                width::take_width(&format!("    {desc}"), w),
+                theme::fg(Role::Muted),
+            )
+        }
         Row::FormHead => Line::styled(
             width::take_width(&format!("  {}", form_title(panel)), w),
             theme::fg(Role::Brand),
@@ -903,7 +931,12 @@ fn listed_parts(
             }
             (
                 mark_for(row.current, caps),
-                row.id.clone(),
+                // The gateway's display alias wins when it has one, in the
+                // interface language: the name a person picks by is the one
+                // the server labels the model with, not the wire id.
+                row.localized_alias()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| row.id.clone()),
                 about.join(" · "),
                 false,
             )
@@ -1606,7 +1639,12 @@ mod tests {
             levels: vec![],
             current: true,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         };
+
         let view = crate::providers::ProvidersView::new(vec![], vec![row.clone()], vec![], vec![]);
         let mut panel = crate::providers::Panel {
             card: Some(crate::model_cards::CardPanel::new(&row)),
@@ -1657,6 +1695,10 @@ mod tests {
             levels: Vec::new(),
             current,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         }
     }
 

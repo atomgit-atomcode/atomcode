@@ -560,9 +560,15 @@ impl Waterfall<AgentRequest> for Bridge {
         self.hook.pre_request(&mut proposed, &ctx).await;
         timing.returned();
         drop(timing);
-        if proposed.len() > before && proposed[..before] == handed[..] {
-            req.messages.extend(proposed.drain(before..));
-        }
+        // Taken off again once the request is answered (`with_tail`): a row
+        // nearer the front that sends it again must not find it already here.
+        let tail: Vec<Message> = if proposed.len() > before && proposed[..before] == handed[..] {
+            proposed.drain(before..).collect()
+        } else {
+            Vec::new()
+        };
+        let at = req.messages.len();
+        req.messages.extend(tail.iter().cloned());
         let mut timing =
             atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request_options");
         self.hook
@@ -582,7 +588,9 @@ impl Waterfall<AgentRequest> for Bridge {
         // `response_meta` measures for the session log — measured again here
         // because the meta that reaches a hook is built here, not there.
         let started = std::time::Instant::now();
-        match next.run(req).await {
+        let result = next.run(req).await;
+        atomcode_harness::tail::take_off(&mut req.messages, at, &tail);
+        match result {
             Ok(response) => {
                 let mut message =
                     Message::assistant(response.text.clone(), response.tool_calls.clone());
@@ -874,13 +882,13 @@ impl Waterfall<AgentRequest> for PlanModeLive {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
-        if self.active() {
-            req.messages
-                .push(atomcode_capabilities::reminder::synthetic_system_reminder(
-                    crate::plan_mode::PLAN_MODE_REMINDER_BODY,
-                ));
+        if !self.active() {
+            return next.run(req).await;
         }
-        next.run(req).await
+        let reminder = atomcode_capabilities::reminder::synthetic_system_reminder(
+            crate::plan_mode::PLAN_MODE_REMINDER_BODY,
+        );
+        atomcode_harness::tail::with_tail(req, vec![reminder], next).await
     }
 }
 
@@ -4841,6 +4849,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let error = ctx
                 .waterfall::<AgentRequest, _>(&mut request, |_| {
@@ -4887,6 +4896,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let seen = std::sync::atomic::AtomicU32::new(0);
             let began = tokio::time::Instant::now();

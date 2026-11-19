@@ -48,6 +48,24 @@ pub struct ModelRequest {
     /// person sent. A recovery policy reads it to know that "no content" is an
     /// answer here — the model has nothing to add — and not a provider failing.
     pub answering_a_nudge: bool,
+    /// What may be done with this request's pictures — and, once it is sent,
+    /// what was. The loop applies it to the messages it actually sends, after
+    /// every row has had its say (a row may rebuild the request from the log),
+    /// so a picture is judged where it leaves this host.
+    pub images: ImageLimits,
+}
+
+/// The pictures a request may carry. `image-budget` sets the limits per
+/// attempt; the loop applies them to what it sends and fills in `sent`.
+#[derive(Clone, Debug, Default)]
+pub struct ImageLimits {
+    /// Encoded image bytes the request may carry; `None`: no limit.
+    pub max_bytes: Option<usize>,
+    /// Send no pictures at all: the provider refused this request's.
+    pub none: bool,
+    /// Pictures and encoded bytes the request was sent with.
+    pub sent: usize,
+    pub sent_bytes: usize,
 }
 
 /// Attempt-local evidence from the request/execution boundary, not inferred

@@ -2122,6 +2122,18 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
+                // 换成了说哪个:网关给模型起了显示别名,提示就用别名 ——
+                // 和选择器、状态栏同一口径;没别名的仍是原来的名字。
+                let display = ctx
+                    .service::<crate::plugin::ProvidersSvc>()
+                    .and_then(|port| {
+                        let rows = port.rows();
+                        let row = rows
+                            .model(wanted)
+                            .or_else(|| rows.models().iter().find(|m| m.model == wanted));
+                        row.and_then(|row| row.localized_alias().map(str::to_string))
+                    })
+                    .unwrap_or_else(|| wanted.to_string());
                 let (model_line, note) = match control
                     .call(HostCommand::SwitchModel {
                         session: root,
@@ -2132,10 +2144,10 @@ impl CommandSet for SessionCommands {
                     // 宿主说换成了,但有话要说 —— 两句都要说:换确实成了,
                     // 而没存下来是重启之后才看得到的那一半。
                     Ok(HostReply::DoneWithNote { note }) => (
-                        format!("{}\n{note}", t(Msg::ModelSet { wanted })),
+                        format!("{}\n{note}", t(Msg::ModelSet { wanted: &display })),
                         Some(note),
                     ),
-                    Ok(_) => (t(Msg::ModelSet { wanted }).into_owned(), None),
+                    Ok(_) => (t(Msg::ModelSet { wanted: &display }).into_owned(), None),
                     Err(error) => return Outcome::Refused(refusal(error)),
                 };
                 // Keep the accepted exact choice available immediately for
@@ -5233,7 +5245,12 @@ mod tests {
                     levels,
                     current: false,
                     managed: false,
+                    alias: None,
+                    desc: None,
+                    alias_en: None,
+                    desc_en: None,
                 };
+
                 crate::providers::ProvidersView::new(
                     Vec::new(),
                     vec![
@@ -5340,6 +5357,10 @@ mod tests {
                         levels,
                         current: false,
                         managed: false,
+                        alias: None,
+                        desc: None,
+                        alias_en: None,
+                        desc_en: None,
                     }
                 };
                 crate::providers::ProvidersView::new(

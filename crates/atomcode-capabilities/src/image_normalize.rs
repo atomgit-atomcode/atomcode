@@ -61,6 +61,62 @@ pub fn normalize_image_base64(media_type: &str, data_b64: &str) -> (String, Stri
     }
 }
 
+/// An image ready to hand to a model: `(media_type, bytes)` — the type named by the
+/// bytes, not by a file extension, and shrunk the way [`normalize_image_raw`] shrinks
+/// it — or `Err` with why it cannot be sent.
+///
+/// Unlike [`normalize_image_raw`] this does NOT fail open. An image that will not
+/// decode here is refused by the provider too (`unsupported image`), and a picture
+/// in the history is sent on every request after it, so passing it along broke the
+/// session for good. The whole image is decoded, under the same limits: a file cut
+/// short keeps a valid header, and only the pixels show it is broken.
+pub fn sendable_image(raw: &[u8]) -> Result<(String, Vec<u8>), &'static str> {
+    // A shrunk image was decoded whole to be shrunk; only one left as it is
+    // still has to be decoded to show it is sound.
+    if let Some(shrunk) = normalize_image_raw(raw) {
+        return Ok(shrunk);
+    }
+    Ok((check_image(raw)?.to_string(), raw.to_vec()))
+}
+
+/// The media type base64 image data really is, if [`sendable_image`] would
+/// accept it as it is; `None` when it is not an image a model can be sent.
+pub fn base64_image_media_type(data_b64: &str) -> Option<&'static str> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .ok()?;
+    check_image(&raw).ok()
+}
+
+/// Decode `raw` in full under the decode limits; its media type if it is an image
+/// a model accepts and decodes cleanly.
+fn check_image(raw: &[u8]) -> Result<&'static str, &'static str> {
+    let format = image::guess_format(raw).map_err(|_| "not a recognised image encoding")?;
+    let media_type = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => return Err("an image format models do not accept (use PNG, JPEG, GIF or WebP)"),
+    };
+    let (w, h) = image::ImageReader::with_format(std::io::Cursor::new(raw), format)
+        .into_dimensions()
+        .map_err(|_| "the image header is invalid")?;
+    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err("the image dimensions are empty or too large");
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(raw), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_EDGE_DECODE);
+    limits.max_image_height = Some(MAX_EDGE_DECODE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|_| "the image data is corrupt or incomplete")?;
+    Ok(media_type)
+}
+
 /// Normalize raw image bytes. `Some((media_type, bytes))` when the image was resized /
 /// re-encoded (the returned media_type reflects the new encoding — png↔jpeg); `None`
 /// when it is already within budget or could not be processed, in which case the caller
@@ -384,6 +440,38 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    /// The reported case: a picture cut short (a half-written download) still has
+    /// a valid header, so only decoding it shows it is broken. Sent anyway, the
+    /// provider refused it — and every later request, since it stays in history.
+    #[test]
+    fn a_truncated_image_is_not_sendable() {
+        let raw = big_png(64, 64);
+        let cut = &raw[..raw.len() / 2];
+        assert!(sendable_image(cut).is_err());
+        assert!(sendable_image(b"not an image at all").is_err());
+    }
+
+    #[test]
+    fn a_sendable_image_is_named_by_its_bytes_not_its_extension() {
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let (media_type, bytes) = sendable_image(&jpeg).expect("a valid JPEG");
+        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(bytes, jpeg, "within budget → the original bytes");
+    }
+
+    #[test]
+    fn an_oversized_sendable_image_is_still_shrunk() {
+        let raw = big_png(4000, 3000);
+        let (_, out) = sendable_image(&raw).expect("a valid PNG");
+        assert!(out.len() < raw.len());
     }
 
     #[test]

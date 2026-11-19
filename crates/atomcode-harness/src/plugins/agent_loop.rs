@@ -186,7 +186,10 @@ impl PluginAgentLoop {
                 let provider = provider.clone();
                 let ctx = ctx.clone();
                 let session = session.clone();
-                let messages = req.messages.clone();
+                // Pictures are judged here, on exactly what is sent: a row may
+                // have rebuilt the request from the log since `image-budget` ran.
+                let mut messages = req.messages.clone();
+                super::image_budget::finalize(&mut messages, &mut req.images);
                 let tools = if text_only {
                     Vec::new()
                 } else {
@@ -1019,6 +1022,7 @@ impl PluginAgentLoop {
                     turn,
                     round: step,
                     answering_a_nudge,
+                    images: Default::default(),
                 },
             );
             let cancel = agent.cancel_token();
