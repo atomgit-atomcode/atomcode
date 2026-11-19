@@ -2886,6 +2886,22 @@ impl UserInterface for Tui {
                         }
                         m.tick = m.tick.wrapping_add(1);
                     }
+                    // A near/exhausted figure on the row is re-asked on this
+                    // idle beat too: the account can move underneath the
+                    // window (a refresh topping it back up) while no turn
+                    // ends, and a notice that stays put through that is
+                    // wrong. `ALLOWANCE_EVERY` still throttles this to one
+                    // round trip per beat.
+                    if crate::modules::status::row_showing(
+                        self.host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .allowance
+                            .as_ref(),
+                    ) {
+                        self.check_allowance();
+                    }
                     stale = true;
                 }
                 // A drag held still at the conversation's edge: one more row.
@@ -18357,6 +18373,55 @@ mod allowance_switch_tests {
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_allowance_refreshed_mid_window_updates_the_row() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let spent = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "23:24".into(),
+            resets_in_seconds: 8_000,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&spent, m.now);
+        }
+        tui.check_allowance();
+        let ask = pending.recv().await.unwrap();
+        // The account was refreshed underneath the window: the row must
+        // follow the new figure instead of keeping the stale one up.
+        let refreshed = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "23:24".into(),
+            resets_in_seconds: 8_000,
+            window_seconds: 18_000,
+            used_percent: Some(10),
+            calls_used: None,
+            call_limit: None,
+        }];
+        ask.send(reply(refreshed)).unwrap();
+        tokio::task::yield_now().await;
+        let now = host
+            .moment
+            .read()
+            .unwrap()
+            .allowance
+            .clone()
+            .expect("the badge stays after a refresh");
+        assert_eq!(now.percent, 10, "the row follows a mid-window refresh");
     }
 }
 

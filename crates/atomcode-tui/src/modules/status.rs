@@ -647,7 +647,7 @@ fn mode_badge(
 /// Below it the figure is one nobody acts on — the work is not going to stop
 /// today — and the row's space is better spent on what changes. The two steps
 /// are the ones `atomcode-tuix` settled on.
-const ALLOWANCE_NEAR: u8 = 80;
+pub(crate) const ALLOWANCE_NEAR: u8 = 80;
 /// From here on it is not a warning any more.
 const ALLOWANCE_SPENT: u8 = 95;
 
@@ -660,6 +660,14 @@ const ALLOWANCE_SPENT: u8 = 95;
 /// was left when the host answered. Past it the window has turned over and the
 /// figure is about a window that no longer exists, so the row says nothing
 /// rather than "90%" of an allowance that is back to full.
+/// Whether the status row currently says something about the allowance: a
+/// figure at or past the near threshold is on the row right now. The idle
+/// beat re-asks only while this holds — a fresh figure nobody sees costs a
+/// round trip for nothing.
+pub(crate) fn row_showing(allowance: Option<&crate::moment::Allowance>) -> bool {
+    allowance.is_some_and(|a| a.percent >= ALLOWANCE_NEAR)
+}
+
 fn allowance_badge(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
@@ -1041,6 +1049,20 @@ mod tests {
     /// The whole point is that it is silent the rest of the time: a row that
     /// always carried the figure would be one more thing to read past, and it
     /// would stop meaning anything when it mattered.
+    #[test]
+    fn the_row_is_remembered_only_while_the_figure_is_near_or_spent() {
+        let left = |percent| crate::moment::Allowance {
+            label: "5 小时".into(),
+            percent,
+            resets_at: "23:24".into(),
+            resets_by: None,
+        };
+        assert!(row_showing(Some(&left(99))));
+        assert!(row_showing(Some(&left(80))));
+        assert!(!row_showing(Some(&left(79))));
+        assert!(!row_showing(None));
+    }
+
     #[test]
     fn the_allowance_is_only_said_once_it_is_worth_saying() {
         let now = crate::moment::Timestamp::millis(0);
