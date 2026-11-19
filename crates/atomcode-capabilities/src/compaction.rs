@@ -10,10 +10,13 @@
 //!
 //! Why this is cache-friendly (the whole point — see core's
 //! `2026-06-09-cache-friendly-compaction-design`): the stub is COMMITTED to history and
-//! MONOTONIC. An already-stubbed result (`text.len() <= MIN_COLLAPSE_SIZE`) yields no
-//! rewrite, so a re-run is a noop (the kernel's net-loss guard refuses it, epoch unchanged).
-//! Each turn therefore breaks the provider prefix cache at most ONCE, at the TAIL (the
-//! turn that just went stale), then freezes — instead of the old ephemeral `microcompact`
+//! MONOTONIC. An already-stubbed result is detected by its envelope
+//! (`text_is_compact_stub`) and yields no rewrite, so a re-run is a noop (the kernel's
+//! net-loss guard refuses it, epoch unchanged) — note a head+tail preview stub (~1.8K
+//! chars) EXCEEDS the size thresholds below, so the envelope guard is the idempotency
+//! mechanism, not the size check. Each turn therefore breaks the provider prefix cache at
+//! most ONCE, at the TAIL (the turn that just went stale), then freezes — instead of the
+//! old ephemeral `microcompact`
 //! that re-derived stubs every render and flipped historical bytes full↔stub,炸 the
 //! prefix repeatedly. Below the trigger threshold nothing is stubbed at all → short
 //! sessions stay full-fidelity and purely append-only (perfect cache).
@@ -36,8 +39,10 @@ use atomcode_kernel::stream::{
 };
 use futures::StreamExt;
 
-/// Tool results at or below this byte size are left alone. A produced stub is far under
-/// this, which is what makes the rewrite MONOTONIC: re-running never re-stubs a stub.
+/// Tool results at or below this byte size are left alone. A produced stub is no longer
+/// guaranteed to be under this — a head+tail preview stub is ~1.8K chars — so the rewrite
+/// MONOTONICity (re-running never re-stubs a stub) is enforced by the envelope guard
+/// `text_is_compact_stub`, not by the size threshold.
 /// Mirrors core's `MIN_COLLAPSE_SIZE`.
 pub const MIN_COLLAPSE_SIZE: usize = 500;
 
@@ -151,8 +156,9 @@ impl CompactionStrategy for StubCompaction {
 }
 
 /// Tool results below this size are left alone under OVERFLOW (smaller than the normal
-/// `MIN_COLLAPSE_SIZE` — overflow is more aggressive). A produced stub is well under this,
-/// so re-running never re-stubs a stub (monotonic / idempotent).
+/// `MIN_COLLAPSE_SIZE` — overflow is more aggressive). A head+tail preview stub exceeds
+/// this, so re-running a stub is kept a no-op by the `text_is_compact_stub` envelope
+/// guard (monotonic / idempotent), not by the size threshold.
 const AGGRESSIVE_STUB_MIN: usize = 160;
 
 /// Marker appended to a hard-truncated message body. Presence of this substring makes
@@ -2164,8 +2170,11 @@ mod tests {
     fn second_pass_over_already_stubbed_results_is_a_noop() {
         // An already-stubbed oversized result must not be re-listed as a
         // rewrite: the plan stays a no-op and the prefix cache keeps its
-        // single-bust guarantee.
-        let stub = build_compact_stub("bash", &big("bash out"), true);
+        // single-bust guarantee. The stub must come from an OVERSIZED output
+        // so it lands in the head+tail branch (> AGGRESSIVE_STUB_MIN), where
+        // the envelope guard — not the size threshold — is the only thing
+        // keeping the second pass a no-op.
+        let stub = build_compact_stub("bash", &"x".repeat(3_000), true);
         let msgs = vec![
             Message::system("persona"),
             Message::user("u1"),
