@@ -201,11 +201,10 @@ impl Plugin for CompactionSummaryPlugin {
 
 // ---- the first rung of an overflow --------------------------------------
 
-/// Tool output at or below this many bytes is left as it is. A stub is far
-/// shorter, which is what keeps stubbing from ever stubbing a stub.
+/// Tool output at or below this many bytes is left as it is.
 const WORTH_STUBBING: usize = 500;
 
-/// On an overflow, long tool output shown as a one-line stub.
+/// On an overflow, show long tool output as a compact stub.
 ///
 /// The cheapest thing that shrinks a request without losing what was asked or
 /// decided — and the only thing that helps a turn that overflowed on its own
@@ -224,20 +223,22 @@ pub fn stub_on_overflow(log: &SessionLog, ask: &CompactionAsk) -> Option<Compact
     let rewrites: Vec<RewrittenText> = traced
         .iter()
         .filter(|t| t.message.role == Role::Tool && t.message.text.len() > WORTH_STUBBING)
-        .filter_map(|t| match t.source {
-            Provenance::Event(seq) => Some(RewrittenText {
-                seq,
-                text: atomcode_capabilities::compaction::build_compact_stub(
-                    t.message
-                        .tool_call_id
-                        .as_deref()
-                        .and_then(|id| names.get(id).copied())
-                        .unwrap_or("tool"),
-                    &t.message.text,
-                    !t.message.is_error,
-                ),
-            }),
-            _ => None,
+        .filter_map(|t| {
+            let Provenance::Event(seq) = t.source else {
+                return None;
+            };
+            let text = atomcode_capabilities::compaction::build_compact_stub(
+                t.message
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| names.get(id).copied())
+                    .unwrap_or("tool"),
+                &t.message.text,
+                !t.message.is_error,
+            );
+            // A no-op would keep returning this rung instead of letting
+            // the compactor proceed to folding the settled history.
+            (text.len() < t.message.text.len()).then_some(RewrittenText { seq, text })
         })
         .collect();
     (!rewrites.is_empty()).then(|| CompactionDecision {

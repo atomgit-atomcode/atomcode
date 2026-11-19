@@ -1657,43 +1657,64 @@ pub struct RateLimitPause {
     pub server_message: Option<String>,
 }
 
-/// True iff `text` already carries a compact-stub envelope
+/// Whether `text` matches a complete compact-stub envelope
 /// (`[<tool> ok|FAILED: <N> lines, first:|head: …]` for any tool name).
 /// Compaction strategies use this to skip already-stubbed results, so a
 /// second pass stays a no-op: re-stubbing would nest envelopes and re-bust
 /// the prefix cache the first stub paid for. The detection is tool-name
 /// agnostic on purpose — a strategy whose tool lookup falls back to a
-/// generic name must still recognize a stub produced under the real name —
-/// and requires the `lines,` + preview-marker segments, so a real tool
-/// output that merely opens with a bracket-plus-status rarely matches.
+/// generic name must still recognize a stub produced under the real name.
 pub fn text_is_compact_stub(text: &str) -> bool {
-    let rest = match text.strip_prefix('[') {
-        Some(rest) => rest,
-        None => return false,
+    let Some(envelope) = text
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+    else {
+        return false;
     };
-    let (name, tail) = match rest.split_once(' ') {
-        Some(pair) => pair,
-        None => return false,
+    let Some((name, tail)) = envelope.split_once(' ') else {
+        return false;
     };
-    if name.is_empty() {
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
         return false;
     }
-    let after_status = match tail
+    let Some(after_status) = tail
         .strip_prefix("ok: ")
         .or_else(|| tail.strip_prefix("FAILED: "))
-    {
-        Some(after) => after,
-        None => return false,
+    else {
+        return false;
     };
-    let (digits, after_count) = match after_status.split_once(' ') {
-        Some(pair) => pair,
-        None => return false,
+    let Some((digits, preview)) = after_status.split_once(" lines, ") else {
+        return false;
     };
-    digits.chars().all(|c| c.is_ascii_digit())
-        && !digits.is_empty()
-        && after_count.starts_with("lines, ")
-        && (after_count.contains("first: ") || after_count.contains("head: "))
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(first) = preview.strip_prefix("first: ") {
+        return first.chars().take(STUB_FIRST_LINE + 1).count() <= STUB_FIRST_LINE
+            && !first.contains('\n');
+    }
+    let Some(head_and_tail) = preview.strip_prefix("head: ") else {
+        return false;
+    };
+    let Some((head_end, _)) = head_and_tail.char_indices().nth(STUB_PREVIEW_HEAD) else {
+        return false;
+    };
+    let Some((omitted, tail)) = head_and_tail[head_end..]
+        .strip_prefix(STUB_OMISSION_START)
+        .and_then(|rest| rest.split_once(STUB_OMISSION_END))
+    else {
+        return false;
+    };
+    omitted.bytes().all(|byte| byte.is_ascii_digit())
+        && omitted
+            .parse::<usize>()
+            .is_ok_and(|count| count > STUB_PREVIEW_MIN_OMITTED)
+        && tail.chars().take(STUB_PREVIEW_TAIL + 1).count() == STUB_PREVIEW_TAIL
 }
+
+const STUB_FIRST_LINE: usize = 80;
+const STUB_OMISSION_START: &str = " … [omitted ";
+const STUB_OMISSION_END: &str = " chars] … ";
 
 /// The head/tail preview budgets for oversized stubbed tool results: the head
 /// carries what ran, the tail carries how it ended (exit codes, error
@@ -1746,7 +1767,7 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
             .unwrap_or(output.len());
         let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
         let candidate = format!(
-            "[{tool_name} {status}: {line_count} lines, head: {} … [omitted {omitted} chars] … {}]",
+            "[{tool_name} {status}: {line_count} lines, head: {}{STUB_OMISSION_START}{omitted}{STUB_OMISSION_END}{}]",
             &output[..head_end],
             &output[tail_start..]
         );
@@ -1762,7 +1783,7 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
         } else {
             l1
         };
-        chosen.chars().take(80).collect()
+        chosen.chars().take(STUB_FIRST_LINE).collect()
     };
     format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]")
 }

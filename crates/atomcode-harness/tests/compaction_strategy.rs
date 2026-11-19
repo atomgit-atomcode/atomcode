@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_capabilities::compaction::{OverflowCompaction, StubCompaction, ANCHOR_SENTINEL};
-use atomcode_harness::plugins::compaction::{decide_with_strategy, strategy_would_summarize};
+use atomcode_harness::plugins::compaction::{
+    decide_with_strategy, strategy_would_summarize, stub_on_overflow,
+};
 use atomcode_harness::seams::{CompactionAsk, CompactionDecision};
 use atomcode_harness::session::{SeqNo, SessionEvent, SessionLog};
 use atomcode_kernel::message::{
@@ -206,6 +208,52 @@ impl Writer {
 fn bulk(tag: &str, bytes: usize) -> String {
     let line = format!("{tag} line of output that nobody needs in full any more\n");
     line.repeat(bytes / line.len() + 1)
+}
+
+#[test]
+fn harness_overflow_only_rewrites_new_tool_output() {
+    let mut writer = Writer::new();
+    writer.ask("inspect output");
+    writer.call("bash", &format!("{}\nexit: 1", "输出\n".repeat(1_000)));
+    let overflow = ask(CompactTrigger::Overflow { attempt: 0 }, 1_000, 0);
+    let first = stub_on_overflow(&writer.log, &overflow).expect("large output is compressed");
+    assert_eq!(first.rewrites.len(), 1);
+    assert!(first.rewrites[0].text.contains("[omitted "));
+    assert!(first.rewrites[0].text.ends_with("exit: 1]"));
+    writer.apply(first);
+    let next_rung = ask(CompactTrigger::Overflow { attempt: 1 }, 1_000, 0);
+    assert!(stub_on_overflow(&writer.log, &next_rung).is_none());
+
+    let fresh = writer.call("bash", &"x".repeat(3_000));
+    let rewrites = stub_on_overflow(&writer.log, &next_rung).unwrap().rewrites;
+    assert_eq!(rewrites.len(), 1);
+    assert_eq!(rewrites[0].seq, fresh);
+}
+
+#[test]
+fn harness_overflow_compresses_raw_output_with_stub_like_headers() {
+    let mut writer = Writer::new();
+    writer.ask("inspect output");
+    let raw_preview = writer.call(
+        "bash",
+        &format!(
+            "[runner ok: 3000 lines, head: starting\n{}]",
+            "body\n".repeat(1_000)
+        ),
+    );
+    let raw_first_line = writer.call(
+        "bash",
+        &format!("[runner ok: 1 lines, first: {}]", "x".repeat(1_000)),
+    );
+    let overflow = ask(CompactTrigger::Overflow { attempt: 0 }, 1_000, 0);
+    let rewrites = stub_on_overflow(&writer.log, &overflow).unwrap().rewrites;
+    assert_eq!(
+        rewrites
+            .iter()
+            .map(|rewrite| rewrite.seq)
+            .collect::<Vec<_>>(),
+        vec![raw_preview, raw_first_line]
+    );
 }
 
 fn no_orphan_results(messages: &[Message]) -> Result<(), String> {
