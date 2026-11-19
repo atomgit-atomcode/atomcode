@@ -4848,6 +4848,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let error = ctx
                 .waterfall::<AgentRequest, _>(&mut request, |_| {
@@ -4894,6 +4895,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let seen = std::sync::atomic::AtomicU32::new(0);
             let began = tokio::time::Instant::now();

@@ -448,20 +448,25 @@ impl Tool for ReadFileTool {
             // `self.vision` (model capability) AND a recognized image type AND a sane
             // size; anything else keeps the existing binary-text + recovery hint.
             if self.vision && meta.len <= MAX_IMAGE_BYTES {
-                if let Some(media_type) = image_media_type(&path) {
+                if image_media_type(&path).is_some() {
                     // Downscale/re-encode oversized images so a huge screenshot doesn't
                     // blow the per-request body (this image is re-sent on every turn).
-                    // Falls back to the original bytes/type on any decode failure.
-                    let (media_type, data) =
-                        match crate::image_normalize::normalize_image_raw(&bytes) {
-                            Some((mt, out)) => {
-                                (mt, base64::engine::general_purpose::STANDARD.encode(out))
-                            }
-                            None => (
-                                media_type.to_string(),
-                                base64::engine::general_purpose::STANDARD.encode(&bytes),
-                            ),
-                        };
+                    // One that does not decode is never attached: the provider refuses
+                    // it too, and from the history it would fail every request after.
+                    let (media_type, data) = match crate::image_normalize::sendable_image(&bytes) {
+                        Ok((mt, out)) => {
+                            (mt, base64::engine::general_purpose::STANDARD.encode(out))
+                        }
+                        Err(why) => {
+                            return err(format!(
+                                "{} cannot be shown: {why}. The file may be damaged, only \
+                                 partly written, or in another format than its extension \
+                                 says (a HEIC photo renamed .png, for one). It was not \
+                                 attached.",
+                                a.file_path
+                            ));
+                        }
+                    };
                     return ok_with_images(
                         format!(
                             "[Image: {} ({} bytes) — attached below for the vision model]",
@@ -866,10 +871,15 @@ mod tests {
         // A vision-capable model must SEE the image: read_file base64-encodes the
         // bytes into the result's `images` instead of the "Binary file" text dead-end.
         let d = tempfile::tempdir().unwrap();
-        // Minimal JPEG-ish blob (SOI marker + a NUL so `looks_binary` flags it).
-        let bytes: &[u8] = &[
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
-        ];
+        // A real (tiny) JPEG: one that does not decode is never attached.
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let bytes = jpeg.as_slice();
         std::fs::write(d.path().join("cover.jpg"), bytes).unwrap();
         let r = ReadFileTool::new(true)
             .execute(r#"{"file_path":"cover.jpg"}"#, &ctx(d.path()))
@@ -884,6 +894,28 @@ mod tests {
         );
         assert!(!r.content.starts_with("Binary file"), "{}", r.content);
         assert!(r.content.contains("cover.jpg"), "{}", r.content);
+    }
+
+    /// A picture that does not decode is refused by the provider (`unsupported
+    /// image`) — and since a tool's image stays in the history, so was every
+    /// request after it. It must never be attached; the model is told why.
+    #[tokio::test]
+    async fn an_image_that_does_not_decode_is_not_attached() {
+        let d = tempfile::tempdir().unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(32, 32))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(d.path().join("cut.png"), &png[..png.len() / 2]).unwrap();
+        let r = ReadFileTool::new(true)
+            .execute(r#"{"file_path":"cut.png"}"#, &ctx(d.path()))
+            .await;
+        assert!(
+            r.images.is_empty(),
+            "a broken image must not reach the model"
+        );
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("cut.png"), "{}", r.content);
     }
 
     #[test]

@@ -91,6 +91,7 @@ mod tests {
             turn: 1,
             round: 1,
             answering_a_nudge: false,
+            images: Default::default(),
         };
         let seen = Mutex::new(Vec::new());
         let _ = app

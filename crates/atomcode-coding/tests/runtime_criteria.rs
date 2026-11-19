@@ -163,6 +163,23 @@ impl LlmProvider for RecordingProvider {
                 retry_after_secs: None,
             });
         }
+        // A provider that will not take the pictures in a request (DeepSeek's
+        // words for a picture it cannot read).
+        if messages
+            .iter()
+            .any(|m| m.role == Role::User && m.text == "refuse pictures")
+            && messages.iter().any(|m| !m.images.is_empty())
+        {
+            return Err(ProviderError {
+                retryable: false,
+                message:
+                    "HTTP 400: .messages[3].content[0]: You have uploaded an unsupported image."
+                        .into(),
+                http_status: Some(400),
+                code: None,
+                retry_after_secs: None,
+            });
+        }
         // A long task: plan, dig for a while without touching the list, stop.
         if let Some(steps) = dig_steps(messages) {
             let event = match steps {
@@ -4605,6 +4622,91 @@ async fn an_exhausted_plan_window_pauses_until_its_reset() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// How many reminders the host added to a request, and how many say plan
+/// mode is on. A request sent again — a limit waited out, a picture refused —
+/// must carry each of them once, as the first did.
+fn reminders(request: &[Message]) -> (usize, usize) {
+    let tails = request
+        .iter()
+        .filter(|m| m.text.contains("<system-reminder>"))
+        .count();
+    let plan = request
+        .iter()
+        .filter(|m| m.text.contains("PLAN MODE is active"))
+        .count();
+    (tails, plan)
+}
+
+/// Every attempt at one turn carries the host's reminders once — the rows
+/// that add them are run again on the same request whenever it is resent.
+async fn a_request_sent_again_carries_each_reminder_once() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.supports_vision = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+
+    // A limit that clears in a moment: waited out, the request goes again.
+    let (reason, _) = turn_to_rate_limit(&mut runtime, "blip").await;
+    assert_eq!(reason, Some(atomcode_kernel::event::StopReason::Stopped));
+    let attempts: Vec<(usize, usize)> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| reminders(r))
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].1, 1, "plan mode said once: {attempts:?}");
+    assert_eq!(
+        attempts[1], attempts[0],
+        "resent after the limit: {attempts:?}"
+    );
+
+    // A picture the provider refuses: sent again without it.
+    recorder.requests.lock().unwrap().clear();
+    runtime
+        .handle
+        .submit(UserInput {
+            text: "refuse pictures".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let attempts: Vec<(usize, usize, usize)> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let (tails, plan) = reminders(r);
+            (r.iter().map(|m| m.images.len()).sum(), tails, plan)
+        })
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!((attempts[0].0, attempts[1].0), (1, 0), "{attempts:?}");
+    assert_eq!(attempts[0].2, 1, "plan mode said once: {attempts:?}");
+    assert_eq!(
+        (attempts[1].1, attempts[1].2),
+        (attempts[0].1, attempts[0].2),
+        "resent without the picture: {attempts:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A limit that clears in a moment is waited out, and the turn goes on.
 async fn a_brief_rate_limit_is_waited_out() {
     let env = env();
@@ -5576,18 +5678,20 @@ async fn the_prompt_teaches_each_product_tool_once() {
 async fn a_picture_read_reaches_a_model_that_can_see_it() {
     for vision in [true, false] {
         let env = env();
-        std::fs::write(
-            env.project.path().join("cover.jpg"),
-            [
-                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
-            ],
-        )
-        .unwrap();
+        // A real 2×1 PNG: a picture that does not decode is never attached.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x7B, 0x40, 0xE8, 0xDD, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0x00, 0x04, 0xFF, 0x01, 0x07, 0x00, 0x01, 0xFF, 0xE2, 0x23,
+            0x9E, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(env.project.path().join("cover.png"), PNG).unwrap();
         let recorder = Arc::new(Recorder::default());
         let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
         config.agent.supports_vision = vision;
         let mut runtime = CodingRuntime::start(config).await.unwrap();
-        turn(&mut runtime, "read cover.jpg").await;
+        turn(&mut runtime, "read cover.png").await;
         let shown = recorder.last_request().iter().any(|m| !m.images.is_empty());
         assert_eq!(shown, vision, "vision = {vision}");
         runtime.handle.shutdown().await.unwrap();
@@ -7130,6 +7234,7 @@ mod criteria {
         an_undone_turn_is_not_offered_as_a_rewind_point,
         a_restored_snapshot_is_what_the_model_sees,
         plan_mode_refuses_a_write_and_says_so,
+        a_request_sent_again_carries_each_reminder_once,
         accept_edits_applies_a_write_without_asking,
         an_always_allow_survives_an_undo,
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
@@ -7510,7 +7615,8 @@ async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() 
                         text: task.into(),
                         images: vec![atomcode_kernel::message::ImageContent {
                             media_type: "image/png".into(),
-                            data: "cGljdHVyZQ==".into(),
+                            // A real 2×1 PNG: one that does not decode is left out.
+                            data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
                         }],
                     },
                 )
