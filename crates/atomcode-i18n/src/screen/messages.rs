@@ -2532,4 +2532,19 @@ pub enum Msg<'a> {
         highlights: &'a [String],
         more: bool,
     },
+    CmdAboutImport,
+    NoMigrationPort,
+    /// The sheet's title: the assets another agent left behind.
+    MigrationReportTitle,
+    /// The sheet when the chosen source has no assets.
+    MigrationNoAssets,
+    /// Picking which source to look at, when more than one has assets.
+    MigrationPickSource,
+    /// How many assets a source has.
+    MigrationAssetsCount,
+    /// The sheet's summary line: which source, how many assets.
+    MigrationSummaryLine {
+        source: &'a str,
+        count: usize,
+    },
 }

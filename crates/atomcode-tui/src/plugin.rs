@@ -147,6 +147,7 @@ plexus_service!(PlacesSvc => dyn crate::places::Places, "tui-places", Seam, "The
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and
 // `/setup` on a brand-new machine is the one thing that needs more than that.
 plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Inspecting project capabilities, reviewing setup actions, and bootstrapping seed skills");
+plexus_service!(MigrationSvc => dyn crate::migration::Migration, "tui-migration", Seam, "Read the assets another AI coding agent left behind");
 
 /// The session's clock, and the only place this crate reads one.
 ///

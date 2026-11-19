@@ -585,6 +585,7 @@ async fn start_full(
         &panel_row,
         launch::Ports {
             settings,
+            migration: None,
             providers: None,
             plugins,
             setup: None,

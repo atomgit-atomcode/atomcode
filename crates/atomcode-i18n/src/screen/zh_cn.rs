@@ -1621,6 +1621,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "{path} 有 {size}，粘不进来（上限 {cap}）。编辑区里的东西每一轮都要重发；             让模型自己去读这个文件，它只会读要用的那几行。"
         )
         .into(),
+
+        Msg::CmdAboutImport => "查看其他 AI 编码 Agent 留下的资产".into(),
+        Msg::NoMigrationPort => "迁移服务不可用".into(),
+        Msg::MigrationReportTitle => "其他 Agent 留下的资产".into(),
+        Msg::MigrationNoAssets => "这个来源没有资产".into(),
+        Msg::MigrationPickSource => "要看哪个 Agent 的资产？".into(),
+        Msg::MigrationAssetsCount => "项资产".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}：{count} 项资产").into()
+        }
     }
 }
 

@@ -4018,8 +4018,157 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
 // be a second answer to "what commands does a screen have", and the second
 // answer is the one that goes stale. See `crate::rows::SCREEN`.
 
+/// The `/import` command set: another agent's assets, and where each stands.
+pub struct ImportCommands;
+
+fn import_catalogue() -> Vec<Command> {
+    vec![Command::said("import", t(Msg::CmdAboutImport))]
+}
+
+/// `CommandSet` is an `#[async_trait]` trait (`command.rs:296`), so the impl
+/// needs the attribute too — without it the `async fn` in the trait does not
+/// match the desugared signature. `async_trait` is already imported in this
+/// file (`commands.rs:14`), so nothing else is needed.
+#[async_trait]
+impl CommandSet for ImportCommands {
+    fn id(&self) -> &'static str {
+        "cmd-import"
+    }
+    fn commands(&self) -> Vec<Command> {
+        import_catalogue()
+    }
+    async fn run(&self, _name: &str, _args: &str, ctx: &Context) -> Outcome {
+        let Some(port) = ctx.service::<crate::plugin::MigrationSvc>() else {
+            return Outcome::Refused(t(Msg::NoMigrationPort).into_owned());
+        };
+        let report = match port.report().await {
+            Ok(report) => report,
+            Err(error) => return Outcome::Refused(error),
+        };
+
+        // **多源才问**（Codex 的做法，`codex-rs/tui/src/external_agent_config_
+        // migration/flow.rs:300`）：先检测**全部**来源，只把**检测到东西的**
+        // 来源放进选择屏；只有一个来源时**不打扰**用户，直接进面板。
+        //
+        // 问「你要导入 Claude Code 还是 Codex」而用户只装了一个，是白问一遍
+        // —— Codex 的 `detected_sources.len() == 1` 分支正是为此。
+        let found: Vec<_> = report
+            .sources
+            .iter()
+            .filter(|source| !source.assets.is_empty())
+            .collect();
+        if found.is_empty() {
+            // The **product** table: the CLI says the same sentence, and one
+            // thing must not be said two ways.
+            use crate::i18n::product::{t as pt, Msg as PMsg};
+            return Outcome::Said(pt(PMsg::MigrationReportEmpty).into_owned());
+        }
+        if found.len() > 1 {
+            let rows: Vec<crate::sheet::Row> = found
+                .iter()
+                .map(|source| {
+                    crate::sheet::Row::new(
+                        format!("/import {}", source.source_id),
+                        source.display_name.clone(),
+                    )
+                    .about(format!(
+                        "{} {}",
+                        source.assets.len(),
+                        t(Msg::MigrationAssetsCount)
+                    ))
+                })
+                .collect();
+            return Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+                crate::sheet::List::new("import-source", t(Msg::MigrationPickSource), rows),
+            )));
+        }
+
+        // One source: its assets are the list.
+        Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+            import_list(&found[0]),
+        )))
+    }
+}
+
+/// The assets of one source, as a list the person can walk.
+///
+/// **This is a bottom sheet (`crate::sheet`), not an overlay.** `overlay.rs`'s
+/// own module note says it: a modal is "a flow rather than a list", and a
+/// list to pick from is the bottom sheet, which rises from the foot of the
+/// screen like every other working panel instead of covering the
+/// conversation.
+///
+/// The sheet gives us, for free: a cursor (↑/↓/PgUp/PgDn/Home/End), a filter
+/// box, and — the reason we want a sheet rather than a text dump —
+/// **`Row::preview`**: the lines shown under the list when the cursor rests on
+/// a row (`sheet.rs:127`). So "expand one item to read what it says" is the
+/// existing shape, not something to invent.
+fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::List {
+    let mut rows: Vec<crate::sheet::Row> = Vec::new();
+    for asset in &source.assets {
+        let status = crate::migration::status_word(asset.status);
+        rows.push(
+            crate::sheet::Row::new(format!("/import {}", asset.name), asset.name.clone())
+                .about(format!("[{status}] {}", asset.detail))
+                // The preview is what the row's own sentence says, in full —
+                // the `about` is the short form.
+                .preview(vec![asset.detail.clone()]),
+        );
+    }
+    crate::sheet::List::new("import", t(Msg::MigrationReportTitle), rows)
+        .summary(vec![crate::sheet::Piece::new(
+            t(Msg::MigrationSummaryLine {
+                source: &source.display_name,
+                count: source.assets.len(),
+            }),
+            crate::sheet::Tone::Plain,
+        )])
+        .empty(t(Msg::MigrationNoAssets))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_import_list_carries_each_asset_of_the_source() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "claude-code".into(),
+            display_name: "Claude Code".into(),
+            assets: vec![crate::migration::MigrationAssetView {
+                name: "web-access".into(),
+                status: crate::migration::AssetStatusView::Active,
+                detail: "Read directly".into(),
+            }],
+        };
+        let list = super::import_list(&source);
+        let rows = list.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "web-access");
+        // The status word is part of what the row means.
+        // The status word comes from the message table, so the criterion
+        // compares against the table — not against a literal that would
+        // only hold in one locale.
+        let active = crate::migration::status_word(crate::migration::AssetStatusView::Active);
+        assert!(
+            rows[0].about.contains(&active),
+            "{:?} should mention {active:?}",
+            rows[0].about
+        );
+        // The preview is the row's own sentence, in full — that is what
+        // "expand one item to read it" shows.
+        assert_eq!(rows[0].preview, vec!["Read directly".to_string()]);
+    }
+
+    #[test]
+    fn an_import_list_with_no_assets_says_so() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "codex".into(),
+            display_name: "Codex".into(),
+            assets: vec![],
+        };
+        let list = super::import_list(&source);
+        assert!(!list.empty.trim().is_empty());
+    }
+
     use super::*;
     #[tokio::test]
     async fn spec_picker_reviews_original_text_before_offering_a_mutation() {

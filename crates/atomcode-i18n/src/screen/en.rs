@@ -1726,6 +1726,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
         )
         .into(),
+
+        Msg::CmdAboutImport => "Look at the assets another AI coding agent left behind".into(),
+        Msg::NoMigrationPort => "No migration service is available".into(),
+        Msg::MigrationReportTitle => "Assets another agent left behind".into(),
+        Msg::MigrationNoAssets => "This source has no assets".into(),
+        Msg::MigrationPickSource => "Which agent's assets do you want to see?".into(),
+        Msg::MigrationAssetsCount => "assets".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}: {count} assets").into()
+        }
     }
 }
 
