@@ -1209,6 +1209,32 @@ async fn answer_prompts(
 /// for this long. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Where a key goes while an approval or question panel waits: the panel, or —
+/// when the composer still holds text the person was mid-typing — the
+/// composer, so the tail of an interrupted IME composition cannot be mistaken
+/// for an answer to a question nobody has read.
+pub enum AskKeyRoute {
+    Panel,
+    Composer(char),
+}
+
+/// One key against the ask panel, with the composer's claim honored: while the
+/// composer holds text, plain characters (a committed IME composition among
+/// them) keep going into the draft instead of selecting an answer. Navigation
+/// (arrows, Enter, Esc, Tab, digits) stays with the panel, so the question
+/// stays answerable by keyboard without clearing the draft first.
+pub fn route_ask_key(input_holds_text: bool, press: &crate::surface::KeyPress) -> AskKeyRoute {
+    use crate::surface::{Key, Mods};
+    let typed = match &press.key {
+        Key::Char(c) if press.mods == Mods::NONE || press.mods == Mods::SHIFT => Some(*c),
+        _ => None,
+    };
+    match (input_holds_text, typed) {
+        (true, Some(c)) => AskKeyRoute::Composer(c),
+        _ => AskKeyRoute::Panel,
+    }
+}
+
 /// The most lines of history to bring in from this project's other sessions.
 ///
 /// The number the other front end settled on for its own history file. This is
@@ -3564,8 +3590,26 @@ impl UserInterface for Tui {
                 // place its keys are routed — and focus is still arbitration,
                 // not composition: exactly one thing can hold it.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
-                    quit = self.answer_question(press);
-                    stale = true;
+                    let holds = !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .input
+                        .is_empty();
+                    match route_ask_key(holds, &press) {
+                        AskKeyRoute::Composer(c) => {
+                            let mut m = self.host.moment.write().expect("moment poisoned");
+                            let at = m.caret.min(m.input.len());
+                            m.input.insert(at, c);
+                            m.caret = at + c.len_utf8();
+                            stale = true;
+                        }
+                        AskKeyRoute::Panel => {
+                            quit = self.answer_question(press);
+                            stale = true;
+                        }
+                    }
                 }
                 // A reverse search owns the keyboard while it is up — the
                 // letters included, which is what makes it a mode rather than a
@@ -17951,6 +17995,42 @@ mod allowance_switch_tests {
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
         );
+    }
+}
+
+#[cfg(test)]
+mod ask_route_tests {
+    use super::*;
+    use crate::surface::Key;
+
+    fn press(key: Key) -> crate::surface::KeyPress {
+        crate::surface::KeyPress::plain(key)
+    }
+
+    #[test]
+    fn a_committed_tail_goes_to_the_draft_not_the_panel() {
+        assert!(matches!(
+            route_ask_key(true, &press(Key::Char('m'))),
+            AskKeyRoute::Composer('m')
+        ));
+    }
+
+    #[test]
+    fn an_empty_composer_leaves_the_keys_with_the_panel() {
+        assert!(matches!(
+            route_ask_key(false, &press(Key::Char('y'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn navigation_keys_stay_with_the_panel_while_the_draft_holds_text() {
+        for key in [Key::Enter, Key::Esc, Key::Up, Key::Tab] {
+            assert!(
+                matches!(route_ask_key(true, &press(key.clone())), AskKeyRoute::Panel),
+                "navigation key {key:?} stays with the panel"
+            );
+        }
     }
 }
 
