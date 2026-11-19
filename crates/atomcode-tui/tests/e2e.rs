@@ -9814,7 +9814,7 @@ fn two_turns() -> atomcode_tui::rewind::RewindView {
                 turn: 2,
                 prompt: "再加一个测试".into(),
                 changes: Vec::new(),
-                code: false,
+                code: true,
             },
         ],
         None,

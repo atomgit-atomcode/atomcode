@@ -292,6 +292,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindCodeNoSession => "这次会话不落盘，工作区回不去".into(),
         Msg::RewindCodeFailed => "代码回退暂不可用，可选择只回退对话。详情见日志。".into(),
         Msg::RewindPanelTurnNoFiles => "这一回合没改过文件，能回的只有对话".into(),
+        Msg::RewindPanelTurnNoCheckpoint => "本轮未保留代码回退点。".into(),
         Msg::RewindLegendChoose => "挑一个".into(),
         Msg::RewindLegendContinue => "下一步".into(),
         Msg::RewindLegendGo => "就回这儿".into(),

@@ -441,6 +441,7 @@ pub enum Msg<'a> {
     /// Checkpoint details are logged, not expanded in the panel.
     RewindCodeFailed,
     RewindPanelTurnNoFiles,
+    RewindPanelTurnNoCheckpoint,
     RewindLegendChoose,
     RewindLegendContinue,
     RewindLegendGo,

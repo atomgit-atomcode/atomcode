@@ -315,6 +315,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindCodeNoSession => "this session is not written down, so the workspace cannot go back".into(),
         Msg::RewindCodeFailed => "Code rewind is unavailable. You can rewind conversation only. See the logs for details.".into(),
         Msg::RewindPanelTurnNoFiles => "this turn changed no file — only the conversation can go back".into(),
+        Msg::RewindPanelTurnNoCheckpoint => "No code checkpoint was kept for this turn.".into(),
         Msg::RewindLegendChoose => "choose".into(),
         Msg::RewindLegendContinue => "continue".into(),
         Msg::RewindLegendGo => "go back".into(),

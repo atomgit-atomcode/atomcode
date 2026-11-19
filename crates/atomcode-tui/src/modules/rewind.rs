@@ -323,6 +323,7 @@ fn changes_line(view: &RewindView, at: usize, w: usize) -> Line {
     };
     let (plus, minus) = point.totals();
     let what = match point.changes.len() {
+        0 if !point.code => t(Msg::RewindPanelTurnNoCheckpoint).into_owned(),
         0 => t(Msg::RewindPanelNoCodeChanges).into_owned(),
         1 => format!("{}{}", point.changes[0].path, counts(plus, minus)),
         files => format!(
@@ -586,6 +587,20 @@ mod tests {
                 .iter()
                 .any(|l| l.contains(&t(Msg::RewindPanelNoCodeChanges).to_string())),
             "在记的时候,没改过就是没改过: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_without_a_code_checkpoint_is_explained_in_the_panel() {
+        let view = view();
+        let panel = open(&view);
+        let hint = t(Msg::RewindPanelTurnNoCheckpoint);
+        assert!(text(&view, &panel, 78)
+            .iter()
+            .any(|line| line.contains(hint.as_ref())));
+        assert_eq!(
+            view.code_why_not(&view.points()[1]).as_deref(),
+            Some(hint.as_ref())
         );
     }
 
