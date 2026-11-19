@@ -631,20 +631,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [compacting, setCompacting] = useState(false);
-  const [summaryCount, setSummaryCount] = useState<number | null>(null);
   const summaryCountRef = useRef<number | null>(null);
   function resetSummaryCount() {
     summaryCountRef.current = null;
-    setSummaryCount(null);
   }
   function updateSummaryCount(count?: number, record = false) {
     const next = nextContextSummary(summaryCountRef.current, count, record);
     summaryCountRef.current = next.count;
-    setSummaryCount(next.count);
     if (next.notice) pushCommandNotice(t('context.summaryRecorded', { count: next.count! }), true);
   }
 
-  const latestSummaryIndex = messages.map(message => message.contextSummary === true).lastIndexOf(true);
   const [processExpanded, setProcessExpanded] = useState<Record<string, boolean>>({});
   const processReadIntent = useRef(false);
   const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
@@ -4258,9 +4254,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
               {(tokens.total / 1000).toFixed(1)}k tokens
             </span>
           )}
-          {summaryCount != null && summaryCount > 0 && (latestSummaryIndex >= 0
-            ? <button class="footer-tokens footer-summary-count" type="button" onClick={() => navigateTurn(latestSummaryIndex)}>{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</button>
-            : <span class="footer-tokens">{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</span>)}
         </div>
         <div class="input-footer-actions">
           <ModeSelector
