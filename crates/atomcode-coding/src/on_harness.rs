@@ -1606,6 +1606,15 @@ pub async fn mount_swappable(
     .await
 }
 
+/// The primary adapter and its metered summary wrapper are updated together.
+#[derive(Clone)]
+pub struct CompactionProviders {
+    pub primary: Arc<dyn LlmProvider>,
+    pub summary: Arc<dyn LlmProvider>,
+}
+
+pub type SharedCompactionProviders = Arc<std::sync::RwLock<Option<CompactionProviders>>>;
+
 /// What the coding runtime hands a tree beyond its provider: the session it
 /// continues, and the lifecycle hooks it already built against that session.
 ///
@@ -1668,7 +1677,7 @@ pub struct HostState {
     /// for the same reason; this is the other half of it, at mount.
     pub model: Option<String>,
     /// The provider a requested compaction's summary is written with.
-    pub summary_provider: Option<atomcode_review::SharedReviewProvider>,
+    pub summary_provider: Option<SharedCompactionProviders>,
     /// The native snapshot writer a committed compaction is stored through.
     pub compaction_checkpoint: Option<Arc<atomcode_capabilities::session::SnapshotHook>>,
     /// Where CodingPlan usage windows come from, when this host has an account.

@@ -1407,6 +1407,7 @@ impl RunningAgent {
             sacred_floor: floor,
             parent: Some(ParentPromptContext {
                 tools: self.tools.snapshot().defs_arc(),
+                replay: None,
             }),
         }));
         if attempted_stages[stage] {
@@ -1462,6 +1463,7 @@ impl RunningAgent {
                 sacred_floor: floor,
                 parent: Some(ParentPromptContext {
                     tools: self.tools.snapshot().defs_arc(),
+                    replay: None,
                 }),
             };
             // Announce BEFORE the (possibly multi-second) LLM summary so a driver can

@@ -767,7 +767,7 @@ pub struct CodingParts {
     pub subagent_provider: Option<SharedReviewProvider>,
     /// The provider for model calls made outside a round — summaries — recorded
     /// and metered; filled with the others by [`wire_side_providers`].
-    side_provider: SharedReviewProvider,
+    side_provider: crate::on_harness::SharedCompactionProviders,
     /// Child-agent assembly prepared from the same live tier-provider cells and
     /// execution policy as `task`. The `team` tool is mounted in the next phase.
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
@@ -1620,7 +1620,7 @@ impl CodingParts {
 
     /// Where the provider for out-of-round model calls lives, refilled on every
     /// model change.
-    pub(crate) fn side_provider_slot(&self) -> SharedReviewProvider {
+    pub(crate) fn side_provider_slot(&self) -> crate::on_harness::SharedCompactionProviders {
         Arc::clone(&self.side_provider)
     }
 
@@ -2346,7 +2346,10 @@ pub(crate) fn wire_side_providers(
     }
 
     if let Ok(mut slot) = parts.side_provider.write() {
-        *slot = Some(metered_provider.clone());
+        *slot = Some(crate::on_harness::CompactionProviders {
+            primary: provider.clone(),
+            summary: metered_provider.clone(),
+        });
     }
     metered_provider
 }

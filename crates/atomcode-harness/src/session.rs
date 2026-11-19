@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use atomcode_kernel::message::Message;
+use atomcode_kernel::provider::{LlmProvider, ReasoningEffort};
+use atomcode_kernel::tool::ToolDef;
 
 /// The vocabulary lives in the kernel (`docs/adr/0024` §6); re-exported whole so
 /// every `crate::session::…` path keeps working.
@@ -44,6 +46,17 @@ pub struct SessionLog {
     /// estimate of the same request. Not a fact: nothing model-visible, and a
     /// resumed log simply starts without one.
     prompt_anchor: Mutex<Option<PromptAnchor>>,
+    /// The last successful, text-only prompt actually sent. This is request
+    /// cache state, derived independently of and never written into the log.
+    sent_prompt: Mutex<Option<SentPrompt>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SentPrompt {
+    pub provider: std::sync::Weak<dyn LlmProvider>,
+    pub messages: Arc<Vec<Message>>,
+    pub tools: Arc<[ToolDef]>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// One request sized twice: by the provider (`measured`) and by the local
@@ -138,7 +151,21 @@ impl SessionLog {
             turn: AtomicU64::new(0),
             clock,
             prompt_anchor: Mutex::new(None),
+            sent_prompt: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn remember_sent_prompt(&self, prompt: SentPrompt) {
+        *self.sent_prompt.lock().expect("sent prompt poisoned") = Some(prompt);
+    }
+
+    pub(crate) fn sent_prompt(&self, provider: &Arc<dyn LlmProvider>) -> Option<SentPrompt> {
+        self.sent_prompt
+            .lock()
+            .expect("sent prompt poisoned")
+            .as_ref()
+            .filter(|prompt| std::ptr::addr_eq(prompt.provider.as_ptr(), Arc::as_ptr(provider)))
+            .cloned()
     }
 
     /// The last measured request, while everything since only added to the

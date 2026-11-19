@@ -2378,7 +2378,7 @@ impl Listener<TurnFinishing> for WorkspaceCaptureBarrier {
 /// person asks for is that summary, steered by their focus. Every summary is
 /// billed to the session through the side provider, and every way it can fail
 /// falls back to something model-free.
-pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedReviewProvider);
+pub(crate) struct CompactionCodingPlugin(pub(crate) crate::on_harness::SharedCompactionProviders);
 
 #[derive(serde::Deserialize)]
 struct CompactionCodingRow {
@@ -2397,24 +2397,32 @@ fn default_compaction_threshold() -> f32 {
 struct CodingCompaction {
     token_limit: Option<u32>,
     stub_recent_budget: Option<u32>,
-    provider: atomcode_review::SharedReviewProvider,
+    provider: crate::on_harness::SharedCompactionProviders,
 }
 
 impl CodingCompaction {
     /// Resolved per call: `/model` and a logout swap the provider under it.
-    fn strategy(&self) -> (atomcode_capabilities::compaction::OverflowCompaction, bool) {
+    fn strategy(
+        &self,
+    ) -> (
+        atomcode_capabilities::compaction::OverflowCompaction,
+        Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+    ) {
         let provider = self.provider.read().ok().and_then(|slot| slot.clone());
-        let writes = provider.is_some();
         let stub = match self.stub_recent_budget {
             Some(limit) => {
                 atomcode_capabilities::compaction::StubCompaction::new(limit as usize, true)
             }
             None => atomcode_capabilities::compaction::StubCompaction::default(),
         };
+        let (primary, summary) = match provider {
+            Some(provider) => (Some(provider.primary), Some(provider.summary)),
+            None => (None, None),
+        };
         (
-            atomcode_capabilities::compaction::OverflowCompaction::new(stub, provider)
+            atomcode_capabilities::compaction::OverflowCompaction::new(stub, summary)
                 .with_auto_token_limit(self.token_limit),
-            writes,
+            primary,
         )
     }
 }
@@ -2442,8 +2450,8 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> bool {
-        let (strategy, writes) = self.strategy();
-        writes
+        let (strategy, provider) = self.strategy();
+        provider.is_some()
             && atomcode_harness::plugins::compaction::strategy_would_summarize(&strategy, log, ask)
     }
 
@@ -2452,8 +2460,7 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> Option<atomcode_harness::seams::CompactionDecision> {
-        let (strategy, _) = self.strategy();
-        atomcode_harness::plugins::compaction::decide_with_strategy(&strategy, log, ask).await
+        self.compact_attempt(log, ask).await.decision
     }
 
     async fn compact_attempt(
@@ -2461,8 +2468,14 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> atomcode_harness::seams::CompactionAttempt {
-        let (strategy, _) = self.strategy();
-        atomcode_harness::plugins::compaction::attempt_with_strategy(&strategy, log, ask).await
+        let (strategy, provider) = self.strategy();
+        atomcode_harness::plugins::compaction::attempt_with_sent_prompt(
+            &strategy,
+            log,
+            ask,
+            provider.as_ref(),
+        )
+        .await
     }
 }
 
@@ -3729,7 +3742,7 @@ mod tests {
             sacred_floor: floor,
             parent: None,
         };
-        let provider: atomcode_review::SharedReviewProvider =
+        let provider: crate::on_harness::SharedCompactionProviders =
             std::sync::Arc::new(std::sync::RwLock::new(None));
 
         let small = super::CodingCompaction {

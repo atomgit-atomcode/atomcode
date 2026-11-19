@@ -431,6 +431,7 @@ async fn summarize_span_fork_replays_the_parent_prefix() {
         ..Default::default()
     };
     let parent = ParentPromptContext {
+        replay: None,
         tools: Arc::new([atomcode_kernel::tool::ToolDef {
             name: "bash".into(),
             description: "run a command".into(),
@@ -479,6 +480,7 @@ async fn summarize_span_fork_overflows_into_the_transcript_path() {
         ..Default::default()
     };
     let parent = ParentPromptContext {
+        replay: None,
         tools: Arc::new([]),
     };
     // The span IS the parent conversation's prefix (system prompt included).
@@ -506,6 +508,7 @@ async fn summarize_span_fork_replays_full_prefix_longer_than_span() {
         ..Default::default()
     };
     let parent = ParentPromptContext {
+        replay: None,
         tools: Arc::new([]),
     };
     let prefix = vec![
@@ -544,6 +547,7 @@ async fn summarize_span_fork_falls_back_on_any_fork_failure() {
         ..Default::default()
     };
     let parent = ParentPromptContext {
+        replay: None,
         tools: Arc::new([]),
     };
     let span = vec![Message::user("q")];
@@ -558,4 +562,60 @@ async fn summarize_span_fork_falls_back_on_any_fork_failure() {
         "the fork must be attempted before the transcript fallback"
     );
     assert_eq!(sent[1][0].text, SUMMARY_SYSTEM_PROMPT);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn summarize_span_fork_rejects_tool_calls_with_text_and_falls_back() {
+    let tool = ToolDef {
+        name: "read_file".into(),
+        description: "read a file".into(),
+        parameters: serde_json::json!({}),
+    };
+    for event in [
+        StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+            id: "call".into(),
+            name: tool.name.clone(),
+            arguments: "{}".into(),
+        }),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments: "{".into(),
+        },
+    ] {
+        let provider = Probe {
+            replies: Mutex::new(VecDeque::from([
+                Ok(vec![
+                    StreamEvent::TextDelta("I will check the file first.".into()),
+                    event,
+                    StreamEvent::Done { truncated: false },
+                ]),
+                answer("fallback summary"),
+            ])),
+            ..Default::default()
+        };
+        let parent = ParentPromptContext {
+            tools: Arc::new([tool.clone()]),
+            replay: None,
+        };
+        let history = [
+            Message::system("parent persona"),
+            Message::user("first task"),
+        ];
+        let summary = summarize_span(
+            &provider,
+            &history[1..],
+            Some(&history),
+            None,
+            Some(&parent),
+        )
+        .await
+        .unwrap();
+        assert!(summary.ends_with("fallback summary"), "{summary}");
+        assert_eq!(
+            &*provider.sent_tools.lock().unwrap(),
+            &[vec![tool.name.clone()], vec![]]
+        );
+    }
 }

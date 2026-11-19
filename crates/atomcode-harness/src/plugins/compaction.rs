@@ -255,6 +255,7 @@ struct StrategyView {
     sources: Vec<Provenance>,
     /// The protected head: through the first real request.
     floor: usize,
+    parent: Option<atomcode_kernel::message::ParentPromptContext>,
 }
 
 impl StrategyView {
@@ -264,8 +265,38 @@ impl StrategyView {
     /// last just below it, as a synthetic user message. The log projects that
     /// summary as a note at the head, so it moves under the first request. `None`
     /// when nothing was ever asked.
-    fn of(events: &[LoggedEvent]) -> Option<Self> {
-        let (summaries, rest): (Vec<_>, Vec<_>) = crate::session::derive_traced(events)
+    fn of(events: &[LoggedEvent], sent: Option<crate::session::SentPrompt>) -> Option<Self> {
+        use atomcode_kernel::message::{ParentPromptContext, ParentPromptReplay};
+        let traced = crate::session::derive_traced(events);
+        let parent = sent.and_then(|sent| {
+            let system_messages = sent
+                .messages
+                .iter()
+                .take_while(|message| message.role == Role::System && !message.synthetic)
+                .count();
+            let matched = traced
+                .iter()
+                .zip(&sent.messages[system_messages..])
+                .take_while(|(projected, sent)| &projected.message == *sent)
+                .count();
+            // The strategy moves summary notes under the first user message,
+            // while the wire projection keeps their original positions. A
+            // cut agrees with the wire prefix if every moved note is included.
+            let through_summaries = traced
+                .iter()
+                .rposition(|message| matches!(message.source, Provenance::Summary(_)))
+                .map_or(0, |index| index + 1);
+            (matched > 0 && matched >= through_summaries).then_some(ParentPromptContext {
+                tools: sent.tools,
+                replay: Some(ParentPromptReplay {
+                    messages: sent.messages,
+                    system_messages,
+                    history: through_summaries..=matched,
+                    reasoning_effort: sent.reasoning_effort,
+                }),
+            })
+        });
+        let (summaries, rest): (Vec<_>, Vec<_>) = traced
             .into_iter()
             .partition(|t| matches!(t.source, Provenance::Summary(_)));
         let first = rest
@@ -290,6 +321,7 @@ impl StrategyView {
             messages,
             sources,
             floor,
+            parent,
         })
     }
 
@@ -305,7 +337,7 @@ impl StrategyView {
                 ask.used_tokens as f32 / ask.window as f32
             },
             sacred_floor: self.floor,
-            parent: None,
+            parent: self.parent.clone(),
         }
     }
 }
@@ -316,7 +348,7 @@ pub fn strategy_would_summarize(
     log: &SessionLog,
     ask: &CompactionAsk,
 ) -> bool {
-    StrategyView::of(&log.events())
+    StrategyView::of(&log.events(), None)
         .is_some_and(|view| strategy.will_summarize(&view.kernel_view(ask)))
 }
 
@@ -347,10 +379,22 @@ pub async fn attempt_with_strategy(
     log: &SessionLog,
     ask: &CompactionAsk,
 ) -> crate::seams::CompactionAttempt {
+    attempt_with_sent_prompt(strategy, log, ask, None).await
+}
+
+/// The same decision, with access to the last prompt sent through the exact
+/// adapter doing the summary. Both automatic and manual compaction use it.
+pub async fn attempt_with_sent_prompt(
+    strategy: &dyn CompactionStrategy,
+    log: &SessionLog,
+    ask: &CompactionAsk,
+    provider: Option<&Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+) -> crate::seams::CompactionAttempt {
     use crate::seams::CompactionAttempt;
     use atomcode_kernel::message::CompactionDiagnostic;
     let events = log.events();
-    let Some(view) = StrategyView::of(&events) else {
+    let sent = provider.and_then(|provider| log.sent_prompt(provider));
+    let Some(view) = StrategyView::of(&events, sent) else {
         return CompactionAttempt::default();
     };
     let plan = strategy.plan(&view.kernel_view(ask)).await;

@@ -108,7 +108,33 @@ fn is_summary_request(request: &[Message]) -> bool {
     request.first().is_some_and(|m| {
         m.text
             .starts_with("You are an anchored context summarization assistant")
+    }) || request.last().is_some_and(|m| {
+        m.text
+            .starts_with("This is a maintenance task, not a conversational turn")
     })
+}
+
+fn assert_compaction_replays_sent_prefix(recorder: &Recorder, at: usize) {
+    let requests = recorder.requests.lock().unwrap();
+    let defs = recorder.defs.lock().unwrap();
+    let options = recorder.options.lock().unwrap();
+    let prior = requests[..at]
+        .iter()
+        .rposition(|request| !is_summary_request(request))
+        .unwrap();
+    let (instruction, prefix) = requests[at].split_last().unwrap();
+    assert!(instruction.text.starts_with("This is a maintenance task"));
+    assert!(prefix.len() > 1);
+    assert!(
+        requests[prior].starts_with(prefix),
+        "summary did not replay the exact sent prefix"
+    );
+    assert!(!defs[prior].is_empty());
+    assert_eq!(defs[at], defs[prior]);
+    assert_eq!(
+        options[at].reasoning_effort,
+        options[prior].reasoning_effort
+    );
 }
 
 /// Long enough that a second copy reads as a re-dump rather than a coincidence.
@@ -5594,13 +5620,17 @@ async fn a_requested_compaction_is_summarized_by_the_model_about_the_focus() {
     };
     assert!(outcome.committed, "the compaction was refused");
 
-    let summary_call = recorder.requests.lock().unwrap()[asked_before..]
+    let summary_call = recorder
+        .requests
+        .lock()
+        .unwrap()
         .iter()
-        .any(|request| request.iter().any(|m| m.text.contains("the zebra parser")));
-    assert!(
-        summary_call,
-        "no model was asked to summarize with the focus"
-    );
+        .enumerate()
+        .skip(asked_before)
+        .find(|(_, request)| request.iter().any(|m| m.text.contains("the zebra parser")))
+        .map(|(index, _)| index)
+        .expect("the summary request must carry the focus");
+    assert_compaction_replays_sent_prefix(&recorder, summary_call);
     let meta = SessionManager::for_project(
         env.project.path(),
         &atomcode_coding::config::product_dirs_from_env(),
@@ -6238,6 +6268,17 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
 
     let summaries = recorder.summary_requests();
     assert_eq!(summaries.len(), 2, "one summary, then one update of it");
+    let summary_indices = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_summary_request(request).then_some(index))
+        .collect::<Vec<_>>();
+    for index in summary_indices {
+        assert_compaction_replays_sent_prefix(&recorder, index);
+    }
     assert!(
         summaries[1]
             .last()

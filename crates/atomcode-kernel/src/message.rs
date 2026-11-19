@@ -958,6 +958,17 @@ pub enum CompactTrigger {
 #[derive(Clone, Debug)]
 pub struct ParentPromptContext {
     pub tools: Arc<[ToolDef]>,
+    /// The host's exact previous request, when its projection differs from the strategy view.
+    pub replay: Option<ParentPromptReplay>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParentPromptReplay {
+    pub messages: Arc<Vec<Message>>,
+    pub system_messages: usize,
+    /// Strategy prefix lengths that are also a complete prefix of the sent history.
+    pub history: std::ops::RangeInclusive<usize>,
+    pub reasoning_effort: Option<crate::provider::ReasoningEffort>,
 }
 
 /// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current

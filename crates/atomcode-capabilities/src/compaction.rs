@@ -632,22 +632,30 @@ pub async fn summarize_span(
     // summarizer below, which keeps the drained-span semantics: the injected
     // tool set adds failure modes (tool calls, truncation, non-overflow
     // rejections) that the tool-free path does not have.
-    match parent {
-        Some(parent) => {
-            let replay = cache_prefix.unwrap_or(span);
-            match summarize_span_fork(provider, replay, focus, parent).await {
+    if let Some(parent) = parent {
+        let projected = cache_prefix.unwrap_or(span);
+        let replay = match &parent.replay {
+            Some(sent) if sent.history.contains(&projected.len()) => sent
+                .messages
+                .get(..sent.system_messages + projected.len())
+                .map(|prefix| (prefix, sent.reasoning_effort)),
+            Some(_) => None,
+            None => Some((projected, None)),
+        };
+        if let Some((prefix, effort)) = replay {
+            let instruction = build_fork_instruction(find_prior_anchor(projected), focus);
+            match summarize_span_fork(provider, prefix, instruction, parent, effort).await {
                 Ok(body) => {
                     return Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"));
                 }
-                Err(e) => {
+                Err(error) => {
                     tracing::debug!(
-                        error = ?e,
+                        ?error,
                         "compaction fork failed; falling back to the transcript summarizer"
                     );
                 }
             }
         }
-        None => tracing::debug!("compaction fork skipped: no parent prompt context"),
     }
     let window = match provider.context_window() {
         0 => 128_000,
@@ -690,7 +698,7 @@ pub async fn summarize_span(
             }
         }
         let prompt = summary_prompt(previous.as_deref(), &remaining[..end], focus);
-        match summarize_window(provider, &prompt, &[], max_output).await {
+        match summarize_window(provider, &prompt, &[], max_output, None).await {
             Ok(summary) => {
                 previous = Some(summary);
                 remaining = &remaining[end..];
@@ -714,13 +722,14 @@ pub async fn summarize_span(
 /// append the summary instruction as the final user message, with the
 /// parent's advertised tool set so the request shares the parent
 /// conversation's prefix from token 0 — the provider's warm prompt cache
-/// covers the history instead of billing it at the cold rate. Only returned
-/// text enters the checkpoint; any tool calls in the stream are ignored.
+/// can cover the shared prefix. A response that requests a tool is incomplete
+/// and falls back to the transcript summarizer.
 async fn summarize_span_fork(
     provider: &dyn LlmProvider,
     prefix: &[Message],
-    focus: Option<&str>,
+    instruction: String,
     parent: &ParentPromptContext,
+    reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
 ) -> Result<String, SummaryError> {
     let window = match provider.context_window() {
         0 => 128_000,
@@ -731,8 +740,17 @@ async fn summarize_span_fork(
     // for images and tool calls a byte/4 heuristic would under-count): a
     // replay that cannot fit the window is a doomed billed request — skip the
     // fork and let the transcript path window it.
-    let estimated_tokens: u32 = prefix.iter().map(Message::estimate_tokens).sum();
-    if estimated_tokens >= window.saturating_sub(max_output) {
+    let instruction = Message::user(instruction);
+    let tool_tokens = serde_json::to_vec(parent.tools.as_ref())
+        .map_or(0, |schemas| schemas.len().div_ceil(3) as u64);
+    let estimated_tokens = prefix
+        .iter()
+        .chain(std::iter::once(&instruction))
+        .map(|message| u64::from(message.estimate_tokens()))
+        .sum::<u64>()
+        + tool_tokens;
+    let input_limit = atomcode_kernel::agent::effective_input_limit(window, Some(max_output));
+    if estimated_tokens >= u64::from(input_limit) {
         return Err(SummaryError::Provider(ProviderError {
             retryable: false,
             message: "the replayed prefix cannot fit the window".into(),
@@ -742,11 +760,22 @@ async fn summarize_span_fork(
         }));
     }
     let mut prompt = prefix.to_vec();
-    prompt.push(Message::user(build_fork_instruction(
-        find_prior_anchor(prefix),
-        focus,
-    )));
-    summarize_window(provider, &prompt, &parent.tools, max_output).await
+    // A fork boundary can land just after an assistant tool call. Never send
+    // a partial tool exchange or repair it into a different cached prefix.
+    let prefix_len = prompt.len();
+    atomcode_kernel::message::Conversation::repair_pairing(&mut prompt);
+    if prompt.len() != prefix_len || prompt != prefix {
+        return Err(SummaryError::Incomplete);
+    }
+    prompt.push(instruction);
+    summarize_window(
+        provider,
+        &prompt,
+        &parent.tools,
+        max_output,
+        reasoning_effort,
+    )
+    .await
 }
 
 fn summary_prompt(previous: Option<&str>, transcript: &str, focus: Option<&str>) -> Vec<Message> {
@@ -779,12 +808,14 @@ async fn summarize_window(
     prompt: &[Message],
     tools: &[ToolDef],
     max_output: u32,
+    reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
 ) -> Result<String, SummaryError> {
     // One owner for transient retries, including adapter authentication replays.
     // A completed window starts a fresh allowance; inference time is not a wait budget.
     let budget = RequestRecoveryBudget::new(2, Duration::from_secs(30));
     let options = ChatOptions {
         max_tokens: Some(max_output),
+        reasoning_effort,
         request_recovery: Some(budget.clone()),
         rate_limit_retry_owner: RateLimitRetryOwner::Kernel,
         ..ChatOptions::default()
@@ -824,7 +855,9 @@ async fn collect_summary(
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::Error(error) => return Err(SummaryError::Provider(error)),
-            StreamEvent::Done { truncated: true } => return Err(SummaryError::Incomplete),
+            StreamEvent::ToolCall(_)
+            | StreamEvent::ToolCallDelta { .. }
+            | StreamEvent::Done { truncated: true } => return Err(SummaryError::Incomplete),
             StreamEvent::Done { truncated: false } => completed = true,
             StreamEvent::TextDelta(text) => {
                 if text.len() > body_budget.saturating_sub(out.len()) {

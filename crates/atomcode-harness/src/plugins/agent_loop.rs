@@ -210,20 +210,32 @@ impl PluginAgentLoop {
                     if retained_bytes > super::spec::allowance(provider.context_window()) {
                         return Err(RequestError::message("Task specifications exceed the current model's context allowance. Use /spec to unpin messages or choose a larger context model."));
                     }
-                    stream_once(
+                    let remember = options.tool_choice == ToolChoice::Auto
+                        && messages.iter().all(|message| message.images.is_empty());
+                    let effort = options.reasoning_effort;
+                    let result = stream_once(
                         &*provider,
                         &ctx,
                         &session,
                         turn,
                         round,
-                        messages,
-                        tools,
+                        &messages,
+                        &tools,
                         options,
                         idle,
                         first_content,
                         &loop_retried,
                     )
-                    .await
+                    .await;
+                    if remember && result.is_ok() {
+                        session.remember_sent_prompt(crate::session::SentPrompt {
+                            provider: Arc::downgrade(&provider),
+                            messages: Arc::new(messages),
+                            tools: tools.into(),
+                            reasoning_effort: effort,
+                        });
+                    }
+                    result
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
             })
             .await;
@@ -405,8 +417,8 @@ async fn stream_once(
     session: &SessionLog,
     turn: u64,
     round: u32,
-    messages: Vec<Message>,
-    tools: Vec<ToolDef>,
+    messages: &[Message],
+    tools: &[ToolDef],
     options: ChatOptions,
     idle: Option<std::time::Duration>,
     first_content: Option<std::time::Duration>,
@@ -420,8 +432,8 @@ async fn stream_once(
             session,
             turn,
             round,
-            &messages,
-            &tools,
+            messages,
+            tools,
             options.clone(),
             idle,
             first_content,
@@ -1529,8 +1541,8 @@ mod content_deadline_tests {
             &log,
             1,
             0,
-            Vec::new(),
-            Vec::new(),
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
@@ -1557,8 +1569,8 @@ mod content_deadline_tests {
             &log,
             1,
             1,
-            vec![],
-            vec![],
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             None,
@@ -1748,8 +1760,8 @@ mod content_deadline_tests {
             &log,
             1,
             0,
-            vec![],
-            vec![],
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
@@ -1802,8 +1814,8 @@ mod content_deadline_tests {
             &SessionLog::new("nonstreaming"),
             1,
             0,
-            vec![],
-            vec![],
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
@@ -1842,8 +1854,8 @@ mod content_deadline_tests {
             &SessionLog::new("progressing-recovery"),
             1,
             1,
-            vec![],
-            vec![],
+            &[],
+            &[],
             options,
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(600)),
@@ -1880,8 +1892,8 @@ mod content_deadline_tests {
             &log,
             1,
             1,
-            vec![],
-            vec![],
+            &[],
+            &[],
             options,
             None,
             None,
