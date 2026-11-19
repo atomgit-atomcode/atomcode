@@ -143,14 +143,16 @@ impl ManagedChild {
             });
         }
 
-        let child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                SubagentError::BinaryNotFound {
-                    binary: spec.program.display().to_string(),
-                }
-            } else {
-                SubagentError::SpawnFailed(e.to_string())
-            }
+        let child = cmd.spawn().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => SubagentError::BinaryNotFound {
+                binary: spec.program.display().to_string(),
+            },
+            std::io::ErrorKind::PermissionDenied => SubagentError::PermissionDenied(format!(
+                "could not launch {} in {}: {e}",
+                spec.program.display(),
+                spec.cwd.display()
+            )),
+            _ => SubagentError::SpawnFailed(e.to_string()),
         })?;
 
         #[cfg(windows)]
