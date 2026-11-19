@@ -1,8 +1,10 @@
 # 一键迁移其他 AI Coding Agent 的资产 —— 设计（第一期 + 第二期）
 
 - 日期：2026-11-17
-- 状态：设计已定（brainstorming 结论）；实施计划见
-  `docs/plans/2026-11-17-external-agent-asset-migration-plan.md`（9 个 Task，尚未开工）
+- 状态：**已实现**（9 个 Task 全部完成并提交）。实施计划见
+  `docs/plans/2026-11-17-external-agent-asset-migration-plan.md`。
+  关键决定：报告的**候选也来自注册表** —— 报告只在注册表根本不知道的树
+  （别人的树）上自己遍历，于是「资产」这个概念只有一个来源。
 - 参照：OpenAI Codex 的 `codex-rs/external-agent-migration`（16681 行，「检测 → 迁移 → 残留兜底」三段式）
 - 关联 Issue：[Feature] 一键迁移其他 AI Coding Agent 的资产（指令/技能/配置/会话）
 

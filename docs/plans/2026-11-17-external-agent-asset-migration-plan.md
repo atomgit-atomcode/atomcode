@@ -12,6 +12,10 @@
 
 **基线：** 分支 `release/v5.2.8`，基线 commit `7b37a2682`（设计文档提交）。开工前工作区有他人未提交改动（`atomcode-tui`、`atomcode-cli`、`webui` 等），**全部属于他人，本任务不得触碰**；每次委派前必须重新核对 `git status`，因为它会在本任务进行中变化。
 
+**状态：9 个 Task 全部完成。** 实现分 9 次提交（`fa4af2817` 起），每个 Task 一提交。
+Task 1 在实现中经过**三轮架构调整**（见 `2026-11-19-task1-architecture-*.md`），
+终局形态是「候选也来自注册表」。
+
 **分工（AGENTS.md 约定）：** Claude Code 只写实现代码；Codex 写测试、跑测试与格式门、独立审查；AtomCode 调度、验收、提交。每轮任务必须给出独立完整的交接说明。
 
 ---
@@ -233,7 +237,7 @@ cargo fmt --all -- --check
 > 规格见 `docs/plans/2026-11-19-task1-architecture-handoff.md`。
 
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `crates/atomcode-capabilities/src/migration/mod.rs` 末尾加：
 
@@ -1272,12 +1276,12 @@ fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bo
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
 Expected: FAIL —— `cannot find module migration` / `unresolved import`。
 
-- [ ] **Step 3: 加 feature 与模块声明**
+- [x] **Step 3: 加 feature 与模块声明**
 
 `crates/atomcode-capabilities/Cargo.toml` 的 `[features]` 段追加：
 
@@ -1342,7 +1346,7 @@ migration = [
 pub mod migration;
 ```
 
-- [ ] **Step 4: 写 report.rs**
+- [x] **Step 4: 写 report.rs**
 
 `crates/atomcode-capabilities/src/migration/report.rs`：
 
@@ -1451,7 +1455,7 @@ impl MigrationReport {
 }
 ```
 
-- [ ] **Step 5: 写 mod.rs 的骨架**
+- [x] **Step 5: 写 mod.rs 的骨架**
 
 Task 1 提供 `identity`、`same_file` 与 `file_id`，供 Task 2 的跨层指令去重使用。
 `same_file` 依次比较原路径、规范路径、设备号与 inode。设备号和 inode 比较仅覆盖 Unix。
@@ -3737,12 +3741,12 @@ pub fn unreadable_config() -> String {
 分组目录的深度超限行。从第 9 层单独生成某个技能行时，保留原注册表根列表，
 其判定为「没有生效，技能加载器也没有给出原因」。
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration -E 'test(migration::tests::)'`
 Expected: PASS —— Task 1 的三条（报告计数 / 空报告 / 无来源扫描）。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add crates/atomcode-capabilities/Cargo.toml crates/atomcode-capabilities/src/lib.rs crates/atomcode-capabilities/src/migration/ crates/atomcode-capabilities/src/skills/{mod,registry}.rs crates/atomcode-config/src/provider_book.rs crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs gates/compile.sh
@@ -3771,7 +3775,7 @@ The feature pulls atomcode-config, which the screen already has transitively."
 仅在已有路径信息足以证明同一文件时去重。若两个不同路径都无法解析身份，保留
 用户级 `Blocked` 行及原始错误。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `claude.rs` 末尾追加：
 
@@ -4010,12 +4014,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::claude`
 Expected: FAIL —— 找不到资产（`detect` 返回空）。
 
-- [ ] **Step 3: 实现 ClaudeSource**
+- [x] **Step 3: 实现 ClaudeSource**
 
 把 `claude.rs` 整体替换为：
 
@@ -5087,7 +5091,7 @@ pub fn provider_nothing_to_connect_to() -> String {
 > `text.rs` 在 Task 1 已经有了**最小版**（11 条：技能、复制目标、读取失败与断链），本 Step 把它
 > **扩成完整版** —— `mod text;` 的声明在 Task 1 的 `mod.rs` 里已经在了。
 
-- [ ] **Step 4: 在 i18n product 表加这些条目**
+- [x] **Step 4: 在 i18n product 表加这些条目**
 
 `crates/atomcode-i18n/src/product/messages.rs` 的 `pub enum Msg<'a>` 末尾追加
 （保留 Task 1 的 11 个变体及中英文 match 臂，包括
@@ -5282,17 +5286,17 @@ pub fn provider_nothing_to_connect_to() -> String {
         }
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::claude`
 Expected: PASS —— 当前 Step 1 有 11 条判据，覆盖指令、技能、权限、MCP、子 agent 与空来源。后续增加判据时，以实际执行条数为准。
 
-- [ ] **Step 6: 跑 i18n 编译检查**
+- [x] **Step 6: 跑 i18n 编译检查**
 
 Run: `cargo check -p atomcode-i18n`
 Expected: 退出 0（漏一个 match arm 就是编译错误）。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add crates/atomcode-capabilities/src/migration/ crates/atomcode-i18n/src/product/
@@ -5314,7 +5318,7 @@ which instead of implying everything already works."
 - Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`
 - Modify: `crates/atomcode-capabilities/Cargo.toml`（`migration` feature 已含 `dep:toml`，无需改）
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `codex.rs` 末尾追加：
 
@@ -5430,12 +5434,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::codex`
 Expected: FAIL —— 找不到资产。
 
-- [ ] **Step 3: 实现 CodexSource**
+- [x] **Step 3: 实现 CodexSource**
 
 把 `codex.rs` 整体替换为：
 
@@ -5874,7 +5878,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 补文案**
+- [x] **Step 4: 补文案**
 
 `text.rs` 追加：
 
@@ -5911,12 +5915,12 @@ pub fn unreadable_config() -> String {
 > `MigrationProviderCopyable` **不在这里加** —— Task 2 已经加过这条臂（它服务的是
 > Claude 与 Codex 两个来源的 provider 行）。
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
 Expected: PASS —— 本 Task 定义的 claude / codex 判据全部通过（**以实际条数为准**）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add crates/atomcode-capabilities/src/migration/ crates/atomcode-i18n/src/product/
@@ -5974,7 +5978,7 @@ OpenCode 遵循 XDG（本机实测：二进制里有 `XDG_CONFIG_HOME` / `XDG_DA
 地方。**本 Task 取前者**：加 `opencode_config_dir` 与 `opencode_data_dir` 两个
 `PathBuf`，宿主填。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `crates/atomcode-capabilities/src/migration/opencode.rs` 末尾追加：
 
@@ -6253,12 +6257,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::opencode`
 Expected: FAIL —— `OpenCodeSource` 不存在。
 
-- [ ] **Step 3: 实现 OpenCodeSource**
+- [x] **Step 3: 实现 OpenCodeSource**
 
 `mod.rs` 加 `mod opencode;`，并在 `builtin_sources()` 的列表末尾追加
 `Box::new(opencode::OpenCodeSource)`。将 Step 1 的测试模块保留在 `opencode.rs` 末尾。
@@ -6670,7 +6674,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 把来源特有的知识收回来源自己**
+- [x] **Step 4: 把来源特有的知识收回来源自己**
 
 这一步是本 Task 的**要点**。OpenCode 加进来之后，`provider.rs` 里**不该**再多出
 任何 `opencode` 的知识。
@@ -6724,7 +6728,7 @@ fn protocol_for_opencode(npm: Option<&str>) -> String {
     pub opencode_data_dir: PathBuf,
 ```
 
-- [ ] **Step 5: 宿主解析 OpenCode 的目录**
+- [x] **Step 5: 宿主解析 OpenCode 的目录**
 
 `atomcode-coding/src/config.rs` 加（与 `product_dirs_from_env` 同处）：
 
@@ -6749,17 +6753,17 @@ pub fn opencode_dirs() -> (PathBuf, PathBuf) {
 
 `scan_context` 加两个参数，CLI 与 TUI 两处调用都补上。
 
-- [ ] **Step 6: 核对文案**
+- [x] **Step 6: 核对文案**
 
 复用 Task 2 已添加的 `text::opencode_plaintext_credentials()` 与
 `MigrationOpencodePlaintextCredentials` 的中英文文案。
 
-- [ ] **Step 7: 跑测试确认通过**
+- [x] **Step 7: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::opencode`
 Expected: PASS —— 本 Task 定义的判据全部通过。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add crates/atomcode-capabilities/src/migration/ crates/atomcode-coding/src/config.rs crates/atomcode-i18n/src/product/
@@ -6784,7 +6788,7 @@ adding a source does not change the shared module."
 - Modify: `crates/atomcode-cli/src/lib.rs`
 - Modify: `crates/atomcode-cli/Cargo.toml`（capabilities feature 加 `migration`）
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `crates/atomcode-cli/src/import_cmd.rs` 里先建文件与测试：
 
@@ -7823,12 +7827,12 @@ fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bo
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd`
 Expected: FAIL —— 模块不存在（`import_cmd` 未在 `lib.rs` 声明）。
 
-- [ ] **Step 3: 接上 capabilities 的 migration feature**
+- [x] **Step 3: 接上 capabilities 的 migration feature**
 
 `crates/atomcode-cli/Cargo.toml` 第 65 行：
 
@@ -7836,7 +7840,7 @@ Expected: FAIL —— 模块不存在（`import_cmd` 未在 `lib.rs` 声明）�
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks", "migration"] }
 ```
 
-- [ ] **Step 4: 声明模块**
+- [x] **Step 4: 声明模块**
 
 `crates/atomcode-cli/src/lib.rs` 的模块声明区加：
 
@@ -7844,7 +7848,7 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify
 pub mod import_cmd;
 ```
 
-- [ ] **Step 5: 加报告文案的 i18n 条目**
+- [x] **Step 5: 加报告文案的 i18n 条目**
 
 `render_text` 与 `status_word` 用的词条（`MigrationReportEmpty` / `MigrationSummary` / `MigrationStatusActive` / `MigrationStatusActionable` / `MigrationStatusBlocked`）还没有 —— Task 2 只加了「每一项资产」的说明词。这几个是**报告的外壳**。
 
@@ -7916,12 +7920,12 @@ pub mod import_cmd;
 
 > **中文标点按 `docs/i18n-style.md`**：全角逗号与句号，数字与中文之间留半角空格。
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd`
 Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数为准**）。
 
-- [ ] **Step 7: 加 CLI 子命令**
+- [x] **Step 7: 加 CLI 子命令**
 
 `crates/atomcode-cli/src/main.rs` 的 `enum Commands` 里加（在 `Setup { .. }` 附近）：
 
@@ -8064,12 +8068,12 @@ pub fn apply_provider_accounts(
 
 **返回值的第二个数是「被跳过的项数」** —— 调用方据此决定退出码：有东西没导入就不是成功。
 
-- [ ] **Step 8: 跑测试与编译检查**
+- [x] **Step 8: 跑测试与编译检查**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd && cargo check -p atomcode-cli`
 Expected: PASS + 退出 0。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 git add crates/atomcode-cli/src/import_cmd.rs crates/atomcode-cli/src/main.rs crates/atomcode-cli/src/lib.rs crates/atomcode-cli/Cargo.toml crates/atomcode-i18n/src/product/
@@ -8097,7 +8101,7 @@ rows with stable status names."
 - Modify: `crates/atomcode-cli/src/lib.rs`（模块声明 + `Ports` 装配）
 - Modify: `crates/atomcode-i18n/src/screen/{messages,en,zh_cn}.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 `crates/atomcode-tui/src/migration.rs`（新建，含端口 trait 与视图类型）：
 
@@ -8169,7 +8173,7 @@ pub trait Migration: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-tui migration`
 
@@ -8179,7 +8183,7 @@ Expected: FAIL —— `/import` 还没注册，判据找不到这个命令。
 > `cargo check` 失败 —— 它根本没进编译。所以这条判据必须是**跑起来的**：
 > 它断言 `/import` 出现在 `/help` 里、且渲染出报告，命令没注册就必然失败。
 
-- [ ] **Step 3: 声明模块**
+- [x] **Step 3: 声明模块**
 
 `crates/atomcode-tui/src/lib.rs` 的模块声明区加：
 
@@ -8187,7 +8191,7 @@ Expected: FAIL —— `/import` 还没注册，判据找不到这个命令。
 pub mod migration;
 ```
 
-- [ ] **Step 4: 加命令集**
+- [x] **Step 4: 加命令集**
 
 `crates/atomcode-tui/src/commands.rs` 加：
 
@@ -8331,7 +8335,7 @@ commands!(
 
 `crates/atomcode-tui/tests/language.rs` 里列了全部内置命令集（`Box::new(atomcode_tui::commands::SessionCommands)` 等），**把 `ImportCommands` 也加进去**，否则那条语言判据不会覆盖新命令。
 
-- [ ] **Step 5: 加 screen 表文案**
+- [x] **Step 5: 加 screen 表文案**
 
 **只有屏幕自己的话进 screen 表。** 「没有发现其他 AI 编码 Agent 留下的资产」这句话 CLI 也会说（`product` 表的 `MigrationReportEmpty`），所以屏幕**复用 product 那一条**，不在 screen 表里写第二遍。
 
@@ -8387,7 +8391,7 @@ commands!(
         }
 ```
 
-- [ ] **Step 6: 写端口实现**
+- [x] **Step 6: 写端口实现**
 
 `crates/atomcode-cli/src/tui_migration.rs`（新建）：
 
@@ -8498,7 +8502,7 @@ impl Migration for DiskMigration {
 }
 ```
 
-- [ ] **Step 7: 装配端口**
+- [x] **Step 7: 装配端口**
 
 `crates/atomcode-cli/src/lib.rs` 的 `launch::Ports { ... }` 加一项。
 
@@ -8574,7 +8578,7 @@ impl Migration for DiskMigration {
 
 > `Ports` 虽然 `#[derive(Default)]`，但这两个构造点没有用 `..Default::default()`，所以**必须**逐个补字段。
 
-- [ ] **Step 8: 写判据**
+- [x] **Step 8: 写判据**
 
 在 `crates/atomcode-tui/src/commands.rs` 的测试区加：
 
@@ -8815,7 +8819,7 @@ impl Migration for DiskMigration {
 > `OpenSheet` 里的 `Page::List` —— 单子的 id、行数、每行的 label 与 preview。
 > 一段文本（`Outcome::Said`）在一屏放不下时会被截断，而清单被截断等于清单没了。
 
-- [ ] **Step 9: 跑测试**
+- [x] **Step 9: 跑测试**
 
 Run: `cargo nextest run -p atomcode-tui import`
 Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数为准**：两条列表判据 +
@@ -8824,7 +8828,7 @@ Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数�
 Run: `cargo check -p atomcode-cli`
 Expected: 退出 0。
 
-- [ ] **Step 10: 提交**
+- [x] **Step 10: 提交**
 
 ```bash
 git add crates/atomcode-tui/src/migration.rs crates/atomcode-tui/src/commands.rs crates/atomcode-tui/src/lib.rs crates/atomcode-tui/src/plugin.rs crates/atomcode-tui/src/launch.rs crates/atomcode-tui/src/rows.rs crates/atomcode-tui/tests/language.rs crates/atomcode-tui/tests/e2e.rs crates/atomcode-cli/src/tui_migration.rs crates/atomcode-cli/src/lib.rs crates/atomcode-i18n/src/screen/
@@ -8933,7 +8937,7 @@ pub fn effective_endpoint(protocol: &str, endpoint: &str) -> Option<String> {
 > 标成 `Blocked`，不是硬造一个 id。
 
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `provider.rs` 末尾追加：
 
@@ -9207,12 +9211,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration migration::provider`
 Expected: FAIL —— `provider_drafts` 不存在。
 
-- [ ] **Step 3: 实现映射**
+- [x] **Step 3: 实现映射**
 
 `provider.rs` 的共享规则（`protocol_for_wire` / `unsupported_protocol` /
 `account_id_for` / `effective_endpoint` / `protocol_needs_endpoint` /
@@ -9458,12 +9462,12 @@ struct MergedCodexConfig {
 
 （`codex.rs` 顶部加 `use super::provider::{ApiKeyRef, ProviderAccountDraft};`）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
 Expected: PASS —— 全部绿。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add crates/atomcode-config/src/provider_book.rs crates/atomcode-capabilities/src/migration/
@@ -9483,7 +9487,7 @@ host can ask about that single item before writing it."
 - Modify: `crates/atomcode-cli/src/main.rs`
 - Modify: `crates/atomcode-i18n/src/product/{messages,en,zh_cn}.rs`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `import_cmd.rs` 的测试区加：
 
@@ -9758,12 +9762,12 @@ host can ask about that single item before writing it."
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd`
 Expected: FAIL —— `write_account` 不存在。
 
-- [ ] **Step 3: 实现写入**
+- [x] **Step 3: 实现写入**
 
 `import_cmd.rs` 加：
 
@@ -10816,7 +10820,7 @@ fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bo
 }
 ```
 
-- [ ] **Step 4: 实现 `--apply` 流程**
+- [x] **Step 4: 实现 `--apply` 流程**
 
 `import_cmd.rs` 加：
 
@@ -11011,7 +11015,7 @@ fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bo
 }
 ```
 
-- [ ] **Step 5: 接上 CLI**
+- [x] **Step 5: 接上 CLI**
 
 `main.rs` 的 `run_import_command` 改成：
 
@@ -11099,7 +11103,7 @@ async fn run_import_command(
 
 > `cli_config_path()` 已在 Task 5 定义（同一个 `main.rs`），**不要在这里再定义一遍**。它接受 `--config` 传下来的路径，所以验收时可以把配置写到临时目录。
 
-- [ ] **Step 6: 加文案**
+- [x] **Step 6: 加文案**
 
 `product/messages.rs` 加：
 
@@ -11230,12 +11234,12 @@ async fn run_import_command(
 
 > **`.into()` 不能漏**：这些 arm 返回 `Cow<'static, str>`，`format!` 给出的是 `String`，所以要 `.into()` 才匹配得上（既有 arm 也是这么写的，见 `product/en.rs:1044`）。
 
-- [ ] **Step 7: 跑测试**
+- [x] **Step 7: 跑测试**
 
 Run: `cargo nextest run -p atomcode-cli import_cmd`
 Expected: PASS —— 本 Task 定义的判据全部通过（**以实际条数为准**）。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add crates/atomcode-cli/src/import_cmd.rs crates/atomcode-cli/src/main.rs crates/atomcode-i18n/src/product/
@@ -11253,12 +11257,12 @@ rather than an overwrite."
 
 **Files:** 无新增文件；只跑门。
 
-- [ ] **Step 1: 编译门**
+- [x] **Step 1: 编译门**
 
 Run: `bash gates/compile.sh`
 Expected: 退出 0。
 
-- [ ] **Step 2: 受影响 crate 的测试**
+- [x] **Step 2: 受影响 crate 的测试**
 
 Run: `cargo nextest run -p atomcode-capabilities --features migration`
 Expected: 全绿。
@@ -11272,7 +11276,7 @@ Expected: 全绿。
 Run: `cargo nextest run -p atomcode-tui`
 Expected: 全绿。
 
-- [ ] **Step 3: 分层与门禁**
+- [x] **Step 3: 分层与门禁**
 
 Run: `bash gates/layers.sh`
 Expected: 通过。
@@ -11286,13 +11290,13 @@ Expected: 通过（本次没有在 `atomcode-tui/src` 或 `atomcode-cli/src` 写
 Run: `bash gates/tui-layers.sh`
 Expected: 通过。
 
-- [ ] **Step 4: 格式**
+- [x] **Step 4: 格式**
 
 Run: `cargo fmt --all`
 Run: `cargo fmt --all -- --check`
 Expected: 退出 0。
 
-- [ ] **Step 5: 手工验收（本机）**
+- [x] **Step 5: 手工验收（本机）**
 
 **先编出要验的那个二进制** —— 这一步在**每一条手工命令之前**，因为
 `PATH` 上的 `atomcode` 可能是装好的旧版，而编译门与 nextest 都不保证
@@ -11395,7 +11399,7 @@ cmp "$dst/config.before" "$dst/config.toml" && echo "unchanged"
 > 在配置里了」（因为它**已经写进去了**）；只读报告说的是「这项资产已经导入」
 > （因为**回检**发现我们的配置里已有等价的账号）。两件事，措辞不同是对的。
 
-- [ ] **Step 6: 提交门的结果（若有格式改动）**
+- [x] **Step 6: 提交门的结果（若有格式改动）**
 
 **只暂存本任务改过的文件**，不要用 `git add -A` —— 工作区里有他人的改动：
 
