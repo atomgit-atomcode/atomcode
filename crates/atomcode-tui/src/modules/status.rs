@@ -660,14 +660,6 @@ const ALLOWANCE_SPENT: u8 = 95;
 /// was left when the host answered. Past it the window has turned over and the
 /// figure is about a window that no longer exists, so the row says nothing
 /// rather than "90%" of an allowance that is back to full.
-/// Whether the status row currently says something about the allowance: a
-/// figure at or past the near threshold is on the row right now. The idle
-/// beat re-asks only while this holds — a fresh figure nobody sees costs a
-/// round trip for nothing.
-pub(crate) fn row_showing(allowance: Option<&crate::moment::Allowance>) -> bool {
-    allowance.is_some_and(|a| a.percent >= ALLOWANCE_NEAR)
-}
-
 fn allowance_badge(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
@@ -704,6 +696,20 @@ fn allowance_badge(
         })
     };
     Some(line.into_owned())
+}
+
+/// Whether the row currently carries the allowance badge — the SAME visibility
+/// `allowance_badge` draws with: at or past the near threshold, AND the window
+/// not yet turned over. The idle beat re-asks only while this holds — a figure
+/// nobody sees (a fresh one, or one whose window has already passed) costs a
+/// round trip for nothing, and a host that never answers would otherwise be
+/// asked about it forever.
+pub(crate) fn row_showing(
+    allowance: Option<&crate::moment::Allowance>,
+    now: crate::moment::Timestamp,
+) -> bool {
+    allowance
+        .is_some_and(|a| a.percent >= ALLOWANCE_NEAR && !a.resets_by.is_some_and(|by| by <= now))
 }
 
 fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
@@ -1050,17 +1056,24 @@ mod tests {
     /// always carried the figure would be one more thing to read past, and it
     /// would stop meaning anything when it mattered.
     #[test]
-    fn the_row_is_remembered_only_while_the_figure_is_near_or_spent() {
-        let left = |percent| crate::moment::Allowance {
+    fn the_row_is_remembered_only_while_the_figure_is_near_and_alive() {
+        let now = crate::moment::Timestamp::millis(1_000);
+        let left = |percent, resets_by| crate::moment::Allowance {
             label: "5 小时".into(),
             percent,
             resets_at: "23:24".into(),
-            resets_by: None,
+            resets_by,
         };
-        assert!(row_showing(Some(&left(99))));
-        assert!(row_showing(Some(&left(80))));
-        assert!(!row_showing(Some(&left(79))));
-        assert!(!row_showing(None));
+        assert!(row_showing(Some(&left(99, None)), now));
+        assert!(row_showing(Some(&left(80, None)), now));
+        assert!(!row_showing(Some(&left(79, None)), now));
+        assert!(!row_showing(None, now));
+        // The window has turned over: the row says nothing, and the idle beat
+        // must not keep asking about a badge that is no longer on it.
+        assert!(!row_showing(
+            Some(&left(99, Some(crate::moment::Timestamp::millis(500)))),
+            now
+        ));
     }
 
     #[test]

@@ -2877,32 +2877,7 @@ impl UserInterface for Tui {
                 }
                 Wake::PullBgQuestion => self.pour_bg_question(),
                 Wake::Tick => {
-                    {
-                        let mut m = self.host.moment.write().expect("moment poisoned");
-                        if m.scrollbar_until
-                            .is_some_and(|t| t <= tokio::time::Instant::now())
-                        {
-                            m.scrollbar_until = None;
-                        }
-                        m.tick = m.tick.wrapping_add(1);
-                    }
-                    // A near/exhausted figure on the row is re-asked on this
-                    // idle beat too: the account can move underneath the
-                    // window (a refresh topping it back up) while no turn
-                    // ends, and a notice that stays put through that is
-                    // wrong. `ALLOWANCE_EVERY` still throttles this to one
-                    // round trip per beat.
-                    if crate::modules::status::row_showing(
-                        self.host
-                            .moment
-                            .read()
-                            .expect("moment poisoned")
-                            .allowance
-                            .as_ref(),
-                    ) {
-                        self.check_allowance();
-                    }
-                    stale = true;
+                    stale = self.tick_beat();
                 }
                 // A drag held still at the conversation's edge: one more row.
                 Wake::EdgeScroll => {
@@ -6511,6 +6486,28 @@ impl Tui {
                 repaint.now();
             }
         });
+    }
+
+    /// One idle beat: per-frame housekeeping, plus — only while the allowance
+    /// badge is actually on the row — a throttled re-ask of the figure, so a
+    /// mid-window refresh on the account reaches the row without waiting for
+    /// a turn to end. The visibility judgment is `row_showing`'s, made under
+    /// the moment's write lock and acted on outside it.
+    fn tick_beat(&self) -> bool {
+        let reask = {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            if m.scrollbar_until
+                .is_some_and(|t| t <= tokio::time::Instant::now())
+            {
+                m.scrollbar_until = None;
+            }
+            m.tick = m.tick.wrapping_add(1);
+            crate::modules::status::row_showing(m.allowance.as_ref(), m.now)
+        };
+        if reask {
+            self.check_allowance();
+        }
+        true
     }
 
     fn check_allowance(&self) {
@@ -18422,6 +18419,68 @@ mod allowance_switch_tests {
             .clone()
             .expect("the badge stays after a refresh");
         assert_eq!(now.percent, 10, "the row follows a mid-window refresh");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_idle_beat_reasks_only_a_visible_badge() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let now = host.moment.read().unwrap().now;
+        // A badge on the row: the idle beat asks.
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = Some(crate::moment::Allowance {
+                label: "5h".into(),
+                percent: 99,
+                resets_at: String::new(),
+                resets_by: Some(crate::moment::Timestamp::millis(
+                    now.as_millis() as u64 + 60_000,
+                )),
+            });
+        }
+        *tui.allowance_checked.lock().unwrap() = None;
+        tui.tick_beat();
+        pending.recv().await.unwrap().send(reply(vec![])).unwrap();
+        tokio::task::yield_now().await;
+        // The window has already turned over: the row shows nothing, and the
+        // beat must not keep asking about a badge that is no longer on it.
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = Some(crate::moment::Allowance {
+                label: "5h".into(),
+                percent: 99,
+                resets_at: String::new(),
+                resets_by: Some(crate::moment::Timestamp::millis(
+                    now.as_millis().saturating_sub(1) as u64,
+                )),
+            });
+        }
+        *tui.allowance_checked.lock().unwrap() = None;
+        tui.tick_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "an expired badge is not re-asked"
+        );
+        // A quiet row (figure below the threshold): nothing asked either.
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = Some(crate::moment::Allowance {
+                label: "5h".into(),
+                percent: 10,
+                resets_at: String::new(),
+                resets_by: None,
+            });
+        }
+        *tui.allowance_checked.lock().unwrap() = None;
+        tui.tick_beat();
+        tokio::task::yield_now().await;
+        assert!(pending.try_recv().is_err(), "a quiet row is not re-asked");
     }
 }
 
