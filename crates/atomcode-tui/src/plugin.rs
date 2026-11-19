@@ -1210,23 +1210,40 @@ async fn answer_prompts(
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
-/// when the composer still holds text the person was mid-typing — the
-/// composer, so the tail of an interrupted IME composition cannot be mistaken
-/// for an answer to a question nobody has read.
+/// when the composer is still on screen AND holds text the person was
+/// mid-typing — the composer, so the tail of an interrupted IME composition
+/// cannot be mistaken for an answer to a question nobody has read.
 pub enum AskKeyRoute {
     Panel,
     Composer(char),
 }
 
 /// One key against the ask panel, with the composer's claim honored: while the
-/// composer holds text, plain characters (a committed IME composition among
-/// them) keep going into the draft instead of selecting an answer. Navigation
-/// (arrows, Enter, Esc, Tab, digits) stays with the panel, so the question
-/// stays answerable by keyboard without clearing the draft first.
-pub fn route_ask_key(input_holds_text: bool, press: &crate::surface::KeyPress) -> AskKeyRoute {
+/// composer is on screen and holds text, plain characters (a committed IME
+/// composition among them) keep going into the draft instead of selecting an
+/// answer. Digits stay with the panel in every state — "every answer is
+/// reachable by one key" is the panel's standing contract.
+///
+/// Known residue: when the composer is EMPTY the terminal cannot tell a
+/// committed IME composition from deliberate keys, so the first burst after
+/// the panel interrupts a just-started line still reaches the panel. The
+/// composer-holds-text guard covers the mid-sentence case only.
+pub fn route_ask_key(
+    input_holds_text: bool,
+    panel_mounted: bool,
+    press: &crate::surface::KeyPress,
+) -> AskKeyRoute {
     use crate::surface::{Key, Mods};
+    if panel_mounted {
+        // The composer has stepped aside for the panel: typing into the field
+        // would be writing where nobody looks. The panel takes the key — its
+        // typing rows live on characters.
+        return AskKeyRoute::Panel;
+    }
     let typed = match &press.key {
-        Key::Char(c) if press.mods == Mods::NONE || press.mods == Mods::SHIFT => Some(*c),
+        Key::Char(c) if press.mods == Mods::NONE || press.mods == Mods::SHIFT => {
+            (!c.is_ascii_digit()).then_some(*c)
+        }
         _ => None,
     };
     match (input_holds_text, typed) {
@@ -3597,12 +3614,11 @@ impl UserInterface for Tui {
                         .expect("moment poisoned")
                         .input
                         .is_empty();
-                    match route_ask_key(holds, &press) {
+                    match route_ask_key(holds, self.panel_mounted(), &press) {
                         AskKeyRoute::Composer(c) => {
-                            let mut m = self.host.moment.write().expect("moment poisoned");
-                            let at = m.caret.min(m.input.len());
-                            m.input.insert(at, c);
-                            m.caret = at + c.len_utf8();
+                            // Through `act`, so the insert keeps its side
+                            // effects (draft history, suggestion dismissal).
+                            quit = self.act(Action::Insert(c), &client);
                             stale = true;
                         }
                         AskKeyRoute::Panel => {
@@ -18010,15 +18026,33 @@ mod ask_route_tests {
     #[test]
     fn a_committed_tail_goes_to_the_draft_not_the_panel() {
         assert!(matches!(
-            route_ask_key(true, &press(Key::Char('m'))),
+            route_ask_key(true, false, &press(Key::Char('m'))),
             AskKeyRoute::Composer('m')
+        ));
+    }
+
+    #[test]
+    fn a_composer_stepped_aside_never_takes_the_key() {
+        // With the panel mounted the composer is hidden: the key must not be
+        // written into a field nobody can see.
+        assert!(matches!(
+            route_ask_key(true, true, &press(Key::Char('m'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn digits_stay_with_the_panel_even_over_a_draft() {
+        assert!(matches!(
+            route_ask_key(true, false, &press(Key::Char('1'))),
+            AskKeyRoute::Panel
         ));
     }
 
     #[test]
     fn an_empty_composer_leaves_the_keys_with_the_panel() {
         assert!(matches!(
-            route_ask_key(false, &press(Key::Char('y'))),
+            route_ask_key(false, false, &press(Key::Char('y'))),
             AskKeyRoute::Panel
         ));
     }
@@ -18027,8 +18061,8 @@ mod ask_route_tests {
     fn navigation_keys_stay_with_the_panel_while_the_draft_holds_text() {
         for key in [Key::Enter, Key::Esc, Key::Up, Key::Tab] {
             assert!(
-                matches!(route_ask_key(true, &press(key.clone())), AskKeyRoute::Panel),
-                "navigation key {key:?} stays with the panel"
+                matches!(route_ask_key(true, false, &press(key)), AskKeyRoute::Panel),
+                "navigation key stays with the panel"
             );
         }
     }
