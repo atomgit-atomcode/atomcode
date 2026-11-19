@@ -497,6 +497,40 @@ async fn summarize_span_fork_overflows_into_the_transcript_path() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn summarize_span_fork_replays_full_prefix_longer_than_span() {
+    // The drained span is a SUFFIX of the parent prefix: the fork must
+    // replay the FULL prefix (including the pre-floor messages) — a
+    // regression back to span-only replay drops the sacred first task.
+    let provider = Probe {
+        replies: Mutex::new(VecDeque::from([answer("the summary")])),
+        ..Default::default()
+    };
+    let parent = ParentPromptContext {
+        tools: Arc::new([]),
+    };
+    let prefix = vec![
+        Message::system("persona"),
+        Message::user("first task"),
+        Message::assistant("mid", vec![]),
+    ];
+    let span = &prefix[1..];
+    let body = summarize_span(
+        &provider,
+        span,
+        Some(&prefix),
+        Some("errors"),
+        Some(&parent),
+    )
+    .await
+    .unwrap();
+    assert!(body.contains("the summary"));
+    let sent = provider.sent.lock().unwrap();
+    assert_eq!(sent[0].len(), prefix.len() + 1);
+    assert_eq!(sent[0][0].text, "persona");
+    assert_eq!(sent[0][1].text, "first task");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn summarize_span_fork_falls_back_on_any_fork_failure() {
     // The injected tool set adds failure modes the tool-free transcript
     // path does not have — ANY fork failure (e.g. a non-overflow gateway

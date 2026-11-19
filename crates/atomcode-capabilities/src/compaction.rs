@@ -620,11 +620,22 @@ pub async fn summarize_span(
     // summarizer below, which keeps the drained-span semantics: the injected
     // tool set adds failure modes (tool calls, truncation, non-overflow
     // rejections) that the tool-free path does not have.
-    if let Some(parent) = parent {
-        let replay = cache_prefix.unwrap_or(span);
-        if let Ok(body) = summarize_span_fork(provider, replay, focus, parent).await {
-            return Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"));
+    match parent {
+        Some(parent) => {
+            let replay = cache_prefix.unwrap_or(span);
+            match summarize_span_fork(provider, replay, focus, parent).await {
+                Ok(body) => {
+                    return Ok(format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n{body}"));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = ?e,
+                        "compaction fork failed; falling back to the transcript summarizer"
+                    );
+                }
+            }
         }
+        None => tracing::debug!("compaction fork skipped: no parent prompt context"),
     }
     let window = match provider.context_window() {
         0 => 128_000,
@@ -704,12 +715,12 @@ async fn summarize_span_fork(
         n => n,
     };
     let max_output = (window / 8).clamp(1, MAX_SUMMARY_TOKENS);
-    // Cheap size pre-estimate: a replay that cannot fit the window is a doomed
-    // billed request — skip the fork and let the transcript path window it.
-    // ~4 bytes per token plus a per-message envelope allowance.
-    let estimated_tokens: usize = prefix.iter().map(|m| m.text.len() / 4 + 64).sum::<usize>()
-        + focus.map(str::len).unwrap_or(0) / 4;
-    if estimated_tokens >= window.saturating_sub(max_output) as usize {
+    // Size pre-estimate via the calibrated per-message estimator (it accounts
+    // for images and tool calls a byte/4 heuristic would under-count): a
+    // replay that cannot fit the window is a doomed billed request — skip the
+    // fork and let the transcript path window it.
+    let estimated_tokens: u32 = prefix.iter().map(Message::estimate_tokens).sum();
+    if estimated_tokens >= window.saturating_sub(max_output) {
         return Err(SummaryError::Provider(ProviderError {
             retryable: false,
             message: "the replayed prefix cannot fit the window".into(),
