@@ -647,7 +647,7 @@ fn mode_badge(
 /// Below it the figure is one nobody acts on — the work is not going to stop
 /// today — and the row's space is better spent on what changes. The two steps
 /// are the ones `atomcode-tuix` settled on.
-pub(crate) const ALLOWANCE_NEAR: u8 = 80;
+const ALLOWANCE_NEAR: u8 = 80;
 /// From here on it is not a warning any more.
 const ALLOWANCE_SPENT: u8 = 95;
 
