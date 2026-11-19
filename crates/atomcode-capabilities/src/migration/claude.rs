@@ -15,12 +15,25 @@
 //!
 //! Read-only: this looks and reports, it never writes.
 
+use super::provider::{ApiKeyRef, ProviderAccountDraft};
 use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 // `probe_file` / `probe_dir` live in the parent module. A child module may
 // reach a parent's private items, but it has to **name** them — an unqualified
 // `probe_file(...)` would not resolve.
 use super::{probe_dir, probe_file, MigrationSource, ScanContext, SkillTruth};
 use std::path::Path;
+
+/// Read Claude's `env` block out of its settings file.
+///
+/// **Claude's, not ours.** The `env` block maps a NAME to a VALUE, and the
+/// value IS the secret — so a key read from here is a literal, never a
+/// reference. That is the opposite of Codex's `env_key`, and the difference
+/// is why this function lives with Claude rather than in the shared module.
+pub fn claude_env(home: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let raw = std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get("env")?.as_object().cloned()
+}
 
 pub struct ClaudeSource;
 
@@ -444,6 +457,67 @@ impl MigrationSource for ClaudeSource {
         }
 
         out
+    }
+
+    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
+        // Claude's own reader — it lives with Claude now.
+        let Some(env) = claude_env(&ctx.os_home) else {
+            return Vec::new();
+        };
+        let base_url = env
+            .get("ANTHROPIC_BASE_URL")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // Claude's `env` block maps a NAME to a VALUE: the value IS the secret.
+        // It is never a reference, so it is always a plaintext credential — and
+        // a plaintext credential needs the person's confirmation before it is
+        // written. Codex's `env_key` is the opposite (a name to read), and that
+        // one becomes an `EnvVar`.
+        let key = env
+            .get("ANTHROPIC_API_KEY")
+            .or_else(|| env.get("ANTHROPIC_AUTH_TOKEN"))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(|secret| ApiKeyRef::Plaintext(secret.to_string()));
+        if base_url.is_none() && key.is_none() {
+            return Vec::new();
+        }
+        // **A BLANK endpoint is an ABSENT endpoint.** Claude's settings can
+        // carry `ANTHROPIC_BASE_URL: ""`; treating that as "it has an
+        // endpoint" would pick the custom protocol and then fail to write it
+        // with `ProtocolNeedsEndpoint`. So the endpoint is trimmed and
+        // emptied ones are treated as absent.
+        let base_url = base_url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        // **Claude with only a key and no endpoint was talking to Anthropic
+        // itself.** It gets the `anthropic` preset, which HAS a default
+        // endpoint (`config/provider_preset.rs:352`). With the
+        // `anthropic-compatible` preset — which has NO default endpoint
+        // (`:86`) — the write would fail with `ProtocolNeedsEndpoint` for a
+        // perfectly ordinary configuration.
+        //
+        // With an explicit `ANTHROPIC_BASE_URL` it is a custom endpoint, so
+        // `anthropic-compatible` is right.
+        let protocol = if base_url.is_some() {
+            super::provider::protocol_for_wire(None, "anthropic-compatible")
+        } else {
+            "anthropic".to_string()
+        };
+        vec![ProviderAccountDraft {
+            // The id the account will get, not the raw name.
+            id: super::provider::account_id_for("claude").unwrap_or_else(|| "claude".into()),
+            // The name the source wrote it under.
+            source_name: "claude".into(),
+            protocol: protocol.clone(),
+            // The endpoint as it will be stored.
+            base_url: super::provider::effective_endpoint(&protocol, base_url.as_deref()),
+            api_key: key,
+            models: Vec::new(),
+            source_path: ctx.os_home.join(".claude").join("settings.json"),
+            scope: AssetScope::User,
+            blocked: None,
+        }]
     }
 }
 

@@ -8,9 +8,113 @@
 //!
 //! Read-only: this looks and reports, it never writes.
 
+use super::provider::{ApiKeyRef, ProviderAccountDraft};
 use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 use super::{probe_dir, MigrationSource, ScanContext, SkillTruth};
 use std::path::Path;
+
+/// Codex's layered config, merged the way Codex itself layers it: the
+/// project's file wins over the user's, key by key.
+struct MergedCodexConfig {
+    /// Provider id -> the provider's table, the file it was read from, and
+    /// the scope it was read at — so the report can show which file to look
+    /// at, and a project provider is not reported as the person's own.
+    providers: std::collections::BTreeMap<
+        String,
+        (toml::Value, std::path::PathBuf, super::report::AssetScope),
+    >,
+    /// The provider the person selected, if the config names one.
+    model_provider: Option<String>,
+    /// The model the person was using.
+    model: Option<String>,
+}
+
+/// Merge the config files in order — later files win.
+///
+/// Each file comes with the scope it was read at, so a provider that came
+/// from the project's config is not reported as the person's own.
+///
+/// **Tables are merged key by key, not replaced.** Codex merges its config
+/// layers recursively (`codex-rs/config/src/merge.rs:59`, `merge_toml_values`
+/// walks into nested tables), so a project file that overrides only
+/// `base_url` under a provider id keeps the `env_key` and `wire_api` the user
+/// file set. Replacing the whole table would drop the credential — the very
+/// thing the person most needs to keep.
+fn merge_codex_configs(
+    files: &[(std::path::PathBuf, super::report::AssetScope)],
+) -> MergedCodexConfig {
+    // The type is spelled out: `and_modify` below needs to know what the
+    // value is.
+    let mut providers: std::collections::BTreeMap<
+        String,
+        (toml::Value, std::path::PathBuf, super::report::AssetScope),
+    > = std::collections::BTreeMap::new();
+    let mut model_provider = None;
+    let mut model = None;
+    for (path, scope) in files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // **`toml::from_str`, not `raw.parse::<toml::Value>()`** — the two
+        // are NOT the same path. `FromStr` for `toml::Value` rejects a table
+        // header with a dot in it, and Codex's own config is full of those:
+        // `[model_providers.my-provider]`. The `FromStr` path would read
+        // every real Codex config as unparseable, and every provider in it
+        // would silently vanish from the report.
+        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+            continue;
+        };
+        if let Some(table) = value.get("model_providers").and_then(|p| p.as_table()) {
+            for (name, provider) in table {
+                providers
+                    .entry(name.clone())
+                    .and_modify(|existing| {
+                        merge_table(&mut existing.0, provider);
+                        // The overlay file is now the one that decides this
+                        // provider's values — so it is also the file the report
+                        // should point at.
+                        existing.1 = path.clone();
+                        existing.2 = *scope;
+                    })
+                    .or_insert_with(|| (provider.clone(), path.clone(), *scope));
+            }
+        }
+        if let Some(selected) = value.get("model_provider").and_then(|v| v.as_str()) {
+            model_provider = Some(selected.to_string());
+        }
+        if let Some(name) = value.get("model").and_then(|v| v.as_str()) {
+            model = Some(name.to_string());
+        }
+    }
+    MergedCodexConfig {
+        providers,
+        model_provider,
+        model,
+    }
+}
+
+/// Merge `overlay` into `base`, key by key, the way Codex merges its layers.
+///
+/// A scalar in the overlay replaces the base's; a table in the overlay is
+/// merged into the base's table rather than replacing it.
+fn merge_table(base: &mut toml::Value, overlay: &toml::Value) {
+    // Reborrow, so `base` is still usable in the `else` arm below — matching
+    // on `(base, overlay)` would MOVE the reference and leave it unusable.
+    let (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) = (&mut *base, overlay)
+    else {
+        // Not a table: the overlay wins outright.
+        *base = overlay.clone();
+        return;
+    };
+    for (key, value) in overlay_table {
+        match base_table.get_mut(key) {
+            Some(existing) => merge_table(existing, value),
+            None => {
+                base_table.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
 
 pub struct CodexSource;
 
@@ -204,6 +308,111 @@ impl MigrationSource for CodexSource {
         }
 
         out
+    }
+
+    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
+        // Codex layers its config: the project's `.codex/config.toml` wins over
+        // the user's `~/.codex/config.toml`. So the two are **merged by id**,
+        // project over user — otherwise the same provider id appears twice and
+        // the second one is a conflict instead of an override.
+        let merged = merge_codex_configs(&[
+            (
+                ctx.os_home.join(".codex").join("config.toml"),
+                super::report::AssetScope::User,
+            ),
+            (
+                ctx.project.join(".codex").join("config.toml"),
+                super::report::AssetScope::Project,
+            ),
+        ]);
+
+        let mut drafts: Vec<ProviderAccountDraft> = merged
+            .providers
+            .into_iter()
+            .map(|(name, (provider, source_path, scope))| {
+                let base_url = provider
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                // `env_key` is the NAME of the variable to read, never a secret.
+                let key = provider
+                    .get("env_key")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|name| ApiKeyRef::EnvVar(name.to_string()));
+                // Codex says its own default: its `WireApi` defaults to
+                // Responses (`codex-rs/model-provider-info/src/lib.rs:117`).
+                let protocol = super::provider::protocol_for_wire(
+                    provider.get("wire_api").and_then(|v| v.as_str()),
+                    "openai-responses",
+                );
+                // **Nothing is dropped here.** Every provider table the
+                // source declares becomes a row — a definition that cannot
+                // be imported is `Blocked` with the reason, not silence.
+                //
+                // Normalizing can turn a valid definition into an
+                // empty-looking one — a provider that uses the Responses
+                // default endpoint has its endpoint stored as `None` — so
+                // the decision is made on the RAW definition, never on the
+                // normalized one.
+                //
+                // A name that cannot become an account id at all is a real
+                // problem the person should see, not something to paper
+                // over with the raw name.
+                let id = super::provider::account_id_for(&name);
+                // A wire protocol we do not speak is refused before the
+                // write (`create_account` would silently downgrade it).
+                let blocked = if id.is_none() {
+                    Some(super::text::provider_name_unusable(&name))
+                } else if super::is_unsupported_protocol(&protocol) {
+                    Some(super::text::provider_protocol_unsupported(&protocol))
+                } else if base_url.is_none() && key.is_none() {
+                    // No endpoint and no credential: there is nothing to
+                    // connect to. It is still a definition the person wrote,
+                    // so it is reported — as blocked.
+                    Some(super::text::provider_nothing_to_connect_to())
+                } else {
+                    None
+                };
+                ProviderAccountDraft {
+                    // The id the account will get, not the raw name. When the
+                    // name cannot become an id, the raw name is kept ONLY so
+                    // the row can name the definition — `blocked` says it
+                    // cannot be imported.
+                    id: id.clone().unwrap_or_else(|| name.clone()),
+                    // The name the source wrote it under — the table's key.
+                    source_name: name.clone(),
+                    protocol: protocol.clone(),
+                    // The endpoint as it will be stored.
+                    base_url: super::provider::effective_endpoint(&protocol, base_url.as_deref()),
+                    api_key: key,
+                    source_path: source_path.clone(),
+                    // The model belongs to the provider that was actually
+                    // selected, not to whichever came first in the table.
+                    models: if merged.model_provider.as_deref() == Some(name.as_str()) {
+                        merged.model.iter().cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    // The scope the config was read at: a provider from the
+                    // project's config is not the person's own provider.
+                    scope,
+                    blocked,
+                }
+            })
+            .collect();
+
+        // A model with NO named provider needs no special handling here: the
+        // per-draft `models` above already gives the model to the provider
+        // Codex actually selected, and to nobody else.
+        //
+        // When `model_provider` is absent, Codex was on its built-in `openai`
+        // provider (`codex-rs/core/src/config/mod.rs:4133` falls back to
+        // `"openai"`). That provider has no entry in `model_providers` and is
+        // not ours to import — so the model is left unattached rather than
+        // pinned onto "the first account", which would put it on an account
+        // the person never selected.
+        drafts
     }
 }
 

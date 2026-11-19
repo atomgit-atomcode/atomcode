@@ -2276,6 +2276,100 @@ pub struct ProviderAccountDraft {
 `provider.rs`（共享模块）里，**每个来源都能用**：
 
 ```rust
+//! Provider accounts found in another agent's configuration. Filled in by Task 7.
+
+use std::path::Path;
+
+use super::report::AssetScope;
+
+/// How a credential is referenced.
+///
+/// `Debug` is written by hand: a derived one would print a literal key in
+/// every `{:?}`, `dbg!` and `unwrap()` panic message.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ApiKeyRef {
+    /// The NAME of an environment variable, e.g. `"MY_KEY"`. The secret stays
+    /// where it is and is resolved at run time.
+    EnvVar(String),
+    /// A literal secret found in the source configuration. Written only after
+    /// the person confirms that one item.
+    Plaintext(String),
+}
+
+impl ApiKeyRef {
+    /// How the credential is written, for the report to say. The VALUE is
+    /// never part of this — only its kind.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ApiKeyRef::EnvVar(_) => "environment variable",
+            ApiKeyRef::Plaintext(_) => "a literal key",
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiKeyRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The variable's NAME, not a secret.
+            ApiKeyRef::EnvVar(name) => f.debug_tuple("EnvVar").field(name).finish(),
+            // The value IS the secret: only its kind is shown.
+            ApiKeyRef::Plaintext(_) => f.debug_tuple("Plaintext").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+/// A provider account an external agent has configured.
+///
+/// The derived `Debug` is safe: `api_key` goes through `ApiKeyRef`'s own
+/// redacting `Debug`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAccountDraft {
+    /// **The id the account WILL get** — already normalised by
+    /// `account_id_for`, the same rule the writer uses. It is not the raw
+    /// source id: `create_account` sanitises the name and may prefix it, so
+    /// a draft built on the raw name would never be found again.
+    pub id: String,
+    /// The definition's name **as the source wrote it**.
+    ///
+    /// Two definitions in one file can normalise to the same id (`"foo bar"`
+    /// and `"foo-bar"` both become `foo-bar`), so the id alone cannot say
+    /// which definition a row is about. The original name can — and it is
+    /// what the person recognises, so the report shows it.
+    pub source_name: String,
+    /// A preset or protocol id (`openai-compatible`, `anthropic-compatible`,
+    /// `openai-responses`).
+    pub protocol: String,
+    /// The endpoint as it will be **stored** — normalised by
+    /// `effective_endpoint`, so it is `None` when the endpoint is the
+    /// protocol's own default (the writer stores nothing in that case).
+    /// The endpoint in USE is `endpoint_in_use(protocol, base_url)`.
+    pub base_url: Option<String>,
+    /// The credential, when the source named one.
+    pub api_key: Option<ApiKeyRef>,
+    /// The models the source was using.
+    pub models: Vec<String>,
+    /// Where this account was configured — the file it was read from. The
+    /// report shows it, so a person can see WHICH file to look at.
+    pub source_path: std::path::PathBuf,
+    /// Whether the account came from the person's own tree or from the
+    /// current project. A project provider is not the user's provider.
+    pub scope: AssetScope,
+    /// Why this account CANNOT be imported, when that is the case.
+    ///
+    /// `None` means it can. A `Some` reason means the account is still
+    /// **reported** — it is configured, the person should see it — but the
+    /// importer refuses it.
+    ///
+    /// Two things land here:
+    /// - the name cannot become an account id at all (`account_id_for`
+    ///   returns `None`), so there is nothing to write it under;
+    /// - the endpoint speaks a wire protocol we do not support.
+    ///
+    /// Both used to be either silently dropped or reported as importable,
+    /// which is the one thing this report must never do.
+    pub blocked: Option<String>,
+}
+
 /// The protocol an external agent's endpoint speaks, mapped to ours.
 ///
 /// **The SOURCE says its own default**, so this function does not ask who is
@@ -4913,119 +5007,273 @@ OpenCode 遵循 XDG（本机实测：二进制里有 `XDG_CONFIG_HOME` / `XDG_DA
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::report::{AssetKind, AssetScope, AssetStatus};
+    use std::path::PathBuf;
+    // The tests call `provider_drafts`, a method on the trait — so the trait
+    // has to be in scope, not just the types. `AssetKind` / `AssetStatus` are
+    // used by the criteria that drive the public `scan()`.
+    use crate::migration::{AssetKind, AssetScope, AssetStatus, MigrationSource, ScanContext};
+    use std::path::Path;
 
-    fn ctx(home: &std::path::Path, project: &std::path::Path) -> ScanContext {
-        ScanContext {
-            os_home: home.to_path_buf(),
-            project: project.to_path_buf(),
-            product: crate::ProductDirs::new(home.join(".ours"), ".ours"),
+    /// Claude's settings.json with a provider configured by environment
+    /// variable name — the shape that can be carried over without copying a
+    /// secret.
+    fn claude_settings(home: &Path, body: &str) {
+        let dir = home.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), body).unwrap();
+    }
+
+    #[test]
+    fn a_claude_env_value_is_a_literal_secret_not_a_reference() {
+        // Claude's `env` block maps a NAME to a VALUE — the value is the secret
+        // itself. Codex's `env_key` is the other way round: it names the
+        // variable to read. Treating them alike would either copy a secret or
+        // write a name that means nothing.
+        let home = tempfile::tempdir().unwrap();
+        claude_settings(
+            home.path(),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_API_KEY":"sk-secret-value"}}"#,
+        );
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
             skill_dirs: None,
-            opencode_config_dir: home.join(".config/opencode"),
-            opencode_data_dir: home.join(".local/share/opencode"),
-        }
-    }
-
-    /// The registry's facts, loaded the way `scan()` loads them.
-    fn truth(home: &std::path::Path, project: &std::path::Path) -> SkillTruth {
-        super::super::SkillTruth::load(&ctx(home, project))
-    }
-
-    /// A skill in OpenCode's own tree: same format as ours, so it can be
-    /// copied.
-    #[test]
-    fn an_opencode_skill_is_actionable_because_we_do_not_read_that_tree() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let skill = home.path().join(".config/opencode/skills/huawei-apig/SKILL.md");
-        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
-        std::fs::write(&skill, "---\nname: huawei-apig\ndescription: x\n---\n\nbody\n").unwrap();
-
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
-        let row = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Skills)
-            .expect("the skill is reported");
-        assert_eq!(row.status, AssetStatus::Actionable);
-    }
-
-    /// A shared `.agents/skills` skill is ALREADY ours — we read that tree
-    /// (`registry.rs:585`). The report must say so, not claim it is movable.
-    #[test]
-    fn a_shared_agents_skill_is_active_because_we_read_that_tree() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let skill = home.path().join(".agents/skills/huawei-vpc/SKILL.md");
-        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
-        std::fs::write(&skill, "---\nname: huawei-vpc\ndescription: x\n---\n\nbody\n").unwrap();
-
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
-        let row = assets
-            .iter()
-            .find(|a| a.kind == AssetKind::Skills && a.name == "huawei-vpc")
-            .expect("the skill is reported");
-        assert_eq!(row.status, AssetStatus::Active);
-    }
-
-    /// The provider's credential is a LITERAL — like Claude's, unlike Codex's.
-    #[test]
-    fn an_opencode_provider_key_is_a_literal_not_a_reference() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let config = home.path().join(".config/opencode/opencode.json");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config,
-            r#"{"provider":{"atomgit":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://127.0.0.1:8001/v1","apiKey":"sk-literal"}}}}"#,
-        )
-        .unwrap();
-
-        let drafts = OpenCodeSource.provider_drafts(&ctx(home.path(), project.path()));
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+        let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
         assert_eq!(drafts.len(), 1);
+        let draft = &drafts[0];
+        assert_eq!(draft.base_url.as_deref(), Some("https://example.invalid"));
         assert_eq!(
-            drafts[0].api_key,
-            Some(ApiKeyRef::Plaintext("sk-literal".into())),
-            "a literal, so it needs the person's confirmation"
+            draft.api_key,
+            Some(ApiKeyRef::Plaintext("sk-secret-value".into())),
+            "the value in Claude's env block IS the secret, so it is marked as one"
         );
     }
 
-    /// The MCP `command` is an ARRAY — split into command + args.
     #[test]
-    fn an_opencode_mcp_command_array_is_split_into_command_and_args() {
+    fn a_codex_env_key_becomes_an_env_named_key() {
         let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let config = home.path().join(".config/opencode/opencode.jsonc");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let dir = home.path().join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            &config,
-            "{\n  // a comment, because this file is jsonc\n  \"mcp\":{\"x\":{\"type\":\"local\",\"command\":[\"node\",\"/tmp/s.mjs\"],\"enabled\":true}}\n}",
+            dir.join("config.toml"),
+            "[model_providers.gateway]\nbase_url = \"https://gw.invalid/v1\"\nenv_key = \"GW_TOKEN\"\n",
         )
         .unwrap();
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+        let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].api_key,
+            Some(ApiKeyRef::EnvVar("GW_TOKEN".into()))
+        );
+        assert_eq!(drafts[0].base_url.as_deref(), Some("https://gw.invalid/v1"));
+    }
 
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
-        let row = assets
+    #[test]
+    fn a_plaintext_key_is_marked_plaintext() {
+        let home = tempfile::tempdir().unwrap();
+        claude_settings(
+            home.path(),
+            r#"{"env":{"ANTHROPIC_API_KEY":"sk-secret-value"}}"#,
+        );
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+        let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
+        assert_eq!(
+            drafts[0].api_key,
+            Some(ApiKeyRef::Plaintext("sk-secret-value".into())),
+            "a literal secret is marked as one, so the host can ask before writing it"
+        );
+    }
+
+    #[test]
+    fn a_provider_in_the_user_settings_is_reported_as_a_row_named_by_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_API_KEY":"sk-x"}}"#,
+        )
+        .unwrap();
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: project.path().to_path_buf(),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+
+        // The row comes from the draft, so the row's NAME is the account id —
+        // that is what the re-check matches on.
+        let report = super::super::scan(&[Box::new(super::super::claude::ClaudeSource)], &ctx);
+        let row = report.sources[0]
+            .assets
             .iter()
-            .find(|a| a.kind == AssetKind::McpServers)
-            .expect("the server is reported");
+            .find(|a| a.kind == AssetKind::ProviderConfig)
+            .expect("the provider is reported");
+        assert_eq!(row.name, "claude", "the row is named by the account id");
         assert_eq!(row.status, AssetStatus::Actionable);
     }
 
-    /// `auth.json` holds PLAINTEXT keys. We report that they are there and
-    /// never offer to move them.
     #[test]
-    fn the_auth_file_is_reported_but_never_offered_for_import() {
+    fn no_provider_configuration_means_no_drafts() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: std::path::PathBuf::from("/work"),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+        let drafts = super::super::claude::ClaudeSource.provider_drafts(&ctx);
+        assert!(drafts.is_empty());
+    }
+
+    /// A project config that overrides ONE field under a provider id the user
+    /// config also declares.
+    ///
+    /// Codex merges its layers recursively
+    /// (`codex-rs/config/src/merge.rs:59`), so the inherited `env_key` and
+    /// `wire_api` survive. Replacing the whole table would drop the
+    /// credential — the one thing the person most needs to keep.
+    #[test]
+    fn a_project_override_keeps_the_inherited_fields() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let auth = home.path().join(".local/share/opencode/auth.json");
-        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
-        std::fs::write(&auth, r#"{"deepseek":{"type":"api","key":"sk-x"}}"#).unwrap();
+        let user_config = home.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_config,
+            "[model_providers.gateway]\nbase_url = \"https://user.invalid/v1\"\n\
+             env_key = \"GW_TOKEN\"\nwire_api = \"responses\"\n",
+        )
+        .unwrap();
+        let project_config = project.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_config,
+            "[model_providers.gateway]\nbase_url = \"https://project.invalid/v1\"\n",
+        )
+        .unwrap();
 
-        let assets = OpenCodeSource.detect(&ctx(home.path(), project.path()), &truth(home.path(), project.path()));
-        let row = assets
+        // Asserted through the PUBLIC surface: `merge_codex_configs` and the
+        // merged struct are private to `codex.rs`, and a sibling module's
+        // test cannot reach them.
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: project.path().to_path_buf(),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+        let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
+        let draft = drafts
             .iter()
-            .find(|a| a.kind == AssetKind::ProviderConfig)
-            .expect("the credentials are reported");
-        assert_eq!(row.status, AssetStatus::Blocked);
+            .find(|d| d.id == "gateway")
+            .expect("the provider is merged into one draft");
+        assert_eq!(
+            draft.base_url.as_deref(),
+            Some("https://project.invalid/v1"),
+            "the project's value wins"
+        );
+        assert_eq!(
+            draft.api_key,
+            Some(ApiKeyRef::EnvVar("GW_TOKEN".into())),
+            "the inherited credential is NOT dropped"
+        );
+        assert_eq!(
+            draft.protocol, "openai-responses",
+            "the inherited protocol is NOT dropped"
+        );
+    }
+
+    #[test]
+    fn a_missing_wire_api_means_responses_not_chat_completions() {
+        // Codex's `WireApi` has `#[default] Responses`
+        // (`codex-rs/model-provider-info/src/lib.rs:117`).
+        assert_eq!(
+            super::protocol_for_wire(None, "openai-responses"),
+            "openai-responses",
+            "a config with no wire_api speaks Responses"
+        );
+        assert_eq!(
+            super::protocol_for_wire(Some("responses"), "openai-responses"),
+            "openai-responses"
+        );
+        assert_eq!(
+            super::protocol_for_wire(Some("chat"), "openai-responses"),
+            "openai-compatible"
+        );
+        // The SOURCE says its own default — the shared function does not know
+        // which source it is.
+        assert_eq!(
+            super::protocol_for_wire(None, "anthropic-compatible"),
+            "anthropic-compatible"
+        );
+    }
+
+    #[test]
+    fn the_model_goes_to_the_provider_that_was_selected() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let config = home.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "model = \"gpt-x\"\nmodel_provider = \"second\"\n\
+             [model_providers.first]\nbase_url = \"https://a.invalid/v1\"\n\
+             [model_providers.second]\nbase_url = \"https://b.invalid/v1\"\n",
+        )
+        .unwrap();
+        let ctx = ScanContext {
+            os_home: home.path().to_path_buf(),
+            project: project.path().to_path_buf(),
+            product: crate::ProductDirs::new(home.path().join(".ours"), ".ours"),
+            skill_dirs: None,
+            opencode_config_dir: PathBuf::new(),
+            opencode_data_dir: PathBuf::new(),
+        };
+        let drafts = super::super::codex::CodexSource.provider_drafts(&ctx);
+        let first = drafts
+            .iter()
+            .find(|d| d.id == "first")
+            .expect("first exists");
+        let second = drafts
+            .iter()
+            .find(|d| d.id == "second")
+            .expect("second exists");
+        assert!(
+            first.models.is_empty(),
+            "the model does NOT go to the first account: {:?}",
+            first.models
+        );
+        assert_eq!(
+            second.models,
+            vec!["gpt-x".to_string()],
+            "the model goes to the provider that was selected"
+        );
     }
 }
 ```
@@ -7613,91 +7861,6 @@ struct MergedCodexConfig {
     model_provider: Option<String>,
     /// The model the person was using.
     model: Option<String>,
-}
-
-/// Merge the config files in order — later files win.
-///
-/// Each file comes with the scope it was read at, so a provider that came
-/// from the project's config is not reported as the person's own.
-///
-/// **Tables are merged key by key, not replaced.** Codex merges its config
-/// layers recursively (`codex-rs/config/src/merge.rs:59`, `merge_toml_values`
-/// walks into nested tables), so a project file that overrides only
-/// `base_url` under a provider id keeps the `env_key` and `wire_api` the user
-/// file set. Replacing the whole table would drop the credential — the very
-/// thing the person most needs to keep.
-fn merge_codex_configs(
-    files: &[(
-        std::path::PathBuf,
-        super::report::AssetScope,
-    )],
-) -> MergedCodexConfig {
-    // The type is spelled out: `and_modify` below needs to know what the
-    // value is.
-    let mut providers: std::collections::BTreeMap<
-        String,
-        (toml::Value, std::path::PathBuf, super::report::AssetScope),
-    > = std::collections::BTreeMap::new();
-    let mut model_provider = None;
-    let mut model = None;
-    for (path, scope) in files {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(value) = raw.parse::<toml::Value>() else {
-            continue;
-        };
-        if let Some(table) = value.get("model_providers").and_then(|p| p.as_table()) {
-            for (name, provider) in table {
-                providers
-                    .entry(name.clone())
-                    .and_modify(|existing| {
-                        merge_table(&mut existing.0, provider);
-                        // The overlay file is now the one that decides this
-                        // provider's values — so it is also the file the report
-                        // should point at.
-                        existing.1 = path.clone();
-                        existing.2 = *scope;
-                    })
-                    .or_insert_with(|| (provider.clone(), path.clone(), *scope));
-            }
-        }
-        if let Some(selected) = value.get("model_provider").and_then(|v| v.as_str()) {
-            model_provider = Some(selected.to_string());
-        }
-        if let Some(name) = value.get("model").and_then(|v| v.as_str()) {
-            model = Some(name.to_string());
-        }
-    }
-    MergedCodexConfig {
-        providers,
-        model_provider,
-        model,
-    }
-}
-
-/// Merge `overlay` into `base`, key by key, the way Codex merges its layers.
-///
-/// A scalar in the overlay replaces the base's; a table in the overlay is
-/// merged into the base's table rather than replacing it.
-fn merge_table(base: &mut toml::Value, overlay: &toml::Value) {
-    // Reborrow, so `base` is still usable in the `else` arm below — matching
-    // on `(base, overlay)` would MOVE the reference and leave it unusable.
-    let (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) =
-        (&mut *base, overlay)
-    else {
-        // Not a table: the overlay wins outright.
-        *base = overlay.clone();
-        return;
-    };
-    for (key, value) in overlay_table {
-        match base_table.get_mut(key) {
-            Some(existing) => merge_table(existing, value),
-            None => {
-                base_table.insert(key.clone(), value.clone());
-            }
-        }
-    }
 }
 ```
 
