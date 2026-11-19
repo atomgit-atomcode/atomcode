@@ -1657,6 +1657,18 @@ pub struct RateLimitPause {
     pub server_message: Option<String>,
 }
 
+/// True iff `text` already carries the compact-stub envelope for `tool_name`
+/// (`[<tool> ok: ` or `[<tool> FAILED: `). Compaction strategies use this to
+/// skip already-stubbed results, so a second pass stays a no-op: re-stubbing
+/// would nest envelopes and re-bust the prefix cache the first stub paid for.
+pub fn text_is_compact_stub(tool_name: &str, text: &str) -> bool {
+    let prefix = format!("[{tool_name} ");
+    text.starts_with(&prefix)
+        && text
+            .get(prefix.len()..)
+            .is_some_and(|rest| rest.starts_with("ok: ") || rest.starts_with("FAILED: "))
+}
+
 /// The head/tail preview budgets for oversized stubbed tool results: the head
 /// carries what ran, the tail carries how it ended (exit codes, error
 /// diagnostics), and the omission marker accounts for the cut middle — the
@@ -1683,27 +1695,23 @@ const STUB_PREVIEW_OVERHEAD: usize = 64;
 /// re-busts the prefix cache the first stub paid for.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let status = if success { "ok" } else { "FAILED" };
-    // Idempotency guard: either status counts — a message's success flag can't
-    // change between passes, only its text shape does.
-    let prefix = format!("[{tool_name} ");
-    if output.starts_with(&prefix)
-        && output
-            .get(prefix.len()..)
-            .is_some_and(|rest| rest.starts_with("ok: ") || rest.starts_with("FAILED: "))
-    {
+    if text_is_compact_stub(tool_name, output) {
         return output.to_string();
     }
     let line_count = output.lines().count();
-    // The preview split only pays off past the budget plus its marker
-    // overhead. The byte length is a cheap pre-filter (it never under-counts
-    // chars); the exact char split happens only when previewing.
-    let chars: Vec<char> =
-        if output.len() > STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL + STUB_PREVIEW_OVERHEAD {
-            output.chars().collect()
-        } else {
-            Vec::new()
-        };
-    if chars.len() <= STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL {
+    // Chars are the single unit of decision: the preview fires only when the
+    // original has more chars than the preview could ever occupy (head + tail
+    // + the marker overhead), so a stub never grows past the text it
+    // replaces. The byte length is only a cheap pre-filter for the char count
+    // (it never under-counts chars), and the oversized branch slices on char
+    // boundaries instead of materializing the whole output.
+    let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL + STUB_PREVIEW_OVERHEAD;
+    let char_count = if output.len() > budget {
+        output.chars().count()
+    } else {
+        0
+    };
+    if char_count <= budget {
         let first_line: String = {
             let mut iter = output.lines();
             let l1 = iter.next().unwrap_or("(empty)");
@@ -1716,8 +1724,20 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
         };
         return format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]");
     }
-    let head: String = chars[..STUB_PREVIEW_HEAD].iter().collect();
-    let tail: String = chars[chars.len() - STUB_PREVIEW_TAIL..].iter().collect();
-    let omitted = chars.len() - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
-    format!("[{tool_name} {status}: {line_count} lines, head: {head} … [omitted {omitted} chars] … {tail}]")
+    let head_end = output
+        .char_indices()
+        .nth(STUB_PREVIEW_HEAD)
+        .map(|(i, _)| i)
+        .unwrap_or(output.len());
+    let tail_start = output
+        .char_indices()
+        .nth(char_count - STUB_PREVIEW_TAIL)
+        .map(|(i, _)| i)
+        .unwrap_or(output.len());
+    let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
+    format!(
+        "[{tool_name} {status}: {line_count} lines, head: {} … [omitted {omitted} chars] … {}]",
+        &output[..head_end],
+        &output[tail_start..]
+    )
 }

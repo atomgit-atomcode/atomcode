@@ -129,6 +129,9 @@ impl CompactionStrategy for StubCompaction {
             if self.exempt_read_file && tool == "read_file" {
                 continue;
             }
+            if text_is_compact_stub(tool, &m.text) {
+                continue; // already stubbed: a second pass stays a no-op
+            }
             // Tool RESULT success = NOT is_error.
             rewrites.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
         }
@@ -311,6 +314,9 @@ impl OverflowCompaction {
                 .unwrap_or("tool");
             if tool == "read_file" && i >= read_exempt_from {
                 continue; // recent read → keep full (working context)
+            }
+            if text_is_compact_stub(tool, &m.text) {
+                continue; // already stubbed: a second pass stays a no-op
             }
             out.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
         }
@@ -1745,12 +1751,12 @@ fn call_id_to_tool(msgs: &[Message]) -> HashMap<String, String> {
     map
 }
 
-/// The one-line stub a stubbed tool result is replaced with. Byte-for-byte port of core's
 /// The stub a compacted tool result becomes — the first-line shape for
 /// results within the preview budget, the head+tail preview for oversized
 /// ones. Part of the session projection, so the kernel's (`docs/adr/0024`
 /// §6); re-exported here where compaction has always called it.
 pub use atomcode_kernel::session::build_compact_stub;
+pub use atomcode_kernel::session::text_is_compact_stub;
 
 #[cfg(test)]
 mod tests {
@@ -2151,6 +2157,25 @@ mod tests {
         assert!(
             !rw.iter().any(|(i, _)| *i == 6),
             "recent read (at/above boundary) must be exempt: {rw:?}"
+        );
+    }
+
+    #[test]
+    fn second_pass_over_already_stubbed_results_is_a_noop() {
+        // An already-stubbed oversized result must not be re-listed as a
+        // rewrite: the plan stays a no-op and the prefix cache keeps its
+        // single-bust guarantee.
+        let stub = build_compact_stub("bash", &big("bash out"), true);
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("u1"),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &stub, false),
+        ];
+        let rw = OverflowCompaction::aggressive_stub_rewrites(&msgs, 0, msgs.len(), 0);
+        assert!(
+            rw.is_empty(),
+            "an already-stubbed result must not be re-stubbed: {rw:?}"
         );
     }
 
