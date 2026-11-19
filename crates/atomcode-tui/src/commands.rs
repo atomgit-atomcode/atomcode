@@ -4037,11 +4037,18 @@ impl CommandSet for ImportCommands {
     fn commands(&self) -> Vec<Command> {
         import_catalogue()
     }
-    async fn run(&self, _name: &str, _args: &str, ctx: &Context) -> Outcome {
+    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
         let Some(port) = ctx.service::<crate::plugin::MigrationSvc>() else {
             return Outcome::Refused(t(Msg::NoMigrationPort).into_owned());
         };
-        let report = match port.report().await {
+        let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+            return Outcome::Refused(t(Msg::NoHost).into_owned());
+        };
+        let project = match working_dir(client.control(), client.root()).await {
+            Ok(project) => project,
+            Err(reason) => return Outcome::Refused(reason),
+        };
+        let report = match port.report(std::path::Path::new(&project)).await {
             Ok(report) => report,
             Err(error) => return Outcome::Refused(error),
         };
@@ -4057,6 +4064,15 @@ impl CommandSet for ImportCommands {
             .iter()
             .filter(|source| !source.assets.is_empty())
             .collect();
+        let requested = args.trim();
+        if !requested.is_empty() {
+            return match found.iter().find(|source| source.source_id == requested) {
+                Some(source) => Outcome::Do(crate::keymap::Action::OpenSheet(
+                    crate::sheet::Sheet::list(import_list(source)),
+                )),
+                None => Outcome::Refused(t(Msg::MigrationSourceUnavailable).into_owned()),
+            };
+        }
         if found.is_empty() {
             // The **product** table: the CLI says the same sentence, and one
             // thing must not be said two ways.
@@ -4108,7 +4124,7 @@ fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::
     for asset in &source.assets {
         let status = crate::migration::status_word(asset.status);
         rows.push(
-            crate::sheet::Row::new(format!("/import {}", asset.name), asset.name.clone())
+            crate::sheet::Row::new("", asset.name.clone())
                 .about(format!("[{status}] {}", asset.detail))
                 // The preview is what the row's own sentence says, in full —
                 // the `about` is the short form.
@@ -4128,6 +4144,76 @@ fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn import_source_selection_uses_the_current_project() {
+        use crate::migration::{
+            AssetStatusView, Migration, MigrationAssetView, MigrationReportView,
+            MigrationSourceView,
+        };
+        #[derive(Default)]
+        struct Port(std::sync::Mutex<Vec<std::path::PathBuf>>);
+        #[async_trait]
+        impl Migration for Port {
+            async fn report(
+                &self,
+                project: &std::path::Path,
+            ) -> Result<MigrationReportView, String> {
+                self.0.lock().unwrap().push(project.to_owned());
+                Ok(MigrationReportView {
+                    sources: ["codex", "opencode"]
+                        .into_iter()
+                        .map(|id| MigrationSourceView {
+                            source_id: id.into(),
+                            display_name: id.into(),
+                            assets: vec![MigrationAssetView {
+                                name: format!("{id}-asset"),
+                                status: AssetStatusView::Actionable,
+                                detail: "details".into(),
+                            }],
+                        })
+                        .collect(),
+                })
+            }
+        }
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .extend(["/first", "/after-cd"].map(|dir| {
+                Ok(HostReply::Context {
+                    window: 0,
+                    used: 0,
+                    model: String::new(),
+                    working_dir: dir.into(),
+                    persona: None,
+                    system_prompt: None,
+                })
+            }));
+        let (app, _, commands) = following(&host);
+        let port = Arc::new(Port::default());
+        let _ = app
+            .context()
+            .provide::<crate::plugin::MigrationSvc>(port.clone());
+        let _ = commands.add(Arc::new(ImportCommands));
+
+        let picker = sheet_of(commands.dispatch("/import", &app.context()).await);
+        let crate::sheet::Page::List(list) = picker.page else {
+            panic!("expected source picker");
+        };
+        assert_eq!(list.rows.len(), 2);
+
+        let report = sheet_of(commands.dispatch(&list.rows[1].value, &app.context()).await);
+        let crate::sheet::Page::List(list) = report.page else {
+            panic!("expected asset list");
+        };
+        assert_eq!(list.id, "import");
+        assert_eq!(list.rows[0].label, "opencode-asset");
+        assert_eq!(
+            *port.0.lock().unwrap(),
+            ["/first", "/after-cd"].map(std::path::PathBuf::from)
+        );
+    }
+
     #[test]
     fn the_import_list_carries_each_asset_of_the_source() {
         let source = crate::migration::MigrationSourceView {

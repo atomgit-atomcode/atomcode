@@ -4,7 +4,8 @@
 //! the only path that writes.
 
 use atomcode_capabilities::migration::{
-    self, ApiKeyRef, AssetKind, AssetStatus, MigrationReport, ProviderAccountDraft, ScanContext,
+    ApiKeyRef, AssetKind, AssetScope, AssetStatus, MigrationReport, ProviderAccountDraft,
+    ScanContext,
 };
 use atomcode_config::provider_book::{AccountInput, BookError, ModelInput, ProviderBook};
 use std::path::{Path, PathBuf};
@@ -79,9 +80,6 @@ pub fn mark_already_imported(
 ) {
     use atomcode_config::provider_book::ProviderBook;
     let config = ProviderBook::new(config_path.to_path_buf()).load();
-    if config.provider_accounts.is_empty() {
-        return;
-    }
     let accounts = &config.provider_accounts;
     let models = &config.models;
     for source in &mut report.sources {
@@ -119,6 +117,11 @@ pub fn mark_already_imported(
             else {
                 continue;
             };
+            if let Some(reason) = unwriteable_credential(draft) {
+                asset.status = AssetStatus::Blocked;
+                asset.detail = reason;
+                continue;
+            }
             let Some(account) = accounts.get(&draft.id) else {
                 continue;
             };
@@ -191,8 +194,19 @@ fn same_account(
     // literal is the same kind as another literal — but the value itself is
     // never read, because the file's key may legitimately have been rotated
     // since, and reading it would put a secret in memory for no reason.
-    let same_credential = same_credential_kind(account.api_key.as_deref(), &draft.api_key);
-    same_endpoint && same_protocol && same_models && same_credential
+    let has_authorization = account
+        .headers
+        .iter()
+        .any(|(name, _)| name == "authorization");
+    let same_credential = match &draft.api_key {
+        Some(ApiKeyRef::Bearer(_)) => has_authorization && account.api_key.is_none(),
+        key => !has_authorization && same_credential_kind(account.api_key.as_deref(), key),
+    };
+    same_endpoint
+        && same_protocol
+        && same_models
+        && same_credential
+        && account.disable_api_key_fallback
 }
 
 /// Whether our stored credential is the same KIND as the draft's.
@@ -204,8 +218,9 @@ fn same_credential_kind(stored: Option<&str>, draft: &Option<ApiKeyRef>) -> bool
     let stored_is_reference = stored.is_some_and(|key| key.starts_with("${"));
     match draft {
         None => stored.is_none(),
-        Some(ApiKeyRef::EnvVar(_)) => stored_is_reference,
+        Some(ApiKeyRef::EnvVar(name)) => stored == Some(&format!("${{{name}}}")),
         Some(ApiKeyRef::Plaintext(_)) => stored.is_some() && !stored_is_reference,
+        Some(ApiKeyRef::Bearer(_)) => false,
     }
 }
 
@@ -217,17 +232,31 @@ pub fn scan_context(
     os_home: &Path,
     project: &Path,
     product: atomcode_capabilities::ProductDirs,
-    skill_dirs: Option<Vec<std::path::PathBuf>>,
-    opencode_config_dir: std::path::PathBuf,
-    opencode_data_dir: std::path::PathBuf,
+    config_path: &Path,
 ) -> ScanContext {
+    let config = atomcode_config::config::Config::load(config_path).unwrap_or_default();
+    let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
+        &config.skills.extra_dirs,
+        project,
+        &product,
+        Some(os_home),
+        None,
+    )
+    .0;
+    let opencode_dir = |var, default| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| os_home.join(default))
+            .join("opencode")
+    };
     ScanContext {
         os_home: os_home.to_path_buf(),
         project: project.to_path_buf(),
         product,
-        skill_dirs,
-        opencode_config_dir,
-        opencode_data_dir,
+        skill_dirs: Some(skill_dirs),
+        opencode_config_dir: opencode_dir("XDG_CONFIG_HOME", ".config"),
+        opencode_data_dir: opencode_dir("XDG_DATA_HOME", ".local/share"),
     }
 }
 
@@ -341,6 +370,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_overrides_require_an_interactive_yes_even_with_an_env_reference() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_for(home.path());
+        ctx.project = project.path().to_owned();
+        let user_config = home.path().join(".codex/config.toml");
+        let project_config = project.path().join(".codex/config.toml");
+        for path in [&user_config, &project_config] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            user_config,
+            "[model_providers.gateway]\nbase_url = \"https://user.invalid/v1\"\nenv_key = \"USER_KEY\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_config,
+            "[model_providers.gateway]\nbase_url = \"https://project.invalid/v1\"\n",
+        )
+        .unwrap();
+        ctx.opencode_config_dir = home.path().join("opencode");
+        let destination = home.path().join("destination.toml");
+        let (_, skipped) = apply_provider_accounts(
+            &atomcode_capabilities::migration::builtin_sources(),
+            &ctx,
+            true,
+            &destination,
+            false,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn unreadable_sources_count_as_failures_even_when_another_account_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_for(home.path());
+        ctx.project = home.path().join("project");
+        ctx.opencode_config_dir = home.path().join("opencode");
+        let broken = home.path().join(".codex/config.toml");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, "[model_providers.not-valid").unwrap();
+        std::fs::create_dir_all(&ctx.opencode_config_dir).unwrap();
+        std::fs::write(
+            ctx.opencode_config_dir.join("opencode.json"),
+            r#"{"provider":{"example":{"options":{"baseURL":"https://example.invalid/v1"},"models":{"demo":{}}}}}"#,
+        )
+        .unwrap();
+
+        let destination = home.path().join("destination.toml");
+        let (message, skipped) = apply_provider_accounts(
+            &atomcode_capabilities::migration::builtin_sources(),
+            &ctx,
+            true,
+            &destination,
+            false,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+        assert!(message.contains(&broken.display().to_string()));
+        let config = ProviderBook::new(destination).load();
+        assert_eq!(config.logical_models()["example/demo"].model, "demo");
+    }
+
+    #[test]
+    fn a_claude_bearer_token_stays_in_its_authorization_header() {
+        let home = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_for(home.path());
+        ctx.opencode_config_dir = home.path().join("opencode");
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.invalid","ANTHROPIC_AUTH_TOKEN":"fixture-token"}}"#,
+        )
+        .unwrap();
+        let sources = atomcode_capabilities::migration::builtin_sources();
+        let (_, drafts) =
+            atomcode_capabilities::migration::scan_with_provider_drafts(&sources, &ctx);
+        let draft = drafts.iter().find(|draft| draft.id == "claude").unwrap();
+        let destination = home.path().join("destination.toml");
+
+        assert!(write_account(&destination, draft, false).is_err());
+        assert!(!destination.exists());
+        write_account(&destination, draft, true).unwrap();
+
+        let config = ProviderBook::new(destination).load();
+        let endpoint = config.account_endpoint("claude").unwrap();
+        assert!(endpoint.api_key.is_none());
+        assert_eq!(
+            endpoint.headers.iter().collect::<Vec<_>>(),
+            [("authorization", "Bearer fixture-token")]
+        );
+    }
+
     /// A source that hands back fixed drafts, so the `--apply` flow can be
     /// driven without a real `~/.claude`.
     struct FixedDrafts(Vec<atomcode_capabilities::migration::ProviderAccountDraft>);
@@ -359,11 +485,14 @@ mod tests {
         ) -> Vec<atomcode_capabilities::migration::AssetReport> {
             Vec::new()
         }
-        fn provider_drafts(
+        fn scan_providers(
             &self,
             _ctx: &atomcode_capabilities::migration::ScanContext,
-        ) -> Vec<atomcode_capabilities::migration::ProviderAccountDraft> {
-            self.0.clone()
+        ) -> atomcode_capabilities::migration::ProviderScan {
+            atomcode_capabilities::migration::ProviderScan {
+                drafts: self.0.clone(),
+                ..Default::default()
+            }
         }
     }
 
@@ -577,7 +706,7 @@ mod tests {
         std::fs::write(
             &config,
             "[provider_accounts.gateway]\nprovider = \"openai-compatible\"\n\
-             base_url = \"https://gw.invalid/v1\"\n",
+             base_url = \"https://gw.invalid/v1\"\ndisable_api_key_fallback = true\n",
         )
         .unwrap();
 
@@ -659,130 +788,44 @@ mod tests {
     }
 }
 
-/// Why this credential cannot be written, if it cannot.
-///
-/// The rules are the writer's, and they are **stated here once** so the report
-/// and the writer cannot disagree:
-///
-/// - a literal containing `$` would be **expanded** by `resolved_api_key`
-///   (`config/provider.rs:360`), so the file would mean something else;
-/// - a literal whose **trimmed** value names a live environment variable
-///   would resolve to that variable instead (`provider.rs:365`), so the file
-///   would mean something else.
-///
-/// The trimmed value is what matters, because that is what the writer stores
-/// (`written_key`, `provider_book.rs:753`).
-///
-/// The **value is never printed** — the reason names the account, not the key.
 fn unwriteable_credential(draft: &ProviderAccountDraft) -> Option<String> {
-    let Some(ApiKeyRef::Plaintext(secret)) = &draft.api_key else {
-        // A reference is always writable: the file holds a NAME.
-        return None;
-    };
-    let stored = secret.trim();
-    if stored.contains('$') {
-        return Some(
-            atomcode_i18n::product::t(atomcode_i18n::product::Msg::MigrationCredentialHasDollar)
-                .into_owned(),
-        );
+    use atomcode_i18n::product::{t, Msg};
+    match &draft.api_key {
+        Some(ApiKeyRef::Plaintext(secret)) if secret.trim().contains('$') => {
+            Some(t(Msg::MigrationCredentialHasDollar).into_owned())
+        }
+        _ => None,
     }
-    if std::env::var(stored).is_ok() {
-        return Some(
-            atomcode_i18n::product::t(atomcode_i18n::product::Msg::MigrationCredentialAmbiguous)
-                .into_owned(),
-        );
-    }
-    None
 }
 
-/// Write one provider account.
-///
-/// A literal secret needs `confirmed`; without it nothing is written at all —
-/// not the account, not the models, not a partial file.
-///
-/// **How the credential is written.**
-///
-/// `resolved_api_key` (`config/provider.rs:356`) has three cases:
-/// a value containing `$` is expanded as an environment reference; a value
-/// whose NAME matches a live environment variable resolves to that variable;
-/// anything else is the key itself. So the same string can mean two things,
-/// and the written form has to pick one:
-///
-/// - A **reference** is written `${NAME}`. Expansion is unambiguous: an unset
-///   variable expands to nothing, so the account ends up with NO key rather
-///   than with the key "NAME". The bare name would instead fall through to
-///   the literal case and be used as the key.
-/// - A **literal** is written as itself, but only when it cannot be read as
-///   something else: no `$` in it (the config would expand it), and no live
-///   environment variable of the same name (that would win over the
-///   literal). A literal that fails either test is refused rather than
-///   written, because the file would then mean two things at once.
+/// Write the account and all its model profiles in one configuration transaction.
 pub fn write_account(
     config_path: &Path,
     draft: &ProviderAccountDraft,
     confirmed: bool,
 ) -> Result<String, String> {
-    // An owned string, because the reference form has to be BUILT rather than
-    // borrowed from the draft.
-    let key: Option<String> = match &draft.api_key {
+    if let Some(reason) = &draft.blocked {
+        return Err(format!("{}: {reason}", draft.id));
+    }
+    if let Some(reason) = unwriteable_credential(draft) {
+        return Err(format!("{}: {reason}", draft.id));
+    }
+    if requires_confirmation(draft) && !confirmed {
+        return Err("confirm this account before writing it".into());
+    }
+    let mut headers = None;
+    let key = match &draft.api_key {
         None => None,
-        // `${NAME}` is the only unambiguous way to write a reference:
-        // `resolved_api_key` (`config/provider.rs:360`) expands a value
-        // containing `$`, and an unset variable expands to nothing — so the
-        // string "NAME" is never used AS the key. Writing the bare name
-        // would instead fall through to the literal branch
-        // (`provider.rs:370`) and use the string "NAME" as the key.
-        //
-        // It does NOT mean "no key": if the expansion comes out empty,
-        // `resolved_api_key` keeps looking and finds a platform credential
-        // (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `ATOMCODE_API_KEY`,
-        // `provider.rs:375-396`). So the migrated endpoint can end up
-        // authenticated with a credential that is not the one this account
-        // was configured for. `${NAME}` is still the right form — it is the
-        // only one that does not put the NAME in as a key — but the report
-        // must not promise "no key" when the variable is unset.
         Some(ApiKeyRef::EnvVar(name)) => Some(format!("${{{name}}}")),
-        Some(ApiKeyRef::Plaintext(secret)) => {
-            if !confirmed {
-                return Err("this account has a plaintext key — confirm it to write it".into());
-            }
-            // A literal that could be read as something else is refused
-            // rather than written, because the file would then mean two
-            // things: `resolved_api_key` expands any `$` in it, and a live
-            // environment variable of the same name wins over the literal.
-            if secret.trim().contains('$') {
-                return Err(format!(
-                    "{}: this key contains `$`, which the config would expand — set it by hand \
-                     instead",
-                    draft.id
-                ));
-            }
-            // The error names the ACCOUNT, never the secret: the message is
-            // printed to the terminal and into the report, and a secret in
-            // it is a secret in the scrollback.
-            //
-            // The check is "is the variable SET", not "is it set and
-            // non-empty": `resolved_api_key` looks the name up, and a lookup
-            // that succeeds with an empty value falls THROUGH to the
-            // platform fallbacks (`provider.rs:375`) instead of treating the
-            // configured string as the literal it is. So an empty variable of
-            // the same name still makes the value ambiguous.
-            //
-            // The check uses the **trimmed** value, because that is what gets
-            // stored: `written_key` trims it (`provider_book.rs:753`). A value
-            // of `" GW_TOKEN "` would be stored as `GW_TOKEN` — so checking
-            // the padded string would miss that `GW_TOKEN` is a live
-            // variable, and the file would end up holding a reference where a
-            // literal was meant.
-            let stored = secret.trim();
-            if std::env::var(stored).is_ok() {
-                return Err(format!(
-                    "{}: an environment variable of the same name is set, so this key cannot be \
-                     written unambiguously — rename the variable or set the key by hand",
-                    draft.id
-                ));
-            }
-            Some(stored.to_string())
+        Some(ApiKeyRef::Plaintext(secret)) => Some(secret.trim().to_owned()),
+        Some(ApiKeyRef::Bearer(token)) => {
+            let authorization = format!("Bearer {}", token.trim());
+            let changes = atomcode_config::provider_headers::HeaderChanges(
+                [("authorization".into(), Some(authorization))].into(),
+            );
+            changes.validate().map_err(str::to_owned)?;
+            headers = Some(changes);
+            None
         }
     };
     let base_url = draft.base_url.as_deref().unwrap_or_default();
@@ -808,7 +851,7 @@ pub fn write_account(
         .collect();
     let book = ProviderBook::new(config_path.to_path_buf());
     let input = AccountInput {
-        headers: None,
+        headers: headers.as_ref(),
         name: &draft.id,
         protocol: &draft.protocol,
         display_name: None,
@@ -816,11 +859,6 @@ pub fn write_account(
         key: key.as_deref(),
         exact_id: true,
     };
-    // A draft that cannot be imported is refused **before** the write.
-    // The report already says so; the writer must not try anyway.
-    if let Some(reason) = &draft.blocked {
-        return Err(format!("{}: {reason}", draft.id));
-    }
     // An unsupported wire protocol is refused **before** the write.
     // `create_account` resolves an unknown preset to `openai-compatible`
     // (`config/provider_preset.rs:381`), so the import would otherwise
@@ -832,7 +870,7 @@ pub fn write_account(
             draft.id, draft.protocol
         ));
     }
-    match book.create_account(&input, &models) {
+    match book.create_imported_account(&input, &models) {
         Ok((id, _)) => Ok(id),
         Err(BookError::IdTaken(name)) => Err(format!(
             "{name}: an account with that id already exists — not overwritten"
@@ -843,20 +881,16 @@ pub fn write_account(
     }
 }
 
-/// Import the provider accounts an external agent has configured.
-///
-/// **What `yes` means.** It answers "yes, import these accounts" — it does
-/// **not** authorize writing a secret the person has not seen. An account
-/// whose credential is a literal is always asked about, one at a time, even
-/// with `--yes`: the question is about the secret, not about the import.
-///
-/// Without a terminal there is nobody to ask, so an account that needs an
-/// answer is **not written at all** — and if that is the only kind of
-/// account there is, nothing is written and the config file stays byte for
-/// byte as it was.
-///
-/// Returns the text to show and how many items were left out. A non-zero
-/// count means the caller must not report success.
+fn requires_confirmation(draft: &ProviderAccountDraft) -> bool {
+    draft.scope == AssetScope::Project
+        || draft
+            .api_key
+            .as_ref()
+            .and_then(ApiKeyRef::literal)
+            .is_some()
+}
+
+/// Import explicitly approved provider accounts and count the items left out.
 pub fn apply_provider_accounts(
     sources: &[Box<dyn atomcode_capabilities::migration::MigrationSource>],
     ctx: &ScanContext,
@@ -865,46 +899,19 @@ pub fn apply_provider_accounts(
     interactive: bool,
 ) -> Result<(String, usize), String> {
     use atomcode_i18n::product::{t, Msg};
-    let mut drafts: Vec<ProviderAccountDraft> = Vec::new();
-    // **A source that could not be read is reported, not swallowed.**
-    //
-    // "No provider accounts" and "I could not read your provider config" are
-    // different answers, and the second one must not exit successfully: a
-    // script would read the exit code as "nothing to import" and move on.
-    let mut unreadable: Vec<String> = Vec::new();
+    let mut drafts = Vec::new();
+    let mut unreadable = Vec::new();
     for source in sources {
-        drafts.extend(source.provider_drafts(ctx));
-        if let Some(reason) = source.provider_drafts_error(ctx) {
-            unreadable.push(format!("{}: {reason}", source.display_name()));
-        }
-    }
-    // **The credential is preflighted HERE, in the host** — before the
-    // re-check and before the write.
-    //
-    // Why the host and not the capability: the check is "is there an
-    // environment variable of this name right now", and that is a question
-    // about the PROCESS, not about the file. The capability is a read-only
-    // view of the disk; it must not ask the environment anything.
-    //
-    // Why before the re-check: a literal with a `$` in it, or one whose
-    // trimmed value names a live environment variable, is a credential the
-    // writer will REFUSE. If the re-check ran first, it could call such an
-    // account "already imported" — and the report would advertise an account
-    // that cannot be written.
-    for draft in &mut drafts {
-        if let Some(reason) = unwriteable_credential(draft) {
-            draft.blocked = Some(reason);
-        }
+        let scan = source.scan_providers(ctx);
+        drafts.extend(scan.drafts);
+        unreadable.extend(
+            scan.failures
+                .into_iter()
+                .map(|failure| format!("{} ({})", failure.path.display(), failure.detail)),
+        );
     }
     if drafts.is_empty() && unreadable.is_empty() {
         return Ok((t(Msg::MigrationImportNone).into_owned(), 0));
-    }
-    if drafts.is_empty() {
-        // Something could not be read, and there is nothing else to say.
-        return Err(t(Msg::MigrationProvidersUnreadable {
-            reasons: &unreadable.join("; "),
-        })
-        .into_owned());
     }
     // What is already in OUR configuration. The re-check and the apply share
     // this: an account that is already there is a **successful no-op**, not a
@@ -920,7 +927,11 @@ pub fn apply_provider_accounts(
         // existing-account check. Otherwise a hand-made account that happens
         // to match would be reported as "already there", and the real reason
         // (we cannot import this) would never be said.
-        if let Some(reason) = &draft.blocked {
+        if let Some(reason) = draft
+            .blocked
+            .clone()
+            .or_else(|| unwriteable_credential(draft))
+        {
             skipped.push(format!("{} ({reason})", draft.id));
             continue;
         }
@@ -937,24 +948,21 @@ pub fn apply_provider_accounts(
             ));
             continue;
         }
-        // A literal secret is always the person's own decision — `--yes` does
-        // not reach it. An account that only names a variable holds no secret,
-        // so `--yes` answers for it; without `--yes` it is asked too.
-        let holds_a_secret = matches!(draft.api_key, Some(ApiKeyRef::Plaintext(_)));
-        let confirmed = if holds_a_secret {
-            if !interactive {
-                skipped.push(draft.id.clone());
-                continue;
-            }
-            ask_to_confirm(draft, config_path)?
-        } else if yes {
+        let confirmed = if yes && !requires_confirmation(draft) {
             true
-        } else {
-            if !interactive {
-                skipped.push(draft.id.clone());
-                continue;
-            }
+        } else if interactive {
             ask_to_confirm(draft, config_path)?
+        } else {
+            if draft.scope == AssetScope::Project {
+                skipped.push(format!(
+                    "{} ({})",
+                    draft.id,
+                    t(Msg::MigrationProjectConfirmationRequired)
+                ));
+            } else {
+                skipped.push(draft.id.clone());
+            }
+            continue;
         };
         if !confirmed {
             skipped.push(draft.id.clone());
@@ -984,7 +992,13 @@ pub fn apply_provider_accounts(
         }));
         out.push('\n');
     }
-    Ok((out, skipped.len()))
+    if !unreadable.is_empty() {
+        out.push_str(&t(Msg::MigrationProvidersUnreadable {
+            reasons: &unreadable.join(", "),
+        }));
+        out.push('\n');
+    }
+    Ok((out, skipped.len() + unreadable.len()))
 }
 
 /// Ask about one account, showing what would be written.
@@ -995,32 +1009,38 @@ pub fn apply_provider_accounts(
 fn ask_to_confirm(draft: &ProviderAccountDraft, config_path: &Path) -> Result<bool, String> {
     use atomcode_i18n::product::{t, Msg};
     use std::io::Write;
+
+    // Configuration and path text may come from a project checkout.
+    let display = |value: &str| {
+        value
+            .chars()
+            .flat_map(char::escape_debug)
+            .collect::<String>()
+    };
+    let endpoint = atomcode_capabilities::migration::endpoint_in_use(
+        &draft.protocol,
+        draft.base_url.as_deref(),
+    );
+    let credential = match &draft.api_key {
+        Some(ApiKeyRef::Plaintext(_) | ApiKeyRef::Bearer(_)) => "plaintext".into(),
+        Some(ApiKeyRef::EnvVar(name)) => format!("env:{}", display(name)),
+        None => "none".into(),
+    };
     print!(
         "{}",
         t(Msg::MigrationImportConfirm {
-            id: &draft.id,
-            protocol: &draft.protocol,
-            // The endpoint IN USE — a protocol's own default is shown, not a
-            // dash, because that is the endpoint this account will talk to.
-            endpoint: &atomcode_capabilities::migration::endpoint_in_use(
-                &draft.protocol,
-                draft.base_url.as_deref(),
-            )
-            .unwrap_or_else(|| "-".into()),
-            models: &draft.models.join(", "),
-            // What will happen to the credential. For a literal it says the
-            // secret will be COPIED INTO the file, and names the file — the
-            // person is being asked to agree to that, not to "import the key
-            // found somewhere".
-            credential: &match &draft.api_key {
-                Some(ApiKeyRef::Plaintext(_)) => "plaintext".into(),
-                Some(ApiKeyRef::EnvVar(name)) => format!("env:{name}"),
-                None => "none".into(),
-            },
-            destination: &config_path.display().to_string(),
+            id: &display(&draft.id),
+            protocol: &display(&draft.protocol),
+            endpoint: &display(endpoint.as_deref().unwrap_or("-")),
+            models: &display(&draft.models.join(", ")),
+            credential: &credential,
+            destination: &display(&config_path.display().to_string()),
+            source: &display(&draft.source_path.display().to_string()),
         })
     );
-    std::io::stdout().flush().ok();
+    std::io::stdout()
+        .flush()
+        .map_err(|error| error.to_string())?;
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)

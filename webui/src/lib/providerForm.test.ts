@@ -12,6 +12,7 @@ import {
   modelsBlocker,
   modelBody,
   adoptPicked,
+  updateModelDraft,
   emptyModelDraft,
   reasoningFrom,
   toggleLevel,
@@ -215,6 +216,51 @@ test('discovery carries declared vision, reasoning and capacities into the saved
   const [unknown] = adoptPicked([], [{ id: 'unknown' }]);
   assert.equal(unknown.vision, null);
   assert.equal(unknown.reasoning.enabled, false);
+});
+
+test('changing a picked model ID drops its automatic specs and keeps fields the user edited', () => {
+  const [picked] = adoptPicked([], [{
+    id: 'old', name: 'Old model', context_window: 1000000, max_tokens: 131072,
+    supports_vision: true, reasoning_effort_levels: ['high'], reasoning_effort: 'high',
+  }]);
+  assert.equal(modelBody(updateModelDraft(picked, { model: ' old ' })).max_tokens, 131072);
+  const edited = updateModelDraft(picked, { window: '64K', vision: false });
+  assert.deepEqual(modelBody(updateModelDraft(edited, { model: 'new' })), {
+    model: 'new', context_window: 64000, supports_vision: false,
+  });
+});
+
+test('explicitly disabling discovered reasoning prevents save-time catalog restoration', () => {
+  const [picked] = adoptPicked([], [{
+    id: 'example', reasoning_effort_levels: ['high'], reasoning_effort: 'high',
+  }]);
+  const clearEffort = updateModelDraft(picked, { reasoning: { ...picked.reasoning, effort: null } });
+  assert.deepEqual(modelBody(clearEffort), { model: 'example', reasoning_effort_levels: ['high'] });
+  assert.deepEqual(modelBody(updateModelDraft(clearEffort, { model: 'different' })), { model: 'different' });
+  const disabled = updateModelDraft(picked, { reasoning: { ...picked.reasoning, enabled: false } });
+  assert.deepEqual(modelBody(disabled), { model: 'example', reasoning_effort_levels: [] });
+  assert.deepEqual(modelBody(updateModelDraft(disabled, { model: 'different' })), {
+    model: 'different', reasoning_effort_levels: [],
+  });
+});
+
+test('changing model keeps explicitly selected levels and clears a default inherited from discovery', () => {
+  const [picked] = adoptPicked([], [{
+    id: 'old', reasoning_effort_levels: ['high', 'xhigh'], reasoning_effort: 'high',
+  }]);
+  const tuned = updateModelDraft(picked, { reasoning: { ...picked.reasoning, levels: ['high'] } });
+  const moved = updateModelDraft(tuned, { model: 'new' });
+  assert.deepEqual(modelBody(moved), { model: 'new', reasoning_effort_levels: ['high'] });
+});
+
+test('changing model keeps an explicit default without treating inherited levels as user choices', () => {
+  const [picked] = adoptPicked([], [{
+    id: 'old', reasoning_effort_levels: ['high', 'xhigh'], reasoning_effort: 'high',
+  }]);
+  const tuned = updateModelDraft(picked, { reasoning: { ...picked.reasoning, effort: 'xhigh' } });
+  const moved = updateModelDraft(tuned, { model: 'new' });
+  assert.deepEqual(moved.reasoning, { enabled: true, levels: [], effort: 'xhigh' });
+  assert.deepEqual(modelsBlocker([moved]), { kind: 'model_reasoning', row: 0 });
 });
 
 test('provider labels show the actual host without paths or credentials', () => {

@@ -269,23 +269,6 @@ pub mod tui_front {
         // configuration file.
         let working_dir = config.working_dir.clone();
         let dirs = config.dirs.clone();
-        // The skill roots the RUNTIME uses. The screen may not depend on
-        // `atomcode-coding` (the layering gate forbids it), so the HOST
-        // resolves them and hands them over — the same list the CLI's own
-        // report uses, so the two front ends agree about which same-named
-        // skill wins.
-        //
-        // Resolved HERE, while `config` is still ours: it is moved into the
-        // connection a few lines down, and the roots are a property of the
-        // configuration.
-        let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
-            &config.extra_skill_dirs,
-            &working_dir,
-            &dirs,
-            dirs::home_dir().as_deref(),
-            None,
-        )
-        .0;
         let (connection, background) = match spawn {
             Some(spawn) => {
                 let (connection, background) =
@@ -412,10 +395,8 @@ pub mod tui_front {
                 plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir.clone())),
                 migration: Some(Arc::new(crate::tui_migration::DiskMigration::new(
                     dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
-                    working_dir.clone(),
                     dirs.clone(),
                     config_path.clone(),
-                    Some(skill_dirs.clone()),
                 ))),
                 setup: Some(crate::tui_setup::DiskSetup::new(
                     working_dir,

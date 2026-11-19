@@ -194,6 +194,24 @@ impl ProviderBook {
         input: &AccountInput<'_>,
         models: &[ModelInput<'_>],
     ) -> Result<(String, Vec<String>), BookError> {
+        self.create_account_with_api_key_policy(input, models, false)
+    }
+
+    /// Create an imported account with credentials bound to its own settings.
+    pub fn create_imported_account(
+        &self,
+        input: &AccountInput<'_>,
+        models: &[ModelInput<'_>],
+    ) -> Result<(String, Vec<String>), BookError> {
+        self.create_account_with_api_key_policy(input, models, true)
+    }
+
+    fn create_account_with_api_key_policy(
+        &self,
+        input: &AccountInput<'_>,
+        models: &[ModelInput<'_>],
+        disable_api_key_fallback: bool,
+    ) -> Result<(String, Vec<String>), BookError> {
         let preset = provider_preset::preset_or_compatible(input.protocol);
         if input.endpoint.trim().is_empty() && preset.default_base_url.is_none() {
             return Err(BookError::ProtocolNeedsEndpoint);
@@ -238,6 +256,9 @@ impl ProviderBook {
                 },
             )
             .map_err(written)?;
+            if disable_api_key_fallback {
+                provider_edit::disable_account_api_key_fallback(document, &id);
+            }
             write_planned(document, &id, &planned).map_err(written)?;
             made = (id, planned.into_iter().map(|p| p.id).collect());
             Ok(())

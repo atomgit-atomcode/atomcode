@@ -180,3 +180,11 @@ pub fn sessions_blocked(count: usize) -> String {
 pub fn unreadable_config() -> String {
     t(Msg::MigrationUnreadableConfig).into_owned()
 }
+
+pub fn unusable_credential_reference() -> String {
+    t(Msg::MigrationCredentialReferenceUnsupported).into_owned()
+}
+
+pub fn ambiguous_claude_auth() -> String {
+    t(Msg::MigrationClaudeAuthAmbiguous).into_owned()
+}

@@ -2503,7 +2503,9 @@ pub enum Msg<'a> {
     },
     MigrationProviderNothingToConnectTo,
     MigrationCredentialHasDollar,
-    MigrationCredentialAmbiguous,
+    MigrationCredentialReferenceUnsupported,
+    MigrationClaudeAuthAmbiguous,
+    MigrationProjectConfirmationRequired,
     MigrationOpencodePlaintextCredentials,
     MigrationAgentsBlocked,
     MigrationPluginsBlocked,
@@ -2551,5 +2553,6 @@ pub enum Msg<'a> {
         credential: &'a str,
         /// The file the account will be written into.
         destination: &'a str,
+        source: &'a str,
     },
 }

@@ -27,6 +27,7 @@ struct MergedCodexConfig {
     model_provider: Option<String>,
     /// The model the person was using.
     model: Option<String>,
+    failures: Vec<AssetReport>,
 }
 
 /// Merge the config files in order — later files win.
@@ -51,18 +52,21 @@ fn merge_codex_configs(
     > = std::collections::BTreeMap::new();
     let mut model_provider = None;
     let mut model = None;
+    let mut failures = Vec::new();
     for (path, scope) in files {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        // **`toml::from_str`, not `raw.parse::<toml::Value>()`** — the two
-        // are NOT the same path. `FromStr` for `toml::Value` rejects a table
-        // header with a dot in it, and Codex's own config is full of those:
-        // `[model_providers.my-provider]`. The `FromStr` path would read
-        // every real Codex config as unparseable, and every provider in it
-        // would silently vanish from the report.
-        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-            continue;
+        let value = match super::provider::read_config(path, |raw| {
+            let value = toml::from_str::<toml::Value>(raw).ok()?;
+            if value.get("model_providers").is_some_and(|p| !p.is_table()) {
+                return None;
+            }
+            Some(value)
+        }) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(()) => {
+                failures.push(super::provider::unreadable_provider_file(path, *scope));
+                continue;
+            }
         };
         if let Some(table) = value.get("model_providers").and_then(|p| p.as_table()) {
             for (name, provider) in table {
@@ -90,6 +94,7 @@ fn merge_codex_configs(
         providers,
         model_provider,
         model,
+        failures,
     }
 }
 
@@ -223,64 +228,23 @@ impl MigrationSource for CodexSource {
             if !path.is_file() {
                 continue;
             }
-            // **`toml::from_str`, not `raw.parse::<toml::Value>()`** — the
-            // two are NOT the same path. `FromStr` for `toml::Value` rejects
-            // a table header with a dot in it, and Codex's own config is
-            // full of those: `[mcp_servers.fs]`. The `FromStr` path would
-            // report every real Codex config as unparseable — and the
-            // person would be told to fix a file that is perfectly fine.
-            // The serde path (`from_str`) takes the dotted key as a nested
-            // table, which is what the file means.
-            match std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+            if let Ok(Some(value)) =
+                super::provider::read_config(&path, |raw| toml::from_str::<toml::Value>(raw).ok())
             {
-                Some(value) => {
-                    if let Some(count) = mcp_server_count(&value) {
-                        out.push(AssetReport {
-                            kind: AssetKind::McpServers,
-                            name: "mcp_servers".into(),
-                            path: path.clone(),
-                            scope,
-                            status: AssetStatus::Actionable,
-                            detail: super::text::mcp_copyable(
-                                count,
-                                &ctx.product.user().join("mcp.json"),
-                            ),
-                        });
-                    }
-                    // The provider rows are added below, from the drafts —
-                    // one row per account, named by its id.
-                }
-                None => {
+                if let Some(count) = mcp_server_count(&value) {
                     out.push(AssetReport {
-                        kind: AssetKind::ProviderConfig,
-                        name: "config.toml".into(),
-                        path: path.clone(),
+                        kind: AssetKind::McpServers,
+                        name: "mcp_servers".into(),
+                        path,
                         scope,
-                        status: AssetStatus::Blocked,
-                        detail: super::text::unreadable_config(),
+                        status: AssetStatus::Actionable,
+                        detail: super::text::mcp_copyable(
+                            count,
+                            &ctx.product.user().join("mcp.json"),
+                        ),
                     });
                 }
             }
-        }
-
-        // The provider rows. They come from the drafts, so the row's NAME is
-        // the account id the importer will write — a row named "config.toml"
-        // could never be matched by the re-check.
-        //
-        // In THIS task `provider_drafts` is still the default (empty), so no
-        // provider row appears yet; Task 7 fills the drafts in and the rows
-        // appear with it.
-        for draft in self.provider_drafts(ctx) {
-            out.push(super::provider_row(
-                &draft,
-                AssetStatus::Actionable,
-                super::text::provider_copyable(
-                    draft.base_url.as_deref(),
-                    draft.api_key.as_ref().map(|k| k.kind()),
-                ),
-            ));
         }
 
         // Sessions.
@@ -310,7 +274,7 @@ impl MigrationSource for CodexSource {
         out
     }
 
-    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
+    fn scan_providers(&self, ctx: &ScanContext) -> super::ProviderScan {
         // Codex layers its config: the project's `.codex/config.toml` wins over
         // the user's `~/.codex/config.toml`. So the two are **merged by id**,
         // project over user — otherwise the same provider id appears twice and
@@ -326,7 +290,14 @@ impl MigrationSource for CodexSource {
             ),
         ]);
 
-        let mut drafts: Vec<ProviderAccountDraft> = merged
+        if !merged.failures.is_empty() {
+            // A broken overlay could change both the endpoint and its credential.
+            return super::ProviderScan {
+                failures: merged.failures,
+                ..Default::default()
+            };
+        }
+        let drafts = merged
             .providers
             .into_iter()
             .map(|(name, (provider, source_path, scope))| {
@@ -366,6 +337,10 @@ impl MigrationSource for CodexSource {
                     Some(super::text::provider_name_unusable(&name))
                 } else if super::is_unsupported_protocol(&protocol) {
                     Some(super::text::provider_protocol_unsupported(&protocol))
+                } else if key.as_ref().is_some_and(|key| {
+                    matches!(key, ApiKeyRef::EnvVar(name) if !super::provider::valid_env_name(name))
+                }) {
+                    Some(super::text::unusable_credential_reference())
                 } else if base_url.is_none() && key.is_none() {
                     // No endpoint and no credential: there is nothing to
                     // connect to. It is still a definition the person wrote,
@@ -402,17 +377,10 @@ impl MigrationSource for CodexSource {
             })
             .collect();
 
-        // A model with NO named provider needs no special handling here: the
-        // per-draft `models` above already gives the model to the provider
-        // Codex actually selected, and to nobody else.
-        //
-        // When `model_provider` is absent, Codex was on its built-in `openai`
-        // provider (`codex-rs/core/src/config/mod.rs:4133` falls back to
-        // `"openai"`). That provider has no entry in `model_providers` and is
-        // not ours to import — so the model is left unattached rather than
-        // pinned onto "the first account", which would put it on an account
-        // the person never selected.
-        drafts
+        super::ProviderScan {
+            drafts,
+            ..Default::default()
+        }
     }
 }
 
@@ -598,10 +566,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "# skill").unwrap();
 
-        let assets = CodexSource.detect(
-            &ctx(home.path(), project.path()),
-            &truth(home.path(), project.path()),
-        );
+        let report =
+            super::super::scan(&[Box::new(CodexSource)], &ctx(home.path(), project.path()));
+        let assets = &report.sources[0].assets;
         assert!(assets.iter().any(|a| a.kind == AssetKind::Skills));
         assert!(assets
             .iter()

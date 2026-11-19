@@ -1867,11 +1867,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::MigrationCredentialHasDollar => {
             "This key contains `$`, which the configuration would expand — not imported".into()
         }
-        Msg::MigrationCredentialAmbiguous => {
-            "An environment variable of the same name is set, so this key cannot be written \
-             unambiguously — not imported"
-                .into()
-        }
         Msg::MigrationOpencodePlaintextCredentials => {
             "This file holds plaintext keys — they are not moved, only reported".into()
         }
@@ -1925,6 +1920,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::MigrationImportConflict { id } => {
             format!("{id}: an account with that id exists but differs — not overwritten").into()
         }
+        Msg::MigrationCredentialReferenceUnsupported => "This endpoint or credential reference needs manual configuration.".into(),
+        Msg::MigrationClaudeAuthAmbiguous => "Both Claude Code authentication methods are configured. Choose the intended credential manually.".into(),
+        Msg::MigrationProjectConfirmationRequired => "A project account requires interactive confirmation.".into(),
         Msg::MigrationImportConfirm {
             id,
             protocol,
@@ -1932,6 +1930,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             models,
             credential,
             destination,
+            source,
         } => {
             let models = if models.is_empty() {
                 String::new()
@@ -1952,7 +1951,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 },
             };
             format!(
-                "Import account `{id}` ({protocol} -> {endpoint}){models}{credential}? [y/N] "
+                "Import account `{id}` from {source} ({protocol} -> {endpoint}){models}{credential}? [y/N] "
             )
             .into()
         }

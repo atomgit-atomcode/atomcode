@@ -33,7 +33,7 @@ use crate::skills::EntryKind;
 // re-exported because `provider` is a **private** module: the host needs it
 // to name the endpoint in its confirmation prompt, and the host cannot reach
 // into a private module.
-pub use provider::{endpoint_in_use, ApiKeyRef, ProviderAccountDraft};
+pub use provider::{endpoint_in_use, ApiKeyRef, ProviderAccountDraft, ProviderScan};
 pub use report::{AssetKind, AssetReport, AssetScope, AssetStatus, MigrationReport, SourceReport};
 
 /// Where to look. The host resolves all of it — this crate reads no environment.
@@ -107,19 +107,14 @@ pub trait MigrationSource: Send + Sync {
     /// moment of the same disk than the source next to it, and the report
     /// would contradict itself.
     fn detect(&self, ctx: &ScanContext, truth: &SkillTruth) -> Vec<AssetReport>;
-    /// The provider accounts this agent has configured, if any.
-    fn provider_drafts(&self, _ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
-        Vec::new()
+    /// Provider drafts and any source files whose configuration could not be read.
+    fn scan_providers(&self, _ctx: &ScanContext) -> ProviderScan {
+        ProviderScan::default()
     }
-    /// Why the provider accounts could NOT be read, when that is the case.
-    ///
-    /// **Absence and failure are different answers.** A source whose config
-    /// file is broken has NOT "no provider accounts" — it has an unreadable
-    /// file. Without this, `--apply` would print "No provider accounts were
-    /// found" and exit successfully, and the person would never learn their
-    /// config was not read at all.
-    fn provider_drafts_error(&self, _ctx: &ScanContext) -> Option<String> {
-        None
+
+    #[cfg(test)]
+    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
+        self.scan_providers(ctx).drafts
     }
 }
 
@@ -133,30 +128,42 @@ pub fn builtin_sources() -> Vec<Box<dyn MigrationSource>> {
 }
 
 /// Scan every source. A source that finds nothing contributes no rows.
-///
-/// Only `detect()` is called here. The provider rows are part of what a
-/// source detects — they are added by that source's own `detect()`, from the
-/// same drafts the importer uses (Task 7). So this function needs no draft
-/// machinery, and Task 1 stands on its own.
 pub fn scan(sources: &[Box<dyn MigrationSource>], ctx: &ScanContext) -> MigrationReport {
+    scan_with_provider_drafts(sources, ctx).0
+}
+
+/// Use the same provider drafts for the visible rows and the host's re-check.
+pub fn scan_with_provider_drafts(
+    sources: &[Box<dyn MigrationSource>],
+    ctx: &ScanContext,
+) -> (MigrationReport, Vec<ProviderAccountDraft>) {
     let mut report = MigrationReport::default();
-    // **ONE registry load for the whole report.** The registry is the
-    // authority on what is in effect; loading it per source would let two
-    // sources in one report see two different moments of the same disk — and
-    // the report would contradict itself.
+    let mut drafts = Vec::new();
     let truth = SkillTruth::load(ctx);
     for source in sources {
-        let assets = source.detect(ctx, &truth);
-        if assets.is_empty() {
-            continue;
+        let mut assets = source.detect(ctx, &truth);
+        let providers = source.scan_providers(ctx);
+        assets.extend(providers.failures);
+        assets.extend(providers.drafts.iter().map(|draft| {
+            provider_row(
+                draft,
+                AssetStatus::Actionable,
+                text::provider_copyable(
+                    draft.base_url.as_deref(),
+                    draft.api_key.as_ref().map(ApiKeyRef::kind),
+                ),
+            )
+        }));
+        drafts.extend(providers.drafts);
+        if !assets.is_empty() {
+            report.sources.push(SourceReport {
+                source_id: source.id(),
+                display_name: source.display_name(),
+                assets,
+            });
         }
-        report.sources.push(SourceReport {
-            source_id: source.id(),
-            display_name: source.display_name(),
-            assets,
-        });
     }
-    report
+    (report, drafts)
 }
 
 /// The report row for a provider account.

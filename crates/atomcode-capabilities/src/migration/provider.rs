@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::report::AssetScope;
+use super::report::{AssetKind, AssetReport, AssetScope, AssetStatus};
 
 /// How a credential is referenced.
 ///
@@ -16,15 +16,25 @@ pub enum ApiKeyRef {
     /// A literal secret found in the source configuration. Written only after
     /// the person confirms that one item.
     Plaintext(String),
+    /// A literal token sent in the Authorization header.
+    Bearer(String),
 }
 
 impl ApiKeyRef {
+    pub fn literal(&self) -> Option<&str> {
+        match self {
+            Self::EnvVar(_) => None,
+            Self::Plaintext(secret) | Self::Bearer(secret) => Some(secret),
+        }
+    }
+
     /// How the credential is written, for the report to say. The VALUE is
     /// never part of this — only its kind.
     pub fn kind(&self) -> &'static str {
         match self {
             ApiKeyRef::EnvVar(_) => "environment variable",
             ApiKeyRef::Plaintext(_) => "a literal key",
+            ApiKeyRef::Bearer(_) => "a literal bearer token",
         }
     }
 }
@@ -36,6 +46,7 @@ impl std::fmt::Debug for ApiKeyRef {
             ApiKeyRef::EnvVar(name) => f.debug_tuple("EnvVar").field(name).finish(),
             // The value IS the secret: only its kind is shown.
             ApiKeyRef::Plaintext(_) => f.debug_tuple("Plaintext").field(&"<redacted>").finish(),
+            ApiKeyRef::Bearer(_) => f.debug_tuple("Bearer").field(&"<redacted>").finish(),
         }
     }
 }
@@ -190,18 +201,69 @@ pub fn endpoint_in_use(protocol: &str, endpoint: Option<&str>) -> Option<String>
         .map(str::to_string)
 }
 
-/// Read a JSON file that may carry comments.
-///
-/// **Comments are stripped first**, the way our own MCP loader does
-/// (`mcp/config.rs:624`: `serde_json::from_str(&crate::jsonc::strip_comments(content))`).
-/// A hand-edited file with a comment in it is a perfectly good file; calling
-/// it broken would be wrong.
-///
-/// `None` when the file cannot be read or parsed — the caller reports that
-/// as blocked, and does NOT treat it as "there is nothing here".
-pub fn read_jsonc(path: &Path) -> Option<serde_json::Value> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&crate::jsonc::strip_comments(&raw)).ok()
+/// A source's provider configuration and any unreadable layers.
+#[derive(Default)]
+pub struct ProviderScan {
+    pub drafts: Vec<ProviderAccountDraft>,
+    pub failures: Vec<AssetReport>,
+}
+
+pub(super) fn unreadable_provider_file(path: &Path, scope: AssetScope) -> AssetReport {
+    AssetReport {
+        kind: AssetKind::ProviderConfig,
+        name: super::last_component(path),
+        path: path.to_path_buf(),
+        scope,
+        status: AssetStatus::Blocked,
+        detail: super::text::unreadable_config(),
+    }
+}
+
+pub(super) fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Distinguish an absent file from an unreadable layer. Parser errors may
+/// contain a credential from the source, so callers report the path only.
+pub(super) fn read_config<T>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, ()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return Err(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(()),
+            };
+        }
+        Err(_) => return Err(()),
+    }
+    match std::fs::read_to_string(path) {
+        Ok(raw) => parse(&raw).map(Some).ok_or(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+pub(super) fn read_jsonc(path: &Path) -> Result<Option<serde_json::Value>, ()> {
+    read_config(path, |raw| {
+        let normalized = if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonc")
+        {
+            crate::jsonc::strip_comments_and_trailing_commas(raw)
+        } else {
+            crate::jsonc::strip_comments(raw)
+        };
+        let value: serde_json::Value = serde_json::from_str(&normalized).ok()?;
+        value.is_object().then_some(value)
+    })
 }
 
 #[cfg(test)]

@@ -1786,9 +1786,6 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::MigrationCredentialHasDollar => {
             "这个密钥里含有 `$`，配置会把它展开 —— 未导入".into()
         }
-        Msg::MigrationCredentialAmbiguous => {
-            "同名环境变量已设置，这个密钥无法唯一确定 —— 未导入".into()
-        }
         Msg::MigrationOpencodePlaintextCredentials => {
             "这个文件里是明文密钥 —— 只报告，不搬运".into()
         }
@@ -1834,6 +1831,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::MigrationImportConflict { id } => {
             format!("{id}：已存在同名但不同的账号 —— 没有覆盖。").into()
         }
+        Msg::MigrationCredentialReferenceUnsupported => "请手动配置此端点或凭据引用。".into(),
+        Msg::MigrationClaudeAuthAmbiguous => "Claude Code 同时配置了两种认证方式，请手动选择要使用的凭据。".into(),
+        Msg::MigrationProjectConfirmationRequired => "项目级账号需要交互式确认。".into(),
         Msg::MigrationImportConfirm {
             id,
             protocol,
@@ -1841,6 +1841,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             models,
             credential,
             destination,
+            source,
         } => {
             let models = if models.is_empty() {
                 String::new()
@@ -1859,7 +1860,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 },
             };
             format!(
-                "要导入账号 `{id}`（{protocol} -> {endpoint}）{models}{credential}吗？[y/N] "
+                "要从 {source} 导入账号 `{id}`（{protocol} -> {endpoint}）{models}{credential}吗？[y/N] "
             )
             .into()
         }

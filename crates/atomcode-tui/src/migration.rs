@@ -61,5 +61,5 @@ pub(crate) fn status_word(status: AssetStatusView) -> String {
 #[async_trait]
 pub trait Migration: Send + Sync {
     /// The report. Read-only.
-    async fn report(&self) -> Result<MigrationReportView, String>;
+    async fn report(&self, project: &std::path::Path) -> Result<MigrationReportView, String>;
 }

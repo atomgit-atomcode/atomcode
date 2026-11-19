@@ -779,7 +779,7 @@ enum Commands {
         /// Import the provider accounts, asking before each one.
         #[arg(long)]
         apply: bool,
-        /// Do not ask; import every provider account that needs no confirmation.
+        /// Skip confirmation for user accounts without a literal credential.
         #[arg(long)]
         yes: bool,
     },
@@ -4107,44 +4107,13 @@ async fn run_import_command(
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dirs = atomcode_coding::config::product_dirs_from_env();
-    // The configuration we are importing INTO — it also says where our
-    // skills live (`[skills].extra_dirs`).
-    let config =
-        atomcode_config::config::Config::load(&cli_config_path(cli_config)).unwrap_or_default();
-    // The skill roots the RUNTIME uses — the user's configured `extra_dirs`
-    // come first, and a skill there can win a same-name collision. Resolving
-    // them here (rather than letting the capability fall back to the
-    // standard list) is what makes the report agree with the runtime.
-    let skill_dirs = atomcode_coding::parts::resolve_skill_dirs_from(
-        &config.skills.extra_dirs,
-        &project,
-        &dirs,
-        Some(home.as_path()),
-        None,
-    )
-    .0;
-    let (opencode_config, opencode_data) = atomcode_coding::config::opencode_dirs();
-    let ctx = atomcode::import_cmd::scan_context(
-        &home,
-        &project,
-        dirs.clone(),
-        Some(skill_dirs),
-        opencode_config,
-        opencode_data,
-    );
-    let sources = atomcode_capabilities::migration::builtin_sources();
-    let mut report = atomcode_capabilities::migration::scan(&sources, &ctx);
-
-    // The re-check: what is already in OUR configuration is not "to be
-    // brought over" — it is already there.
-    let drafts: Vec<_> = sources
-        .iter()
-        .flat_map(|source| source.provider_drafts(&ctx))
-        .collect();
     let config_path = cli_config_path(cli_config);
-    atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &config_path);
-
+    let ctx = atomcode::import_cmd::scan_context(&home, &project, dirs, &config_path);
+    let sources = atomcode_capabilities::migration::builtin_sources();
     if !apply {
+        let (mut report, drafts) =
+            atomcode_capabilities::migration::scan_with_provider_drafts(&sources, &ctx);
+        atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &config_path);
         println!("{}", atomcode::import_cmd::render(&report, json));
         return 0;
     }

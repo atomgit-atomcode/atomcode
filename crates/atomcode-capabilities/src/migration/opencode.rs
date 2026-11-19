@@ -90,9 +90,6 @@ impl MigrationSource for OpenCodeSource {
             ));
         }
 
-        // The provider configuration.
-        out.extend(provider_rows(ctx));
-
         // The MCP servers.
         out.extend(mcp_rows(ctx));
 
@@ -111,75 +108,122 @@ impl MigrationSource for OpenCodeSource {
         out
     }
 
-    /// The provider accounts OpenCode has configured.
-    ///
-    /// **The credential is a LITERAL**, like Claude's — not a variable name
-    /// like Codex's. So it needs the person's confirmation before it is
-    /// written.
-    fn provider_drafts(&self, ctx: &ScanContext) -> Vec<ProviderAccountDraft> {
-        let Some(value) =
-            super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.json"))
-        else {
-            return Vec::new();
-        };
-        let Some(providers) = value.get("provider").and_then(|p| p.as_object()) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for (id, provider) in providers {
-            let Some(options) = provider.get("options").and_then(|o| o.as_object()) else {
-                continue;
+    fn scan_providers(&self, ctx: &ScanContext) -> super::ProviderScan {
+        let mut scan = super::ProviderScan::default();
+        let mut definitions = std::collections::BTreeMap::new();
+        for file in ["opencode.json", "opencode.jsonc"] {
+            let path = ctx.opencode_config_dir.join(file);
+            let parsed = super::provider::read_jsonc(&path).and_then(|config| {
+                let Some(config) = config else {
+                    return Ok(None);
+                };
+                let Some(providers) = config.get("providers").or_else(|| config.get("provider"))
+                else {
+                    return Ok(None);
+                };
+                providers.as_object().cloned().map(Some).ok_or(())
+            });
+            match parsed {
+                Ok(Some(providers)) => {
+                    definitions.extend(
+                        providers
+                            .into_iter()
+                            .map(|(id, provider)| (id, (provider, path.clone()))),
+                    );
+                }
+                Ok(None) => {}
+                Err(()) => scan
+                    .failures
+                    .push(super::provider::unreadable_provider_file(
+                        &path,
+                        AssetScope::User,
+                    )),
+            }
+        }
+        if !scan.failures.is_empty() {
+            return scan;
+        }
+
+        for (name, (provider, source_path)) in definitions {
+            let settings = provider.get("settings").or_else(|| provider.get("options"));
+            let setting = |key: &str| {
+                settings
+                    .and_then(|settings| settings.get(key))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
             };
-            let base_url = options
-                .get("baseURL")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let api_key = options
-                .get("apiKey")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(|secret| ApiKeyRef::Plaintext(secret.to_string()));
-            if base_url.is_none() && api_key.is_none() {
+            let base_url = setting("baseURL");
+            let key = setting("apiKey");
+            if base_url.is_none() && key.is_none() {
                 continue;
             }
-            let protocol = protocol_for_opencode(provider.get("npm").and_then(|v| v.as_str()));
-            out.push(ProviderAccountDraft {
-                id: super::provider::account_id_for(id).unwrap_or_else(|| id.clone()),
-                source_name: id.clone(),
-                protocol: protocol.clone(),
-                base_url: super::provider::effective_endpoint(&protocol, base_url.as_deref()),
-                api_key,
-                models: Vec::new(),
-                source_path: ctx.opencode_config_dir.join("opencode.json"),
+            let id = super::provider::account_id_for(&name);
+            let protocol = protocol_for_opencode(
+                provider
+                    .get("package")
+                    .or_else(|| provider.get("npm"))
+                    .and_then(|v| v.as_str()),
+            );
+            let api_key = key.map(parse_credential).transpose();
+            let blocked = if id.is_none() {
+                Some(super::text::provider_name_unusable(&name))
+            } else if super::is_unsupported_protocol(&protocol) {
+                Some(super::text::provider_protocol_unsupported(&protocol))
+            } else if api_key.is_err() || base_url.is_some_and(has_reference) {
+                Some(super::text::unusable_credential_reference())
+            } else if base_url.is_none() && super::provider::protocol_needs_endpoint(&protocol) {
+                Some(super::text::provider_nothing_to_connect_to())
+            } else {
+                None
+            };
+            let models = provider
+                .get("models")
+                .and_then(|models| models.as_object())
+                .into_iter()
+                .flatten()
+                .map(|(id, model)| {
+                    model
+                        .get("modelID")
+                        .or_else(|| model.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id)
+                        .to_owned()
+                })
+                .collect();
+            scan.drafts.push(ProviderAccountDraft {
+                id: id.unwrap_or_else(|| name.clone()),
+                source_name: name,
+                base_url: super::provider::effective_endpoint(&protocol, base_url),
+                protocol,
+                api_key: api_key.ok().flatten(),
+                models,
+                source_path,
                 scope: AssetScope::User,
-                blocked: None,
+                blocked,
             });
         }
-        out
+        scan
     }
 }
 
-/// The provider accounts OpenCode has configured.
-///
-/// **The rows come from the drafts**, so the row's name is the account id
-/// the importer will write — the same rule the other two sources follow.
-fn provider_rows(ctx: &ScanContext) -> Vec<AssetReport> {
-    // **The rows come from the drafts** — the same shape the other two
-    // sources use. Re-deriving the values here would give two places that
-    // could disagree about what an account is.
-    let mut out = Vec::new();
-    for draft in OpenCodeSource.provider_drafts(ctx) {
-        out.push(super::provider_row(
-            &draft,
-            AssetStatus::Actionable,
-            super::text::provider_copyable(
-                draft.base_url.as_deref(),
-                draft.api_key.as_ref().map(|k| k.kind()),
-            ),
-        ));
+fn has_reference(value: &str) -> bool {
+    value.contains("{env:") || value.contains("{file:")
+}
+
+fn parse_credential(value: &str) -> Result<ApiKeyRef, ()> {
+    if let Some(name) = value
+        .strip_prefix("{env:")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        if super::provider::valid_env_name(name) {
+            return Ok(ApiKeyRef::EnvVar(name.to_owned()));
+        }
     }
-    out
+    if has_reference(value) {
+        return Err(());
+    }
+    Ok(ApiKeyRef::Plaintext(value.to_owned()))
 }
 
 /// The MCP servers OpenCode has configured.
@@ -188,7 +232,8 @@ fn provider_rows(ctx: &ScanContext) -> Vec<AssetReport> {
 /// while ours is `command: Option<String>` + `args: Option<Vec<String>>`
 /// (`mcp/config.rs:145`) — so it is split here.
 fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
-    let Some(value) = super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.jsonc"))
+    let Ok(Some(value)) =
+        super::provider::read_jsonc(&ctx.opencode_config_dir.join("opencode.jsonc"))
     else {
         return Vec::new();
     };
@@ -252,9 +297,15 @@ fn mcp_rows(ctx: &ScanContext) -> Vec<AssetReport> {
 /// adds a function here, and the shared module stays untouched.
 fn protocol_for_opencode(npm: Option<&str>) -> String {
     match npm {
-        Some("@ai-sdk/openai-compatible") => "openai-compatible".into(),
-        Some("@ai-sdk/anthropic") => "anthropic-compatible".into(),
-        Some("@ai-sdk/openai") => "openai-responses".into(),
+        Some("@ai-sdk/openai-compatible" | "@opencode/ai/providers/openai-compatible") => {
+            "openai-compatible".into()
+        }
+        Some("@ai-sdk/anthropic" | "@opencode/ai/providers/anthropic-compatible") => {
+            "anthropic-compatible".into()
+        }
+        Some("@ai-sdk/openai" | "@opencode/ai/providers/openai-compatible/responses") => {
+            "openai-responses".into()
+        }
         Some(other) => super::provider::unsupported_protocol(&format!("opencode:{other}")),
         None => "openai-compatible".into(),
     }
@@ -353,6 +404,61 @@ mod tests {
             Some(ApiKeyRef::Plaintext("sk-literal".into())),
             "a literal, so it needs the person's confirmation"
         );
+    }
+
+    #[test]
+    fn a_jsonc_file_with_trailing_commas_keeps_providers_from_the_json_file() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let ctx = ctx(home.path(), project.path());
+        std::fs::create_dir_all(&ctx.opencode_config_dir).unwrap();
+        std::fs::write(
+            ctx.opencode_config_dir.join("opencode.json"),
+            r#"{"provider":{"demo":{"options":{"baseURL":"https://example.invalid/v1"},
+                "models":{"demo-model":{}}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.opencode_config_dir.join("opencode.jsonc"),
+            "{\n  // Keep the rest of the settings in a separate file.\n  \"theme\": \"dark\",\n}",
+        )
+        .unwrap();
+
+        let scan = OpenCodeSource.scan_providers(&ctx);
+        assert!(scan.failures.is_empty());
+        let [draft] = scan.drafts.as_slice() else {
+            panic!("expected the provider from opencode.json");
+        };
+        assert_eq!(draft.id, "demo");
+        assert_eq!(draft.models, ["demo-model"]);
+    }
+
+    #[test]
+    fn model_ids_and_environment_references_survive_the_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let ctx = ctx(home.path(), project.path());
+        std::fs::create_dir_all(&ctx.opencode_config_dir).unwrap();
+        std::fs::write(
+            ctx.opencode_config_dir.join("opencode.jsonc"),
+            r#"{"provider":{
+                "env":{"options":{"baseURL":"https://env.invalid/v1","apiKey":"{env:OPENCODE_KEY}"},
+                    "models":{"alias":{"modelID":"provider/model"},"plain":{},},},
+                "file":{"options":{"baseURL":"https://file.invalid/v1","apiKey":"{file:private-key}"},},
+            },}"#,
+        )
+        .unwrap();
+
+        let scan = OpenCodeSource.scan_providers(&ctx);
+        assert!(scan.failures.is_empty());
+        let [env, file] = scan.drafts.as_slice() else {
+            panic!("expected both providers");
+        };
+        assert_eq!(env.models, ["provider/model", "plain"]);
+        assert_eq!(env.api_key, Some(ApiKeyRef::EnvVar("OPENCODE_KEY".into())));
+        assert!(env.blocked.is_none());
+        assert!(file.api_key.is_none());
+        assert!(file.blocked.is_some());
     }
 
     /// The MCP `command` is an ARRAY — split into command + args.

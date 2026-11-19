@@ -310,6 +310,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelCurrent => "(current)".into(),
         Msg::RewindPanelNoCodeChanges => "no code changes".into(),
         Msg::RewindPanelFiles { files } => format!("{files} files").into(),
+        Msg::RewindPanelTurnNoCheckpoint => "No code checkpoint was kept for this turn.".into(),
         Msg::RewindPanelScopeAsk => "  going back there takes what with it?".into(),
         Msg::RewindCodeNotEnabled => "workspace rewind is turned off by ATOMCODE_CODE_REWIND; unset it to turn it back on".into(),
         Msg::RewindCodeNoSession => "this session is not written down, so the workspace cannot go back".into(),
@@ -400,6 +401,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "Will use".into(),
         Msg::ProviderSetUse => "Use this model".into(),
         Msg::ProviderBatchChoose => "Use focused model".into(),
+        Msg::ProviderCatalogCandidates => "models.dev suggestions · account access unverified".into(),
         Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),
@@ -1731,12 +1733,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoMigrationPort => "No migration service is available".into(),
         Msg::MigrationReportTitle => "Assets another agent left behind".into(),
         Msg::MigrationNoAssets => "This source has no assets".into(),
+        Msg::MigrationSourceUnavailable => "That agent has no assets in the current project.".into(),
         Msg::MigrationPickSource => "Which agent's assets do you want to see?".into(),
         Msg::MigrationAssetsCount => "assets".into(),
         Msg::MigrationSummaryLine { source, count } => {
             format!("{source}: {count} assets").into()
         }
-    }
+}
 }
 
 /// `team · 2 members · 1 background task`, leaving out a count that is zero.

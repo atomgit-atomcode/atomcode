@@ -561,6 +561,8 @@ export interface ProviderPresetInfo {
 
 export interface DiscoveredModelInfo {
   id: string;
+  catalog_only?: boolean;
+  catalog_default_effort?: string;
   supports_vision?: boolean;
   reasoning_effort_levels?: string[];
   reasoning_effort?: string;
