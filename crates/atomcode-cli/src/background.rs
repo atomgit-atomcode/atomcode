@@ -114,6 +114,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
         working_dir: &std::path::Path,
         task: String,
         scope: Option<String>,
+        files: usize,
     ) -> Option<Result<atomcode_review::DelegatedReview, String>> {
         let background = self
             .home
@@ -129,6 +130,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
                 task,
                 scope,
                 Some("code-review".to_string()),
+                files,
             )
             .await
         {
@@ -1705,7 +1707,8 @@ impl Background {
         }
         .working_dir_now()
         .await;
-        self.start_locked(working_dir, text, scope, None).await
+        self.start_locked(working_dir, text, scope, None, None)
+            .await
     }
 
     /// [`Self::start`],替 `front_end` 那个 runtime —— 只在它**此刻**就是前台那个时。
@@ -1725,6 +1728,7 @@ impl Background {
         text: String,
         scope: Option<String>,
         name: Option<String>,
+        files: usize,
     ) -> Result<Option<HostReply>, HostError> {
         let Ok(_op) = self.op.try_lock() else {
             return Ok(None);
@@ -1746,7 +1750,7 @@ impl Background {
         // The parent's request is context, not another assignment. In
         // particular, its authorized edits/commit/PR remain the parent's job.
         let text = review_task(request.as_deref(), &text);
-        self.start_locked(working_dir, text, scope, name)
+        self.start_locked(working_dir, text, scope, name, Some(files))
             .await
             .map(Some)
     }
@@ -1758,6 +1762,7 @@ impl Background {
         text: String,
         scope: Option<String>,
         name: Option<String>,
+        confirmed_files: Option<usize>,
     ) -> Result<HostReply, HostError> {
         let control = {
             let state = self.state.lock().expect("background poisoned");
@@ -1777,9 +1782,10 @@ impl Background {
             .await
             .map_err(crate::host::refused)?;
         // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
-        let files = match scope.as_deref() {
-            Some(scope) => changed_files(&working_dir, scope).await,
-            None => None,
+        let files = match (confirmed_files, scope.as_deref()) {
+            (Some(files), _) => Some(files),
+            (None, Some(scope)) => changed_files(&working_dir, scope).await,
+            (None, None) => None,
         };
         let mut live = self.spawn_at(working_dir.clone()).await?;
         // Configure before publishing the slot or submitting any work. Failure

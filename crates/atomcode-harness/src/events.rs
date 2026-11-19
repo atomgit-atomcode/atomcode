@@ -78,6 +78,9 @@ pub enum ToolDispatchProof {
     NotDispatched,
 }
 
+/// A host-owned operation exhausted its total time budget.
+pub const HOST_DEADLINE_CODE: &str = "host_deadline";
+
 /// Why a model request failed, with the structure a recovery policy needs.
 ///
 /// The provider already classifies its own failures — `retryable`, an HTTP

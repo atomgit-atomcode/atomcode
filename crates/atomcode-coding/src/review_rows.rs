@@ -258,10 +258,24 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Revi
             req.tools.retain(|tool| tool.name == "code_review");
             if let Some(result) = completed_review(&events, req.turn) {
                 return if result.1 {
-                    Err(RequestError {
-                        policy_denied: true,
-                        ..RequestError::message(result.0)
-                    })
+                    if let Some(detail) = atomcode_review::review_deadline_detail(&result.0) {
+                        Err(RequestError {
+                            code: Some(atomcode_harness::events::HOST_DEADLINE_CODE.into()),
+                            ..RequestError::message(detail)
+                        })
+                    } else if let Some(detail) =
+                        atomcode_review::review_open_timeout_detail(&result.0)
+                    {
+                        Err(RequestError::from_provider(
+                            &atomcode_kernel::stream::ProviderError {
+                                code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.into()),
+                                message: detail.to_owned(),
+                                ..Default::default()
+                            },
+                        ))
+                    } else {
+                        Err(RequestError::message(result.0))
+                    }
                 } else {
                     Ok(ModelResponse {
                         text: result.0,

@@ -16,6 +16,7 @@ use tracing::{Instrument, Span};
 #[derive(Clone)]
 pub(crate) struct ReviewTiming {
     span: Span,
+    bounded: bool,
 }
 
 impl ReviewTiming {
@@ -29,13 +30,20 @@ impl ReviewTiming {
                 review_id,
                 source_call_id = source_id.unwrap_or_default()
             ),
+            bounded: false,
         }
     }
 
     pub(crate) fn pass(&self, stage: &str, candidate: Option<usize>) -> Self {
         Self {
             span: tracing::info_span!(parent: &self.span, "review_pass", stage, candidate),
+            bounded: self.bounded,
         }
+    }
+
+    pub(crate) fn bounded(mut self) -> Self {
+        self.bounded = true;
+        self
     }
 
     pub(crate) fn start(&self) -> Timer {
@@ -50,6 +58,7 @@ impl ReviewTiming {
         Arc::new(TimedProvider {
             parent: self.span.clone(),
             next_request: AtomicU64::new(1),
+            bounded: self.bounded,
             inner,
         })
     }
@@ -57,6 +66,7 @@ impl ReviewTiming {
     pub(crate) fn tool(&self, inner: Arc<dyn Tool>) -> Arc<dyn Tool> {
         Arc::new(TimedTool {
             parent: self.span.clone(),
+            bounded: self.bounded,
             inner,
         })
     }
@@ -103,6 +113,7 @@ impl Drop for Timer {
 struct TimedProvider {
     parent: Span,
     next_request: AtomicU64,
+    bounded: bool,
     inner: Arc<dyn LlmProvider>,
 }
 
@@ -143,12 +154,29 @@ impl LlmProvider for TimedProvider {
             parent: &self.parent, "review_model", request, messages = messages.len()
         );
         let mut timer = Timer::start(span.clone(), "model request");
-        match self
-            .inner
-            .chat_stream(messages, tools, options)
-            .instrument(span)
-            .await
-        {
+        let request = async {
+            if self.bounded {
+                use crate::review_batches::{fit_request, OPEN_TIMEOUT};
+                let messages = fit_request(messages, tools, options, self.context_window())?;
+                return tokio::time::timeout(
+                    OPEN_TIMEOUT,
+                    self.inner.chat_stream(&messages, tools, options),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ProviderError {
+                        code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.into()),
+                        message: format!(
+                            "Timed out after {}s waiting for model response headers.",
+                            OPEN_TIMEOUT.as_secs()
+                        ),
+                        ..Default::default()
+                    })
+                });
+            }
+            self.inner.chat_stream(messages, tools, options).await
+        };
+        match request.instrument(span).await {
             Ok(stream) => Ok(Box::pin(TimedStream {
                 stream: Some(stream),
                 timer,
@@ -211,6 +239,7 @@ impl Drop for TimedStream {
 
 struct TimedTool {
     parent: Span,
+    bounded: bool,
     inner: Arc<dyn Tool>,
 }
 
@@ -262,7 +291,10 @@ impl Tool for TimedTool {
             name = self.name(), call_id = ctx.progress.source_id().unwrap_or_default()
         );
         let mut timer = Timer::start(span.clone(), "tool execution");
-        let result = self.inner.execute(args, ctx).instrument(span).await;
+        let mut result = self.inner.execute(args, ctx).instrument(span).await;
+        if self.bounded {
+            crate::review_batches::limit_evidence_result(self.name(), &mut result.content);
+        }
         timer.finish(if result.is_error {
             "error"
         } else {

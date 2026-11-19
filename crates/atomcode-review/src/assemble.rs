@@ -122,7 +122,7 @@ pub fn build_review_agent_with_cancel(
     provider: Arc<dyn LlmProvider>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> (Agent, ReportFindingTool) {
-    build_review_agent_inner(cfg, provider, cancel_token, None)
+    build_review_agent_inner(cfg, provider, cancel_token, None, None)
 }
 
 pub(crate) fn build_review_agent_inner(
@@ -130,6 +130,7 @@ pub(crate) fn build_review_agent_inner(
     provider: Arc<dyn LlmProvider>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     timing: Option<&ReviewTiming>,
+    patch: Option<Arc<crate::review_batches::ReviewPatch>>,
 ) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
@@ -154,6 +155,7 @@ pub(crate) fn build_review_agent_inner(
         mount_graph,
         &cfg.skill_dirs,
         timing,
+        patch,
     );
     let provider = match timing {
         Some(timing) => timing.provider(provider),
@@ -250,6 +252,7 @@ fn mount_review_tools(
     mount_graph: bool,
     skill_dirs: &[PathBuf],
     timing: Option<&ReviewTiming>,
+    patch: Option<Arc<crate::review_batches::ReviewPatch>>,
 ) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg, &dirs); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
@@ -266,6 +269,10 @@ fn mount_review_tools(
         ));
         atomcode_capabilities::skills::register_skill_tools(&mut reg, skills);
         names.extend_from_slice(atomcode_capabilities::skills::skill_tool_names());
+    }
+    if let Some(patch) = patch {
+        reg.register(patch);
+        names.push("read_review_patch");
     }
     let mounted = reg.mount(&names);
     if let Some(timing) = timing {

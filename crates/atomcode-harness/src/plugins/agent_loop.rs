@@ -1056,7 +1056,14 @@ impl PluginAgentLoop {
                         outcome.stop = StopReason::RateLimited;
                         break;
                     }
-                    outcome.stop = if matches!(error.code.as_deref(), Some(STREAM_IDLE_CODE)) {
+                    outcome.stop = if matches!(
+                        error.code.as_deref(),
+                        Some(
+                            STREAM_IDLE_CODE
+                                | atomcode_kernel::stream::OPEN_TIMEOUT_CODE
+                                | crate::events::HOST_DEADLINE_CODE
+                        )
+                    ) {
                         StopReason::Timeout
                     } else {
                         StopReason::ProviderError

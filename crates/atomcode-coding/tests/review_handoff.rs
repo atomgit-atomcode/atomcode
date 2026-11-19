@@ -5,8 +5,12 @@ use atomcode_coding::{
     ProviderBuildError, StaticPluginHookSource,
 };
 use atomcode_kernel::{
-    event::StopReason, provider::LlmProvider, stream::StreamEvent, testkit::RecordingProvider,
-    tool::ToolCall,
+    event::StopReason,
+    message::Message,
+    provider::{ChatOptions, LlmProvider},
+    stream::{ProviderError, StreamEvent, OPEN_TIMEOUT_CODE},
+    testkit::RecordingProvider,
+    tool::{ToolCall, ToolDef},
 };
 use std::{
     path::Path,
@@ -16,7 +20,35 @@ use std::{
     },
 };
 
-struct Factory(Arc<RecordingProvider>);
+struct Factory(Arc<dyn LlmProvider>);
+
+struct TimeoutOnReview(Arc<RecordingProvider>);
+
+#[async_trait::async_trait]
+impl LlmProvider for TimeoutOnReview {
+    fn model_name(&self) -> &str {
+        self.0.model_name()
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
+        if messages
+            .iter()
+            .any(|message| message.text.contains("=== DIFF ==="))
+        {
+            return Err(ProviderError {
+                code: Some(OPEN_TIMEOUT_CODE.into()),
+                message: "fixture timed out waiting for model response headers".into(),
+                ..Default::default()
+            });
+        }
+        self.0.chat_stream(messages, tools, options).await
+    }
+}
 impl CodingProviderFactory for Factory {
     fn build(
         &self,
@@ -38,6 +70,7 @@ impl atomcode_review::ReviewDelegate for Delegate {
         _: &Path,
         _: String,
         _: Option<String>,
+        _: usize,
     ) -> Option<Result<atomcode_review::DelegatedReview, String>> {
         None
     }
@@ -50,7 +83,7 @@ fn git(path: &Path) {
         .unwrap()
         .success());
 }
-async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
+async fn run(clean_repo: bool, taken_over: bool, batch: bool, timeout: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     if clean_repo {
@@ -68,6 +101,15 @@ async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
                 "-qm",
                 "init"
             ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+    }
+    if timeout {
+        std::fs::write(dir.path().join("fixture.rs"), "fn fixture() {}\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "--", "fixture.rs"])
             .current_dir(dir.path())
             .status()
             .unwrap()
@@ -106,6 +148,11 @@ async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
         dir.path(),
         atomcode_capabilities::ProductDirs::new(home.path(), ".handoff-test"),
     );
+    let selected: Arc<dyn LlmProvider> = if timeout {
+        Arc::new(TimeoutOnReview(provider.clone()))
+    } else {
+        provider.clone()
+    };
     let mut runtime = CodingRuntime::start(CodingRuntimeStart {
         agent: config,
         prepare: PrepareOptions {
@@ -116,7 +163,7 @@ async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
             review_delegate: Some(delegate),
             ..Default::default()
         },
-        provider_factory: Arc::new(Factory(provider.clone())),
+        provider_factory: Arc::new(Factory(selected)),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
         image_preprocessor: None,
     })
@@ -146,10 +193,12 @@ async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
     } else {
         assert_eq!(
             reason,
-            if clean_repo {
+            if timeout {
+                StopReason::Timeout
+            } else if clean_repo {
                 StopReason::Stopped
             } else {
-                StopReason::PolicyDenied
+                StopReason::ProviderError
             }
         );
         assert_eq!(
@@ -166,18 +215,23 @@ async fn run(clean_repo: bool, taken_over: bool, batch: bool) {
 }
 #[tokio::test]
 async fn a_successful_review_returns_without_another_model_request() {
-    run(true, false, false).await;
+    run(true, false, false, false).await;
 }
 #[tokio::test]
 async fn a_failed_review_ends_without_a_retry_or_manual_fallback() {
-    run(false, false, false).await;
+    run(false, false, false, false).await;
 }
 #[tokio::test]
 async fn a_persons_takeover_restores_normal_conversation() {
-    run(true, true, false).await;
+    run(true, true, false, false).await;
 }
 
 #[tokio::test]
 async fn duplicate_review_and_unrelated_write_in_one_batch_do_not_expand_the_assignment() {
-    run(true, false, true).await;
+    run(true, false, true, false).await;
+}
+
+#[tokio::test]
+async fn a_header_timeout_ends_as_a_timeout_without_retrying_the_assignment() {
+    run(true, false, false, true).await;
 }
