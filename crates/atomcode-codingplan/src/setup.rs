@@ -1525,6 +1525,13 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .or_else(|| {
                 atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name)
             }),
+        // Display alias / description advertised by the gateway. An empty
+        // string is treated as "not sent" so a misconfigured row never
+        // blanks a picker label; `None` falls back to the raw model name.
+        alias: entry.alias.clone().filter(|a| !a.is_empty()),
+        desc: entry.desc.clone().filter(|d| !d.is_empty()),
+        alias_en: entry.alias_en.clone().filter(|a| !a.is_empty()),
+        desc_en: entry.desc_en.clone().filter(|d| !d.is_empty()),
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -2121,6 +2128,10 @@ mod tests {
             plan_available: true,
             capable_model: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             api_key: None,
         };
         let p = build_codingplan_provider(&e);

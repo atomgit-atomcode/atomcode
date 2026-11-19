@@ -2360,12 +2360,19 @@ impl atomcode_kernel::tool::Tool for ImageMutation {
             content: "image saved".into(),
             images: vec![atomcode_kernel::message::ImageContent {
                 media_type: "image/png".into(),
-                data: "cmF3".into(),
+                // A real 2×1 PNG: one that does not decode is left out.
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
             }],
             ..Default::default()
         }
     }
 }
+
+/// What the redaction puts in place of a picture: a different picture that still
+/// decodes (a PNG followed by two zero bytes) — one that does not is left out of
+/// the request.
+const REDACTED_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJgggAA";
 
 struct ImageRedaction(bool);
 #[async_trait]
@@ -2381,7 +2388,7 @@ impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for ImageRedaction {
         for result in &mut results {
             if result.call_id == "first" {
                 result.images[0].data = if self.0 {
-                    "cmVkYWN0ZWQ=".into()
+                    REDACTED_PNG.into()
                 } else {
                     String::new()
                 };
@@ -2433,11 +2440,11 @@ async fn image_tool_recovery_reuses_committed_images_without_repeating_the_mutat
             let events = app.context().only_session().unwrap().events();
             assert!(events.iter().any(|e| matches!(&e.event,
                 SessionEvent::ToolResultLogged { call_id, content, images, .. }
-                if call_id == "repeat" && content.contains("tool not executed again") && images.len() == 1 && images[0].data == "cmVkYWN0ZWQ=")));
+                if call_id == "repeat" && content.contains("tool not executed again") && images.len() == 1 && images[0].data == REDACTED_PNG)));
             let calls = provider.recorded();
             let images: Vec<_> = calls[3].0.iter().flat_map(|m| &m.images).collect();
             assert_eq!(images.len(), 2);
-            assert!(images.iter().all(|i| i.data == "cmVkYWN0ZWQ="));
+            assert!(images.iter().all(|i| i.data == REDACTED_PNG));
         }
     }
 }
@@ -2559,7 +2566,7 @@ async fn actual_content_idle_after_image_tools_recovers_twice_then_succeeds_or_s
             assert!(messages
                 .iter()
                 .flat_map(|m| &m.images)
-                .any(|i| i.data == "cmF3"));
+                .any(|i| i.data.starts_with("iVBORw0KGgo")));
             assert!(!messages
                 .iter()
                 .any(|m| m.reasoning.as_deref() == Some("inspect the saved image")));

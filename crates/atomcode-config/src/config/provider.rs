@@ -71,6 +71,23 @@ pub struct ProviderConfig {
     /// still be sent even when no switchable list is declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias advertised by the CodingPlan gateway's `models-v3`
+    /// (e.g. `"智速模式"`). Persisted verbatim so UI surfaces can show it
+    /// without re-querying the server. `None` keeps the raw model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// English alias / description advertised by the CodingPlan gateway
+    /// (`models-v3`), shown when the interface language is English; `None`
+    /// falls back to [`Self::alias`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_en: Option<String>,
+    /// Human-readable model description advertised by the CodingPlan
+    /// gateway's `models-v3`. Persisted verbatim; `None` means absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
+    /// English description advertised by the CodingPlan gateway (`models-v3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_en: Option<String>,
     /// Whether extended thinking is enabled for this provider.
     /// For Claude: sends `thinking.type = "enabled"` in request body.
     /// Default: not set (thinking disabled).
@@ -191,6 +208,20 @@ pub struct ModelProfileConfig {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias advertised by the CodingPlan gateway (`models-v3`),
+    /// carried through resolution so a folded legacy provider keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// English alias / description advertised by the CodingPlan gateway,
+    /// carried through resolution the same way as [`Self::alias`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_en: Option<String>,
+    /// Human-readable model description advertised by the CodingPlan gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
+    /// English description advertised by the CodingPlan gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_en: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,6 +309,12 @@ pub struct ResolvedModelConfig {
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias / description advertised by the CodingPlan gateway,
+    /// carried through resolution for UI surfaces.
+    pub alias: Option<String>,
+    pub desc: Option<String>,
+    pub alias_en: Option<String>,
+    pub desc_en: Option<String>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
@@ -330,6 +367,10 @@ impl ResolvedModelConfig {
             reasoning_history: self.reasoning_history.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_effort_levels: self.reasoning_effort_levels.clone(),
+            alias: self.alias.clone(),
+            desc: self.desc.clone(),
+            alias_en: self.alias_en.clone(),
+            desc_en: self.desc_en.clone(),
             thinking_enabled: self.thinking_enabled,
             thinking_budget: self.thinking_budget,
             skip_tls_verify: self.skip_tls_verify,
@@ -647,6 +688,10 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -681,6 +726,10 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: true,
@@ -764,6 +813,10 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -797,6 +850,10 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -830,6 +887,10 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
