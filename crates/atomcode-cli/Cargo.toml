@@ -62,7 +62,7 @@ atomcode-host-api = { path = "../atomcode-host-api" }
 atomcode-harness = { path = "../atomcode-harness" }
 # Grape tools are temporarily excluded from the product's model-facing catalog.
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
-atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
+atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks", "migration"] }
 atomcode-auth = { path = "../atomcode-auth" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

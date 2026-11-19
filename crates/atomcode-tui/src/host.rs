@@ -8421,21 +8421,16 @@ mod tests {
             model: "m".into(),
             reason: atomcode_harness::session::HeaderReason::Append,
         });
-        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(10_000);
-        h.absorb(&SessionEvent::AssistantChunk {
-            turn: 1,
-            round: 1,
-            delta: "a".repeat(400),
-            reasoning: true,
-        });
-        assert_eq!(
-            h.moment
-                .read()
-                .unwrap()
-                .generation
-                .rate(crate::moment::Timestamp::millis(12_000)),
-            Some(8)
-        );
+        for at in [10_000, 12_000] {
+            h.moment.write().unwrap().now = crate::moment::Timestamp::millis(at);
+            h.absorb(&SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "a".repeat(800),
+                reasoning: true,
+            });
+        }
+        assert_eq!(h.moment.read().unwrap().generation.rate(), Some(100));
         h.absorb(&SessionEvent::TurnEnd {
             turn: 1,
             stop: atomcode_kernel::event::StopReason::Stopped,

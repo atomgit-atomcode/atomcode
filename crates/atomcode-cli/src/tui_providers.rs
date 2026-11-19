@@ -374,11 +374,13 @@ fn discovery_future(
                     .into_iter()
                     .map(|model| atomcode_tui::providers::Discovered {
                         id: model.id,
+                        catalog_only: model.catalog_only,
                         window: model.context_window,
                         name: model.name,
                         max_tokens: model.max_tokens,
                         vision: model.supports_vision,
                         effort: model.reasoning_effort,
+                        catalog_default_effort: model.catalog_default_effort,
                         levels: model.reasoning_effort_levels,
                     })
                     .collect()
@@ -472,6 +474,52 @@ impl Providers for ConfigProviders {
             .map_err(said)
     }
 
+    fn enrich_models(
+        &self,
+        drafts: &[ModelDraft],
+    ) -> Option<atomcode_tui::providers::EnrichModelsFuture> {
+        use atomcode_capabilities::provider::discovery::{catalog, DiscoveredModel};
+        let account = &drafts.first()?.account;
+        if !drafts.iter().any(|d| {
+            d.window.is_none() || d.max_tokens.is_none() || d.vision.is_none() || d.levels.is_none()
+        }) {
+            return None;
+        }
+        let endpoint = self.load().account_endpoint(account)?;
+        let base_url = endpoint.base_url?;
+        let wire = endpoint.provider_type;
+        if !catalog::supports_lookup(&base_url, &wire) {
+            return None;
+        }
+        let mut drafts = drafts.to_vec();
+        Some(Box::pin(async move {
+            let entries = catalog::models(&base_url, &wire).await;
+            for draft in &mut drafts {
+                let Some(entry) = entries.iter().find(|entry| entry.id == draft.model.trim())
+                else {
+                    continue;
+                };
+                let mut metadata = DiscoveredModel {
+                    id: entry.id.clone(),
+                    name: draft.name.clone(),
+                    context_window: draft.window,
+                    max_tokens: draft.max_tokens,
+                    supports_vision: draft.vision,
+                    reasoning_effort: draft.effort.clone(),
+                    reasoning_effort_levels: draft.levels.clone(),
+                    ..Default::default()
+                };
+                catalog::fill_missing(&mut metadata, entry);
+                draft.name = metadata.name;
+                draft.window = metadata.context_window;
+                draft.max_tokens = metadata.max_tokens;
+                draft.vision = metadata.supports_vision;
+                draft.levels = metadata.reasoning_effort_levels;
+            }
+            drafts
+        }))
+    }
+
     /// The panel shows every field it owns, so each one is set or cleared —
     /// while the display name, which the panel does not edit, is kept.
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
@@ -501,7 +549,9 @@ impl Providers for ConfigProviders {
     /// listing the web UI's `/providers/discover-models` reads, by the same
     /// code (`atomcode_capabilities::provider::discovery`).
     fn discover(&self, account: &str) -> Option<atomcode_tui::providers::DiscoverFuture> {
-        use atomcode_capabilities::provider::discovery::{discovery_protocol, DiscoveryTransport};
+        use atomcode_capabilities::provider::discovery::{
+            catalog, discovery_protocol, DiscoveryTransport,
+        };
         let config = self.load();
         // The service's own models; nothing to pick from here.
         if config.account_is_codingplan_managed(account) {
@@ -510,7 +560,9 @@ impl Providers for ConfigProviders {
         let endpoint = config.account_endpoint(account)?;
         let base_url = endpoint.base_url.clone()?;
         let wire = endpoint.provider_type.clone();
-        discovery_protocol(&wire)?;
+        if discovery_protocol(&wire).is_none() && !catalog::supports_lookup(&base_url, &wire) {
+            return None;
+        }
         let transport = DiscoveryTransport {
             headers: endpoint.headers.clone(),
             api_key: endpoint.api_key.clone(),

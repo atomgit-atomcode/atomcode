@@ -4210,6 +4210,13 @@ impl SessionManager {
         if let Ok(dir) = self.artifacts_dir(id) {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
         }
+        // Its Code Rewind store only served `/rewind` for this session; nothing
+        // else reads it. Best-effort, like the artifacts: the session is gone.
+        // Named by the leased id, never by what a file says its id is; a
+        // delegated session (`<lead>~<name>`) has no store of its own.
+        if let Some(rewind) = super::rewind_retention::rewind_root_for(&self.root) {
+            super::rewind_retention::remove_session_stores(&rewind, id);
+        }
         Ok(())
     }
 
@@ -9245,6 +9252,27 @@ mod tests {
         assert!(art.exists());
         mgr.delete(&lease).unwrap();
         assert!(!art.exists(), "artifacts dir removed with the session");
+    }
+
+    #[test]
+    fn delete_removes_the_sessions_rewind_store_in_any_bucket() {
+        let user = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(SessionManager::sessions_root(user.path()).join("cwd"));
+        mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
+        // A session started in a subdirectory keeps its store under the
+        // worktree root's bucket, not its own.
+        let store = |id: &str| {
+            let dir = user.path().join("rewind").join("worktree-root").join(id);
+            std::fs::create_dir_all(dir.join("objects")).unwrap();
+            std::fs::write(dir.join("atomcode-rewind-version"), "atomcode-rewind-v1").unwrap();
+            dir
+        };
+        let own = store("s1");
+        let other = store("s2");
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.delete(&lease).unwrap();
+        assert!(!own.exists(), "the deleted session's store goes with it");
+        assert!(other.exists(), "another session's store stays");
     }
 
     #[cfg(unix)]

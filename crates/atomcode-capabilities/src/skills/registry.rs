@@ -34,6 +34,65 @@ fn ignored_discovery_directory(path: &Path) -> bool {
         })
 }
 
+/// The failure an entry has, if it is there but cannot be used.
+///
+/// **The entry itself, not what it points at.** `std::fs::metadata` FOLLOWS
+/// a symlink, so a link whose target is gone reads as "not there" — and the
+/// asset would vanish with nothing to say about it. `symlink_metadata` does
+/// not follow it, so the entry is still visible.
+///
+/// `None` when the entry is fine (or is a regular file / a directory — the
+/// caller's own probes say that).
+fn entry_failure(path: &Path) -> Option<LoadFailure> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        // The link is there; is the target? `NotFound` is the dangling case —
+        // any other error (a permission we may not read through) is not.
+        if matches!(
+            std::fs::metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Some(LoadFailure::BrokenLink);
+        }
+        return None;
+    }
+    if metadata.is_file() || metadata.is_dir() {
+        return None;
+    }
+    // A FIFO, a socket, a device — not something the loader can read.
+    Some(LoadFailure::NotARegularFile)
+}
+
+/// The reason an entry could not be used, in plain words.
+///
+/// **A fact about the ENTRY**, not the loader's verdict — the loader never
+/// treated this entry as a skill at all.
+fn failure_reason(failure: LoadFailure) -> String {
+    match failure {
+        LoadFailure::Rejected => "the loader refused it".into(),
+        LoadFailure::BrokenLink => "its symlink target is gone".into(),
+        LoadFailure::NotARegularFile => "it is not a regular file".into(),
+    }
+}
+
+/// The name an asset would have been registered under.
+///
+/// The registry's own naming rule: a flat template is named after its file
+/// STEM, a skill directory after its directory name (`skill.rs:615`,
+/// `skill.rs:655`).
+fn asset_name(asset: &Path, entry: EntryKind) -> String {
+    match entry {
+        EntryKind::FlatFile => asset
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        EntryKind::SkillDir => asset
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
 /// The caller identifies the role of a directory, including custom plugin paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemplateKind {
@@ -52,10 +111,140 @@ pub struct SkillDiagnostic {
     pub warning: bool,
 }
 
+/// How the walk found an entry — the FORM it was found in.
+///
+/// **Not the index.** A skill directory (`<dir>/SKILL.md`) and a flat `*.md`
+/// file can BOTH go into the skill index (`registry.rs:341` and
+/// `registry.rs:353`), so the index cannot tell them apart. A caller that
+/// matched a flat-file candidate against a directory skill's record would be
+/// borrowing a fact about a different asset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A skill directory: found at its `SKILL.md`.
+    SkillDir,
+    /// A flat template file: found at the file itself.
+    FlatFile,
+}
+
+/// One entry the registry's walk found.
+///
+/// **The walk's own record.** A caller that needs to know what the registry
+/// actually saw — not what a second traversal would find — reads this. Two
+/// traversals of the same disk can disagree (a symlink, an ignored
+/// directory, a depth limit), so a caller that re-derives the answer is
+/// answering a different question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredTemplate {
+    /// The path the walk found it at: the `SKILL.md` for a skill directory,
+    /// the file itself for a flat command template.
+    pub path: PathBuf,
+    /// The ASSET this entry is — the thing a person would call "this skill".
+    ///
+    /// **A skill directory is its BUNDLE directory, not its `SKILL.md`.** Two
+    /// bundles may ship the same `SKILL.md` (a symlink to one file); they are
+    /// two assets that happen to share a body. Matching the file alone would
+    /// report both as one.
+    ///
+    /// For a flat template file this is the file itself.
+    pub asset: PathBuf,
+    /// The name it was registered under.
+    pub name: String,
+    /// Which index it went into.
+    pub kind: TemplateKind,
+    /// The FORM it was found in — a skill directory or a flat file. The
+    /// index cannot say this: both forms go into the skill index.
+    pub entry: EntryKind,
+    /// The scanned root this entry was found under — the root EXACTLY as
+    /// handed to the registry.
+    ///
+    /// A caller enumerates a tree by its root; this says which root found
+    /// the entry, so "the assets under THIS root" is a question the registry
+    /// answers.
+    pub root: PathBuf,
+    /// Whether a later same-name entry displaced it.
+    ///
+    /// **A same-name entry displaces the earlier one even when the two
+    /// definitions are identical** — the registry keeps the later one and
+    /// says nothing, because nothing is wrong. A caller reporting "which one
+    /// is in effect" needs to know the earlier one lost, and only the
+    /// registry knows.
+    pub replaced: bool,
+    /// The diagnostics the registry recorded for THIS asset: its reason and
+    /// whether it is a warning.
+    ///
+    /// **On the asset, not on the file.** A flat candidate and a skill
+    /// directory can sit at the same path; a diagnostic about one is not
+    /// about the other.
+    pub diagnostics: Vec<(String, bool)>,
+}
+
+/// Why an asset the walk found could not be loaded.
+///
+/// **Whose words the reason is.** A `Rejected` failure is the LOADER's own
+/// words: it read the file and refused it. The other two are facts about the
+/// ENTRY — the loader never treated it as a skill at all, so putting its
+/// words in its mouth would send the person to fix the wrong thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadFailure {
+    /// The loader read it and refused it.
+    Rejected,
+    /// The entry is a symlink whose target is gone.
+    BrokenLink,
+    /// The entry is there, but it is not a regular file (a FIFO, a socket).
+    NotARegularFile,
+}
+
+/// An asset the walk found but could NOT load.
+///
+/// **The asset's identity, not the file's.** A skill directory that fails to
+/// parse is still the asset that directory is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedAsset {
+    /// The path the walk found it at: the `SKILL.md` for a skill directory,
+    /// the file itself for a flat template.
+    pub path: PathBuf,
+    /// The ASSET this is — the bundle directory for a skill directory, the
+    /// file itself for a flat template.
+    pub asset: PathBuf,
+    /// The name it would have been registered under.
+    pub name: String,
+    /// The FORM it was found in.
+    pub entry: EntryKind,
+    /// The scanned root it was found under — the root EXACTLY as handed to
+    /// the registry.
+    pub root: PathBuf,
+    /// Why it could not be loaded.
+    pub failure: LoadFailure,
+    /// The reason, in the registry's own words. Meaningful for
+    /// [`LoadFailure::Rejected`].
+    pub reason: String,
+}
+
 #[derive(Default)]
 struct SkillIndex {
     directories: Vec<PathBuf>,
     diagnostics: Vec<SkillDiagnostic>,
+    /// Every entry the walk found, in the order it found them.
+    discovered: Vec<DiscoveredTemplate>,
+    /// Every asset the walk found but could NOT load — a parse failure, a
+    /// dangling symlink, an entry that is not a regular file.
+    ///
+    /// **Separate from `discovered`**, because a failed asset has no
+    /// registration: it has no name in any index, and no "was it
+    /// displaced" question. It is still an ASSET the walk found, so the
+    /// report must be able to say so.
+    failed: Vec<FailedAsset>,
+    /// Which discovery record is the CURRENT winner of each skill name.
+    ///
+    /// **The slot, not the path.** The same file can be found more than once
+    /// (the same root listed twice, one directory reached through two
+    /// roots), and the same path can sit in both indexes — so looking a
+    /// record up by path finds the wrong one. The slot says which record
+    /// actually holds the name.
+    skill_records: BTreeMap<String, usize>,
+    /// The same, for the command index. A **separate** map: the two indexes
+    /// never compete, so one index's loss says nothing about the other's.
+    command_records: BTreeMap<String, usize>,
     skills: BTreeMap<String, Arc<Skill>>,
     commands: BTreeMap<String, Arc<Skill>>,
 }
@@ -188,6 +377,25 @@ impl SkillRegistry {
         self.read().diagnostics.clone()
     }
 
+    /// Every entry the walk found, in the order it found them.
+    ///
+    /// **The walk's own record.** A caller that needs to know what the registry
+    /// actually saw reads this, rather than walking the disk a second time and
+    /// hoping the two walks agree.
+    pub fn discovered(&self) -> Vec<DiscoveredTemplate> {
+        self.read().discovered.clone()
+    }
+
+    /// Every asset the walk found but could NOT load.
+    ///
+    /// **The walk's own record.** A file that failed to parse, a dangling
+    /// symlink, an entry that is not a regular file — each is an asset the
+    /// walk found and could not use, and a caller reporting on those trees
+    /// needs to know about it.
+    pub fn failed(&self) -> Vec<FailedAsset> {
+        self.read().failed.clone()
+    }
+
     pub fn take_new_warnings(&self) -> Vec<String> {
         let warnings: Vec<_> = self
             .read()
@@ -211,7 +419,22 @@ impl SkillRegistry {
         });
     }
 
-    fn insert_parsed(&self, parsed: Result<Parsed, String>, path: &Path, kind: TemplateKind) {
+    /// Record one asset the walk found.
+    ///
+    /// `path` is where the walk found it (`<dir>/SKILL.md` for a skill
+    /// directory, the file itself for a flat template); `asset` is what it
+    /// IS — the bundle directory for a skill directory, the file itself for
+    /// a flat template. `root` is the scanned root it was found under, the
+    /// root EXACTLY as handed to the registry.
+    fn insert_parsed(
+        &self,
+        parsed: Result<Parsed, String>,
+        path: &Path,
+        asset: &Path,
+        root: &Path,
+        kind: TemplateKind,
+        entry: EntryKind,
+    ) {
         match parsed {
             Ok(parsed) => {
                 let mut index = self.write();
@@ -221,12 +444,21 @@ impl SkillRegistry {
                 // A bad `args:` value is a warning, not a load failure: the
                 // skill still loads with its default, so the typo is reported
                 // without dropping the command from the menu.
+                //
+                // **The warning belongs to the ASSET**, so it is recorded
+                // twice: once in the flat diagnostic list (the runtime's
+                // view, unchanged) and once ON the discovery record (the
+                // asset's own view — a flat candidate and a skill directory
+                // can sit at the same path, and a diagnostic about one is
+                // not about the other).
+                let mut asset_diagnostics: Vec<(String, bool)> = Vec::new();
                 for warning in parsed.warnings {
                     index.diagnostics.push(SkillDiagnostic {
                         path: path.to_path_buf(),
-                        reason: warning,
+                        reason: warning.clone(),
                         warning: true,
                     });
+                    asset_diagnostics.push((warning, true));
                 }
                 // Compare loaded definitions, not current disk contents: a file
                 // may have changed since the earlier source was scanned.
@@ -242,21 +474,101 @@ impl SkillRegistry {
                         && previous.user_invocable == skill.user_invocable
                         && previous.args_requirement == skill.args_requirement
                 });
-                let previous = match kind {
-                    TemplateKind::Skill => index.skills.insert(name, Arc::new(skill)),
-                    TemplateKind::Command => index.commands.insert(name, Arc::new(skill)),
+                // The SLOT that holds this name now — and, before it, the one
+                // that used to. The slot is what says which record actually
+                // won: the same file can be found twice (the same root listed
+                // twice, one directory reached through two roots), and the
+                // same path can sit in BOTH indexes — so looking the loser up
+                // by path would find the wrong record.
+                //
+                // Read BEFORE the slot is moved below.
+                let displaced = match kind {
+                    TemplateKind::Skill => index.skill_records.get(&name).copied(),
+                    TemplateKind::Command => index.command_records.get(&name).copied(),
                 };
+                let previous = match kind {
+                    TemplateKind::Skill => index.skills.insert(name.clone(), Arc::new(skill)),
+                    TemplateKind::Command => index.commands.insert(name.clone(), Arc::new(skill)),
+                };
+                // The walk's own record of what it found. The report reads it
+                // instead of walking the disk a second time.
+                let record = index.discovered.len();
+                index.discovered.push(DiscoveredTemplate {
+                    path: path.to_path_buf(),
+                    asset: asset.to_path_buf(),
+                    name: name.clone(),
+                    kind,
+                    entry,
+                    root: root.to_path_buf(),
+                    replaced: false,
+                    diagnostics: asset_diagnostics,
+                });
+                match kind {
+                    TemplateKind::Skill => {
+                        index.skill_records.insert(name.clone(), record);
+                    }
+                    TemplateKind::Command => {
+                        index.command_records.insert(name.clone(), record);
+                    }
+                }
+                // The slot MOVED, so the record that used to hold this name
+                // lost it — even when the new record is the SAME file (the
+                // same root listed twice) and even when the two definitions
+                // are identical. Both are displacements: the earlier record
+                // is not the one in effect any more.
+                //
+                // The registry keeps the later one and says nothing, because
+                // nothing is wrong — but a caller reporting "which one is in
+                // effect" needs to know the earlier one lost, and only the
+                // registry knows.
                 if let Some(previous) = previous {
+                    // The OVERRIDE DIAGNOSTIC's condition is unchanged: an
+                    // identical definition is not a problem, so it is not
+                    // reported. The same path re-loaded is not an override
+                    // either.
                     if previous.source_path != source && !same_definition {
+                        let reason = format!("overridden by {}", source.display());
                         index.diagnostics.push(SkillDiagnostic {
                             path: previous.source_path.clone(),
-                            reason: format!("overridden by {}", source.display()),
+                            reason: reason.clone(),
                             warning: false,
                         });
+                        // The override belongs to the ASSET that LOST — the
+                        // bundle directory, not the `SKILL.md` — so a flat
+                        // candidate can never borrow it. It goes on the
+                        // DISPLACED record, which is the one that lost.
+                        if let Some(slot) = displaced {
+                            if let Some(displaced_entry) = index.discovered.get_mut(slot) {
+                                displaced_entry.diagnostics.push((reason, false));
+                            }
+                        }
+                    }
+                }
+                if let Some(slot) = displaced {
+                    if let Some(displaced_entry) = index.discovered.get_mut(slot) {
+                        displaced_entry.replaced = true;
                     }
                 }
             }
-            Err(error) => self.diagnose(path, error, true),
+            Err(error) => {
+                // A load FAILURE is still an asset the walk found: the file is
+                // there, the walk reached it, and the loader refused it. The
+                // report has to be able to say so — by ASSET identity, so a
+                // flat candidate never borrows a directory skill's failure.
+                //
+                // The diagnostic itself is UNCHANGED — the runtime's view of
+                // a failed load is exactly what it always was.
+                self.diagnose(path, error.clone(), true);
+                self.write().failed.push(FailedAsset {
+                    path: path.to_path_buf(),
+                    asset: asset.to_path_buf(),
+                    name: asset_name(asset, entry),
+                    entry,
+                    root: root.to_path_buf(),
+                    failure: LoadFailure::Rejected,
+                    reason: error,
+                });
+            }
         }
     }
 
@@ -275,7 +587,7 @@ impl SkillRegistry {
     }
 
     pub fn load_template_dir(&self, dir: &Path, namespace: Option<&str>, kind: TemplateKind) {
-        self.scan_skill_dir(dir, namespace, 0, kind, &mut BTreeSet::new());
+        self.scan_skill_dir(dir, dir, namespace, 0, kind, &mut BTreeSet::new());
     }
 
     /// Scan `dir` for skills, recursing into grouping subdirectories. A subdir holding a
@@ -285,9 +597,16 @@ impl SkillRegistry {
     /// slash-commands are TOP-LEVEL only (depth 0) — a skill's own `*.md` are resources,
     /// not separate commands. Dependency/cache trees are not groups. Ancestry
     /// detects real symlink cycles; depth independently bounds grouping traversal.
+    ///
+    /// `root` is the scanned root this walk started from — the root EXACTLY
+    /// as handed to the registry. It is carried down through the recursion
+    /// so every discovery record can say WHICH root found it: a caller
+    /// enumerates a tree by its root, and "the assets under THIS root" is a
+    /// question only the registry can answer.
     fn scan_skill_dir(
         &self,
         dir: &Path,
+        root: &Path,
         namespace: Option<&str>,
         depth: usize,
         kind: TemplateKind,
@@ -339,7 +658,14 @@ impl SkillRegistry {
         for p in entries {
             if p.is_file() {
                 if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
-                    self.insert_parsed(parse_skill_file(&p, namespace), &p, kind);
+                    self.insert_parsed(
+                        parse_skill_file(&p, namespace),
+                        &p,
+                        &p,
+                        root,
+                        kind,
+                        EntryKind::FlatFile,
+                    );
                 }
             } else if p.is_dir() {
                 // Explicit roots remain usable, including .system bundles and
@@ -353,14 +679,74 @@ impl SkillRegistry {
                     self.insert_parsed(
                         parse_skill_dir(&p, &skill_md, namespace),
                         &skill_md,
+                        &p,
+                        root,
                         TemplateKind::Skill,
+                        EntryKind::SkillDir,
                     );
                 } else {
-                    self.scan_skill_dir(&p, namespace, depth + 1, kind, ancestors);
+                    // The `SKILL.md` entry is there, but it is not a regular
+                    // file: a DANGLING symlink (the target is gone), a FIFO, a
+                    // socket. `metadata` FOLLOWS the link, so a link whose
+                    // target is gone reads as "not there" — and the asset
+                    // would vanish, with nothing to say about it.
+                    //
+                    // **The loader never treated it as a skill**, so this is
+                    // not the loader's story to tell: it is a fact about the
+                    // ENTRY.
+                    if let Some(failure) = entry_failure(&skill_md) {
+                        self.record_failed(
+                            &skill_md,
+                            &p,
+                            root,
+                            EntryKind::SkillDir,
+                            failure,
+                            failure_reason(failure),
+                        );
+                        continue;
+                    }
+                    self.scan_skill_dir(&p, root, namespace, depth + 1, kind, ancestors);
+                }
+            } else if let Some(failure) = entry_failure(&p) {
+                // The entry itself is a dangling symlink (or not a regular
+                // file). At depth 0 a flat `*.md` would have been a command
+                // template; deeper down it is nothing the loader loads. Either
+                // way it is an asset the walk found and could not use.
+                if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
+                    self.record_failed(
+                        &p,
+                        &p,
+                        root,
+                        EntryKind::FlatFile,
+                        failure,
+                        failure_reason(failure),
+                    );
                 }
             }
         }
         ancestors.remove(&identity);
+    }
+
+    /// Record an asset the walk found but could not use.
+    fn record_failed(
+        &self,
+        path: &Path,
+        asset: &Path,
+        root: &Path,
+        entry: EntryKind,
+        failure: LoadFailure,
+        reason: String,
+    ) {
+        let mut index = self.write();
+        index.failed.push(FailedAsset {
+            path: path.to_path_buf(),
+            asset: asset.to_path_buf(),
+            name: asset_name(asset, entry),
+            entry,
+            root: root.to_path_buf(),
+            failure,
+            reason,
+        });
     }
 
     /// Resolve a skill by its registry key, falling back to bare-name lookup.

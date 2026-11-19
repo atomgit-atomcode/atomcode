@@ -136,6 +136,7 @@ pub fn tree(screen: &Screen, extra: &[&str]) -> Result<ConfigTree, String> {
 /// and the panel that wanted it says so rather than pretending.
 #[derive(Default, Clone)]
 pub struct Ports {
+    pub migration: Option<Arc<dyn crate::migration::Migration>>,
     /// The configuration, as this launcher reads and writes it.
     pub settings: Option<Arc<dyn crate::settings::Settings>>,
     /// The provider accounts and models, likewise.
@@ -211,6 +212,11 @@ pub async fn mount_with(
     if let Some(plugins) = ports.plugins {
         let _ = ctx
             .provide::<crate::plugin::PluginsSvc>(plugins)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(migration) = ports.migration {
+        let _ = ctx
+            .provide::<crate::plugin::MigrationSvc>(migration)
             .map_err(|e| e.to_string())?;
     }
     if let Some(setup) = ports.setup {

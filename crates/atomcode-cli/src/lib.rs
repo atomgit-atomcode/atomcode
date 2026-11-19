@@ -31,6 +31,7 @@ pub mod browser_cmd;
 pub mod desktop;
 pub mod git_auth_cmd;
 pub mod grape_connect;
+pub mod import_cmd;
 mod mcp_setup;
 pub mod project_setup;
 pub mod relay;
@@ -41,6 +42,7 @@ pub mod tui_git_auth;
 pub mod tui_grape;
 pub mod tui_login;
 pub mod tui_mcp;
+pub mod tui_migration;
 pub mod tui_onboarding;
 pub mod tui_opening;
 pub mod tui_openrouter;
@@ -391,6 +393,11 @@ pub mod tui_front {
                     config_path.clone(),
                 )),
                 plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir.clone())),
+                migration: Some(Arc::new(crate::tui_migration::DiskMigration::new(
+                    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
+                    dirs.clone(),
+                    config_path.clone(),
+                ))),
                 setup: Some(crate::tui_setup::DiskSetup::new(
                     working_dir,
                     dirs.clone(),

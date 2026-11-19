@@ -441,6 +441,7 @@ pub enum Msg<'a> {
     /// Checkpoint details are logged, not expanded in the panel.
     RewindCodeFailed,
     RewindPanelTurnNoFiles,
+    RewindPanelTurnNoCheckpoint,
     RewindLegendChoose,
     RewindLegendContinue,
     RewindLegendGo,
@@ -535,6 +536,7 @@ pub enum Msg<'a> {
     CmdAboutMouse,
     /// `/provider`'s model picker: the listing had nothing the account lacks.
     ProviderDiscoverNothingNew,
+    ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
@@ -2531,5 +2533,21 @@ pub enum Msg<'a> {
         releases: usize,
         highlights: &'a [String],
         more: bool,
+    },
+    CmdAboutImport,
+    NoMigrationPort,
+    /// The sheet's title: the assets another agent left behind.
+    MigrationReportTitle,
+    /// The sheet when the chosen source has no assets.
+    MigrationNoAssets,
+    /// Picking which source to look at, when more than one has assets.
+    MigrationPickSource,
+    MigrationSourceUnavailable,
+    /// How many assets a source has.
+    MigrationAssetsCount,
+    /// The sheet's summary line: which source, how many assets.
+    MigrationSummaryLine {
+        source: &'a str,
+        count: usize,
     },
 }

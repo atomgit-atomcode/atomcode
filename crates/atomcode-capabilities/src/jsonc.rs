@@ -17,10 +17,22 @@
 ///
 /// Trailing commas remain invalid — this is comment tolerance, not full JSON5.
 pub fn strip_comments(input: &str) -> String {
+    normalize(input, false)
+}
+
+/// Blank comments and trailing commas in files that opt in to JSONC.
+#[cfg(feature = "migration")]
+pub(crate) fn strip_comments_and_trailing_commas(input: &str) -> String {
+    normalize(input, true)
+}
+
+fn normalize(input: &str, allow_trailing_commas: bool) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     let mut in_string = false;
+    let mut previous = None;
+    let mut trailing_comma = None;
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -43,6 +55,8 @@ pub fn strip_comments(input: &str) -> String {
 
         match b {
             b'"' => {
+                previous = Some(b);
+                trailing_comma = None;
                 in_string = true;
                 out.push(b);
                 i += 1;
@@ -68,6 +82,18 @@ pub fn strip_comments(input: &str) -> String {
                 }
             }
             _ => {
+                if allow_trailing_commas && !b.is_ascii_whitespace() {
+                    if matches!(b, b']' | b'}') {
+                        if let Some(comma) = trailing_comma {
+                            out[comma] = b' ';
+                        }
+                    }
+                    // Let the parser reject commas without a preceding value.
+                    trailing_comma = (b == b','
+                        && previous.is_some_and(|b| !matches!(b, b'[' | b'{' | b':' | b',')))
+                    .then_some(i);
+                    previous = Some(b);
+                }
                 out.push(b);
                 i += 1;
             }
@@ -85,6 +111,30 @@ pub fn strip_comments(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn trailing_commas_are_blanked_outside_strings_only() {
+        let input = r#"{"array": ["quote\",]", 2, /* comment */], "text": ",}",}"#;
+        let normalized = strip_comments_and_trailing_commas(input);
+        assert_eq!(normalized.len(), input.len());
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(value["array"][0], "quote\",]");
+        assert_eq!(value["array"][1], 2);
+        assert_eq!(value["text"], ",}");
+        assert!(serde_json::from_str::<Value>(&strip_comments(input)).is_err());
+    }
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn commas_that_do_not_follow_a_value_still_fail() {
+        for input in [r#"{,}"#, r#"[ , ]"#, r#"[1,,]"#, r#"{"value": ,}"#] {
+            assert!(
+                serde_json::from_str::<Value>(&strip_comments_and_trailing_commas(input)).is_err(),
+                "{input}"
+            );
+        }
+    }
 
     /// The trap: a URL's `//` sits inside a string and must survive untouched.
     #[test]

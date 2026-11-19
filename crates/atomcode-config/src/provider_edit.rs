@@ -170,6 +170,11 @@ pub fn put_account(document: &mut DocumentMut, id: &str, patch: &AccountPatch<'_
     Ok(())
 }
 
+pub(crate) fn disable_account_api_key_fallback(document: &mut DocumentMut, id: &str) {
+    let table = sub_table(document, "provider_accounts", id);
+    set_key(table, "disable_api_key_fallback", value(true));
+}
+
 /// Write one model profile under `[models.<id>]`.
 ///
 /// Only the keys a person can reach from the panel are touched: a `max_tokens`

@@ -40,7 +40,13 @@ const server = createServer(async (req, res) => {
   if (path === '/live') { res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.write('data: {"type":"state","running":false}\n\n'); clients.add(res); req.on('close', () => clients.delete(res)); return; }
   if (path === '/providers/discover-models' || path === '/provider-accounts') {
     let body = ''; for await (const chunk of req) body += chunk;
-    if (path === '/providers/discover-models') { discoveries.push(JSON.parse(body)); return json({ models: [{ id: 'listed-model' }] }); }
+    if (path === '/providers/discover-models') {
+      discoveries.push(JSON.parse(body));
+      return json({ models: [{
+        id: 'listed-model', catalog_only: true, context_window: 1000000, max_tokens: 131072,
+        supports_vision: true, reasoning_effort_levels: ['high'], catalog_default_effort: 'high',
+      }] });
+    }
     writes.push(JSON.parse(body)); return json({ account: 'taotoken', models: ['taotoken/manual-model'], config });
   }
   if (path === '/config') return json(config);
@@ -132,9 +138,21 @@ try {
     await form.getByRole('button', { name: 'Fetch available models' }).click();
     const picker = page.locator('.model-picker-modal');
     await picker.getByText('listed-model', { exact: true }).waitFor();
+    await picker.getByText('models.dev suggestions · account access unverified', { exact: true }).waitFor();
     assert.equal(discoveries.at(-1).type, 'anthropic');
     assert.equal(discoveries.at(-1).base_url, connections[1].base_urls[1]);
-    await picker.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await picker.getByText('Default level high', { exact: true }).waitFor();
+    await picker.getByText('listed-model', { exact: true }).click();
+    await picker.getByRole('button', { name: 'Add selected (1)', exact: true }).click();
+    const window = form.getByRole('textbox', { name: 'Context budget' });
+    assert.equal(await window.inputValue(), '1M');
+    await window.fill('64K');
+    await form.locator('.reasoning-toggle').click();
+    const effort = form.locator('.reasoning-fields .custom-select-trigger');
+    await effort.click();
+    await form.locator('.custom-select-option').getByText('high', { exact: true }).click();
+    await effort.click();
+    await form.locator('.custom-select-option').getByText('Endpoint default', { exact: true }).click();
     await model.fill('manual-model');
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'no horizontal overflow');
     await page.screenshot({ path: `/tmp/atomcode-provider-protocol-${width}.png` });
@@ -145,7 +163,7 @@ try {
     assert.equal(writes.at(-1).provider, 'taotoken');
     assert.equal(writes.at(-1).protocol, 'anthropic');
     assert.equal(writes.at(-1).base_url, connections[1].base_urls[1]);
-    assert.equal(writes.at(-1).models[0].model, 'manual-model');
+    assert.deepEqual(writes.at(-1).models[0], { model: 'manual-model', context_window: 64000 });
   }
   assert.deepEqual(errors, []);
   console.log('PASS: vendor protocol entry, plan preservation, custom URLs, discovery/save consistency, desktop/mobile');

@@ -10645,6 +10645,7 @@ mod tests {
         base_url: String,
     ) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            api_key_is_resolved: false,
             headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("test-key".into()),

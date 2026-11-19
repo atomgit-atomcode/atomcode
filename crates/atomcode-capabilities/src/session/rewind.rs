@@ -108,7 +108,7 @@ fn disk_floor_ok(available: Option<u64>, floor: u64) -> bool {
     matches!(available, Some(a) if a >= floor)
 }
 
-fn dir_size_bytes(path: &Path) -> u64 {
+pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {

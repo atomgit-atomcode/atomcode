@@ -11,7 +11,7 @@ import { TaskSpecifications } from './TaskSpecifications';
 import { ApiCallError, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
-import { processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
+import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
 import { BrowseActivityStatus } from './BrowseActivityStatus';
 import { browseActiveTurn } from '../lib/browseTurn';
@@ -631,20 +631,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [compacting, setCompacting] = useState(false);
-  const [summaryCount, setSummaryCount] = useState<number | null>(null);
   const summaryCountRef = useRef<number | null>(null);
   function resetSummaryCount() {
     summaryCountRef.current = null;
-    setSummaryCount(null);
   }
   function updateSummaryCount(count?: number, record = false) {
     const next = nextContextSummary(summaryCountRef.current, count, record);
     summaryCountRef.current = next.count;
-    setSummaryCount(next.count);
     if (next.notice) pushCommandNotice(t('context.summaryRecorded', { count: next.count! }), true);
   }
 
-  const latestSummaryIndex = messages.map(message => message.contextSummary === true).lastIndexOf(true);
   const [processExpanded, setProcessExpanded] = useState<Record<string, boolean>>({});
   const processReadIntent = useRef(false);
   const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
@@ -4258,9 +4254,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
               {(tokens.total / 1000).toFixed(1)}k tokens
             </span>
           )}
-          {summaryCount != null && summaryCount > 0 && (latestSummaryIndex >= 0
-            ? <button class="footer-tokens footer-summary-count" type="button" onClick={() => navigateTurn(latestSummaryIndex)}>{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</button>
-            : <span class="footer-tokens">{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</span>)}
         </div>
         <div class="input-footer-actions">
           <ModeSelector
@@ -5142,11 +5135,7 @@ function AssistantMessageView({
 }) {
   const t = useT();
   const text = messageText(msg);
-  const isError =
-    text.includes('[错误:') ||
-    text.includes('[连接错误:') ||
-    text.includes('[Error:') ||
-    text.includes('[Connection error:');
+  const isError = hasChatErrorNotice(text);
   const streaming = isLast && busy;
   // 三点 loading 覆盖整个回合：思考（无可见输出）和文本输出阶段都显示，
   // 直到回合结束（busy 变 false）才消失。不再使用闪烁光标。

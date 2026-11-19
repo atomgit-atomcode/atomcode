@@ -562,12 +562,40 @@ fn resolve_skill_dirs_at(
     if !opts.tools {
         return (Vec::new(), Vec::new(), Vec::new());
     }
-    if let Some(dirs) = &opts.skill_dirs {
-        return (dirs.clone(), dirs.clone(), Vec::new());
+    resolve_skill_dirs_from(
+        &cfg.extra_skill_dirs,
+        &cfg.working_dir,
+        &cfg.dirs,
+        home,
+        opts.skill_dirs.as_deref(),
+    )
+}
+
+/// The skill roots, from the inputs a HOST has.
+///
+/// **The same rule [`resolve_skill_dirs_at`] applies**, reading these five
+/// inputs instead of a config and a prepare-options struct. One body, two
+/// callers: the runtime resolves the roots it will load, and the migration
+/// report resolves the roots the runtime will load. If they were two
+/// bodies, they would drift — and the report would claim a skill is in
+/// effect that the runtime does not read (or the other way round).
+///
+/// `explicit` is the driver's own override (`PrepareOptions::skill_dirs`):
+/// given one, ONLY it is used — not even the standard directories. That is
+/// what an override means, and a host must honour it the same way.
+pub fn resolve_skill_dirs_from(
+    extra_dirs: &[String],
+    project: &std::path::Path,
+    product_dirs: &atomcode_capabilities::ProductDirs,
+    home: Option<&std::path::Path>,
+    explicit: Option<&[PathBuf]>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    if let Some(dirs) = explicit {
+        return (dirs.to_vec(), dirs.to_vec(), Vec::new());
     }
     let mut warnings = Vec::new();
     let mut extra = Vec::new();
-    for value in &cfg.extra_skill_dirs {
+    for value in extra_dirs {
         let path = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
             let Some(home) = home else {
                 warnings.push(
@@ -586,7 +614,7 @@ fn resolve_skill_dirs_at(
             if path.is_absolute() {
                 path
             } else {
-                cfg.working_dir.join(path)
+                project.join(path)
             }
         };
         extra.push(path.canonicalize().unwrap_or(path));
@@ -594,8 +622,8 @@ fn resolve_skill_dirs_at(
     let mut dirs = extra.clone();
     dirs.extend(standard_skill_dirs(SkillRoots {
         home: home.unwrap_or(std::path::Path::new(".")),
-        project: &cfg.working_dir,
-        dirs: &cfg.dirs,
+        project,
+        dirs: product_dirs,
     }));
     let mut seen = std::collections::BTreeSet::new();
     dirs.reverse();
@@ -833,6 +861,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string()),
         );
+        host_only_tools.push("git_status".into());
     }
     let request_user_input_enabled = opts.tools
         && opts.request_user_input

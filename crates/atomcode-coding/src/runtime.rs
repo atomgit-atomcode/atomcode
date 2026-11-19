@@ -15458,6 +15458,7 @@ mod tests {
 
     fn tier_provider(model: &str, rank: i64) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            api_key_is_resolved: false,
             headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("key".into()),

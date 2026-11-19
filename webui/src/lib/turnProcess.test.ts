@@ -53,6 +53,14 @@ test('warnings and archived answer previews cannot be mistaken for a complete fi
   assert.equal(turnProcesses(archived).get(1)!.foldable, false);
 });
 
+test('a connection loss keeps the partial turn expanded in both languages', () => {
+  for (const prefix of ['WebUI 与 AtomCode 服务通信失败', 'WebUI communication with the AtomCode service failed']) {
+    const messages = fixture();
+    messages[2].parts = [{ kind: 'text', text: `partial reply\n\n[${prefix}: interrupted]` }];
+    assert.equal(turnProcesses(messages).get(1)!.foldable, false);
+  }
+});
+
 
 test('steering input does not collapse an earlier part of the running turn', () => {
   const messages = fixture();

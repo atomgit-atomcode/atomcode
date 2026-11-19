@@ -288,6 +288,40 @@ fn normalize_models(models: &mut [NewModelRequest]) -> Result<(), axum::response
     Ok(())
 }
 
+pub(crate) async fn enrich_new_models(models: &mut [NewModelRequest], base_url: &str, wire: &str) {
+    use atomcode_capabilities::provider::discovery::{catalog, DiscoveredModel};
+    if !models.iter().any(|m| {
+        m.context_window.is_none()
+            || m.max_tokens.is_none()
+            || m.supports_vision.is_none()
+            || m.reasoning_effort_levels.is_none()
+    }) {
+        return;
+    }
+    let entries = catalog::models(base_url, wire).await;
+    for model in models {
+        let Some(entry) = entries.iter().find(|entry| entry.id == model.model.trim()) else {
+            continue;
+        };
+        let mut metadata = DiscoveredModel {
+            id: entry.id.clone(),
+            name: model.display_name.clone(),
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            supports_vision: model.supports_vision,
+            reasoning_effort: model.reasoning_effort.clone(),
+            reasoning_effort_levels: model.reasoning_effort_levels.clone(),
+            ..Default::default()
+        };
+        catalog::fill_missing(&mut metadata, entry);
+        model.display_name = metadata.name;
+        model.context_window = metadata.context_window;
+        model.max_tokens = metadata.max_tokens;
+        model.supports_vision = metadata.supports_vision;
+        model.reasoning_effort_levels = metadata.reasoning_effort_levels;
+    }
+}
+
 fn bad_request(code: &str, message: impl Into<String>) -> axum::response::Response {
     coded_json_error(StatusCode::BAD_REQUEST, code, message, false).into_response()
 }
@@ -343,9 +377,6 @@ fn model_inputs<'a>(models: &'a [NewModelRequest], set_default: bool) -> Vec<Mod
 /// POST /provider-accounts — an account and its models in one write.
 pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) -> impl IntoResponse {
     if let Err(refusal) = validate_new_models(&req.models) {
-        return refusal;
-    }
-    if let Err(refusal) = normalize_models(&mut req.models) {
         return refusal;
     }
     if let Err(refusal) = refuse_gateway(req.base_url.as_deref()) {
@@ -409,6 +440,18 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
         }
         None => (preset.id, false),
     };
+    let wire = connection
+        .map(|choice| choice.provider_type)
+        .unwrap_or(preset.provider_type);
+    let catalog_endpoint = if endpoint.is_empty() {
+        preset.default_base_url.unwrap_or_default()
+    } else {
+        endpoint
+    };
+    enrich_new_models(&mut req.models, catalog_endpoint, wire.wire()).await;
+    if let Err(refusal) = normalize_models(&mut req.models) {
+        return refusal;
+    }
     let models = model_inputs(&req.models, req.set_default);
     match ProviderBook::default_book().create_account(
         &AccountInput {

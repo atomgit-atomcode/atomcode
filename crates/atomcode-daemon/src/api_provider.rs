@@ -17,12 +17,12 @@ use crate::{
 // here is the HTTP surface and resolving a saved account's transport.
 pub(crate) use atomcode_capabilities::provider::discovery::discovery_protocol;
 use atomcode_capabilities::provider::discovery::{
-    discovery_url, fetch_discovery_body, parse_discovered_models, DiscoveryRequestError,
-    DiscoveryTransport, DISCOVERY_TIMEOUT,
+    discover, discovery_url, DiscoveryError, DiscoveryRequestError, DiscoveryTransport,
 };
 #[cfg(test)]
 use atomcode_capabilities::provider::discovery::{
-    normalize_discovered_models, DISCOVERY_MAX_RESPONSE_BYTES,
+    fetch_discovery_body, normalize_discovered_models, parse_discovered_models,
+    DISCOVERY_MAX_RESPONSE_BYTES,
 };
 
 #[derive(Debug)]
@@ -346,19 +346,7 @@ pub(crate) struct CreateAccountModelsRequest {
     pub models: Vec<CreateAccountModelRequest>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct CreateAccountModelRequest {
-    pub selection_id: Option<String>,
-    pub model: String,
-    pub display_name: Option<String>,
-    pub context_window: Option<usize>,
-    pub max_tokens: Option<usize>,
-    pub supports_vision: Option<bool>,
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    #[serde(default)]
-    pub reasoning_effort_levels: Option<Vec<String>>,
-}
+pub(crate) type CreateAccountModelRequest = crate::api_provider_accounts::NewModelRequest;
 
 /// Saved transport settings may only be reused for the endpoint they belong to.
 /// Otherwise a caller could name an existing provider while supplying an
@@ -561,24 +549,12 @@ fn insert_account_models(
 /// the existing provider's resolved credential.
 pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> impl IntoResponse {
     let provider_type = req.provider_type.trim().to_ascii_lowercase();
-    let Some(protocol) = discovery_protocol(&provider_type) else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "This provider protocol has no supported model listing; enter the model manually",
-        )
-        .into_response();
-    };
-    let url = match discovery_url(&req.base_url, &provider_type) {
-        Ok(url) => url,
-        Err(error) => {
-            return json_error(StatusCode::BAD_REQUEST, error.to_string()).into_response()
-        }
-    };
     let mut transport = req
         .provider_name
         .as_deref()
         .and_then(|name| {
             let config = load_config().ok()?;
+            let url = discovery_url(&req.base_url, &provider_type).ok()?;
             stored_discovery_transport(&config, name, &provider_type, &url)
         })
         .unwrap_or_default();
@@ -589,24 +565,24 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
     if let Some(headers) = req.headers {
         transport.headers = headers;
     }
-    let body = match fetch_discovery_body(url, protocol, &transport, DISCOVERY_TIMEOUT).await {
-        Ok(body) => body,
-        Err(error @ DiscoveryRequestError::OllamaUnavailable { .. }) => {
+    let models = match discover(&req.base_url, &provider_type, &transport).await {
+        Ok(models) => models,
+        Err(DiscoveryError::Request(error @ DiscoveryRequestError::OllamaUnavailable { .. })) => {
             return json_error(StatusCode::BAD_GATEWAY, error.ollama_guidance().unwrap())
                 .into_response()
         }
-        Err(DiscoveryRequestError::Timeout) => {
+        Err(DiscoveryError::Request(DiscoveryRequestError::Timeout)) => {
             return json_error(StatusCode::GATEWAY_TIMEOUT, "Model discovery timed out")
                 .into_response()
         }
-        Err(DiscoveryRequestError::ResponseTooLarge) => {
+        Err(DiscoveryError::Request(DiscoveryRequestError::ResponseTooLarge)) => {
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "model listing exceeds the 4 MiB response limit",
             )
             .into_response()
         }
-        Err(DiscoveryRequestError::UpstreamStatus(status)) => {
+        Err(DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(status))) => {
             let suffix = if matches!(status, 401 | 403) {
                 "; check the API key"
             } else {
@@ -618,17 +594,24 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
             )
             .into_response();
         }
-        Err(DiscoveryRequestError::Transport) => {
+        Err(DiscoveryError::Request(DiscoveryRequestError::Transport)) => {
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "Could not reach the model endpoint",
             )
             .into_response()
         }
-    };
-    let models = match parse_discovered_models(&provider_type, &body) {
-        Ok(models) => models,
-        Err(_) => {
+        Err(DiscoveryError::Unsupported) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "This provider protocol has no supported model listing; enter the model manually",
+            )
+            .into_response()
+        }
+        Err(DiscoveryError::BadUrl(error)) => {
+            return json_error(StatusCode::BAD_REQUEST, error).into_response()
+        }
+        Err(DiscoveryError::NotAListing) => {
             let message = if provider_type == "ollama" {
                 "Ollama model listing has no valid models array"
             } else {
@@ -644,28 +627,23 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
 /// update. The account credential is reused in place and never returned.
 pub(crate) async fn create_account_models(
     Path(account): Path<String>,
-    Json(req): Json<CreateAccountModelsRequest>,
+    Json(mut req): Json<CreateAccountModelsRequest>,
 ) -> impl IntoResponse {
-    // An account in the new schema is written by the book the terminal panel
-    // writes through, as a document patch. A legacy `[providers.*]` entry is
-    // upgraded below first — once, and then it is an account like any other.
     if let Ok(config) = load_config() {
+        if !account_is_managed(&config, &account) {
+            if let Some(endpoint) = config.account_endpoint(&account) {
+                if let Some(base_url) = endpoint.base_url.as_deref() {
+                    crate::api_provider_accounts::enrich_new_models(
+                        &mut req.models,
+                        base_url,
+                        &endpoint.provider_type,
+                    )
+                    .await;
+                }
+            }
+        }
         if config.provider_accounts.contains_key(&account) {
-            let mut models: Vec<_> = req
-                .models
-                .into_iter()
-                .map(|m| crate::api_provider_accounts::NewModelRequest {
-                    selection_id: m.selection_id,
-                    model: m.model,
-                    display_name: m.display_name,
-                    context_window: m.context_window,
-                    max_tokens: m.max_tokens,
-                    supports_vision: m.supports_vision,
-                    reasoning_effort: m.reasoning_effort,
-                    reasoning_effort_levels: m.reasoning_effort_levels,
-                })
-                .collect();
-            return crate::api_provider_accounts::add_models(&account, &mut models);
+            return crate::api_provider_accounts::add_models(&account, &mut req.models);
         }
     }
     let mut created = Vec::new();
@@ -767,6 +745,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         .unwrap_or_else(|| default_context_window_for(&req.provider_type));
 
     let provider = ProviderConfig {
+        api_key_is_resolved: false,
         headers: Default::default(),
         provider_type: req.provider_type,
         api_key: req.api_key,
