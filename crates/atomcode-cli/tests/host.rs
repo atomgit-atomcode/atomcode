@@ -2203,7 +2203,11 @@ impl HostConfig for Models {
         }
         let mut config = CodingAgentConfig::new(
             "key",
-            "https://example.test/v1",
+            if model == "gateway-test" {
+                "https://llm-api.atomgit.com/v1"
+            } else {
+                "https://example.test/v1"
+            },
             model,
             &self.0,
             atomcode_coding::config::product_dirs_from_env(),
@@ -2295,6 +2299,16 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
     let session = connection.session.clone();
     connection.commands.send(message("hello")).unwrap();
     through_turn(&mut connection).await;
+    let last_model = || {
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .clone()
+    };
     let apps = front_end.apps_fed();
 
     assert!(matches!(
@@ -2319,16 +2333,43 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
     );
     connection.commands.send(message("which model")).unwrap();
     through_turn(&mut connection).await;
-    assert_eq!(
-        env.script
-            .requests
-            .lock()
-            .unwrap()
-            .last()
-            .map(|(m, _)| m.clone()),
-        Some("glm-5".to_string())
-    );
+    assert_eq!(last_model(), "glm-5");
 
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignOut {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Readiness {
+                session: session.clone(),
+            })
+            .await,
+        Ok(atomcode::host::readiness_for(None))
+    );
+    connection
+        .commands
+        .send(message("still on my external model"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(last_model(), "glm-5");
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "gateway-test".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
     assert_eq!(
         connection
             .control
@@ -2357,6 +2398,21 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
         asked,
         "signed out: nothing reached a model"
     );
+
+    // The gateway is offline, but a configured external model is still selectable.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "external".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("carry on")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(last_model(), "external");
 
     assert_eq!(
         connection

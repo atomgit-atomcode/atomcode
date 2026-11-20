@@ -814,7 +814,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "重新加载完成；已加载的指令来源可在 /status 查看。轻量 skill 重载不刷新指令正文".into(),
-        Msg::SignedOutHint => "已退出登录。/login 重新登录 · /provider 选择模型服务".into(),
+        Msg::SignedOutHint => "已退出 AtomGit。/model 切换模型 · /login 重新登录 · /provider 配置模型服务".into(),
         Msg::SignedOut => "已退出登录。".into(),
         Msg::SignedIn => "已登录".into(),
 

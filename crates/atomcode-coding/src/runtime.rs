@@ -8455,6 +8455,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        // AtomGit logout revokes the gateway login. An independently
+                        // authenticated endpoint keeps serving the current session.
+                        // Check the live configuration here, ordered with model switches.
+                        if reason == ProviderUnavailableReason::SignedOut
+                            && resources.as_ref().is_some_and(|runtime| {
+                                !atomcode_config::endpoints::is_codingplan_llm_gateway(
+                                    &runtime.config.base_url,
+                                )
+                            })
+                        {
+                            let _ = done.send(Ok(RuntimeGeneration(generation)));
+                            continue;
+                        }
                         if !agent_available && provider_unavailable_reason == Some(reason) {
                             if let Some(intervention) = pending_policy_intervention.take() {
                                 let _ = runtime_event_tx.send(

@@ -870,7 +870,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "Reload complete. See /status for loaded instruction sources; a lightweight skill reload keeps instruction text unchanged.".into(),
-        Msg::SignedOutHint => "Signed out. /login to sign in · /provider to select a provider".into(),
+        Msg::SignedOutHint => "Signed out of AtomGit. /model to switch models · /login to sign in · /provider to configure providers".into(),
         Msg::SignedOut => "Signed out.".into(),
         Msg::SignedIn => "signed in".into(),
 
