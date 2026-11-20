@@ -3832,8 +3832,7 @@ impl Host {
         let count = key.as_deref().unwrap_or_default().chars().count();
         match panel.form.as_mut() {
             Some(crate::providers::Form::Account(form)) => form.key_len = count,
-            Some(crate::providers::Form::Model(form)) => form.key_len = count,
-            None => {}
+            Some(crate::providers::Form::Model(_)) | None => {}
         }
         let mut m = self.moment.write().expect("moment poisoned");
         if m.providers_panel.is_some() {

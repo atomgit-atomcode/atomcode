@@ -378,11 +378,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  管理 Provider：添加、编辑、删除或设置全局默认。按 Esc 取消。\n".into(),
         Msg::ProviderWizardCancelled =>
             "（已取消）".into(),
-        Msg::ProviderMenuAdd => "添加".into(),
         Msg::ProviderMenuAddDesc => "新建 Provider 配置".into(),
         Msg::ProviderMenuEdit => "编辑".into(),
         Msg::ProviderMenuEditDesc => "修改已有 Provider 配置".into(),
-        Msg::ProviderMenuDelete => "删除".into(),
         Msg::ProviderMenuDeleteDesc => "删除已有 Provider 配置".into(),
         Msg::ProviderMenuSetDefault => "设为全局默认".into(),
         Msg::ProviderMenuSetDefaultDesc => "设置默认 Provider，并切换当前会话".into(),

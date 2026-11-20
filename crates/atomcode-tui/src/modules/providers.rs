@@ -1013,6 +1013,13 @@ fn account_field(
             let caret = if form.key_len == 0 { 0 } else { value.len() };
             (t(Msg::FieldKey).into_owned(), value, focused, true, caret)
         }
+        AccountField::More => (
+            t(Msg::ProviderMoreSettings).into_owned(),
+            String::new(),
+            focused,
+            false,
+            0,
+        ),
     }
 }
 
@@ -1024,11 +1031,6 @@ fn model_field(
     caps: crate::caps::Caps,
 ) -> (String, String, bool, bool, usize) {
     match field {
-        ModelField::Key => {
-            let value = dots(form.key_len, false, caps);
-            let caret = value.len();
-            (t(Msg::FieldKey).into_owned(), value, focused, true, caret)
-        }
         ModelField::Model => (
             pt(PMsg::ProviderPanelFieldModel).into_owned(),
             form.model.clone(),
@@ -1217,21 +1219,20 @@ fn hint(key: &str, msg: Msg<'_>, yield_rank: u8) -> Hint {
 /// takes, so a key that is listed is a key that does something.
 fn legend(view: &ProvidersView, panel: &Panel) -> Vec<Hint> {
     match &panel.form {
-        Some(Form::Account(form)) if form.is_ollama(view) => vec![
-            hint("⏎", Msg::ProviderContinue, 0),
-            // The only way to ask again on this form: it stays on a narrow
-            // terminal with the main action.
-            hint("Ctrl+F", Msg::ProviderDiscoverHint, 0),
-            hint("Ctrl+O", Msg::ProviderAdvanced, 2),
+        // On the 「更多设置 ▸」 row Enter opens the rest of the form; on every
+        // other row of a connection form it saves.
+        Some(Form::Account(form)) if form.focus == AccountField::More => vec![
+            hint("⏎", Msg::ProviderAdvanced, 0),
+            hint("↑↓", Msg::LegendNextField, 2),
             hint("esc", Msg::LegendCancel, 0),
         ],
-        Some(Form::Account(form)) if form.preset.is_some() => {
+        Some(Form::Account(form)) if form.preset.is_some() || form.is_ollama(view) => {
             let mut keys = vec![
                 hint("⏎", Msg::ProviderContinue, 0),
-                hint("Ctrl+O", Msg::ProviderAdvanced, 2),
+                hint("↑↓", Msg::LegendNextField, 2),
                 hint("esc", Msg::LegendCancel, 0),
             ];
-            if form.fields(view).contains(&AccountField::Protocol) {
+            if form.focus == AccountField::Protocol {
                 keys.insert(1, hint("←→", Msg::LegendChangeValue, 1));
             }
             keys
@@ -1438,8 +1439,6 @@ fn legend_buttons(
                 "F2" => Some(KeyPress::plain(Key::F(2))),
                 "Ctrl+E" => Some(KeyPress::ctrl('e')),
                 "Ctrl+D" => Some(KeyPress::ctrl('d')),
-                "Ctrl+O" => Some(KeyPress::ctrl('o')),
-                "Ctrl+F" => Some(KeyPress::ctrl('f')),
                 _ => None,
             };
             (text_of(hint), press)
@@ -1677,7 +1676,9 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("ollama serve"));
         assert!(text.contains("11434"));
-        assert!(drawn(&m, 40, 40).contains("Ctrl+F"));
+        // Retry is leaving the address (or the page's own retry row after
+        // saving): no key of its own for the footer to carry.
+        assert!(!drawn(&m, 40, 40).contains("Ctrl+F"));
         // Editing an address clears its diagnostic, but must keep retry discoverable.
         let mut edited = m.clone();
         let Some(Form::Account(form)) = edited.providers_panel.as_mut().unwrap().form.as_mut()
@@ -1685,7 +1686,7 @@ mod tests {
             panic!("account");
         };
         form.discovery = None;
-        assert!(drawn(&edited, 40, 40).contains("Ctrl+F"));
+        assert!(drawn(&edited, 40, 40).contains("⏎"));
         assert!(
             rows.iter()
                 .filter(|row| matches!(row, Row::DiscoveryMessage(_)))
@@ -1846,7 +1847,6 @@ mod tests {
     fn the_manual_model_caret_stays_near_its_label_on_wide_terminals() {
         let v = view();
         let mut form = ModelForm::add(&v, "deepseek").unwrap();
-        form.advanced = false;
         form.focus = ModelField::Model;
         let at = form
             .fields(&v)
@@ -1866,8 +1866,10 @@ mod tests {
                 .map(|span| span.width())
                 .sum();
             assert!(line.spans.iter().any(|span| span.style.reverse));
+            // The form lines its labels up on the widest one (capped), so the
+            // caret sits a fixed distance from the label at every width.
             assert!(
-                caret_column <= 12,
+                caret_column <= LEAD + LABEL_MAX + 2,
                 "caret too far from model label: {line:?}"
             );
         }
@@ -1888,19 +1890,15 @@ mod tests {
             let mut account = AccountForm::connect(&v, v.account("deepseek").unwrap());
             account.focus = AccountField::Key;
             account.key_len = len;
-            let mut model = ModelForm::add(&v, &v.open_accounts()[0]).unwrap();
-            model.focus = ModelField::Key;
-            model.key_len = len;
-            for form in [Form::Account(account), Form::Model(model)] {
+            // A key is asked for on the connection only: a model form has no
+            // key field any more.
+            for form in [Form::Account(account)] {
                 let field = match &form {
                     Form::Account(f) => f
                         .fields(&v)
                         .iter()
                         .position(|field| *field == AccountField::Key),
-                    Form::Model(f) => f
-                        .fields(&v)
-                        .iter()
-                        .position(|field| *field == ModelField::Key),
+                    Form::Model(_) => None,
                 }
                 .expect("key field is offered");
                 let panel = Panel {
@@ -1971,7 +1969,6 @@ mod tests {
     #[test]
     fn the_output_row_shows_exact_budget_and_validation_hint() {
         let mut form = ModelForm::add(&view(), "deepseek").unwrap();
-        form.advanced = true;
         form.focus = ModelField::Output;
         form.max_tokens = Some(4096);
         let render = |form: &ModelForm, width| {
@@ -2033,9 +2030,16 @@ mod tests {
         assert!(text.contains(&t(Msg::FieldKey).to_string()), "{text}");
         assert!(text.contains("https://"), "{text}");
         assert!(text.contains("OpenAI"), "{text}");
-        let (col, row) = button_hit(&m, KeyPress::ctrl('o'));
+        // The rest of the form is a row to walk to, not a key to know.
+        assert!(text.contains("更多设置 ▸"), "{text}");
+        assert!(!text.contains("Ctrl+O"), "{text}");
+        // And the footer's Enter is still clickable.
+        let (col, row) = button_hit(&m, KeyPress::plain(crate::surface::Key::Enter));
         let vp = Viewport::new(Rect::sized(120, 24), &m);
-        assert_eq!(action_at(&m, &vp, col, row), Some(KeyPress::ctrl('o')));
+        assert_eq!(
+            action_at(&m, &vp, col, row),
+            Some(KeyPress::plain(crate::surface::Key::Enter))
+        );
     }
 
     #[test]

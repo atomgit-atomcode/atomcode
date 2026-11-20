@@ -810,6 +810,9 @@ pub enum AccountField {
     Protocol,
     Endpoint,
     Key,
+    /// The last row of a short form: Enter shows every field. A row, not a
+    /// key: what it opens is listed where the eye already is.
+    More,
 }
 
 /// Adding an account, or changing one.
@@ -952,12 +955,13 @@ impl AccountForm {
                 if self.needs_key(view) {
                     fields.push(AccountField::Key);
                 }
+                fields.push(AccountField::More);
                 return fields;
             }
             return if self.needs_key(view) {
-                vec![AccountField::Key]
+                vec![AccountField::Key, AccountField::More]
             } else {
-                vec![AccountField::Endpoint]
+                vec![AccountField::Endpoint, AccountField::More]
             };
         }
         if self.editing.is_none() {
@@ -1024,7 +1028,7 @@ impl AccountForm {
         match self.focus {
             AccountField::Name => self.name.len(),
             AccountField::Endpoint => self.endpoint.len(),
-            AccountField::Protocol | AccountField::Key => 0,
+            AccountField::Protocol | AccountField::Key | AccountField::More => 0,
         }
     }
 
@@ -1106,7 +1110,7 @@ impl AccountForm {
         match self.focus {
             AccountField::Name => Some((&mut self.name, caret)),
             AccountField::Endpoint => Some((&mut self.endpoint, caret)),
-            AccountField::Protocol | AccountField::Key => None,
+            AccountField::Protocol | AccountField::Key | AccountField::More => None,
         }
     }
 }
@@ -1191,7 +1195,6 @@ pub fn parse_output_tokens(text: &str) -> Option<usize> {
 /// Which field of the model form has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelField {
-    Key,
     Model,
     Vision,
     Effort,
@@ -1232,11 +1235,9 @@ pub struct ModelForm {
     pub levels: Vec<bool>,
     /// Which level Space toggles.
     pub level: usize,
-    pub key_len: usize,
     pub focus: ModelField,
     /// Where the next character goes in the focused text field.
     pub caret: usize,
-    pub advanced: bool,
     pub known_levels: Option<Vec<String>>,
     pub discovered_model: Option<String>,
     pub name: Option<String>,
@@ -1294,10 +1295,8 @@ impl ModelForm {
             effort: None,
             levels: vec![true; view.efforts().len()],
             level: 0,
-            key_len: 0,
             focus: ModelField::Model,
             caret: 0,
-            advanced: true,
             known_levels: None,
             discovered_model: None,
             name: None,
@@ -1332,10 +1331,8 @@ impl ModelForm {
             effort: row.effort.clone(),
             levels,
             level: 0,
-            key_len: 0,
             caret: row.model.len(),
             focus: ModelField::Model,
-            advanced: true,
             known_levels: None,
             discovered_model: None,
             name: None,
@@ -1397,36 +1394,10 @@ impl ModelForm {
         &self.account
     }
 
-    /// Whether this form also has to ask for a credential: a new model on an
-    /// account that has none stored yet.
-    pub fn needs_key(&self, view: &ProvidersView) -> bool {
-        self.editing.is_none()
-            && view.account(self.account_id()).is_some_and(|a| {
-                !a.has_key
-                    && !a.managed
-                    && view
-                        .protocols()
-                        .iter()
-                        .find(|protocol| protocol.label == a.protocol)
-                        .is_none_or(|protocol| protocol.needs_key)
-            })
-    }
-
+    /// The fields, in the order Tab walks them: all of them, always. A key is
+    /// the connection's, changed on the connection row.
     pub fn fields(&self, view: &ProvidersView) -> Vec<ModelField> {
-        if !self.advanced {
-            return if self.needs_key(view) {
-                vec![ModelField::Key, ModelField::Model]
-            } else {
-                vec![ModelField::Model]
-            };
-        }
-        let mut out = Vec::new();
-        if self.needs_key(view) {
-            out.push(ModelField::Key);
-        }
-        out.push(ModelField::Model);
-        out.push(ModelField::Vision);
-        out.push(ModelField::Effort);
+        let mut out = vec![ModelField::Model, ModelField::Vision, ModelField::Effort];
         if !view.efforts().is_empty() {
             out.push(ModelField::Levels);
         }
@@ -2329,22 +2300,23 @@ fn account_key(
     let previous_protocol = form.protocol;
     let previous_endpoint = form.endpoint.clone();
     let previous_focus = form.focus;
-    let mut discover = false;
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
             leave_form(panel, secret);
             return Step::Stay;
         }
-        (Key::Char('o'), Mods::CTRL) => {
-            form.advanced = !form.advanced;
+        // Enter is save — except on the 「更多设置 ▸」 row, where it shows the
+        // rest of the form, landing on the first field that was not there.
+        (Key::Enter, _) if form.focus == AccountField::More => {
+            let short = form.fields(view);
+            form.advanced = true;
             form.focus = form
                 .fields(view)
-                .first()
-                .copied()
-                .unwrap_or(AccountField::Key);
+                .into_iter()
+                .find(|field| !short.contains(field))
+                .unwrap_or(AccountField::Endpoint);
             form.caret = form.focused_len();
         }
-        (Key::Char('f'), Mods::CTRL) if form.is_ollama(view) => discover = true,
         (Key::Enter, _) => return save_account(view, panel, &form, secret),
         (Key::Tab, _) | (Key::Down, _) => form.step_focus(view, true),
         (Key::BackTab, _) | (Key::Up, _) => form.step_focus(view, false),
@@ -2405,10 +2377,16 @@ fn account_key(
         // Editing immediately invalidates a request, before a replacement is sent.
         form.discovery = None;
     }
-    discover |= form.protocol != previous_protocol
+    // Leaving the address asks again whenever there is no good listing for
+    // it — none yet, or one that failed (`ollama serve` not started, say):
+    // that is how a person retries here, with no key of its own to learn.
+    let discover = form.protocol != previous_protocol
         || (previous_focus == AccountField::Endpoint
             && form.focus != previous_focus
-            && form.discovery.is_none());
+            && form
+                .discovery
+                .as_ref()
+                .is_none_or(|d| matches!(d.result, Some(Err(_)))));
     let step = if discover {
         form.start_discovery(view)
     } else {
@@ -2494,11 +2472,6 @@ fn model_key(
             leave_form(panel, secret);
             return Step::Stay;
         }
-        (Key::Char('o'), Mods::CTRL) => {
-            form.advanced = !form.advanced;
-            form.focus = ModelField::Model;
-            form.caret = form.model.len();
-        }
         (Key::Enter, _) => return save_model(view, panel, &form, secret),
         (Key::Tab, _) | (Key::Down, _) => form.step_focus(view, true),
         (Key::BackTab, _) | (Key::Up, _) => form.step_focus(view, false),
@@ -2533,19 +2506,16 @@ fn model_key(
                 *caret = text.len();
             }
         }
-        // Space is the confirm for the fields that are toggles: it is what a
-        // person reaches for on a checkbox, and none of those fields take text.
+        // One meaning per key: ←→ change a value, Space turns the bracketed
+        // reasoning level on or off — on that row only. Elsewhere it is a
+        // space in a text field, or nothing: a second key that also changed
+        // values was a second thing to learn about every row.
         (Key::Char(' '), Mods::NONE) => match form.focus {
             ModelField::Levels => {
                 if let Some(on) = form.levels.get_mut(form.level) {
                     *on = !*on;
                 }
             }
-            ModelField::Vision => form.cycle_vision(true),
-            ModelField::Effort => form.cycle_effort(view, true),
-            ModelField::Window if form.window_typed.is_none() => form.cycle_window(true),
-            ModelField::Window => {}
-            ModelField::Output if form.max_tokens_typed.is_none() => form.cycle_output(true),
             _ => {
                 if let Some((text, caret)) = form.text_and_caret() {
                     insert_at(text, caret, ' ');
@@ -2553,26 +2523,17 @@ fn model_key(
             }
         },
         (Key::Backspace, _) => {
-            if form.focus == ModelField::Key {
-                secret.pop();
-                form.key_len = secret.chars().count();
-            } else if let Some((text, caret)) = form.text_and_caret() {
+            if let Some((text, caret)) = form.text_and_caret() {
                 backspace_at(text, caret);
             }
         }
         (Key::Delete, _) => {
-            if form.focus == ModelField::Key {
-                secret.clear();
-                form.key_len = 0;
-            } else if let Some((text, caret)) = form.text_and_caret() {
+            if let Some((text, caret)) = form.text_and_caret() {
                 delete_at(text, caret);
             }
         }
         (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
-            if form.focus == ModelField::Key {
-                secret.push(c);
-                form.key_len = secret.chars().count();
-            } else if form.focus == ModelField::Window {
+            if form.focus == ModelField::Window {
                 form.type_window(c);
             } else if form.focus == ModelField::Output {
                 form.type_output(c);
@@ -2628,7 +2589,6 @@ fn save_model(
             None => {
                 let mut form = form.clone();
                 form.focus = ModelField::Output;
-                form.advanced = true;
                 form.caret = typed.len();
                 panel.form = Some(Form::Model(form));
                 return Step::Stay;
@@ -2650,7 +2610,7 @@ fn save_model(
         effort: form.effort.clone(),
         levels: form.declared_levels(view),
         default: false,
-        key: (form.needs_key(view) && !secret.trim().is_empty()).then(|| secret.trim().to_string()),
+        key: None,
     };
     let id = form.editing.clone();
     leave_form(panel, secret);
@@ -2697,11 +2657,6 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
             true
         }
         Some(Form::Model(form)) => {
-            if form.focus == ModelField::Key {
-                secret.push_str(&line);
-                form.key_len = secret.chars().count();
-                return true;
-            }
             // The window row takes a paste the way it takes typing — one
             // character at a time through the same filter, which is also what
             // starts a custom window when a preset has the keyboard.
@@ -3157,7 +3112,8 @@ mod tests {
                 vec![
                     AccountField::Protocol,
                     AccountField::Endpoint,
-                    AccountField::Key
+                    AccountField::Key,
+                    AccountField::More
                 ]
             );
             let mut panel = Panel {
@@ -3584,10 +3540,10 @@ mod tests {
     fn output_budget_presets_and_automatic_are_saved() {
         let view = view();
         let mut form = ModelForm::add(&view, &view.open_accounts()[0]).unwrap();
-        form.advanced = false;
-        assert!(!form.fields(&view).contains(&ModelField::Output));
-        form.advanced = true;
-        assert!(form.fields(&view).contains(&ModelField::Output));
+        assert!(
+            form.fields(&view).contains(&ModelField::Output),
+            "every field, always"
+        );
         form.model = "vendor-x".into();
         form.focus = ModelField::Output;
         let mut panel = Panel::new();
@@ -3597,7 +3553,7 @@ mod tests {
             &view,
             &mut panel,
             &mut secret,
-            &[press(Key::Right), press(Key::Char(' '))],
+            &[press(Key::Right), press(Key::Right)],
         );
         let Step::SaveModel { draft, .. } =
             run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
@@ -3672,7 +3628,6 @@ mod tests {
                     panic!("keeps the form")
                 };
                 assert_eq!(form.focus, ModelField::Output);
-                assert!(form.advanced);
                 assert_eq!(form.max_tokens_typed.as_deref(), Some(input));
                 // A deliberate choice of automatic recovers from invalid input.
                 run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
@@ -3752,7 +3707,7 @@ mod tests {
             &view,
             &mut panel,
             &mut secret,
-            &[press(Key::Right), press(Key::Char(' '))],
+            &[press(Key::Right), press(Key::Right)],
         );
         let Some(Form::Model(form)) = panel.form.clone() else {
             panic!("the form stays open");
@@ -3899,10 +3854,14 @@ mod tests {
         };
         let first = form.discovery.as_ref().unwrap().id;
         form.discovery.as_mut().unwrap().result = Some(Err("Run ollama serve".into()));
-        assert!(matches!(
-            key(&view, &mut panel, &mut secret, ctrl('f')),
-            Step::DiscoverDraft { .. }
-        ));
+        form.focus = AccountField::Endpoint;
+        assert!(
+            matches!(
+                key(&view, &mut panel, &mut secret, press(Key::Tab)),
+                Step::DiscoverDraft { .. }
+            ),
+            "leaving the address after a failure asks again"
+        );
         let Some(Form::Account(form)) = panel.form.as_mut() else {
             panic!("account draft");
         };
@@ -3971,15 +3930,12 @@ mod tests {
         }
         // A model form's account is fixed by the page it opened on: there is no
         // other target to carry a typed key to.
-        let mut form = ModelForm::add(&view, "local").unwrap();
+        let form = ModelForm::add(&view, "local").unwrap();
         assert_eq!(form.account_id(), "local");
-        form.advanced = false;
-        assert_eq!(form.fields(&view), vec![ModelField::Key, ModelField::Model]);
-        Arc::make_mut(&mut view.accounts)[1].protocol = "Ollama".into();
         assert_eq!(
-            form.fields(&view),
-            vec![ModelField::Model],
-            "local models do not ask for a credential"
+            form.fields(&view).first(),
+            Some(&ModelField::Model),
+            "a key is the connection's: the model form never asks for one"
         );
     }
 
@@ -3990,7 +3946,10 @@ mod tests {
         offer.configured = false;
         offer.has_key = false;
         let form = AccountForm::connect(&view, &offer);
-        assert_eq!(form.fields(&view), vec![AccountField::Key]);
+        assert_eq!(
+            form.fields(&view),
+            vec![AccountField::Key, AccountField::More]
+        );
         assert_eq!(form.focus, AccountField::Key);
         assert_eq!(form.editing, None);
         let mut panel = Panel {
@@ -4654,5 +4613,63 @@ mod tests {
             panic!("an add");
         };
         assert!(!draft.use_now, "the next one only adds");
+    }
+
+    #[test]
+    fn a_form_key_means_one_thing_on_every_row() {
+        let view = view();
+        let mut secret = String::new();
+        // A short connection form ends on 「更多设置 ▸」: Enter there opens the
+        // rest, landing on the first field that was not shown; elsewhere it saves.
+        let mut offer = account("deepseek", 0);
+        offer.configured = false;
+        let mut panel = Panel {
+            form: Some(Form::Account(AccountForm::connect(&view, &offer))),
+            ..Panel::new()
+        };
+        assert_eq!(
+            run(
+                &view,
+                &mut panel,
+                &mut secret,
+                &[press(Key::Down), press(Key::Enter)]
+            ),
+            Step::Stay
+        );
+        let Some(Form::Account(form)) = &panel.form else {
+            panic!("still the form");
+        };
+        assert!(form.advanced);
+        assert!(!form.fields(&view).contains(&AccountField::More));
+        assert_eq!(
+            form.focus,
+            AccountField::Name,
+            "on the first field it had not shown"
+        );
+        // Ctrl+O and Ctrl+F do nothing any more.
+        let before = panel.clone();
+        run(&view, &mut panel, &mut secret, &[ctrl('o'), ctrl('f')]);
+        assert_eq!(panel, before);
+
+        // On a model form Space changes nothing but a reasoning level.
+        let mut form = ModelForm::add(&view, "deepseek").unwrap();
+        form.focus = ModelField::Vision;
+        let mut panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        run(&view, &mut panel, &mut secret, &[press(Key::Char(' '))]);
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("still the form");
+        };
+        assert_eq!(
+            form.vision, None,
+            "Space is not a second way to change a value"
+        );
+        run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("still the form");
+        };
+        assert_eq!(form.vision, Some(true), "←→ is");
     }
 }

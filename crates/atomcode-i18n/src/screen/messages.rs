@@ -535,28 +535,15 @@ pub enum Msg<'a> {
     CmdAboutErrors,
     CmdAboutShowInject,
     CmdAboutMouse,
-    /// `/provider`'s model picker: the listing had nothing the account lacks.
-    ProviderDiscoverNothingNew,
     ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
     ProviderDiscovering,
-    /// …beside an empty model field: the key that opens it.
-    ProviderDiscoverHint,
     ProviderAdvanced,
     ProviderManualAdd,
-    ProviderBatchCount {
-        n: usize,
-    },
-    ProviderWillUse,
-    ProviderSetUse,
-    ProviderBatchChoose,
     ProviderNotProvided,
-    ProviderEdit,
     ProviderContinue,
-    ProviderConnectUse,
-    ProviderSaveOnly,
     ProviderConnected,
     ProviderAvailable,
     ProviderCapabilitiesUnknown,
@@ -572,12 +559,6 @@ pub enum Msg<'a> {
         id: &'a str,
     },
 
-    /// …its keys.
-    ProviderPickKeys,
-    /// …its filter line.
-    ProviderPickFilter {
-        query: &'a str,
-    },
     /// …the listing could not be had, and why.
     ProviderDiscoverFailed {
         why: &'a str,
@@ -1978,16 +1959,13 @@ pub enum Msg<'a> {
     ProviderFormAddModelTo {
         account: &'a str,
     },
-    ProviderFormAddModel,
     ProviderModelCount {
         n: usize,
     },
     ProviderHasKey,
     ProviderNoKey,
     ProviderManaged,
-    ProviderUnconfigured,
     ProviderVision,
-    ArmedDelete,
     FieldName,
     FieldProtocol,
     FieldKey,
@@ -1999,7 +1977,6 @@ pub enum Msg<'a> {
     ContextBudgetSource,
     /// Routed responses do not guarantee the next request uses the same model.
     AutoContextBudgetNote,
-    FieldUseAfterSaving,
     VisionYes,
     VisionNo,
     EffortUnsupported,
@@ -2025,8 +2002,6 @@ pub enum Msg<'a> {
     /// The arrows on the custom window field: leave it for the presets.
     LegendBackToPresets,
     LegendPressAgainToDelete,
-    LegendSeeItsModels,
-    LegendSwitchToIt,
     LegendChange,
 
     // ── the providers panel: list → detail (2026-11 redesign) ──
@@ -2065,6 +2040,8 @@ pub enum Msg<'a> {
     LegendRetry,
     /// Enter on a server row while the person has no model: add it and use it.
     LegendAddAndUse,
+    /// The last row of a short connection form: Enter shows every field.
+    ProviderMoreSettings,
     /// An added model whose add-and-use switch is on its way.
     ProviderSwitching,
     /// An added model whose switch was refused: Enter tries again.
