@@ -328,17 +328,12 @@ irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall
 atomcode
 ```
 
-首次运行会有一个向导帮你配置模型：
+首次启动时，如果尚未配置模型，终端会请你选择模型接入方式：
 
-```
-Welcome to AtomCode! Let's set up your first provider.
+1. **使用 AtomGit 账号登录**，扫码授权并领取免费 Coding Plan 额度。
+2. **连接已有的模型服务**，使用第三方或自建服务，按需填写 API 地址和密钥。
 
-Select provider:
-  [1] Claude (Anthropic)
-  [2] OpenAI
-  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
-  [4] Ollama (local)
-```
+用方向键切换，按 Enter 确认。等待 AtomGit 授权时，按 Esc 可返回选择。模型可用后会显示聊天输入框。
 
 ### 2. 配置
 
@@ -551,7 +546,6 @@ atomcode --prompt-file task.md
 | `/reload` | 从磁盘重新加载 `~/.atomcode/config.toml` |
 | `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
-| `/welcome` | 重新运行引导向导 |
 | `/language` | 切换显示语言及默认 Git 提交消息语言 |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |

@@ -2999,15 +2999,9 @@ async fn mcp_act_disable_writes_config_and_withdraws() {
     );
 }
 
-/// Every reason a provider cannot serve has an answer for the person, and only
-/// a cause this build can actually fix names a command.
-///
-/// The table exists so a new reason cannot be added without deciding what the
-/// screen says about it — the same rule the error table above follows. The
-/// `None` arms are the point: a command named here is one the person will run,
-/// so naming one that cannot help is worse than saying nothing.
+/// Reason text should help users recover without launching a sign-in flow on their behalf.
 #[test]
-fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix() {
+fn provider_readiness_explains_recovery_without_automatically_signing_in() {
     use atomcode::host::readiness_for;
 
     assert_eq!(
@@ -3019,28 +3013,20 @@ fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix(
         }
     );
 
-    let cases = [
-        // Nothing is run on its own: the sentence names /login and /provider.
-        (ProviderUnavailableReason::NotConfigured, None),
-        (
-            ProviderUnavailableReason::AuthenticationRequired,
-            Some("login"),
-        ),
-        (ProviderUnavailableReason::UnsupportedBuild, None),
-    ];
-    for (reason, fix) in cases {
+    for reason in [
+        ProviderUnavailableReason::NotConfigured,
+        ProviderUnavailableReason::AuthenticationRequired,
+        ProviderUnavailableReason::UnsupportedBuild,
+    ] {
         match readiness_for(Some(reason.clone())) {
-            HostReply::Readiness {
-                ready,
-                why,
-                fix: named,
-            } => {
+            HostReply::Readiness { ready, why, fix } => {
                 assert!(!ready, "{reason:?}");
-                assert!(
-                    why.is_some_and(|w| !w.trim().is_empty()),
-                    "{reason:?} owes the person a reason"
-                );
-                assert_eq!(named.as_deref(), fix, "{reason:?}");
+                let why = why.expect("an unavailable provider owes the user a reason");
+                assert!(!why.trim().is_empty(), "{reason:?}");
+                assert!(fix.is_none(), "{reason:?}");
+                if reason != ProviderUnavailableReason::UnsupportedBuild {
+                    assert!(why.contains("/login") && why.contains("/provider"), "{why}");
+                }
             }
             other => panic!("{reason:?} answered with {other:?}"),
         }

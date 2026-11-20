@@ -513,6 +513,22 @@ impl Stream {
         self.opening = Some(id);
     }
 
+    /// Replace the presentation-only opener. Its position and ID remain stable
+    /// while its settled row cache is replaced along with its contents.
+    pub(crate) fn replace_opening(&mut self, content: Arc<dyn Content>) -> bool {
+        let Some(index) = self.opening.and_then(|id| self.position_of(id)) else {
+            return false;
+        };
+        let previous = self.slots[index].block();
+        self.slots[index] = Slot::Settled(Settled::new(Arc::new(Block {
+            id: previous.id,
+            at: previous.at,
+            producer: previous.producer,
+            content,
+        })));
+        true
+    }
+
     /// Insert read-only history below the opener, preserving live block IDs.
     pub(crate) fn prepend_history(&mut self, mut older: Self) {
         assert!(older.slots.iter().all(Slot::is_settled));

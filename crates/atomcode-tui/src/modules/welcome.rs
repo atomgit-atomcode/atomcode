@@ -257,6 +257,7 @@ impl Producer for Welcome {
             tips,
             brand: self.brand.clone(),
             note: open.note.clone(),
+            model_setup: open.model_setup.clone(),
         }))
     }
 }

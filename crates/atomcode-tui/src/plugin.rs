@@ -59,6 +59,7 @@ plexus_service!(WelcomeWordsSvc => dyn crate::content::WelcomeWords, "tui-welcom
 // `content::OpeningNotices`. Unfilled means a launch with nothing to report,
 // which is the ordinary case.
 plexus_service!(OpeningNoticesSvc => crate::content::OpeningNotices, "tui-opening-notices", Seam, "What the launcher has to say about this launch, the moment the screen opens");
+plexus_service!(ModelSetupSvc => crate::model_setup::ModelSetup, "tui-model-setup", Seam, "First-run model choice and interactive sign-in cancellation");
 plexus_service!(WelcomeNoteSeenSvc => dyn crate::content::WelcomeNoteSeen, "tui-welcome-note-seen", Seam, "Told once the welcome's note has actually been drawn");
 // 跑一条本机命令。手势(`!`)归屏幕,开一个进程归启动器 —— 这块屏幕
 // 碰不到操作系统。没填就没有这个功能,`!git status` 还是一句发给模型的话。
@@ -1761,6 +1762,7 @@ impl UserInterface for Tui {
         // Kept before the connection takes it: the one question asked of the
         // host before a person has typed anything.
         let readiness = control.clone();
+        let model_setup = ctx.service::<ModelSetupSvc>();
         // And the second one — which mode this session is in, which a host may
         // have set before this screen subscribed.
         let mode_of_session = control.clone();
@@ -1869,6 +1871,7 @@ impl UserInterface for Tui {
             let mut m = self.host.moment.write().expect("moment poisoned");
             m.lead = session.clone();
             m.viewing = session.clone();
+            m.model_setup_required = model_setup.as_ref().is_some_and(|setup| setup.required());
         }
 
         // What the launcher has to say about this launch
@@ -1961,6 +1964,7 @@ impl UserInterface for Tui {
         // its opening prefix when the model becomes known; later pages always
         // go below that prefix, independent of event arrival order.
         let mut owes_opening = true;
+        let mut setup_opening: Option<crate::module::Opening> = None;
 
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
@@ -2173,9 +2177,35 @@ impl UserInterface for Tui {
                     .expect("moment poisoned")
                     .unready
                     .is_some();
+                let setup_view = model_setup
+                    .as_ref()
+                    .filter(|setup| setup.required())
+                    .and_then(|setup| {
+                        if self.host.providers_open() {
+                            Some(crate::model_setup::SetupView::Provider)
+                        } else {
+                            setup.view(self.surface.size().1)
+                        }
+                    });
+                if let Some(opening) = setup_opening.as_mut() {
+                    if opening.model_setup != setup_view {
+                        opening.model_setup = setup_view.clone();
+                        if setup_view.is_none() {
+                            opening.model =
+                                client.described().and_then(|description| description.model);
+                        }
+                        stale |= self.host.refresh_opening(opening);
+                    }
+                    if setup_view.is_none() {
+                        setup_opening = None;
+                    }
+                }
                 if owes_opening {
                     let described = client.described();
-                    if described.is_some() || unready {
+                    if described.is_some()
+                        || unready
+                        || model_setup.as_ref().is_some_and(|setup| setup.required())
+                    {
                         let (cwd, providers) = {
                             let m = self.host.moment.read().expect("moment poisoned");
                             (m.cwd.clone(), m.providers.clone())
@@ -2215,12 +2245,16 @@ impl UserInterface for Tui {
                                     |ctx| ctx.service::<crate::plugin::WelcomeWordsSvc>(),
                                 ),
                                 note: welcome_note.clone(),
+                                model_setup: setup_view.clone(),
                             };
                         // Spent only by a welcome that was drawn: a session whose
                         // history stood the welcome down leaves it for the next.
                         let opened = self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);
+                        if opened && setup_view.is_some() {
+                            setup_opening = Some(open);
+                        }
                         if opened && welcome_note.take().is_some() && launcher_note_pending {
                             // Drawn: only now is it spent on the launcher's side.
                             if let Some(seen) = self
@@ -2547,6 +2581,7 @@ impl UserInterface for Tui {
                         // welcome block is produced by `open_conversation` alone,
                         // and nothing else asks.
                         owes_opening = true;
+                        setup_opening = None;
                         self.host.say(
                             t(Msg::SwitchedToSession { session: &session }).into_owned(),
                             false,
@@ -3433,6 +3468,8 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Paste(text)) if self.host.mcp_open() => {
                     stale |= self.host.mcp_paste(&text);
                 }
+                Wake::Input(Input::Paste(_))
+                    if model_setup.as_ref().is_some_and(|setup| setup.required()) => {}
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
                     stale = true;
@@ -3567,6 +3604,50 @@ impl UserInterface for Tui {
                     quit = self.answer_question(press);
                     stale = true;
                 }
+                Wake::Input(Input::Key(press))
+                    if press.key == crate::surface::Key::Esc
+                        && model_setup
+                            .as_ref()
+                            .is_some_and(|setup| setup.cancel_login()) =>
+                {
+                    if !model_setup.as_ref().is_some_and(|setup| setup.required()) {
+                        self.host.say(t(Msg::LoginCancelled).into_owned(), false);
+                    }
+                    stale = true;
+                }
+                Wake::Input(Input::Key(press))
+                    if model_setup.as_ref().is_some_and(|setup| setup.required()) =>
+                {
+                    use crate::surface::{Key, Mods};
+                    let setup = model_setup.as_ref().expect("setup is required");
+                    match (press.key, press.mods) {
+                        (Key::Char('c' | 'd'), Mods::CTRL) => quit = true,
+                        (key, Mods::NONE) if !setup.signing_in() => {
+                            let choice = match key {
+                                Key::Up | Key::Down => {
+                                    setup.select(!setup.second());
+                                    None
+                                }
+                                Key::Char('1') => Some(false),
+                                Key::Char('2') => Some(true),
+                                Key::Enter => Some(setup.second()),
+                                _ => None,
+                            };
+                            if let Some(second) = choice {
+                                setup.select(second);
+                                let command = if second { "/provider" } else { "/login" };
+                                match self.host.commands.dispatch(command, ctx).await {
+                                    crate::command::Outcome::Do(action) => {
+                                        quit = self.act(action, &client)
+                                    }
+                                    outcome => deliver(&self.host, &wake_tx, outcome),
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    stale = true;
+                }
                 // A reverse search owns the keyboard while it is up — the
                 // letters included, which is what makes it a mode rather than a
                 // list like the slash menu below. Above the menu because the
@@ -3681,6 +3762,9 @@ impl UserInterface for Tui {
         // A question brought up from a background session is taken back first,
         // unanswered: refusing it would be deciding for that session, and the
         // host stops it on the way out anyway.
+        if let Some(setup) = model_setup.as_ref() {
+            setup.cancel_login();
+        }
         self.host.withdraw_any_bg_question();
         self.host.asks.refuse_all();
         // And the password, for the same reason and with the same meaning: a
@@ -3987,7 +4071,8 @@ impl Tui {
     /// there belongs here too, or the wheel scrolls under it.
     fn arrows_reach_the_composer(&self) -> bool {
         let up = crate::surface::KeyPress::plain(crate::surface::Key::Up);
-        !(self.host.secret_waiting()
+        !(self.host.model_setup_required()
+            || self.host.secret_waiting()
             || self.host.overlays.is_open()
             || self.host.context_menu_open()
             || self.host.settings_open()
@@ -4299,8 +4384,19 @@ impl Tui {
         } else {
             None
         };
+        let returns_to_setup = press.key == crate::surface::Key::Esc && {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.model_setup_required
+                && matches!(
+                    moment.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
+                    Some(crate::providers::Form::Account(form)) if form.editing.is_none()
+                )
+        };
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
+            if returns_to_setup {
+                return self.host.toggle_providers() || changed;
+            }
             return changed;
         };
         use crate::providers::Step;
@@ -4800,18 +4896,39 @@ impl Tui {
         let Some(control) = self.client.control() else {
             return;
         };
+        let setup = self
+            .ctx
+            .lock()
+            .expect("ctx poisoned")
+            .as_ref()
+            .and_then(|ctx| ctx.service::<ModelSetupSvc>());
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
-            let unready = match control.call(HostCommand::Readiness { session }).await {
+            let (ready, unready) = match control
+                .call(HostCommand::Readiness {
+                    session: session.clone(),
+                })
+                .await
+            {
                 Ok(HostReply::Readiness {
                     ready: false, why, ..
-                }) => why,
-                Ok(HostReply::Readiness { ready: true, .. }) => None,
+                }) => (false, why),
+                Ok(HostReply::Readiness { ready: true, .. }) => (true, None),
                 _ => return,
             };
             let mut moment = host.moment.write().expect("moment poisoned");
-            if moment.unready != unready {
+            if moment.lead != session {
+                return;
+            }
+            let finished = ready && moment.model_setup_required;
+            if finished {
+                if let Some(setup) = setup.as_ref() {
+                    setup.ready();
+                }
+                moment.model_setup_required = false;
+            }
+            if moment.unready != unready || finished {
                 moment.unready = unready;
                 drop(moment);
                 if let Some(keys) = keys {
@@ -7201,7 +7318,7 @@ impl Tui {
                     // turn would now be taken is the host's to say, so it is asked
                     // again rather than assumed: a session whose sign-in expired
                     // still has an agent that describes itself.
-                    if moment.unready.is_some() {
+                    if moment.unready.is_some() || moment.model_setup_required {
                         self.recheck_readiness(moment.lead.clone());
                     }
                     let changed = moment.ctx_window != window
@@ -9187,6 +9304,7 @@ impl Tui {
             // draws that session and writes the moment, which is a lock this
             // guard still holds.
             Action::ToggleProviders => {
+                let first_setup = m.model_setup_required;
                 drop(m);
                 // Refused rather than silently opening a panel with no module
                 // to draw it: a panel that is "up" but unmounted would take the
@@ -9200,6 +9318,9 @@ impl Tui {
                 // frozen at launch would quietly lie.
                 if self.host.providers_open() {
                     self.refresh_providers();
+                    if first_setup {
+                        self.run_providers_key(crate::surface::KeyPress::ctrl('a'));
+                    }
                 }
                 return false;
             }
@@ -16225,6 +16346,7 @@ mod paste_habit_tests {
                 tips: Vec::new(),
                 brand: Arc::new(crate::content::Brand::default()),
                 note: None,
+                model_setup: None,
             }),
         );
         {

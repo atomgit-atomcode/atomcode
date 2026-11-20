@@ -64,6 +64,7 @@ pub mod layout;
 pub mod markdown;
 pub mod mcp;
 pub mod menu;
+pub mod model_setup;
 pub mod module;
 pub mod modules;
 pub mod moment;

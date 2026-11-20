@@ -43,7 +43,6 @@ pub mod tui_grape;
 pub mod tui_login;
 pub mod tui_mcp;
 pub mod tui_migration;
-pub mod tui_onboarding;
 pub mod tui_opening;
 pub mod tui_openrouter;
 pub mod tui_places;
@@ -254,11 +253,6 @@ pub mod tui_front {
         // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
         // is the panel `/config` pulls up. They are not alternatives — one is
         // what a host can be asked, the other is what this screen can show.
-        // Six rows and three ports. The onboarding row is here rather than
-        // behind a condition because what it contributes is a command: whether
-        // it runs is readiness's answer, asked when the screen starts, and a
-        // machine that is already set up simply never names it.
-        //
         // The welcome-words row is the same shape as the settings one: the
         // screen owns the opening block, this launcher owns the sentences in it
         // (they live in `atomcode-config`, which the screen must not depend on),
@@ -267,6 +261,19 @@ pub mod tui_front {
         // resolves project-scoped installs against it, and it is the one thing
         // here that is about *where this session is* rather than about the
         // configuration file.
+        // A resumed conversation keeps its command input so the user can
+        // recover with /login or /provider without losing access to history.
+        let needs_model_setup = !runtime
+            .session
+            .as_ref()
+            .is_some_and(|session| session.resumed)
+            && matches!(
+                runtime.handle.provider_unavailable_reason(),
+                Some(atomcode_coding::ProviderUnavailableReason::NotConfigured)
+            );
+        let model_setup = Arc::new(atomcode_tui::model_setup::ModelSetup::new(
+            needs_model_setup,
+        ));
         let working_dir = config.working_dir.clone();
         let dirs = config.dirs.clone();
         let (connection, background) = match spawn {
@@ -294,7 +301,6 @@ pub mod tui_front {
             crate::tui_rewind::row_layer(),
             crate::tui_resume::row_layer(),
             crate::tui_bg::row_layer(),
-            crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_git_auth::row_layer(),
             // Grape consent is not deployed on the public cloud yet. Keep its
@@ -328,11 +334,8 @@ pub mod tui_front {
             Arc::new(crate::tui_rewind::RewindRow),
             Arc::new(crate::tui_resume::ResumeRow),
             Arc::new(crate::tui_bg::BgRow),
-            Arc::new(crate::tui_onboarding::OnboardingRow {
-                config_path: config_path.clone(),
-                telemetry: telemetry.clone(),
-            }),
             Arc::new(crate::tui_login::LoginRow {
+                model_setup,
                 config_path: config_path.clone(),
                 telemetry: telemetry.clone(),
             }),

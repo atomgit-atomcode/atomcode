@@ -161,6 +161,7 @@ pub struct WelcomeBlock {
     /// A dim line under the working directory and the model
     /// (`OpeningNotices::welcome_note`).
     pub note: Option<String>,
+    pub model_setup: Option<crate::model_setup::SetupView>,
 }
 
 /// What the welcome block says, in the language in force.
@@ -356,6 +357,25 @@ impl Content for WelcomeBlock {
             parts.push(command);
             parts.push(about);
         }
+        use crate::model_setup::SetupView;
+        match &self.model_setup {
+            Some(SetupView::Choose { second }) => {
+                parts.push(if *second {
+                    "setup-provider"
+                } else {
+                    "setup-login"
+                });
+            }
+            Some(SetupView::Authorize { url, .. }) => {
+                parts.push("setup-authorize");
+                if let Some(url) = url {
+                    parts.push(url);
+                }
+            }
+            Some(SetupView::Completing) => parts.push("setup-completing"),
+            Some(SetupView::Provider) => parts.push("setup-provider-form"),
+            None => {}
+        }
         hash_of(&parts)
     }
 
@@ -446,7 +466,71 @@ impl Content for WelcomeBlock {
         };
         let tips = &self.tips[..self.tips.len().min(limit)];
         let mut right: Vec<Line> = Vec::new();
-        if !tips.is_empty() {
+        use crate::model_setup::SetupView;
+        if let Some(setup) = self.model_setup.as_ref() {
+            let heading = if matches!(setup, SetupView::Provider) {
+                Msg::ModelSetupProvider
+            } else {
+                Msg::ModelSetupTitle
+            };
+            right.push(Line::styled(
+                width::take_width(&t(heading), content_w),
+                muted(),
+            ));
+            match setup {
+                SetupView::Choose { second: selected } => {
+                    for (second, label, about) in [
+                        (false, Msg::ModelSetupLogin, Msg::ModelSetupLoginAbout),
+                        (true, Msg::ModelSetupProvider, Msg::ModelSetupProviderAbout),
+                    ] {
+                        let active = second == *selected;
+                        let marker = if active {
+                            ctx.caps.g(Glyph::Prompt)
+                        } else {
+                            " "
+                        };
+                        let prefix = format!("{marker} {}. ", if second { 2 } else { 1 });
+                        let style = if active {
+                            theme::fg(Role::Accent).bold()
+                        } else {
+                            Style::default()
+                        };
+                        right.extend(wrapped(&t(label), content_w as u16, style, &prefix));
+                        right.extend(wrapped(&t(about), content_w as u16, muted(), "     "));
+                    }
+                    right.extend(wrapped(
+                        &t(Msg::ModelSetupKeys),
+                        content_w as u16,
+                        muted(),
+                        "",
+                    ));
+                }
+                SetupView::Authorize { .. } => {
+                    right.extend(wrapped(
+                        &t(Msg::ModelSetupWaiting),
+                        content_w as u16,
+                        Style::default(),
+                        "",
+                    ));
+                }
+                SetupView::Provider => {
+                    right.extend(wrapped(
+                        &t(Msg::ModelSetupProviderAbout),
+                        content_w as u16,
+                        muted(),
+                        "",
+                    ));
+                }
+                SetupView::Completing => {
+                    right.extend(wrapped(
+                        &t(Msg::ModelSetupCompleting),
+                        content_w as u16,
+                        muted(),
+                        "",
+                    ));
+                }
+            }
+        } else if !tips.is_empty() {
             right.push(Line::styled(
                 width::take_width(&self.heading, content_w),
                 muted(),
@@ -566,6 +650,40 @@ impl Content for WelcomeBlock {
                 }
                 rows.push(line);
             }
+        }
+        if let Some(SetupView::Authorize { url, screen_rows }) = &self.model_setup {
+            let cancel = wrapped(&t(Msg::LoginCancelKey), content_w as u16, muted(), &pad);
+            if let Some(url) = url {
+                let url_rows = wrapped(url, content_w as u16, theme::fg(Role::Accent), &pad);
+                let qr_rows = crate::qr::CodeBlock::new(url).map_or_else(Vec::new, |qr| {
+                    qr.lines(&RenderCtx {
+                        width: content_w as u16,
+                        ..*ctx
+                    })
+                });
+                let scan = wrapped(&t(Msg::ScanOrOpen), content_w as u16, muted(), &pad);
+                // Draw the complete code, or leave a usable browser link.
+                let with_code = rows.len()
+                    + below.len()
+                    + scan.len()
+                    + qr_rows.len()
+                    + url_rows.len()
+                    + cancel.len()
+                    + 1;
+                if !qr_rows.is_empty() && with_code <= usize::from(*screen_rows) {
+                    rows.extend(scan);
+                    rows.extend(qr_rows);
+                } else {
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupOpenLink),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                rows.extend(url_rows);
+            }
+            below.extend(cancel);
         }
         rows.extend(below);
 
@@ -4261,7 +4379,30 @@ mod tests {
             ],
             brand: std::sync::Arc::new(Brand::default()),
             note: None,
+            model_setup: None,
         }
+    }
+
+    #[test]
+    fn the_setup_authorization_falls_back_to_a_link_in_a_short_terminal() {
+        let url = "https://example.test/authorize";
+        let shows_qr = |screen_rows| {
+            let block = WelcomeBlock {
+                model_setup: Some(crate::model_setup::SetupView::Authorize {
+                    url: Some(url.into()),
+                    screen_rows,
+                }),
+                ..welcome()
+            };
+            let lines = lines_of(&block, 80, true);
+            assert!(lines.iter().any(|line| line.contains(url)));
+            assert!(lines.iter().any(|line| line.contains("Esc")));
+            lines
+                .iter()
+                .any(|line| line.chars().filter(|ch| *ch == '▀').count() > 9)
+        };
+        assert!(shows_qr(40));
+        assert!(!shows_qr(12));
     }
 
     #[test]
@@ -4504,6 +4645,7 @@ mod tests {
         let block = WelcomeBlock {
             brand: std::sync::Arc::new(mine.clone()),
             note: None,
+            model_setup: None,
             ..welcome()
         };
         let all = lines_of(&block, 80, true).join("\n");

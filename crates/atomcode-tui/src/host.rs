@@ -2247,6 +2247,25 @@ impl Host {
         false
     }
 
+    /// Update the setup view without adding a transcript entry or moving history.
+    pub(crate) fn refresh_opening(&self, opening: &crate::module::Opening) -> bool {
+        let content = self
+            .modules
+            .producers()
+            .iter()
+            .find_map(|producer| producer.opening(crate::block::Coord::default(), opening));
+        let changed = content.is_some_and(|content| {
+            self.stream
+                .write()
+                .expect("stream poisoned")
+                .replace_opening(content)
+        });
+        if changed {
+            self.forget_row_index();
+        }
+        changed
+    }
+
     /// Seed sidebars/producer indexes without presenting old transcript bodies.
     pub(crate) fn seed_history(&self, seed: &[atomcode_kernel::session::Committed]) {
         let before = self.stream.read().expect("stream poisoned").len();
@@ -5089,8 +5108,16 @@ impl Host {
     /// 键盘此刻是不是在一个问询之外的东西手里：密码框、modal、菜单、各个面板、反查、
     /// 团队面板 —— 主循环分键时排在问询前面或会吃掉字母的那些（`plugin.rs` 的键路由）。
     /// 一个地方列全，分键那边加了新的面板，这里跟着加一行。
+    pub(crate) fn model_setup_required(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .model_setup_required
+    }
+
     pub fn keyboard_held_elsewhere(&self) -> bool {
-        self.secret_waiting()
+        self.model_setup_required()
+            || self.secret_waiting()
             || self.overlays.is_open()
             || self.context_menu_open()
             || self.settings_open()
@@ -6336,6 +6363,27 @@ impl Host {
         out
     }
 
+    /// Fit the first-run Provider form immediately below the opening when
+    /// both fit. The ordinary Provider panel still follows the conversation's tail.
+    fn setup_pane_room(&self, mut room: Rect, heights: &[(String, u16)], moment: &Moment) -> Rect {
+        if moment.model_setup_required
+            && moment.scroll.0 == 0
+            && heights
+                .iter()
+                .any(|(id, height)| id == crate::modules::providers::ID && *height > 0)
+        {
+            let tail_rows = heights
+                .iter()
+                .map(|(_, height)| usize::from(*height))
+                .sum::<usize>();
+            let rows = self
+                .block_total_in(room.w, moment, usize::from(room.h))
+                .max(1);
+            room.h = rows.saturating_add(tail_rows).min(usize::from(room.h)) as u16;
+        }
+        room
+    }
+
     fn pane_geometry_capped(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
         // Everything below is in "distance from the bottom of the pane", which
         // is the coordinate `scroll` is already measured in: `d = 0` is the last
@@ -6828,7 +6876,8 @@ impl Host {
                     // is why every layout in this build still composes the same
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
-                    let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    let pane_room = self.setup_pane_room(rect, &heights, &moment);
+                    let mut pane = Self::pane_geometry(pane_room, moment.scroll.0, &heights);
                     let header_rect =
                         Rect::new(pane.block_rect.x, pane.block_rect.y, pane.block_rect.w, 1);
                     if let Some(header) = self.reserve_prompt_header(&mut pane, &moment) {
@@ -7590,7 +7639,8 @@ impl Host {
                 _ => None,
             })?;
         let heights = self.tail_heights_of(&tail, rect.w, moment);
-        let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+        let pane_room = self.setup_pane_room(rect, &heights, moment);
+        let mut pane = Self::pane_geometry(pane_room, moment.scroll.0, &heights);
         self.reserve_prompt_header(&mut pane, moment);
         Some(BlockView {
             rect: pane.block_rect,
@@ -7602,6 +7652,10 @@ impl Host {
     /// How many rows the conversation's blocks render to at `width` — the
     /// painter's own count ([`Host::row_index_window`]), tail not included.
     fn block_total(&self, width: u16, moment: &Moment) -> usize {
+        self.block_total_in(width, moment, 0)
+    }
+
+    fn block_total_in(&self, width: u16, moment: &Moment, height: usize) -> usize {
         let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
@@ -7610,7 +7664,7 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            self.selection_layout_budget(width, moment, moment.scroll.0, 0, pres.revision()),
+            self.selection_layout_budget(width, moment, moment.scroll.0, height, pres.revision()),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         )
         .total
@@ -8112,7 +8166,7 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
     // covers, read as one more row of the panel. Asked here for the same reason
     // the composer is: it is what the screen does with the row, not what the
     // row needs.
-    if id == crate::modules::status::ID && panel_is_up(moment) {
+    if id == crate::modules::status::ID && (panel_is_up(moment) || moment.model_setup_required) {
         return 0;
     }
     asked
@@ -8180,7 +8234,8 @@ pub fn displaces_composer(moment: &Moment) -> bool {
     // The background panel has a box of its own, where the keys go while it is
     // up; a second one under it would leave a person asking which one they are
     // typing into.
-    moment.asking.is_some()
+    moment.model_setup_required
+        || moment.asking.is_some()
         || moment.settings_panel.is_some()
         || moment.providers_panel.is_some()
         || moment.bg_panel.is_some()
@@ -8531,6 +8586,7 @@ mod tests {
             tips: Vec::new(),
             brand: Arc::new(crate::content::Brand::default()),
             note: None,
+            model_setup: None,
         };
         h.stream
             .write()
