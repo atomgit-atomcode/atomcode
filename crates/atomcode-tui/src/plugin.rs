@@ -9496,14 +9496,6 @@ impl Tui {
             // draws that session and writes the moment, which is a lock this
             // guard still holds.
             Action::ToggleProviders => {
-                let first_setup = m.model_setup_required
-                    && !self
-                        .ctx
-                        .lock()
-                        .expect("ctx poisoned")
-                        .as_ref()
-                        .and_then(|ctx| ctx.service::<ModelSetupSvc>())
-                        .is_some_and(|setup| setup.expired);
                 drop(m);
                 // Refused rather than silently opening a panel with no module
                 // to draw it: a panel that is "up" but unmounted would take the
@@ -9517,9 +9509,6 @@ impl Tui {
                 // frozen at launch would quietly lie.
                 if self.host.providers_open() {
                     self.refresh_providers();
-                    if first_setup {
-                        self.run_providers_key(crate::surface::KeyPress::ctrl('a'));
-                    }
                 }
                 return false;
             }

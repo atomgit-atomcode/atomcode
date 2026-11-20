@@ -714,19 +714,20 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
 
     term.press(KeyPress::plain(Key::Down));
     term.press(KeyPress::plain(Key::Enter));
-    let providers = wait_for("添加 provider").await;
+    let providers = wait_for("手动添加").await;
+    assert!(!providers.contains("添加 provider"));
     assert!(!providers.contains("使用 AtomCode 开始工作"));
     assert!(
         !providers.contains("Enter 确认"),
-        "the form owns the keyboard"
+        "the provider picker owns the keyboard"
     );
-    let form_line = providers
+    let picker_line = providers
         .lines()
-        .position(|line| line.contains("添加 provider"))
+        .position(|line| line.contains("账号"))
         .unwrap();
     assert!(
-        form_line < 18,
-        "the first-run form follows the header on a tall terminal:\n{providers}"
+        picker_line < 18,
+        "the first-run picker follows the header on a tall terminal:\n{providers}"
     );
     term.press(KeyPress::plain(Key::Esc));
     let returned = wait_for("选择模型接入方式").await;

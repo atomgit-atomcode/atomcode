@@ -23,7 +23,7 @@ pub enum SetupView {
 #[derive(Debug)]
 pub struct ModelSetup {
     required: AtomicBool,
-    pub(crate) expired: bool,
+    expired: bool,
     second: AtomicBool,
     login: Mutex<Option<Arc<LoginAttempt>>>,
 }

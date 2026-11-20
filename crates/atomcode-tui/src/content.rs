@@ -597,6 +597,8 @@ impl Content for WelcomeBlock {
             rows.push(Line::empty());
             let heading = if matches!(setup, SetupView::Provider) {
                 Msg::ModelSetupProvider
+            } else if matches!(setup, SetupView::Authorize { .. } | SetupView::Completing) {
+                Msg::ModelSetupLogin
             } else if matches!(setup, SetupView::Choose { expired: true, .. }) {
                 Msg::RecoveryTitle
             } else {
@@ -628,6 +630,7 @@ impl Content for WelcomeBlock {
                             Msg::ModelSetupProviderAbout,
                         ),
                     ] {
+                        rows.push(Line::empty());
                         let active = second == *selected;
                         let marker = if active {
                             ctx.caps.g(Glyph::Prompt)
@@ -651,6 +654,7 @@ impl Content for WelcomeBlock {
                             &format!("{pad}     "),
                         ));
                     }
+                    rows.push(Line::empty());
                     rows.extend(wrapped(
                         &t(Msg::ModelSetupKeys),
                         content_w as u16,
@@ -659,6 +663,7 @@ impl Content for WelcomeBlock {
                     ));
                 }
                 SetupView::Authorize { .. } => {
+                    rows.push(Line::empty());
                     rows.extend(wrapped(
                         &t(Msg::ModelSetupWaiting),
                         content_w as u16,
@@ -667,6 +672,7 @@ impl Content for WelcomeBlock {
                     ));
                 }
                 SetupView::Provider => {
+                    rows.push(Line::empty());
                     rows.extend(wrapped(
                         &t(Msg::ModelSetupProviderAbout),
                         content_w as u16,
@@ -675,6 +681,7 @@ impl Content for WelcomeBlock {
                     ));
                 }
                 SetupView::Completing => {
+                    rows.push(Line::empty());
                     rows.extend(wrapped(
                         &t(Msg::ModelSetupCompleting),
                         content_w as u16,
@@ -687,6 +694,7 @@ impl Content for WelcomeBlock {
         if let Some(SetupView::Authorize { url, screen_rows }) = &self.model_setup {
             let cancel = wrapped(&t(Msg::LoginCancelKey), content_w as u16, muted(), &pad);
             if let Some(url) = url {
+                rows.push(Line::empty());
                 let url_rows = wrapped(url, content_w as u16, theme::fg(Role::Accent), &pad);
                 let qr_rows = crate::qr::CodeBlock::new(url).map_or_else(Vec::new, |qr| {
                     qr.lines(&RenderCtx {
@@ -695,9 +703,9 @@ impl Content for WelcomeBlock {
                     })
                 });
                 let scan = wrapped(&t(Msg::ScanOrOpen), content_w as u16, muted(), &pad);
-                // Draw the complete code, or leave a usable browser link.
+                // Include the gap before the cancel hint and the trailing blank.
                 let with_code =
-                    rows.len() + scan.len() + qr_rows.len() + url_rows.len() + cancel.len() + 1;
+                    rows.len() + scan.len() + qr_rows.len() + url_rows.len() + cancel.len() + 2;
                 if !qr_rows.is_empty() && with_code <= usize::from(*screen_rows) {
                     rows.extend(scan);
                     rows.extend(qr_rows);
@@ -711,6 +719,7 @@ impl Content for WelcomeBlock {
                 }
                 rows.extend(url_rows);
             }
+            rows.push(Line::empty());
             rows.extend(cancel);
         }
 
