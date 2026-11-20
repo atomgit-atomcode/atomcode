@@ -247,13 +247,6 @@ impl View for Status {
         // state, not news, and it must never squeeze the model, the directory
         // or the context usage off the row. Placed after everything else, it
         // is drawn only in the room left over.
-        // Why no turn can be taken, when that is so: reserved like the badges,
-        // because it is the one thing on this row a person must act on before
-        // anything else here matters.
-        let unready = vp.moment.unready.clone();
-        if let Some(text) = &unready {
-            reserved += width::str_width(text) + sep_w;
-        }
         // `!` shell mode, said on the row while the line starts with `!` — the
         // same words tuix puts in its footer: what the bare `!` did, then what
         // Enter will do once there is a command after it. Reserved: it is about
@@ -410,10 +403,6 @@ impl View for Status {
             row.push(El::styled(text.clone(), style_for(*seg)));
         }
 
-        if let Some(text) = unready {
-            row.push(El::styled(sep_text.clone(), dim));
-            row.push(El::styled(text, theme::fg(Role::Warning)));
-        }
         if let Some(text) = shell_hint {
             row.push(El::styled(sep_text.clone(), dim));
             row.push(El::styled(text, theme::fg(Role::Brand)));
@@ -924,11 +913,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Why no turn can be taken stands on the row, and the model slot says
-    /// "not configured" rather than a name that reads as a model — the page
-    /// above it opens as usual. Nothing of it shows once a turn can be taken.
+    /// The recovery tip has its own row above the composer.
     #[test]
-    fn why_no_turn_can_be_taken_stands_on_the_row() {
+    fn the_model_slot_reports_unconfigured_without_repeating_the_tip() {
         let why = "还没有可用的 provider——在 atomcode 终端里用 /login 登录,或用 /provider 添加一个";
         let unready = Moment {
             cwd: "~/work/project".into(),
@@ -936,7 +923,7 @@ mod tests {
             ..Moment::default()
         };
         let row = draw::<Status>(&State::default(), 160, &unready);
-        assert!(row.contains(why), "{row}");
+        assert!(!row.contains(why), "{row}");
         let not_configured =
             crate::i18n::product::t(crate::i18n::product::Msg::StatusModelNotConfigured)
                 .into_owned();

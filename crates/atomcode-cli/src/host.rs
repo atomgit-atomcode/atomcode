@@ -1289,6 +1289,11 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
         }
         // 没有可用的 provider。话与「改去哪里」都已经有现成的 ——
         // `readiness_for` 就是干这个的,只是只在开屏那一次被问过。
+        // The explicit sign-out command already confirms success in the transcript.
+        CodingRuntimeEvent::ProviderUnavailable {
+            reason: ProviderUnavailableReason::SignedOut,
+            ..
+        } => None,
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
             match readiness_for(Some(reason)) {
                 HostReply::Readiness { why: Some(why), .. } => Some(said(why.into())),
@@ -2922,7 +2927,7 @@ impl HostControl for RuntimeControl {
                         message: error.to_string(),
                     })?;
                 self.handle
-                    .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+                    .deactivate_provider(ProviderUnavailableReason::SignedOut)
                     .await
                     .map_err(refused)?;
                 Ok(HostReply::Done)
@@ -3304,6 +3309,7 @@ pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
             }
         }
         Some(ProviderUnavailableReason::NotConfigured) => (tr(SMsg::NoProviderConfigured), None),
+        Some(ProviderUnavailableReason::SignedOut) => (tr(SMsg::SignedOutHint), None),
         Some(ProviderUnavailableReason::AuthenticationRequired) => (tr(SMsg::LoginExpired), None),
         Some(ProviderUnavailableReason::UnsupportedBuild) => {
             (tr(SMsg::ProviderUnsupportedByBuild), None)
@@ -3372,7 +3378,8 @@ pub fn refused(error: RuntimeError) -> HostError {
                     ProviderUnavailableReason::NotConfigured => {
                         atomcode_host_api::ProviderUnavailableReason::NotConfigured
                     }
-                    ProviderUnavailableReason::AuthenticationRequired => {
+                    ProviderUnavailableReason::AuthenticationRequired
+                    | ProviderUnavailableReason::SignedOut => {
                         atomcode_host_api::ProviderUnavailableReason::AuthenticationRequired
                     }
                     ProviderUnavailableReason::UnsupportedBuild => {

@@ -692,10 +692,28 @@ impl Content for WelcomeBlock {
             }
         }
         if let Some(SetupView::Authorize { url, screen_rows }) = &self.model_setup {
-            let cancel = wrapped(&t(Msg::LoginCancelKey), content_w as u16, muted(), &pad);
+            let cancel = wrapped(
+                &t(if url.is_some() {
+                    Msg::LoginLinkKeys
+                } else {
+                    Msg::LoginCancelKey
+                }),
+                content_w as u16,
+                muted(),
+                &pad,
+            );
             if let Some(url) = url {
                 rows.push(Line::empty());
-                let url_rows = wrapped(url, content_w as u16, theme::fg(Role::Accent), &pad);
+                let url_rows = crate::markdown::wrap_spans(
+                    &[Span::linked(
+                        url,
+                        theme::fg(Role::Accent).underline(),
+                        url.as_str(),
+                    )],
+                    content_w as u16,
+                    &pad,
+                    muted(),
+                );
                 let qr_rows = crate::qr::CodeBlock::new(url).map_or_else(Vec::new, |qr| {
                     qr.lines(&RenderCtx {
                         width: content_w as u16,

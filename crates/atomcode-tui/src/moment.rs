@@ -994,8 +994,7 @@ pub struct Moment {
     /// It must not be written into a member's conversation.
     pub held_goal_end: Option<HeldGoalEnd>,
     /// 开屏时问到的「现在发不出回合」的原因(没有可用 provider、登录过期……),
-    /// `None` 是能发。画在状态行里、常挂着,而不是写进对话流顶上:和 tuix 一样,
-    /// 页面照常打开(欢迎块照画),原因在底下。agent 起来(`Described`)时清掉。
+    /// 输入框上方显示恢复提示，模型可用时清空。
     pub unready: Option<String>,
     pub(crate) model_setup_required: bool,
     /// 有更新的版本时状态行那一句(启动器给的原话,`None` 是没有或没问到)。

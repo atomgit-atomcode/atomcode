@@ -2338,6 +2338,17 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
             .await,
         Ok(HostReply::Done)
     );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Readiness {
+                session: session.clone()
+            })
+            .await,
+        Ok(atomcode::host::readiness_for(Some(
+            ProviderUnavailableReason::SignedOut
+        )))
+    );
     let asked = env.script.requests.lock().unwrap().len();
     connection.commands.send(message("anyone there")).unwrap();
     let _ = quiet(&mut connection).await;

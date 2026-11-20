@@ -814,7 +814,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "重新加载完成；已加载的指令来源可在 /status 查看。轻量 skill 重载不刷新指令正文".into(),
-        Msg::SignedOut => "已登出;/login 重新登录".into(),
+        Msg::SignedOutHint => "已退出登录。/login 重新登录 · /provider 选择模型服务".into(),
+        Msg::SignedOut => "已退出登录。".into(),
         Msg::SignedIn => "已登录".into(),
 
         // ── MCP 面板 (`mcp.rs`、`modules/mcp.rs`) ──
@@ -1300,7 +1301,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "思考".into(),
         Msg::RuntimeAlreadyStopped => "这个会话的运行时已经停了".into(),
         Msg::NoProviderConfigured => "还没有可用的 provider——在 atomcode 终端里用 /login 登录,或用 /provider 添加一个".into(),
-        Msg::LoginExpired => "登录已失效。Alt+1 重新登录 AtomGit · Alt+2 切换或连接其他模型服务".into(),
+        Msg::LoginExpired => "登录已失效。/login 重新登录 · /provider 选择模型服务".into(),
         Msg::ProviderUnsupportedByBuild => "当前构建不支持 AtomGit 官方网关。请安装官方版本，或用 /model 切换到其他模型、/provider 换一个 provider".into(),
         Msg::ScreenNotConnectedAgent => "屏幕还没接上 agent".into(),
         Msg::HostHasNoControl => "这个宿主没有控制面".into(),
@@ -1364,10 +1365,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::GoalQuotaShort => "Goal 等待额度".into(),
         Msg::QuotaAvailableContinueManually => "当前额度可用。若任务仍处于暂停状态，可发送“继续”继续当前对话；已结束的 loop 需要手动重新启动。".into(),
         Msg::ConfigWrittenReloadFailedCli { error } => format!("配置已写入，但重新加载失败：{error}").into(),
-        Msg::SignedInSettingUpProvider => "登录成了，正在配 provider…".into(),
+        Msg::SignedInSettingUpProvider => "登录成功，正在配置模型服务…".into(),
         Msg::AlreadySignedInRefreshing => "已登录，正在刷新 codingplan 配置…".into(),
         Msg::TokenRejectedSigningInAgain => "服务端不认这个 token 了，重新登录一次…".into(),
-        Msg::SignedInAgainRerunningSetup => "重新登录成了，重跑 setup…".into(),
+        Msg::SignedInAgainRerunningSetup => "重新登录成功，正在重新配置模型服务…".into(),
         Msg::ConfigNotWritten { error } => format!("配置没写成：{error}").into(),
         Msg::LoginCouldNotStart { error } => format!("登录起不来：{error}").into(),
         Msg::LoginAutoOpenFailed { reason } => {
@@ -1376,7 +1377,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LoginFailed { error } => format!("登录没成：{error}").into(),
         Msg::LoginNoAnswer => "登录没了回音".into(),
         Msg::TokenExchangeFailed { error } => format!("换 token 没成：{error}").into(),
-        Msg::SignedInCredentialsNotSaved { error } => format!("登录成了，但凭据没写成：{error}").into(),
+        Msg::SignedInCredentialsNotSaved { error } => format!("登录成功，但凭据保存失败：{error}").into(),
         Msg::ScanOrOpen => "用手机扫码，或在浏览器里打开：".into(),
         Msg::InternalError { error } => format!("internal error：{error}").into(),
 
@@ -1392,6 +1393,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelSetupWaiting => "等待 AtomGit 授权…".into(),
         Msg::ModelSetupOpenLink => "请在浏览器中打开此链接。".into(),
         Msg::ModelSetupCompleting => "正在应用登录结果…".into(),
+        Msg::LoginLinkKeys => "点击链接打开 · c 复制链接 · Esc 取消登录并返回".into(),
         Msg::LoginCancelKey => "Esc 取消登录并返回".into(),
         Msg::LoginCancelled => "已取消登录。".into(),
         Msg::LoginAlreadyRunning => "登录已在进行中。".into(),

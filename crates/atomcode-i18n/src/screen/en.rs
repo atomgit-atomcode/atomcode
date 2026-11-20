@@ -870,7 +870,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "Reload complete. See /status for loaded instruction sources; a lightweight skill reload keeps instruction text unchanged.".into(),
-        Msg::SignedOut => "signed out; /login signs in again".into(),
+        Msg::SignedOutHint => "Signed out. /login to sign in · /provider to select a provider".into(),
+        Msg::SignedOut => "Signed out.".into(),
         Msg::SignedIn => "signed in".into(),
 
         // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
@@ -1369,7 +1370,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "thinking".into(),
         Msg::RuntimeAlreadyStopped => "this session's runtime has already stopped".into(),
         Msg::NoProviderConfigured => "no provider is available — in the atomcode terminal, sign in with /login or add one with /provider".into(),
-        Msg::LoginExpired => "Sign-in expired. Alt+1 Sign in to AtomGit again · Alt+2 Switch or connect a provider".into(),
+        Msg::LoginExpired => "Sign-in expired. /login to sign in again · /provider to select a provider".into(),
         Msg::ProviderUnsupportedByBuild => "this build cannot use the official AtomGit gateway — install an official build, or switch with /model or /provider".into(),
         Msg::ScreenNotConnectedAgent => "the screen is not connected to an agent".into(),
         Msg::HostHasNoControl => "this host has no control surface".into(),
@@ -1461,6 +1462,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelSetupWaiting => "Waiting for AtomGit authorization…".into(),
         Msg::ModelSetupOpenLink => "Open this link in your browser.".into(),
         Msg::ModelSetupCompleting => "Applying the sign-in result…".into(),
+        Msg::LoginLinkKeys => "Click to open · c Copy link · Esc Cancel sign-in and go back".into(),
         Msg::LoginCancelKey => "Esc Cancel sign-in and go back".into(),
         Msg::LoginCancelled => "Sign-in cancelled.".into(),
         Msg::LoginAlreadyRunning => "Sign-in is already in progress.".into(),

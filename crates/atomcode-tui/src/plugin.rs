@@ -2133,10 +2133,7 @@ impl UserInterface for Tui {
                 else {
                     return;
                 };
-                // On the status row, not at the top of the conversation: the
-                // page opens as it always does (the welcome is drawn — see
-                // `owes_opening`) and the reason stands under it, the way tuix
-                // shows "no provider" in its footer.
+                // Keep the recovery commands available above the composer.
                 if let Some(why) = why {
                     host.moment.write().expect("moment poisoned").unready = Some(why);
                     let _ = keys.send(Wake::Fact);
@@ -3788,6 +3785,15 @@ impl UserInterface for Tui {
                     let setup = model_setup.as_ref().expect("setup is required");
                     match (press.key, press.mods) {
                         (Key::Char('c' | 'd'), Mods::CTRL) => quit = true,
+                        (Key::Char('c'), Mods::NONE) => {
+                            if let Some(crate::model_setup::SetupView::Authorize {
+                                url: Some(url),
+                                ..
+                            }) = setup.view(self.surface.size().1)
+                            {
+                                self.copy_text(url, t(Msg::CopiedSelection).into_owned());
+                            }
+                        }
                         (key, Mods::NONE) if !setup.signing_in() => {
                             let choice = match key {
                                 Key::Up | Key::Down => {
@@ -5082,7 +5088,7 @@ impl Tui {
     }
 
     /// Ask the host again whether a turn would be taken, and put its answer on
-    /// the status row (`Moment::unready`): the reason while it still holds,
+    /// the tip row (`Moment::unready`): the reason while it still holds,
     /// nothing once it does not.
     fn recheck_readiness(&self, session: String) {
         let Some(control) = self.client.control() else {

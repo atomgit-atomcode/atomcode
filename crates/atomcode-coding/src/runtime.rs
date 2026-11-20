@@ -1125,6 +1125,7 @@ impl Error for RuntimeError {}
 pub enum ProviderUnavailableReason {
     NotConfigured,
     AuthenticationRequired,
+    SignedOut,
     UnsupportedBuild,
 }
 
@@ -1132,6 +1133,7 @@ impl fmt::Display for ProviderUnavailableReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConfigured => f.write_str("no provider configured — run /login or /provider"),
+            Self::SignedOut => f.write_str("signed out — run /login or /provider"),
             Self::AuthenticationRequired => {
                 f.write_str("provider authentication required — run /login")
             }
@@ -4551,6 +4553,7 @@ fn encode_provider_unavailable_reason(reason: Option<ProviderUnavailableReason>)
         Some(ProviderUnavailableReason::NotConfigured) => 1,
         Some(ProviderUnavailableReason::AuthenticationRequired) => 2,
         Some(ProviderUnavailableReason::UnsupportedBuild) => 3,
+        Some(ProviderUnavailableReason::SignedOut) => 4,
     }
 }
 
@@ -4559,6 +4562,7 @@ fn decode_provider_unavailable_reason(value: u8) -> Option<ProviderUnavailableRe
         1 => Some(ProviderUnavailableReason::NotConfigured),
         2 => Some(ProviderUnavailableReason::AuthenticationRequired),
         3 => Some(ProviderUnavailableReason::UnsupportedBuild),
+        4 => Some(ProviderUnavailableReason::SignedOut),
         _ => None,
     }
 }

@@ -1230,6 +1230,7 @@ pub enum Msg<'a> {
     },
     Reloaded,
     SignedOut,
+    SignedOutHint,
     SignedIn,
 
     // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
@@ -2241,6 +2242,7 @@ pub enum Msg<'a> {
     ModelSetupOpenLink,
     ModelSetupCompleting,
     LoginCancelKey,
+    LoginLinkKeys,
     LoginCancelled,
     LoginAlreadyRunning,
     /// The confirmation before a rollback (titled by the product's

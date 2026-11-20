@@ -703,6 +703,17 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
     assert!(waiting.contains("AtomCode"));
     assert!(!waiting.contains("使用 AtomCode 开始工作"));
     assert!(waiting.contains("https://example.test/authorize"));
+    let frame = term.frames().pop().unwrap();
+    assert!((0..frame.size.h).any(|y| (0..frame.size.w)
+        .any(|x| frame.link_at(x, y).as_deref() == Some("https://example.test/authorize"))));
+    term.press(KeyPress::plain(Key::Char('c')));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while term.clipboard_text().as_deref() != Some("https://example.test/authorize") {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("c copies the full authorization link");
     term.press(KeyPress::plain(Key::Esc));
     let choice = wait_for("连接已有的模型服务").await;
     assert!(choice.contains("使用 AtomGit 账号登录"));
@@ -757,9 +768,9 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
         .deactivate_provider(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
         .await
         .expect("simulate expired credentials");
-    let expired = wait_for("Alt+1 重新登录").await;
+    let expired = wait_for("/login 重新登录").await;
     assert!(expired.contains("answer 1"));
-    assert!(expired.contains("Alt+2 切换"));
+    assert!(expired.contains("/provider 选择"));
     assert!(!expired.contains("选择模型接入方式"));
     assert!(
         model_setup.start_login().is_some(),
