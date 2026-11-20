@@ -233,7 +233,30 @@ impl LlmProvider for RecordingProvider {
                 StreamEvent::Done { truncated: false },
             ])));
         }
+        // A job left running in the background, polled once, then the answer.
+        let backgrounding = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.synthetic)
+            .is_some_and(|m| m.text.starts_with("background "));
         let first = match last {
+            Some(m) if backgrounding && m.role == Role::User => StreamEvent::ToolCall(ToolCall {
+                id: format!("call-{n}"),
+                name: "bash_start".into(),
+                arguments: serde_json::json!({ "command": &m.text[11..] }).to_string(),
+            }),
+            Some(m) if backgrounding && m.text.starts_with("Started background job ") => {
+                let job = m.text["Started background job ".len()..]
+                    .split_once(". ")
+                    .map(|(job, _)| job)
+                    .unwrap_or_default();
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "bash_poll".into(),
+                    arguments: serde_json::json!({ "job_id": job, "wait_ms": 0 }).to_string(),
+                })
+            }
+            Some(_) if backgrounding => StreamEvent::TextDelta("polled".into()),
             Some(m) if m.role == Role::User && m.text == "launch debug fixture" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1674,6 +1697,62 @@ async fn the_model_is_told_how_this_host_waits_for_background_work() {
                 "{shown}"
             );
         }
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    }
+}
+
+/// A model whose poll found a job still running, where the host will wake it
+/// when the job finishes, is told on that request to end its response. The
+/// reminder rides the request only: the poll's result stays the tool's own for
+/// the front end that groups quiet polls and the loop guard that counts them,
+/// and a note after the status line does not hide the job's state from it.
+/// Under `-p` polling is how the model waits, so nothing is said.
+async fn a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request() {
+    for (command, wakeups, quiet) in [
+        ("sleep 20", true, true),
+        ("sleep 20 && cargo build | tail -n 5", true, false),
+        ("sleep 20", false, true),
+    ] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.background_wakeups = wakeups;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, &format!("background {command}")).await;
+        // The request that answered the poll, not a side call made after it.
+        let sent = recorder
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|request| request.iter().any(|m| m.role == Role::Tool))
+            .cloned()
+            .expect("a request answered the poll");
+        let poll = sent
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("the poll's result was sent");
+        if quiet {
+            assert_eq!(poll.text, "status: running", "{command}");
+        } else {
+            assert!(
+                poll.text.contains("status: running\n\n[execution note"),
+                "{command}: {}",
+                poll.text
+            );
+        }
+        let reminded = sent
+            .iter()
+            .skip_while(|m| m.role != Role::Tool || m.text != poll.text)
+            .any(|m| m.synthetic && m.text.contains("end your response instead of polling"));
+        let shape: Vec<String> = sent
+            .iter()
+            .map(|m| format!("{:?} synthetic={} {:.120}", m.role, m.synthetic, m.text))
+            .collect();
+        assert_eq!(reminded, wakeups, "{command}: {shape:#?}");
         runtime.handle.shutdown().await.unwrap();
         let _ = runtime.task.await;
     }
@@ -7310,6 +7389,7 @@ mod criteria {
         an_always_allow_survives_an_undo,
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
         the_model_is_told_how_this_host_waits_for_background_work,
+        a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
         #[cfg(unix)]

@@ -745,6 +745,10 @@ pub struct CodingParts {
     /// Current real-user turn's explicit execution restriction. The same instance is
     /// a lifecycle hook and a pre-approval Bash middleware.
     pub(crate) turn_execution_policy: Arc<TurnExecutionPolicy>,
+    /// Which background jobs a completion will wake the model for, written by
+    /// the runtime and read by `background-wait-hint`. Rebuilt with the parts:
+    /// a new assembly is a new generation, whose pending notifications start over.
+    pub(crate) background_waits: crate::background_jobs::BackgroundWaits,
     /// Session grant store for mutating MCP tools the user approved "always" while in
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
@@ -1367,6 +1371,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         bypass_mode,
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_execution_policy,
+        background_waits: Default::default(),
         mcp_plan_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),

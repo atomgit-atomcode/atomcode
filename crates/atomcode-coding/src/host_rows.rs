@@ -2531,9 +2531,9 @@ impl Plugin for CompactionCodingPlugin {
 pub(crate) struct CapabilityCommandsPlugin(
     pub(crate) Arc<dyn crate::runtime::RuntimeCommands>,
     pub(crate) std::path::PathBuf,
-    /// The driver shows the turn a background completion starts
-    /// (`CodingAgentConfig::background_wakeups`).
-    pub(crate) bool,
+    /// `Some` when the driver shows the turn a background completion starts
+    /// (`CodingAgentConfig::background_wakeups`): the jobs it will wake for.
+    pub(crate) Option<crate::background_jobs::BackgroundWaits>,
 );
 
 #[async_trait]
@@ -2554,7 +2554,17 @@ impl Plugin for CapabilityCommandsPlugin {
         // keeps its turn open to poll only delays them; but only a driver that
         // stays attached shows the turn a completion starts (`-p` exits at its
         // first turn terminal), so only there may the model end its response.
-        let (policy, knowledge) = if self.2 {
+        let (policy, knowledge) = if let Some(waits) = &self.2 {
+            // The policy said once, at mount, reaches a model that has read
+            // many rounds since; the job it is polling right now is better
+            // evidence. Only on the request, so the tool result the front end
+            // groups and the loop guard counts stays the tool's own.
+            let _ = ctx.on_waterfall::<AgentRequest>(
+                Arc::new(crate::background_jobs::BackgroundWaitHint::new(
+                    waits.clone(),
+                )),
+                false,
+            );
             (
                 "This host resumes you when a background job finishes. For bounded work \
                  that may take a long time, including downloads, SDK installation, builds \
@@ -2564,9 +2574,10 @@ impl Plugin for CapabilityCommandsPlugin {
                  Ending your response does not end the task, even when the next step needs \
                  the job's result: the completion notification starts your next turn with \
                  that result and you continue the remaining steps from there. The \
-                 notification is delivered only after your response ends, so keeping the \
-                 turn open to wait — repeated bash_poll waits, shell sleep, ls, pgrep — only \
-                 delays it. After the notification, \
+                 notification is delivered only after your response ends, and every \
+                 bash_poll wait that times out with the job still running costs a whole \
+                 request; shell sleep, ls and pgrep wait without the job's status at all. \
+                 After the notification, \
                  collect each finished job once with bash_poll and wait_ms 0, then check the \
                  result. A file existing or a process disappearing does not prove success. \
                  Leave completion notifications off for servers and watchers. If a job was \

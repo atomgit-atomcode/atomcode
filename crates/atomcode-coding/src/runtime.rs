@@ -4993,6 +4993,17 @@ fn spawn_runtime_owner_with_optional_agent(
                 }
             }
             background_jobs.retain_generation(generation);
+            // The same conditions the delivery below holds a completion back on.
+            background_jobs.publish(
+                resources
+                    .as_ref()
+                    .map(|runtime| &runtime.parts.background_waits),
+                resources
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.config.background_wakeups)
+                    && loop_state.is_none()
+                    && !goal.as_ref().is_some_and(|state| !state.active),
+            );
             if follow_up_epoch != generation {
                 follow_up_elapsed = std::time::Duration::ZERO;
                 follow_up_epoch = generation;
@@ -12387,7 +12398,12 @@ fn harness_host_state(
             .collect(),
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
-        background_wakeups: config.background_wakeups,
+        // Only a driver that shows the turn a completion starts can tell the
+        // model to end its response and wait for it; elsewhere polling is how
+        // it waits.
+        background_waits: config
+            .background_wakeups
+            .then(|| parts.background_waits.clone()),
         tool_switches: Some(parts.tool_switches()),
         permission_settings: None,
         tool_catalog_slot: parts.tool_catalog_slot(),
@@ -15969,6 +15985,13 @@ mod tests {
         controller_test_runtime_with_config(provider_factory, config).await
     }
 
+    thread_local! {
+        /// The parts' background-wait table of the runtime the helpers below
+        /// last started on this thread, read by what the hint would say.
+        static TEST_BACKGROUND_WAITS: std::cell::RefCell<Option<crate::background_jobs::BackgroundWaits>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// A runtime whose driver shows the turn a background completion starts.
     pub(super) async fn waking_test_runtime() -> (
         CodingRuntimeHandle,
@@ -16028,6 +16051,9 @@ mod tests {
                 .await
                 .unwrap();
         let loop_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        TEST_BACKGROUND_WAITS.with(|waits| {
+            *waits.borrow_mut() = Some(parts.background_waits.clone());
+        });
         let resources = RuntimeResources {
             config,
             prepare,
@@ -25099,6 +25125,53 @@ type = "openai"
             .unwrap();
         assert!(matches!(commands.recv().await,
             Some(AgentCommand::SendSyntheticMessage { text }) if text.contains("Background job")));
+        adapter.shutdown().await.unwrap();
+    }
+
+    /// The hint reads the runtime's own decision, not a copy of its rules: a
+    /// job the runtime observes is published to the mounted assembly's table,
+    /// and a cancelled turn takes the claim back.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_jobs_a_completion_will_wake_for_reach_the_assembly() {
+        let (handle, _commands, events, mut runtime_events, _wake, _active, adapter) =
+            waking_test_runtime().await;
+        let waits = TEST_BACKGROUND_WAITS
+            .with(|waits| waits.borrow().clone())
+            .unwrap();
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        let id = crate::discipline::started_job(&result.content)
+            .unwrap()
+            .to_owned();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        // The table is written as the owner goes round again, which the next
+        // event of the turn makes it do.
+        let next = atomcode_kernel::tool::ToolCall {
+            id: "next".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        events.send(AgentEvent::ToolStarted { call: next }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolStarted { call })) if call.id == "next"
+        ) {}
+        assert!(waits.wakes_on(&id));
+        handle.cancel().await.unwrap();
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Cancelled,
+                provider_failure: None,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !waits.wakes_on(&id),
+            "cancellation retires the notification"
+        );
+        finish.cancel();
         adapter.shutdown().await.unwrap();
     }
 

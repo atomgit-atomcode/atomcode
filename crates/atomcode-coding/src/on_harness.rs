@@ -1656,10 +1656,11 @@ pub struct HostState {
     /// the policy intervention — offered as commands a person runs
     /// (`docs/adr/0021` §3, §10).
     pub(crate) runtime_commands: Option<Arc<dyn crate::runtime::RuntimeCommands>>,
-    /// Whether the driver shows the turn a background completion starts
-    /// ([`crate::CodingAgentConfig::background_wakeups`]); decides what the
-    /// `capability-commands` row tells the model about waiting.
-    pub(crate) background_wakeups: bool,
+    /// `Some` when the driver shows the turn a background completion starts
+    /// ([`crate::CodingAgentConfig::background_wakeups`]): the jobs the runtime
+    /// will wake the model for. Decides what the `capability-commands` row
+    /// tells the model about waiting, and lets it remind a model still polling.
+    pub(crate) background_waits: Option<crate::background_jobs::BackgroundWaits>,
     /// Row edits the runtime's own options call for (a capability switched off,
     /// a directory to resolve against).
     pub rows: Layer,
@@ -2236,7 +2237,7 @@ fn compose_hosted(
         registry.register(Arc::new(crate::host_rows::CapabilityCommandsPlugin(
             commands,
             working_dir.to_path_buf(),
-            host.background_wakeups,
+            host.background_waits,
         )));
     }
     if let Some(file) = host.config_file {
