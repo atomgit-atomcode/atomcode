@@ -1,8 +1,8 @@
 //! `search_replace` — bulk find-and-replace across many files (literal or regex),
 //! optionally scoped by a glob. Mutates the filesystem ⇒ always `Risky`. Neutral port of
 //! the production tool, minus the coding bookkeeping (file_history / file_store / LSP) —
-//! the L1 `ToolContext` has none of that. The (blocking) `ignore` walk + per-file reads
-//! run on `spawn_blocking` so a hung filesystem can't stall the async worker.
+//! the L1 `ToolContext` has none of that. Reads, writes and compensation all go
+//! through the same execution world's filesystem.
 
 use super::{coerce_eol, err, ok, resolve_path};
 use crate::world::{FileSystem, LocalFs};
@@ -14,6 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub struct SearchReplaceTool {
     /// The tree being rewritten. Walk, read and write all go through it, so a
@@ -85,7 +86,8 @@ impl Tool for SearchReplaceTool {
          blindly applying it. To apply the reviewed plan, repeat identical arguments with its \
          `preview_token`, `expected_files` and `expected_replacements` from the preview. \
          Any changed target file or scope invalidates the token. `dry_run:true` \
-         previews any replacement. This is text matching, NOT syntax-aware editing: a regex \
+         previews any replacement. A failed batch attempts to restore its writes and reports \
+         uncertain files. Inspect them before retrying. This is text matching, NOT syntax-aware editing: a regex \
          deleting empty parentheses also deletes function calls and declarations."
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -126,6 +128,9 @@ impl Tool for SearchReplaceTool {
                 "search_replace: search is empty — an empty pattern would corrupt every file."
                     .to_string(),
             );
+        }
+        if ctx.cancel.is_cancelled() {
+            return err("search_replace: cancelled. No files written.");
         }
         let root = resolve_path(a.path.as_deref().unwrap_or("."), &ctx.working_dir);
         match self.world.info(&root).await {
@@ -172,13 +177,14 @@ impl Tool for SearchReplaceTool {
             crate::pathutil::skip_dir_for(&self.dirs),
             &root,
             re.as_ref(),
-            &a.search,
-            &a.replace,
+            &a,
             glob_filter.as_ref(),
+            &ctx.cancel,
         )
         .await
         {
-            Ok(scan) => scan,
+            Ok(scan) if !ctx.cancel.is_cancelled() => scan,
+            Ok(_) => return err("search_replace: cancelled. No files written."),
             Err(e) => return err(format!("search_replace: {e}")),
         };
 
@@ -210,45 +216,31 @@ impl Tool for SearchReplaceTool {
             return err("search_replace: applying this preview requires expected_files and expected_replacements from the reviewed plan. No files written.");
         }
 
-        // Validate every original before the first write, including small literal
-        // replacements. Refuse changes observed after the scan, before writing.
-        for edit in &modified {
-            match self.world.read_text(&edit.path).await {
-                Ok(current) if current == edit.before => {},
-                _ => return err(format!("search_replace: {} changed or became unreadable during planning. No files written; preview again.", crate::pathnorm::to_display(&edit.path))),
-            }
-        }
-
-        // Phase 2: write the changed files.
-        let mut total = 0usize;
-        let mut report = Vec::new();
-        for PlannedEdit {
-            path,
-            after: new_content,
-            count,
-            ..
-        } in modified
-        {
-            if let Err(e) = self.world.write_text(&path, &new_content).await {
-                return err(format!(
-                    "search_replace: failed to write {}: {e}; {} files were already written. Inspect those changes before retrying.",
-                    crate::pathnorm::to_display(&path), report.len()
-                ));
-            }
-            total += count;
-            report.push(format!(
-                "  {} ({count} replacements)",
-                crate::pathnorm::to_display(&path)
-            ));
-        }
-
-        if report.is_empty() {
+        if modified.is_empty() {
             return ok(format!(
                 "No matches for '{}' in {} ({scanned} files scanned).",
                 a.search,
                 crate::pathnorm::to_display(&root)
             ));
         }
+        let world = Arc::clone(&self.world);
+        let cancel = ctx.cancel.child_token();
+        let _stop_commit = cancel.clone().drop_guard();
+        // The standalone kernel may drop execute on cancellation. Once a write
+        // starts, keep polling it and its compensation to completion.
+        let report = match tokio::spawn(async move {
+            commit_edits(world.as_ref(), &modified, &cancel).await?;
+            Ok::<_, String>(modified)
+        })
+        .await
+        {
+            Ok(Ok(edits)) => edits
+                .iter()
+                .map(|edit| format!("  {} ({} replacements)", crate::pathnorm::to_display(&edit.path), edit.count))
+                .collect::<Vec<_>>(),
+            Ok(Err(error)) => return err(error),
+            Err(error) => return err(format!("search_replace: commit task failed ({error}); file states are unknown. Inspect the workspace before retrying.")),
+        };
         ok(format!(
             "Replaced '{}' → '{}': {total} replacements across {} files.\n{}",
             a.search,
@@ -264,6 +256,127 @@ struct PlannedEdit {
     before: String,
     after: String,
     count: usize,
+}
+
+fn check_cancelled(cancel: &CancellationToken) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+    Ok(())
+}
+
+async fn commit_edits(
+    world: &dyn FileSystem,
+    edits: &[PlannedEdit],
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    // Verify every original before the first write and remember the world path
+    // so a retargeted path cannot be used for compensation.
+    let mut targets = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let verified = async {
+            check_cancelled(cancel)?;
+            let target = world
+                .canonicalize(&edit.path)
+                .await
+                .map_err(|e| e.to_string())?;
+            verify_bytes(world, &edit.path, edit.before.as_bytes()).await?;
+            Ok::<_, String>(target)
+        }
+        .await;
+        targets.push(verified.map_err(|error| {
+            format!(
+                "search_replace: {}: {error}. No files written; preview again.",
+                crate::pathnorm::to_display(&edit.path)
+            )
+        })?);
+    }
+
+    let mut attempted = 0;
+    for (edit, target) in edits.iter().zip(&targets) {
+        let result = async {
+            let lock = super::edit::edit_path_lock(target);
+            let _guard = tokio::select! {
+                guard = lock.lock() => guard,
+                _ = cancel.cancelled() => return Err("cancelled".into()),
+            };
+            verify_target(world, &edit.path, target).await?;
+            verify_bytes(world, &edit.path, edit.before.as_bytes()).await?;
+            check_cancelled(cancel)?;
+            attempted += 1;
+            world
+                .write_text(&edit.path, &edit.after)
+                .await
+                .map_err(|e| format!("write failed: {e}"))?;
+            verify_target(world, &edit.path, target).await?;
+            verify_bytes(world, &edit.path, edit.after.as_bytes()).await?;
+            check_cancelled(cancel)
+        }
+        .await;
+        if let Err(error) = result {
+            let mut restored_or_unchanged = Vec::new();
+            let mut uncertain = Vec::new();
+            for (written, target) in edits[..attempted].iter().zip(&targets).rev() {
+                let lock = super::edit::edit_path_lock(target);
+                let _guard = lock.lock().await;
+                let path = crate::pathnorm::to_display(&written.path);
+                if restore_original(world, written, target).await {
+                    restored_or_unchanged.push(path);
+                } else {
+                    uncertain.push(path);
+                }
+            }
+            return Err(format!(
+                "search_replace: {}",
+                json!({
+                    "status": "failed",
+                    "file": crate::pathnorm::to_display(&edit.path),
+                    "error": error,
+                    "restored_or_unchanged": restored_or_unchanged,
+                    "uncertain": uncertain,
+                    "not_attempted": edits[attempted..].iter().map(|e| crate::pathnorm::to_display(&e.path)).collect::<Vec<_>>(),
+                    "retry": "Inspect uncertain files and review a fresh preview before retrying.",
+                })
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_target(world: &dyn FileSystem, path: &Path, target: &Path) -> Result<(), String> {
+    let current = world.canonicalize(path).await.map_err(|e| e.to_string())?;
+    if current != target {
+        return Err("resolved target changed".into());
+    }
+    Ok(())
+}
+
+async fn verify_bytes(world: &dyn FileSystem, path: &Path, expected: &[u8]) -> Result<(), String> {
+    let current = world.read_bytes(path).await.map_err(|e| e.to_string())?;
+    if current != expected {
+        return Err("file content differs from expected bytes".into());
+    }
+    Ok(())
+}
+
+async fn restore_original(world: &dyn FileSystem, edit: &PlannedEdit, target: &Path) -> bool {
+    if verify_target(world, &edit.path, target).await.is_err() {
+        return false;
+    }
+    match world.read_bytes(&edit.path).await {
+        Ok(current) if current == edit.before.as_bytes() => true,
+        Ok(current) if current == edit.after.as_bytes() => {
+            world
+                .write_bytes(&edit.path, edit.before.as_bytes())
+                .await
+                .is_ok()
+                && verify_target(world, &edit.path, target).await.is_ok()
+                && verify_bytes(world, &edit.path, edit.before.as_bytes())
+                    .await
+                    .is_ok()
+        }
+        _ => false,
+    }
 }
 
 fn generic_syntax_deletion(edits: &[PlannedEdit]) -> bool {
@@ -351,17 +464,17 @@ async fn sr_scan(
     skip: crate::world::SkipDir,
     root: &Path,
     re: Option<&regex::Regex>,
-    search: &str,
-    replace: &str,
+    args: &Args,
     glob_filter: Option<&FileGlob>,
+    cancel: &CancellationToken,
 ) -> Result<(Vec<PlannedEdit>, usize), crate::world::FsError> {
     let mut modified = Vec::new();
     let mut scanned = 0usize;
-    // Not the turn's stop: this walk decides which files get rewritten, and one
-    // cut halfway through is a replace half applied — worse than one that
-    // finishes. Stopping a turn is cooperative, and this is a step that finishes.
-    let finishes = tokio_util::sync::CancellationToken::new();
-    for path in world.walk(root, &skip, &finishes).await? {
+    // The caller discards the plan on cancellation, including a partial walk.
+    for path in world.walk(root, &skip, cancel).await? {
+        if cancel.is_cancelled() {
+            break;
+        }
         if let Some(g) = glob_filter {
             if !g.is_match(&path, root) {
                 continue;
@@ -372,7 +485,7 @@ async fn sr_scan(
             Err(_) => continue, // skip binary / unreadable
         };
         scanned += 1;
-        if let Some((new_content, count)) = replace_in(&content, re, search, replace) {
+        if let Some((new_content, count)) = replace_in(&content, re, &args.search, &args.replace) {
             modified.push(PlannedEdit {
                 path,
                 before: content,
@@ -533,7 +646,221 @@ impl FileGlob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::sync::CancellationToken;
+    use crate::world::{DirEntry, FileInfo, FsError};
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        RefuseWrite,
+        PartialWrite,
+        EditEarlierFile,
+        EditNextFile,
+        CancelDuringWrite,
+        PauseDuringWrite,
+    }
+
+    struct FaultWorld {
+        inner: LocalFs,
+        fault: Fault,
+        cancel: CancellationToken,
+        write_started: tokio::sync::Notify,
+        resume_write: tokio::sync::Notify,
+        restored: tokio::sync::Notify,
+    }
+
+    impl FaultWorld {
+        fn new(root: &Path, fault: Fault, cancel: CancellationToken) -> Self {
+            Self {
+                inner: LocalFs::new(root),
+                fault,
+                cancel,
+                write_started: tokio::sync::Notify::new(),
+                resume_write: tokio::sync::Notify::new(),
+                restored: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FileSystem for FaultWorld {
+        fn root(&self) -> PathBuf {
+            self.inner.root()
+        }
+        fn describe(&self) -> String {
+            "search_replace fault fixture".into()
+        }
+        async fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+            self.inner.read_bytes(path).await
+        }
+        async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
+            if matches!(self.fault, Fault::PauseDuringWrite) && path.ends_with("a.txt") {
+                if bytes == b"new" {
+                    self.write_started.notify_one();
+                    self.resume_write.notified().await;
+                } else {
+                    self.inner.write_bytes(path, bytes).await?;
+                    self.restored.notify_one();
+                    return Ok(());
+                }
+            }
+            if bytes == b"new" {
+                if path.ends_with("a.txt") && matches!(self.fault, Fault::EditNextFile) {
+                    self.inner
+                        .write_bytes(&path.with_file_name("b.txt"), b"external")
+                        .await?;
+                }
+                if path.ends_with("b.txt") {
+                    match self.fault {
+                        Fault::RefuseWrite => return Err(FsError::io("second write failed")),
+                        Fault::PartialWrite => {
+                            self.inner.write_bytes(path, b"partial").await?;
+                            return Err(FsError::io("second write failed"));
+                        }
+                        Fault::EditEarlierFile => {
+                            self.inner
+                                .write_bytes(&path.with_file_name("a.txt"), b"external")
+                                .await?;
+                            return Err(FsError::io("second write failed"));
+                        }
+                        Fault::CancelDuringWrite => self.cancel.cancel(),
+                        Fault::EditNextFile | Fault::PauseDuringWrite => {}
+                    }
+                }
+            }
+            self.inner.write_bytes(path, bytes).await
+        }
+        async fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+            self.inner.create_dir_all(path).await
+        }
+        async fn list(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+            self.inner.list(path).await
+        }
+        async fn info(&self, path: &Path) -> Result<FileInfo, FsError> {
+            self.inner.info(path).await
+        }
+        async fn canonicalize(&self, path: &Path) -> Result<PathBuf, FsError> {
+            self.inner.canonicalize(path).await
+        }
+    }
+
+    async fn batch_with_fault(fault: Fault, files: &[&str]) -> (serde_json::Value, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        for file in files {
+            std::fs::write(dir.path().join(file), "old").unwrap();
+        }
+        let ctx = ctx(dir.path());
+        let tool = SearchReplaceTool::with_world(
+            Arc::new(FaultWorld::new(dir.path(), fault, ctx.cancel.clone())),
+            crate::product_dirs::test_dirs(),
+        );
+        let result = tool
+            .execute(r#"{"search":"old","replace":"new"}"#, &ctx)
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        let report =
+            serde_json::from_str(result.content.strip_prefix("search_replace: ").unwrap()).unwrap();
+        let contents = files
+            .iter()
+            .map(|file| std::fs::read_to_string(dir.path().join(file)).unwrap())
+            .collect();
+        (report, contents)
+    }
+
+    fn reported_files(report: &serde_json::Value, field: &str) -> Vec<String> {
+        report[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| {
+                path.as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_restores_verified_files_and_reports_unattempted_targets() {
+        let (report, contents) =
+            batch_with_fault(Fault::RefuseWrite, &["a.txt", "b.txt", "c.txt"]).await;
+        assert_eq!(contents, ["old", "old", "old"]);
+        assert_eq!(
+            reported_files(&report, "restored_or_unchanged"),
+            ["b.txt", "a.txt"]
+        );
+        assert!(reported_files(&report, "uncertain").is_empty());
+        assert_eq!(reported_files(&report, "not_attempted"), ["c.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_write_and_an_external_edit_are_left_for_review() {
+        let files = ["a.txt", "b.txt", "c.txt"];
+        let (report, contents) = batch_with_fault(Fault::PartialWrite, &files).await;
+        assert_eq!(contents, ["old", "partial", "old"]);
+        assert_eq!(reported_files(&report, "uncertain"), ["b.txt"]);
+        assert_eq!(reported_files(&report, "restored_or_unchanged"), ["a.txt"]);
+
+        let (report, contents) = batch_with_fault(Fault::EditEarlierFile, &files).await;
+        assert_eq!(contents, ["external", "old", "old"]);
+        assert_eq!(reported_files(&report, "uncertain"), ["a.txt"]);
+        assert_eq!(reported_files(&report, "restored_or_unchanged"), ["b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_target_changed_after_preflight_is_not_written() {
+        let (report, contents) =
+            batch_with_fault(Fault::EditNextFile, &["a.txt", "b.txt", "c.txt"]).await;
+        assert_eq!(contents, ["old", "external", "old"]);
+        assert_eq!(reported_files(&report, "not_attempted"), ["b.txt", "c.txt"]);
+        assert_eq!(reported_files(&report, "restored_or_unchanged"), ["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_the_last_write_restores_the_batch() {
+        let (report, contents) =
+            batch_with_fault(Fault::CancelDuringWrite, &["a.txt", "b.txt"]).await;
+        assert_eq!(contents, ["old", "old"]);
+        assert_eq!(report["error"], "cancelled");
+        assert_eq!(
+            reported_files(&report, "restored_or_unchanged"),
+            ["b.txt", "a.txt"]
+        );
+        assert!(reported_files(&report, "not_attempted").is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_execute_during_a_write_still_restores_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "old").unwrap();
+        std::fs::write(&b, "old").unwrap();
+        let ctx = ctx(dir.path());
+        let world = Arc::new(FaultWorld::new(
+            dir.path(),
+            Fault::PauseDuringWrite,
+            ctx.cancel.clone(),
+        ));
+        let tool = SearchReplaceTool::with_world(world.clone(), crate::product_dirs::test_dirs());
+        {
+            let execution = tool.execute(r#"{"search":"old","replace":"new"}"#, &ctx);
+            tokio::pin!(execution);
+            tokio::select! {
+                _ = world.write_started.notified() => {}
+                result = &mut execution => panic!("finished before the write was resumed: {}", result.content),
+            }
+        }
+        world.resume_write.notify_one();
+        world.restored.notified().await;
+        // Wait for the worker to finish verification before removing the fixture.
+        let lock = super::super::edit::edit_path_lock(&a);
+        let _guard = lock.lock().await;
+        assert_eq!(std::fs::read_to_string(a).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(b).unwrap(), "old");
+        assert!(!ctx.cancel.is_cancelled());
+    }
 
     #[tokio::test]
     async fn a_read_only_world_finds_the_matches_and_refuses_the_rewrite() {
