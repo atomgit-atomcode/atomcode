@@ -376,8 +376,8 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let mut ctx = ctx_for(home.path());
         ctx.project = project.path().to_owned();
-        let user_config = home.path().join(".codex/config.toml");
-        let project_config = project.path().join(".codex/config.toml");
+        let user_config = home.path().join(".codex").join("config.toml");
+        let project_config = project.path().join(".codex").join("config.toml");
         for path in [&user_config, &project_config] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
@@ -411,7 +411,7 @@ mod tests {
         let mut ctx = ctx_for(home.path());
         ctx.project = home.path().join("project");
         ctx.opencode_config_dir = home.path().join("opencode");
-        let broken = home.path().join(".codex/config.toml");
+        let broken = home.path().join(".codex").join("config.toml");
         std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
         std::fs::write(&broken, "[model_providers.not-valid").unwrap();
         std::fs::create_dir_all(&ctx.opencode_config_dir).unwrap();
@@ -441,7 +441,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut ctx = ctx_for(home.path());
         ctx.opencode_config_dir = home.path().join("opencode");
-        let settings = home.path().join(".claude/settings.json");
+        let settings = home.path().join(".claude").join("settings.json");
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         std::fs::write(
             settings,
