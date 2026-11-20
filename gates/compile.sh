@@ -71,6 +71,13 @@ else
 fi
 rm -f /tmp/atomcode-feature-gate.$$
 
+# 诊断行里指向源文件的那一段由 rustc 决定分隔符:Windows 上是反斜杠,其它平台是正斜杠。
+# 两侧都归一成正斜杠再比对,否则在 Windows 上永远认不出阴性对照确实报了诊断,量具会
+# 把自己判成坏的。其它平台 `tr` 是空操作,不影响原有行为。
+diagnosed_at() { # $1 = 编译输出文件, $2 = 期望出现在诊断里的源文件
+  tr '\\' '/' < "$1" | grep -Fq -- "--> $2:"
+}
+
 # 量具自身要能判红。没有这一步,一个永远 `exit 0` 的脚本和这个脚本看起来一模一样。
 #
 # 办法是喂给它一个**一定编译不过**的测试文件,然后要求它说不。放在一个真 crate 的
@@ -92,7 +99,7 @@ RS
 if cargo check --workspace --all-targets >"$canary_out" 2>&1; then
   printf '  \033[31mFAIL\033[0m 闸门判不出编译错误 —— 它现在什么也没在挡\n'
   fail=1
-elif ! grep -Fq -- "--> $canary:" "$canary_out"; then
+elif ! diagnosed_at "$canary_out" "$canary"; then
   printf '  \033[31mFAIL\033[0m 闸门报红，但本次阴性对照没有产生诊断\n'
   fail=1
 else
@@ -134,7 +141,7 @@ if cargo check -p atomcode-capabilities --all-targets \
      --features "$FEATURE_GATED" >"$feature_out" 2>&1; then
   printf '  \033[31mFAIL\033[0m feature 门控的闸门判不出编译错误\n'
   fail=1
-elif ! grep -Fq -- "--> $feature_canary:" "$feature_out"; then
+elif ! diagnosed_at "$feature_out" "$feature_canary"; then
   printf '  \033[31mFAIL\033[0m feature 门报红,但不是阴性对照引起的 —— feature 门后面的代码本来就坏着,这一条判不了\n'
   fail=1
 elif cargo check --workspace --all-targets >"$feature_out" 2>&1; then
