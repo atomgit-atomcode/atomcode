@@ -127,6 +127,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MentionEmpty => "  暂无匹配条目".into(),
         Msg::MentionLegend => "  Enter/Tab 插入 · Esc 关闭 · ↑/↓ 选择 · ←/→ 切换分类".into(),
         Msg::MentionSessions => "会话".into(),
+        Msg::MentionSessionsWorkspace => "会话 · 本工作区".into(),
         Msg::MentionSelected => "已选中".into(),
         Msg::MentionFilter => "切换类别 · Enter / Tab".into(),
         Msg::MenuFolder => "目录".into(),

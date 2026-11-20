@@ -156,6 +156,7 @@ pub enum Msg<'a> {
     MentionEmpty,
     MentionLegend,
     MentionSessions,
+    MentionSessionsWorkspace,
     MentionSelected,
     MentionFilter,
 

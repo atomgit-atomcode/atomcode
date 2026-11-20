@@ -1607,8 +1607,25 @@ impl TeamRoster for Roster {
 #[derive(Default)]
 struct SessionSuggestions {
     entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    /// First-user-message previews for entries whose name is empty (never
+    /// auto-named), by session id: the human-readable label the picker shows
+    /// instead of the raw `atomcode-session:` link.
+    previews: std::collections::HashMap<String, String>,
     checked: Option<std::time::Instant>,
     loading: bool,
+}
+
+/// The row label for a @-session candidate: the auto/user name, falling back
+/// to a first-user-message preview, then to the raw id.
+fn session_label(name: &str, preview: Option<&str>, id: &str) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    preview
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// Own and abort superseded panel reads.
@@ -9994,7 +10011,7 @@ impl Tui {
         use atomcode_capabilities::session::SessionManager;
         let kind = *self.mention_kind.lock().expect("mention kind poisoned");
         let mut rows = Vec::new();
-        if kind != 2 {
+        if kind != 2 && kind != 3 {
             rows.extend(paths_under(
                 &self.files,
                 cwd,
@@ -10002,7 +10019,7 @@ impl Tui {
                 self.host.project_dir_name(),
             ));
         }
-        if kind == 2 {
+        if kind == 2 || kind == 3 {
             let mut cache = self
                 .session_references
                 .lock()
@@ -10014,10 +10031,46 @@ impl Tui {
                     let shared = self.session_references.clone();
                     let wake = self.wake.lock().expect("wake poisoned").clone();
                     std::thread::spawn(move || {
-                        let entries = SessionManager::scan_catalog(&root).entries;
+                        let mut entries = SessionManager::scan_catalog(&root).entries;
+                        // Sessions auto-named at their first completed turn carry a
+                        // title; ones abandoned before that would render as a raw
+                        // `atomcode-session:` link, so back their label with the
+                        // first user message. Bounded: only unnamed entries, and
+                        // only the first 200 of them per scan.
+                        let mut by_bucket = std::collections::BTreeMap::new();
+                        for entry in entries.iter().filter(|e| e.name.is_empty()).take(200) {
+                            by_bucket
+                                .entry(entry.project_bucket.clone())
+                                .or_insert_with(Vec::new)
+                                .push(entry.id.clone());
+                        }
+                        let mut previews = std::collections::HashMap::new();
+                        for (bucket, ids) in by_bucket {
+                            let manager = SessionManager::with_root(root.join(&bucket));
+                            for id in ids {
+                                let Ok(records) = manager.load_transcript_records(&id) else {
+                                    continue;
+                                };
+                                if let Some(user) = records
+                                    .iter()
+                                    .find(|r| !r.user.trim().is_empty())
+                                    .map(|r| r.user.trim())
+                                {
+                                    let folded =
+                                        user.split_whitespace().collect::<Vec<_>>().join(" ");
+                                    if !folded.is_empty() {
+                                        previews.insert(
+                                            id,
+                                            folded.chars().take(60).collect::<String>(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         {
                             let mut held = shared.lock().expect("session suggestions poisoned");
                             held.entries = entries;
+                            held.previews = previews;
                             held.checked = Some(std::time::Instant::now());
                             held.loading = false;
                         }
@@ -10034,8 +10087,11 @@ impl Tui {
                 .iter()
                 .filter(|e| {
                     atomcode_capabilities::session::reference::available(e)
+                        // The "this workspace" tab narrows to the cwd; the
+                        // "Sessions" tab keeps every local session reachable.
+                        && (kind == 2 || e.working_dir == std::path::Path::new(cwd))
                         && (e.id != current || e.working_dir != std::path::Path::new(cwd))
-                        && format!("{} {}", e.name, e.working_dir.display())
+                        && format!("{} {} {}", e.name, e.id, e.working_dir.display())
                             .to_lowercase()
                             .contains(&query)
                 })
@@ -10047,12 +10103,17 @@ impl Tui {
                 )
             });
             for e in candidates {
+                let label = session_label(
+                    &e.name,
+                    cache.previews.get(&e.id).map(|s| s.as_str()),
+                    &e.id,
+                );
                 let reference = atomcode_capabilities::session::reference::SessionReference {
                     bucket: e.project_bucket.clone(),
                     id: e.id.clone(),
                 };
                 rows.push(
-                    crate::menu::Item::new(reference.spelling(&e.name), e.name.clone())
+                    crate::menu::Item::new(reference.spelling(&label), label)
                         .about(format!(
                             "{} · {}",
                             chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
@@ -10218,12 +10279,17 @@ impl Tui {
             let tabs = [
                 ("files", t(Msg::MentionFiles)),
                 ("sessions", t(Msg::MentionSessions)),
+                ("workspace", t(Msg::MentionSessionsWorkspace)),
             ]
             .into_iter()
             .map(|(key, label)| crate::menu::Item::new(format!("@\0mention-filter:{key}"), label))
             .collect();
-            self.host
-                .set_mention_menu(menu, tabs, usize::from(kind == 2));
+            let tab = match kind {
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            };
+            self.host.set_mention_menu(menu, tabs, tab);
         } else {
             self.host.set_menu(menu);
         }
@@ -10469,6 +10535,7 @@ impl Tui {
             *self.mention_kind.lock().expect("mention kind poisoned") = match kind {
                 "files" => 1,
                 "sessions" => 2,
+                "workspace" => 3,
                 _ => 0,
             };
             self.refresh_menu();
@@ -17919,6 +17986,19 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 0);
         tui.complete_path("@\0mention-filter:sessions");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
+        tui.complete_path("@\0mention-filter:workspace");
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn an_unnamed_session_falls_back_to_preview_then_id() {
+        assert_eq!(super::session_label("named", None, "id-1"), "named");
+        assert_eq!(
+            super::session_label("", Some("first user message"), "id-1"),
+            "first user message"
+        );
+        assert_eq!(super::session_label("", Some("  "), "id-1"), "id-1");
+        assert_eq!(super::session_label("", None, "id-1"), "id-1");
     }
 }
 
