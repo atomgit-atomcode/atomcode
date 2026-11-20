@@ -19,7 +19,7 @@
 //! (`docs/adr/0024` §7) — so the numbering on disk has gaps.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
@@ -29,11 +29,51 @@ use atomcode_kernel::session::{
 };
 
 use super::manager::{
-    io_at, open_append_file, open_read_file, read_regular_file_bounded,
+    io_at, open_append_file, open_read_file, read_regular_file_bounded, regular_file_len,
     retry_transient_file_access, SessionLease, SessionManager, SessionMeta, SessionResult,
     SessionStoreError, StorageOwner, MAX_JSONL_BYTES, MAX_JSONL_LINE_BYTES,
 };
 use super::transcript::TurnRecord;
+
+const PROMPT_PREVIEW_BYTES: u64 = 64 * 1024;
+
+fn first_prompt_in_prefix(
+    path: &Path,
+    mut preview: impl FnMut(&[u8], usize) -> SessionResult<Option<String>>,
+) -> SessionResult<Option<String>> {
+    regular_file_len(path)?;
+    let file = open_read_file(path)?;
+    fs2::FileExt::try_lock_shared(&file).map_err(|error| io_at(path, error))?;
+    let mut reader = BufReader::new(file.take(PROMPT_PREVIEW_BYTES));
+    let mut line = Vec::new();
+    for index in 0.. {
+        line.clear();
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| io_at(path, e))?;
+        // A torn append or the last bytes of the read budget are not a record.
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            if let Some(label) = preview(&line, index)? {
+                return Ok(Some(label));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn prompt_preview(text: &str) -> Option<String> {
+    let label: String = text
+        .split(|ch: char| ch.is_whitespace() || ch.is_control())
+        .filter(|word| !word.is_empty())
+        .flat_map(|word| std::iter::once(' ').chain(word.chars()))
+        .skip(1)
+        .take(60)
+        .collect();
+    (!label.is_empty()).then(|| label.trim_end().to_owned())
+}
 
 /// What an event log line holds.
 #[derive(serde::Deserialize)]
@@ -881,6 +921,65 @@ impl SessionManager {
     /// Every stored fact of an event session, in file order.
     pub fn load_events(&self, id: &str) -> SessionResult<Vec<LoggedEvent>> {
         Ok(self.read_event_log(id, false)?.1)
+    }
+
+    /// A short display label from the first prompt recorded for an unnamed
+    /// session, including a turn that never finished. Reads only a log prefix.
+    pub fn first_prompt_preview(&self, id: &str) -> SessionResult<Option<String>> {
+        let preview = if self.is_event_session(id) {
+            self.first_event_prompt_preview(id)?
+        } else {
+            first_prompt_in_prefix(&self.jsonl_path(id)?, |raw, _| {
+                let record: TurnRecord = super::manager::deserialize(raw, "transcript record")?;
+                if record.v > super::transcript::RECORD_VERSION {
+                    return Err(SessionStoreError::FutureSchema {
+                        kind: "transcript record",
+                        found: record.v,
+                        supported: super::transcript::RECORD_VERSION,
+                    });
+                }
+                Ok(prompt_preview(&record.user))
+            })?
+        };
+        let Some(preview) = preview else {
+            return Ok(None);
+        };
+        let meta = self.read_meta(id)?;
+        Ok((!meta.user_renamed
+            && !meta.ai_named
+            && !meta.needs_newer_version()
+            && (meta.name.trim().is_empty() || SessionMeta::name_needs_fallback(&meta.name, id)))
+        .then_some(preview))
+    }
+
+    fn first_event_prompt_preview(&self, id: &str) -> SessionResult<Option<String>> {
+        let path = self.events_path(id)?;
+        let mut header = None;
+        first_prompt_in_prefix(&path, |raw, index| {
+            let line: Line = super::manager::deserialize(raw, "session events")?;
+            if let Some(found) = line.header {
+                if found.version > SESSION_FORMAT_VERSION {
+                    return Err(SessionStoreError::FutureSchema {
+                        kind: "session events",
+                        found: found.version,
+                        supported: SESSION_FORMAT_VERSION,
+                    });
+                }
+                if header.is_none() && storage_id(&found.id) == id {
+                    header = Some(found);
+                    return Ok(None);
+                }
+            } else if let (Some(header), Some(_), Some(event)) = (&header, line.seq, line.event) {
+                return match event_of(event, &path, index, Some(header))? {
+                    SessionEvent::UserMessage { text, .. } => Ok(prompt_preview(&text)),
+                    _ => Ok(None),
+                };
+            }
+            Err(SessionStoreError::Corrupt {
+                kind: "session events",
+                message: format!("{}:{}: invalid preview record", path.display(), index + 1),
+            })
+        })
     }
 
     /// The conversation an event session's log projects to, as a snapshot.
@@ -2649,6 +2748,92 @@ mod tests {
             .create_event_session(&lease, &SessionHeader::new(id), &meta(id))
             .unwrap();
         lease
+    }
+
+    #[test]
+    fn prompt_preview_stops_at_the_first_prompt_and_ignores_an_incomplete_record() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "preview");
+        let path = manager.events_path("preview").unwrap();
+        let event = logged(
+            1,
+            0,
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "first\n\tquestion".into(),
+                images: Vec::new(),
+            },
+        );
+        let mut line = record_line(&event).unwrap();
+        assert_eq!(line.pop(), Some(b'\n'));
+        let mark = manager.events_mark("preview").unwrap();
+        open_append_file(&path).unwrap().write_all(&line).unwrap();
+        assert_eq!(manager.first_prompt_preview("preview").unwrap(), None);
+
+        manager.truncate_events(&lease, mark).unwrap();
+        manager.append_events(&lease, &[event]).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(PROMPT_PREVIEW_BYTES * 2)
+            .unwrap();
+        assert_eq!(
+            manager.first_prompt_preview("preview").unwrap().as_deref(),
+            Some("first question")
+        );
+        manager.rename("preview", "default").unwrap();
+        assert_eq!(manager.first_prompt_preview("preview").unwrap(), None);
+    }
+
+    #[test]
+    fn prompt_preview_skips_a_prompt_record_beyond_its_budget() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "large");
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    1,
+                    0,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "x".repeat(PROMPT_PREVIEW_BYTES as usize),
+                        images: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert_eq!(manager.first_prompt_preview("large").unwrap(), None);
+    }
+
+    #[test]
+    fn prompt_preview_defers_while_the_event_log_is_locked_for_writing() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "busy");
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    1,
+                    0,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "first question".into(),
+                        images: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+
+        let writer = open_append_file(&manager.events_path("busy").unwrap()).unwrap();
+        fs2::FileExt::lock_exclusive(&writer).unwrap();
+        assert!(manager.first_prompt_preview("busy").is_err());
+        drop(writer);
+        assert_eq!(
+            manager.first_prompt_preview("busy").unwrap().as_deref(),
+            Some("first question")
+        );
     }
 
     #[test]

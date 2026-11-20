@@ -1623,26 +1623,58 @@ impl TeamRoster for Roster {
 /// Cached metadata for asynchronous session reference discovery.
 #[derive(Default)]
 struct SessionSuggestions {
-    entries: Vec<atomcode_capabilities::session::CatalogEntry>,
-    /// First-user-message previews for entries whose name is empty (never
-    /// auto-named), by session id: the human-readable label the picker shows
-    /// instead of the raw `atomcode-session:` link.
-    previews: std::collections::HashMap<String, String>,
+    entries: Vec<SessionSuggestion>,
     checked: Option<std::time::Instant>,
     loading: bool,
 }
 
-/// The row label for a @-session candidate: the auto/user name, falling back
-/// to a first-user-message preview, then to the raw id.
-fn session_label(name: &str, preview: Option<&str>, id: &str) -> String {
-    if !name.is_empty() {
-        return name.to_string();
+struct SessionSuggestion {
+    entry: atomcode_capabilities::session::CatalogEntry,
+    preview: Option<String>,
+}
+
+impl SessionSuggestion {
+    fn scan(root: &std::path::Path) -> Vec<Self> {
+        use atomcode_capabilities::session::{reference, SessionManager, SessionMeta};
+
+        let mut candidates: Vec<_> = SessionManager::scan_catalog(root)
+            .entries
+            .into_iter()
+            .filter(reference::available)
+            .map(|entry| Self {
+                entry,
+                preview: None,
+            })
+            .collect();
+        // The catalog is newest first. Cap preview reads per refresh.
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| {
+                let entry = &candidate.entry;
+                entry.name.trim().is_empty()
+                    || SessionMeta::name_needs_fallback(&entry.name, &entry.id)
+            })
+            .take(200)
+        {
+            let entry = &candidate.entry;
+            candidate.preview = SessionManager::with_root(root.join(&entry.project_bucket))
+                .first_prompt_preview(&entry.id)
+                .ok()
+                .flatten();
+        }
+        candidates
     }
-    preview
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| id.to_string())
+
+    fn label(&self) -> &str {
+        self.preview.as_deref().unwrap_or_else(|| {
+            let name = self.entry.name.trim();
+            if name.is_empty() {
+                &self.entry.id
+            } else {
+                name
+            }
+        })
+    }
 }
 
 /// Own and abort superseded panel reads.
@@ -10097,46 +10129,10 @@ impl Tui {
                     let shared = self.session_references.clone();
                     let wake = self.wake.lock().expect("wake poisoned").clone();
                     std::thread::spawn(move || {
-                        let mut entries = SessionManager::scan_catalog(&root).entries;
-                        // Sessions auto-named at their first completed turn carry a
-                        // title; ones abandoned before that would render as a raw
-                        // `atomcode-session:` link, so back their label with the
-                        // first user message. Bounded: only unnamed entries, and
-                        // only the first 200 of them per scan.
-                        let mut by_bucket = std::collections::BTreeMap::new();
-                        for entry in entries.iter().filter(|e| e.name.is_empty()).take(200) {
-                            by_bucket
-                                .entry(entry.project_bucket.clone())
-                                .or_insert_with(Vec::new)
-                                .push(entry.id.clone());
-                        }
-                        let mut previews = std::collections::HashMap::new();
-                        for (bucket, ids) in by_bucket {
-                            let manager = SessionManager::with_root(root.join(&bucket));
-                            for id in ids {
-                                let Ok(records) = manager.load_transcript_records(&id) else {
-                                    continue;
-                                };
-                                if let Some(user) = records
-                                    .iter()
-                                    .find(|r| !r.user.trim().is_empty())
-                                    .map(|r| r.user.trim())
-                                {
-                                    let folded =
-                                        user.split_whitespace().collect::<Vec<_>>().join(" ");
-                                    if !folded.is_empty() {
-                                        previews.insert(
-                                            id,
-                                            folded.chars().take(60).collect::<String>(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        let entries = SessionSuggestion::scan(&root);
                         {
                             let mut held = shared.lock().expect("session suggestions poisoned");
                             held.entries = entries;
-                            held.previews = previews;
                             held.checked = Some(std::time::Instant::now());
                             held.loading = false;
                         }
@@ -10151,35 +10147,37 @@ impl Tui {
             let mut candidates: Vec<_> = cache
                 .entries
                 .iter()
-                .filter(|e| {
-                    atomcode_capabilities::session::reference::available(e)
-                        // The "this workspace" tab narrows to the cwd; the
-                        // "Sessions" tab keeps every local session reachable.
-                        && (kind == 2 || e.working_dir == std::path::Path::new(cwd))
+                .filter(|candidate| {
+                    let e = &candidate.entry;
+                    (kind == 2 || e.working_dir == std::path::Path::new(cwd))
                         && (e.id != current || e.working_dir != std::path::Path::new(cwd))
-                        && format!("{} {} {}", e.name, e.id, e.working_dir.display())
-                            .to_lowercase()
-                            .contains(&query)
+                        && format!(
+                            "{} {} {} {}",
+                            e.name,
+                            e.id,
+                            e.working_dir.display(),
+                            candidate.preview.as_deref().unwrap_or_default()
+                        )
+                        .to_lowercase()
+                        .contains(&query)
                 })
                 .collect();
-            candidates.sort_by_key(|e| {
+            candidates.sort_by_key(|candidate| {
+                let e = &candidate.entry;
                 (
                     e.working_dir != std::path::Path::new(cwd),
                     std::cmp::Reverse(e.updated_at_ms),
                 )
             });
-            for e in candidates {
-                let label = session_label(
-                    &e.name,
-                    cache.previews.get(&e.id).map(|s| s.as_str()),
-                    &e.id,
-                );
+            for candidate in candidates {
+                let e = &candidate.entry;
+                let label = candidate.label();
                 let reference = atomcode_capabilities::session::reference::SessionReference {
                     bucket: e.project_bucket.clone(),
                     id: e.id.clone(),
                 };
                 rows.push(
-                    crate::menu::Item::new(reference.spelling(&label), label)
+                    crate::menu::Item::new(reference.spelling(label), label)
                         .about(format!(
                             "{} · {}",
                             chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
@@ -18079,14 +18077,77 @@ mod session_mention_tests {
     }
 
     #[test]
-    fn an_unnamed_session_falls_back_to_preview_then_id() {
-        assert_eq!(super::session_label("named", None, "id-1"), "named");
+    fn preview_labels_and_workspace_filters_keep_their_reference_identity() {
+        use atomcode_capabilities::session::{
+            reference, SessionManager, SessionMeta, StorageOwner,
+        };
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+        let root = tempfile::tempdir().unwrap();
+        let local = "0123456789abcdef";
+        let other = "fedcba9876543210";
+        for (bucket, cwd, prompt) in [
+            (local, "/local", "  Local\n  question  "),
+            (other, "/another", "Other question"),
+        ] {
+            let manager = SessionManager::with_root(root.path().join(bucket));
+            let lease = manager.acquire_lease("same-id").unwrap();
+            let mut meta = SessionMeta::new("same-id", cwd, 1);
+            meta.owner = StorageOwner::Native;
+            manager
+                .create_event_session(&lease, &SessionHeader::new("same-id"), &meta)
+                .unwrap();
+            manager
+                .append_events(
+                    &lease,
+                    &[
+                        LoggedEvent {
+                            seq: 1,
+                            at: 1,
+                            event: SessionEvent::TurnStart { turn: 1 },
+                        },
+                        LoggedEvent {
+                            seq: 2,
+                            at: 2,
+                            event: SessionEvent::UserMessage {
+                                turn: 1,
+                                text: prompt.into(),
+                                images: Vec::new(),
+                            },
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+
+        let (_, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut cache = tui.session_references.lock().unwrap();
+            cache.entries = super::SessionSuggestion::scan(root.path());
+            cache.checked = Some(std::time::Instant::now());
+        }
+        *tui.mention_kind.lock().unwrap() = 2;
+        let rows = tui.mention_rows("/local", "same-id");
+        assert_eq!(rows.len(), 2);
+        for (row, label, bucket) in [
+            (&rows[0], "Local question", local),
+            (&rows[1], "Other question", other),
+        ] {
+            assert_eq!(row.label, label);
+            assert_eq!(
+                reference::parse(&row.value).unwrap(),
+                vec![reference::SessionReference {
+                    bucket: bucket.into(),
+                    id: "same-id".into(),
+                }]
+            );
+        }
         assert_eq!(
-            super::session_label("", Some("first user message"), "id-1"),
-            "first user message"
+            tui.mention_rows("/local", "other question"),
+            vec![rows[1].clone()]
         );
-        assert_eq!(super::session_label("", Some("  "), "id-1"), "id-1");
-        assert_eq!(super::session_label("", None, "id-1"), "id-1");
+        *tui.mention_kind.lock().unwrap() = 3;
+        assert_eq!(tui.mention_rows("/local", "same-id"), vec![rows[0].clone()]);
     }
 }
 

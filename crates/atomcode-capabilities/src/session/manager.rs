@@ -5315,7 +5315,10 @@ pub(super) fn serialize_pretty_bounded<T: Serialize>(
     Ok(bytes)
 }
 
-fn deserialize<T: for<'de> Deserialize<'de>>(bytes: &[u8], kind: &'static str) -> SessionResult<T> {
+pub(super) fn deserialize<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    kind: &'static str,
+) -> SessionResult<T> {
     serde_json::from_slice(bytes).map_err(|e| SessionStoreError::Corrupt {
         kind,
         message: e.to_string(),
@@ -6165,6 +6168,12 @@ mod tests {
         assert_eq!(records[0].user, "question 1");
         assert_eq!(records[0].assistant, "answer 1");
         assert_eq!(records[2].user, "question 3");
+
+        mgr.write_meta(&SessionMeta::new("s1", "/work", 1)).unwrap();
+        assert_eq!(
+            mgr.first_prompt_preview("s1").unwrap().as_deref(),
+            Some("question 1")
+        );
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {
