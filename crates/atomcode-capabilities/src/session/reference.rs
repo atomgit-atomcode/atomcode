@@ -39,36 +39,25 @@ pub fn available(entry: &super::CatalogEntry) -> bool {
     !entry.delegated()
         && !entry.needs_newer_version
         && entry.presence != super::CatalogPresence::LegacyOnly
-        && valid_identity(&entry.project_bucket, &entry.id)
+        && validate_identity(&entry.project_bucket, &entry.id).is_ok()
 }
 
-fn valid_identity(bucket: &str, id: &str) -> bool {
-    validate_identity(bucket, id).is_ok()
-}
-
-/// Why [`valid_identity`] said no. The bucket must be the 16-hex project hash
-/// and the id a session-shaped token; spelling out which side broke and with
-/// what character saves a round of guessing, because the one opaque "invalid"
-/// covered four different mistakes.
-fn validate_identity(bucket: &str, id: &str) -> Result<(), String> {
+// Keep diagnostics bounded even when an invalid field spans the whole input.
+fn validate_identity(bucket: &str, id: &str) -> Result<(), &'static str> {
     if bucket.len() != 16 || bucket.bytes().any(|b| !b.is_ascii_hexdigit()) {
-        return Err(format!(
-            "the project bucket must be a 16-hex id, got {bucket:?}"
-        ));
+        return Err("the project bucket must be a 16-hex id");
     }
     if id.is_empty() {
-        return Err("the session id is empty".into());
+        return Err("the session id is empty");
     }
     if id.len() > 128 {
-        return Err(format!("the session id exceeds 128 bytes: {id:?}"));
+        return Err("the session id exceeds 128 bytes");
     }
     if !id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(format!(
-            "the session id contains characters outside [A-Za-z0-9_-]: {id:?}"
-        ));
+        return Err("the session id contains characters outside [A-Za-z0-9_-]");
     }
     Ok(())
 }
@@ -114,9 +103,9 @@ fn parsed(text: &str) -> Result<(Vec<SessionReference>, Vec<std::ops::Range<usiz
             .find(')')
             .ok_or("Unfinished session reference; select the session again")?;
         let identity = &value[..end];
-        let (bucket, id) = identity.split_once('/').ok_or_else(|| {
-            format!("Invalid session reference identity: expected `<project bucket>/<session id>`, got {identity:?}")
-        })?;
+        let (bucket, id) = identity.split_once('/').ok_or(
+            "Invalid session reference identity: expected `<project bucket>/<session id>`",
+        )?;
         validate_identity(bucket, id)
             .map_err(|e| format!("Invalid session reference identity: {e}"))?;
         if seen.insert(identity.to_string()) {
@@ -371,6 +360,27 @@ mod tests {
             e.contains("expected `<project bucket>/<session id>`"),
             "{e}"
         );
+    }
+    #[test]
+    fn long_invalid_identity_fields_do_not_expand_the_error() {
+        let long = "x".repeat(4096);
+        for (identity, reason) in [
+            (
+                format!("{long}/id"),
+                "the project bucket must be a 16-hex id",
+            ),
+            (
+                format!("0123456789abcdef/{long}"),
+                "the session id exceeds 128 bytes",
+            ),
+            (long, "expected `<project bucket>/<session id>`"),
+        ] {
+            let input = format!("@[x](atomcode-session:{identity})");
+            assert_eq!(
+                parse(&input).unwrap_err(),
+                format!("Invalid session reference identity: {reason}")
+            );
+        }
     }
     #[test]
     fn missing_sources_fail_instead_of_becoming_empty_context() {
