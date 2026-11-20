@@ -22,6 +22,49 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CHAT_PATH: &str = "/chat/completions";
 
+/// Neutralizes the developer machine's ambient proxy for the duration of a test.
+///
+/// The provider installs an explicit proxy only when its system probe returns
+/// one. When the probe returns nothing, reqwest falls back to its own
+/// environment detection, so a machine with `HTTPS_PROXY` set sends a loopback
+/// request to the proxy instead of the local gateway — and the proxy probe is
+/// spent out of the open budget, which turns the expected TTFB timeout into a
+/// non-retryable budget exhaustion. `nextest` runs one test per process, so
+/// saving and restoring the variables here cannot leak into another test.
+struct NoAmbientProxy(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl NoAmbientProxy {
+    fn new() -> Self {
+        const KEYS: [&str; 6] = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ];
+        let saved = KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for NoAmbientProxy {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// A final-answer SSE response (text + stop + usage + [DONE]).
 const FINAL_SSE: &str = "data: {\"id\":\"resp-final\",\"choices\":[{\"delta\":{\"content\":\"It is noon.\"}}]}\n\
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":4}}\n\
@@ -729,9 +772,18 @@ fn black_hole_gateway() -> String {
 
 #[tokio::test]
 async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
+    // The budget this test measures is the open budget: a live system proxy
+    // would spend part of it on its own probe and change which error surfaces.
+    let _no_ambient_proxy = NoAmbientProxy::new();
     let base = black_hole_gateway();
     let mut cfg = OpenAiCompatConfig::new("k", &base, "test-model");
-    cfg.open_timeout = Duration::from_millis(300);
+    // The open budget is `2 × open_timeout`, and the system-proxy probe (bounded
+    // by its own 2 s deadline) is spent from that budget on every attempt. With a
+    // tight `open_timeout` a slow probe turns the expected TTFB timeout into a
+    // budget exhaustion, which reports `retryable: false` — the machine's probe
+    // latency, not the timeout contract. Keep the budget strictly larger than
+    // probe + timeout so this judge measures the contract.
+    cfg.open_timeout = Duration::from_millis(2500);
     cfg.retry = RetryPolicy::none(); // single attempt, so the timing is unambiguous
     let provider = OpenAiCompatProvider::new(cfg).unwrap();
     let msgs = vec![Message::user("hi")];
@@ -745,7 +797,7 @@ async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_secs(8),
         "took {elapsed:?} — not bounded by open_timeout"
     );
     assert!(
