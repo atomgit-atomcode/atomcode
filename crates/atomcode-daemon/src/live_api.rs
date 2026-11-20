@@ -290,6 +290,7 @@ pub(crate) fn chat_runtime_config(
     let (permission_rules, startup_warnings) =
         atomcode_coding::config::permission_rules_from_config(&config.permissions);
     atomcode_coding::CodingRuntimeConfig {
+        require_approval_hook: false,
         startup_warnings,
         extra_skill_dirs: config.skills.extra_dirs.clone(),
         compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),

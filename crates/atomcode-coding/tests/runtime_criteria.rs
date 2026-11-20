@@ -1931,6 +1931,7 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         },
     ]));
     let mut runtime = CodingRuntime::start(start).await.unwrap();
@@ -1939,6 +1940,101 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
 
     assert!(from_file.exists(), "the hooks.json hook did not run");
     assert!(from_plugin.exists(), "the plugin's hook did not run");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Even in accept-edits mode, a required approval must authorize the write.
+#[cfg(unix)]
+async fn a_failed_required_approval_prevents_the_tool_from_writing() {
+    let env = env();
+    let project = env.project.path();
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "guard": {
+                    "event": "PreToolUse",
+                    "matcher": "write_file",
+                    "command": "exit 127",
+                    "required_approval": true,
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    turn(&mut runtime, "write denied.txt").await;
+    assert!(!project.join("denied.txt").exists());
+    assert!(recorder.last_request().iter().any(
+        |message| message.role == Role::Tool && message.text.contains("Required approval hook")
+    ));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+async fn managed_required_approval_is_checked_on_the_hooks_the_runtime_loads() {
+    let env = env();
+    let project = env.project.path();
+    let hooks = serde_json::json!({"hooks": {"guard": {
+        "event": "PreToolUse",
+        "matcher": "",
+        "command": "exit 127",
+        "required_approval": true
+    }}})
+    .to_string();
+    std::fs::write(project.join(".hooks.json"), &hooks).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let managed = || {
+        let mut input = start(project, &recorder, SessionMode::Fresh);
+        input.agent.require_approval_hook = true;
+        input
+    };
+    let user_hooks = env._home.path().join("hooks.json");
+    for content in [None, Some("{invalid")] {
+        if let Some(content) = content {
+            std::fs::write(&user_hooks, content).unwrap();
+        }
+        let Err(error) = CodingRuntime::start(managed()).await else {
+            panic!("managed startup must reject a missing or malformed user hook file");
+        };
+        assert!(
+            error.to_string().contains("--require-approval-hook"),
+            "{error}"
+        );
+    }
+
+    std::fs::remove_file(project.join(".hooks.json")).unwrap();
+    std::fs::write(&user_hooks, hooks).unwrap();
+    let mut runtime = CodingRuntime::start(managed()).await.unwrap();
+    let generation = runtime.handle.status().generation;
+    std::fs::remove_file(user_hooks).unwrap();
+    let mut reload = start(project, &recorder, SessionMode::Fresh).agent;
+    reload.todo.enabled = !reload.todo.enabled;
+    let error = runtime.handle.reprepare_config(reload).await.unwrap_err();
+    assert!(
+        error.to_string().contains("--require-approval-hook"),
+        "{error}"
+    );
+    assert_eq!(runtime.handle.status().generation, generation);
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    turn(&mut runtime, "write denied.txt").await;
+    assert!(!project.join("denied.txt").exists());
+    assert!(recorder.last_request().iter().any(
+        |message| message.role == Role::Tool && message.text.contains("Required approval hook")
+    ));
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -7392,6 +7488,10 @@ mod criteria {
         a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        #[cfg(unix)]
+        a_failed_required_approval_prevents_the_tool_from_writing,
+        #[cfg(unix)]
+        managed_required_approval_is_checked_on_the_hooks_the_runtime_loads,
         #[cfg(unix)]
         the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused,
         a_stop_hook_is_pointed_at_the_sessions_log,

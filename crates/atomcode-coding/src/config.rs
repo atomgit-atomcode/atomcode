@@ -15,6 +15,8 @@ use atomcode_kernel::agent::ToolLoopPolicy;
 /// stalled provider or silent driver can never park a turn forever.
 #[derive(Clone)]
 pub struct CodingAgentConfig {
+    /// Require a catch-all approval hook from the user configuration on every prepare.
+    pub require_approval_hook: bool,
     /// Host-injected persistent automation service; absent in generic library agents.
     pub automation: Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
     /// User-only follow-up dispatch/history port. Never exposed as a model tool.
@@ -296,6 +298,8 @@ pub fn settle_dir_names(dirs: &atomcode_capabilities::ProductDirs) {
 /// This is a driver configuration object, not a legacy command protocol.
 #[derive(Clone)]
 pub struct CodingRuntimeConfig {
+    /// Host opt-in to require a user approval hook when assembling the runtime.
+    pub require_approval_hook: bool,
     /// See [`CodingAgentConfig::startup_warnings`].
     pub startup_warnings: Vec<String>,
     /// Optional absolute prompt budget from `[compaction].token_limit`.
@@ -785,6 +789,7 @@ impl CodingRuntimeConfig {
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
             background_wakeups: false,
+            require_approval_hook: false,
             lsp: {
                 let mut lsp = lsp_settings_from_config(&config.lsp);
                 lsp.config_dir = Some(dirs.user().to_path_buf());
@@ -868,6 +873,7 @@ impl CodingRuntimeConfig {
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.background_wakeups = self.background_wakeups;
+        config.require_approval_hook = self.require_approval_hook;
         config.lsp = self.lsp.clone();
         config.dap = self.dap.clone();
         config.web_search_provider = self.web_search_provider.clone();
@@ -1347,6 +1353,7 @@ impl CodingAgentConfig {
             auto_review: true,
             architecture_topology: false,
             repeat_stop_rounds: None,
+            require_approval_hook: false,
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
             background_wakeups: false,

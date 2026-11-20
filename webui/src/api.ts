@@ -1628,6 +1628,7 @@ export async function saveModeModels(bindings: ModeBindings): Promise<ModeModels
 export interface HookEntry {
   id: string; name: string; event: string; matcher: string | null; command: string;
   timeout_ms: number; source: string; scope: string; disabled: boolean; testable: boolean; args?: string[];
+  required_approval?: boolean;
 }
 export interface HookCatalogue {
   cwd: string;

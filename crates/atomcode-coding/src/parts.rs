@@ -818,6 +818,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
+    let cc_hooks = if cfg.require_approval_hook {
+        CCExternalHooks::load_with_required_approval(
+            &cfg.working_dir,
+            cfg.dirs.user(),
+            plugin_cc_hooks,
+        )?
+    } else {
+        CCExternalHooks::load_with_extra(&cfg.working_dir, cfg.dirs.user(), plugin_cc_hooks)
+    };
     let bypass_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
@@ -1310,8 +1319,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // (`plugin_cc_hooks`, resolved by the host), mounted by the `cc-hooks-host` row on
     // both the lifecycle and the tool-middleware seam. Only when hooks actually exist.
     let cc_external = {
-        let mut cc =
-            CCExternalHooks::load_with_extra(&cfg.working_dir, cfg.dirs.user(), plugin_cc_hooks);
+        let mut cc = cc_hooks;
         // Stamp the persistent session id into every CC payload (CC `session_id`), so a
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {

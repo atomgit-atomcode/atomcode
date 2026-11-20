@@ -7911,6 +7911,8 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        // The installed hooks and their host requirement stay with these parts.
+                        next.require_approval_hook = runtime.config.require_approval_hook;
                         let routing = next
                             .subagent_config
                             .clone()
@@ -11717,7 +11719,9 @@ fn resolve_reprepare_input(
                 None,
             )))
         }
-        ReprepareTarget::ReloadConfig(config) => {
+        ReprepareTarget::ReloadConfig(mut config) => {
+            // An in-process reload cannot relax requirements imposed by the host.
+            config.require_approval_hook |= runtime.config.require_approval_hook;
             if runtime.parts.session.is_some() && config.dirs != runtime.config.dirs {
                 return Err(RuntimeError::ReconfigureFailed(
                     "cannot change product data directories while keeping an active session; \

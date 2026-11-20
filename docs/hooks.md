@@ -60,8 +60,9 @@ Both load; project hooks are added to the global ones. Each entry:
 | `event` | ✅ | One of the 8 events below (PascalCase or snake_case). |
 | `command` | ✅ | The shell command line to run, **in the project directory**. The shell expands variables — see [How the command runs](#how-the-command-runs). |
 | `matcher` | — | Tool-name glob for tool events; `\|`-separated alternatives (e.g. `bash\|edit_file`, `write*`). Omit to match every tool. |
-| `timeout_ms` | — | Per-run timeout (default `10000`). A timeout or crash is **fail-open** (treated as "proceed"). |
+| `timeout_ms` | — | Per-run timeout (default `10000`). A required approval blocks on timeout or failure. Ordinary hook processing continues. |
 | `disabled` | — | `true` to keep the entry but not run it. |
+| `required_approval` | — | For `PreToolUse`, require a successful, explicit allow before the matched tool can execute. Defaults to `false`. |
 
 The map key (`"audit-bash"` above) is for your own organization; it is **not**
 retained after loading, so you cannot address a hook by it (see the CLI section).
@@ -209,6 +210,27 @@ or the CC shape:
 When several hooks match one event, the **most-restrictive** decision wins
 (`deny` > `ask` > `allow` > proceed); rewrites apply in registration order.
 
+### Required tool approval
+
+Set `"required_approval": true` on an enabled `PreToolUse` hook when the
+tool must wait for a decision from an external approval service. The command
+must exit with status 0 and emit `{"action":"allow"}` or the equivalent
+`hookSpecificOutput.permissionDecision` value. A timeout, launch failure,
+nonzero exit, empty or invalid reply, or any decision other than an explicit
+allow blocks the matching tool call.
+
+Required hooks run after ordinary `PreToolUse` hooks, so they receive the
+arguments produced by any earlier rewrites. They cannot rewrite tool input.
+If several required hooks match, each must approve. Keep the configured hook
+enabled and avoid permission bypass mode when an external service owns
+tool approval.
+
+For managed headless runs, pass `--require-approval-hook`. When the runtime
+loads the user's `hooks.json`, it requires an enabled, catch-all
+`required_approval` hook in that file. Omit the matcher, use an empty string,
+or use `"*"` to match all tools. Project and plugin hooks cannot satisfy this
+requirement. This flag conflicts with `--dangerously-skip-permissions`.
+
 ## CLI
 
 ```bash
@@ -230,7 +252,7 @@ atomcode hooks test <NAME>    # execute one hook with a synthetic payload
 | 3 | `event` spelled right | See the table (either case). |
 | 4 | `matcher` matches the tool | Tool events only; omit it to match all. |
 | 5 | `disabled` not set | Defaults to enabled. |
-| 6 | Not timing out | Default 10s; a timeout is fail-open (silently proceeds). |
+| 6 | Not timing out | Default 10s. A required approval blocks on timeout. An ordinary hook lets processing continue. |
 
 ## Security notes
 
@@ -245,7 +267,7 @@ does not prohibit a trusted hook script from launching that command. JSON
 1. Hooks **cannot bypass hard safety boundaries** — a `PreToolUse` deny blocks
    the tool call; an allow is convenience, never consent for a security boundary.
 2. Commands run with **your** permissions — mind the command's own safety.
-3. **Fail-open:** a timeout or crash is treated as "proceed", not "block".
+3. **Failure policy:** an ordinary hook timeout or crash lets processing continue. A matching required approval blocks the call on failure.
 4. On Windows the command runs under `cmd /C`: use an explicit interpreter,
    and `%VAR%` rather than `${VAR}`; `~` is not expanded.
 

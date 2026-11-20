@@ -226,6 +226,7 @@ mode = "follow_system"
 #   {"action":"modify","args":{...}}, or Claude Code's
 #   {"hookSpecificOutput":{"permissionDecision":"allow|deny|ask"}}; exit code 2 with a
 #   reason also blocks.
+#   With "required_approval": true, only exit 0 and explicit allow authorize a tool.
 # UserPromptSubmit can block via {"decision":"block","reason":"..."} or add context via
 #   {"hookSpecificOutput":{"additionalContext":"..."}}.
 #

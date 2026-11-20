@@ -697,6 +697,14 @@ struct Cli {
     )]
     output_format: HeadlessOutputFormat,
 
+    /// Require an enabled, catch-all required approval hook for headless tools.
+    #[arg(
+        long,
+        requires = "headless_input",
+        conflicts_with = "dangerously_skip_permissions"
+    )]
+    require_approval_hook: bool,
+
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
     #[arg(short = 'v', long)]
@@ -2601,6 +2609,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         !is_headless,
     );
     runtime_cfg.prompt_overrides = prompt_overrides.clone();
+    runtime_cfg.require_approval_hook = cli.require_approval_hook;
     runtime_cfg.next_prompt_suggestions = !is_headless;
     // The TUI shows the turn a background completion starts; `-p` exits at its
     // first turn terminal, so there the model must wait with `bash_poll`.

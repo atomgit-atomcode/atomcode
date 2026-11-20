@@ -75,6 +75,7 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
             <strong>{entry.event}</strong><span>{entry.name}</span><small>{entry.scope} · {entry.disabled ? t('hooks.disabled') : entry.testable ? t('hooks.configured') : t('hooks.invalid')}</small>
           </button>)}</nav>
           {item && <div class="hooks-detail"><h4>{item.name}</h4><p>{item.event} · {item.matcher ?? '*'} · {item.timeout_ms} ms</p><div class="hooks-path">{item.source}</div><pre>{item.command}</pre>{Boolean(item.args?.length) && <pre>args: {JSON.stringify(item.args)}</pre>}
+            {item.required_approval && <p>{t('hooks.requiredApproval')}</p>}
             <button type="button" class="btn" disabled={!item.testable || running || loading} onClick={run}>{running ? t('hooks.running') : t('hooks.test')}</button>
             {result && <div class="hooks-result" role="status"><p>{result.completed ? `${t('hooks.exit')} ${result.exit_code ?? '—'}` : t('hooks.incomplete')}</p><h5>stdout</h5><pre>{result.stdout || '—'}</pre><h5>stderr</h5><pre>{result.stderr || '—'}</pre></div>}
           </div>}</div>
