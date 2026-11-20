@@ -604,6 +604,13 @@ pub fn describe_config_file_for(
          Use the lsp tool probe/status/reload operations to diagnose initialization and reread JSON files; command/policy changes require a new runtime.\n\
          - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
+         - `[cue]` `enabled` (default false): AI inline completion in an IDE (the ghost-text \
+         suggestion at the cursor). Off by default because every suggestion spends model quota. \
+         `model` names the selection that answers completions — empty uses the default model; a \
+         completion wants a FAST model, so prefer a small one over the agent's capable one. \
+         `timeout_secs` (1..=120, default 10) bounds one request: a suggestion that arrives after \
+         the user kept typing is worse than none. Read by the daemon, which owns the credential \
+         and the model; the IDE never holds a key. See docs/cue-inline-completion.md.\n\
          - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
          true), `language` (`en` | `zh_CN`), `[network]` `upstream_retry_max_attempts`, \
          and `[datalog]` `enabled` / `dir`.\n\

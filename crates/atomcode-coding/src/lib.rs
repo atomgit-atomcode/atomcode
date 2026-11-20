@@ -103,6 +103,12 @@ pub use controllers::{
     GoalTokenUsage, LoopProgress,
 };
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
+/// The side-call helper: one stateless, tool-less request whose answer a
+/// program reads. Shared by every side call in the product (the next-prompt
+/// guess, the recap, the IDE's inline completion) so they hold ONE policy —
+/// low effort asked for, NO output cap, a timeout instead, and a truncated
+/// answer refused.
+pub use next_prompt_suggestion::{sample_side_call_messages, SideSample};
 pub use parts::{
     prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, HostPlugins, McpRowFacts, PrepareOptions,

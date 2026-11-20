@@ -30,6 +30,8 @@ import {
   SkillInfo,
   AppendSessionMessagesRequest,
   AppendSessionMessagesResponse,
+  CueCompletionRequest,
+  CueCompletionResponse,
 } from './types';
 
 /**
@@ -148,9 +150,9 @@ export class DaemonClient {
 
   // ── REST helpers ──────────────────────────────────────────────
 
-  private request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<T> {
     const revision = this.connectionRevision;
-    return this.requestOnce<T>(method, path, body).catch(async (err) => {
+    return this.requestOnce<T>(method, path, body, timeout).catch(async (err) => {
       if (revision !== this.connectionRevision) {
         throw new Error('AtomCode daemon endpoint changed; retry the operation.');
       }
@@ -159,7 +161,7 @@ export class DaemonClient {
       // is safe for any method. Invalidate the cache and retry once.
       if (err instanceof DaemonHttpError && err.statusCode === 401) {
         this.invalidateToken();
-        return this.requestOnce<T>(method, path, body);
+        return this.requestOnce<T>(method, path, body, timeout);
       }
       // Restart/retry only idempotent reads. Replaying POST/PATCH/DELETE after
       // process replacement can duplicate work or reuse daemon-owned stale IDs.
@@ -248,8 +250,8 @@ export class DaemonClient {
     return this.request<T>('GET', path);
   }
 
-  private post<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>('POST', path, body);
+  private post<T>(path: string, body?: unknown, timeout?: number): Promise<T> {
+    return this.request<T>('POST', path, body, timeout);
   }
 
   private patch<T>(path: string, body?: unknown): Promise<T> {
@@ -702,5 +704,21 @@ export class DaemonClient {
 
   activeSessions(): Promise<string[]> {
     return this.get<string[]>('/chat/active');
+  }
+
+  // ── CUE (inline completion) ────────────────────────────────────
+
+  /**
+   * Ask the daemon for the completion at the cursor.
+   *
+   * The daemon owns the credential and the model, so this carries code — never
+   * a key. The timeout is shorter than the REST default on purpose: a
+   * suggestion that arrives after the user kept typing is worse than none.
+   */
+  requestCueCompletion(
+    request: CueCompletionRequest,
+    timeoutMs = 8000,
+  ): Promise<CueCompletionResponse> {
+    return this.post<CueCompletionResponse>('/cue/complete', request, timeoutMs);
   }
 }

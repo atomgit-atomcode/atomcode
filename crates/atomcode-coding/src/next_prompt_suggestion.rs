@@ -101,7 +101,7 @@ pub(crate) async fn generate_next_prompt_suggestion(
 
 /// What one side call sent back: the visible text, whether the response was
 /// cut off, and how much the model spent thinking (counted, never kept).
-pub(crate) struct SideSample {
+pub struct SideSample {
     pub raw: String,
     pub cut_off: bool,
     pub thinking_chars: usize,
@@ -112,14 +112,39 @@ pub(crate) struct SideSample {
 /// they hold one policy: low effort asked for, no output cap (see
 /// [`generate_next_prompt_suggestion`] for why), a timeout instead. `None` on
 /// any failure or the timeout; `what` names it in the debug log.
-#[tracing::instrument(name = "llm_call", skip_all, fields(purpose = what))]
 pub(crate) async fn sample_side_call(
     provider: Arc<dyn LlmProvider>,
     prompt: String,
     timeout: Duration,
     what: &'static str,
 ) -> Option<SideSample> {
-    let request = [Message::user(prompt)];
+    sample_side_call_messages(provider, vec![Message::user(prompt)], timeout, what).await
+}
+
+/// The same policy, for a side call that brings its OWN messages instead of a
+/// plain prompt.
+///
+/// Split out because the shape is what the policy is about, not the prompt: a
+/// caller that needs a system instruction beside its request (the IDE's inline
+/// completion does) must not thereby get a SECOND set of request options.
+/// Two side calls of one shape should not hold two policies — the same
+/// argument [`generate_next_prompt_suggestion`] makes about the output cap.
+///
+/// The policy it carries, unchanged:
+/// - low effort ASKED FOR, not relied on (see [`generate_next_prompt_suggestion`]);
+/// - NO output cap, because a reasoning model spends the cap on thinking and
+///   the answer is starved out of it;
+/// - a TIMEOUT instead of a token budget;
+/// - a TRUNCATED or TERMINAL-LESS answer is refused, because a cut-off reply
+///   is not an answer — a program that acted on half of one would act on a
+///   fragment.
+#[tracing::instrument(name = "llm_call", skip_all, fields(purpose = what))]
+pub async fn sample_side_call_messages(
+    provider: Arc<dyn LlmProvider>,
+    request: Vec<Message>,
+    timeout: Duration,
+    what: &'static str,
+) -> Option<SideSample> {
     let options = ChatOptions {
         // Asked for, and deliberately with no `max_tokens` beside it — see
         // `generate_next_prompt_suggestion` on why a budget cannot rest on this.

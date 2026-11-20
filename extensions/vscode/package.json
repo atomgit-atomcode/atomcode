@@ -210,6 +210,11 @@
           "type": "boolean",
           "default": true,
           "description": "%atomcode.configuration.showInlineHints.description%"
+        },
+        "atomcode.cue.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "%atomcode.configuration.cue.enabled.description%"
         }
       }
     },

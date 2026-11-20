@@ -45,6 +45,8 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 
 **🖥 IDE 语言服务桥接** — 把 VS Code 的定义跳转、引用、符号、工作区符号查询能力暴露给 AtomCode，让 agent 用 IDE 自己的语言服务而不是另建索引。
 
+**⚡ CUE 行内补全** — 像 TRAE / Copilot 那样，在光标处给出"该写什么"的幽灵文本建议，`Tab` 接受。模型由本地服务调用，扩展不持有任何 API Key。
+
 ---
 
 ## 快速开始
@@ -136,6 +138,7 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 | `atomcode.sendWithCtrlEnter` | `false` | Ctrl+Enter 发送 |
 | `atomcode.fontSize` | `13` | 聊天面板字号 |
 | `atomcode.showInlineHints` | `true` | 显示内联 diff 提示 |
+| `atomcode.cue.enabled` | `true` | 显示 AI 行内补全（幽灵文本） |
 
 ---
 

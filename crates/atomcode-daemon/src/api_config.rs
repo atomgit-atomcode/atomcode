@@ -287,6 +287,11 @@ pub(crate) async fn reload_config(
         }
     };
     let live = crate::live_api::sync_live_provider_config(&config, state.telemetry.clone()).await;
+    // The CUE provider cache is keyed by a fingerprint of the credentials and
+    // endpoint, so it would rebuild on its own — but the reload is the moment
+    // the user says "my settings changed", so dropping it here makes the next
+    // request pick the new model immediately.
+    state.cue_providers.clear();
     Json(ConfigReloadResponse {
         config: config_response(&config),
         live_provider_sync: live,

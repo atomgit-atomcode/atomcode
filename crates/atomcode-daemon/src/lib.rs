@@ -28,6 +28,7 @@ fn _isolate_atomcode_home() {
 mod api_auth;
 mod api_codingplan;
 mod api_config;
+mod api_cue;
 mod api_provider;
 mod api_provider_accounts;
 mod api_schedule;
@@ -739,6 +740,10 @@ pub struct AppState {
     /// different localhost port would shadow the shared-jar cookie). See
     /// [`auth_token::webui_cookie_name`].
     pub webui_cookie_name: String,
+    /// CUE's provider cache, shared with the `/cue/complete` route. Keyed by a
+    /// fingerprint of the credentials and endpoint, so a changed model or key
+    /// rebuilds instead of reusing a stale provider.
+    pub cue_providers: api_cue::CueProviders,
 }
 
 /// Get default working directory
@@ -8016,6 +8021,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
         // instances get distinct cookie names.
         webui_cookie_name: auth_token::webui_cookie_name(port),
+        cue_providers: api_cue::CueProviders::default(),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，
@@ -8039,6 +8045,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             state.project.clone(),
             api_schedule::system_service(),
         ))
+        // CUE — AI inline completion. The IDE extension asks here; the daemon
+        // owns the credential, so the extension never holds a key.
+        .merge(api_cue::routes())
         // Shutdown endpoint (R7.1)
         .route("/shutdown", post(shutdown_handler))
         // Session APIs
@@ -9638,6 +9647,7 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
+            cue_providers: api_cue::CueProviders::default(),
         }
     }
 
@@ -10317,6 +10327,20 @@ mod tests {
         tokio::sync::oneshot::Receiver<String>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_openai_sse_with_finish(response_text, None).await
+    }
+
+    /// The same mock, but able to say the response was CUT OFF
+    /// (`finish_reason: "length"`) — which is how a model reports that it ran
+    /// out of room, and what the daemon must refuse to insert.
+    async fn spawn_openai_sse_with_finish(
+        response_text: &str,
+        finish_reason: Option<&str>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -10327,7 +10351,7 @@ mod tests {
         let payload = serde_json::json!({
             "choices": [{
                 "delta": { "content": response_text },
-                "finish_reason": null
+                "finish_reason": finish_reason,
             }]
         });
         let sse = format!("data: {payload}\n\ndata: [DONE]\n\n");
@@ -12097,6 +12121,261 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             Some("172.16.2.14".into())
         );
         assert_eq!(extract_ip_eq("no ip here"), None);
+    }
+
+    /// The whole CUE path, end to end: an IDE asks the daemon, the daemon asks
+    /// the model, and the model's answer comes back as the text to insert.
+    ///
+    /// The provider is a mock SSE server, so this asserts the CHAIN — the
+    /// route, the config boundary, the provider factory, the prompt, and the
+    /// extraction — without a network or a credential.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_completes_a_cursor_position_from_the_model() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        // The model answers with the whole line, the way a model echoes the
+        // line the cursor is on.
+        let (url, request, task) = spawn_openai_sse("let x = println!();").await;
+
+        let mut config = Config::with_default_provider("p");
+        config
+            .providers
+            .insert("p".into(), test_provider("test-model", url));
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let body = serde_json::json!({
+            "file_path": "src/main.rs",
+            "language_id": "rust",
+            "prefix": "fn main() {\n    let x = ",
+            "suffix": ";\n}",
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // The model echoed the line; the echo is removed, so only the NEW
+        // text is returned for the cursor to insert.
+        assert_eq!(
+            payload["completion"].as_str(),
+            Some("println!();"),
+            "the echoed line must not come back: {payload}"
+        );
+        assert_eq!(payload["model"].as_str(), Some("test-model"));
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .expect("the provider must be called")
+            .expect("provider request captured");
+        assert!(
+            sent.contains("let x = "),
+            "the request must carry the code before the cursor: {sent}"
+        );
+        assert!(
+            sent.contains(";\\n}"),
+            "the request must carry the code after the cursor: {sent}"
+        );
+        task.abort();
+    }
+
+    /// CUE is opt-in: a disabled configuration answers "no suggestion" rather
+    /// than an error, and never calls the model.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_says_nothing_when_it_is_disabled() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut config = Config::with_default_provider("p");
+        config.cue.enabled = false;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"prefix": "let x = ", "suffix": ""}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload["completion"].is_null(),
+            "a disabled CUE offers nothing: {payload}"
+        );
+    }
+
+    /// A request that carries more text than the daemon accepts is refused
+    /// before it reaches the model — a whole repository must not be billed as
+    /// one completion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_refuses_an_oversized_request() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut config = Config::with_default_provider("p");
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "prefix": "a".repeat(100_000),
+                            "suffix": "",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An answer the model reports as CUT OFF is a fragment, not a
+    /// completion. Inserting half of it would put broken code in the user's
+    /// file, so the daemon offers nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_refuses_a_cut_off_answer() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let (url, _request, task) =
+            spawn_openai_sse_with_finish("let x = println!();", Some("length")).await;
+
+        let mut config = Config::with_default_provider("p");
+        config
+            .providers
+            .insert("p".into(), test_provider("test-model", url));
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"prefix": "fn main() {", "suffix": "}"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload["completion"].is_null(),
+            "a cut-off answer must not be inserted: {payload}"
+        );
+        task.abort();
+    }
+
+    /// An answer longer than a completion is a model that lost the thread,
+    /// not a completion. Truncating it would insert half a statement, so it
+    /// is refused instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_refuses_an_answer_longer_than_a_completion() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let huge = "x".repeat(9 * 1024);
+        let (url, _request, task) = spawn_openai_sse(&huge).await;
+
+        let mut config = Config::with_default_provider("p");
+        config
+            .providers
+            .insert("p".into(), test_provider("test-model", url));
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"prefix": "fn main() {", "suffix": "}"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload["completion"].is_null(),
+            "an over-long answer must not be inserted: {payload}"
+        );
+        task.abort();
     }
 }
 
