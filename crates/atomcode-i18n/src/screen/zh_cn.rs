@@ -1291,6 +1291,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendAddIt => "添加".into(),
         Msg::LegendEditThenAdd => "编辑后添加".into(),
         Msg::LegendRetry => "重试".into(),
+        Msg::LegendAddAndUse => "添加并使用".into(),
+        Msg::ProviderSwitching => "切换中…".into(),
+        Msg::ProviderSwitchFailedOnRow { why } => format!("已添加，切换失败：{why}").into(),
+        Msg::ProviderSwitchedEffortFailed { model, why } => {
+            format!("已切换到 {model}，推理强度设置失败：{why}").into()
+        }
 
         // ── the host side of the screen (`atomcode-cli`) ──
         Msg::HostConfigNotEditable => "这个宿主的配置不能从屏幕上改".into(),

@@ -1697,6 +1697,20 @@ pub struct Panel {
     /// Server rows whose add failed, with why — drawn on the row, which stays
     /// where it is to be tried again.
     pub add_errors: std::collections::BTreeMap<(String, String), String>,
+    /// Enter on a server row also takes the session to that model: the person
+    /// has no model to talk to (first run, or signed out of the one they had)
+    /// and no other add holds that claim. Kept in step by the host, which owns
+    /// both facts.
+    pub auto_use: bool,
+    /// Which opening of the panel this is: an answer meant for an earlier one
+    /// must not close or move this one.
+    pub instance: u64,
+    /// The add-and-use this panel is waiting on, by (request, account, model):
+    /// its row says it is switching, and only its answer may close the panel.
+    pub awaiting_switch: Option<(u64, String, String)>,
+    /// A switch that was refused after its model was saved, by (model id, why):
+    /// said on the added row, where Enter tries the switch again.
+    pub switch_error: Option<(String, String)>,
 }
 
 /// 在面板里为一个刚选中的模型挑思考强度。
@@ -1738,6 +1752,9 @@ impl Panel {
         self.query.clear();
         self.pending_delete = None;
         self.efforts = None;
+        // Leaving the page is leaving the switch it was waiting on: its answer
+        // is then only said.
+        self.awaiting_switch = None;
         true
     }
 
@@ -2190,10 +2207,11 @@ fn enter_key(
             // lands; past the last one the cursor is on the manual row, never on
             // an added model a further Enter would switch to.
             panel.cursor = walk(listed, panel.cursor, true);
-            Step::SaveModel {
-                id: None,
-                draft: ModelDraft::listed(&account, &item),
-            }
+            let mut draft = ModelDraft::listed(&account, &item);
+            // The one add-and-use: this Enter takes the claim, so the next
+            // server row says 「添加」 and only saves.
+            draft.use_now = std::mem::take(&mut panel.auto_use);
+            Step::SaveModel { id: None, draft }
         }
         Some(Listed::Manual) => {
             let Screen::Detail(account) = panel.screen.clone() else {
@@ -4606,5 +4624,35 @@ mod tests {
                 id: "deepseek/chat".into()
             }
         );
+    }
+
+    #[test]
+    fn with_no_model_the_first_enter_adds_and_uses_and_the_next_only_adds() {
+        let (view, mut panel) = on_page(&["flash", "pro"]);
+        panel.auto_use = true;
+        let mut secret = String::new();
+        run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Down), press(Key::Down)],
+        );
+        let Step::SaveModel { draft, .. } =
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        else {
+            panic!("an add");
+        };
+        assert!(draft.use_now, "the add-and-use");
+        assert!(
+            !draft.default,
+            "the default follows the switch, not the draft"
+        );
+        assert!(!panel.auto_use, "taken");
+        let Step::SaveModel { draft, .. } =
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        else {
+            panic!("an add");
+        };
+        assert!(!draft.use_now, "the next one only adds");
     }
 }

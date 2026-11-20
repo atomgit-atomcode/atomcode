@@ -1533,6 +1533,9 @@ pub struct Host {
     /// has since been replaced — or an account since deleted, which the port
     /// would quietly re-create — is dropped instead of written.
     provider_generations: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// How many times the providers panel has been opened: each opening gets
+    /// its own number (`Panel::instance`).
+    provider_openings: std::sync::atomic::AtomicU64,
     /// The next token a pick out of the bottom sheet is stamped with
     /// ([`Host::sheet_key`], [`Host::settle_sheet_pick`]).
     sheet_picks: std::sync::atomic::AtomicU64,
@@ -1821,6 +1824,7 @@ impl Host {
             secrets: crate::secret::Secrets::new(),
             providers_secret: Mutex::new(String::new()),
             provider_generations: Mutex::new(std::collections::BTreeMap::new()),
+            provider_openings: std::sync::atomic::AtomicU64::new(0),
             sheet_picks: std::sync::atomic::AtomicU64::new(1),
             rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
@@ -3481,7 +3485,12 @@ impl Host {
                 m.mcp_panel = None;
                 m.bg_panel = None;
                 m.sheet = None;
-                m.providers_panel = Some(crate::providers::Panel::new());
+                let mut panel = crate::providers::Panel::new();
+                panel.instance = self
+                    .provider_openings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                m.providers_panel = Some(panel);
                 true
             }
         }
@@ -3716,6 +3725,96 @@ impl Host {
             return false;
         };
         panel.add_settled(account, model, outcome)
+    }
+
+    /// Keep the panel's 「添加并使用」 in step: the person has no model to talk
+    /// to — first run, or the one they had stopped answering after a sign-out —
+    /// and no add holds the claim (`claim_free`). The host decides both; the
+    /// panel only draws and keys by the answer.
+    pub fn sync_provider_auto_use(&self, claim_free: bool) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let recovering = m.model_setup_required || m.unready.is_some();
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        let want = recovering && claim_free;
+        let moved = panel.auto_use != want;
+        panel.auto_use = want;
+        moved
+    }
+
+    /// The panel's opening number, while it is up.
+    pub fn provider_instance(&self) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        m.providers_panel.as_ref().map(|panel| panel.instance)
+    }
+
+    /// The panel is now waiting on this add-and-use.
+    pub fn await_provider_switch(&self, request: u64, account: &str, model: &str) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.providers_panel.as_mut() {
+            panel.awaiting_switch = Some((request, account.to_string(), model.to_string()));
+            panel.switch_error = None;
+        }
+    }
+
+    /// The add-and-use `request` ended without a switch to wait for.
+    pub fn clear_provider_switch(&self, request: u64) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.providers_panel.as_mut() {
+            if panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request) {
+                panel.awaiting_switch = None;
+            }
+        }
+    }
+
+    /// The answer to add-and-use `request` came back. It may close the panel
+    /// (switched) or put the cursor on the added row with why (refused) only
+    /// when the panel up is the very opening that sent it, still on that
+    /// account's page and still waiting on it — any other panel, form or
+    /// draft is left exactly as it is, and the answer is only said. True when
+    /// the panel was the one.
+    pub fn provider_switch_answer(
+        &self,
+        request: u64,
+        instance: u64,
+        account: &str,
+        id: &str,
+        refused: Option<&str>,
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let ours = m.providers_panel.as_ref().is_some_and(|panel| {
+            panel.instance == instance
+                && panel.screen == crate::providers::Screen::Detail(account.to_string())
+                && panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request)
+        });
+        if !ours {
+            return false;
+        }
+        match refused {
+            None => {
+                m.providers_panel = None;
+                self.providers_secret
+                    .lock()
+                    .expect("provider secret poisoned")
+                    .clear();
+            }
+            Some(why) => {
+                let Some(panel) = m.providers_panel.as_mut() else {
+                    return false;
+                };
+                panel.awaiting_switch = None;
+                panel.switch_error = Some((id.to_string(), why.to_string()));
+                if let Some(at) = view.listed(panel).iter().position(|row| {
+                    matches!(row, crate::providers::Listed::Configured(i)
+                        if view.models().get(*i).is_some_and(|m| m.id == id))
+                }) {
+                    panel.cursor = at;
+                }
+            }
+        }
+        true
     }
 
     /// Whether a form is up over the providers panel.

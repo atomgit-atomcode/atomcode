@@ -2063,6 +2063,19 @@ pub enum Msg<'a> {
     LegendAddIt,
     LegendEditThenAdd,
     LegendRetry,
+    /// Enter on a server row while the person has no model: add it and use it.
+    LegendAddAndUse,
+    /// An added model whose add-and-use switch is on its way.
+    ProviderSwitching,
+    /// An added model whose switch was refused: Enter tries again.
+    ProviderSwitchFailedOnRow {
+        why: &'a str,
+    },
+    /// The model was switched to; only the reasoning level was refused.
+    ProviderSwitchedEffortFailed {
+        model: &'a str,
+        why: &'a str,
+    },
 
     // ── the host side of the screen (`atomcode-cli`) ──
     HostConfigNotEditable,

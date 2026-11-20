@@ -1360,6 +1360,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendAddIt => "add".into(),
         Msg::LegendEditThenAdd => "edit, then add".into(),
         Msg::LegendRetry => "retry".into(),
+        Msg::LegendAddAndUse => "add and use".into(),
+        Msg::ProviderSwitching => "switching…".into(),
+        Msg::ProviderSwitchFailedOnRow { why } => format!("added; switching failed: {why}").into(),
+        Msg::ProviderSwitchedEffortFailed { model, why } => {
+            format!("Switched to {model}; setting the reasoning effort failed: {why}").into()
+        }
 
         // ── the host side of the screen (`atomcode-cli`) ──
         Msg::HostConfigNotEditable => "this host's configuration cannot be changed from the screen".into(),

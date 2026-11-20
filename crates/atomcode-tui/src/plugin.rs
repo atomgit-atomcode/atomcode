@@ -206,6 +206,14 @@ pub struct AgentClient {
     receipts: AtomicU64,
     history_sink: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     history_enabled: AtomicBool,
+    /// The one add that may also take the session to its model, while the
+    /// person has no model to talk to: the request that claimed it, by number.
+    ///
+    /// Here rather than on the providers panel, which can be closed and opened
+    /// again while that add is still on its way: the claim has to outlive the
+    /// panel, and a later explicit switch has to be able to take it back.
+    auto_use: Mutex<Option<u64>>,
+    auto_use_requests: AtomicU64,
 }
 
 struct Link {
@@ -364,6 +372,44 @@ impl AgentClient {
     /// may well have been folded, and the list marked, while this id was still
     /// the old one. Switching between two accounts sending the same name, the
     /// old id still matches the wire name and that mark would stand.
+    /// Whether no add holds the claim to switch the session.
+    pub(crate) fn auto_use_free(&self) -> bool {
+        self.auto_use.lock().expect("client poisoned").is_none()
+    }
+
+    /// Claim the switch for a new request, answering with its number.
+    pub(crate) fn claim_auto_use(&self) -> u64 {
+        let request = self.auto_use_requests.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.auto_use.lock().expect("client poisoned") = Some(request);
+        request
+    }
+
+    /// Take the claim for `request`'s switch: true only when it still holds
+    /// it. Taking it clears it — one claim, one switch.
+    pub(crate) fn take_auto_use(&self, request: u64) -> bool {
+        let mut claim = self.auto_use.lock().expect("client poisoned");
+        if *claim == Some(request) {
+            *claim = None;
+            return true;
+        }
+        false
+    }
+
+    /// `request` failed: let go of the claim if it is still its own — never
+    /// another request's.
+    pub(crate) fn release_auto_use(&self, request: u64) {
+        let mut claim = self.auto_use.lock().expect("client poisoned");
+        if *claim == Some(request) {
+            *claim = None;
+        }
+    }
+
+    /// The person chose a model themselves: no add still on its way may switch
+    /// the session away from it afterwards. The add still lands.
+    pub(crate) fn revoke_auto_use(&self) {
+        *self.auto_use.lock().expect("client poisoned") = None;
+    }
+
     pub(crate) fn chose_model(&self, selection: Option<String>) {
         let mut views = self.view.lock().expect("client poisoned");
         let root = views.root.clone();
@@ -1311,6 +1357,98 @@ impl ApprovalInput {
     }
 }
 
+/// Switch the session to `id`, then set the reasoning level — the same two
+/// commands a person would type, each answered on its own.
+///
+/// Two dispatches rather than one `/model <id> <level>`: that command answers
+/// for both halves at once, so a refused level reads as a refused switch while
+/// the session is already on the new model. The level is the draft's, else
+/// `default` — explicit either way, so switching never asks a second time.
+async fn switch_and_set_level(
+    commands: &crate::command::Commands,
+    ctx: &Context,
+    id: &str,
+    effort: Option<&str>,
+) -> SwitchResult {
+    use crate::command::Outcome;
+    let model = match commands.dispatch(&format!("/model {id}"), ctx).await {
+        Outcome::Refused(why) => Err(why),
+        Outcome::Said(said) => Ok(said),
+        // The switch went through and the command offered the model's levels:
+        // the level is set below, so only its words are kept — the host's note
+        // with them, which would otherwise be lost.
+        Outcome::Do(Action::PickEffort { note, .. }) => Ok(match note {
+            Some(note) => format!("{}\n{note}", t(Msg::ModelSet { wanted: id })),
+            None => t(Msg::ModelSet { wanted: id }).into_owned(),
+        }),
+        _ => Ok(t(Msg::ModelSet { wanted: id }).into_owned()),
+    };
+    if model.is_err() {
+        return SwitchResult {
+            model,
+            effort: None,
+        };
+    }
+    let level = effort.unwrap_or("default");
+    let effort = match commands.dispatch(&format!("/effort {level}"), ctx).await {
+        Outcome::Refused(why) => Err(why),
+        Outcome::Said(said) => Ok(said),
+        _ => Ok(String::new()),
+    };
+    SwitchResult {
+        model,
+        effort: Some(effort),
+    }
+}
+
+/// What to say about a switch: both halves, and whether it is a refusal.
+/// A refused level after a good switch says the switch happened.
+pub(crate) fn switch_said(id: &str, result: &SwitchResult) -> (String, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut refused = false;
+    match &result.model {
+        Ok(said) => lines.push(said.clone()),
+        Err(why) => {
+            lines.push(why.clone());
+            refused = true;
+        }
+    }
+    match &result.effort {
+        Some(Ok(said)) => lines.push(said.clone()),
+        Some(Err(why)) => {
+            // The switch line already says it moved; this replaces it with the
+            // one sentence that says both.
+            lines.retain(|line| line != &t(Msg::ModelSet { wanted: id }).into_owned());
+            lines.push(t(Msg::ProviderSwitchedEffortFailed { model: id, why }).into_owned());
+            refused = true;
+        }
+        None => {}
+    }
+    lines.retain(|line| !line.is_empty());
+    (lines.join("\n"), refused)
+}
+
+/// The add-and-use an add carries: which claim it took, from which opening of
+/// the panel, for which session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderClaim {
+    request: u64,
+    instance: u64,
+    session: String,
+}
+
+/// What switching to a just-added model said, in its two halves: the switch,
+/// and the reasoning level set after it. Kept apart because a refused level
+/// is not a refused switch — the session is on the new model either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SwitchResult {
+    /// What switching said (the host's note included), or why it was refused.
+    pub model: Result<String, String>,
+    /// What setting the level said (its note included), or why it was refused.
+    /// `None` when the switch itself was refused.
+    pub effort: Option<Result<String, String>>,
+}
+
 enum Wake {
     History {
         session: String,
@@ -1333,6 +1471,14 @@ enum Wake {
         /// The account's generation when the add was sent
         /// (`Host::provider_generation`).
         generation: u64,
+        claim: Option<ProviderClaim>,
+    },
+    /// An add-and-use's switch came back.
+    ProviderSwitched {
+        claim: ProviderClaim,
+        account: String,
+        id: String,
+        result: SwitchResult,
     },
     SessionReferences,
     Foreground {
@@ -2630,8 +2776,20 @@ impl UserInterface for Tui {
                     after,
                     session,
                     generation,
+                    claim,
                 } => {
-                    self.models_enriched(original, drafts, before, after, session, generation);
+                    self.models_enriched(
+                        original, drafts, before, after, session, generation, claim,
+                    );
+                    stale = true;
+                }
+                Wake::ProviderSwitched {
+                    claim,
+                    account,
+                    id,
+                    result,
+                } => {
+                    self.provider_switched(&claim, &account, &id, result);
                     stale = true;
                 }
                 // Most of what arrives here moves nothing on the screen: a
@@ -4547,7 +4705,10 @@ impl Tui {
             })
             .or(wire);
         let view = rows.with_current(live.as_deref());
-        self.host.show_providers(view)
+        let moved = self
+            .host
+            .sync_provider_auto_use(self.client.auto_use_free());
+        self.host.show_providers(view) || moved
     }
 
     /// Run one key against the providers panel, and act on what it asked for.
@@ -4576,6 +4737,11 @@ impl Tui {
                     Some(crate::providers::Form::Account(form)) if form.editing.is_none()
                 )
         };
+        // Whether this Enter is the add-and-use is the host's to say: the
+        // person may have signed in, or another add claimed it, since the
+        // panel last looked.
+        self.host
+            .sync_provider_auto_use(self.client.auto_use_free());
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
             if returns_to_setup {
@@ -4584,6 +4750,22 @@ impl Tui {
             return changed;
         };
         use crate::providers::Step;
+        // The add-and-use claims the switch the moment it is sent — not when its
+        // write lands — so which model ends up in use does not hang on which of
+        // two adds' metadata came back first.
+        let claim = match &step {
+            Step::SaveModel { id: None, draft } if draft.use_now => {
+                let request = self.client.claim_auto_use();
+                self.host
+                    .await_provider_switch(request, &draft.account, &draft.model);
+                Some(ProviderClaim {
+                    request,
+                    instance: self.host.provider_instance().unwrap_or_default(),
+                    session: self.client.session(),
+                })
+            }
+            _ => None,
+        };
         let drafts = match &step {
             Step::SaveModel { id: None, draft } => std::slice::from_ref(draft),
             Step::SaveModels { drafts } => drafts.as_slice(),
@@ -4615,13 +4797,82 @@ impl Tui {
                         after,
                         session,
                         generation,
+                        claim,
                     });
                 });
                 return true;
             }
         }
-        self.finish_provider_step(step, before);
+        self.finish_provider_step(step, before, claim);
         true
+    }
+
+    /// An add-and-use was written: switch to it — when the claim it took is
+    /// still its own and the session is the one it was sent for. A claim taken
+    /// back by an explicit switch since leaves the model saved and the session
+    /// where the person put it.
+    fn auto_use_after_add(
+        &self,
+        claim: ProviderClaim,
+        account: String,
+        model: String,
+        effort: Option<String>,
+    ) {
+        self.refresh_providers();
+        let id = self.client_rows().and_then(|rows| {
+            rows.models()
+                .iter()
+                .find(|row| row.account == account && row.model == model)
+                .map(|row| row.id.clone())
+        });
+        let switch = id.filter(|_| {
+            self.client.session() == claim.session && self.client.take_auto_use(claim.request)
+        });
+        let (Some(id), Some(ctx), Some(keys)) = (
+            switch,
+            self.ctx.lock().expect("ctx poisoned").clone(),
+            self.wake.lock().expect("wake poisoned").clone(),
+        ) else {
+            self.client.release_auto_use(claim.request);
+            self.host.clear_provider_switch(claim.request);
+            return;
+        };
+        let commands = self.host.commands.clone();
+        tokio::spawn(async move {
+            let result = switch_and_set_level(&commands, &ctx, &id, effort.as_deref()).await;
+            let _ = keys.send(Wake::ProviderSwitched {
+                claim,
+                account,
+                id,
+                result,
+            });
+        });
+    }
+
+    /// The rows the port reads now, when there is a port.
+    fn client_rows(&self) -> Option<crate::providers::ProvidersView> {
+        let ctx = self.ctx.lock().expect("ctx poisoned").clone()?;
+        Some(ctx.service::<crate::plugin::ProvidersSvc>()?.rows())
+    }
+
+    /// An add-and-use's switch came back: say both halves, and — only for the
+    /// very panel that is waiting on it — close it (switched) or rest on the
+    /// added row with why (refused), where Enter tries the switch once more.
+    fn provider_switched(
+        &self,
+        claim: &ProviderClaim,
+        account: &str,
+        id: &str,
+        result: SwitchResult,
+    ) {
+        let refused = result.model.as_ref().err().map(String::as_str);
+        self.host
+            .provider_switch_answer(claim.request, claim.instance, account, id, refused);
+        let (said, refused) = switch_said(id, &result);
+        if !said.is_empty() {
+            self.host.say(said, refused);
+        }
+        self.refresh_providers();
     }
 
     /// An add's metadata came back off the frame: write it — unless what it
@@ -4634,6 +4885,7 @@ impl Tui {
         after: Option<crate::providers::Panel>,
         session: String,
         generation: u64,
+        claim: Option<ProviderClaim>,
     ) {
         use crate::providers::Step;
         // The connection was saved again or the account deleted while the
@@ -4646,6 +4898,10 @@ impl Tui {
             .map(|d| d.account.clone())
             .unwrap_or_default();
         if self.host.provider_generation(&account) != generation {
+            if let Some(claim) = &claim {
+                self.client.release_auto_use(claim.request);
+                self.host.clear_provider_switch(claim.request);
+            }
             self.host
                 .say(t(Msg::ProviderConnectionChanged).into_owned(), true);
             return;
@@ -4674,14 +4930,38 @@ impl Tui {
             Step::SaveModels { .. } => Step::SaveModels { drafts },
             step => step,
         };
-        self.finish_provider_step(step, before.filter(|_| still_here));
+        self.finish_provider_step(step, before.filter(|_| still_here), claim);
     }
 
     fn finish_provider_step(
         &self,
         step: crate::providers::Step,
         before: Option<crate::providers::Panel>,
+        claim: Option<ProviderClaim>,
     ) {
+        // An add-and-use writes like any add; the switch after it is decided by
+        // the claim (`auto_use_after_add`), not by the draft.
+        let (step, switch_to) = match (step, &claim) {
+            (
+                crate::providers::Step::SaveModel {
+                    id: None,
+                    mut draft,
+                },
+                Some(_),
+            ) => {
+                let wanted = (
+                    draft.account.clone(),
+                    draft.model.clone(),
+                    draft.effort.clone(),
+                );
+                draft.use_now = false;
+                (
+                    crate::providers::Step::SaveModel { id: None, draft },
+                    Some(wanted),
+                )
+            }
+            (step, _) => (step, None),
+        };
         let key = match &step {
             crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
             crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
@@ -4711,6 +4991,17 @@ impl Tui {
                 Err(why) => Err(why.clone()),
             };
             self.host.provider_add_settled(account, model, settled);
+        }
+        if let (Some(claim), Some((account, model, effort))) = (claim, switch_to) {
+            match &outcome {
+                Ok(_) => self.auto_use_after_add(claim, account, model, effort),
+                // Not written, so nothing to switch to: let go of the claim,
+                // and only if it is still this add's.
+                Err(_) => {
+                    self.client.release_auto_use(claim.request);
+                    self.host.clear_provider_switch(claim.request);
+                }
+            }
         }
         match outcome {
             Ok(Some(said)) => self.host.say(&said, false),
@@ -14666,7 +14957,28 @@ mod provider_probe_tests {
                     has_key: configured,
                     managed: false,
                 }],
-                vec![],
+                // What it was given, so an added model is on the page.
+                self.models
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|draft| crate::providers::ModelRow {
+                        id: format!("deepseek/{}", draft.model),
+                        account: "deepseek".into(),
+                        model: draft.model.clone(),
+                        window: draft.window.unwrap_or(128_000),
+                        max_tokens: draft.max_tokens,
+                        vision: draft.vision,
+                        effort: draft.effort.clone(),
+                        levels: Vec::new(),
+                        current: false,
+                        managed: false,
+                        alias: None,
+                        desc: None,
+                        alias_en: None,
+                        desc_en: None,
+                    })
+                    .collect(),
                 vec![Protocol {
                     id: "openai-compatible".into(),
                     label: "OpenAI".into(),
@@ -14785,6 +15097,231 @@ mod provider_probe_tests {
         }
     }
 
+    /// Wait for an add's metadata and hand it to the screen, the way its loop
+    /// does.
+    async fn enriched(tui: &Tui, woken: &mut mpsc::UnboundedReceiver<Wake>) {
+        let Wake::ProviderModelsEnriched {
+            original,
+            drafts,
+            before,
+            after,
+            session,
+            generation,
+            claim,
+        } = wait_for(woken, |w| matches!(w, Wake::ProviderModelsEnriched { .. })).await
+        else {
+            unreachable!()
+        };
+        tui.models_enriched(original, drafts, before, after, session, generation, claim);
+    }
+
+    async fn switched(
+        woken: &mut mpsc::UnboundedReceiver<Wake>,
+    ) -> (ProviderClaim, String, String, SwitchResult) {
+        let Wake::ProviderSwitched {
+            claim,
+            account,
+            id,
+            result,
+        } = wait_for(woken, |w| matches!(w, Wake::ProviderSwitched { .. })).await
+        else {
+            unreachable!()
+        };
+        (claim, account, id, result)
+    }
+
+    /// Open the panel again: a new opening, with its own number. (The test
+    /// screen mounts no providers view, so it is put up the way `open_connect`
+    /// puts it up.)
+    fn reopen(host: &Host) {
+        let mut m = host.moment.write().unwrap();
+        m.providers_panel = Some(crate::providers::Panel {
+            instance: 99,
+            ..crate::providers::Panel::new()
+        });
+    }
+
+    fn pro() -> crate::providers::Discovered {
+        crate::providers::Discovered {
+            id: "pro".into(),
+            ..Default::default()
+        }
+    }
+
+    /// No model to talk to: the first Enter on a server row is 「添加并使用」,
+    /// and it takes the only claim — the next row only adds, and the switch is
+    /// the first one's whichever write lands first.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_page_without_a_model_offers_add_and_use_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash(), pro()]));
+        tui.refresh_providers();
+        assert!(panel(&host).auto_use, "the footer can say 添加并使用");
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // flash: add and use
+        assert!(!tui.client.auto_use_free(), "claimed when sent");
+        let p = panel(&host);
+        assert!(!p.auto_use, "the next row only adds");
+        assert_eq!(
+            p.awaiting_switch.as_ref().map(|a| a.2.as_str()),
+            Some("flash")
+        );
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // pro: only adds
+        enriched(&tui, &mut woken).await;
+        enriched(&tui, &mut woken).await;
+        assert_eq!(port.models.lock().unwrap().len(), 2);
+        let (_, _, id, _) = switched(&mut woken).await;
+        assert_eq!(id, "deepseek/flash");
+    }
+
+    /// A switch refused after its model was saved leaves the page up, on the
+    /// added row, saying why; Enter there switches once and adds nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_refused_switch_rests_on_the_added_row_and_enter_only_switches() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        let (claim, account, id, _) = switched(&mut woken).await;
+        // The command was queued and the host then refused it.
+        let refused = SwitchResult {
+            model: Err("the host refused".into()),
+            effort: None,
+        };
+        tui.provider_switched(&claim, &account, &id, refused);
+        assert!(host.providers_open(), "refused: the page stays");
+        assert_eq!(
+            panel(&host).switch_error,
+            Some(("deepseek/flash".into(), "the host refused".into()))
+        );
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Configured(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let Wake::Chose(Some(line)) = wait_for(&mut woken, |w| matches!(w, Wake::Chose(_))).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(line, "/model deepseek/flash");
+        assert_eq!(port.models.lock().unwrap().len(), 1, "nothing added again");
+    }
+
+    /// 添加并使用 A → close → reopen: the claim is still A's, so B only adds;
+    /// then the person switches to B themselves, and A, landing last, is saved
+    /// but does not take the session back.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_explicit_switch_takes_back_a_claim_that_outlived_its_panel() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // ① A: add and use
+        let first = panel(&host).instance;
+        host.close_providers(); // ②
+        reopen(&host); // ③
+        assert_ne!(panel(&host).instance, first);
+        host.enter_provider_detail("deepseek", Some(vec![pro()]));
+        tui.refresh_providers();
+        assert!(
+            !panel(&host).auto_use,
+            "the claim is still A's: B only adds"
+        );
+        // ④ The person switches themselves — what `/model` does on success.
+        tui.client.revoke_auto_use();
+        // ⑤ A lands.
+        enriched(&tui, &mut woken).await;
+        assert_eq!(port.models.lock().unwrap().len(), 1, "A is saved");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderSwitched { .. } | Wake::Chose(_)),
+                "A did not take the session back"
+            );
+        }
+    }
+
+    /// A late answer for an earlier opening of the panel never closes or moves
+    /// the one up now: a half-typed form survives, keystrokes and all.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_switch_answer_leaves_another_panel_alone() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let (claim, account, id, result) = switched(&mut woken).await;
+        // The person left while it was switching and is now editing the
+        // connection in a new opening of the panel.
+        host.close_providers();
+        reopen(&host);
+        host.enter_provider_detail("deepseek", Some(vec![]));
+        tui.run_providers_key(KeyPress::ctrl('e'));
+        assert!(host.provider_form_open());
+        host.providers_paste("sk-half");
+        let before = panel(&host);
+        for result in [
+            result,
+            SwitchResult {
+                model: Ok("switched".into()),
+                effort: Some(Ok(String::new())),
+            },
+        ] {
+            tui.provider_switched(&claim, &account, &id, result);
+            assert!(host.providers_open());
+            assert_eq!(panel(&host), before, "form, cursor and draft untouched");
+        }
+    }
+
+    #[test]
+    fn a_refused_level_after_a_good_switch_says_the_switch_happened() {
+        let (said, refused) = switch_said(
+            "deepseek/flash",
+            &SwitchResult {
+                model: Ok(t(Msg::ModelSet {
+                    wanted: "deepseek/flash",
+                })
+                .into_owned()),
+                effort: Some(Err("max is not offered".into())),
+            },
+        );
+        assert!(refused);
+        assert_eq!(
+            said,
+            t(Msg::ProviderSwitchedEffortFailed {
+                model: "deepseek/flash",
+                why: "max is not offered"
+            })
+            .into_owned()
+        );
+        // A level set with the host's note keeps the note.
+        let (said, refused) = switch_said(
+            "deepseek/flash",
+            &SwitchResult {
+                model: Ok("model set".into()),
+                effort: Some(Ok("effort set\nnot kept after restart".into())),
+            },
+        );
+        assert!(!refused);
+        assert!(said.contains("model set") && said.contains("not kept after restart"));
+    }
+
     /// Connecting an account lands on its page with what its endpoint lists,
     /// and one Enter there adds one model — saved, not switched to.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -14899,6 +15436,7 @@ mod provider_probe_tests {
                 after,
                 session,
                 generation,
+                claim,
             } = wait_for(&mut woken, |w| {
                 matches!(w, Wake::ProviderModelsEnriched { .. })
             })
@@ -14906,7 +15444,7 @@ mod provider_probe_tests {
             else {
                 unreachable!()
             };
-            tui.models_enriched(original, drafts, before, after, session, generation);
+            tui.models_enriched(original, drafts, before, after, session, generation, claim);
             assert_eq!(
                 port.models.lock().unwrap().len(),
                 usize::from(written),
@@ -14939,6 +15477,7 @@ mod provider_probe_tests {
             after,
             session,
             generation,
+            claim,
         } = wait_for(&mut woken, |w| {
             matches!(w, Wake::ProviderModelsEnriched { .. })
         })
@@ -14946,7 +15485,7 @@ mod provider_probe_tests {
         else {
             unreachable!()
         };
-        tui.models_enriched(original, drafts, before, after, session, generation);
+        tui.models_enriched(original, drafts, before, after, session, generation, claim);
         assert_eq!(port.models.lock().unwrap().len(), 1);
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         while let Ok(woke) = woken.try_recv() {

@@ -805,6 +805,21 @@ fn listed_parts(
             if row.managed {
                 about.insert(0, t(Msg::ProviderManaged).into_owned());
             }
+            let switching = panel
+                .awaiting_switch
+                .as_ref()
+                .is_some_and(|(_, account, model)| *account == row.account && *model == row.model);
+            let refused = panel
+                .switch_error
+                .as_ref()
+                .filter(|(id, _)| *id == row.id)
+                .map(|(_, why)| why);
+            let warn = refused.is_some();
+            if switching {
+                about = vec![t(Msg::ProviderSwitching).into_owned()];
+            } else if let Some(why) = refused {
+                about = vec![t(Msg::ProviderSwitchFailedOnRow { why }).into_owned()];
+            }
             Parts {
                 mark: mark_for(row.current, caps),
                 // The gateway's display alias wins when it has one, in the
@@ -816,7 +831,7 @@ fn listed_parts(
                     .unwrap_or_else(|| row.id.clone()),
                 about,
                 dim: false,
-                warn: false,
+                warn,
             }
         }
         Listed::Available(j) => {
@@ -1354,12 +1369,15 @@ fn list_legend(view: &ProvidersView, panel: &Panel) -> Vec<Hint> {
                 }
                 _ => false,
             };
+            // While the person has no model, the first add also takes the
+            // session to it — the footer says so before the key is pressed.
+            let add = match panel.auto_use {
+                true => Msg::LegendAddAndUse,
+                false => Msg::LegendAddIt,
+            };
             match busy {
                 true => vec![],
-                false => vec![
-                    hint("⏎", Msg::LegendAddIt, 0),
-                    hint("Ctrl+E", Msg::LegendEditThenAdd, 1),
-                ],
+                false => vec![hint("⏎", add, 0), hint("Ctrl+E", Msg::LegendEditThenAdd, 1)],
             }
         }
         Some(Listed::Failed) => vec![hint("⏎", Msg::LegendRetry, 0)],
@@ -2237,6 +2255,31 @@ mod tests {
         assert!(
             !out.lines().last().unwrap().contains("添加"),
             "a row on its way offers no add: {out}"
+        );
+    }
+
+    #[test]
+    fn with_no_model_the_footer_says_add_and_use_and_the_row_says_switching() {
+        let mut m = page(1, Some(4));
+        m.providers_panel.as_mut().unwrap().auto_use = true;
+        let out = drawn(&m, 100, 24);
+        assert!(out.lines().last().unwrap().contains("添加并使用"), "{out}");
+        // Waiting on deepseek/chat's switch: its row says so.
+        let mut m = page(1, Some(2));
+        m.providers_panel.as_mut().unwrap().awaiting_switch =
+            Some((1, "deepseek".into(), "deepseek/chat".into()));
+        let out = drawn(&m, 100, 24);
+        let row = out.lines().find(|l| l.contains("deepseek/chat")).unwrap();
+        assert!(row.contains("切换中…"), "{out}");
+        // Refused: why, on the same row.
+        let mut m = page(1, Some(2));
+        m.providers_panel.as_mut().unwrap().switch_error =
+            Some(("deepseek/chat".into(), "HTTP 403".into()));
+        let out = drawn(&m, 100, 24);
+        let row = out.lines().find(|l| l.contains("deepseek/chat")).unwrap();
+        assert!(
+            row.contains("切换失败") && row.contains("HTTP 403"),
+            "{out}"
         );
     }
 }

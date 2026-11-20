@@ -138,7 +138,7 @@
 
 **「添加并使用」等待切换的真实结果**：现有 `Step::Use` 把 `/model …` 当作一行输入放进队列（`Wake::Chose`）后就立即关闭面板（`plugin.rs`），真正的 `SwitchModel` 成功、拒绝或 `DoneWithNote` 要稍后在 `commands.rs` 里才返回，面板收不到。所以「添加并使用」不走这条即发即关的路径：
 - 保存成功后执行切换，等待结果后带上请求序号以 `Wake` 回送给插件。等待期间面板保留，A 行显示「切换中…」。
-- **结果要分开记录模型切换和强度设置**。现有 `/model <id> <effort>` 分两步：先 `SwitchModel`，再走 `/effort`；`/effort` 被拒时整条命令返回 `Outcome::Refused`，而此时模型已经切到 A（`commands.rs`）。所以不能只看 `Said` / `Refused`。把 `/model` 分支里「切换模型 + 设置强度」的主体抽成一个函数，返回结构化结果 `SwitchResult { model: Result<Option<note>, 原因>, effort: Option<Result<Option<note>, 原因>> }`（两步的成功结果都带上宿主可能附带的 `DoneWithNote` 提示，`/effort` 现在就会把它显示出来）：`/model` 命令用它来拼 `Outcome`（文案和行为不变），面板路径直接读它。命令实现仍然只有一份。
+- **结果要分开记录模型切换和强度设置**。现有 `/model <id> <effort>` 分两步：先 `SwitchModel`，再走 `/effort`；`/effort` 被拒时整条命令返回 `Outcome::Refused`，而此时模型已经切到 A（`commands.rs`）。所以不能只看一条命令的 `Said` / `Refused`。实现上插件依次派发 `/model <id>` 与 `/effort <level>` 两条命令（`plugin.rs::switch_and_set_level`；`level` 取草稿的强度，否则 `default`，与原「连接并使用」一致），各自的 `Outcome` 记进 `SwitchResult { model: Result<String, String>, effort: Option<Result<String, String>> }`，成功文本里原样带着宿主的 `DoneWithNote` 提示。命令实现仍然只有一份，`commands.rs` 不改；`/model` 返回 `Do(PickEffort)` 也算切换成功，其中的 `note` 保留。
   - `model` 成功、`effort` 失败：A 标为当前模型，提示「已切换到 A，推理强度设置失败：<原因>」，按切换成功处理，用户不需要再切一次。
   - `model` 或 `effort` 成功且带 `note`（`DoneWithNote`）：提示原样显示，两步都有时都显示。
   - `model` 失败：按「切换被拒」处理。

@@ -2166,6 +2166,9 @@ impl CommandSet for SessionCommands {
                         let first = hit.next()?;
                         hit.next().is_none().then(|| first.id.clone())
                     });
+                // An explicit choice: an add still on its way, claimed to take
+                // the session to its model, now only saves.
+                client.revoke_auto_use();
                 client.chose_model(selection);
                 client.refresh_model_selection(&client.root());
                 // 带了档位:走 `/effort` 那一套设过去(只有一份实现),于是
