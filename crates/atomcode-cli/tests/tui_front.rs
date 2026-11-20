@@ -649,7 +649,7 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
     handle
         .deactivate_provider(atomcode_coding::ProviderUnavailableReason::NotConfigured)
         .await
-        .expect("no model configured");
+        .expect("unconfigured at startup");
     let screen = Screen {
         headless: Some((100, 60)),
         ..Screen::default()
@@ -706,6 +706,7 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
     term.press(KeyPress::plain(Key::Esc));
     let choice = wait_for("连接已有的模型服务").await;
     assert!(choice.contains("使用 AtomGit 账号登录"));
+    assert!(choice.find("上手提示").unwrap() < choice.find("选择模型接入方式").unwrap());
     assert!(!choice.contains("https://example.test/authorize"));
     assert!(login.attempt.cancelled());
     assert!(!login.attempt.begin_completion());
@@ -755,14 +756,26 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
         .deactivate_provider(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
         .await
         .expect("simulate expired credentials");
-    let expired = wait_for("用 /login 重新登录").await;
+    let expired = wait_for("Alt+1 重新登录").await;
     assert!(expired.contains("answer 1"));
-    assert!(expired.contains("或用 /provider"));
+    assert!(expired.contains("Alt+2 切换"));
     assert!(!expired.contains("选择模型接入方式"));
     assert!(
         model_setup.start_login().is_some(),
         "expiry did not automatically sign in"
     );
+
+    for c in "draft".chars() {
+        term.press(KeyPress::plain(Key::Char(c)));
+    }
+    wait_for("draft").await;
+    term.press(KeyPress::new(
+        Key::Char('2'),
+        atomcode_tui::surface::Mods::ALT,
+    ));
+    wait_for("账号").await;
+    term.press(KeyPress::plain(Key::Esc));
+    assert!(wait_for("draft").await.contains("answer 1"));
 
     term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;

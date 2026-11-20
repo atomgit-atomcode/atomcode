@@ -263,16 +263,22 @@ pub mod tui_front {
         // configuration file.
         // A resumed conversation keeps its command input so the user can
         // recover with /login or /provider without losing access to history.
+        let reason = runtime.handle.provider_unavailable_reason();
         let needs_model_setup = !runtime
             .session
             .as_ref()
             .is_some_and(|session| session.resumed)
             && matches!(
-                runtime.handle.provider_unavailable_reason(),
+                reason,
                 Some(atomcode_coding::ProviderUnavailableReason::NotConfigured)
+                    | Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
             );
         let model_setup = Arc::new(atomcode_tui::model_setup::ModelSetup::new(
             needs_model_setup,
+            matches!(
+                reason,
+                Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
+            ),
         ));
         let working_dir = config.working_dir.clone();
         let dirs = config.dirs.clone();

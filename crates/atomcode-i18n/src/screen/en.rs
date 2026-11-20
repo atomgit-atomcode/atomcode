@@ -1369,7 +1369,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "thinking".into(),
         Msg::RuntimeAlreadyStopped => "this session's runtime has already stopped".into(),
         Msg::NoProviderConfigured => "no provider is available — in the atomcode terminal, sign in with /login or add one with /provider".into(),
-        Msg::LoginExpired => "Sign-in expired. Run /login to sign in again or /provider to change providers.".into(),
+        Msg::LoginExpired => "Sign-in expired. Alt+1 Sign in to AtomGit again · Alt+2 Switch or connect a provider".into(),
         Msg::ProviderUnsupportedByBuild => "this build cannot use the official AtomGit gateway — install an official build, or switch with /model or /provider".into(),
         Msg::ScreenNotConnectedAgent => "the screen is not connected to an agent".into(),
         Msg::HostHasNoControl => "this host has no control surface".into(),
@@ -1449,6 +1449,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ScanOrOpen => "scan it with your phone, or open it in a browser:".into(),
         Msg::InternalError { error } => format!("internal error: {error}").into(),
 
+        Msg::RecoveryTitle => "Sign-in expired. Choose how to continue".into(),
+        Msg::RecoveryLogin => "Sign in to AtomGit again".into(),
+        Msg::RecoveryProvider => "Switch or connect another model provider".into(),
         Msg::ModelSetupTitle => "Choose how to connect a model".into(),
         Msg::ModelSetupLogin => "Sign in with AtomGit".into(),
         Msg::ModelSetupLoginAbout => "Authorize to claim free Coding Plan credits.".into(),

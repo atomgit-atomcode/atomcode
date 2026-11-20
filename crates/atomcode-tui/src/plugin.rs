@@ -3782,6 +3782,29 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+                Wake::Input(Input::Key(press))
+                    if press.mods == crate::surface::Mods::ALT
+                        && matches!(press.key, crate::surface::Key::Char('1' | '2'))
+                        && composer_on_screen
+                        && self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .unready
+                            .is_some() =>
+                {
+                    let command = if press.key == crate::surface::Key::Char('1') {
+                        "/login"
+                    } else {
+                        "/provider"
+                    };
+                    match self.host.commands.dispatch(command, ctx).await {
+                        crate::command::Outcome::Do(action) => quit = self.act(action, &client),
+                        outcome => deliver(&self.host, &wake_tx, outcome),
+                    }
+                    stale = true;
+                }
                 // A reverse search owns the keyboard while it is up — the
                 // letters included, which is what makes it a mode rather than a
                 // list like the slash menu below. Above the menu because the
@@ -7455,7 +7478,7 @@ impl Tui {
                     // turn would now be taken is the host's to say, so it is asked
                     // again rather than assumed: a session whose sign-in expired
                     // still has an agent that describes itself.
-                    if moment.unready.is_some() || moment.model_setup_required {
+                    if description.session == moment.lead {
                         self.recheck_readiness(moment.lead.clone());
                     }
                     let changed = moment.ctx_window != window
@@ -9441,7 +9464,14 @@ impl Tui {
             // draws that session and writes the moment, which is a lock this
             // guard still holds.
             Action::ToggleProviders => {
-                let first_setup = m.model_setup_required;
+                let first_setup = m.model_setup_required
+                    && !self
+                        .ctx
+                        .lock()
+                        .expect("ctx poisoned")
+                        .as_ref()
+                        .and_then(|ctx| ctx.service::<ModelSetupSvc>())
+                        .is_some_and(|setup| setup.expired);
                 drop(m);
                 // Refused rather than silently opening a panel with no module
                 // to draw it: a panel that is "up" but unmounted would take the

@@ -1300,7 +1300,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "思考".into(),
         Msg::RuntimeAlreadyStopped => "这个会话的运行时已经停了".into(),
         Msg::NoProviderConfigured => "还没有可用的 provider——在 atomcode 终端里用 /login 登录,或用 /provider 添加一个".into(),
-        Msg::LoginExpired => "登录已失效。用 /login 重新登录，或用 /provider 切换模型服务。".into(),
+        Msg::LoginExpired => "登录已失效。Alt+1 重新登录 AtomGit · Alt+2 切换或连接其他模型服务".into(),
         Msg::ProviderUnsupportedByBuild => "当前构建不支持 AtomGit 官方网关。请安装官方版本，或用 /model 切换到其他模型、/provider 换一个 provider".into(),
         Msg::ScreenNotConnectedAgent => "屏幕还没接上 agent".into(),
         Msg::HostHasNoControl => "这个宿主没有控制面".into(),
@@ -1380,6 +1380,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ScanOrOpen => "用手机扫码，或在浏览器里打开：".into(),
         Msg::InternalError { error } => format!("internal error：{error}").into(),
 
+        Msg::RecoveryTitle => "登录已失效，请选择如何继续".into(),
+        Msg::RecoveryLogin => "重新登录 AtomGit".into(),
+        Msg::RecoveryProvider => "切换或连接其他模型服务".into(),
         Msg::ModelSetupTitle => "选择模型接入方式".into(),
         Msg::ModelSetupLogin => "使用 AtomGit 账号登录".into(),
         Msg::ModelSetupLoginAbout => "扫码授权，领取免费 Coding Plan 额度。".into(),

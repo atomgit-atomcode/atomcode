@@ -2228,6 +2228,9 @@ pub enum Msg<'a> {
         error: &'a str,
     },
 
+    RecoveryTitle,
+    RecoveryLogin,
+    RecoveryProvider,
     ModelSetupTitle,
     ModelSetupLogin,
     ModelSetupLoginAbout,

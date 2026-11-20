@@ -359,7 +359,10 @@ impl Content for WelcomeBlock {
         }
         use crate::model_setup::SetupView;
         match &self.model_setup {
-            Some(SetupView::Choose { second }) => {
+            Some(SetupView::Choose { second, expired }) => {
+                if *expired {
+                    parts.push("expired");
+                }
                 parts.push(if *second {
                     "setup-provider"
                 } else {
@@ -466,71 +469,7 @@ impl Content for WelcomeBlock {
         };
         let tips = &self.tips[..self.tips.len().min(limit)];
         let mut right: Vec<Line> = Vec::new();
-        use crate::model_setup::SetupView;
-        if let Some(setup) = self.model_setup.as_ref() {
-            let heading = if matches!(setup, SetupView::Provider) {
-                Msg::ModelSetupProvider
-            } else {
-                Msg::ModelSetupTitle
-            };
-            right.push(Line::styled(
-                width::take_width(&t(heading), content_w),
-                muted(),
-            ));
-            match setup {
-                SetupView::Choose { second: selected } => {
-                    for (second, label, about) in [
-                        (false, Msg::ModelSetupLogin, Msg::ModelSetupLoginAbout),
-                        (true, Msg::ModelSetupProvider, Msg::ModelSetupProviderAbout),
-                    ] {
-                        let active = second == *selected;
-                        let marker = if active {
-                            ctx.caps.g(Glyph::Prompt)
-                        } else {
-                            " "
-                        };
-                        let prefix = format!("{marker} {}. ", if second { 2 } else { 1 });
-                        let style = if active {
-                            theme::fg(Role::Accent).bold()
-                        } else {
-                            Style::default()
-                        };
-                        right.extend(wrapped(&t(label), content_w as u16, style, &prefix));
-                        right.extend(wrapped(&t(about), content_w as u16, muted(), "     "));
-                    }
-                    right.extend(wrapped(
-                        &t(Msg::ModelSetupKeys),
-                        content_w as u16,
-                        muted(),
-                        "",
-                    ));
-                }
-                SetupView::Authorize { .. } => {
-                    right.extend(wrapped(
-                        &t(Msg::ModelSetupWaiting),
-                        content_w as u16,
-                        Style::default(),
-                        "",
-                    ));
-                }
-                SetupView::Provider => {
-                    right.extend(wrapped(
-                        &t(Msg::ModelSetupProviderAbout),
-                        content_w as u16,
-                        muted(),
-                        "",
-                    ));
-                }
-                SetupView::Completing => {
-                    right.extend(wrapped(
-                        &t(Msg::ModelSetupCompleting),
-                        content_w as u16,
-                        muted(),
-                        "",
-                    ));
-                }
-            }
-        } else if !tips.is_empty() {
+        if !tips.is_empty() {
             right.push(Line::styled(
                 width::take_width(&self.heading, content_w),
                 muted(),
@@ -651,6 +590,100 @@ impl Content for WelcomeBlock {
                 rows.push(line);
             }
         }
+        rows.append(&mut below);
+
+        use crate::model_setup::SetupView;
+        if let Some(setup) = self.model_setup.as_ref() {
+            rows.push(Line::empty());
+            let heading = if matches!(setup, SetupView::Provider) {
+                Msg::ModelSetupProvider
+            } else if matches!(setup, SetupView::Choose { expired: true, .. }) {
+                Msg::RecoveryTitle
+            } else {
+                Msg::ModelSetupTitle
+            };
+            rows.extend(wrapped(&t(heading), content_w as u16, muted(), &pad));
+            match setup {
+                SetupView::Choose {
+                    second: selected,
+                    expired,
+                } => {
+                    for (second, label, about) in [
+                        (
+                            false,
+                            if *expired {
+                                Msg::RecoveryLogin
+                            } else {
+                                Msg::ModelSetupLogin
+                            },
+                            Msg::ModelSetupLoginAbout,
+                        ),
+                        (
+                            true,
+                            if *expired {
+                                Msg::RecoveryProvider
+                            } else {
+                                Msg::ModelSetupProvider
+                            },
+                            Msg::ModelSetupProviderAbout,
+                        ),
+                    ] {
+                        let active = second == *selected;
+                        let marker = if active {
+                            ctx.caps.g(Glyph::Prompt)
+                        } else {
+                            " "
+                        };
+                        let prefix = format!("{pad}{marker} {}. ", if second { 2 } else { 1 });
+                        let style = if active {
+                            theme::fg(Role::Accent).bold()
+                        } else {
+                            Style::default()
+                        };
+                        rows.extend(wrapped(&t(label), content_w as u16, style, &prefix));
+                        if *expired {
+                            continue;
+                        }
+                        rows.extend(wrapped(
+                            &t(about),
+                            content_w as u16,
+                            muted(),
+                            &format!("{pad}     "),
+                        ));
+                    }
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupKeys),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                SetupView::Authorize { .. } => {
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupWaiting),
+                        content_w as u16,
+                        Style::default(),
+                        &pad,
+                    ));
+                }
+                SetupView::Provider => {
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupProviderAbout),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                SetupView::Completing => {
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupCompleting),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+            }
+        }
         if let Some(SetupView::Authorize { url, screen_rows }) = &self.model_setup {
             let cancel = wrapped(&t(Msg::LoginCancelKey), content_w as u16, muted(), &pad);
             if let Some(url) = url {
@@ -663,13 +696,8 @@ impl Content for WelcomeBlock {
                 });
                 let scan = wrapped(&t(Msg::ScanOrOpen), content_w as u16, muted(), &pad);
                 // Draw the complete code, or leave a usable browser link.
-                let with_code = rows.len()
-                    + below.len()
-                    + scan.len()
-                    + qr_rows.len()
-                    + url_rows.len()
-                    + cancel.len()
-                    + 1;
+                let with_code =
+                    rows.len() + scan.len() + qr_rows.len() + url_rows.len() + cancel.len() + 1;
                 if !qr_rows.is_empty() && with_code <= usize::from(*screen_rows) {
                     rows.extend(scan);
                     rows.extend(qr_rows);
@@ -683,9 +711,8 @@ impl Content for WelcomeBlock {
                 }
                 rows.extend(url_rows);
             }
-            below.extend(cancel);
+            rows.extend(cancel);
         }
-        rows.extend(below);
 
         // A trailing blank, so whatever arrives next (a connection notice, an
         // upgrade hint) does not butt against the last row. Tuix keeps one too.
@@ -4380,6 +4407,31 @@ mod tests {
             brand: std::sync::Arc::new(Brand::default()),
             note: None,
             model_setup: None,
+        }
+    }
+
+    #[test]
+    fn model_setup_choices_follow_the_welcome_tips_and_directory() {
+        let block = WelcomeBlock {
+            model_setup: Some(crate::model_setup::SetupView::Choose {
+                second: false,
+                expired: true,
+            }),
+            ..welcome()
+        };
+        for width in [32, 100] {
+            let rows = block.lines(&wctx(width, true));
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+            let find = |text: &str| {
+                rows.iter()
+                    .position(|row| row.plain().contains(text))
+                    .unwrap()
+            };
+            let directory = find("~/proj");
+            let setup = find(t(Msg::RecoveryTitle).as_ref());
+            assert!(find("上手提示") < find("/resume"));
+            assert!(find("/resume") < directory && directory < setup);
+            assert!(setup < find("1.") && find("1.") < find("2."));
         }
     }
 

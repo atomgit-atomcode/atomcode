@@ -10,6 +10,7 @@ const COMPLETING: u8 = 2;
 pub enum SetupView {
     Choose {
         second: bool,
+        expired: bool,
     },
     Authorize {
         url: Option<String>,
@@ -22,14 +23,16 @@ pub enum SetupView {
 #[derive(Debug)]
 pub struct ModelSetup {
     required: AtomicBool,
+    pub(crate) expired: bool,
     second: AtomicBool,
     login: Mutex<Option<Arc<LoginAttempt>>>,
 }
 
 impl ModelSetup {
-    pub fn new(required: bool) -> Self {
+    pub fn new(required: bool, expired: bool) -> Self {
         Self {
             required: AtomicBool::new(required),
+            expired,
             second: AtomicBool::new(false),
             login: Mutex::new(None),
         }
@@ -61,6 +64,7 @@ impl ModelSetup {
             match login.as_ref() {
                 None => SetupView::Choose {
                     second: self.second(),
+                    expired: self.expired,
                 },
                 Some(attempt) if attempt.state.load(SeqCst) == WAITING => SetupView::Authorize {
                     url: attempt.url.lock().expect("login URL poisoned").clone(),
@@ -166,7 +170,7 @@ mod tests {
 
     #[test]
     fn cancelled_authorization_cannot_commit_or_clear_its_replacement() {
-        let setup = Arc::new(ModelSetup::new(true));
+        let setup = Arc::new(ModelSetup::new(true, false));
         let first = setup.start_login().unwrap();
         assert!(setup.cancel_login());
         assert!(!first.attempt.begin_completion());

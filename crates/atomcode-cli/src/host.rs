@@ -374,6 +374,7 @@ pub(crate) fn attach(
                     if !watched.tell_unavailable(reason) {
                         continue;
                     }
+                    watched.redescribe();
                     if let Some(event) =
                         translate(CodingRuntimeEvent::ProviderUnavailable { reason, forced })
                     {
