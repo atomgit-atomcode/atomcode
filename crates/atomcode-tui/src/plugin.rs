@@ -1219,23 +1219,15 @@ pub enum AskKeyRoute {
     Composer(char),
 }
 
-/// One key against the ask panel, with the composer's claim honored: while the
-/// composer is on screen and holds text, plain characters (a committed IME
-/// composition among them) keep going into the draft instead of selecting an
-/// answer. Digits stay with the panel in every state — "every answer is
-/// reachable by one key" is the panel's standing contract.
-///
-/// Known residue: when the composer is EMPTY the terminal cannot tell a
-/// committed IME composition from deliberate keys, so the first burst after
-/// the panel interrupts a just-started line still reaches the panel. The
-/// composer-holds-text guard covers the mid-sentence case only.
+/// Keep plain text going into a visible draft. The ask handler owns digits
+/// and navigation, and applies the appropriate rules to the pending request.
 pub fn route_ask_key(
     input_holds_text: bool,
-    panel_mounted: bool,
+    composer_hidden: bool,
     press: &crate::surface::KeyPress,
 ) -> AskKeyRoute {
     use crate::surface::{Key, Mods};
-    if panel_mounted {
+    if composer_hidden {
         // The composer has stepped aside for the panel: typing into the field
         // would be writing where nobody looks. The panel takes the key — its
         // typing rows live on characters.
@@ -1295,6 +1287,30 @@ async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ApprovalInput {
+    presentation: crate::ask::PresentedApproval,
+    frame: u64,
+}
+
+impl ApprovalInput {
+    fn for_input(self, input: &Input, current: Self) -> Option<crate::ask::PresentedApproval> {
+        if self.presentation.id != current.presentation.id {
+            return None;
+        }
+        match input {
+            Input::Mouse(..) if self.frame != current.frame => None,
+            Input::Key(press)
+                if press.key == crate::surface::Key::Enter
+                    && self.presentation.selected != current.presentation.selected =>
+            {
+                None
+            }
+            _ => Some(self.presentation),
+        }
+    }
+}
+
 enum Wake {
     History {
         session: String,
@@ -1332,6 +1348,7 @@ enum Wake {
     /// The host replaced the session.
     Host(HostEvent),
     Input(Input),
+    InputOverApproval(Input, ApprovalInput),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
     /// A command the far end (phone, browser) asked this screen to run.
@@ -2029,17 +2046,32 @@ impl UserInterface for Tui {
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
         let keys_tx = wake_tx.clone();
+        let presented_approval = Arc::new(Mutex::new(None));
+        let input_approval = presented_approval.clone();
         let reader = match self.surface.take_input() {
             Some(mut scripted) => tokio::spawn(async move {
                 while let Some(input) = scripted.recv().await {
-                    if keys_tx.send(Wake::Input(input)).is_err() {
+                    if keys_tx
+                        .send(input_wake(
+                            input,
+                            *input_approval.lock().expect("approval poisoned"),
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                 }
             }),
             None => {
                 let surface = self.surface.clone();
-                tokio::spawn(async move { read_input(keys_tx, move || !surface.mouse()).await })
+                tokio::spawn(async move {
+                    read_input(
+                        keys_tx,
+                        move || !surface.mouse(),
+                        move || *input_approval.lock().expect("approval poisoned"),
+                    )
+                    .await
+                })
             }
         };
         // Keep the existing transient hint too; the welcome carries the durable
@@ -2180,6 +2212,9 @@ impl UserInterface for Tui {
         // Wakes answered since that frame. See [`COALESCE_LIMIT`].
         let mut coalesced = 0usize;
         let mut painted_size = self.surface.size();
+        let mut approval_on_screen = None;
+        let mut frame = 0;
+        let mut composer_on_screen = false;
         let mut last_menu_hover = None;
         // Whether the screen could take a background question at the last frame,
         // so the moment it can is seen once (see [`became_ready`]).
@@ -2375,7 +2410,14 @@ impl UserInterface for Tui {
                 was_ready = ready;
                 painted_size = self.surface.size();
                 last_menu_hover = None;
-                self.paint(painted_size);
+                let (approval, composer) = self.paint(painted_size);
+                frame += 1;
+                approval_on_screen = approval.map(|presentation| ApprovalInput {
+                    presentation,
+                    frame,
+                });
+                composer_on_screen = composer;
+                *presented_approval.lock().expect("approval poisoned") = approval_on_screen;
                 stale = false;
                 coalesced = 0;
             }
@@ -2430,6 +2472,14 @@ impl UserInterface for Tui {
                     None => wake.recv().await.unwrap_or(Wake::Closed),
                 },
             };
+            let (woke, input_approval) = match woke {
+                Wake::InputOverApproval(input, receipt) => {
+                    let approval =
+                        approval_on_screen.and_then(|current| receipt.for_input(&input, current));
+                    (Wake::Input(input), approval)
+                }
+                other => (other, None),
+            };
             if matches!(woke, Wake::EdgeScroll) {
                 edge_due = None;
             }
@@ -2440,6 +2490,8 @@ impl UserInterface for Tui {
             // (the turn streaming on, a resize) goes on as usual — the frames
             // it asks for are not drawn until the screen is back.
             if self.surface.showing_transcript() {
+                approval_on_screen = None;
+                *presented_approval.lock().expect("approval poisoned") = None;
                 match &woke {
                     Wake::Input(Input::Key(_)) => {
                         self.surface.back_from_transcript();
@@ -2500,6 +2552,7 @@ impl UserInterface for Tui {
             }
             let closed = matches!(woke, Wake::Closed | Wake::TerminalInputFailed(_));
             match woke {
+                Wake::InputOverApproval(..) => unreachable!("input was normalized"),
                 Wake::Closed => quit = true,
                 Wake::TerminalInputFailed(error) => {
                     terminal_input_error = Some(error);
@@ -3061,8 +3114,12 @@ impl UserInterface for Tui {
                             // another one's row.
                             if self.host.asks.is_waiting() {
                                 if let Some(row) = self.host.answer_row_at(x, y) {
-                                    let _ = self.host.point_ask_at(row);
-                                    quit = self.confirm_question();
+                                    if let Some((id, step)) = self
+                                        .host
+                                        .click_ask(row, input_approval.map(|approval| approval.id))
+                                    {
+                                        self.deliver_answer(id, step);
+                                    }
                                     stale = true;
                                     continue;
                                 }
@@ -3668,7 +3725,7 @@ impl UserInterface for Tui {
                         .expect("moment poisoned")
                         .input
                         .is_empty();
-                    match route_ask_key(holds, self.panel_mounted(), &press) {
+                    match route_ask_key(holds, !composer_on_screen, &press) {
                         AskKeyRoute::Composer(c) => {
                             // Through `act`, so the insert keeps its side
                             // effects (draft history, suggestion dismissal).
@@ -3676,7 +3733,7 @@ impl UserInterface for Tui {
                             stale = true;
                         }
                         AskKeyRoute::Panel => {
-                            quit = self.answer_question(press);
+                            quit = self.answer_question(press, input_approval);
                             stale = true;
                         }
                     }
@@ -4167,7 +4224,7 @@ impl Tui {
             || self.host.team_focused())
     }
 
-    fn paint(&self, size: (u16, u16)) {
+    fn paint(&self, size: (u16, u16)) -> (Option<crate::ask::PresentedApproval>, bool) {
         self.name_the_window();
         // Where the pointer is, for the status row's marker: the surface is the
         // one that knows, and every way it changes (ctrl+g, `[ui] mouse`, the
@@ -4179,8 +4236,11 @@ impl Tui {
                 m.mouse_handed_back = back;
             }
         }
-        let frame = self.host.compose(size);
+        let (frame, approval) = self.host.compose_with_approval(size);
+        let approval = approval.filter(|_| !self.surface.showing_transcript());
+        let composer = frame.part("input").is_some();
         self.surface.present(&frame);
+        (approval, composer)
     }
 
     /// Put the session's name in the window title, when it has changed.
@@ -9864,19 +9924,23 @@ impl Tui {
 
     /// Route one key to the question on screen. Returns `true` to quit.
     ///
-    /// A question is a panel riding the stream's tail, not a modal, so the keys come
-    /// here directly — there is no overlay that holds the keyboard first. What has
-    /// not changed is the rule: while a question is waiting, every key is the
-    /// question's. Exactly one thing can hold focus, and this is what holds it.
-    ///
-    /// **Every answer is reachable by one key.** Up/down walk the list, which is what
-    /// a highlighted row is for; enter takes the row that is lit; a digit or a first
-    /// letter goes straight to an answer, which is faster once the list is known; esc
-    /// declines. With the panel up, what each key does is the panel's own
-    /// ([`crate::ask::Sheet::key`]) — the rows it draws and the keys that take them are
-    /// one implementation rather than two that agree until one changes.
-    fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
+    /// Tool approval answers belong to the request shown when the input arrived.
+    /// Ordinary questions retain their panel and stream shortcuts.
+    fn answer_question(
+        &self,
+        press: crate::surface::KeyPress,
+        approval_at_input: Option<crate::ask::PresentedApproval>,
+    ) -> bool {
         use crate::surface::{Key, Mods};
+        let Some((id, page, asked)) = self.host.asks.current_with_id() else {
+            return false;
+        };
+        if asked.is_tool_approval() {
+            if let Some(approval) = approval_at_input.filter(|approval| approval.id == id) {
+                self.deliver_answer(id, self.host.approval_key(approval, press));
+            }
+            return false;
+        }
         if self.panel_mounted() {
             if let Some((id, step)) = self.host.ask_key(press) {
                 self.deliver_answer(id, step);
@@ -9886,9 +9950,6 @@ impl Tui {
         // No panel: the question at the foot of the stream, one at a time. It
         // marks no row, so there is no highlight to trust — enter takes an
         // answer only when there is exactly one to take.
-        let Some(asked) = self.host.asks.current() else {
-            return false;
-        };
         let question = asked.question;
         let chosen = match (press.key, press.mods) {
             // Esc and ctrl-c decline. Declining is an answer; it is never consent,
@@ -9908,7 +9969,7 @@ impl Tui {
         if let Some(answer) = chosen {
             self.host
                 .asks
-                .answer_current(answer.map(crate::ask::Reply::from));
+                .answer_current(id, page, answer.map(crate::ask::Reply::from));
         }
         false
     }
@@ -9935,31 +9996,6 @@ impl Tui {
             .expect("moment poisoned")
             .asking
             .is_some()
-    }
-
-    /// Take the row the panel has lit, as a return would. `true` to quit, for the
-    /// key path.
-    ///
-    /// One path for both the return key and a click on a row, so a confirm and a
-    /// pick cannot disagree about what is pointed at.
-    fn confirm_question(&self) -> bool {
-        // A click elsewhere in the card must not accidentally commit an edit.
-        if self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .asking
-            .as_ref()
-            .is_some_and(|sheet| sheet.option_edit().is_some())
-        {
-            return false;
-        }
-        let press = crate::surface::KeyPress::plain(crate::surface::Key::Enter);
-        if let Some((id, step)) = self.host.ask_key(press) {
-            self.deliver_answer(id, step);
-        }
-        false
     }
 
     /// What has been typed after the slash, while a command is being named.
@@ -11795,6 +11831,13 @@ fn arrows_scroll(
     !mouse_held && (mouse_reported || alternate_scroll) && would_scroll
 }
 
+fn input_wake(input: Input, approval: Option<ApprovalInput>) -> Wake {
+    match approval {
+        Some(receipt) => Wake::InputOverApproval(input, receipt),
+        None => Wake::Input(input),
+    }
+}
+
 /// Read the terminal, gathering keystroke bursts that are really a paste.
 ///
 /// **Why this is not just a loop over events.** A terminal without bracketed
@@ -11818,12 +11861,13 @@ fn arrows_scroll(
 async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
+    presented_approval: impl Fn() -> Option<ApprovalInput> + Send + 'static,
 ) {
     let events = crate::terminal_modes::input_records(
         crossterm::event::EventStream::new(),
         crate::terminal_modes::ensure_input,
     );
-    pump_terminal_input(events, wake, handed_back).await;
+    pump_terminal_input(events, wake, handed_back, presented_approval).await;
 }
 
 /// Keep read/mode failures visible and stop accepting input after the first one.
@@ -11831,6 +11875,7 @@ async fn pump_terminal_input<S>(
     events: S,
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
+    presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = std::io::Result<crossterm::event::Event>>,
 {
@@ -11850,6 +11895,7 @@ async fn pump_terminal_input<S>(
         wake.clone(),
         handed_back,
         crate::ansi::alternate_scroll_enabled(),
+        presented_approval,
     )
     .await;
     let _ = wake.send(Wake::Closed);
@@ -11867,7 +11913,7 @@ async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
             KeyModifiers::NONE,
         ))),
     ]);
-    pump_terminal_input(events, wake, || false).await;
+    pump_terminal_input(events, wake, || false, || None).await;
     assert!(
         matches!(received.recv().await, Some(Wake::TerminalInputFailed(message)) if message.contains("console mode refused"))
     );
@@ -11886,6 +11932,7 @@ async fn pump_input<S>(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
     alternate_scroll: bool,
+    presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
 {
@@ -11899,10 +11946,12 @@ async fn pump_input<S>(
                 if key.kind == crossterm::event::KeyEventKind::Release
         ))
     });
+    // Sample before burst detection can defer a key past a frame boundary.
+    let events = events.map(|event| (event, presented_approval()));
     futures::pin_mut!(events);
-    let forward = |event| -> bool {
+    let forward = |event, approval| -> bool {
         match crate::surface::from_crossterm(event) {
-            Some(input) => wake.send(Wake::Input(input)).is_ok(),
+            Some(input) => wake.send(input_wake(input, approval)).is_ok(),
             // Not an event this screen has a use for; the reader lives on.
             None => true,
         }
@@ -11911,7 +11960,7 @@ async fn pump_input<S>(
     // after a replayed paste) goes round again, through every check above —
     // forwarded straight on, a reversed wheel's first arrow was one ↑ into the
     // composer, and a paste's first character was a keystroke.
-    let mut next_up: Option<crossterm::event::Event> = None;
+    let mut next_up = None;
     let mut paste_continuation = false;
     loop {
         // Reaching the allocation cap is not a paste boundary. Carry its
@@ -11926,13 +11975,14 @@ async fn pump_input<S>(
                 }
             }
         }
-        let event = match next_up.take() {
+        let (event, approval) = match next_up.take() {
             Some(event) => event,
             None => match events.next().await {
                 Some(event) => event,
                 None => break,
             },
         };
+        let approval_id = approval.map(|receipt| receipt.presentation.id);
         // **The wheel, turned into arrow keys by the terminal.** With the
         // pointer handed back, iTerm2 ("scroll wheel sends arrow keys when in
         // alternate screen mode", on by default) and Terminal.app send the
@@ -11946,10 +11996,15 @@ async fn pump_input<S>(
         if let Some(up) = crate::surface::bare_arrow(&event).filter(|_| handed_back()) {
             paste_continuation = false;
             let mut n = 1usize;
-            let mut after: Option<crossterm::event::Event> = None;
+            let mut after = None;
             loop {
                 match tokio::time::timeout(crate::surface::BURST_PENDING, events.next()).await {
-                    Ok(Some(next)) if crate::surface::bare_arrow(&next) == Some(up) => n += 1,
+                    Ok(Some(next))
+                        if next.1.map(|receipt| receipt.presentation.id) == approval_id
+                            && crate::surface::bare_arrow(&next.0) == Some(up) =>
+                    {
+                        n += 1;
+                    }
                     Ok(Some(next)) => {
                         after = Some(next);
                         break;
@@ -11962,7 +12017,7 @@ async fn pump_input<S>(
             // history; Ctrl+P/Ctrl+N remain unambiguous history keys. Other
             // terminals preserve the usual single-arrow keyboard behavior.
             let sent = if n == 1 && !alternate_scroll {
-                forward(event)
+                forward(event, approval)
             } else {
                 wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
             };
@@ -11974,13 +12029,13 @@ async fn pump_input<S>(
         }
         let Some(first) = crate::surface::burst_char(&event) else {
             paste_continuation = false;
-            if !forward(event) {
+            if !forward(event, approval) {
                 break;
             }
             continue;
         };
-        let mut held: Vec<(char, crossterm::event::Event)> = vec![(first, event)];
-        let mut after: Option<crossterm::event::Event> = None;
+        let mut held = vec![(first, event, approval)];
+        let mut after = None;
         // The wider window opens only once a second character has confirmed
         // there is something to bridge: until then a lone keystroke must not
         // pay for the paste case.
@@ -11995,9 +12050,11 @@ async fn pump_input<S>(
                 break; // quiet: whatever this was, it is over
             };
             let Some(next) = next else { break };
-            match crate::surface::burst_char(&next) {
+            match crate::surface::burst_char(&next.0)
+                .filter(|_| next.1.map(|receipt| receipt.presentation.id) == approval_id)
+            {
                 Some(c) => {
-                    held.push((c, next));
+                    held.push((c, next.0, next.1));
                     confirmed = true;
                 }
                 None => {
@@ -12006,13 +12063,14 @@ async fn pump_input<S>(
                 }
             }
         }
-        let chars: Vec<char> = held.iter().map(|(c, _)| *c).collect();
+        let chars: Vec<char> = held.iter().map(|(c, _, _)| *c).collect();
         let capped = held.len() == crate::surface::BURST_CAP;
         let sent = if paste_continuation || capped || crate::surface::is_paste_burst(&chars) {
             wake.send(Wake::Input(Input::Paste(chars.into_iter().collect())))
                 .is_ok()
         } else {
-            held.into_iter().all(|(_, event)| forward(event))
+            held.into_iter()
+                .all(|(_, event, receipt)| forward(event, receipt))
         };
         if !sent {
             break;
@@ -13986,7 +14044,7 @@ mod paste_burst_tests {
         .fuse();
         futures::pin_mut!(events);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        super::pump_input(events, tx, move || handed_back, alternate_scroll).await;
+        super::pump_input(events, tx, move || handed_back, alternate_scroll, || None).await;
         let mut seen = Vec::new();
         while let Ok(Wake::Input(input)) = rx.try_recv() {
             seen.push(input);
@@ -17132,7 +17190,7 @@ mod skills_menu_tests {
         for _ in 0..3 {
             assert!(!tui.act(Action::EndOfInput, &tui.client));
         }
-        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d')));
+        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d'), None));
         assert!(!tui.team_key(crate::surface::KeyPress::ctrl('d')));
     }
 
@@ -18267,6 +18325,133 @@ mod ask_route_tests {
                 "navigation key stays with the panel"
             );
         }
+    }
+
+    #[test]
+    fn approval_dispatch_requires_the_presented_request_and_selection() {
+        use atomcode_capabilities::tools::approval::APPROVAL_KIND;
+        use tokio::sync::oneshot::error::TryRecvError;
+        let approval = || {
+            crate::ask::question_for(
+                APPROVAL_KIND,
+                &serde_json::json!({"tool": "write_file", "args": r#"{"file_path":"note.txt"}"#}),
+                &[],
+            )
+            .expect("a tool approval")
+        };
+
+        for mounted in [false, true] {
+            let (host, tui) = assemble(Headless::new(100, 30));
+            if mounted {
+                host.modules
+                    .add_view(Arc::new(
+                        crate::module::Mounted::<crate::modules::ask::Ask>::new(),
+                    ))
+                    .unwrap();
+            }
+            let (id, mut answer) = host.asks.push_with_id(approval());
+            for key in [Key::Char('1'), Key::Down, Key::Enter] {
+                tui.answer_question(press(key), None);
+            }
+            assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
+
+            host.sync_asking();
+            let (shown, _) = tui.paint((100, 30));
+            assert_eq!(shown.unwrap().id, id);
+            tui.answer_question(press(Key::Down), shown);
+            tui.answer_question(press(Key::Enter), shown);
+            assert_eq!(
+                answer.try_recv(),
+                Err(TryRecvError::Empty),
+                "selection has not been painted"
+            );
+            let (selected, _) = tui.paint((100, 30));
+            assert_eq!(selected.unwrap().selected, Some(0));
+
+            let (next, mut next_answer) = host.asks.push_with_id(approval());
+            assert!(host.asks.withdraw(id));
+            host.sync_asking();
+            tui.answer_question(press(Key::Enter), selected);
+            assert_eq!(next_answer.try_recv(), Err(TryRecvError::Empty));
+
+            let (next_shown, _) = tui.paint((100, 30));
+            assert_eq!(next_shown.unwrap().id, next);
+            tui.answer_question(press(Key::Down), next_shown);
+            let (next_selected, _) = tui.paint((100, 30));
+            tui.answer_question(press(Key::Enter), next_selected);
+            assert_eq!(
+                next_answer.try_recv(),
+                Ok(Some(crate::ask::Reply::from("allow")))
+            );
+        }
+    }
+
+    #[test]
+    fn queued_confirmation_cannot_pick_up_a_later_selection_or_mouse_layout() {
+        let before = ApprovalInput {
+            presentation: crate::ask::PresentedApproval {
+                id: 1,
+                selected: None,
+            },
+            frame: 1,
+        };
+        let after = ApprovalInput {
+            presentation: crate::ask::PresentedApproval {
+                id: 1,
+                selected: Some(0),
+            },
+            frame: 2,
+        };
+        let enter = Input::Key(press(Key::Enter));
+        assert!(before.for_input(&enter, after).is_none());
+        assert_eq!(after.for_input(&enter, after).unwrap().selected, Some(0));
+
+        let click = Input::Mouse(crate::surface::Click::Press, 0, 0);
+        assert!(before.for_input(&click, after).is_none());
+        assert!(after.for_input(&click, after).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn queued_keys_keep_the_approval_seen_when_they_arrived() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (wake, mut received) = mpsc::unbounded_channel();
+        // The input reader replays short candidate lines as individual keys.
+        let keys = futures::stream::iter(
+            [
+                KeyCode::Char('1'),
+                KeyCode::Enter,
+                KeyCode::Char('2'),
+                KeyCode::Enter,
+            ]
+            .map(|key| Event::Key(KeyEvent::new(key, KeyModifiers::NONE))),
+        );
+        let sampled = std::cell::Cell::new(0);
+        pump_input(
+            keys,
+            wake,
+            || false,
+            false,
+            || {
+                let frame = sampled.get();
+                sampled.set(frame + 1);
+                Some(ApprovalInput {
+                    presentation: crate::ask::PresentedApproval {
+                        id: 1,
+                        selected: (frame > 0).then_some(0),
+                    },
+                    frame,
+                })
+            },
+        )
+        .await;
+        assert!(
+            matches!(received.try_recv(), Ok(Wake::InputOverApproval(Input::Key(key), receipt))
+            if key.key == Key::Char('1') && receipt.presentation.selected.is_none())
+        );
+        assert!(
+            matches!(received.try_recv(), Ok(Wake::InputOverApproval(Input::Key(key), receipt))
+            if key.key == Key::Enter && receipt.presentation.selected == Some(0))
+        );
     }
 }
 

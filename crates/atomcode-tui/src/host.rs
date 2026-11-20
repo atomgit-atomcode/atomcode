@@ -2955,20 +2955,29 @@ impl Host {
     ///
     /// **True when a frame is owed.**
     pub fn sync_asking(&self) -> bool {
-        // Only when the panel is mounted. Unmounted, there is no panel to draw
-        // the question and no panel for the composer to step aside for: the
-        // question goes to the foot of the stream the way it did before there was
-        // a panel, and the composer stays exactly where it was. Gating here rather
-        // than in each of the four places that read `asking` is what keeps them
-        // from disagreeing about whether a question is on screen.
-        let waiting = self.ask_panel_mounted().then(|| self.asks.peek()).flatten();
+        // Without the panel, an approval still needs a sheet to track its
+        // selection. Its sheet is drawn in the stream and leaves the composer up.
+        let mounted = self.ask_panel_mounted();
+        let waiting = self.asks.peek().filter(|(_, asked)| {
+            mounted
+                || asked
+                    .first()
+                    .is_some_and(crate::ask::Asked::is_tool_approval)
+        });
         let mut m = self.moment.write().expect("moment poisoned");
+        let (shown, cleared) = if mounted {
+            let cleared = m.fallback_approval.take().is_some();
+            (&mut m.asking, cleared)
+        } else {
+            let cleared = m.asking.take().is_some();
+            (&mut m.fallback_approval, cleared)
+        };
         match waiting {
-            None => m.asking.take().is_some(),
+            None => shown.take().is_some() || cleared,
             // The same request keeps its sheet — the lit row, the page, what
             // has been ticked and typed. Keyed on the request's id rather than
             // on its words: two questions worded alike are still two questions.
-            Some((id, _)) if m.asking.as_ref().is_some_and(|had| had.id == id) => false,
+            Some((id, _)) if shown.as_ref().is_some_and(|had| had.id == id) => cleared,
             Some((id, asked)) => {
                 let mut sheet = crate::moment::Ask::new(id, asked);
                 let key = m
@@ -2980,7 +2989,11 @@ impl Host {
                     .unwrap_or("ctrl+e");
                 sheet.edit_key = crate::keymap::parse_question_edit_key(key)
                     .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
-                m.asking = Some(sheet);
+                if mounted {
+                    m.asking = Some(sheet);
+                } else {
+                    m.fallback_approval = Some(sheet);
+                }
                 true
             }
         }
@@ -2989,14 +3002,58 @@ impl Host {
     /// Move the highlight to a row, by index. True when it moved.
     pub fn point_ask_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        m.asking.as_mut().is_some_and(|a| a.point_at(row))
+        m.asking.as_mut().is_some_and(|a| a.hover_at(row))
     }
 
     /// Give a key to the question panel, and say what it came to.
     pub fn ask_key(&self, press: crate::surface::KeyPress) -> Option<(u64, crate::ask::Step)> {
         let mut m = self.moment.write().expect("moment poisoned");
-        let sheet = m.asking.as_mut()?;
+        let sheet = m
+            .asking
+            .as_mut()
+            .filter(|sheet| !sheet.is_tool_approval())?;
         Some((sheet.id, sheet.key(press)))
+    }
+
+    pub(crate) fn approval_key(
+        &self,
+        presented: crate::ask::PresentedApproval,
+        press: crate::surface::KeyPress,
+    ) -> crate::ask::Step {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let sheet = match m.asking.as_mut() {
+            Some(sheet) => Some(sheet),
+            None => m.fallback_approval.as_mut(),
+        };
+        let Some(sheet) =
+            sheet.filter(|sheet| sheet.id == presented.id && sheet.is_tool_approval())
+        else {
+            return crate::ask::Step::Stay;
+        };
+        if press.key == crate::surface::Key::Enter
+            && !presented
+                .selected
+                .is_some_and(|row| sheet.row_selected(row))
+        {
+            return crate::ask::Step::Stay;
+        }
+        sheet.key(press)
+    }
+
+    pub(crate) fn click_ask(
+        &self,
+        row: usize,
+        approval_on_screen: Option<u64>,
+    ) -> Option<(u64, crate::ask::Step)> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let sheet = m.asking.as_mut()?;
+        if sheet.option_edit().is_some()
+            || (sheet.is_tool_approval() && approval_on_screen != Some(sheet.id))
+        {
+            return None;
+        }
+        sheet.point_at(row);
+        Some((sheet.id, sheet.enter()))
     }
 
     /// Paste into the question panel's typing row. True when it took it.
@@ -6523,9 +6580,10 @@ impl Host {
         rect: Rect,
         scroll: usize,
         caps: crate::block::ShapeCaps,
-        activity: crate::moment::Activity,
-        tick: u64,
+        moment: &Moment,
     ) -> (Vec<Line>, Vec<RowOwner>) {
+        let activity = moment.activity;
+        let tick = moment.tick;
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let calls_apart = pres.calls_apart();
@@ -6549,17 +6607,14 @@ impl Host {
         // is what makes the row a product's decision instead of a dependency of
         // the front end.
         if !self.ask_panel_mounted() {
-            if let Some(asked) = self.asks.current() {
-                let pending = fallback_question(&asked);
-                let mut lines =
-                    crate::block::Content::lines(&pending, &crate::block::RenderCtx::bare(rect.w));
-                lines.reverse();
-                for line in lines {
-                    if out.len() < want {
-                        out.push(line);
-                        owner.push(None); // a question is not a block yet
-                    }
-                }
+            for line in self
+                .fallback_ask_lines(rect.w, want, moment)
+                .into_iter()
+                .rev()
+                .take(want)
+            {
+                out.push(line);
+                owner.push(None); // a question is not a block yet
             }
         }
         // The same table `stream_height` summed, so the two cannot disagree
@@ -6835,7 +6890,15 @@ impl Host {
 
     /// Compose one frame.
     pub fn compose(&self, size: (u16, u16)) -> Frame {
+        self.compose_with_approval(size).0
+    }
+
+    pub(crate) fn compose_with_approval(
+        &self,
+        size: (u16, u16),
+    ) -> (Frame, Option<crate::ask::PresentedApproval>) {
         let (w, h) = size;
+        let mut approval = None;
         let mut frame = Frame::new(w, h);
         self.hits.lock().expect("hits poisoned").scrollbar = None;
         let mut moment = self.moment.read().expect("moment poisoned").clone();
@@ -6896,13 +6959,14 @@ impl Host {
                             head: view.screen_of(sel.head),
                         });
                     }
-                    let (lines, owners) = self.stream_lines(
-                        pane.block_rect,
-                        pane.block_scroll,
-                        caps,
-                        moment.activity,
-                        moment.tick,
-                    );
+                    let (lines, owners) =
+                        self.stream_lines(pane.block_rect, pane.block_scroll, caps, &moment);
+                    if let Some(sheet) = moment.fallback_approval.as_ref() {
+                        if !self.ask_panel_mounted() {
+                            approval =
+                                crate::modules::ask::presented_approval(sheet, pane.block_rect);
+                        }
+                    }
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
                         rows: owners,
@@ -6976,6 +7040,14 @@ impl Host {
                         // have to reproduce the tail's split.
                         if id == crate::modules::ask::ID {
                             self.hits.lock().expect("hits poisoned").ask = Some(*tail_rect);
+                            if let Some(sheet) = moment
+                                .asking
+                                .as_ref()
+                                .filter(|sheet| sheet.is_tool_approval())
+                            {
+                                approval =
+                                    crate::modules::ask::presented_approval(sheet, *tail_rect);
+                            }
                         }
                         if id == crate::modules::todo::ID {
                             let mut hits = self.hits.lock().expect("hits poisoned");
@@ -7261,7 +7333,7 @@ impl Host {
             frame.containment_violations()
         );
         *self.painted.lock().expect("counter poisoned") += 1;
-        frame
+        (frame, approval)
     }
 
     /// How many rows the conversation gets on a screen this size.
@@ -7737,13 +7809,7 @@ impl Host {
         let asked = if self.ask_panel_mounted() {
             0
         } else {
-            self.asks.current().map_or(0, |asked| {
-                crate::block::Content::lines(
-                    &fallback_question(&asked),
-                    &crate::block::RenderCtx::bare(width),
-                )
-                .len()
-            })
+            self.fallback_ask_lines(width, usize::MAX, moment).len()
         };
         let most = (u16::MAX as usize).saturating_sub(asked).max(1);
         let mut out = Vec::with_capacity(total);
@@ -7754,8 +7820,7 @@ impl Host {
                 Rect::new(0, 0, width, (rows + asked).min(u16::MAX as usize) as u16),
                 total - start - rows,
                 caps,
-                moment.activity,
-                moment.tick,
+                moment,
             );
             out.extend(lines.into_iter().take(rows));
             start += rows;
@@ -7796,8 +7861,7 @@ impl Host {
             rect,
             end - last,
             crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
-            moment.activity,
-            moment.tick,
+            moment,
         );
         let width = view.rect.w;
         let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -7899,15 +7963,27 @@ impl Host {
         // see `stream_lines`. Counted here for the reason the tail is: a row the
         // frame drew and this did not would be out of reach at the bottom of the
         // scroll, which is the whole failure `row_index` exists to prevent.
-        let pending = match self.ask_panel_mounted() {
-            false => self.asks.current(),
-            true => None,
+        let question = if self.ask_panel_mounted() {
+            0
+        } else {
+            self.fallback_ask_lines(width, usize::MAX, moment).len()
         };
-        let question = pending.map_or(0, |asked| {
-            let block = fallback_question(&asked);
-            crate::block::Content::lines(&block, &crate::block::RenderCtx::bare(width)).len()
-        });
         (total + tail + question, tail)
+    }
+
+    fn fallback_ask_lines(&self, width: u16, height: usize, moment: &Moment) -> Vec<Line> {
+        if let Some(sheet) = &moment.fallback_approval {
+            return crate::modules::ask::render_sheet(sheet, moment, width, height);
+        }
+        self.asks
+            .current()
+            .filter(|asked| !asked.is_tool_approval())
+            .map_or_else(Vec::new, |asked| {
+                crate::block::Content::lines(
+                    &fallback_question(&asked),
+                    &crate::block::RenderCtx::bare(width),
+                )
+            })
     }
 
     /// The view modules riding the stream's tail, with the height each asks for
@@ -8726,8 +8802,11 @@ mod tests {
             Rect::sized(80, 20),
             0,
             caps,
-            crate::moment::Activity::Working,
-            tick,
+            &Moment {
+                activity: crate::moment::Activity::Working,
+                tick,
+                ..Moment::default()
+            },
         );
         // The call's opening row is the one naming the file; its first span is
         // the `●` mark, whose colour the pulse moves.
@@ -8789,8 +8868,10 @@ mod tests {
                 Rect::sized(80, 20),
                 0,
                 caps,
-                crate::moment::Activity::Working,
-                0,
+                &Moment {
+                    activity: crate::moment::Activity::Working,
+                    ..Moment::default()
+                },
             )
             .0
             .iter()
@@ -12531,17 +12612,11 @@ mod tests {
         }
         let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
         let draw = |rows: u16, scroll: usize| -> Vec<String> {
-            h.stream_lines(
-                Rect::sized(80, rows),
-                scroll,
-                caps,
-                crate::moment::Activity::Idle,
-                0,
-            )
-            .0
-            .iter()
-            .map(|l| l.plain())
-            .collect()
+            h.stream_lines(Rect::sized(80, rows), scroll, caps, &Moment::default())
+                .0
+                .iter()
+                .map(|l| l.plain())
+                .collect()
         };
         let whole = draw(400, 0);
         let total = whole.iter().rposition(|l| !l.is_empty()).unwrap() + 1;

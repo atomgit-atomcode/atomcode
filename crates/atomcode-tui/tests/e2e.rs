@@ -2898,6 +2898,33 @@ async fn until(s: &Session, text: &str) {
     panic!("`{text}` never appeared:\n{}", s.screen());
 }
 
+/// Select the first choice and wait until that selection has been drawn.
+async fn allow_approval(s: &Session) {
+    s.term.press(KeyPress::plain(Key::Down));
+    let highlight = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
+    for _ in 0..400 {
+        let selected = s.term.last().is_some_and(|frame| {
+            frame
+                .part("ask")
+                .or_else(|| frame.part("stream"))
+                .is_some_and(|part| {
+                    part.lines.iter().any(|line| {
+                        line.plain().contains("允许一次")
+                            && line.spans.iter().any(|span| span.style.bg == highlight)
+                    })
+                })
+        });
+        if selected {
+            s.term.press(KeyPress::plain(Key::Enter));
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the allow option never became selected:\n{}", s.screen());
+}
+
 /// Wait for something to *stop* being on screen — the shape a filter needs,
 /// where what is asserted is what is no longer listed.
 async fn until_gone(s: &Session, text: &str) {
@@ -3034,7 +3061,11 @@ async fn a_risky_call_is_asked_about_on_screen_and_an_allow_lets_it_run() {
         "nothing may run before it is approved"
     );
 
-    s.term.press(KeyPress::ch('1'));
+    // A terminal can deliver committed text followed by Enter as ordinary keys.
+    for key in [Key::Char('1'), Key::Char('允'), Key::Enter] {
+        s.term.press(KeyPress::plain(key));
+    }
+    allow_approval(&s).await;
     s.quiet().await;
     assert_eq!(
         std::fs::read_to_string(dir.join("out.txt")).unwrap(),
@@ -3392,7 +3423,7 @@ async fn the_light_turns_green_yellow_and_red() {
         s.term.title()
     );
 
-    s.term.press(KeyPress::ch('1'));
+    allow_approval(&s).await;
     s.quiet().await;
     assert!(
         s.term.title().is_some_and(|t| t.starts_with('🟢')),
@@ -5699,8 +5730,8 @@ async fn an_approval_asked_for_by_a_member_says_which_member() {
     // Delegating is itself a risky call, so the lead's own `team` card comes
     // first. Allow it, and the member's card is the next one up.
     // The running tool line already says `team`, before its approval is ready.
-    until(&s, "1) 允许一次").await;
-    s.term.press(KeyPress::ch('1'));
+    until(&s, "↑↓ 选择").await;
+    allow_approval(&s).await;
     // Not `quiet`: the turn is deliberately stuck on a question, which is the
     // state under test. Settle on the card being up instead.
     until(&s, "write_file").await;
@@ -5718,7 +5749,7 @@ async fn an_approval_asked_for_by_a_member_says_which_member() {
     );
 
     // Answer it: the member writes, and the file is there.
-    s.term.press(KeyPress::ch('1'));
+    allow_approval(&s).await;
     s.quiet().await;
     assert!(
         dir.join("notes.md").exists(),
@@ -5757,11 +5788,12 @@ async fn with_no_panel_row_the_question_is_still_asked_and_still_answered() {
     let task = s.open().await;
 
     s.term.type_line("write it");
-    until(&s, "write_file").await;
+    until(&s, "↑↓ 选择").await;
     let screen = s.screen();
+    assert!(s.term.last().unwrap().part("ask").is_none(), "no panel row");
     assert!(
-        !screen.contains("↑↓ 选择"),
-        "no row, no panel legend:\n{screen}"
+        screen.contains("↑↓ 选择"),
+        "the stream approval has the same keyboard hints:\n{screen}"
     );
     assert!(
         screen.contains("允许一次"),
@@ -5774,7 +5806,10 @@ async fn with_no_panel_row_the_question_is_still_asked_and_still_answered() {
         "and so is the field, since nothing came to take its place:\n{screen}"
     );
 
-    s.term.press(KeyPress::ch('1'));
+    for key in [Key::Char('1'), Key::Char('允'), Key::Enter] {
+        s.term.press(KeyPress::plain(key));
+    }
+    allow_approval(&s).await;
     s.quiet().await;
     assert_eq!(
         std::fs::read_to_string(dir.join("out.txt")).unwrap(),
@@ -5885,7 +5920,18 @@ async fn the_question_panel_picks_by_key_and_by_pointer_and_confirms_the_lit_row
     };
 
     let panel = s.term.last().expect("a frame").part("ask").unwrap().rect;
-    let first = lit_row(&s).expect("an answer starts lit");
+    assert_eq!(lit_row(&s), None, "an approval starts without a selection");
+    let first = (panel.y..panel.y + panel.h)
+        .find(|y| {
+            let frame = s.term.last().unwrap();
+            let part = frame.part("ask").unwrap();
+            part.lines
+                .get((y - panel.y) as usize)
+                .is_some_and(|line| line.plain().contains("允许一次"))
+        })
+        .expect("the allow-once row");
+    s.term.press(KeyPress::plain(Key::Down));
+    until_row(&s, first, true).await;
     assert!(
         first >= panel.y && first < panel.y + panel.h,
         "the lit row is inside the panel: {first} vs {panel:?}"
@@ -5914,31 +5960,8 @@ async fn the_question_panel_picks_by_key_and_by_pointer_and_confirms_the_lit_row
     until_row(&s, first, true).await;
     assert_eq!(lit_row(&s), Some(first), "up did not come back");
 
-    // The pointer takes over the same row. Hovering is enough: the row under the
-    // pointer is the row a click would take, and the panel must say so.
-    let last = panel.y + panel.h - 1;
-    let target = (panel.y..=last)
-        .rev()
-        .find(|y| {
-            let part = s.term.last().unwrap().part("ask").unwrap().clone();
-            let i = (y - part.rect.y) as usize;
-            part.lines
-                .get(i)
-                .is_some_and(|l| l.plain().contains("允许"))
-        })
-        .expect("an answer row to point at");
-    s.term
-        .pointer(atomcode_tui::surface::Click::Hover, panel.x + 2, target);
-    until_row(&s, target, true).await;
-    assert_eq!(
-        lit_row(&s),
-        Some(target),
-        "the row the pointer is over is not the row drawn brighter:\n{}",
-        s.screen()
-    );
-
-    // And the row that is lit is the row a click takes — not the first one, which
-    // is what a click that ignored the pointer would have taken.
+    // A click on a visible approval option is an explicit confirmation.
+    let target = first;
     s.term
         .pointer(atomcode_tui::surface::Click::Press, panel.x + 2, target);
     s.term
@@ -5999,7 +6022,7 @@ async fn until_row(s: &Session, row: u16, lit: bool) {
 
 /// While a question is up the terminal must report where the pointer is.
 ///
-/// The panel lights the row the pointer is over, and a hover is DECSET 1003 —
+/// The terminal reports hover with DECSET 1003 —
 /// which the screen asks for only while something is following the pointer.
 /// Handed in as a recorded event like the menu's own test, this passes whether or
 /// not a real terminal would ever have sent one; asserted as the request, it does
@@ -6034,7 +6057,7 @@ async fn a_question_asks_the_terminal_for_the_pointer_only_while_it_is_up() {
     // Answer it: the panel goes, and so does the request — a terminal left in
     // 1003 sends an event for every cell the pointer crosses for the rest of the
     // session, for nothing.
-    s.term.press(KeyPress::ch('2'));
+    s.term.press(KeyPress::plain(Key::Esc));
     s.quiet().await;
     assert!(
         !s.screen().contains("↑↓ 选择"),
@@ -6096,7 +6119,7 @@ async fn a_question_holds_still_while_the_conversation_is_read_back() {
     );
 
     // And it is still the question's to answer: the keys it takes still reach it.
-    s.term.press(KeyPress::ch('1'));
+    allow_approval(&s).await;
     for _ in 0..200 {
         if dir.join("out.txt").exists() {
             break;
@@ -7749,7 +7772,7 @@ async fn a_resumed_session_shows_the_approval_it_was_given() {
         // The turn is deliberately blocked on the answer, so this waits for the
         // question rather than for quiet.
         until(&s, "esc 拒绝").await;
-        s.term.press(KeyPress::ch('1'));
+        allow_approval(&s).await;
         s.quiet().await;
         assert_eq!(
             std::fs::read_to_string(root.join("out.txt")).unwrap_or_default(),

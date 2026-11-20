@@ -788,6 +788,8 @@ pub struct Moment {
     /// a module that folded "is a question waiting?" from facts would be folding
     /// something that is not in them. See `modules::ask`.
     pub asking: Option<Ask>,
+    /// A tool approval rendered in the stream when the panel row is absent.
+    pub(crate) fallback_approval: Option<Ask>,
     /// The password a running process is blocked on, if one is being asked for:
     /// the asking program's own words, and how many characters have been typed.
     ///
