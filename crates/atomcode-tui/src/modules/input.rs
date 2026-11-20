@@ -630,10 +630,13 @@ impl View for Input {
                     && vp.moment.search.is_none()
                     && vp.moment.history_at.is_none()
                 {
-                    // Paint the hint without adding anything to the editable buffer.
+                    // Leave one empty cell for the native cursor. Over the
+                    // first wide glyph of a hint, terminals can draw a
+                    // two-cell cursor when unfocused and a thin one when focused.
                     let hint = t(Msg::ComposerPlaceholder);
+                    row.push(El::raw(" "));
                     row.push(El::styled(
-                        width::take_width(&hint, body),
+                        width::take_width(&hint, body.saturating_sub(1)),
                         theme::fg(Role::Muted),
                     ));
                 }
@@ -723,7 +726,14 @@ mod tests {
         let state = State::default();
         let mut moment = Moment::default();
         let placeholder = t(Msg::ComposerPlaceholder);
-        assert!(draw(&state, &moment, 60, 3)[1].contains(placeholder.as_ref()));
+        let rect = Rect::sized(60, 3);
+        let (x, y) = caret(&moment, rect);
+        let rows = draw(&state, &moment, rect.w, rect.h);
+        let row = &rows[y as usize];
+        let through_caret = width::take_width(row, x as usize + 1);
+        assert_eq!(width::str_width(&through_caret), x as usize + 1);
+        assert!(through_caret.ends_with(' '), "cursor cell in {row:?}");
+        assert!(row[through_caret.len()..].starts_with(placeholder.as_ref()));
         assert!(moment.input.is_empty() && moment.suggestion.is_none());
 
         moment.suggestion = Some("Review this change".into());
