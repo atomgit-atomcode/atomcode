@@ -530,6 +530,9 @@ pub fn headless_patch() -> atomcode_plexus::Layer {
 /// Public for the same reason [`CODING_DEFAULTS`] is: a host with its own front
 /// end stacks this list instead of restating it.
 pub const CODING_ROWS: &str = r#"
+[[insert]]
+name = "tool-git-index-review"
+
 # Approval gates that the chain mounted as kernel `ToolMiddleware`s.
 # Same judgements — each row calls the same L1 function the middleware does —
 # reached through the `approval` seam instead of a private `PermissionStore`.
@@ -919,13 +922,12 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     if names_sessions_with_a_model(cfg) {
         out = out.swap("session-title-first-prompt", "session-title-model");
     }
-    // A positive host budget opts into a single bounded lower-effort attempt.
-    out = out.patch("llm-stream-recovery", serde_json::json!({
-        "max_recoveries":3,
-        "reasoning_checkpoint":cfg.round_cap_checkpoint,
-        "reasoning_recovery_ms":cfg.reasoning_recovery_timeout.as_millis().min(u64::MAX as u128) as u64
-    })).map_err(|e| e.to_string())?;
-    // Interactive checkpoints remain available when automatic recovery is off.
+    out = out
+        .patch(
+            "llm-stream-recovery",
+            serde_json::json!({"max_recoveries": 3}),
+        )
+        .map_err(|e| e.to_string())?;
     if cfg.round_cap_checkpoint {
         out = out
             .patch(
@@ -1535,6 +1537,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(crate::policy_rows::CredentialShellPlugin),
         Arc::new(crate::policy_rows::WriteApprovalPlugin),
         Arc::new(crate::policy_rows::BashWorkspacePlugin),
+        Arc::new(crate::git_index_policy::GitIndexPlugin),
         // Every tool call states its reason in one line, for the person reading
         // the transcript. This product's call, not the mechanism's: what a tool
         // call should say about itself is a presentation decision
@@ -1603,6 +1606,15 @@ pub async fn mount_swappable(
     .await
 }
 
+/// The primary adapter and its metered summary wrapper are updated together.
+#[derive(Clone)]
+pub struct CompactionProviders {
+    pub primary: Arc<dyn LlmProvider>,
+    pub summary: Arc<dyn LlmProvider>,
+}
+
+pub type SharedCompactionProviders = Arc<std::sync::RwLock<Option<CompactionProviders>>>;
+
 /// What the coding runtime hands a tree beyond its provider: the session it
 /// continues, and the lifecycle hooks it already built against that session.
 ///
@@ -1644,6 +1656,11 @@ pub struct HostState {
     /// the policy intervention — offered as commands a person runs
     /// (`docs/adr/0021` §3, §10).
     pub(crate) runtime_commands: Option<Arc<dyn crate::runtime::RuntimeCommands>>,
+    /// `Some` when the driver shows the turn a background completion starts
+    /// ([`crate::CodingAgentConfig::background_wakeups`]): the jobs the runtime
+    /// will wake the model for. Decides what the `capability-commands` row
+    /// tells the model about waiting, and lets it remind a model still polling.
+    pub(crate) background_waits: Option<crate::background_jobs::BackgroundWaits>,
     /// Row edits the runtime's own options call for (a capability switched off,
     /// a directory to resolve against).
     pub rows: Layer,
@@ -1661,7 +1678,7 @@ pub struct HostState {
     /// for the same reason; this is the other half of it, at mount.
     pub model: Option<String>,
     /// The provider a requested compaction's summary is written with.
-    pub summary_provider: Option<atomcode_review::SharedReviewProvider>,
+    pub summary_provider: Option<SharedCompactionProviders>,
     /// The native snapshot writer a committed compaction is stored through.
     pub compaction_checkpoint: Option<Arc<atomcode_capabilities::session::SnapshotHook>>,
     /// Where CodingPlan usage windows come from, when this host has an account.
@@ -2220,6 +2237,7 @@ fn compose_hosted(
         registry.register(Arc::new(crate::host_rows::CapabilityCommandsPlugin(
             commands,
             working_dir.to_path_buf(),
+            host.background_waits,
         )));
     }
     if let Some(file) = host.config_file {
@@ -2676,12 +2694,12 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Skil
         // steering for one round, and a log full of nudges is a log nobody can
         // read. The loop's "model-visible content is logged" invariant is
         // checked on the assembled messages before the request is built, so a
-        // tail added here is outside it by construction.
-        req.messages
-            .push(atomcode_capabilities::reminder::synthetic_system_reminder(
-                crate::skill_first::SKILL_FIRST_BODY,
-            ));
-        next.run(req).await
+        // tail added here is outside it by construction. Taken off again after,
+        // so a request sent again carries it once.
+        let reminder = atomcode_capabilities::reminder::synthetic_system_reminder(
+            crate::skill_first::SKILL_FIRST_BODY,
+        );
+        atomcode_harness::tail::with_tail(req, vec![reminder], next).await
     }
 }
 

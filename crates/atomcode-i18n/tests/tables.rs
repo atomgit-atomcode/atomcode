@@ -79,7 +79,6 @@ fn no_english_arm_is_left_in_chinese() {
     // Names, not sentences: a person looking for the Chinese option is looking
     // for the word 中文, whatever language the rest of the screen is in.
     const NAMED_IN_THEIR_OWN_LANGUAGE: &[&str] = &[
-        "OnboardLanguageChinese",
         // The other front end's language picker, which spells each option in
         // its own language and glosses it: `简体中文 (Simplified Chinese)`.
         "OnboardingLanguageOptionZhCn",

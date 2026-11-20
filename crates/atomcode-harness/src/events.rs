@@ -48,6 +48,24 @@ pub struct ModelRequest {
     /// person sent. A recovery policy reads it to know that "no content" is an
     /// answer here — the model has nothing to add — and not a provider failing.
     pub answering_a_nudge: bool,
+    /// What may be done with this request's pictures — and, once it is sent,
+    /// what was. The loop applies it to the messages it actually sends, after
+    /// every row has had its say (a row may rebuild the request from the log),
+    /// so a picture is judged where it leaves this host.
+    pub images: ImageLimits,
+}
+
+/// The pictures a request may carry. `image-budget` sets the limits per
+/// attempt; the loop applies them to what it sends and fills in `sent`.
+#[derive(Clone, Debug, Default)]
+pub struct ImageLimits {
+    /// Encoded image bytes the request may carry; `None`: no limit.
+    pub max_bytes: Option<usize>,
+    /// Send no pictures at all: the provider refused this request's.
+    pub none: bool,
+    /// Pictures and encoded bytes the request was sent with.
+    pub sent: usize,
+    pub sent_bytes: usize,
 }
 
 /// Attempt-local evidence from the request/execution boundary, not inferred
@@ -59,6 +77,9 @@ pub enum ToolDispatchProof {
     /// No local call collected in this failed attempt reached ToolExec.
     NotDispatched,
 }
+
+/// A host-owned operation exhausted its total time budget.
+pub const HOST_DEADLINE_CODE: &str = "host_deadline";
 
 /// Why a model request failed, with the structure a recovery policy needs.
 ///
@@ -83,8 +104,10 @@ pub struct RequestError {
     /// The history no longer fits. Compacting and retrying is the only thing
     /// that helps, and retrying without compacting is guaranteed to fail again.
     pub context_overflow: bool,
-    /// The provider answered with no content and no tool calls. Distinct from
-    /// an error: nothing failed, the turn simply cannot proceed on it.
+    /// The provider answered with no content, no tool calls and no reasoning.
+    /// Distinct from an error: nothing failed, the turn simply cannot proceed
+    /// on it. A reasoning-only answer is not this; see
+    /// [`ModelResponse::ended_in_reasoning`].
     pub empty_response: bool,
     /// A rate-limit policy decided this 429 is a pause, not a failure: the turn
     /// ends cleanly as rate-limited and the person is told when it resets.
@@ -191,6 +214,12 @@ pub struct ModelResponse {
     /// anything still streaming when it was cut — a tool call's arguments in
     /// particular — is incomplete and unsafe to act on.
     pub truncated: bool,
+    /// The provider ended the response normally after reasoning alone: no
+    /// text, no tool call. Not empty — the reasoning is real and was paid for —
+    /// but the turn cannot advance on it, and replaying the same request only
+    /// reasons the same way again. Seen when an upstream gateway closes a long
+    /// request at its own wall-clock limit and reports a plain `stop`.
+    pub ended_in_reasoning: bool,
 }
 
 /// A round's tool calls, on their way to being scheduled.

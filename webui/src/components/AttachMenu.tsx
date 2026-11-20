@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useSkills, refreshSkills } from '../skills';
 import { useT } from '../settings';
+import { useComposerToolbarHold } from '../lib/composerFocus';
 
 interface AttachMenuProps {
 /** Insert text into the chat input at the cursor (used for `/<skill> `).
@@ -64,6 +65,7 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
   const rootRef = useRef<HTMLDivElement>(null);
   const patchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const toolbarHold = useComposerToolbarHold();
 
   // Close on outside click.
   useEffect(() => {
@@ -86,6 +88,9 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
     <div class="attach-menu" ref={rootRef}>
       <button
         class="attach-btn"
+        onPointerDown={toolbarHold.onPointerDown}
+        onPointerUp={toolbarHold.onPointerUp}
+        onPointerCancel={toolbarHold.onPointerCancel}
         onClick={() => setOpen((o) => !o)}
         title={t('attach.menu')}
         aria-label={t('attach.menu')}

@@ -113,6 +113,8 @@ pub struct HookConfig {
     pub plugin_root: Option<PathBuf>,
     /// Content authorized when this runtime loaded the plugin.
     pub plugin_content_hash: Option<String>,
+    /// A matching PreToolUse hook must explicitly allow the final tool input.
+    pub required_approval: bool,
 }
 
 impl HookConfig {
@@ -147,6 +149,7 @@ impl HookConfig {
             ),
             args: Vec::new(),
             plugin_root: Some(plugin_root),
+            required_approval: false,
         })
     }
 }
@@ -158,7 +161,7 @@ fn default_timeout_ms() -> u64 {
 // ───────────────────────────── config loading ─────────────────────────────
 
 /// On-disk `hooks.json` shape: `{ "hooks": { "<name>": { event, matcher?,
-/// command, timeout_ms?, disabled? } } }`. Mirrors the legacy core format so a
+/// command, timeout_ms?, disabled?, required_approval? } } }`. Mirrors the legacy core format so a
 /// user's existing file works unchanged.
 #[derive(Debug, Deserialize)]
 struct HooksFile {
@@ -176,6 +179,8 @@ struct HookEntry {
     timeout_ms: u64,
     #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    required_approval: bool,
 }
 
 /// What reading one hooks file came to — the answer `atomcode hooks list/paths` shows
@@ -243,6 +248,7 @@ fn read_hooks_file(path: &Path) -> (Vec<HookConfig>, HooksFileStatus) {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: entry.required_approval && event == HookEvent::PreToolUse,
         });
     }
     let status = HooksFileStatus::Loaded {
@@ -320,14 +326,22 @@ pub fn load_hooks_config(project_dir: &Path, user_dir: &Path) -> Vec<HookConfig>
 /// zero-dependency and backward compatible with the legacy trailing-`*` form
 /// (`edit_*` still matches `edit_file`). Full regex (`.`, `[...]`, `()`) is NOT
 /// supported — such a matcher is treated literally and simply won't match.
-fn matches_tool(matcher: &Option<String>, tool_name: &str) -> bool {
-    let Some(pat) = matcher.as_deref() else {
+fn matches_all_tools(matcher: Option<&str>) -> bool {
+    let Some(pat) = matcher else {
         return true;
     };
-    if pat.is_empty() || pat == "*" {
-        return true;
-    }
-    pat.split('|').any(|alt| glob_match(alt.trim(), tool_name))
+    pat.is_empty()
+        || pat.split('|').any(|alt| {
+            let alt = alt.trim();
+            !alt.is_empty() && alt.bytes().all(|byte| byte == b'*')
+        })
+}
+
+fn matches_tool(matcher: &Option<String>, tool_name: &str) -> bool {
+    matches_all_tools(matcher.as_deref())
+        || matcher
+            .as_deref()
+            .is_some_and(|pat| pat.split('|').any(|alt| glob_match(alt.trim(), tool_name)))
 }
 
 /// Glob match where `*` matches any run (including empty) and every other byte is
@@ -628,6 +642,7 @@ pub(crate) fn validate_plugin_hook(
         args: hook.args.clone(),
         plugin_root: Some(hook.plugin_root.clone()),
         plugin_content_hash: None,
+        required_approval: false,
     };
     plugin_hook_command(&config).map(|_| ())
 }
@@ -963,6 +978,33 @@ impl CCExternalHooks {
         Self::new(hooks, project_dir.to_string_lossy().into_owned())
     }
 
+    /// Validate and mount the same user-hook snapshot. Project and plugin
+    /// hooks are loaded only after a user hook satisfies the requirement.
+    pub fn load_with_required_approval(
+        project_dir: &Path,
+        user_dir: &Path,
+        extra: Vec<HookConfig>,
+    ) -> std::io::Result<Self> {
+        let path = global_hooks_path(user_dir);
+        let (mut hooks, status) = read_hooks_file(&path);
+        if !hooks.iter().any(|hook| {
+            hook.event == HookEvent::PreToolUse
+                && hook.required_approval
+                && matches_all_tools(hook.matcher.as_deref())
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "--require-approval-hook requires an enabled catch-all PreToolUse hook with required_approval in {} ({status:?})",
+                    path.display()
+                ),
+            ));
+        }
+        hooks.extend(load_hooks_file(&project_hooks_path(project_dir)));
+        hooks.extend(extra);
+        Ok(Self::new(hooks, project_dir.to_string_lossy().into_owned()))
+    }
+
     /// Stamp the CC `session_id` sent in every payload (the agent's persistent session
     /// id). Builder-style so callers can chain off [`load`]; leave unset for one-shot
     /// runs (the payload then carries an empty `session_id`, as before).
@@ -1252,13 +1294,12 @@ impl ToolMiddleware for CCExternalHooks {
 /// the CC exit-code contract — is the same judgement either way, so it is
 /// written once and the two assemblies differ in one line.
 impl CCExternalHooks {
-    /// The PreToolUse fold, with an `ask` left UNRESOLVED for the caller.
-    pub async fn pre_tool_gate(&self, call: &mut ToolCall) -> BeforeOutcome {
+    fn pre_tool_payload(&self, call: &ToolCall) -> String {
         // PreToolUse stdin: tool_input is the PARSED args object (CC sends an
         // object, not a string), falling back to the raw string if unparseable.
         let tool_input: Value = serde_json::from_str(&call.arguments)
             .unwrap_or_else(|_| Value::String(call.arguments.clone()));
-        let payload = serde_json::json!({
+        serde_json::json!({
             "session_id": self.session_id,
             "hook_event_name": HookEvent::PreToolUse.cc_name(),
             // The call's id, so a hook can correlate this PreToolUse with the
@@ -1271,15 +1312,23 @@ impl CCExternalHooks {
             "tool_input": tool_input,
             "cwd": self.cwd,
         })
-        .to_string();
+        .to_string()
+    }
 
+    /// The PreToolUse fold, with an `ask` left UNRESOLVED for the caller.
+    pub async fn pre_tool_gate(&self, call: &mut ToolCall) -> BeforeOutcome {
+        let payload = self.pre_tool_payload(call);
         // Fold across matching hooks: most-restrictive gate wins
         // (Deny > Ask > Allow > Proceed); the last `updatedInput` rewrite of `call.arguments`
         // wins. SEQUENTIAL (unlike the fire-and-forget session_* events) so the gate can
         // SHORT-CIRCUIT on the first Deny — a denied call must not keep spawning the
         // remaining hooks — and so the rewrite order is deterministic.
+        let matching = self.matching(HookEvent::PreToolUse, Some(&call.name));
         let mut gate = BeforeOutcome::Proceed;
-        for hook in self.matching(HookEvent::PreToolUse, Some(&call.name)) {
+        for hook in &matching {
+            if hook.required_approval {
+                continue;
+            }
             let Some((exit_code, stdout, stderr)) =
                 run_command_hook(hook, &self.cwd, &payload).await
             else {
@@ -1341,7 +1390,21 @@ impl CCExternalHooks {
             }
 
             if gate.is_deny() {
-                break; // deny is final.
+                return gate; // deny is final.
+            }
+        }
+        // Approval hooks see the final input after all ordinary rewrites.
+        // They cannot rewrite those arguments themselves.
+        if matching.iter().any(|hook| hook.required_approval) {
+            let payload = self.pre_tool_payload(call);
+            for hook in matching {
+                if hook.required_approval {
+                    let approval = required_pre_tool_approval(hook, &self.cwd, &payload).await;
+                    gate = stronger(gate, approval);
+                    if gate.is_deny() {
+                        break;
+                    }
+                }
             }
         }
         gate
@@ -1429,6 +1492,45 @@ impl CCExternalHooks {
     }
 }
 
+/// Required approvals accept only a successful, explicit allow. A child that
+/// prints allow and then fails cannot authorize a tool call.
+async fn required_pre_tool_approval(hook: &HookConfig, cwd: &str, payload: &str) -> BeforeOutcome {
+    let deny = |reason: &str| BeforeOutcome::Deny {
+        reason: reason.into(),
+    };
+    let Some((exit_code, stdout, _)) = run_command_hook(hook, cwd, payload).await else {
+        return deny("Required approval hook could not complete");
+    };
+    let Some(decision) =
+        last_json_line(&stdout).and_then(|value| serde_json::from_value::<Decision>(value).ok())
+    else {
+        return deny("Required approval hook did not return an explicit allow");
+    };
+    let specific = decision.hook_specific.as_ref();
+    let permission = specific.and_then(|value| value.permission_decision.as_deref());
+    let action = decision.action.as_deref();
+    if permission == Some("deny")
+        || action == Some("block")
+        || decision.decision.as_deref() == Some("block")
+    {
+        let reason = specific
+            .and_then(|value| value.permission_decision_reason.as_deref())
+            .or(decision.reason.as_deref())
+            .unwrap_or("Required approval hook denied the tool call");
+        return deny(reason);
+    }
+    if exit_code == Some(0)
+        && (permission == Some("allow") || (permission.is_none() && action == Some("allow")))
+        && action != Some("modify")
+        && specific
+            .and_then(|value| value.updated_input.as_ref())
+            .is_none()
+    {
+        return BeforeOutcome::Allow { reason: None };
+    }
+    deny("Required approval hook did not return a successful allow for the final tool input")
+}
+
 /// Most-restrictive-wins precedence for the PreToolUse gate fold:
 /// Deny > Ask > Allow > Proceed.
 fn stronger(a: BeforeOutcome, b: BeforeOutcome) -> BeforeOutcome {
@@ -1451,6 +1553,103 @@ fn stronger(a: BeforeOutcome, b: BeforeOutcome) -> BeforeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn approval_hook(command: &str, required_approval: bool) -> HookConfig {
+        HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: command.into(),
+            args: Vec::new(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+            plugin_content_hash: None,
+            required_approval,
+        }
+    }
+
+    #[cfg(unix)]
+    fn approval_test_call() -> ToolCall {
+        ToolCall {
+            id: "approval-test".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"original"}"#.into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn required_approval_accepts_only_successful_explicit_allow() {
+        let cases = [
+            (r#"printf '%s' '{"action":"allow"}'"#, true),
+            (
+                r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#,
+                true,
+            ),
+            (r#"printf '%s' '{"action":"allow"}'; exit 1"#, false),
+            (r#"printf '%s' '{"action":"block"}'"#, false),
+            (
+                r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"ask"}}'"#,
+                false,
+            ),
+            (
+                r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{}}}'"#,
+                false,
+            ),
+            ("printf 'invalid response'", false),
+            ("exit 0", false),
+            ("exit 127", false),
+        ];
+        for (command, allowed) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let hooks_path = dir.path().join("hooks.json");
+            std::fs::write(
+                &hooks_path,
+                serde_json::json!({"hooks": {"managed-approval": {
+                    "event": "PreToolUse", "command": command, "required_approval": true
+                }}})
+                .to_string(),
+            )
+            .unwrap();
+            let cc = CCExternalHooks::new(load_hooks_file(&hooks_path), "/tmp");
+            let decision = cc.pre_tool_gate(&mut approval_test_call()).await;
+            assert_eq!(
+                matches!(decision, BeforeOutcome::Allow { .. }),
+                allowed,
+                "{command}"
+            );
+            assert_eq!(decision.is_deny(), !allowed, "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn required_approval_times_out_without_authorizing_call() {
+        let mut hook = approval_hook("exec sleep 60", true);
+        hook.timeout_ms = 10;
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        assert!(cc.pre_tool_gate(&mut approval_test_call()).await.is_deny());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn required_approval_sees_rewritten_input() {
+        let approval = approval_hook(
+            r#"if grep -q '"path":"rewritten"'; then printf '%s' '{"action":"allow"}'; fi"#,
+            true,
+        );
+        let rewrite = approval_hook(
+            r#"printf '%s' '{"action":"modify","args":{"path":"rewritten"}}'"#,
+            false,
+        );
+        let cc = CCExternalHooks::new(vec![approval, rewrite], "/tmp");
+        let mut call = approval_test_call();
+        assert!(matches!(
+            cc.pre_tool_gate(&mut call).await,
+            BeforeOutcome::Allow { .. }
+        ));
+        assert_eq!(call.arguments, r#"{"path":"rewritten"}"#);
+    }
 
     /// A hook that printed text instead of a decision used to be indistinguishable from
     /// one that printed nothing: both proceeded. They are different facts — only the
@@ -1621,6 +1820,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(
             vec![
@@ -1707,6 +1907,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         CCExternalHooks::new(vec![single], "/tmp")
             .with_transcript_path(transcript_s.clone())
@@ -1730,6 +1931,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         CCExternalHooks::new(vec![hook(&m_a_s), hook(&m_b_s)], "/tmp")
             .turn_complete(&convo, &StopReason::Stopped, &ctx)
@@ -2178,6 +2380,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2204,6 +2407,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let out = run_hook_for_test(
             &hook,
@@ -2234,6 +2438,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2267,6 +2472,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut text = "hello".to_string();
@@ -2284,6 +2490,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut text = "hi".to_string();
@@ -2313,6 +2520,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], dir.clone());
         let mut text = "hi".to_string();
@@ -2352,6 +2560,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(
             vec![
@@ -2382,6 +2591,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/nonexistent/atomcode-project-dir");
         let mut text = "hi".to_string();
@@ -2400,6 +2610,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut convo = Conversation::new();
@@ -2440,6 +2651,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2466,6 +2678,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2501,6 +2714,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
         std::env::set_var("LC_ALL", "C");
@@ -2670,6 +2884,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2729,6 +2944,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let fail_hook = HookConfig {
             event: HookEvent::PostToolUseFailure,
@@ -2738,6 +2954,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![ok_hook, fail_hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2795,6 +3012,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp").with_session_id("sess-xyz");
         let mut text = "hi".to_string();
@@ -2820,6 +3038,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut call = ToolCall {
@@ -2843,6 +3062,7 @@ mod tests {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         }
     }
 

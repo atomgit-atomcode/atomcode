@@ -60,6 +60,43 @@ fn action() -> Vec<StreamEvent> {
         StreamEvent::Done { truncated: false },
     ]
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_can_query_live_git_status_through_the_product_mount() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    repository(root.path());
+    let cfg = config(root.path(), home.path());
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "status".into(),
+                name: "git_status".into(),
+                arguments: "{}".into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        done(),
+    ]));
+    let mut mounted = support::mount(&cfg, support::quiet_options(), provider).await;
+    // Create the file after mounting so the startup snapshot cannot supply it.
+    std::fs::write(root.path().join("fresh.txt"), "new").unwrap();
+    let turn = support::turn(&mut mounted.handle, "check live status", None).await;
+    assert!(turn.error.is_none(), "{:?}", turn.error);
+    assert!(turn.asked.is_empty());
+    let result = turn
+        .tool_results
+        .iter()
+        .find(|r| r.call_id == "status")
+        .unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(value["untracked"], serde_json::json!(["fresh.txt"]));
+    assert!(value["head"].is_null());
+    assert!(value["ahead"].is_null());
+    assert!(value["behind"].is_null());
+    assert_eq!(value["truncated"], false);
+}
 struct Probe;
 #[async_trait]
 impl Tool for Probe {

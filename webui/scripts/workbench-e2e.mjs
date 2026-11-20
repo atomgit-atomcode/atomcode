@@ -151,6 +151,7 @@ try {
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1000 },
   });
+  await page.addInitScript(() => { localStorage.setItem("atomcode.lang", "en"); localStorage.setItem("atomcode.onboarding.done", "1"); });
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto(base + "/?session=" + a.id + "&token=" + token);
@@ -196,7 +197,7 @@ try {
   await writeFile(resolve(root, "refresh-added.txt"), "new file");
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await panel.locator(".workbench-tree").getByRole("button", { name: "refresh-added.txt", exact: false }).waitFor();
-  await page.evaluate(({session, path}) => window.dispatchEvent(new CustomEvent("workbench-open-file", {detail:{session,path}})), {session:a.id,path:resolve(root,"hello.ts")});
+  await panel.locator(".workbench-tree").getByRole("button", {name:"hello.ts", exact:false}).click();
   await until(async () => (await panel.locator(".workbench-preview").textContent()).includes("answer = 42"));
   await page.screenshot({ path: resolve(temp, "files.png"), fullPage: true });
   await panel.locator("nav").getByRole("button", {name:"Start", exact:true}).click();
@@ -280,6 +281,7 @@ try {
   await page.screenshot({ path: resolve(temp, "desktop.png"), fullPage: true });
   await page.goto(base + "/?session=" + b.id + "&token=" + token);
   await page.locator(".workbench-toggle").click();
+  await panel.locator("nav").getByRole("button", {name:"Files", exact:true}).click();
   assert.equal(await page.locator(".workbench-tabs").textContent(), "");
   await page
     .locator(".workbench-tree")
@@ -345,8 +347,8 @@ try {
     .locator(".workbench-tree")
     .getByRole("button", { name: "hello.ts", exact: false })
     .click();
-  await panel.locator(".workbench-file-mode button").nth(1).click();
-  const editor = panel.getByRole("textbox", { name: "文件编辑器" });
+  await panel.locator(".workbench-file-mode").getByRole("button", {name:"Edit", exact:true}).click();
+  const editor = panel.getByRole("textbox", { name: "File editor" });
   await editor.waitFor();
   await editor.fill("export const answer = 43;\n");
   assert.equal(
@@ -402,7 +404,7 @@ try {
   await until(async () =>
     (
       await panel.locator('.workbench-editor [role="alert"]').textContent()
-    ).includes("外部修改"),
+    ).includes("changed externally"),
   );
   assert.equal(
     await readFile(resolve(root, "hello.ts"), "utf8"),
@@ -411,7 +413,7 @@ try {
   assert.equal(await editor.inputValue(), "unsaved conflict draft\n");
   page.once("dialog", (dialog) => dialog.dismiss());
   await panel
-    .getByRole("button", { name: "关闭 hello.ts", exact: true })
+    .getByRole("button", { name: "Close hello.ts", exact: true })
     .click();
   assert.equal(await editor.isVisible(), true);
   let releaseReload;
@@ -424,7 +426,7 @@ try {
   page.once("dialog", (dialog) => dialog.accept());
   await panel
     .locator(".workbench-editor-actions")
-    .getByRole("button", { name: "重新载入", exact: true })
+    .getByRole("button", { name: "Reload", exact: true })
     .click();
   await until(() => editor.evaluate(el => el.readOnly));
   await editor.focus();
@@ -483,7 +485,7 @@ try {
     .locator(".workbench-tree")
     .getByRole("button", { name: "windows.txt", exact: false })
     .click();
-  await panel.locator(".workbench-file-mode button").nth(1).click();
+  await panel.locator(".workbench-file-mode").getByRole("button", {name:"Edit", exact:true}).click();
   await editor.waitFor();
   await editor.fill("first\nsecond\nthird\n");
   await panel.locator(".workbench-save").click();
@@ -498,7 +500,7 @@ try {
     .locator(".workbench-tree")
     .getByRole("button", { name: "long.txt", exact: false })
     .click();
-  await panel.locator(".workbench-file-mode button").nth(1).click();
+  await panel.locator(".workbench-file-mode").getByRole("button", {name:"Edit", exact:true}).click();
   await editor.waitFor();
   await editor.evaluate((el) => {
     el.focus();

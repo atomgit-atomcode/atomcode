@@ -80,3 +80,4 @@ pub use store::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};
 pub mod provider_headers;
 
 pub mod mode_models;
+pub mod vision_preprocessor;

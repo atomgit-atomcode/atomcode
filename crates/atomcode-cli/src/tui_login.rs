@@ -1,9 +1,6 @@
 //! `/login` on the new screen: the same flow tuix's `/login` ran.
 //!
-//! Here and not in `atomcode-tui`, for the same reason `tui_onboarding` is
-//! (`docs/plans/2026-09-19-remaining-gaps.md` 决策 2): credentials, what a
-//! provider is, what counts as set up — none of that is the screen's. The
-//! screen only shows what this hands it.
+//! Credentials and provider configuration are launcher concerns.
 //!
 //! **No modal.** tuix's `/login` never took the screen over: the QR code, the
 //! URL, each step and the setup report went into scrollback through
@@ -31,7 +28,8 @@ use async_trait::async_trait;
 use atomcode_harness::seams::{UiSvc, UserInterface};
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::command::{Command, CommandSet, Outcome};
-use atomcode_tui::plugin::{AgentClientSvc, CommandsSvc, Repaint, RepaintSvc};
+use atomcode_tui::model_setup::{LoginAttempt, ModelSetup};
+use atomcode_tui::plugin::{AgentClientSvc, CommandsSvc, ModelSetupSvc, Repaint, RepaintSvc};
 use serde_json::Value;
 
 /// The row's name.
@@ -46,6 +44,7 @@ pub fn row_layer() -> String {
 
 /// Mounts the command.
 pub struct LoginRow {
+    pub model_setup: Arc<ModelSetup>,
     pub config_path: PathBuf,
     pub telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
 }
@@ -57,6 +56,9 @@ impl Plugin for LoginRow {
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tui-commands"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-model-setup"]
     }
     fn description(&self) -> &'static str {
         "signing in: OAuth when needed, and what the account is entitled to"
@@ -70,30 +72,42 @@ impl Plugin for LoginRow {
         let runtime_handle = tokio::runtime::Handle::current();
         let telemetry = self.telemetry.clone();
         let path = self.config_path.clone();
+        let model_setup = self.model_setup.clone();
+        let _ = ctx
+            .provide::<ModelSetupSvc>(model_setup.clone())
+            .map_err(|e| e.to_string())?;
         let set = Arc::new(LoginCommands {
             start: Arc::new(move |ui| {
-                let world = World::production(
-                    telemetry.clone(),
-                    path.clone(),
-                    client.clone(),
-                    runtime_handle.clone(),
-                    repaint.clone(),
-                    ui.clone(),
-                );
-                let painted = {
-                    let repaint = repaint.clone();
-                    move || {
+                let Some(flight) = model_setup.start_login() else {
+                    return false;
+                };
+                let telemetry = telemetry.clone();
+                let path = path.clone();
+                let client = client.clone();
+                let runtime_handle = runtime_handle.clone();
+                let repaint = repaint.clone();
+                // The worker owns this attempt across credential I/O, authorization,
+                // and the live reload. The UI keeps accepting keys in the meantime.
+                tokio::task::spawn_blocking(move || {
+                    let world = World::production(
+                        telemetry,
+                        path,
+                        client,
+                        runtime_handle,
+                        repaint.clone(),
+                        ui.clone(),
+                        flight.attempt.clone(),
+                    );
+                    let painted = || {
                         if let Some(repaint) = repaint.as_ref() {
                             repaint.now();
                         }
-                    }
-                };
-                // Off the loop, like every other host-reaching gesture a command
-                // makes: the loop must keep painting and keep accepting keys
-                // while a login is polled.
-                tokio::task::spawn_blocking(move || {
-                    run_login_flow_with(&world, &ui, &painted);
+                    };
+                    run_login_flow_with(&world, &ui, &painted, Some(&flight.attempt));
+                    drop(flight);
+                    painted();
                 });
+                true
             }),
         });
         commands.add(set)?;
@@ -102,8 +116,8 @@ impl Plugin for LoginRow {
 }
 
 /// What the command sets going — a seam, so a criterion hands over something
-/// that does not open a browser (the same shape [`crate::tui_onboarding`] uses).
-type StartFlow = Arc<dyn Fn(Arc<dyn UserInterface>) + Send + Sync>;
+/// that does not open a browser.
+type StartFlow = Arc<dyn Fn(Arc<dyn UserInterface>) -> bool + Send + Sync>;
 
 struct LoginCommands {
     start: StartFlow,
@@ -128,7 +142,9 @@ impl CommandSet for LoginCommands {
             Ok(ui) => ui,
             Err(error) => return Outcome::Refused(error.to_string()),
         };
-        (self.start)(ui);
+        if !(self.start)(ui) {
+            return Outcome::Refused(tr(SMsg::LoginAlreadyRunning).into_owned());
+        }
         // Nothing to say yet: the flow says it as it goes, into the
         // conversation. A command that answered here would be answering before
         // the thing it was asked for has happened.
@@ -237,15 +253,19 @@ trait Say: Send + Sync {
 }
 
 /// The screen's front end, seen as somewhere lines go.
-struct ScreenSay(Arc<dyn UserInterface>);
+struct ScreenSay<'a>(Arc<dyn UserInterface>, Option<&'a LoginAttempt>);
 
-impl Say for ScreenSay {
+impl Say for ScreenSay<'_> {
     fn say(&self, text: &str) {
-        self.0.say(text);
+        if !self.1.is_some_and(LoginAttempt::cancelled) {
+            self.0.say(text);
+        }
     }
 
     fn show_qr(&self, data: &str) {
-        self.0.show_qr(data);
+        if !self.1.is_some_and(LoginAttempt::cancelled) {
+            self.0.show_qr(data);
+        }
     }
 }
 
@@ -258,13 +278,17 @@ impl World {
         runtime_handle: tokio::runtime::Handle,
         repaint: Option<Arc<dyn Repaint>>,
         ui: Arc<dyn UserInterface>,
+        attempt: Arc<LoginAttempt>,
     ) -> Self {
         let load_path = config_path.clone();
         let load =
             Arc::new(move || atomcode_config::config::Config::load(&load_path).unwrap_or_default());
 
         let login_telemetry = telemetry.clone();
-        let login = Arc::new(move |say: &dyn Say| run_oauth(say, &login_telemetry));
+        let login_repaint = repaint.clone();
+        let login = Arc::new(move |say: &dyn Say| {
+            run_oauth(say, &login_telemetry, &attempt, login_repaint.as_deref())
+        });
 
         // codingplan's `Client` wraps `reqwest::blocking::Client`, which stands
         // up a tokio runtime of its own and panics when dropped on an async
@@ -321,13 +345,11 @@ impl World {
             let paused_at = rate_limited_turn(&client);
             let client = client.clone();
             let repaint = repaint.clone();
-            // The screen is where the words go, so the failure is reported
-            // through it — the same road the successful lines take. Nothing
-            // borrows across the spawn: the failure is said through the front
-            // end the closure already reaches, not through the caller's frame.
+            // Keep this attempt open until the live configuration has answered.
+            // The caller is on a blocking worker, so the TUI stays responsive.
             let _ = say;
             let screen = ui.clone();
-            runtime_handle.spawn(async move {
+            runtime_handle.block_on(async move {
                 match control
                     .call(atomcode_host_api::HostCommand::SignIn {
                         session: root.clone(),
@@ -380,13 +402,17 @@ impl World {
 ///
 /// This is what the criteria drive: with a recording world, "already signed in
 /// means no login prompt" is an assertion instead of a hope.
-fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn Fn()) {
+fn run_login_flow_with(
+    world: &World,
+    ui: &Arc<dyn UserInterface>,
+    painted: &dyn Fn(),
+    attempt: Option<&LoginAttempt>,
+) {
+    let sink = ScreenSay(ui.clone(), attempt);
     let say = |lines: String| {
-        ui.say(&lines);
+        sink.say(&lines);
         painted();
     };
-    // The world's own closures talk to a `Say`; the front end is what that is.
-    let sink = ScreenSay(ui.clone());
 
     // Phase 1: 未登录才走 OAuth。已登录的账号不动，Phase 2 会用它的 token 把
     // codingplan 配置刷新一遍 —— 再弹一次登录是要人重做已经做过的事。
@@ -399,6 +425,9 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
             }
         }
     } else {
+        if attempt.is_some_and(|attempt| !attempt.begin_completion()) {
+            return;
+        }
         say(tr(SMsg::AlreadySignedInRefreshing).into_owned());
     }
 
@@ -414,6 +443,9 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
     // Phase 3: auth_expired —— 本地 token 还没过期但服务端拒了（被吊销、
     // refresh 死了）。再走一次 OAuth，重跑 setup。只有一次，不循环。
     if report.auth_expired {
+        if let Some(attempt) = attempt {
+            attempt.wait_for_authorization();
+        }
         say(tr(SMsg::TokenRejectedSigningInAgain).into_owned());
         if let Err(error) = (world.login)(&sink) {
             say(error);
@@ -465,15 +497,35 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
 fn run_oauth(
     say: &dyn Say,
     telemetry: &Option<Arc<atomcode_telemetry::Telemetry>>,
+    attempt: &LoginAttempt,
+    repaint: Option<&dyn Repaint>,
 ) -> Result<(), String> {
+    let cancelled = || tr(SMsg::LoginCancelled).into_owned();
+    if attempt.cancelled() {
+        return Err(cancelled());
+    }
     let session = atomcode_auth::oauth::start_login().map_err(|error| {
         tr(SMsg::LoginCouldNotStart {
             error: &format!("{error:#}"),
         })
         .into_owned()
     })?;
-    show_login_chrome(say, session.url());
+    if attempt.cancelled() {
+        return Err(cancelled());
+    }
+    let in_setup = attempt.display_in_setup(session.url());
+    if in_setup {
+        if let Some(repaint) = repaint {
+            repaint.now();
+        }
+    } else {
+        show_login_chrome(say, session.url());
+        say.say(&tr(SMsg::LoginCancelKey));
+    }
 
+    if attempt.cancelled() {
+        return Err(cancelled());
+    }
     // 把页面直接送到人面前，省掉一次复制粘贴：走本机自己的 opener —— 鸿蒙 PC 上
     // 就是设备浏览器经 `aa`（见 capabilities::open_file）。best-effort：二维码和
     // URL 反正留在屏幕上，错过了没有损失；但错过要说出来，不然寂静会被读成
@@ -485,7 +537,10 @@ fn run_oauth(
 
     let ticks = session.spawn_poller(Duration::from_secs(2));
     loop {
-        match ticks.recv() {
+        if attempt.cancelled() {
+            return Err(cancelled());
+        }
+        match ticks.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(atomcode_auth::oauth::PollOutcome::Authorized)) => break,
             Ok(Ok(atomcode_auth::oauth::PollOutcome::Pending)) => continue,
             Ok(Err(error)) => {
@@ -494,8 +549,18 @@ fn run_oauth(
                 })
                 .into_owned())
             }
-            Err(_) => return Err(tr(SMsg::LoginNoAnswer).into_owned()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(tr(SMsg::LoginNoAnswer).into_owned());
+            }
         }
+    }
+    if !attempt.begin_completion() {
+        return Err(cancelled());
+    }
+    drop(ticks);
+    if let Some(repaint) = repaint {
+        repaint.now();
     }
 
     let auth = session
@@ -778,7 +843,7 @@ mod tests {
         let world = World2::new(false, false);
         let ui = sink();
 
-        run_login_flow_with(&world.world(), &ui, &|| {});
+        run_login_flow_with(&world.world(), &ui, &|| {}, None);
 
         assert_eq!(
             world.logins.load(Ordering::SeqCst),
@@ -794,7 +859,7 @@ mod tests {
         let world = World2::new(true, false);
         let ui = sink();
 
-        run_login_flow_with(&world.world(), &ui, &|| {});
+        run_login_flow_with(&world.world(), &ui, &|| {}, None);
 
         assert_eq!(
             world.logins.load(Ordering::SeqCst),
@@ -815,7 +880,7 @@ mod tests {
         let world = World2::new(true, true);
         let ui = sink();
 
-        run_login_flow_with(&world.world(), &ui, &|| {});
+        run_login_flow_with(&world.world(), &ui, &|| {}, None);
 
         assert_eq!(world.logins.load(Ordering::SeqCst), 1, "one re-login");
         assert_eq!(
@@ -843,7 +908,7 @@ mod tests {
 
         let world = World2::new(true, false);
         let recorder = Arc::new(Recording::default());
-        run_login_flow_with(&world.world(), &sink_with(recorder.clone()), &|| {});
+        run_login_flow_with(&world.world(), &sink_with(recorder.clone()), &|| {}, None);
 
         let said = recorder.all();
         assert!(
@@ -929,7 +994,7 @@ mod tests {
             inner_reload(say)
         });
 
-        run_login_flow_with(&w, &ui, &|| {});
+        run_login_flow_with(&w, &ui, &|| {}, None);
 
         assert_eq!(world.saves.load(Ordering::SeqCst), 1);
         assert_eq!(world.reloads.load(Ordering::SeqCst), 1);

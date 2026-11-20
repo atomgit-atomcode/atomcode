@@ -88,6 +88,32 @@ export function relayRequest(
   return ['/api' + input, { ...init, headers, credentials: 'omit', redirect: 'error' }];
 }
 
+/** Fetch did not receive an HTTP response from the WebUI transport endpoint.
+ * It says nothing about provider health or whether an accepted turn has stopped.
+ * Do not include the URL, credentials or raw browser error in this message.
+ */
+export class ApiTransportError extends Error {
+  readonly code = 'webui_transport_unreachable';
+  readonly endpoint: 'local' | 'relay';
+  constructor(endpoint: 'local' | 'relay') {
+    super(endpoint === 'local'
+      ? 'Cannot reach the AtomCode local service. Check the AtomCode process and service address, then refresh. / 无法访问 AtomCode 本地服务，请检查 AtomCode 进程和服务地址，恢复后刷新页面。'
+      : 'Cannot reach the WebUI relay. Check the relay connection and the AtomCode host, then reconnect. / 无法访问 WebUI 中继，请检查中继连接和 AtomCode 宿主，恢复后重新连接。');
+    this.name = 'ApiTransportError';
+    this.endpoint = endpoint;
+  }
+}
+
+/** The response arrived, but its body stopped arriving before the reader finished. */
+export class ApiStreamInterruptedError extends Error {
+  constructor() {
+    super(relayPage
+      ? 'The WebUI relay connection dropped while receiving a reply. Reconnect and refresh to check the turn. / 正在接收回复时，WebUI 中继连接中断。重新连接后刷新页面，查看当前回合状态。'
+      : 'The connection to the AtomCode service dropped while receiving a reply. Refresh after reconnecting to check the turn. / 正在接收回复时，与 AtomCode 服务的连接中断。连接恢复后刷新页面，查看当前回合状态。');
+    this.name = 'ApiStreamInterruptedError';
+  }
+}
+
 /** An unpaired relay page must ask for a fresh link instead of falling back
  * to endpoints on the relay server as though it were the local daemon. */
 export function createApiFetch(
@@ -95,13 +121,23 @@ export function createApiFetch(
   credentials: RelayCredentials | null,
   fetchFn: typeof fetch = (input, init) => fetch(input, init),
 ): typeof fetch {
-  return (input, init) => {
+  return async (input, init) => {
     if (remote && !credentials) return Promise.resolve(Response.json({
       error: 'Relay is not paired. Open a fresh pairing link or scan the QR code again. / 中继未配对，请重新打开配对链接或扫码。',
       code: 'relay_unpaired',
     }, { status: 401 }));
     const args = credentials ? relayRequest(credentials, input, init) : [input, init] as const;
-    return fetchFn(...args);
+    try {
+      return await fetchFn(...args);
+    } catch (error) {
+      // User cancellation is not an outage. HTTP failures remain Responses and
+      // keep their normal status-based handling; never relabel a provider error.
+      if (init?.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+      if (error instanceof TypeError || (error instanceof Error && error.name === 'NetworkError')) {
+        throw new ApiTransportError(remote || credentials !== null ? 'relay' : 'local');
+      }
+      throw error;
+    }
   };
 }
 

@@ -261,6 +261,7 @@ mod tests {
                 colors: crate::caps::Colors::Ansi16,
                 cell_background: true,
                 graphics: crate::caps::Graphics::None,
+                wrap_diff: true,
             },
         };
         let drawn = block

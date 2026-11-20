@@ -130,7 +130,7 @@ pub async fn execute_one(
                 let mut result = tool.execute(&call.arguments, &tool_ctx).await;
                 // Tools mint their own id-less results; pairing is the caller's.
                 result.call_id = call.id.clone();
-                if !result.is_error && result.images.is_empty() {
+                if !result.is_error {
                     *executed.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some((tool, call, working_dir));
                 }
@@ -138,13 +138,13 @@ pub async fn execute_one(
             }) as BoxFuture<'_, ToolResult>
         })
         .await;
-    if !result.is_error && result.images.is_empty() {
+    if !result.is_error {
         if let (Some(progress), Some(log), Some((tool, call, cwd))) = (
             recovery,
             session,
             proof.lock().unwrap_or_else(|e| e.into_inner()).take(),
         ) {
-            progress.record(&log, round, tool, call, cwd, result.clone());
+            progress.record(&log, round, tool, call, cwd, &result);
         }
     }
     result

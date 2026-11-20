@@ -378,6 +378,9 @@ mod protocol_tests {
                         Err(e) => panic!("{e}"),
                     }
                 };
+                // Accepted sockets inherit O_NONBLOCK on macOS; a read timeout
+                // alone does not restore blocking reads for this test server.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();

@@ -5,6 +5,26 @@ use axum::{response::IntoResponse, Json};
 
 use crate::{json_error, ConfigResponse, ProviderAccountInfo, ProviderInfo, ProviderPresetInfo};
 
+use atomcode_config::vision_preprocessor::{
+    select_vision_preprocessor, vision_preprocessor_status,
+};
+
+#[derive(serde::Deserialize)]
+pub(crate) struct VisionPreprocessorUpdate {
+    provider: String,
+}
+
+pub(crate) async fn set_vision_preprocessor(
+    Json(request): Json<VisionPreprocessorUpdate>,
+) -> axum::response::Response {
+    // Validate against the latest snapshot inside the same locked update as
+    // persistence. Other model/account edits must not be overwritten.
+    match update_config(|config| select_vision_preprocessor(config, &request.provider)) {
+        Ok(config) => Json(config_response(&config)).into_response(),
+        Err(error) => json_error(axum::http::StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+
 /// Load config from disk.
 pub(crate) fn load_config() -> Result<Config, String> {
     let path = Config::default_path();
@@ -62,6 +82,8 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         path: Config::default_path(),
         default_provider: default_selection,
         default_workdir: config.default_workdir.clone(),
+        vision_preprocessor_provider: config.vision_preprocessor_provider.clone(),
+        vision_preprocessor_status: vision_preprocessor_status(config),
         providers,
         provider_accounts: {
             let mut accounts: Vec<_> = config
@@ -98,7 +120,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                         label: atomcode_config::provider_book::account_label(config, &id),
                         preset_name: preset.display_name.to_string(),
                         custom: is_generic_protocol(preset.id),
-                        discoverable: crate::api_provider::discovery_protocol(wire).is_some(),
+                        discoverable: supports_model_listing(wire, base_url.as_deref()),
                         probeable: wire == "openai",
                         id: id.clone(),
                         header_names: account.headers.names(),
@@ -162,6 +184,12 @@ fn is_generic_protocol(id: &str) -> bool {
     GENERIC_PROTOCOLS.contains(&id)
 }
 
+fn supports_model_listing(wire: &str, base_url: Option<&str>) -> bool {
+    use atomcode_capabilities::provider::discovery::{catalog, discovery_protocol};
+    discovery_protocol(wire).is_some()
+        || base_url.is_some_and(|url| catalog::supports_lookup(url, wire))
+}
+
 fn preset_info(
     preset: &atomcode_config::config::provider_preset::ProviderPreset,
 ) -> ProviderPresetInfo {
@@ -178,8 +206,18 @@ fn preset_info(
             ModelSource::Manual => "manual",
         }
         .to_string(),
-        discoverable: crate::api_provider::discovery_protocol(preset.provider_type.wire())
-            .is_some(),
+        discoverable: supports_model_listing(preset.provider_type.wire(), preset.default_base_url),
+        connections: atomcode_config::config::provider_preset::connections(preset.id)
+            .iter()
+            .map(|choice| crate::ProviderConnectionInfo {
+                provider_type: choice.provider_type.wire().to_string(),
+                base_urls: choice
+                    .base_urls
+                    .iter()
+                    .map(|url| (*url).to_string())
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -298,8 +336,43 @@ pub(crate) async fn reload_config(
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_response_preserves_stale_vl_selection_and_reports_capability() {
+        use atomcode_config::vision_preprocessor::VisionPreprocessorStatus;
+        let mut config = Config::default();
+        config.vision_preprocessor_provider = Some("removed-vl".into());
+        let response = config_response(&config);
+        assert_eq!(
+            response.vision_preprocessor_provider.as_deref(),
+            Some("removed-vl")
+        );
+        assert_eq!(
+            response.vision_preprocessor_status,
+            VisionPreprocessorStatus::Unresolvable
+        );
+        let mut vl = provider("https://example.invalid");
+        vl.supports_vision = Some(true);
+        config.providers.insert("vl".into(), vl);
+        select_vision_preprocessor(&mut config, "vl").unwrap();
+        assert_eq!(
+            config_response(&config).vision_preprocessor_status,
+            VisionPreprocessorStatus::Resolved
+        );
+        config.providers.get_mut("vl").unwrap().supports_vision = Some(false);
+        assert_eq!(
+            config_response(&config).vision_preprocessor_status,
+            VisionPreprocessorStatus::Unsupported
+        );
+        select_vision_preprocessor(&mut config, "").unwrap();
+        assert_eq!(
+            config_response(&config).vision_preprocessor_status,
+            VisionPreprocessorStatus::Unconfigured
+        );
+    }
+
     fn provider(base_url: &str) -> ProviderConfig {
         ProviderConfig {
+            api_key_is_resolved: false,
             headers: Default::default(),
             provider_type: "openai".into(),
             api_key: None,
@@ -315,13 +388,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         }
     }
 

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.7</span>
+    <span class="dhdr-ver">v5.2.8</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -246,7 +246,7 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/webui stop</code></td><td>关闭 webui 服务</td></tr>
           <tr><td><code>/sync</code></td><td>把当前 TUI 接入正在运行的 webui 会话(需先 <code>/webui</code>)。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话</td></tr>
           <tr><td><code>/sync off</code></td><td>退出同步,回到独立会话</td></tr>
-          <tr><td><code>/app</code></td><td>把当前会话通过官方中继暴露给 <strong>手机 App</strong>:终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 <code>/webui</code> 同源共用同一段会话,双向实时同步;区别是 App 扫码配对，不打开浏览器)。需先 <code>/login</code> 登录</td></tr>
+          <tr><td><code>/app</code></td><td>把当前会话通过官方中继暴露给 <strong>手机 App</strong>:终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 <code>/webui</code> 同源共用同一段会话,双向实时同步;区别是 App 扫码配对，不打开浏览器)。支持在 App 内处理权限审批；连接恢复后会同步仍待处理的审批。App 断线不会自动取消电脑端任务。需先 <code>/login</code> 登录。中继连接与重试日志保存在产品目录的 <code>logs/app-relay-&lt;进程号&gt;.log</code>（默认 <code>~/.atomcode/logs/</code>）</td></tr>
           <tr><td><code>/app stop</code></td><td>停止 App 远程访问,断开中继并回到本地会话</td></tr>
         </tbody>
       </table>

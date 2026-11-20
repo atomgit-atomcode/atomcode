@@ -81,22 +81,35 @@ harness + tui 481 全绿,差分基线未动,clippy 干净。
 一条不借:按型号名选模型。它能这么做是因为型号表固定且自己控制;私有化部署的
 型号表每家不同,档的抽象更稳。
 
-## 补:wait 已于 2026-09-15 删除
+## 补:交互式 `wait` 已于 2026-09-15 删除
 
-`team` 的 `wait` 动作(lead 阻塞到成员空闲再取回最后一句)已移除,动作集现为
+`team` 的 `wait` 动作(lead 阻塞到成员空闲再取回最后一句)从交互式工具面移除,动作集现为
 delegate / tell / status / stop。理由:同步委派本就有 `task` 这一行——它一次把子
 agent 跑到终态并交回报告,且天然并行(一个回合里发几个就并行几个)。`team` 的定位
 是**异步、跨回合长驻**的成员,报告经 `tell_parent` 推回 lead(机制一/二),lead 不需
 要也不应该把回合堵在某个成员上。`wait` 把这条分工线糊掉了。
 
-另外它和工具的自我描述互相矛盾:描述写「delegate, then carry on or end your turn;
-you do not have to wait」,而 delegate 的返回值写「use `wait` to block on it」——
-返回值是刚落地到上下文里的最新文本,离决策点更近,实测 lead 会照后者做,于是连串
-wait 把回合锁死,用户在此期间无法插话。
+交互式工具描述与 delegate 回执都应说明报告会唤醒 lead,无需轮询；阻塞式 `wait` 会锁住
+用户当前回合,所以仅供确实需要同步结果的短任务,不应成为 team 的默认协作方式。
 
 闸门 `tests/team.rs` 随之改名 `status_tell_and_stop_are_the_leads_to_call`,原先用
 `wait` 做同步的三处断言改为测试自己的 `until_idle` + 读成员日志的 `last_said`;
 「不存在的成员」的 Refusal 文案断言从 `wait` 转发到 `tell`。harness 312 全绿。
+
+## 补:一次性 headless 运行的有界 `wait` (2026-11-16)
+
+交互式“不必等待”的结论不能直接套到 CLI `-p`。headless driver 在 lead 的首个
+`TurnFinished` 后关闭 runtime；此时让 lead 结束回合不会等待成员消息,可能使本次命令在
+成员完成前退出。coding host 通过 `TeamRowPatch.headless_wait` 只在无人值守装配中开放
+`team wait`。它阻塞当前工具调用,等待一个成员变为 idle,返回该成员最近的报告,并支持
+1–300 秒超时及 turn cancellation；交互式工具 schema 仍不包含 `wait`。headless delegate
+回执明确提示在结果必需时使用有界 `wait`；交互式回执则提示不要用 `status` 轮询。
+
+这不是把 team 改成同步调度：成员依旧由同一个 harness/runtime 生命周期驱动,成员消息仍
+写入 lead inbox；`wait` 只是 headless lead 在自己的回合内等待一个成员,并把成员日志中的
+最近报告作为工具结果返回。测试覆盖 headless 下等待并取回报告,以及交互式 schema 不暴露
+等待动作。若后续要让 `-p` 自动等待所有成员并处理层级委派,应单独设计 host drain 与
+lead 续跑语义,不能把当前单成员有界等待称为自动 drain。
 
 注意:`atomcode-coding/src/team/tool.rs` 里另有一个 `team` 工具(动作含
 delegate / wait / result,参数是 `run_id`),那是 coding 侧独立的一套,本次未动。

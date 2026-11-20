@@ -59,6 +59,7 @@ fn screen_catalogue() -> Vec<Command> {
         Command::said("team", t(Msg::CmdAboutTeam)),
         Command::said_taking("paste", t(Msg::CmdTakesPath), t(Msg::CmdAboutPaste)),
         Command::said("config", t(Msg::CmdAboutConfig)),
+        Command::said("theme", t(Msg::CmdAboutTheme)),
         Command::said("provider", t(Msg::CmdAboutProviderPanel)),
     ]
 }
@@ -176,6 +177,7 @@ impl CommandSet for ScreenCommands {
                 }
             },
             "config" => Outcome::Do(Action::ToggleSettings),
+            "theme" => Outcome::Do(Action::OpenSetting("ui.theme")),
             "provider" => Outcome::Do(Action::ToggleProviders),
             "keys" => {
                 let names = ctx
@@ -1848,6 +1850,17 @@ impl CommandSet for SessionCommands {
                                     turns: stored.turns,
                                     needs_newer_version: stored.needs_newer_version,
                                     scheduled: stored.scheduled,
+                                    held: stored.held.map(|held| match held {
+                                        atomcode_host_api::HeldActivity::Open => {
+                                            crate::resume::Held::Open
+                                        }
+                                        atomcode_host_api::HeldActivity::Running => {
+                                            crate::resume::Held::Running
+                                        }
+                                        atomcode_host_api::HeldActivity::Waiting => {
+                                            crate::resume::Held::Waiting
+                                        }
+                                    }),
                                 })
                                 .collect();
                             if sessions.is_empty() {
@@ -2111,6 +2124,18 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
+                // 换成了说哪个:网关给模型起了显示别名,提示就用别名 ——
+                // 和选择器、状态栏同一口径;没别名的仍是原来的名字。
+                let display = ctx
+                    .service::<crate::plugin::ProvidersSvc>()
+                    .and_then(|port| {
+                        let rows = port.rows();
+                        let row = rows
+                            .model(wanted)
+                            .or_else(|| rows.models().iter().find(|m| m.model == wanted));
+                        row.and_then(|row| row.localized_alias().map(str::to_string))
+                    })
+                    .unwrap_or_else(|| wanted.to_string());
                 let (model_line, note) = match control
                     .call(HostCommand::SwitchModel {
                         session: root,
@@ -2121,10 +2146,10 @@ impl CommandSet for SessionCommands {
                     // 宿主说换成了,但有话要说 —— 两句都要说:换确实成了,
                     // 而没存下来是重启之后才看得到的那一半。
                     Ok(HostReply::DoneWithNote { note }) => (
-                        format!("{}\n{note}", t(Msg::ModelSet { wanted })),
+                        format!("{}\n{note}", t(Msg::ModelSet { wanted: &display })),
                         Some(note),
                     ),
-                    Ok(_) => (t(Msg::ModelSet { wanted }).into_owned(), None),
+                    Ok(_) => (t(Msg::ModelSet { wanted: &display }).into_owned(), None),
                     Err(error) => return Outcome::Refused(refusal(error)),
                 };
                 // Keep the accepted exact choice available immediately for
@@ -4007,8 +4032,243 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
 // be a second answer to "what commands does a screen have", and the second
 // answer is the one that goes stale. See `crate::rows::SCREEN`.
 
+/// The `/import` command set: another agent's assets, and where each stands.
+pub struct ImportCommands;
+
+fn import_catalogue() -> Vec<Command> {
+    vec![Command::said("import", t(Msg::CmdAboutImport))]
+}
+
+/// `CommandSet` is an `#[async_trait]` trait (`command.rs:296`), so the impl
+/// needs the attribute too — without it the `async fn` in the trait does not
+/// match the desugared signature. `async_trait` is already imported in this
+/// file (`commands.rs:14`), so nothing else is needed.
+#[async_trait]
+impl CommandSet for ImportCommands {
+    fn id(&self) -> &'static str {
+        "cmd-import"
+    }
+    fn commands(&self) -> Vec<Command> {
+        import_catalogue()
+    }
+    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
+        let Some(port) = ctx.service::<crate::plugin::MigrationSvc>() else {
+            return Outcome::Refused(t(Msg::NoMigrationPort).into_owned());
+        };
+        let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+            return Outcome::Refused(t(Msg::NoHost).into_owned());
+        };
+        let project = match working_dir(client.control(), client.root()).await {
+            Ok(project) => project,
+            Err(reason) => return Outcome::Refused(reason),
+        };
+        let report = match port.report(std::path::Path::new(&project)).await {
+            Ok(report) => report,
+            Err(error) => return Outcome::Refused(error),
+        };
+
+        // **多源才问**（Codex 的做法，`codex-rs/tui/src/external_agent_config_
+        // migration/flow.rs:300`）：先检测**全部**来源，只把**检测到东西的**
+        // 来源放进选择屏；只有一个来源时**不打扰**用户，直接进面板。
+        //
+        // 问「你要导入 Claude Code 还是 Codex」而用户只装了一个，是白问一遍
+        // —— Codex 的 `detected_sources.len() == 1` 分支正是为此。
+        let found: Vec<_> = report
+            .sources
+            .iter()
+            .filter(|source| !source.assets.is_empty())
+            .collect();
+        let requested = args.trim();
+        if !requested.is_empty() {
+            return match found.iter().find(|source| source.source_id == requested) {
+                Some(source) => Outcome::Do(crate::keymap::Action::OpenSheet(
+                    crate::sheet::Sheet::list(import_list(source)),
+                )),
+                None => Outcome::Refused(t(Msg::MigrationSourceUnavailable).into_owned()),
+            };
+        }
+        if found.is_empty() {
+            // The **product** table: the CLI says the same sentence, and one
+            // thing must not be said two ways.
+            use crate::i18n::product::{t as pt, Msg as PMsg};
+            return Outcome::Said(pt(PMsg::MigrationReportEmpty).into_owned());
+        }
+        if found.len() > 1 {
+            let rows: Vec<crate::sheet::Row> = found
+                .iter()
+                .map(|source| {
+                    crate::sheet::Row::new(
+                        format!("/import {}", source.source_id),
+                        source.display_name.clone(),
+                    )
+                    .about(format!(
+                        "{} {}",
+                        source.assets.len(),
+                        t(Msg::MigrationAssetsCount)
+                    ))
+                })
+                .collect();
+            return Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+                crate::sheet::List::new("import-source", t(Msg::MigrationPickSource), rows),
+            )));
+        }
+
+        // One source: its assets are the list.
+        Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+            import_list(&found[0]),
+        )))
+    }
+}
+
+/// The assets of one source, as a list the person can walk.
+///
+/// **This is a bottom sheet (`crate::sheet`), not an overlay.** `overlay.rs`'s
+/// own module note says it: a modal is "a flow rather than a list", and a
+/// list to pick from is the bottom sheet, which rises from the foot of the
+/// screen like every other working panel instead of covering the
+/// conversation.
+///
+/// The sheet gives us, for free: a cursor (↑/↓/PgUp/PgDn/Home/End), a filter
+/// box, and — the reason we want a sheet rather than a text dump —
+/// **`Row::preview`**: the lines shown under the list when the cursor rests on
+/// a row (`sheet.rs:127`). So "expand one item to read what it says" is the
+/// existing shape, not something to invent.
+fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::List {
+    let mut rows: Vec<crate::sheet::Row> = Vec::new();
+    for asset in &source.assets {
+        let status = crate::migration::status_word(asset.status);
+        rows.push(
+            crate::sheet::Row::new("", asset.name.clone())
+                .about(format!("[{status}] {}", asset.detail))
+                // The preview is what the row's own sentence says, in full —
+                // the `about` is the short form.
+                .preview(vec![asset.detail.clone()]),
+        );
+    }
+    crate::sheet::List::new("import", t(Msg::MigrationReportTitle), rows)
+        .summary(vec![crate::sheet::Piece::new(
+            t(Msg::MigrationSummaryLine {
+                source: &source.display_name,
+                count: source.assets.len(),
+            }),
+            crate::sheet::Tone::Plain,
+        )])
+        .empty(t(Msg::MigrationNoAssets))
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn import_source_selection_uses_the_current_project() {
+        use crate::migration::{
+            AssetStatusView, Migration, MigrationAssetView, MigrationReportView,
+            MigrationSourceView,
+        };
+        #[derive(Default)]
+        struct Port(std::sync::Mutex<Vec<std::path::PathBuf>>);
+        #[async_trait]
+        impl Migration for Port {
+            async fn report(
+                &self,
+                project: &std::path::Path,
+            ) -> Result<MigrationReportView, String> {
+                self.0.lock().unwrap().push(project.to_owned());
+                Ok(MigrationReportView {
+                    sources: ["codex", "opencode"]
+                        .into_iter()
+                        .map(|id| MigrationSourceView {
+                            source_id: id.into(),
+                            display_name: id.into(),
+                            assets: vec![MigrationAssetView {
+                                name: format!("{id}-asset"),
+                                status: AssetStatusView::Actionable,
+                                detail: "details".into(),
+                            }],
+                        })
+                        .collect(),
+                })
+            }
+        }
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .extend(["/first", "/after-cd"].map(|dir| {
+                Ok(HostReply::Context {
+                    window: 0,
+                    used: 0,
+                    model: String::new(),
+                    working_dir: dir.into(),
+                    persona: None,
+                    system_prompt: None,
+                })
+            }));
+        let (app, _, commands) = following(&host);
+        let port = Arc::new(Port::default());
+        let _ = app
+            .context()
+            .provide::<crate::plugin::MigrationSvc>(port.clone());
+        let _ = commands.add(Arc::new(ImportCommands));
+
+        let picker = sheet_of(commands.dispatch("/import", &app.context()).await);
+        let crate::sheet::Page::List(list) = picker.page else {
+            panic!("expected source picker");
+        };
+        assert_eq!(list.rows.len(), 2);
+
+        let report = sheet_of(commands.dispatch(&list.rows[1].value, &app.context()).await);
+        let crate::sheet::Page::List(list) = report.page else {
+            panic!("expected asset list");
+        };
+        assert_eq!(list.id, "import");
+        assert_eq!(list.rows[0].label, "opencode-asset");
+        assert_eq!(
+            *port.0.lock().unwrap(),
+            ["/first", "/after-cd"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn the_import_list_carries_each_asset_of_the_source() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "claude-code".into(),
+            display_name: "Claude Code".into(),
+            assets: vec![crate::migration::MigrationAssetView {
+                name: "web-access".into(),
+                status: crate::migration::AssetStatusView::Active,
+                detail: "Read directly".into(),
+            }],
+        };
+        let list = super::import_list(&source);
+        let rows = list.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "web-access");
+        // The status word is part of what the row means.
+        // The status word comes from the message table, so the criterion
+        // compares against the table — not against a literal that would
+        // only hold in one locale.
+        let active = crate::migration::status_word(crate::migration::AssetStatusView::Active);
+        assert!(
+            rows[0].about.contains(&active),
+            "{:?} should mention {active:?}",
+            rows[0].about
+        );
+        // The preview is the row's own sentence, in full — that is what
+        // "expand one item to read it" shows.
+        assert_eq!(rows[0].preview, vec!["Read directly".to_string()]);
+    }
+
+    #[test]
+    fn an_import_list_with_no_assets_says_so() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "codex".into(),
+            display_name: "Codex".into(),
+            assets: vec![],
+        };
+        let list = super::import_list(&source);
+        assert!(!list.empty.trim().is_empty());
+    }
+
     use super::*;
     #[tokio::test]
     async fn spec_picker_reviews_original_text_before_offering_a_mutation() {
@@ -4981,12 +5241,18 @@ mod tests {
                     account: "a".into(),
                     model: id.into(),
                     window: 1000,
+                    max_tokens: None,
                     vision: None,
                     effort: None,
                     levels,
                     current: false,
                     managed: false,
+                    alias: None,
+                    desc: None,
+                    alias_en: None,
+                    desc_en: None,
                 };
+
                 crate::providers::ProvidersView::new(
                     Vec::new(),
                     vec![
@@ -5087,11 +5353,16 @@ mod tests {
                         account: "a".into(),
                         model: id.into(),
                         window: 1000,
+                        max_tokens: None,
                         vision: None,
                         effort,
                         levels,
                         current: false,
                         managed: false,
+                        alias: None,
+                        desc: None,
+                        alias_en: None,
+                        desc_en: None,
                     }
                 };
                 crate::providers::ProvidersView::new(
@@ -7925,6 +8196,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     })
                     .collect(),
             }));
@@ -7980,6 +8252,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     },
                     atomcode_host_api::StoredSession {
                         id: "two".into(),
@@ -7990,6 +8263,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     },
                 ],
             }));
@@ -8137,6 +8411,11 @@ mod tests {
             c.dispatch("/config", &app.context()).await,
             Outcome::Do(Action::ToggleSettings)
         );
+        assert_eq!(
+            c.dispatch("/theme", &app.context()).await,
+            Outcome::Do(Action::OpenSetting("ui.theme"))
+        );
+        assert!(c.all().iter().any(|command| command.name == "theme"));
         // And `/provider` is the other panel, on the same terms. It used to be a
         // picker over `HostCommand::Providers` that could only switch between
         // the legacy `[providers.*]` entries — which is why an account in the

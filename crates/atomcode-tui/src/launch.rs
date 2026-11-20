@@ -32,6 +32,7 @@ pub struct Screen {
     /// Take the pointer. Off leaves selection to the terminal.
     pub mouse: bool,
     pub scrollbar: String,
+    pub wrap_diff: bool,
 }
 
 impl Default for Screen {
@@ -42,6 +43,7 @@ impl Default for Screen {
             theme: None,
             mouse: true,
             scrollbar: "hidden".into(),
+            wrap_diff: true,
         }
     }
 }
@@ -114,8 +116,8 @@ pub fn tree(screen: &Screen, extra: &[&str]) -> Result<ConfigTree, String> {
         layers.push("[[patch]]\nid = \"tui-panel-mascot\"\ndisabled = false\n".to_string());
     }
     layers.push(format!(
-        "[[patch]]\nid = \"ui\"\nconfig = {{ scrollbar = {:?} }}\n",
-        screen.scrollbar
+        "[[patch]]\nid = \"ui\"\nconfig = {{ scrollbar = {:?}, wrap_diff = {} }}\n",
+        screen.scrollbar, screen.wrap_diff
     ));
     layers.extend(extra.iter().map(|layer| layer.to_string()));
     let layers = layers
@@ -134,6 +136,7 @@ pub fn tree(screen: &Screen, extra: &[&str]) -> Result<ConfigTree, String> {
 /// and the panel that wanted it says so rather than pretending.
 #[derive(Default, Clone)]
 pub struct Ports {
+    pub migration: Option<Arc<dyn crate::migration::Migration>>,
     /// The configuration, as this launcher reads and writes it.
     pub settings: Option<Arc<dyn crate::settings::Settings>>,
     /// The provider accounts and models, likewise.
@@ -209,6 +212,11 @@ pub async fn mount_with(
     if let Some(plugins) = ports.plugins {
         let _ = ctx
             .provide::<crate::plugin::PluginsSvc>(plugins)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(migration) = ports.migration {
+        let _ = ctx
+            .provide::<crate::plugin::MigrationSvc>(migration)
             .map_err(|e| e.to_string())?;
     }
     if let Some(setup) = ports.setup {

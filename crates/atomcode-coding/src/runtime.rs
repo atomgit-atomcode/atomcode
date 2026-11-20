@@ -1125,6 +1125,7 @@ impl Error for RuntimeError {}
 pub enum ProviderUnavailableReason {
     NotConfigured,
     AuthenticationRequired,
+    SignedOut,
     UnsupportedBuild,
 }
 
@@ -1132,6 +1133,7 @@ impl fmt::Display for ProviderUnavailableReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConfigured => f.write_str("no provider configured — run /login or /provider"),
+            Self::SignedOut => f.write_str("signed out — run /login or /provider"),
             Self::AuthenticationRequired => {
                 f.write_str("provider authentication required — run /login")
             }
@@ -1989,6 +1991,10 @@ pub async fn compact_snapshot(
             used_tokens,
             utilization,
             sacred_floor: floor,
+            // The daemon-side snapshot path has no conversation-bound tool
+            // registry here, so the fork's warm-prefix reuse stays
+            // engine-driven until the tools are threaded through this call.
+            parent: None,
         })
         .await;
     let mutation = snapshot_mutation(&conversation, &plan);
@@ -2433,6 +2439,18 @@ impl CodingRuntimeHandle {
         self.deliver(None, input, None).await
     }
 
+    /// Admit a prepared input only to the runtime generation it was prepared for.
+    /// Unlike `submit`, this must not sample the generation again after a driver
+    /// has awaited preprocessing: a session switch may have replaced the target.
+    pub async fn submit_at_generation(
+        &self,
+        generation: u64,
+        input: UserInput,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        self.deliver_at_generation(generation, None, input, None)
+            .await
+    }
+
     /// As [`Self::submit`], carrying the driver's own id for this message.
     ///
     /// The harness answers a claimed message under the id its command arrived
@@ -2462,13 +2480,29 @@ impl CodingRuntimeHandle {
         input: UserInput,
         extra_context: Option<String>,
     ) -> Result<SubmitReceipt, RuntimeError> {
-        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let state = self.state.load(Ordering::Acquire);
+        self.deliver_at_generation(
+            runtime_state_generation(state),
+            receipt,
+            input,
+            extra_context,
+        )
+        .await
+    }
+
+    async fn deliver_at_generation(
+        &self,
+        generation: u64,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+        input: UserInput,
+        extra_context: Option<String>,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
                 invocation: None,
-                generation: runtime_state_generation(state),
+                generation,
                 input,
                 receipt,
                 extra_context,
@@ -3669,6 +3703,9 @@ impl CodingRuntimeHandle {
             return Ok(exit);
         }
 
+        // Like cancel, shutdown must wake cancellable work being awaited inside
+        // the owner loop before its queued command can be read.
+        self.stop.lock().expect("stop poisoned").cancel();
         let state = self.state.load(Ordering::Acquire);
         let sent = self.tx.send(CodingRuntimeControl::Shutdown {
             generation: runtime_state_generation(state),
@@ -4516,6 +4553,7 @@ fn encode_provider_unavailable_reason(reason: Option<ProviderUnavailableReason>)
         Some(ProviderUnavailableReason::NotConfigured) => 1,
         Some(ProviderUnavailableReason::AuthenticationRequired) => 2,
         Some(ProviderUnavailableReason::UnsupportedBuild) => 3,
+        Some(ProviderUnavailableReason::SignedOut) => 4,
     }
 }
 
@@ -4524,6 +4562,7 @@ fn decode_provider_unavailable_reason(value: u8) -> Option<ProviderUnavailableRe
         1 => Some(ProviderUnavailableReason::NotConfigured),
         2 => Some(ProviderUnavailableReason::AuthenticationRequired),
         3 => Some(ProviderUnavailableReason::UnsupportedBuild),
+        4 => Some(ProviderUnavailableReason::SignedOut),
         _ => None,
     }
 }
@@ -4958,6 +4997,17 @@ fn spawn_runtime_owner_with_optional_agent(
                 }
             }
             background_jobs.retain_generation(generation);
+            // The same conditions the delivery below holds a completion back on.
+            background_jobs.publish(
+                resources
+                    .as_ref()
+                    .map(|runtime| &runtime.parts.background_waits),
+                resources
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.config.background_wakeups)
+                    && loop_state.is_none()
+                    && !goal.as_ref().is_some_and(|state| !state.active),
+            );
             if follow_up_epoch != generation {
                 follow_up_elapsed = std::time::Duration::ZERO;
                 follow_up_epoch = generation;
@@ -7419,7 +7469,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             let _ = crate::parts::wire_side_providers(&runtime.parts, &next, &candidate);
                             if let Some(snapshot) = runtime.parts.snapshot_hook() { snapshot.set_model_attribution(&next.provider_name, &next.model); }
-                            tell(runtime, crate::told::reconfigured(&runtime.config, &next));
+                            tell_reconfigured(
+                                runtime,
+                                &runtime.config,
+                                &next,
+                                observed_tokens.map(|t| t as u64),
+                                &runtime_event_tx,
+                            );
                             runtime.config = next;
                             // The live agent is unchanged and no turn is in flight.
                             // Mode changes retain its generation; only the provider seam is patched.
@@ -7859,6 +7915,8 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        // The installed hooks and their host requirement stay with these parts.
+                        next.require_approval_hook = runtime.config.require_approval_hook;
                         let routing = next
                             .subagent_config
                             .clone()
@@ -8020,7 +8078,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                         snapshot.set_model_attribution(&next.provider_name, &next.model);
                                     }
                                 }
-                                tell(&runtime, crate::told::reconfigured(&runtime.config, &next));
+                                tell_reconfigured(
+                                    &runtime,
+                                    &runtime.config,
+                                    &next,
+                                    observed_tokens.map(|t| t as u64),
+                                    &runtime_event_tx,
+                                );
                                 runtime.config = next;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = current_runtime_model(&runtime).unwrap_or_default();
@@ -8232,7 +8296,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate);
                                 // Before the pending prompt is replayed, so the
                                 // note precedes the first message on the new model.
-                                tell(&runtime, crate::told::reconfigured(&old_config, &runtime.config));
+                                tell_reconfigured(
+                                    &runtime,
+                                    &old_config,
+                                    &runtime.config,
+                                    observed_tokens.map(|t| t as u64),
+                                    &runtime_event_tx,
+                                );
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -8383,6 +8453,19 @@ fn spawn_runtime_owner_with_optional_agent(
                     }) => {
                         if request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        // AtomGit logout revokes the gateway login. An independently
+                        // authenticated endpoint keeps serving the current session.
+                        // Check the live configuration here, ordered with model switches.
+                        if reason == ProviderUnavailableReason::SignedOut
+                            && resources.as_ref().is_some_and(|runtime| {
+                                !atomcode_config::endpoints::is_codingplan_llm_gateway(
+                                    &runtime.config.base_url,
+                                )
+                            })
+                        {
+                            let _ = done.send(Ok(RuntimeGeneration(generation)));
                             continue;
                         }
                         if !agent_available && provider_unavailable_reason == Some(reason) {
@@ -9105,13 +9188,25 @@ fn spawn_runtime_owner_with_optional_agent(
                         controls
                             .provider_unavailable_reason
                             .store(0, Ordering::Release);
+                        // The last observed usage still describes this
+                        // conversation's size — the switch changes the window,
+                        // not the history — so take it before the reset and
+                        // let the switch hint compare it against the new
+                        // window.
+                        let switch_used = observed_tokens;
                         observed_tokens = None;
                         snapshot_in_flight = false;
                         compaction_suspended = false;
                         match reloaded_from {
                             Some(None) => tell(&runtime, Some(crate::told::reloaded())),
                             Some(Some(before)) => {
-                                tell(&runtime, crate::told::reconfigured(&before, &runtime.config))
+                                tell_reconfigured(
+                                    &runtime,
+                                    &before,
+                                    &runtime.config,
+                                    switch_used.map(|t| t as u64),
+                                    &runtime_event_tx,
+                                )
                             }
                             None => {}
                         }
@@ -10962,10 +11057,26 @@ fn spawn_runtime_owner_with_optional_agent(
                     if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
                         continue;
                     }
-                    let Some(text) = completion.notification() else { continue; };
-                    if loop_state.is_some() || goal.as_ref().is_some_and(|state| !state.active) {
-                        // A completion cannot shorten the person's /loop cadence
-                        // or re-engage a paused goal. Carry it with the next input.
+                    let goal_waiting = held_turn.is_some() && goal.as_ref().is_some_and(|state| state.active);
+                    // Completions that have also already happened travel in the same
+                    // notice: one turn for the batch, not one each. A job the model
+                    // stopped with bash_kill is left out — the kill's result already
+                    // told it to collect the output — unless a parked goal waits on it.
+                    let batch: Vec<_> = std::iter::once(completion)
+                        .chain(background_jobs.ready())
+                        .collect();
+                    let text = crate::background_jobs::completion_notice(&batch, goal_waiting);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let wakes = resources.as_ref().is_some_and(|runtime| runtime.config.background_wakeups);
+                    if loop_state.is_some()
+                        || goal.as_ref().is_some_and(|state| !state.active)
+                        || (!wakes && !goal_waiting)
+                    {
+                        // A completion cannot shorten the person's /loop cadence,
+                        // re-engage a paused goal, or open a turn a driver that does
+                        // not show it would never surface. Carry it with the next input.
                         pending_local_context.push(text);
                         continue;
                     }
@@ -11625,7 +11736,9 @@ fn resolve_reprepare_input(
                 None,
             )))
         }
-        ReprepareTarget::ReloadConfig(config) => {
+        ReprepareTarget::ReloadConfig(mut config) => {
+            // An in-process reload cannot relax requirements imposed by the host.
+            config.require_approval_hook |= runtime.config.require_approval_hook;
             if runtime.parts.session.is_some() && config.dirs != runtime.config.dirs {
                 return Err(RuntimeError::ReconfigureFailed(
                     "cannot change product data directories while keeping an active session; \
@@ -12194,6 +12307,7 @@ fn harness_host_state(
                 &config.model,
                 session_id,
                 Arc::clone(&position),
+                config.working_dir.clone(),
             )),
         );
         middleware.insert(
@@ -12305,6 +12419,12 @@ fn harness_host_state(
             .collect(),
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
+        // Only a driver that shows the turn a completion starts can tell the
+        // model to end its response and wait for it; elsewhere polling is how
+        // it waits.
+        background_waits: config
+            .background_wakeups
+            .then(|| parts.background_waits.clone()),
         tool_switches: Some(parts.tool_switches()),
         permission_settings: None,
         tool_catalog_slot: parts.tool_catalog_slot(),
@@ -12583,6 +12703,7 @@ struct TeamRowPatch<'a> {
     project_root: &'a std::path::Path,
     max_members: usize,
     max_rounds: u32,
+    headless_wait: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -12591,7 +12712,6 @@ struct AgentLoopOptionsPatch<'a> {
     undo_cancelled: bool,
     stream_idle_ms: u128,
     stream_first_content_ms: u128,
-    reasoning_timeout_ms: u128,
     /// Carried, not left to the row's default: this patch is the last word on
     /// `agent-loop` in this host, so omitting it would *be* the fuse value — the
     /// serde default in `harness/plugins/agent_loop.rs`. See
@@ -12689,6 +12809,7 @@ fn harness_option_rows(
                     project_root: wd,
                     max_members,
                     max_rounds,
+                    headless_wait: !config.is_attended(),
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -12702,7 +12823,6 @@ fn harness_option_rows(
             undo_cancelled: !config.keep_interrupted_context,
             stream_idle_ms: config.stream_timeout.as_millis(),
             stream_first_content_ms: config.first_token_timeout.as_millis(),
-            reasoning_timeout_ms: config.reasoning_timeout.as_millis(),
             max_rounds: crate::on_harness::RUNAWAY_FUSE_ROUNDS,
         },
     )
@@ -13089,6 +13209,21 @@ fn tell(runtime: &RuntimeResources, said: Option<String>) {
     };
     if let Some(agent) = live_root_agent(runtime) {
         agent.note(said, atomcode_harness::session::InjectionOrigin::Reminder);
+    }
+}
+
+/// Keep model-facing context and user-facing switch warnings on the same
+/// runtime-owned transition, while keeping their audiences explicit.
+fn tell_reconfigured(
+    runtime: &RuntimeResources,
+    from: &CodingAgentConfig,
+    to: &CodingAgentConfig,
+    used_tokens: Option<u64>,
+    runtime_event_tx: &RuntimeEventEmitter,
+) {
+    tell(runtime, crate::told::reconfigured(from, to, used_tokens));
+    if let Some(warning) = crate::told::context_window_warning(from, to, used_tokens) {
+        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
     }
 }
 
@@ -15364,6 +15499,7 @@ mod tests {
 
     fn tier_provider(model: &str, rank: i64) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            api_key_is_resolved: false,
             headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("key".into()),
@@ -15379,13 +15515,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: Some(rank),
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         }
     }
 
@@ -15866,6 +16006,29 @@ mod tests {
         controller_test_runtime_with_config(provider_factory, config).await
     }
 
+    thread_local! {
+        /// The parts' background-wait table of the runtime the helpers below
+        /// last started on this thread, read by what the hint would say.
+        static TEST_BACKGROUND_WAITS: std::cell::RefCell<Option<crate::background_jobs::BackgroundWaits>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A runtime whose driver shows the turn a background completion starts.
+    pub(super) async fn waking_test_runtime() -> (
+        CodingRuntimeHandle,
+        mpsc::UnboundedReceiver<AgentCommand>,
+        mpsc::UnboundedSender<AgentEvent>,
+        mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+        mpsc::UnboundedSender<WakeupRequest>,
+        Arc<std::sync::atomic::AtomicBool>,
+        KernelRuntimeAdapter,
+    ) {
+        let mut config = native_start(false).agent;
+        config.background_wakeups = true;
+        controller_test_runtime_with_config(Arc::new(GoalNotMetProviderFactory::default()), config)
+            .await
+    }
+
     pub(super) async fn controller_test_runtime_with_config(
         provider_factory: Arc<dyn CodingProviderFactory>,
         config: CodingAgentConfig,
@@ -15909,6 +16072,9 @@ mod tests {
                 .await
                 .unwrap();
         let loop_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        TEST_BACKGROUND_WAITS.with(|waits| {
+            *waits.borrow_mut() = Some(parts.background_waits.clone());
+        });
         let resources = RuntimeResources {
             config,
             prepare,
@@ -16504,6 +16670,41 @@ mod tests {
             Err(RuntimeError::DeliveryFailed)
         );
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prepared_submit_cannot_enter_a_replacement_session() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().into();
+        start.agent.dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".submit-test");
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let captured_generation = runtime.handle.status().generation;
+        let changed = runtime.handle.fresh_session().await.unwrap();
+        assert_ne!(changed.generation.0, captured_generation);
+        let before = runtime.handle.snapshot().await.unwrap();
+
+        assert_eq!(
+            runtime
+                .handle
+                .submit_at_generation(captured_generation, UserInput::from("belongs to A"))
+                .await,
+            Err(RuntimeError::Unavailable)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        assert_eq!(runtime.handle.snapshot().await.unwrap(), before);
+        runtime
+            .handle
+            .submit_at_generation(changed.generation.0, UserInput::from("belongs to B"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot.messages.iter().any(|m| m.text == "belongs to B"));
+        assert!(!snapshot.messages.iter().any(|m| m.text == "belongs to A"));
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -19644,6 +19845,66 @@ mod tests {
             "{terminals:?}"
         );
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_signals_stop_before_waiting_for_the_owner_terminal() {
+        let (handle, mut controls) = coding_runtime_control_channel();
+        let stop = handle.stop.lock().unwrap().clone();
+        let shutdown = handle.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(
+            stop.is_cancelled(),
+            "wake in-owner work before reading Shutdown"
+        );
+        assert!(matches!(
+            controls.rx.recv().await,
+            Some(CodingRuntimeControl::Shutdown { .. })
+        ));
+        assert!(!handle.is_stopped(), "a signal is not a cleanup terminal");
+        let exit = RuntimeExit {
+            reason: RuntimeExitReason::ShutdownRequested,
+            forced: false,
+        };
+        controls.terminal_tx.send_replace(Some(exit));
+        assert_eq!(shutdown.await.unwrap(), exit);
+        assert_eq!(handle.shutdown().await.unwrap(), exit);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_interrupts_an_in_owner_image_read_without_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let reading = Arc::new(testkit::ReadingThatNeverEnds::new());
+        let runtime = testkit::runtime_with_a_fake_agent(dir.path(), Some(reading.clone())).await;
+        let submit = runtime.handle.submit(UserInput {
+            text: "read picture".into(),
+            images: vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "x".into(),
+            }],
+        });
+        tokio::pin!(submit);
+        tokio::select! {
+            result = &mut submit => panic!("image read unexpectedly completed: {result:?}"),
+            () = async { while reading.entered() == 0 { tokio::task::yield_now().await; } } => {}
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runtime.handle.shutdown(),
+        )
+        .await
+        .expect("shutdown must interrupt the image read")
+        .unwrap();
+        assert!(runtime.handle.is_stopped());
+        assert!(
+            matches!(submit.await.unwrap(), SubmitReceipt::NotSent { .. }),
+            "the interrupted submit must report that it never reached the agent"
+        );
     }
 
     /// A picture being read is not a reason esc cannot be heard.
@@ -24851,7 +25112,7 @@ type = "openai"
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn background_completion_waits_for_the_current_turn_to_finish() {
         let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
-            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+            waking_test_runtime().await;
         let (call, result, finish) = crate::background_jobs::tests::job(true).await;
         events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
         events.send(AgentEvent::ToolStarted { call }).unwrap();
@@ -24888,11 +25149,132 @@ type = "openai"
         adapter.shutdown().await.unwrap();
     }
 
+    /// The hint reads the runtime's own decision, not a copy of its rules: a
+    /// job the runtime observes is published to the mounted assembly's table,
+    /// and a cancelled turn takes the claim back.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_jobs_a_completion_will_wake_for_reach_the_assembly() {
+        let (handle, _commands, events, mut runtime_events, _wake, _active, adapter) =
+            waking_test_runtime().await;
+        let waits = TEST_BACKGROUND_WAITS
+            .with(|waits| waits.borrow().clone())
+            .unwrap();
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        let id = crate::discipline::started_job(&result.content)
+            .unwrap()
+            .to_owned();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        // The table is written as the owner goes round again, which the next
+        // event of the turn makes it do.
+        let next = atomcode_kernel::tool::ToolCall {
+            id: "next".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        events.send(AgentEvent::ToolStarted { call: next }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolStarted { call })) if call.id == "next"
+        ) {}
+        assert!(waits.wakes_on(&id));
+        handle.cancel().await.unwrap();
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Cancelled,
+                provider_failure: None,
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !waits.wakes_on(&id),
+            "cancellation retires the notification"
+        );
+        finish.cancel();
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completions_that_already_happened_arrive_together_without_killed_jobs() {
+        use atomcode_kernel::tool::Tool;
+        let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            waking_test_runtime().await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        let mut jobs = Vec::new();
+        for name in ["first", "second", "stopped"] {
+            let (mut call, mut result, finish) = crate::background_jobs::tests::job(true).await;
+            call.id = name.into();
+            result.call_id = name.into();
+            let id = crate::discipline::started_job(&result.content)
+                .unwrap()
+                .to_owned();
+            events.send(AgentEvent::ToolStarted { call }).unwrap();
+            events.send(AgentEvent::ToolResult { result }).unwrap();
+            while !matches!(
+                runtime_events.recv().await,
+                Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+            ) {}
+            jobs.push((id, finish));
+        }
+        jobs[0].1.cancel();
+        jobs[1].1.cancel();
+        let ctx = atomcode_kernel::tool::ToolContext {
+            working_dir: "/tmp".into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: Default::default(),
+            requester: None,
+        };
+        let killed = atomcode_capabilities::tools::bash::BashKillTool
+            .execute(&serde_json::json!({"job_id": jobs[2].0}).to_string(), &ctx)
+            .await;
+        assert!(!killed.is_error);
+        // Every job has ended before the turn does.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        let Some(AgentCommand::SendSyntheticMessage { text }) = commands.recv().await else {
+            panic!("expected one completion notice");
+        };
+        for (id, _) in &jobs[..2] {
+            assert!(
+                text.contains(&format!("Background job {id} has finished")),
+                "{text}"
+            );
+        }
+        assert!(
+            !text.contains(&format!("Background job {} has", jobs[2].0)),
+            "a job the model stopped is not announced: {text}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err(),
+            "the batch is one wakeup and the stopped job adds none"
+        );
+        adapter.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_explicit_background_job_notifies_once_and_cancel_forgets_it() {
         for action in 0..4 {
             let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
-                controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+                waking_test_runtime().await;
             let (call, result, finish) = crate::background_jobs::tests::job(true).await;
             events.send(AgentEvent::ToolStarted { call }).unwrap();
             events.send(AgentEvent::ToolResult { result }).unwrap();
@@ -24953,11 +25335,13 @@ type = "openai"
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_goal_waits_for_explicit_background_completion_instead_of_spinning() {
-        goal_wait_case(false).await;
-        goal_wait_case(true).await;
+        goal_wait_case(false, false).await;
+        goal_wait_case(true, false).await;
+        // A job the model stopped is not announced, except to a goal parked on it.
+        goal_wait_case(false, true).await;
     }
 
-    async fn goal_wait_case(time_cap: bool) {
+    async fn goal_wait_case(time_cap: bool, kill: bool) {
         let mut config = native_start(false).agent;
         config.goal_max_duration_secs = if time_cap { 10 } else { 0 };
         let (handle, mut commands, events, mut runtime_events, _wake, _active, _adapter) =
@@ -24972,6 +25356,9 @@ type = "openai"
             Some(AgentCommand::SendMessage { .. })
         ));
         let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        let job = crate::discipline::started_job(&result.content)
+            .unwrap()
+            .to_owned();
         let snapshot = SessionSnapshot::new(vec![
             Message::user("finish bounded build"),
             Message::assistant("", vec![call.clone()]),
@@ -25019,7 +25406,21 @@ type = "openai"
                 }
             }
         }
-        finish.cancel();
+        if kill {
+            use atomcode_kernel::tool::Tool;
+            let ctx = atomcode_kernel::tool::ToolContext {
+                working_dir: "/tmp".into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: Default::default(),
+                requester: None,
+            };
+            let killed = atomcode_capabilities::tools::bash::BashKillTool
+                .execute(&serde_json::json!({"job_id": job}).to_string(), &ctx)
+                .await;
+            assert!(!killed.is_error);
+        } else {
+            finish.cancel();
+        }
         let next = tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv()).await;
         if time_cap {
             assert!(next.is_err(), "budget expiry must suppress late completion");
@@ -25028,6 +25429,50 @@ type = "openai"
                 matches!(next, Ok(Some(AgentCommand::SendSyntheticMessage { text })) if text.contains("Background job"))
             );
         }
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn without_wakeups_a_completion_rides_the_next_input() {
+        let (handle, mut commands, events, mut runtime_events, _wake, _active, _adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+        ) {}
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err(),
+            "a driver that would not show the turn gets none"
+        );
+        handle.submit(UserInput::from("next")).await.unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::SendMessage { text, .. })
+            if text.contains("Background job") && text.ends_with("next")),
+            "the notice rides the person's next input"
+        );
         handle.shutdown().await.unwrap();
     }
 

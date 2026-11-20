@@ -43,6 +43,12 @@ pub const MAX_TODO_SIDECAR_BYTES: usize = 256 * 1024;
 const MAX_TODO_SIDECAR_FILE_BYTES: usize = 2 * MAX_TODO_SIDECAR_BYTES + 64;
 const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
 const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
+/// How often [`SessionManager::acquire_lease`] retries contention before
+/// calling the session in use. A [`SessionManager::lease_is_held`] probe holds
+/// the lock for microseconds; a runtime holding the session holds it for
+/// minutes, so the retries only ever outlast the former.
+const LEASE_PROBE_RETRIES: u32 = 3;
+const LEASE_PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Serializable todo-list sidecar. Independent of the transcript so a compaction
 /// that drains old turns (including the early todowrite plan call) does not erase
@@ -2024,6 +2030,13 @@ impl SessionManager {
             // A stale or unsafe auxiliary checkpoint must not shadow committed
             // state on future resumes.
             self.clear_inflight_snapshot(lease.id());
+            // This can also be a stale checkpoint from a completed turn;
+            // its presence cannot prove a crash or loss of committed history.
+            notes.push(format!(
+                "a stale or unsafe checkpoint for session {} was not replayed; \
+                 the committed conversation was retained",
+                lease.id()
+            ));
             Ok((loaded, None))
         }
     }
@@ -2085,7 +2098,19 @@ impl SessionManager {
         // own `Rewound`, and `unanswered_prompt` hands back only a turn no
         // rewind follows, so this finds a later prompt still waiting — never
         // the withdrawn one.
+        // A stopped prompt is handed back below. When no prompt is waiting,
+        // the run may still have died mid-turn: the last `TurnStart` never
+        // followed by its `TurnEnd` is a process that stopped with rounds of
+        // activity unfinished. Say so on resume — silence reads the locked
+        // sending state as a provider outage.
         let Some((to, turn, prompt)) = super::events::unanswered_prompt(own_events) else {
+            if let Some(turn) = super::events::unterminated_turn(own_events) {
+                notes.push(format!(
+                    "the previous run of session {id} stopped mid-turn: turn {turn} never \
+                     recorded its end, so the conversation resumes with that turn left \
+                     unfinished"
+                ));
+            }
             return Ok((loaded, None));
         };
         // Loading does not retract: the prompt stays visible until the runtime is
@@ -2314,25 +2339,65 @@ impl SessionManager {
     }
 
     /// Try to become the sole active runtime for `id`. Contention is reported
-    /// immediately as [`SessionStoreError::SessionInUse`]; this never waits.
+    /// as [`SessionStoreError::SessionInUse`] without waiting for the holder;
+    /// only a [`lease_is_held`](Self::lease_is_held) probe, which holds the
+    /// lock for an instant, is waited out.
     pub fn acquire_lease(&self, id: &str) -> SessionResult<SessionLease> {
         validate_session_id(id)?;
         fs::create_dir_all(&self.root).map_err(|error| io_at(&self.root, error))?;
         let path = self.lease_path(id)?;
         reject_existing_non_regular(&path)?;
         let file = open_session_lock_file(id, &path)?;
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(SessionLease {
-                inner: Arc::new(SessionLeaseInner {
-                    id: id.to_string(),
-                    path,
-                    file,
-                }),
-            }),
-            Err(error) if is_file_lock_contention(&error) => Err(SessionStoreError::SessionInUse {
-                id: id.to_string(),
-                path,
-            }),
+        let mut probes_waited_out = 0;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {
+                    return Ok(SessionLease {
+                        inner: Arc::new(SessionLeaseInner {
+                            id: id.to_string(),
+                            path,
+                            file,
+                        }),
+                    })
+                }
+                Err(error)
+                    if is_file_lock_contention(&error)
+                        && probes_waited_out < LEASE_PROBE_RETRIES =>
+                {
+                    probes_waited_out += 1;
+                    std::thread::sleep(LEASE_PROBE_RETRY_DELAY);
+                }
+                Err(error) if is_file_lock_contention(&error) => {
+                    return Err(SessionStoreError::SessionInUse {
+                        id: id.to_string(),
+                        path,
+                    })
+                }
+                Err(error) => return Err(io_at(&path, error)),
+            }
+        }
+    }
+
+    /// Whether some runtime — in this process or another — holds `id`'s lease
+    /// right now, i.e. has the session open.
+    ///
+    /// Read-only: a session never leased has no lease file and none is created.
+    /// The probe takes a shared lock and drops it at once; an
+    /// [`acquire_lease`](Self::acquire_lease) racing it retries past that
+    /// instant instead of reporting the session in use.
+    pub fn lease_is_held(&self, id: &str) -> SessionResult<bool> {
+        let path = self.lease_path(id)?;
+        let file = match open_read_file(&path) {
+            Ok(file) => file,
+            Err(SessionStoreError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                Ok(false)
+            }
+            Err(error) if is_file_lock_contention(&error) => Ok(true),
             Err(error) => Err(io_at(&path, error)),
         }
     }
@@ -2957,6 +3022,19 @@ impl SessionManager {
         now_ms: i64,
     ) -> SessionResult<(LoadedSession, SessionLease)> {
         self.copy_native_session(source_id, destination_id, now_ms, false)
+    }
+
+    /// Explicitly branch the committed state of a session held elsewhere.
+    /// Unlike `branch_native_session`, this never modifies the source: its
+    /// runtime retains ownership. The destination is independent of automatic
+    /// busy-fork collapse and garbage collection.
+    pub fn branch_committed_session(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.copy_native_session(source_id, destination_id, now_ms, true)
     }
 
     /// Explicit user branch: retain provenance in the event header, but keep an
@@ -4132,6 +4210,13 @@ impl SessionManager {
         if let Ok(dir) = self.artifacts_dir(id) {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
         }
+        // Its Code Rewind store only served `/rewind` for this session; nothing
+        // else reads it. Best-effort, like the artifacts: the session is gone.
+        // Named by the leased id, never by what a file says its id is; a
+        // delegated session (`<lead>~<name>`) has no store of its own.
+        if let Some(rewind) = super::rewind_retention::rewind_root_for(&self.root) {
+            super::rewind_retention::remove_session_stores(&rewind, id);
+        }
         Ok(())
     }
 
@@ -4181,7 +4266,7 @@ impl SessionManager {
                 record.turn_id,
                 TurnTimestamp {
                     started_at: record.started_at,
-                    completed_at: record.ts,
+                    completed_at: Some(record.ts),
                 },
             );
             Ok(())
@@ -5230,7 +5315,10 @@ pub(super) fn serialize_pretty_bounded<T: Serialize>(
     Ok(bytes)
 }
 
-fn deserialize<T: for<'de> Deserialize<'de>>(bytes: &[u8], kind: &'static str) -> SessionResult<T> {
+pub(super) fn deserialize<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    kind: &'static str,
+) -> SessionResult<T> {
     serde_json::from_slice(bytes).map_err(|e| SessionStoreError::Corrupt {
         kind,
         message: e.to_string(),
@@ -6034,9 +6122,9 @@ mod tests {
         let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
         assert_eq!(timestamps.len(), 2);
         assert_eq!(timestamps[&7].started_at, Some(1_700_000_000_000));
-        assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
+        assert_eq!(timestamps[&7].completed_at, Some(1_700_000_000_123));
         assert_eq!(timestamps[&8].started_at, None);
-        assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
+        assert_eq!(timestamps[&8].completed_at, Some(1_700_000_001_123));
     }
 
     #[test]
@@ -6080,6 +6168,12 @@ mod tests {
         assert_eq!(records[0].user, "question 1");
         assert_eq!(records[0].assistant, "answer 1");
         assert_eq!(records[2].user, "question 3");
+
+        mgr.write_meta(&SessionMeta::new("s1", "/work", 1)).unwrap();
+        assert_eq!(
+            mgr.first_prompt_preview("s1").unwrap().as_deref(),
+            Some("question 1")
+        );
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {
@@ -9169,6 +9263,27 @@ mod tests {
         assert!(!art.exists(), "artifacts dir removed with the session");
     }
 
+    #[test]
+    fn delete_removes_the_sessions_rewind_store_in_any_bucket() {
+        let user = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(SessionManager::sessions_root(user.path()).join("cwd"));
+        mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
+        // A session started in a subdirectory keeps its store under the
+        // worktree root's bucket, not its own.
+        let store = |id: &str| {
+            let dir = user.path().join("rewind").join("worktree-root").join(id);
+            std::fs::create_dir_all(dir.join("objects")).unwrap();
+            std::fs::write(dir.join("atomcode-rewind-version"), "atomcode-rewind-v1").unwrap();
+            dir
+        };
+        let own = store("s1");
+        let other = store("s2");
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.delete(&lease).unwrap();
+        assert!(!own.exists(), "the deleted session's store goes with it");
+        assert!(other.exists(), "another session's store stays");
+    }
+
     #[cfg(unix)]
     #[test]
     fn active_lease_rejects_a_symlink_lock_file() {
@@ -9487,6 +9602,50 @@ mod tests {
             !mgr.has_inflight_snapshot(id),
             "unsafe checkpoints are cleared so they cannot shadow later resumes"
         );
+    }
+
+    #[test]
+    fn stale_or_unsafe_checkpoints_do_not_claim_a_mid_turn_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("checkpoint-note").unwrap();
+        let canonical = snap(&["committed"]);
+        let mut meta = SessionMeta::new(lease.id(), "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        for checkpoint in [
+            canonical.clone(),
+            SessionSnapshot::new(vec![
+                Message::user("committed"),
+                Message::assistant("uncommitted work", vec![]),
+            ]),
+        ] {
+            mgr.save_inflight_snapshot(lease.id(), &checkpoint, true)
+                .unwrap();
+            let mut notes = Vec::new();
+            let (loaded, pending) = mgr
+                .load_native_session_for_resume_noting(&lease, &mut notes)
+                .unwrap();
+            assert_eq!(loaded.snapshot, canonical);
+            assert!(pending.is_none());
+            assert!(!mgr.has_inflight_snapshot(lease.id()));
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].contains("was not replayed"));
+            assert!(!notes[0].contains("stopped mid-turn"));
+            let mut again = Vec::new();
+            mgr.load_native_session_for_resume_noting(&lease, &mut again)
+                .unwrap();
+            assert!(
+                again.is_empty(),
+                "do not repeat a cleared checkpoint notice"
+            );
+        }
     }
 
     #[test]

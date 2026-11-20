@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { ApprovalMode } from '../api';
 import { useT } from '../settings';
+import { useComposerToolbarHold } from '../lib/composerFocus';
 import { MsgKey } from '../i18n';
 import { ModeModelsDialog } from './ModeModelsDialog';
 
@@ -27,6 +28,7 @@ export function ModeSelector({
   const [open, setOpen] = useState(false);
   const [configuring, setConfiguring] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const toolbarHold = useComposerToolbarHold();
   useEffect(() => {
     if (!open) return;
     const h = (e: MouseEvent) => {
@@ -41,6 +43,10 @@ export function ModeSelector({
     <div class="model-selector model-selector-up mode-selector" ref={ref}>
       <button
         class={'model-selector-trigger mode-selector-trigger' + (isAuto ? ' mode-bypass' : '')}
+        // Keeps the mobile composer expanded while the trigger is pressed — see lib/composerFocus.
+        onPointerDown={toolbarHold.onPointerDown}
+        onPointerUp={toolbarHold.onPointerUp}
+        onPointerCancel={toolbarHold.onPointerCancel}
         onClick={() => {
           if (!disabled) setOpen((o) => !o);
         }}

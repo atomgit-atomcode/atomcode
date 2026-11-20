@@ -447,6 +447,7 @@ pub fn provision_with_listed(
             }
         })
         .or_insert_with(|| ProviderAccountConfig {
+            disable_api_key_fallback: false,
             headers: Default::default(),
             provider: OPENROUTER_ACCOUNT_ID.to_string(),
             display_name: None,
@@ -562,10 +563,14 @@ pub fn provision_with_listed(
                         reasoning_history: None,
                         reasoning_effort: None,
                         reasoning_effort_levels: None,
+                        alias: None,
+                        desc: None,
+                        alias_en: None,
+                        desc_en: None,
                         thinking_enabled: None,
                         thinking_budget: None,
                         retry_max_attempts: None,
-                        reasoning_timeout_secs: None,
+                        response_header_timeout_secs: None,
                         origin: Some(OPENROUTER_FREE_ORIGIN.to_string()),
                         rank,
                     },

@@ -192,6 +192,15 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
+        id: "kimi-code",
+        display_name: "Kimi Code",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.kimi.com/coding/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("KIMI_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
         id: "aliyun",
         display_name: "Alibaba Cloud Model Studio",
         provider_type: ProviderType::OpenAi,
@@ -201,12 +210,41 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
+        id: "aliyun-token-plan",
+        display_name: "Alibaba Cloud Token Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some(
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("ALIBABA_TOKEN_PLAN_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "aliyun-coding",
+        display_name: "Alibaba Cloud Coding Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://coding.dashscope.aliyuncs.com/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("ALIBABA_CODING_PLAN_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
         id: "xiaomi-mimo",
         display_name: "Xiaomi MiMo",
         provider_type: ProviderType::OpenAi,
         default_base_url: Some("https://api.xiaomimimo.com/v1"),
         auth_kind: AuthKind::ApiKey,
         api_key_env: Some("MIMO_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "xiaomi-token-plan",
+        display_name: "Xiaomi MiMo Token Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://token-plan-cn.xiaomimimo.com/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("MIMO_TOKEN_PLAN_API_KEY"),
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
@@ -236,6 +274,33 @@ pub const PRESETS: &[ProviderPreset] = &[
         default_base_url: Some("https://ark.cn-beijing.volces.com/api/coding/v3"),
         auth_kind: AuthKind::ApiKey,
         api_key_env: Some("ARK_CODING_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "tencent-tokenhub",
+        display_name: "Tencent TokenHub",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://tokenhub.tencentmaas.com/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("TENCENT_TOKENHUB_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "tencent-token-plan",
+        display_name: "Tencent Token Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://tokenhub.tencentmaas.com/plan/v3"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("TENCENT_TOKEN_PLAN_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "tencent-coding",
+        display_name: "Tencent Coding Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.lkeap.cloud.tencent.com/coding/v3"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("TENCENT_CODING_PLAN_API_KEY"),
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
@@ -317,10 +382,351 @@ pub fn preset_or_compatible(id: &str) -> &'static ProviderPreset {
     preset(id).unwrap_or(&OPENAI_COMPATIBLE)
 }
 
+/// Connection choices for a vendor. Matching indices in `base_urls` refer to
+/// the same service/plan; changing protocol must never switch billing routes.
+/// `preset_id` is an existing persisted protocol, not a new account format.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderConnection {
+    pub preset_id: &'static str,
+    pub provider_type: ProviderType,
+    pub base_urls: &'static [&'static str],
+}
+
+/// Only protocols and address pairs documented by the service are offered.
+/// Single-protocol vendors use their ordinary preset without extra controls.
+pub fn connections(id: &str) -> &'static [ProviderConnection] {
+    match id {
+        "taotoken" => &[
+            ProviderConnection {
+                preset_id: "taotoken",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &[
+                    "https://taotoken.net/api/v1",
+                    "https://api.taotoken.net/v1",
+                    "https://api.taotoken.net/coding/v1",
+                    "https://api.taotoken.net/token/v1",
+                ],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &[
+                    "https://taotoken.net/api",
+                    "https://api.taotoken.net",
+                    "https://api.taotoken.net/coding",
+                    "https://api.taotoken.net/token",
+                ],
+            },
+        ],
+        "aliyun" => &[
+            ProviderConnection {
+                preset_id: "aliyun",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &[
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                    "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+                    "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1",
+                ],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &[
+                    "https://dashscope.aliyuncs.com/apps/anthropic",
+                    "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+                    "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+                    "https://dashscope-us.aliyuncs.com/apps/anthropic",
+                    "https://cn-hongkong.dashscope.aliyuncs.com/apps/anthropic",
+                ],
+            },
+        ],
+        // https://docs.bigmodel.cn/cn/guide/develop/claude/introduction
+        "zhipu" => &[
+            ProviderConnection {
+                preset_id: "zhipu",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://open.bigmodel.cn/api/paas/v4"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://open.bigmodel.cn/api/anthropic"],
+            },
+        ],
+        // https://docs.bigmodel.cn/cn/coding-plan/tool/claude
+        "zhipu-coding" => &[
+            ProviderConnection {
+                preset_id: "zhipu-coding",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://open.bigmodel.cn/api/coding/paas/v4"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://open.bigmodel.cn/api/anthropic"],
+            },
+        ],
+        // https://github.com/MiniMax-AI/Mini-Agent/blob/main/mini_agent/config/config-example.yaml
+        "minimax" => &[
+            ProviderConnection {
+                preset_id: "minimax",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &[
+                    "https://api.minimaxi.com/v1",
+                    "https://api.minimax.cn/v1",
+                    "https://api.minimax.io/v1",
+                ],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &[
+                    "https://api.minimaxi.com/anthropic",
+                    "https://api.minimax.cn/anthropic",
+                    "https://api.minimax.io/anthropic",
+                ],
+            },
+        ],
+        // https://platform.minimax.cn/docs/m-plan/quickstart
+        "minimax-token-plan" => &[
+            ProviderConnection {
+                preset_id: "minimax-token-plan",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://api.minimax.cn/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://api.minimax.cn/anthropic"],
+            },
+        ],
+        // https://platform.kimi.com/docs/api/messages
+        "moonshot" => &[
+            ProviderConnection {
+                preset_id: "moonshot",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://api.moonshot.cn/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://api.moonshot.cn/anthropic"],
+            },
+        ],
+        // https://mimo.mi.com/docs/tokenplan/integration
+        "xiaomi-mimo" => &[
+            ProviderConnection {
+                preset_id: "xiaomi-mimo",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &[
+                    "https://api.xiaomimimo.com/v1",
+                    "https://token-plan-cn.xiaomimimo.com/v1",
+                ],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &[
+                    "https://api.xiaomimimo.com/anthropic",
+                    "https://token-plan-cn.xiaomimimo.com/anthropic",
+                ],
+            },
+        ],
+        // https://longcat.chat/platform/docs/APIDocs.html
+        "longcat" => &[
+            ProviderConnection {
+                preset_id: "longcat",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://api.longcat.chat/openai/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://api.longcat.chat/anthropic"],
+            },
+        ],
+        // https://docs.volcengine.com/docs/ark/messages-api
+        "volcengine" => &[
+            ProviderConnection {
+                preset_id: "volcengine",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://ark.cn-beijing.volces.com/api/v3"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://ark.cn-beijing.volces.com/api/compatible"],
+            },
+        ],
+        // https://console.volcengine.com/ark/region%3Acn-beijing/docs/coding-plan-personal-ai-claude-code
+        "volcengine-coding" => &[
+            ProviderConnection {
+                preset_id: "volcengine-coding",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://ark.cn-beijing.volces.com/api/coding/v3"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://ark.cn-beijing.volces.com/api/coding"],
+            },
+        ],
+        // https://docs.siliconflow.cn/docs/api/messages-post
+        "siliconflow" => &[
+            ProviderConnection {
+                preset_id: "siliconflow",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://api.siliconflow.cn/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://api.siliconflow.cn"],
+            },
+        ],
+        // https://openrouter.ai/docs/guides/coding-agents/claude-code-integration
+        "openrouter" => &[
+            ProviderConnection {
+                preset_id: "openrouter",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://openrouter.ai/api/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://openrouter.ai/api"],
+            },
+        ],
+        "aliyun-token-plan" => &[
+            ProviderConnection {
+                preset_id: "aliyun-token-plan",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"],
+            },
+        ],
+        "aliyun-coding" => &[
+            ProviderConnection {
+                preset_id: "aliyun-coding",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://coding.dashscope.aliyuncs.com/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://coding.dashscope.aliyuncs.com/apps/anthropic"],
+            },
+        ],
+        "xiaomi-token-plan" => &[
+            ProviderConnection {
+                preset_id: "xiaomi-token-plan",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://token-plan-cn.xiaomimimo.com/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://token-plan-cn.xiaomimimo.com/anthropic"],
+            },
+        ],
+        "kimi-code" => &[
+            ProviderConnection {
+                preset_id: "kimi-code",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://api.kimi.com/coding/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://api.kimi.com/coding"],
+            },
+        ],
+        // https://cloud.tencent.com/document/product/1823/135874
+        "tencent-tokenhub" => &[
+            ProviderConnection {
+                preset_id: "tencent-tokenhub",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://tokenhub.tencentmaas.com/v1"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://tokenhub.tencentmaas.com"],
+            },
+        ],
+        "tencent-token-plan" => &[
+            ProviderConnection {
+                preset_id: "tencent-token-plan",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://tokenhub.tencentmaas.com/plan/v3"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://tokenhub.tencentmaas.com/plan/anthropic"],
+            },
+        ],
+        "tencent-coding" => &[
+            ProviderConnection {
+                preset_id: "tencent-coding",
+                provider_type: ProviderType::OpenAi,
+                base_urls: &["https://api.lkeap.cloud.tencent.com/coding/v3"],
+            },
+            ProviderConnection {
+                preset_id: "anthropic-compatible",
+                provider_type: ProviderType::Anthropic,
+                base_urls: &["https://api.lkeap.cloud.tencent.com/coding/anthropic"],
+            },
+        ],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn vendor_connections_use_existing_protocols_and_pair_the_same_plans() {
+        for vendor in PRESETS
+            .iter()
+            .map(|preset| preset.id)
+            .filter(|id| !connections(id).is_empty())
+        {
+            let options = connections(vendor);
+            assert_eq!(options.len(), 2);
+            assert_eq!(
+                options[0].base_urls.first().copied(),
+                preset(vendor).unwrap().default_base_url
+            );
+            for option in options {
+                assert_eq!(
+                    preset(option.preset_id).unwrap().provider_type,
+                    option.provider_type
+                );
+                assert_eq!(option.base_urls.len(), options[0].base_urls.len());
+            }
+            for (openai, anthropic) in options[0].base_urls.iter().zip(options[1].base_urls) {
+                assert_eq!(openai.split('/').nth(2), anthropic.split('/').nth(2));
+                // Zhipu documents a shared Anthropic path: the key selects the plan.
+                for plan in ["/coding", "/token", "token-plan."] {
+                    if vendor == "zhipu-coding" && plan == "/coding" {
+                        continue;
+                    }
+                    assert_eq!(openai.contains(plan), anthropic.contains(plan));
+                }
+            }
+        }
+        assert!(connections("unknown").is_empty());
+        assert!(connections("anthropic").is_empty());
+    }
 
     /// The curated vendor set and 2 generic compatible presets must
     /// all be present and resolvable by id.
@@ -334,6 +740,13 @@ mod tests {
         for id in [
             "atomgit",
             "aliyun",
+            "aliyun-token-plan",
+            "aliyun-coding",
+            "xiaomi-token-plan",
+            "kimi-code",
+            "tencent-tokenhub",
+            "tencent-token-plan",
+            "tencent-coding",
             "volcengine",
             "xiaomi-mimo",
             "deepseek",
@@ -407,7 +820,28 @@ mod tests {
             Some("https://ark.cn-beijing.volces.com/api/coding/v3")
         );
         assert_ne!(ark.api_key_env, preset("volcengine").unwrap().api_key_env);
-        for subscription in [minimax, ark] {
+        let additions = [
+            "aliyun-token-plan",
+            "aliyun-coding",
+            "xiaomi-token-plan",
+            "kimi-code",
+            "tencent-token-plan",
+            "tencent-coding",
+            "tencent-tokenhub",
+        ]
+        .map(|id| preset(id).unwrap());
+        let mut keys = HashSet::new();
+        for account in additions {
+            assert_eq!(connections(account.id).len(), 2);
+            assert!(
+                keys.insert(account.api_key_env.unwrap()),
+                "distinct product credentials"
+            );
+            for ordinary in ["aliyun", "xiaomi-mimo", "moonshot"] {
+                assert_ne!(account.api_key_env, preset(ordinary).unwrap().api_key_env);
+            }
+        }
+        for subscription in [minimax, ark].into_iter().chain(additions) {
             assert_eq!(subscription.provider_type, ProviderType::OpenAi);
             assert!(
                 !crate::config::is_codingplan_provider_name(subscription.id),

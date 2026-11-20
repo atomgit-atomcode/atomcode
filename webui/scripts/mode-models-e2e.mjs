@@ -104,7 +104,9 @@ try{
   // Manual selection is a temporary override until the next real mode transition.
   await page.locator('.message-input').focus();
   await page.locator('.model-selector-trigger').filter({hasText:'deep-wire'}).click();
+  await page.locator('.model-effort-name').click();
   await page.locator('.model-item').filter({hasText:/^fast-wire$/}).click();
+  await page.locator('.model-effort-panel').waitFor();
   await page.waitForFunction(()=>[...document.querySelectorAll('.model-selector-trigger')].some(el=>el.textContent.includes('fast-wire')));
   // Same-mode selection does not reapply bindings or issue another request.
   const before=modeRequests;

@@ -1355,6 +1355,23 @@ pub struct StoredSession {
     /// A persistent conversation used by an automation task.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scheduled: bool,
+    /// What another runtime holding the session — a TUI in another terminal —
+    /// is doing with it. `None` when nobody holds it. Resuming one held
+    /// elsewhere opens a copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<HeldActivity>,
+}
+
+/// What the runtime holding a stored session is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldActivity {
+    /// Open, between turns.
+    Open,
+    /// A turn is under way.
+    Running,
+    /// A turn is waiting on a question to the person.
+    Waiting,
 }
 
 /// Something that happened on the host, whoever caused it.
@@ -1980,6 +1997,7 @@ mod tests {
                     turns: 3,
                     needs_newer_version: true,
                     scheduled: true,
+                    held: Some(HeldActivity::Running),
                 }],
             },
             HostReply::Undone {

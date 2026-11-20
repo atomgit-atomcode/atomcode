@@ -565,6 +565,7 @@ mod tests {
             turn: 1,
             round: 1,
             answering_a_nudge: false,
+            images: Default::default(),
         }
     }
     fn discovery() -> ToolDef {

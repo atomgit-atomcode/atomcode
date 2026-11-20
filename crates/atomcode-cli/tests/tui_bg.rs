@@ -654,14 +654,21 @@ async fn bg_drop_cancels_a_running_one() {
 /// A later change on the parent never silently raises a child's permissions.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[serial_test::serial(atomcode_home)]
-async fn background_tasks_snapshot_live_permissions_and_reviews_stay_read_only() {
+async fn background_tasks_and_reviews_snapshot_the_parents_live_mode() {
     use atomcode_host_api::Mode;
     for (mode, scope, expected) in [
         (Mode::Auto, None, Mode::Auto),
         (Mode::AcceptEdits, None, Mode::AcceptEdits),
         (Mode::Plan, None, Mode::Plan),
         (Mode::Ask, None, Mode::Ask),
-        (Mode::Auto, Some("working_tree".to_string()), Mode::Plan),
+        (Mode::Auto, Some("working_tree".to_string()), Mode::Auto),
+        (
+            Mode::AcceptEdits,
+            Some("staged".to_string()),
+            Mode::AcceptEdits,
+        ),
+        (Mode::Plan, Some("working_tree".to_string()), Mode::Plan),
+        (Mode::Ask, Some("working_tree".to_string()), Mode::Ask),
     ] {
         let rig = Rig::new().await;
         let parent = rig.client.root();
@@ -704,6 +711,132 @@ async fn background_tasks_snapshot_live_permissions_and_reviews_stay_read_only()
         ));
         rig.quit().await;
     }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn switching_background_sessions_restores_their_actual_mode_badges() {
+    use atomcode_host_api::Mode;
+    let rig = Rig::new().await;
+    rig.term.type_line("parent history");
+    rig.until_screen("answer 1").await;
+    rig.until("parent is idle", |rig| rig.client.root_settled())
+        .await;
+    let parent = rig.client.root();
+    let control = rig.control();
+    control
+        .call(HostCommand::SetMode {
+            session: parent.clone(),
+            mode: Mode::Auto,
+        })
+        .await
+        .unwrap();
+    let HostReply::Backgrounded { session: child, .. } = control
+        .call(HostCommand::StartBackground {
+            text: "slow job".into(),
+            scope: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("background task");
+    };
+    // The parent's later mode change does not change the child. Switching to
+    // either runtime must refresh the badge, even with no new ModeChanged event.
+    control
+        .call(HostCommand::SetMode {
+            session: parent.clone(),
+            mode: Mode::Plan,
+        })
+        .await
+        .unwrap();
+    let shows = |rig: &Rig, badge: &str| {
+        rig.term
+            .text()
+            .lines()
+            .any(|line| line.contains("scripted") && line.contains(badge))
+    };
+    rig.until("parent displays plan", |rig| shows(rig, "plan"))
+        .await;
+    control
+        .call(HostCommand::Foreground {
+            session: parent.clone(),
+            target: child.clone(),
+        })
+        .await
+        .unwrap();
+    rig.until("child displays its inherited auto mode", |rig| {
+        rig.client.root() == child && shows(rig, "auto")
+    })
+    .await;
+    control
+        .call(HostCommand::Foreground {
+            session: child,
+            target: parent.clone(),
+        })
+        .await
+        .unwrap();
+    rig.until("parent displays plan again", |rig| {
+        rig.client.root() == parent && shows(rig, "plan")
+    })
+    .await;
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn a_background_review_is_named_before_the_model_sees_its_assignment() {
+    let rig = Rig::new().await;
+    let HostReply::Backgrounded { session, .. } = rig
+        .control()
+        .call(HostCommand::StartBackground {
+            text: "slow review assignment".into(),
+            scope: Some("staged".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a background session");
+    };
+    let title = format!("code-review · {}", t(Msg::ReviewWhatStaged));
+    rig.until_background("review has its assigned title", |list| {
+        list.iter()
+            .any(|task| task.session == session && task.title.as_deref() == Some(&title))
+    })
+    .await;
+    rig.until("the review assignment reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let events = store.load_events(&session).unwrap();
+    let named = events
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event,
+                atomcode_kernel::session::SessionEvent::Titled { title: name, user_set: false, .. }
+                    if name == &title
+            )
+        })
+        .expect("the assigned title is persisted");
+    let prompted = events
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event,
+                atomcode_kernel::session::SessionEvent::UserMessage { .. }
+            )
+        })
+        .expect("the task was submitted");
+    assert!(
+        named < prompted,
+        "automatic naming must never race this assignment"
+    );
+    rig.quit().await;
 }
 
 /// **`/background <task>` runs a task without changing the foreground.** The
@@ -3340,4 +3473,82 @@ async fn a_browser_fork_keeps_the_terminal_host_in_sync_and_the_original_resumab
     );
     atomcode::tui_share::detach().unwrap();
     rig.quit().await;
+}
+
+/// Reproduce the publication window deterministically: a request has reached
+/// the host pump while the runtime phase still says Idle. Resubscription must
+/// replay it rather than consulting the lagging phase watch.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resubscribe_replays_a_request_before_the_phase_watch_catches_up() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let (_gate, open) = watch::channel(false);
+    let script = Script {
+        gate: open,
+        started: Arc::new(AtomicUsize::new(0)),
+        finished: Arc::new(AtomicUsize::new(0)),
+        count: Arc::new(AtomicUsize::new(0)),
+    };
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &script,
+        front_end.clone(),
+        &ReviewHome::new(),
+    );
+    let runtime = CodingRuntime::start(start).await.unwrap();
+    let handle = runtime.handle.clone();
+    let spawn: Spawn = Arc::new(|_| Box::pin(async { Err("unused spawn".into()) }));
+    let (mut connection, background) =
+        atomcode::background::connect(runtime, front_end.clone(), config, None, spawn).unwrap();
+    let request = AgentEvent::Request {
+        id: 812,
+        kind: "approval".into(),
+        payload: serde_json::json!({"prompt": "continue?"}),
+    };
+    front_end.events().send(request.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                connection.events.recv().await,
+                Some(AgentEvent::Request { id: 812, .. })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the pump observed and tracked the request");
+    assert_ne!(
+        handle.status().phase,
+        atomcode_coding::runtime::RuntimePhase::WaitingApproval
+    );
+    connection
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: connection.session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(AgentEvent::Request {
+                id: 812,
+                kind,
+                payload,
+            }) = connection.events.recv().await
+            {
+                assert_eq!(kind, "approval");
+                assert_eq!(payload, serde_json::json!({"prompt": "continue?"}));
+                break;
+            }
+        }
+    })
+    .await
+    .expect("resubscribe replays the request despite the lagging phase");
+    background.shutdown_all().await;
+    handle.shutdown().await.unwrap();
 }

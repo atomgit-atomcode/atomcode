@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::stream::TokenUsage;
-use crate::tool::ToolCall;
+use crate::tool::{ToolCall, ToolDef};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -405,6 +407,16 @@ impl Message {
     /// reporting provider records utilization 0.0 forever and never compacts).
     /// Mirrors the legacy estimate heuristic (see `atomcode-coding`'s telemetry copy).
     pub fn estimate_tokens(&self) -> u32 {
+        self.estimate_wire_tokens(true)
+    }
+
+    /// [`estimate_tokens`](Self::estimate_tokens) for an adapter that does or does
+    /// not send prior `reasoning` back ([`LlmProvider::replays_reasoning`]). Counting
+    /// thinking that never reaches the wire is the larger error of the two: a
+    /// thinking-heavy history carries more reasoning than everything else combined.
+    ///
+    /// [`LlmProvider::replays_reasoning`]: crate::provider::LlmProvider::replays_reasoning
+    pub fn estimate_wire_tokens(&self, replays_reasoning: bool) -> u32 {
         // Images dominate when present (vision ≈ 1600 tok each).
         if !self.images.is_empty() {
             return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
@@ -417,7 +429,12 @@ impl Message {
                 .iter()
                 .map(|tc| tc.name.len() + tc.arguments.len() + 20)
                 .sum();
-            self.text.len() + calls + self.reasoning.as_ref().map_or(0, |r| r.len())
+            let reasoning = self
+                .reasoning
+                .as_ref()
+                .filter(|_| replays_reasoning)
+                .map_or(0, |r| r.len());
+            self.text.len() + calls + reasoning
         } else {
             self.text.len()
         };
@@ -933,10 +950,32 @@ pub enum CompactTrigger {
     Overflow { attempt: u8 },
 }
 
+/// The advertised tool set a cache-safe compaction fork replays with the
+/// parent conversation's own messages: the summary request then shares the
+/// parent conversation's prefix from token 0, so the provider's warm prompt
+/// cache covers the history instead of billing it at the cold rate. The
+/// system prompt needs no separate capture — the replayed span carries it.
+#[derive(Clone, Debug)]
+pub struct ParentPromptContext {
+    pub tools: Arc<[ToolDef]>,
+    /// The host's exact previous request, when its projection differs from the strategy view.
+    pub replay: Option<ParentPromptReplay>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParentPromptReplay {
+    pub messages: Arc<Vec<Message>>,
+    pub system_messages: usize,
+    /// Strategy prefix lengths that are also a complete prefix of the sent history.
+    pub history: std::ops::RangeInclusive<usize>,
+    pub reasoning_effort: Option<crate::provider::ReasoningEffort>,
+}
+
 /// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
-/// history plus the pressure facts the kernel already records, and the
-/// kernel-computed `sacred_floor`. A strategy reads these to PLAN a drain; it can
-/// never mutate the conversation (the kernel is the sole writer via `apply_plan`).
+/// conversation messages, the trigger, the pressure facts the kernel already
+/// records, and the kernel-computed `sacred_floor`. A strategy reads these to
+/// PLAN a drain; it can never mutate the conversation (the kernel is the sole
+/// writer via `apply_plan`).
 pub struct CompactionView<'a> {
     pub messages: &'a [Message],
     pub trigger: CompactTrigger,
@@ -946,6 +985,12 @@ pub struct CompactionView<'a> {
     /// The number of leading messages the strategy must NOT propose draining (the
     /// kernel re-enforces this anyway by clamping in `apply_plan`).
     pub sacred_floor: usize,
+    /// The parent conversation's advertised tool set, when the engine can
+    /// supply it. `Some` lets the strategy fork the summary request onto the
+    /// parent's prefix — the span already carries the system prompt — so the
+    /// provider's warm cache covers the history; `None` falls back to the
+    /// rendered-transcript summarizer.
+    pub parent: Option<ParentPromptContext>,
 }
 
 /// Why a safe compaction could not provide the requested reduction. Display-only:
@@ -955,6 +1000,12 @@ pub struct CompactionView<'a> {
 pub enum CompactionDiagnostic {
     SummaryFailed,
     SummaryTimedOut,
+    SummaryContextExceeded,
+    SummaryIncomplete,
+    SummaryRequestFailed,
+    SummaryAuthenticationFailed,
+    SummaryRequestRejected,
+    SummaryRateLimited,
     NotSmaller,
 }
 
@@ -963,6 +1014,12 @@ impl CompactionDiagnostic {
         match self {
             Self::SummaryFailed => "summary_failed",
             Self::SummaryTimedOut => "summary_timed_out",
+            Self::SummaryContextExceeded => "summary_context_exceeded",
+            Self::SummaryIncomplete => "summary_incomplete",
+            Self::SummaryRequestFailed => "summary_request_failed",
+            Self::SummaryAuthenticationFailed => "summary_authentication_failed",
+            Self::SummaryRequestRejected => "summary_request_rejected",
+            Self::SummaryRateLimited => "summary_rate_limited",
             Self::NotSmaller => "not_smaller",
         }
     }
@@ -1137,6 +1194,28 @@ impl SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_the_adapter_drops_is_not_counted() {
+        let mut m = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "c".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        m.reasoning = Some("t".repeat(40_000));
+        let replayed = m.estimate_wire_tokens(true);
+        let dropped = m.estimate_wire_tokens(false);
+        assert!(replayed >= 10_000, "{replayed}");
+        assert!(dropped < 20, "{dropped}");
+        assert_eq!(
+            m.estimate_tokens(),
+            replayed,
+            "the plain estimate stays conservative"
+        );
+    }
 
     fn img(bytes: usize) -> ImageContent {
         ImageContent {
@@ -1981,6 +2060,7 @@ mod tests {
                 used_tokens: 0,
                 utilization: 0.0,
                 sacred_floor: floor,
+                parent: None,
             };
             let plan = SummarizeOldestStrategy { keep_recent }.plan(&view).await;
             c.apply_plan(plan, floor);
@@ -2244,6 +2324,7 @@ mod tests {
             used_tokens: 900,
             utilization: 0.9,
             sacred_floor: 2,
+            parent: None,
         };
         let plan = NoCompaction.plan(&view).await;
         assert!(plan.is_noop(), "NoCompaction must return a noop plan");

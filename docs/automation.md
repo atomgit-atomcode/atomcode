@@ -66,3 +66,12 @@ capabilities 只依赖注入的接口，coding runtime 继续拥有 agent 生命
 自动测试使用临时目录、注入的系统命令执行器和本地模拟接口，不注册真实系统任务。
 macOS launchd、Linux systemd 和 Windows Task Scheduler 的命令生成与失败语义均有
 测试；实际设备上的触发、休眠唤醒、系统账户权限仍需平台验收。
+
+## CLI 参数与通知
+
+- `--daily` / `--weekly` 使用共享的时间校验：小时为 0–23、分钟为 0–59；`9:00` 会规范化为 `09:00`。额外分隔符或空白会被拒绝。
+- 任意 cron 目前不受 OS 适配器支持。CLI 对旧 `--cron` 参数明确报错，不会保存为一个无法触发的任务。
+- `--mode` 仅接受 `plan`、`accept_edits`、`auto`；`--notify` 仅接受 `off`、`important`、`all`。
+- 完成通知：`off` 关闭该任务通知；`important` 沿用全局 `min_duration_secs` 门槛；`all` 将该门槛设为 0，每次完成都尝试通知。全局通知总开关、渠道及后台限制始终保留，因此 `all` 不会强行打开全局已关闭的通知。
+- 列表中的预计运行时间明确标为 UTC，`schedule zone` 单独说明调度所用时区。
+- `--request-id` 仅用于去重，不允许绕过任务禁用状态。记录运行失败时若账本也写入失败，两项错误都会报告，原始执行错误仍保留。

@@ -6,7 +6,7 @@ use crate::hook::{
 };
 use crate::message::{
     CompactTrigger, CompactionStrategy, CompactionView, Conversation, ImageContent, Message,
-    MessageMeta, NoCompaction, SessionSnapshot, SNAPSHOT_VERSION,
+    MessageMeta, NoCompaction, ParentPromptContext, SessionSnapshot, SNAPSHOT_VERSION,
 };
 use crate::middleware::{AfterOutcome, BeforeOutcome, ToolMiddleware};
 use crate::provider::{ChatOptions, LlmProvider};
@@ -587,12 +587,33 @@ fn empty_exhaustion_message(
 /// the model's usable limit.
 pub fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
     let output_reserve = max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    let margin = (window / 8).clamp(16_000, 128_000);
+    let margin = estimate_margin(window);
     let reserve = output_reserve.saturating_add(margin);
     // If the reserve can't fit inside the window (unrealistically small windows,
     // e.g. test fixtures), don't reserve — fall back to the raw window so the guard
     // keeps its old `est >= window` behavior. Real model windows (>= 128K) always
     // leave room, so this only affects tiny windows.
+    if reserve >= window {
+        window
+    } else {
+        window - reserve
+    }
+}
+
+/// What an estimate of a whole request may undercount by, for `window`.
+fn estimate_margin(window: u32) -> u32 {
+    (window / 8).clamp(16_000, 128_000)
+}
+
+/// [`effective_input_limit`] for a size the provider measured except for the
+/// last `unmeasured` tokens, estimated since: the completion is reserved, and
+/// the margin only up to what is estimated — the measured part has no estimate
+/// error to absorb, and keeping the whole margin for it puts the pre-send guard
+/// below the threshold compaction it is meant to back up.
+pub fn measured_input_limit(window: u32, max_tokens: Option<u32>, unmeasured: u64) -> u32 {
+    let output_reserve = max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let margin = estimate_margin(window).min(u32::try_from(unmeasured).unwrap_or(u32::MAX));
+    let reserve = output_reserve.saturating_add(margin);
     if reserve >= window {
         window
     } else {
@@ -1384,6 +1405,10 @@ impl RunningAgent {
             used_tokens,
             utilization,
             sacred_floor: floor,
+            parent: Some(ParentPromptContext {
+                tools: self.tools.snapshot().defs_arc(),
+                replay: None,
+            }),
         }));
         if attempted_stages[stage] {
             return;
@@ -1436,6 +1461,10 @@ impl RunningAgent {
                 used_tokens,
                 utilization,
                 sacred_floor: floor,
+                parent: Some(ParentPromptContext {
+                    tools: self.tools.snapshot().defs_arc(),
+                    replay: None,
+                }),
             };
             // Announce BEFORE the (possibly multi-second) LLM summary so a driver can
             // show a "compacting…" progress line — but ONLY if the strategy will
@@ -6359,7 +6388,25 @@ mod provider_message_pairing_tests {
 
 #[cfg(test)]
 mod effective_input_limit_tests {
-    use super::effective_input_limit;
+    use super::{effective_input_limit, measured_input_limit};
+
+    #[test]
+    fn a_measured_size_keeps_a_margin_only_for_what_was_estimated() {
+        // 1M window, 128K completion, nothing estimated: the completion alone.
+        assert_eq!(measured_input_limit(1_000_000, Some(128_000), 0), 872_000);
+        // 20K estimated since the measurement: 20K of the 125K margin.
+        assert_eq!(
+            measured_input_limit(1_000_000, Some(128_000), 20_000),
+            852_000
+        );
+        // A large estimated part takes no more than the whole margin.
+        assert_eq!(
+            measured_input_limit(1_000_000, Some(128_000), 900_000),
+            effective_input_limit(1_000_000, Some(128_000))
+        );
+        // A completion as large as the window reserves nothing, like the estimate.
+        assert_eq!(measured_input_limit(8_000, Some(16_384), 0), 8_000);
+    }
 
     #[test]
     fn reserves_output_plus_margin() {

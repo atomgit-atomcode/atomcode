@@ -308,11 +308,26 @@ fn session_line(
     } else {
         session.heading().to_string()
     };
-    let spans = vec![
+    let mut spans = vec![
         crate::frame::Span::styled(pointer, base),
         crate::frame::Span::styled(heading, heading_style),
-        crate::frame::Span::styled(format!("  {meta}"), base.under(theme::fg(Role::Muted))),
     ];
+    // 别处(另一个终端)拿着它:选中不是接回那边,而是 Fork 一份。
+    if let Some(held) = session.held {
+        let (label, role) = match held {
+            crate::resume::Held::Running => (t(Msg::ResumeHeldRunning), Role::Accent),
+            crate::resume::Held::Waiting => (t(Msg::ResumeHeldWaiting), Role::Accent),
+            crate::resume::Held::Open => (t(Msg::ResumeHeldOpen), Role::Muted),
+        };
+        spans.push(crate::frame::Span::styled(
+            format!("  {label}"),
+            base.under(theme::fg(role)),
+        ));
+    }
+    spans.push(crate::frame::Span::styled(
+        format!("  {meta}"),
+        base.under(theme::fg(Role::Muted)),
+    ));
     pad_to(Line::from_spans(spans).truncate(w), w, base)
 }
 
@@ -363,6 +378,7 @@ mod tests {
             turns: 3,
             needs_newer_version: false,
             scheduled: false,
+            held: None,
         }
     }
 
@@ -375,6 +391,33 @@ mod tests {
         assert!(rendered.contains("◷"), "{rendered}");
         assert!(rendered.contains("Check trending"), "{rendered}");
         assert_eq!(view.sessions()[0].id, "hourly");
+    }
+
+    /// 别的终端拿着的会话在列表里标出来:选中它是 Fork 一份,不是接回那边。
+    #[test]
+    fn a_session_held_elsewhere_is_marked_in_the_list() {
+        let mut running = session("busy", Some("跑着的那个"));
+        running.held = Some(crate::resume::Held::Running);
+        let mut open = session("idle", Some("开着没跑"));
+        open.held = Some(crate::resume::Held::Open);
+        let view = ResumeView::new(vec![running, open, session("free", Some("没人拿着"))]);
+        let shown = text_with(&view, &Panel::new(), None, 120);
+        let line = |title: &str| {
+            shown
+                .iter()
+                .find(|line| line.contains(title))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(
+            line("跑着的那个").contains(&*t(Msg::ResumeHeldRunning)),
+            "{shown:?}"
+        );
+        assert!(
+            line("开着没跑").contains(&*t(Msg::ResumeHeldOpen)),
+            "{shown:?}"
+        );
+        assert!(!line("没人拿着").contains('●'), "{shown:?}");
     }
 
     fn view() -> ResumeView {

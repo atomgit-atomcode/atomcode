@@ -15,6 +15,8 @@ use atomcode_kernel::agent::ToolLoopPolicy;
 /// stalled provider or silent driver can never park a turn forever.
 #[derive(Clone)]
 pub struct CodingAgentConfig {
+    /// Require a catch-all approval hook from the user configuration on every prepare.
+    pub require_approval_hook: bool,
     /// Host-injected persistent automation service; absent in generic library agents.
     pub automation: Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
     /// User-only follow-up dispatch/history port. Never exposed as a model tool.
@@ -93,12 +95,6 @@ pub struct CodingAgentConfig {
     /// inter-token budget. Once the first content arrives, `stream_timeout` takes over.
     /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
     pub first_token_timeout: Duration,
-    /// Continuous reasoning before any answer/tool output. Default 300s;
-    /// ATOMCODE_REASONING_TIMEOUT_SECS overrides it, 0 disables it. Prefill excluded.
-    pub reasoning_timeout: Duration,
-    /// Opt-in single lower-effort recovery cap; 0 disables automatic recovery.
-    /// ATOMCODE_REASONING_RECOVERY_TIMEOUT_SECS accepts 1..=3600 seconds.
-    pub reasoning_recovery_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -139,6 +135,12 @@ pub struct CodingAgentConfig {
     /// headless/daemon/ACP paths do not incur a hidden model request before they
     /// implement the corresponding UI. The interactive TUI opts in explicitly.
     pub next_prompt_suggestions: bool,
+    /// Whether this driver stays attached after a turn ends and shows the turn a
+    /// background completion starts, so the model may end its response instead of
+    /// polling for a `bash_start` job. Default false: `-p` exits at its first turn
+    /// terminal and ACP only forwards the turns it prompted, so there the model is
+    /// told to wait with `bash_poll`. The interactive TUI opts in.
+    pub background_wakeups: bool,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
     /// identical repetition. Defaults to 3/5 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
@@ -201,10 +203,8 @@ pub struct CodingAgentConfig {
     /// stub older output sooner, and values above the window-relative budget
     /// are clamped to it. None keeps the window-relative budget.
     pub compact_stub_recent_budget: Option<u32>,
-    /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
-    /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
-    /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
-    /// tool was hardwired to Exa with no way to opt into DDG.
+    /// Web search backend: auto (default), exa, parallel, tavily, firecrawl,
+    /// tinyfish or legacy duckduckgo/ddg. An explicit backend stays pinned.
     pub web_search_provider: Option<String>,
     /// `[web_search] api_key`, for Exa. `None` leaves the tool to `EXA_API_KEY` or
     /// the keyless tier.
@@ -242,6 +242,9 @@ pub struct CodingAgentConfig {
     /// An explicit upstream retry count takes precedence.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     /// Retry count after the initial attempt, sourced from `[network]
     /// upstream_retry_max_attempts`. When set, the native shared total is this
     /// count plus one, taking precedence over the provider's total-attempt cap.
@@ -295,6 +298,8 @@ pub fn settle_dir_names(dirs: &atomcode_capabilities::ProductDirs) {
 /// This is a driver configuration object, not a legacy command protocol.
 #[derive(Clone)]
 pub struct CodingRuntimeConfig {
+    /// Host opt-in to require a user approval hook when assembling the runtime.
+    pub require_approval_hook: bool,
     /// See [`CodingAgentConfig::startup_warnings`].
     pub startup_warnings: Vec<String>,
     /// Optional absolute prompt budget from `[compaction].token_limit`.
@@ -334,8 +339,6 @@ pub struct CodingRuntimeConfig {
     pub quality: atomcode_config::config::QualityConfig,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
-    /// Per-model continuous reasoning budget; environment overrides it, 0 disables it.
-    pub reasoning_timeout_secs: Option<u64>,
     /// The effort levels this endpoint exposes (server-advertised or folded builtin).
     /// Carried so `agent_config` can derive `supports_reasoning_effort` from CONFIG
     /// (via `endpoint_supports_reasoning_effort`) instead of a hardcoded model name.
@@ -361,6 +364,9 @@ pub struct CodingRuntimeConfig {
     /// transient retry, 429 and stream continuation. `None` uses six.
     /// An explicit upstream retry count takes precedence.
     pub retry_max_attempts: Option<u32>,
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     /// Retry count after the first attempt (`[network] upstream_retry_max_attempts`).
     /// Takes precedence over the provider's shared total-attempt cap.
     pub upstream_retry_max_attempts: Option<u32>,
@@ -380,6 +386,8 @@ pub struct CodingRuntimeConfig {
     /// Driver opt-in for ephemeral next-prompt sampling. Default false;
     /// currently only the interactive TUI renders and accepts the result.
     pub next_prompt_suggestions: bool,
+    /// Driver opt-in: see [`CodingAgentConfig::background_wakeups`].
+    pub background_wakeups: bool,
     pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
     pub dap: atomcode_capabilities::tools::debug::Settings,
@@ -539,8 +547,7 @@ pub fn describe_config_file_for(
          a `[providers.<name>]` entry (`type`, `model`, `api_key`, `base_url`, …); \
          `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
-         highest the capable one.\n\
-         - Host environment `ATOMCODE_REASONING_RECOVERY_TIMEOUT_SECS=60` opts into one automatic lower-effort recovery per turn after a reasoning-only timeout, with a 60-second total recovery limit including prefill. Unset/0 disables automatic recovery; accepted values are 1..3600. This never changes the model's configured effort.\n\
+         highest the capable one. `response_header_timeout_secs` sets a positive HTTP response-header wait (default 300 seconds), with a cumulative OPEN/retry allowance of twice that value; streaming after headers is separate. `ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS` supplies the fallback when unset.\n\
          - `[skills]` `extra_dirs`: additional trusted skill roots, e.g. [`~/shared-skills`]. \
          Relative paths use the session working directory; `~` uses the user home. Standard \
          roots take precedence over extra roots; later extra roots win among themselves. \
@@ -586,8 +593,8 @@ pub fn describe_config_file_for(
          delegated execution; `[team]` `max_members` (default 6) limits the persistent \
          roster, including idle members; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
          `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \
-         `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
-         or Claude Code CLI as a delegate where the front end allows it.\n\
+         `claude-code` | `grok` | `opencode`, `model`, `permission`, `timeout_secs`, `enabled`), add \
+         an external CLI as a delegate. Grok and OpenCode support only `read-only`.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
          - `[tools.atomgit]` `tool_search` (default true): discover AtomGit schemas via `builtin_search`; false sends them eagerly.\n\
          - `[tools.mcp]` `tool_search`: `on` (default), `auto`, or `off`; \
@@ -602,7 +609,7 @@ pub fn describe_config_file_for(
          `[lsp.features]` and service `features` select definition/references/hover/diagnostics/document_symbols with on|auto|off. \
          `[lsp] trace = off|messages|verbose` enables bounded, redacted protocol logging. Relative LSP JSON files use the user config directory. \
          Use the lsp tool probe/status/reload operations to diagnose initialization and reread JSON files; command/policy changes require a new runtime.\n\
-         - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
+         - `[web_search]` `provider` = `auto` (default) | `exa` | `parallel` | `tavily` | `firecrawl` | `tinyfish` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
          - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
          true), `language` (`en` | `zh_CN`), `[network]` `upstream_retry_max_attempts`, \
@@ -673,15 +680,22 @@ impl CodingRuntimeConfig {
             .filter(|name| !name.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| config.effective_model_selection().unwrap_or_default());
-        let resolved = config.resolve_model(Some(&requested)).ok().or_else(|| {
-            let mut ids: Vec<String> = config.logical_models().into_keys().collect();
-            ids.sort();
-            ids.into_iter()
-                .find_map(|id| config.resolve_model(Some(&id)).ok())
-        });
-        let r = resolved.as_ref();
         let (permission_rules, mut startup_warnings) =
             permission_rules_from_config(&config.permissions);
+        let resolved = match config.resolve_model(Some(&requested)) {
+            Ok(resolved) => Some(resolved),
+            Err(error) if error.is::<atomcode_config::config::MissingBoundApiKey>() => {
+                startup_warnings.push(error.to_string());
+                None
+            }
+            Err(_) => {
+                let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+                ids.sort();
+                ids.into_iter()
+                    .find_map(|id| config.resolve_model(Some(&id)).ok())
+            }
+        };
+        let r = resolved.as_ref();
         // The external agents are resolved again at each spawn site
         // (`parts::prepare_from_config`); what they said about the file is said
         // once, here.
@@ -725,7 +739,6 @@ impl CodingRuntimeConfig {
             quality: config.quality.clone(),
             reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
             reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
-            reasoning_timeout_secs: r.and_then(|r| r.reasoning_timeout_secs),
             reasoning_effort_levels: r.and_then(|r| r.reasoning_effort_levels.clone()),
             provider_type: r
                 .map(|r| r.provider_type.clone())
@@ -754,6 +767,7 @@ impl CodingRuntimeConfig {
             headers: r.map(|r| r.headers.clone()).unwrap_or_default(),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
+            response_header_timeout_secs: r.and_then(|r| r.response_header_timeout_secs),
             upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
@@ -774,6 +788,8 @@ impl CodingRuntimeConfig {
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
+            background_wakeups: false,
+            require_approval_hook: false,
             lsp: {
                 let mut lsp = lsp_settings_from_config(&config.lsp);
                 lsp.config_dir = Some(dirs.user().to_path_buf());
@@ -827,7 +843,6 @@ impl CodingRuntimeConfig {
         config.datalog = self.datalog.clone();
         config.quality = self.quality.clone();
         config.reasoning_history = self.reasoning_history.clone();
-        config.reasoning_timeout = model_reasoning_timeout(self.reasoning_timeout_secs);
         config.chat_options.reasoning_effort =
             atomcode_kernel::provider::ReasoningEffort::from_config(
                 self.reasoning_effort.as_deref(),
@@ -840,6 +855,7 @@ impl CodingRuntimeConfig {
         config.headers = self.headers.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.retry_max_attempts = self.retry_max_attempts;
+        config.response_header_timeout_secs = self.response_header_timeout_secs;
         config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
@@ -856,6 +872,8 @@ impl CodingRuntimeConfig {
         config.permission_rules = self.permission_rules.clone();
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
+        config.background_wakeups = self.background_wakeups;
+        config.require_approval_hook = self.require_approval_hook;
         config.lsp = self.lsp.clone();
         config.dap = self.dap.clone();
         config.web_search_provider = self.web_search_provider.clone();
@@ -886,8 +904,9 @@ pub fn apply_provider_config(
     if let Some(base_url) = &provider.base_url {
         config.base_url = base_url.clone();
     }
-    if let Some(api_key) = provider.resolved_api_key() {
-        config.api_key = api_key;
+    let api_key = provider.resolved_api_key();
+    if provider.api_key_is_resolved || api_key.is_some() {
+        config.api_key = api_key.unwrap_or_default();
     }
     config.context_window = provider.context_window as u32;
     config.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);
@@ -911,6 +930,7 @@ pub fn apply_provider_config(
     config.headers = provider.headers.clone();
     config.skip_tls_verify = provider.skip_tls_verify;
     config.retry_max_attempts = provider.retry_max_attempts;
+    config.response_header_timeout_secs = provider.response_header_timeout_secs;
 }
 
 /// A thunk the runtime supplies that constructs a (gateway-signed) tier provider. `Some` on
@@ -1139,28 +1159,6 @@ fn env_duration_secs(var: &str) -> Option<Duration> {
 fn default_stream_timeout() -> Duration {
     env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
 }
-/// Limit only reasoning before useful output, independently of prefill/idle.
-fn default_reasoning_timeout() -> Duration {
-    model_reasoning_timeout(None)
-}
-
-pub(crate) fn model_reasoning_timeout(model_seconds: Option<u64>) -> Duration {
-    resolve_reasoning_timeout(
-        std::env::var("ATOMCODE_REASONING_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
-        model_seconds,
-    )
-}
-
-fn resolve_reasoning_timeout(value: Option<&str>, model_seconds: Option<u64>) -> Duration {
-    value
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .or(model_seconds)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(300))
-}
-
 /// The default first-token (prefill / TTFB) timeout. An explicit
 /// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
 /// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
@@ -1349,20 +1347,16 @@ impl CodingAgentConfig {
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
             first_token_timeout: default_first_token_timeout(),
-            reasoning_timeout: default_reasoning_timeout(),
-            reasoning_recovery_timeout: env_duration_secs(
-                "ATOMCODE_REASONING_RECOVERY_TIMEOUT_SECS",
-            )
-            .filter(|d| d.as_secs() <= 3600)
-            .unwrap_or(Duration::ZERO),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
             auto_review: true,
             architecture_topology: false,
             repeat_stop_rounds: None,
+            require_approval_hook: false,
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
+            background_wakeups: false,
             interactive: false,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
@@ -1393,6 +1387,7 @@ impl CodingAgentConfig {
             headers: Default::default(),
             skip_tls_verify: false,
             retry_max_attempts: None,
+            response_header_timeout_secs: None,
             upstream_retry_max_attempts: None,
             subagent_config: None,
             subagent_fast_provider: None,
@@ -1404,38 +1399,6 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn reasoning_budget_defaults_to_five_minutes_and_preserves_overrides() {
-        use std::time::Duration;
-
-        for value in [None, Some(""), Some("invalid"), Some("-1")] {
-            assert_eq!(
-                super::resolve_reasoning_timeout(value, None),
-                Duration::from_secs(300)
-            );
-        }
-        assert_eq!(
-            super::resolve_reasoning_timeout(Some(" 600 "), None),
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            super::resolve_reasoning_timeout(Some("0"), Some(600)),
-            Duration::ZERO
-        );
-        assert_eq!(
-            super::resolve_reasoning_timeout(None, Some(0)),
-            Duration::ZERO
-        );
-        assert_eq!(
-            super::resolve_reasoning_timeout(Some("900"), Some(600)),
-            Duration::from_secs(900)
-        );
-        assert_eq!(
-            super::resolve_reasoning_timeout(Some("invalid"), Some(600)),
-            Duration::from_secs(600)
-        );
-    }
-
     #[test]
     fn auto_review_environment_policy_is_independent() {
         for configured in [true, false] {
@@ -2220,11 +2183,6 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
             .field("first_token_timeout", &self.first_token_timeout)
-            .field("reasoning_timeout", &self.reasoning_timeout)
-            .field(
-                "reasoning_recovery_timeout",
-                &self.reasoning_recovery_timeout,
-            )
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

@@ -1,0 +1,808 @@
+{
+  "model": "qwen3.8-27b",
+  "endpoint_host": "llm-api.atomgit.com",
+  "summary": {
+    "completed_streams_with_usage": 31,
+    "possibly_started_but_interrupted_requests": 1,
+    "maximum_inference_calls": 32,
+    "completed_input_tokens": 700622,
+    "completed_output_tokens": 894,
+    "streams_without_content_delta": 1,
+    "cache_write_counter_reports": 0
+  },
+  "interruption": {
+    "cause": "nextest 120-second whole-test deadline, not an upstream provider error",
+    "completed_ordinals": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "possibly_interrupted_ordinal": 15,
+    "unissued_independent_ordinals": [
+      16,
+      17
+    ],
+    "followup": "Fresh-prefix crossover/tool phases only; did not replay completed calls. Two later long-prefix probes used remaining call budget."
+  },
+  "batches": {
+    "independent_partial": {
+      "method": "18 independent-prefix interleaved calls, 8 same-prefix mode crossover calls, 6 growing tool-history calls; no real tools executed; max output 96; no adapter retries; stop on provider error",
+      "model": "qwen3.8-27b",
+      "requests": [
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4887,
+          "explicit_cache": false,
+          "first_content_ms": 3192,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 0,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-0-0",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4191,
+          "explicit_cache": true,
+          "first_content_ms": 3367,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 1,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-0-1",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4824,
+          "explicit_cache": true,
+          "first_content_ms": 3108,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 2,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-1-1",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4760,
+          "explicit_cache": false,
+          "first_content_ms": 3187,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 3,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-1-0",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 5825,
+          "explicit_cache": false,
+          "first_content_ms": 4624,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 4,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-2-0",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4150,
+          "explicit_cache": true,
+          "first_content_ms": 2944,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 5,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-2-1",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 10398,
+          "explicit_cache": true,
+          "first_content_ms": 9298,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 6,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-0-1",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 25674,
+          "explicit_cache": false,
+          "first_content_ms": 24297,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 7,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-0-0",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 4095,
+          "explicit_cache": false,
+          "first_content_ms": 2928,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 8,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-1-0",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 16896,
+          "cold_prefix": false,
+          "elapsed_ms": 3647,
+          "explicit_cache": true,
+          "first_content_ms": 1925,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 9,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-1-1",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": true,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 16896,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 3963,
+          "explicit_cache": true,
+          "first_content_ms": 2891,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 10,
+          "output_tokens": 26,
+          "phase": "independent",
+          "prefix": "independent-2-1",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 6025,
+          "explicit_cache": false,
+          "first_content_ms": 4524,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 11,
+          "output_tokens": 26,
+          "phase": "independent",
+          "prefix": "independent-2-0",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 6587,
+          "explicit_cache": false,
+          "first_content_ms": 5312,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 12,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-0-0",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 3974,
+          "explicit_cache": true,
+          "first_content_ms": 3018,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 13,
+          "output_tokens": 20,
+          "phase": "independent",
+          "prefix": "independent-0-1",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 20,
+              "input_tokens": 19834
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 24212,
+          "explicit_cache": true,
+          "first_content_ms": 22593,
+          "input_tokens": 19834,
+          "ok": true,
+          "ordinal": 14,
+          "output_tokens": 27,
+          "phase": "independent",
+          "prefix": "independent-1-1",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19834
+            }
+          ]
+        }
+      ]
+    },
+    "crossover_and_tools": {
+      "continuation": true,
+      "method": "planned: 18 independent-prefix interleaved calls, 8 same-prefix mode crossover calls, 6 growing tool-history calls; continuation skips independent phase; no real tools executed; max output 96; no adapter retries; stop on provider error",
+      "model": "qwen3.8-27b",
+      "requests": [
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 3961,
+          "explicit_cache": false,
+          "first_content_ms": 2905,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 18,
+          "output_tokens": 26,
+          "phase": "crossover",
+          "prefix": "crossover-0",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 5288,
+          "explicit_cache": false,
+          "first_content_ms": 3342,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 19,
+          "output_tokens": 26,
+          "phase": "crossover",
+          "prefix": "crossover-0",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 2994,
+          "explicit_cache": true,
+          "first_content_ms": 2631,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 20,
+          "output_tokens": 34,
+          "phase": "crossover",
+          "prefix": "crossover-0",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 34,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 4320,
+          "explicit_cache": true,
+          "first_content_ms": 2909,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 21,
+          "output_tokens": 34,
+          "phase": "crossover",
+          "prefix": "crossover-0",
+          "round": 3,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 34,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 3744,
+          "explicit_cache": true,
+          "first_content_ms": 2828,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 22,
+          "output_tokens": 27,
+          "phase": "crossover",
+          "prefix": "crossover-1",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 4308,
+          "explicit_cache": true,
+          "first_content_ms": 3015,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 23,
+          "output_tokens": 26,
+          "phase": "crossover",
+          "prefix": "crossover-1",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 4604,
+          "explicit_cache": false,
+          "first_content_ms": 3134,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 24,
+          "output_tokens": 34,
+          "phase": "crossover",
+          "prefix": "crossover-1",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 34,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 3104,
+          "explicit_cache": false,
+          "first_content_ms": 2839,
+          "input_tokens": 19832,
+          "ok": true,
+          "ordinal": 25,
+          "output_tokens": 34,
+          "phase": "crossover",
+          "prefix": "crossover-1",
+          "round": 3,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 34,
+              "input_tokens": 19832
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4593,
+          "explicit_cache": false,
+          "first_content_ms": 3036,
+          "input_tokens": 20167,
+          "ok": true,
+          "ordinal": 26,
+          "output_tokens": 37,
+          "phase": "rolling_tools",
+          "prefix": "tools-0",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 37,
+              "input_tokens": 20167
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4405,
+          "explicit_cache": true,
+          "first_content_ms": 2971,
+          "input_tokens": 20167,
+          "ok": true,
+          "ordinal": 27,
+          "output_tokens": 37,
+          "phase": "rolling_tools",
+          "prefix": "tools-1",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 37,
+              "input_tokens": 20167
+            }
+          ]
+        },
+        {
+          "cached_tokens": 18432,
+          "cold_prefix": false,
+          "elapsed_ms": 2157,
+          "explicit_cache": true,
+          "first_content_ms": 727,
+          "input_tokens": 20250,
+          "ok": true,
+          "ordinal": 28,
+          "output_tokens": 37,
+          "phase": "rolling_tools",
+          "prefix": "tools-1",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": true,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 18432,
+              "completion_tokens": 37,
+              "input_tokens": 20250
+            }
+          ]
+        },
+        {
+          "cached_tokens": 18432,
+          "cold_prefix": false,
+          "elapsed_ms": 2914,
+          "explicit_cache": false,
+          "first_content_ms": 1362,
+          "input_tokens": 20250,
+          "ok": true,
+          "ordinal": 29,
+          "output_tokens": 37,
+          "phase": "rolling_tools",
+          "prefix": "tools-0",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": true,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 18432,
+              "completion_tokens": 37,
+              "input_tokens": 20250
+            }
+          ]
+        },
+        {
+          "cached_tokens": 18432,
+          "cold_prefix": false,
+          "elapsed_ms": 4369,
+          "explicit_cache": false,
+          "first_content_ms": 2457,
+          "input_tokens": 20333,
+          "ok": true,
+          "ordinal": 30,
+          "output_tokens": 36,
+          "phase": "rolling_tools",
+          "prefix": "tools-0",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": true,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 18432,
+              "completion_tokens": 36,
+              "input_tokens": 20333
+            }
+          ]
+        },
+        {
+          "cached_tokens": 18432,
+          "cold_prefix": false,
+          "elapsed_ms": 2333,
+          "explicit_cache": true,
+          "first_content_ms": 746,
+          "input_tokens": 20333,
+          "ok": true,
+          "ordinal": 31,
+          "output_tokens": 36,
+          "phase": "rolling_tools",
+          "prefix": "tools-1",
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": true,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 18432,
+              "completion_tokens": 36,
+              "input_tokens": 20333
+            }
+          ]
+        }
+      ],
+      "run_id": "81234-1794801663004344000"
+    },
+    "long_prefix": {
+      "continuation": false,
+      "long_prefix": true,
+      "method": "planned: 18 independent-prefix interleaved calls, 8 same-prefix mode crossover calls, 6 growing tool-history calls; continuation skips independent phase; no real tools executed; max output 96; no adapter retries; stop on provider error",
+      "model": "qwen3.8-27b",
+      "requests": [
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 8398,
+          "explicit_cache": true,
+          "first_content_ms": null,
+          "input_tokens": 61478,
+          "ok": true,
+          "ordinal": 0,
+          "output_tokens": 1,
+          "phase": "long_prefix",
+          "prefix": "long-prefix",
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 1,
+              "input_tokens": 61478
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 10318,
+          "explicit_cache": true,
+          "first_content_ms": 8637,
+          "input_tokens": 61478,
+          "ok": true,
+          "ordinal": 1,
+          "output_tokens": 36,
+          "phase": "long_prefix",
+          "prefix": "long-prefix",
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 36,
+              "input_tokens": 61478
+            }
+          ]
+        }
+      ],
+      "run_id": "83222-1794801791112500000"
+    }
+  }
+}

@@ -15,6 +15,7 @@
 //! Phase 1 / T1.4 of the external-agent subagent-driver spec.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,6 +37,7 @@ pub struct ClaudeCodeBackend {
     permission: PermissionMode,
     allow_dangerous: bool,
     timeout: Duration,
+    quota: Mutex<Option<SubagentError>>,
 }
 
 impl ClaudeCodeBackend {
@@ -48,6 +50,7 @@ impl ClaudeCodeBackend {
             permission,
             allow_dangerous: false,
             timeout: DEFAULT_TIMEOUT,
+            quota: Mutex::new(None),
         }
     }
 
@@ -73,6 +76,32 @@ impl ClaudeCodeBackend {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    fn active_quota(&self) -> Option<SubagentError> {
+        let mut quota = self.quota.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(&*quota, Some(SubagentError::RateLimited { retry_at: Some(at), .. }) if *at > chrono::Utc::now())
+        {
+            return quota.clone();
+        }
+        *quota = None;
+        None
+    }
+
+    fn classify_failure(&self, diagnostic: &str) -> Option<SubagentError> {
+        if let Some(error) = super::failure::claude_quota(diagnostic, chrono::Utc::now()) {
+            if matches!(
+                error,
+                SubagentError::RateLimited {
+                    retry_at: Some(_),
+                    ..
+                }
+            ) {
+                *self.quota.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+            }
+            return Some(error);
+        }
+        super::failure::permission_denied(diagnostic)
     }
 }
 
@@ -182,6 +211,12 @@ impl SubagentBackend for ClaudeCodeBackend {
         if self.permission.is_dangerous() && !self.allow_dangerous {
             return Err(SubagentError::DangerousModeRefused);
         }
+        if req.cancel.is_cancelled() {
+            return Ok(result(String::new(), SubagentStopReason::Cancelled));
+        }
+        if let Some(error) = self.active_quota() {
+            return Err(error);
+        }
         let argv = claude_argv(self.permission, self.model.as_deref());
         let mut spec = ChildSpec::new(&self.program, &req.cwd).args(argv);
         spec.stdin = super::proc::StdinMode::Piped;
@@ -201,20 +236,28 @@ impl SubagentBackend for ClaudeCodeBackend {
             .map_err(|e| SubagentError::SpawnFailed(e.to_string()))?;
 
         match outcome {
-            WaitOutcome::Exited(status) if status.success() => {
+            WaitOutcome::Exited(status) => {
                 let parsed = parse_result(&buf);
-                // claude can exit 0 yet report its own failure (is_error): surface
-                // it as an agent-level error, not a successful completion.
+                if !status.success() || parsed.is_error {
+                    if let Some(error) = self
+                        .classify_failure(&parsed.text)
+                        .or_else(|| self.classify_failure(&stderr_tail))
+                    {
+                        return Err(error);
+                    }
+                }
+                if !status.success() {
+                    return Err(SubagentError::NonZeroExit {
+                        code: status.code(),
+                        stderr_tail,
+                    });
+                }
                 if parsed.is_error {
                     Err(SubagentError::AgentError(parsed.text))
                 } else {
                     Ok(result(parsed.text, SubagentStopReason::Completed))
                 }
             }
-            WaitOutcome::Exited(status) => Err(SubagentError::NonZeroExit {
-                code: status.code(),
-                stderr_tail,
-            }),
             WaitOutcome::TimedOut => {
                 Ok(result(parse_result(&buf).text, SubagentStopReason::Timeout))
             }
@@ -289,6 +332,39 @@ mod tests {
             Err(SubagentError::DangerousModeRefused) => {}
             other => panic!("expected DangerousModeRefused, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_known_quota_reset_prevents_another_process_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub");
+        let deadline = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf x >> launches\ncat <<'EOF'\n{{\"is_error\":true,\"result\":\"You've hit your session limit · resets {}\"}}\nEOF\nexit 1\n",
+                deadline.to_rfc3339()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend =
+            ClaudeCodeBackend::new("cc-stub", PermissionMode::ReadOnly).with_program(stub);
+
+        for _ in 0..2 {
+            let error = backend
+                .run(SubagentRun::new("do it", dir.path()))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SubagentError::RateLimited { retry_at: Some(at), .. } if at == deadline
+            ));
+        }
+        assert_eq!(std::fs::read(dir.path().join("launches")).unwrap(), b"x");
     }
 
     // Stub `claude`: prints one JSON result object, exits 0. No real Claude, no

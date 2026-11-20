@@ -228,12 +228,13 @@ pub async fn submit_confirmed(
 /// webui image path so the VL caption feeds the model but the user's original
 /// message + image is what displays.
 pub async fn submit_confirmed_with_echo(
+    binding: &crate::live_hub::LiveBinding,
     runtime_input: UserInput,
     echo_input: UserInput,
     client_input_id: Option<String>,
 ) -> Result<atomcode_coding::SubmitReceipt, HubError> {
     hub()
-        .submit_confirmed_with_echo(runtime_input, echo_input, client_input_id)
+        .submit_confirmed_with_echo_for(binding, runtime_input, echo_input, client_input_id)
         .await
 }
 
@@ -356,6 +357,10 @@ pub async fn current_turn_model(
 
 pub async fn model_selection() -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
     hub().model_selection().await
+}
+
+pub fn current_mode() -> Option<RuntimeMode> {
+    hub().current_mode()
 }
 
 pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {

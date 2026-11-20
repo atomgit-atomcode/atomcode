@@ -64,6 +64,18 @@ impl PowerShell {
 #[cfg(any(windows, test))]
 #[async_trait]
 impl Shell for PowerShell {
+    fn dialect(&self) -> crate::world::ShellDialect {
+        crate::world::ShellDialect::PowerShell
+    }
+    async fn spawn_program(
+        &self,
+        program: &str,
+        arguments: &[String],
+        options: &SpawnOptions,
+    ) -> Result<Arc<dyn Process>, SpawnError> {
+        super::bash::spawn_local_program(program, arguments, options).await
+    }
+
     fn describe(&self) -> String {
         format!("PowerShell {} on this machine", self.version)
     }

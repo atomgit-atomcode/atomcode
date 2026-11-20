@@ -1821,6 +1821,12 @@ pub enum Msg<'a> {
     // ── /compact ──
     CompactSummaryFailed,
     CompactSummaryTimedOut,
+    CompactSummaryContextExceeded,
+    CompactSummaryIncomplete,
+    CompactSummaryRequestFailed,
+    CompactSummaryAuthenticationFailed,
+    CompactSummaryRequestRejected,
+    CompactSummaryRateLimited,
     CompactNotSmaller,
     CompactDiagnosticRetained {
         reason: &'a str,
@@ -2418,4 +2424,136 @@ pub enum Msg<'a> {
     CmdCatalogRememberUsage,
     CmdCatalogForget,
     CmdCatalogForgetUsage,
+    // External-agent asset migration (see
+    // docs/plans/2026-11-17-external-agent-asset-migration-design.md).
+    MigrationSkillActive,
+    MigrationSkillRejected {
+        reason: &'a str,
+    },
+    MigrationSkillOverridden {
+        name: &'a str,
+    },
+    MigrationUnreadableFile {
+        reason: &'a str,
+    },
+    MigrationSkillDepthLimit,
+    MigrationSkillSymlinkCycle,
+    MigrationSkillMdNotAFile,
+    MigrationSkillCopyable {
+        target: &'a str,
+    },
+    MigrationSkillNotInEffect,
+    /// The file itself cannot be parsed, so copying it over would only move
+    /// the failure — the registry never looked at this file.
+    MigrationForeignUnparseable,
+    /// The entry is a symlink whose target is gone.
+    MigrationBrokenLink,
+    /// The entry is there, but it is not a regular file (a FIFO, a socket).
+    MigrationNotARegularFile,
+    /// The tree root is there, but it is not a directory we can walk.
+    MigrationNotADirectory,
+    /// **The report's own walk** hit the grouping-depth limit — the skill
+    /// loader never looked at this tree.
+    MigrationReportDepthLimit,
+    /// **The report's own walk** found a symlink cycle — the skill loader
+    /// never looked at this tree.
+    MigrationReportSymlinkCycle,
+    /// The entry is there, but it is not something the loader can use. The
+    /// loader never treated it as a skill at all.
+    MigrationReportEntryUnusable {
+        reason: &'a str,
+    },
+    // External-agent asset migration (see
+    // docs/plans/2026-11-17-external-agent-asset-migration-design.md).
+    MigrationInstructionsActive,
+    MigrationInstructionsCopyable {
+        target: &'a str,
+    },
+    MigrationInstructionsShadowed {
+        by: &'a str,
+    },
+    MigrationInstructionsEmpty,
+    MigrationPermissionsActive,
+    MigrationPermissionsCopyable {
+        target: &'a str,
+    },
+    MigrationMcpCopyable {
+        count: usize,
+        target: &'a str,
+    },
+    MigrationMcpActive {
+        count: usize,
+    },
+    MigrationMcpAllDisabled {
+        count: usize,
+    },
+    MigrationMcpRemoteNotCopyable,
+    MigrationRulesRejected,
+    MigrationHooksCopyable {
+        target: &'a str,
+    },
+    MigrationProviderCopyable {
+        base_url: &'a str,
+        key: &'a str,
+    },
+    MigrationProviderNameUnusable {
+        name: &'a str,
+    },
+    MigrationProviderProtocolUnsupported {
+        protocol: &'a str,
+    },
+    MigrationProviderNothingToConnectTo,
+    MigrationCredentialHasDollar,
+    MigrationCredentialReferenceUnsupported,
+    MigrationClaudeAuthAmbiguous,
+    MigrationProjectConfirmationRequired,
+    MigrationOpencodePlaintextCredentials,
+    MigrationAgentsBlocked,
+    MigrationPluginsBlocked,
+    MigrationSessionsBlocked {
+        count: usize,
+    },
+    MigrationUnreadableConfig,
+    MigrationReportEmpty,
+    MigrationSummary {
+        total: usize,
+        active: usize,
+        imported: usize,
+        actionable: usize,
+        blocked: usize,
+    },
+    MigrationStatusActive,
+    MigrationStatusImported,
+    MigrationStatusActionable,
+    MigrationStatusBlocked,
+    MigrationAlreadyImported,
+    MigrationImportDone {
+        imported: &'a str,
+    },
+    MigrationImportSkipped {
+        skipped: &'a str,
+    },
+    MigrationImportNone,
+    MigrationProvidersUnreadable {
+        reasons: &'a str,
+    },
+    MigrationImportAlreadyThere {
+        already: &'a str,
+    },
+    MigrationImportConflict {
+        id: &'a str,
+    },
+    MigrationImportConfirm {
+        id: &'a str,
+        protocol: &'a str,
+        endpoint: &'a str,
+        models: &'a str,
+        /// What will happen to the credential: `plaintext`, `env:NAME`, or
+        /// `none`. The prompt must say which — the person is agreeing to
+        /// copy a literal secret into a file, not to "import a key".
+        credential: &'a str,
+        /// The file the account will be written into.
+        destination: &'a str,
+        source: &'a str,
+    },
 }

@@ -25,7 +25,8 @@ use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{
-    self, box_edge, edit_line, pad_to, panel_edge, search_line, LABEL_MAX, LABEL_MIN, LEAD,
+    self, box_edge, edit_line_with_label_width, pad_to, panel_edge, search_line, LABEL_MAX,
+    LABEL_MIN, LEAD,
 };
 use crate::moment::{Moment, Viewport};
 use crate::providers::{
@@ -122,6 +123,10 @@ enum Row {
     Blank,
     /// A row of the list, by its index into [`ProvidersView::listed`].
     Listed(usize),
+    /// A model row's description, on its own line under the model — dim,
+    /// indented, and never selectable. By the model's index into
+    /// [`ProvidersView::listed`].
+    ModelDesc(usize),
     /// What a filter that matched nothing says.
     Nothing,
     /// How many rows are out of sight above and below.
@@ -192,6 +197,11 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                 cursor,
             } => {
                 rows.push(Row::PickFilter);
+                if items.iter().any(|item| item.catalog_only) {
+                    rows.push(Row::DiscoveryMessage(
+                        t(Msg::ProviderCatalogCandidates).into_owned(),
+                    ));
+                }
                 let listed = picked_rows(items, query).len();
                 if listed == 0 {
                     rows.push(Row::Nothing);
@@ -243,6 +253,25 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
         Some(form) => {
             rows.push(Row::FormHead);
             rows.push(Row::Blank);
+            if let Form::Account(f) = form {
+                if !f.fields(view).contains(&AccountField::Protocol) {
+                    rows.push(Row::Card(format!(
+                        "  {}  {}",
+                        t(Msg::FieldProtocol),
+                        f.protocol_label(view)
+                    )));
+                }
+                if !f.fields(view).contains(&AccountField::Endpoint) && !f.endpoint.is_empty() {
+                    rows.extend(
+                        width::wrap(
+                            &format!("{}  {}", t(Msg::FieldAddress), f.endpoint),
+                            w.saturating_sub(2).max(1),
+                        )
+                        .into_iter()
+                        .map(Row::Card),
+                    );
+                }
+            }
             let fields = match form {
                 Form::Account(f) => f.fields(view).len(),
                 Form::Model(f) => f.fields(view).len(),
@@ -298,6 +327,18 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                     }
                 }
                 entries.push(Row::Listed(at));
+                // A model the gateway gave a description to says it on the line
+                // under its own, dim and not selectable — the row budget and
+                // the scroll window treat it like any other row.
+                if let Listed::Model(i) = item {
+                    if view
+                        .models()
+                        .get(*i)
+                        .is_some_and(|m| m.localized_desc().is_some())
+                    {
+                        entries.push(Row::ModelDesc(*i));
+                    }
+                }
             }
             if entries.is_empty() {
                 rows.push(Row::Nothing);
@@ -366,6 +407,18 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             theme::fg(Role::Muted),
         ),
         Row::Listed(at) => listed_line(view, panel, at, w, caps),
+        Row::ModelDesc(i) => {
+            let Some(row) = view.models().get(i) else {
+                return Line::empty();
+            };
+            let Some(desc) = row.localized_desc() else {
+                return Line::empty();
+            };
+            Line::styled(
+                width::take_width(&format!("    {desc}"), w),
+                theme::fg(Role::Muted),
+            )
+        }
         Row::FormHead => Line::styled(
             width::take_width(&format!("  {}", form_title(panel)), w),
             theme::fg(Role::Brand),
@@ -392,7 +445,10 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
                                 .as_deref()
                                 .and_then(crate::providers::parse_window)
                         }),
-                        form.max_tokens,
+                        form.max_tokens_typed
+                            .as_deref()
+                            .map(crate::providers::parse_output_tokens)
+                            .unwrap_or(form.max_tokens),
                         None,
                         None,
                         &[],
@@ -491,7 +547,11 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
                     .filter(|levels| !levels.is_empty())
                     .map(|levels| levels.join("/"))
                     .unwrap_or_else(|| unknown.to_string());
-                let effort = item.effort.as_deref().unwrap_or(&unknown);
+                let effort = item
+                    .effort
+                    .as_deref()
+                    .or(item.catalog_default_effort.as_deref())
+                    .unwrap_or(&unknown);
                 format!(
                     "{} {} · {} {} · {} {}",
                     t(Msg::FieldVision),
@@ -798,11 +858,20 @@ fn listed_parts(
                 return None;
             };
             let host = row.endpoint_host();
-            let mut about = vec![if host.is_empty() {
-                row.protocol.clone()
+            let choices = view.connections(&row.id);
+            let protocol = if !row.configured && choices.len() > 1 {
+                choices
+                    .iter()
+                    .map(|choice| choice.protocol.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
             } else {
-                host.to_string()
-            }];
+                row.protocol.clone()
+            };
+            let mut about = vec![protocol];
+            if !host.is_empty() {
+                about.push(host.to_string());
+            }
             if row.configured {
                 about.push(t(Msg::ProviderModelCount { n: row.models }).into_owned());
                 about.push(
@@ -862,7 +931,12 @@ fn listed_parts(
             }
             (
                 mark_for(row.current, caps),
-                row.id.clone(),
+                // The gateway's display alias wins when it has one, in the
+                // interface language: the name a person picks by is the one
+                // the server labels the model with, not the wire id.
+                row.localized_alias()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| row.id.clone()),
                 about.join(" · "),
                 false,
             )
@@ -877,7 +951,7 @@ const ABOUT_MIN: usize = 20;
 /// listed, so every row lines up and none is cut — as long as the descriptions
 /// still keep [`ABOUT_MIN`] beside it.
 ///
-/// Not the form's fixed [`LABEL_MAX`]: a form's labels are short field names,
+/// Not the form's [`LABEL_MAX`] cap: a form's labels are short field names,
 /// while a list's are model ids, and an OpenRouter id
 /// (`openrouter/thinkingmachines/…`) is past thirty columns before it says
 /// which model it is. Capped at thirty, every such row was cut to the same
@@ -936,8 +1010,22 @@ fn field_line(
     // A text field with the keyboard is drawn with its caret in it; everything
     // else is drawn as a value, because a caret on a toggle would say "type
     // here" about a field nothing can be typed into.
+    let label_width = match form {
+        Form::Account(f) => f
+            .fields(view)
+            .iter()
+            .map(|field| width::str_width(&account_field(view, f, *field, false, caps).0))
+            .max(),
+        Form::Model(f) => f
+            .fields(view)
+            .iter()
+            .map(|field| width::str_width(&model_field(view, f, *field, false, caps).0))
+            .max(),
+    }
+    .unwrap_or(LABEL_MIN)
+    .clamp(LABEL_MIN, LABEL_MAX);
     if focused && typing {
-        return edit_line(&label, &value, caret, w, caps);
+        return edit_line_with_label_width(&label, &value, caret, w, caps, label_width);
     }
     let base = if focused {
         theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
@@ -949,7 +1037,7 @@ fn field_line(
     } else {
         "  ".to_string()
     };
-    let label_room = w.saturating_sub(LEAD + 2).clamp(LABEL_MIN, LABEL_MAX);
+    let label_room = label_width.min(w.saturating_sub(LEAD + 2 + 8));
     let shown = width::take_width(&label, label_room);
     let pad = label_room.saturating_sub(width::str_width(&shown));
     let spans = vec![
@@ -1094,6 +1182,40 @@ fn model_field(
                 0,
             ),
         },
+        ModelField::Output => match &form.max_tokens_typed {
+            // The custom stop is a text field while it has the keyboard, and
+            // says what it holds (or that it is the custom one) when it has not.
+            Some(typed) if focused => (
+                t(Msg::FieldOutputTokens).into_owned(),
+                typed.clone(),
+                focused,
+                true,
+                form.caret,
+            ),
+            Some(typed) => (
+                t(Msg::FieldOutputTokens).into_owned(),
+                match typed.trim().is_empty() {
+                    true => t(Msg::WindowCustom).into_owned(),
+                    false => typed.clone(),
+                },
+                focused,
+                false,
+                0,
+            ),
+            None => (
+                t(Msg::FieldOutputTokens).into_owned(),
+                cycled(
+                    &match form.max_tokens {
+                        Some(tokens) => tokens.to_string(),
+                        None => t(Msg::OutputAutomatic).into_owned(),
+                    },
+                    focused,
+                ),
+                focused,
+                false,
+                0,
+            ),
+        },
         ModelField::Default => (
             t(Msg::FieldUseAfterSaving).into_owned(),
             cycled(
@@ -1207,11 +1329,17 @@ fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
             key("^o", Msg::ProviderAdvanced),
             key("esc", Msg::LegendCancel),
         ],
-        Some(Form::Account(form)) if form.preset.is_some() => vec![
-            key("⏎", Msg::ProviderContinue),
-            key("^o", Msg::ProviderAdvanced),
-            key("esc", Msg::LegendCancel),
-        ],
+        Some(Form::Account(form)) if form.preset.is_some() => {
+            let mut keys = vec![
+                key("⏎", Msg::ProviderContinue),
+                key("^o", Msg::ProviderAdvanced),
+                key("esc", Msg::LegendCancel),
+            ];
+            if form.fields(view).contains(&AccountField::Protocol) {
+                keys.insert(1, key("←→", Msg::LegendChangeValue));
+            }
+            keys
+        }
         Some(Form::Model(form)) if form.connecting => vec![
             key("⏎", Msg::ProviderConnectUse),
             key("^s", Msg::ProviderSaveOnly),
@@ -1236,6 +1364,27 @@ fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
             vec![
                 key("space", Msg::LegendToggleLevel),
                 key("←→", Msg::LegendPickLevel),
+                key("⇥", Msg::LegendNextField),
+                key("⏎", Msg::LegendSave),
+                key("esc", Msg::LegendCancel),
+            ]
+        }
+        Some(Form::Model(form)) if form.focus == ModelField::Output => {
+            let invalid = form
+                .max_tokens_typed
+                .as_deref()
+                .is_some_and(|typed| crate::providers::parse_output_tokens(typed).is_none());
+            vec![
+                (
+                    t(if invalid {
+                        Msg::OutputInvalid
+                    } else {
+                        Msg::LegendTypeOutput
+                    })
+                    .into_owned(),
+                    String::new(),
+                ),
+                key("←→", Msg::LegendChangeValue),
                 key("⇥", Msg::LegendNextField),
                 key("⏎", Msg::LegendSave),
                 key("esc", Msg::LegendCancel),
@@ -1484,12 +1633,18 @@ mod tests {
             account: "account".into(),
             model: "glm-5.3-flash".into(),
             window: 12345,
+            max_tokens: None,
             vision: Some(true),
             effort: None,
             levels: vec![],
             current: true,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         };
+
         let view = crate::providers::ProvidersView::new(vec![], vec![row.clone()], vec![], vec![]);
         let mut panel = crate::providers::Panel {
             card: Some(crate::model_cards::CardPanel::new(&row)),
@@ -1534,11 +1689,16 @@ mod tests {
             account: account.into(),
             model: id.into(),
             window: 128_000,
+            max_tokens: None,
             vision: None,
             effort: None,
             levels: Vec::new(),
             current,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         }
     }
 
@@ -2128,6 +2288,38 @@ mod tests {
     }
 
     #[test]
+    fn the_manual_model_caret_stays_near_its_label_on_wide_terminals() {
+        let v = view();
+        let mut form = ModelForm::add(&v, Some("deepseek")).unwrap();
+        form.advanced = false;
+        form.focus = ModelField::Model;
+        form.discovery_error = Some("HTTP 404".into());
+        let at = form
+            .fields(&v)
+            .iter()
+            .position(|f| *f == ModelField::Model)
+            .unwrap();
+        let panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        for w in [40, 80, 280] {
+            let line = field_line(&v, &panel, at, w, crate::caps::Caps::default());
+            let caret_column: usize = line
+                .spans
+                .iter()
+                .take_while(|span| !span.style.reverse)
+                .map(|span| span.width())
+                .sum();
+            assert!(line.spans.iter().any(|span| span.style.reverse));
+            assert!(
+                caret_column <= 12,
+                "caret too far from model label: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn input_carets_are_visible_on_focused_account_and_model_keys() {
         let original = view();
         let mut accounts = original.accounts().to_vec();
@@ -2223,6 +2415,37 @@ mod tests {
     /// The window row says that typing a number makes a custom window, and
     /// the custom field says what it takes and how to leave it.
     #[test]
+    fn the_output_row_shows_exact_budget_and_validation_hint() {
+        let mut form = ModelForm::add(&view(), None).unwrap();
+        form.advanced = true;
+        form.focus = ModelField::Output;
+        form.max_tokens = Some(4096);
+        let render = |form: &ModelForm, width| {
+            drawn(
+                &moment(Some(Panel {
+                    form: Some(Form::Model(form.clone())),
+                    ..Panel::new()
+                })),
+                width,
+                30,
+            )
+        };
+        for width in [80, 120] {
+            let out = render(&form, width);
+            assert!(
+                out.contains(&t(Msg::FieldOutputTokens).to_string()),
+                "{out}"
+            );
+            assert!(out.contains("4096"), "{out}");
+        }
+        form.max_tokens_typed = Some("-4096".into());
+        form.caret = 5;
+        let out = render(&form, 160);
+        assert!(out.contains("-4096"), "{out}");
+        assert!(out.contains("1–4294967295"), "{out}");
+    }
+
+    #[test]
     fn the_window_row_says_how_to_type_a_custom_one() {
         let mut form = ModelForm::add(&view(), None).expect("an account to add to");
         form.focus = ModelField::Window;
@@ -2244,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_hides_address_and_offers_clickable_advanced_settings() {
+    fn a_connection_shows_protocol_and_address_and_offers_clickable_advanced_settings() {
         use crate::surface::KeyPress;
         let v = view();
         let form = AccountForm::connect(&v, v.account("deepseek").unwrap());
@@ -2254,7 +2477,8 @@ mod tests {
         }));
         let text = drawn(&m, 120, 24);
         assert!(text.contains(&t(Msg::FieldKey).to_string()), "{text}");
-        assert!(!text.contains("https://"), "{text}");
+        assert!(text.contains("https://"), "{text}");
+        assert!(text.contains("OpenAI"), "{text}");
         let (col, row) = button_hit(&m, KeyPress::ctrl('o'));
         let vp = Viewport::new(Rect::sized(120, 24), &m);
         assert_eq!(action_at(&m, &vp, col, row), Some(KeyPress::ctrl('o')));

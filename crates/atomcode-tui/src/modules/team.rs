@@ -139,8 +139,8 @@ fn main_target(moment: &Moment) -> &str {
 /// that only said `等待 1 个后台任务完成` gave no way to see which, or how far
 /// along. Claude Code lists its background agents in the same strip.
 ///
-/// Done ones are not: their result has come home into this conversation, which
-/// is where it is read. The `/bg` panel keeps the full list.
+/// The `/bg` panel keeps the full list, including failed sessions. Its
+/// needs-input group includes failures as well as actual pending questions.
 pub fn background(moment: &Moment) -> Vec<&crate::bg::Session> {
     if moment.lead.is_empty() {
         return Vec::new();
@@ -150,7 +150,8 @@ pub fn background(moment: &Moment) -> Vec<&crate::bg::Session> {
         .sessions()
         .iter()
         .filter(|s| {
-            s.group != crate::bg::Group::Completed && s.origin.as_deref() == Some(&*moment.lead)
+            (s.group == crate::bg::Group::Working || s.waiting)
+                && s.origin.as_deref() == Some(&*moment.lead)
         })
         .collect()
 }
@@ -989,6 +990,31 @@ mod tests {
         )]);
         let screen = drew(&State::default(), &moment);
         assert!(screen.contains(&*t(Msg::TeamBackgroundWaiting)), "{screen}");
+    }
+
+    #[test]
+    fn the_strip_hides_when_its_last_background_review_fails() {
+        use crate::bg::{BgView, Group};
+        let mut moment = Moment::default().with_lead("lead-1");
+        moment.viewing = "lead-1".into();
+        let state = State::default();
+        moment.bg = BgView::new(vec![bg_session(
+            "review",
+            "code-review",
+            Group::Working,
+            "lead-1",
+        )]);
+        assert_eq!(targets(&moment), vec!["lead-1", "review"]);
+
+        moment.bg = BgView::new(vec![crate::bg::Session {
+            waiting: false,
+            failed: true,
+            ..bg_session("review", "code-review", Group::NeedsInput, "lead-1")
+        }]);
+        assert_eq!(Team::height(&state, &moment, 60), Height::Hug(0));
+        assert!(targets(&moment).is_empty());
+        assert!(moment.bg.sessions()[0].failed);
+        assert_eq!(moment.bg.slot_of("review"), Some(1));
     }
 
     /// Members first, then background work: the order `targets` switches in.

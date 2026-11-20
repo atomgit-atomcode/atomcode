@@ -151,7 +151,7 @@ async fn an_approval_saves_only_the_offered_exact_project_rule_and_a_new_mount_r
         serde_json::json!({"unrelated": {"keep":true}, "permissions":{"allow":[], "deny":[]}}),
     );
     let result = run_answered_turn(project.path(), "rm -rf scratch", PermissionRules::default(), |payload| {
-        assert_eq!(payload["project_rule"]["rule"], "Bash(rm -rf scratch)");
+        assert_eq!(payload["project_rule"]["rule"], r#"BashExact("rm -rf scratch")"#);
         assert!(payload["reason"].as_str().unwrap().contains("No project/user allow rule covers"));
         serde_json::json!({"decision":"allow", "save_project_rule":true, "rule":"Bash(*)", "file":"/tmp/ignored"})
     }).await;
@@ -165,7 +165,7 @@ async fn an_approval_saves_only_the_offered_exact_project_rule_and_a_new_mount_r
     .unwrap();
     assert_eq!(
         settings["permissions"]["allow"],
-        serde_json::json!(["Bash(rm -rf scratch)"])
+        serde_json::json!([r#"BashExact("rm -rf scratch")"#])
     );
     assert_eq!(settings["unrelated"]["keep"], true);
     let next = run_turn(project.path(), "rm -rf scratch", PermissionRules::default()).await;

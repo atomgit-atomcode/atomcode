@@ -65,12 +65,6 @@ fn native_runtime_mode(mode: ApprovalMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-/// 当前审批模式的线格字符串（"build" / "accept_edits" / "bypass" / "plan"），
-/// 供 Snapshot / 广播使用。
-fn live_current_mode_wire() -> String {
-    live_current_approval_mode().wire().to_string()
-}
-
 /// Coding Runtime 是工作目录的唯一运行时所有者；未绑定时使用 daemon 项目状态。
 fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
     crate::native_live::binding()
@@ -296,6 +290,7 @@ pub(crate) fn chat_runtime_config(
     let (permission_rules, startup_warnings) =
         atomcode_coding::config::permission_rules_from_config(&config.permissions);
     atomcode_coding::CodingRuntimeConfig {
+        require_approval_hook: false,
         startup_warnings,
         extra_skill_dirs: config.skills.extra_dirs.clone(),
         compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
@@ -361,7 +356,7 @@ pub(crate) fn chat_runtime_config(
         headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
-        reasoning_timeout_secs: p.and_then(|p| p.reasoning_timeout_secs),
+        response_header_timeout_secs: p.and_then(|p| p.response_header_timeout_secs),
         upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
             config.loop_config.max_rounds,
@@ -385,6 +380,8 @@ pub(crate) fn chat_runtime_config(
         // WebUI/daemon projection is intentionally deferred; avoid a hidden
         // auxiliary model request until that driver renders the suggestion.
         next_prompt_suggestions: false,
+        // `/chat` answers one request; only `/live` (below) shows later turns.
+        background_wakeups: false,
         lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
         dap: atomcode_coding::config::dap_settings_from_config(&config.dap),
         web_search_provider: atomcode_coding::config::web_search_from_config(&config.web_search).0,
@@ -402,6 +399,9 @@ pub(crate) fn live_runtime_config(
 ) -> atomcode_coding::CodingRuntimeConfig {
     let mut runtime = chat_runtime_config(config, provider_name, working_dir, telemetry);
     runtime.interactive = true;
+    // The live hub shows turns it did not submit (`live_hub`: a turn started
+    // outside `submit`), so a background completion's turn reaches the page.
+    runtime.background_wakeups = true;
     runtime
 }
 
@@ -858,6 +858,9 @@ pub(crate) enum LiveWireEvent {
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Routine automatic retry diagnostics; clients keep these out of live status.
+    #[serde(rename = "provider_retry")]
+    ProviderRetry { message: String },
     /// Auxiliary session persistence failed. Kept distinct from conversational
     /// warnings so browser clients render it outside the message timeline.
     #[serde(rename = "persistence_warning")]
@@ -1104,7 +1107,7 @@ impl NativeLiveWireProjector {
                     max_attempts,
                     backoff_secs,
                     reason,
-                } => LiveWireEvent::Warning {
+                } => LiveWireEvent::ProviderRetry {
                     message: format!(
                         "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
                     ),
@@ -1761,7 +1764,7 @@ pub(crate) async fn live_stream(
             project_hash,
             provider: join.binding.provider.clone(),
             model: join.model.clone(),
-            mode: live_current_mode_wire(),
+            mode: join.mode.wire().to_string(),
             working_dir: snapshot_wd.to_string_lossy().to_string(),
             goal: initial_goal.as_ref().map(goal_snapshot),
             loop_progress: join.loop_progress.clone(),
@@ -2121,6 +2124,7 @@ pub(crate) async fn live_message(
             return Json(serde_json::json!({ "accepted": false, "error": error }));
         }
     };
+    let mut submission_binding = join.binding.clone();
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
     let mut provider_change_applied = true;
@@ -2162,7 +2166,10 @@ pub(crate) async fn live_message(
             match crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
                 .await
             {
-                Ok(_) => {
+                Ok(generation) => {
+                    // Only our own successful reload may advance the captured
+                    // target. Never reacquire whichever session is current.
+                    submission_binding.generation = generation.0;
                     provider_name = requested_provider;
                 }
                 // A turn is active, so this /live/message is a STEER that folds into
@@ -2236,6 +2243,7 @@ pub(crate) async fn live_message(
     );
     let (runtime_input, echo_input) = split_live_inputs(req.message, original_images, runtime_text);
     match crate::native_live::submit_confirmed_with_echo(
+        &submission_binding,
         runtime_input,
         echo_input,
         req.client_input_id,
@@ -2501,7 +2509,7 @@ pub(crate) struct ApprovalModeResp {
 pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     Json(ApprovalModeResp {
         ok: true,
-        mode: live_current_approval_mode(),
+        mode: crate::native_live::current_mode().unwrap_or_else(live_current_approval_mode),
         error: None,
         selection: None,
     })
@@ -3812,6 +3820,10 @@ mod tests {
             telemetry,
         );
         assert!(runtime.interactive);
+        assert!(
+            runtime.agent_config().background_wakeups,
+            "the live page shows a turn a background completion starts"
+        );
         assert!(runtime.agent_config().architecture_topology);
         assert_eq!(
             runtime.agent_config().auto_review,
@@ -4121,6 +4133,25 @@ mod tests {
                 kind: "unknown_future_kind".into(),
             })
             .is_none());
+    }
+
+    #[test]
+    fn automatic_retries_are_diagnostics_instead_of_warnings() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(
+            atomcode_coding::CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::ProviderRetry {
+                    attempt: 1,
+                    max_attempts: 5,
+                    backoff_secs: 3,
+                    reason: "timeout".into(),
+                },
+            ),
+        ));
+        let wire = wire.unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "provider_retry");
+        assert!(json["message"].as_str().unwrap().contains("timeout"));
     }
 
     #[test]

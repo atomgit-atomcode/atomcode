@@ -19,6 +19,8 @@
 //! judgement that needed a repository on disk to reach it would be judging
 //! `git` as much as this.
 
+#[cfg(feature = "tools")]
+pub(crate) mod detail;
 mod task_probe;
 pub use task_probe::{inspect, WorktreeStatus};
 
@@ -32,7 +34,7 @@ use std::process::Command;
 /// alphabet, and because the set is closed — an unknown letter is
 /// [`Status::Other`] rather than a parse failure, so a future git cannot make
 /// this refuse to answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Status {
     Added,
     Modified,

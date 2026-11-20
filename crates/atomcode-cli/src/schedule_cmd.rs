@@ -51,16 +51,16 @@ pub enum ScheduleCli {
         #[arg(long, group = "freq")]
         hourly: bool,
 
-        /// Schedule: cron expression (e.g. "0 9 * * 1-5").
-        #[arg(long, value_name = "EXPR", group = "freq")]
+        /// Unsupported legacy flag; use daily, weekly, hourly or every.
+        #[arg(long, hide = true, value_name = "EXPR", group = "freq")]
         cron: Option<String>,
 
         /// Permission mode: plan | accept_edits | auto.
-        #[arg(long, default_value = "plan")]
+        #[arg(long, default_value = "plan", value_parser = ["plan", "accept_edits", "auto"])]
         mode: String,
 
-        /// Notify level: off | important | all.
-        #[arg(long, default_value = "important")]
+        /// Completion notifications: off | important (global duration threshold) | all (every completion).
+        #[arg(long, default_value = "important", value_parser = ["off", "important", "all"])]
         notify: String,
     },
 
@@ -81,9 +81,9 @@ pub enum ScheduleCli {
         every: Option<String>,
         #[arg(long, group = "edit_freq")]
         hourly: bool,
-        #[arg(long)]
+        #[arg(long, value_parser = ["plan", "accept_edits", "auto"])]
         mode: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = ["off", "important", "all"])]
         notify: Option<String>,
         /// Reject the edit if the task no longer has this observed revision.
         #[arg(long)]
@@ -153,13 +153,8 @@ fn parse_schedule(
     cron: Option<&str>,
 ) -> Result<Schedule> {
     if let Some(t) = daily {
-        // Validate HH:MM format minimally.
-        if !t.contains(':') {
-            anyhow::bail!("--daily expects HH:MM format, got {:?}", t);
-        }
-        return Ok(Schedule::Daily {
-            time: t.to_string(),
-        });
+        return atomcode_schedule::timing::normalized_schedule(&Schedule::Daily { time: t.into() })
+            .context("--daily expects a valid HH:MM time");
     }
     if let Some(w) = weekly {
         // Format: N@HH:MM
@@ -172,13 +167,11 @@ fn parse_schedule(
         if !(1..=7).contains(&weekday) {
             anyhow::bail!("--weekly weekday must be 1..7, got {}", weekday);
         }
-        if !time.contains(':') {
-            anyhow::bail!("--weekly time must be HH:MM, got {:?}", time);
-        }
-        return Ok(Schedule::Weekly {
+        return atomcode_schedule::timing::normalized_schedule(&Schedule::Weekly {
             weekday,
-            time: time.to_string(),
-        });
+            time: time.into(),
+        })
+        .context("--weekly expects N@HH:MM with a valid time");
     }
     if let Some(e) = every {
         // Format: Nm  (e.g. "30m")
@@ -199,14 +192,12 @@ fn parse_schedule(
     if hourly {
         return Ok(Schedule::Hourly);
     }
-    if let Some(expr) = cron {
-        return Ok(Schedule::Cron {
-            expr: expr.to_string(),
-        });
+    if cron.is_some() {
+        anyhow::bail!("--cron is not supported by the OS adapters; use --daily, --weekly, --hourly or --every");
     }
     anyhow::bail!(
         "one frequency flag is required: --daily HH:MM | --weekly N@HH:MM | \
-         --every Nm | --hourly | --cron EXPR"
+         --every Nm | --hourly"
     )
 }
 
@@ -269,7 +260,11 @@ fn slug(s: &str) -> String {
     if out.is_empty() {
         "task".to_string()
     } else {
-        out.chars().take(32).collect()
+        out.chars()
+            .take(32)
+            .collect::<String>()
+            .trim_end_matches('-')
+            .to_owned()
     }
 }
 
@@ -411,12 +406,13 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                 hourly,
                 cron.as_deref(),
             )?;
-            let cwd = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_default()
+            let cwd = match cwd {
+                Some(cwd) => cwd,
+                None => std::env::current_dir()
+                    .context("cannot determine current directory; pass --cwd")?
                     .to_string_lossy()
-                    .into_owned()
-            });
+                    .into_owned(),
+            };
             let task = build_task(&title, &prompt, &cwd, sched, &mode, &notify);
             let entry = task_service().save(&task, None)?;
             println!("  Added task {} ({})", task.id, task.title);
@@ -490,7 +486,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                 let next = entry
                     .next_run
                     .as_ref()
-                    .map(|n| format!("~{} ({})", format_epoch(n.at), n.time_zone))
+                    .map(format_next_run)
                     .unwrap_or_else(|| "-".into());
                 let last = match &entry.last_run {
                     Some(atomcode_schedule::RunEvent::Finished { status, .. }) => status.as_str(),
@@ -550,9 +546,18 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             for entry in service.catalog()? {
                 match service.reconcile(&entry.definition.task.id) {
                     Ok(entry) if entry.registration_error.is_none() => {}
-                    result => {
+                    Ok(entry) => {
                         errors += 1;
-                        eprintln!("[schedule] registration not confirmed: {result:?}");
+                        if let Some(error) = entry.registration_error {
+                            eprintln!(
+                                "[schedule] {}: registration failed: {error}",
+                                entry.definition.task.id
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        errors += 1;
+                        eprintln!("[schedule] {}: {error:#}", entry.definition.task.id);
                     }
                 }
             }
@@ -628,7 +633,11 @@ async fn run_task_in(
         Ok(lease) => lease,
         Err(error) => {
             if let Some(request_id) = request_id {
-                store.record_rejected(id, request_id, format!("{error:#}"))?;
+                let record = store.record_rejected(id, request_id, format!("{error:#}"));
+                return Err(preserve_run_error(
+                    error,
+                    record.context("could not record admission rejection"),
+                ));
             }
             return Err(error);
         }
@@ -640,8 +649,11 @@ async fn run_task_in(
             Ok(code)
         }
         Err(error) => {
-            lease.finish("error", Some(format!("{error:#}")))?;
-            Err(error)
+            let record = lease.finish("error", Some(format!("{error:#}")));
+            Err(preserve_run_error(
+                error,
+                record.context("could not record execution failure"),
+            ))
         }
     }
 }
@@ -698,13 +710,21 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
             anyhow::bail!("one-shot follow-up already has a session; refusing to execute again")
         }
         Some((id, previous_cwd)) => {
-            if std::fs::canonicalize(&previous_cwd)? != std::fs::canonicalize(&cwd)? {
+            if std::fs::canonicalize(&previous_cwd).with_context(|| {
+                format!("cannot resolve automation conversation directory {previous_cwd}")
+            })? != std::fs::canonicalize(&cwd).with_context(|| {
+                format!("cannot resolve task working directory {}", cwd.display())
+            })? {
                 anyhow::bail!("automation conversation belongs to {previous_cwd}; create a new task to change its working directory");
             }
             Some(id)
         }
         None => None,
     };
+
+    // The lease, configuration and session binding are validated before loading
+    // optional host credentials. No runtime or second agent lifecycle is created.
+    crate::load_saved_git_auth().await?;
 
     // 6. First run is fresh; subsequent runs restore the same native log.
     // Headless path always uses ProviderBootstrap::Required so it fails fast
@@ -756,16 +776,8 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
         .await
         .map_err(anyhow::Error::new)?;
 
-    // 9. Build notification config.
-    //    "off" → disabled config; anything else → use the user's config.
-    let notifications_cfg = if task.notify == "off" {
-        atomcode_config::config::NotificationConfig {
-            enabled: false,
-            ..Default::default()
-        }
-    } else {
-        config.notifications.clone()
-    };
+    // 9. Task policy preserves the global master switch and channel settings.
+    let notifications_cfg = task_notifications(&config.notifications, &task.notify);
 
     // 10. Run headless with strict unattended approver.
     //    skip_permissions=false: scheduled tasks never do full bypass.
@@ -792,6 +804,34 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
 
     // Completion is recorded in the run ledger, never written over the task.
     Ok((exit_code, diagnostic))
+}
+
+fn preserve_run_error(error: anyhow::Error, recording: Result<()>) -> anyhow::Error {
+    if let Err(recording) = recording {
+        eprintln!("[schedule] {recording:#}");
+    }
+    error
+}
+
+fn task_notifications(
+    global: &atomcode_config::config::NotificationConfig,
+    policy: &str,
+) -> atomcode_config::config::NotificationConfig {
+    let mut config = global.clone();
+    match policy {
+        "off" => config.enabled = false,
+        "all" => config.min_duration_secs = 0,
+        _ => {}
+    }
+    config
+}
+
+fn format_next_run(next: &atomcode_schedule::timing::NextRun) -> String {
+    format!(
+        "~{} (UTC; schedule zone: {})",
+        format_epoch(next.at),
+        next.time_zone
+    )
 }
 
 /// Format an epoch-seconds timestamp as a human-readable UTC string.
@@ -849,6 +889,112 @@ fn is_leap(y: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_calendar_inputs_fail_before_save() {
+        for time in ["99:99", "::", "1:2:3", " 09:00", "09:00\n", "14:00@junk"] {
+            assert!(
+                parse_schedule(Some(time), None, None, false, None).is_err(),
+                "{time:?}"
+            );
+            assert!(
+                parse_schedule(None, Some(&format!("3@{time}")), None, false, None).is_err(),
+                "{time:?}"
+            );
+        }
+        assert!(
+            matches!(parse_schedule(Some("9:00"), None, None, false, None).unwrap(), Schedule::Daily { time } if time == "09:00")
+        );
+    }
+
+    #[test]
+    fn clap_rejects_unknown_task_policies() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Args {
+            #[command(subcommand)]
+            command: ScheduleCli,
+        }
+        for (flag, value) in [("--mode", "acept_edits"), ("--notify", "bogus")] {
+            assert!(Args::try_parse_from([
+                "test", "add", "--title", "task", "--prompt", "work", "--hourly", flag, value
+            ])
+            .is_err());
+            assert!(Args::try_parse_from(["test", "edit", "task-id", flag, value]).is_err());
+        }
+    }
+
+    #[test]
+    fn notification_policies_preserve_master_switch_and_channels() {
+        use atomcode_config::config::NotificationConfig;
+        let global = NotificationConfig {
+            enabled: true,
+            min_duration_secs: 30,
+            terminal: false,
+            ..Default::default()
+        };
+        assert!(!task_notifications(&global, "off").enabled);
+        assert_eq!(
+            task_notifications(&global, "important").min_duration_secs,
+            30
+        );
+        let all = task_notifications(&global, "all");
+        assert!(all.enabled);
+        assert!(!all.terminal);
+        assert_eq!(all.min_duration_secs, 0);
+        let disabled = NotificationConfig {
+            enabled: false,
+            ..global
+        };
+        assert!(!task_notifications(&disabled, "all").enabled);
+    }
+
+    #[test]
+    fn ledger_failure_does_not_replace_original_error() {
+        let error = preserve_run_error(
+            anyhow::anyhow!("original execution failure"),
+            Err(anyhow::anyhow!("ledger unavailable")),
+        );
+        assert_eq!(error.to_string(), "original execution failure");
+    }
+
+    #[test]
+    fn next_run_labels_utc_separately_from_schedule_zone() {
+        let next = atomcode_schedule::timing::NextRun {
+            at: 0,
+            time_zone: "America/New_York".into(),
+            estimated: true,
+        };
+        assert_eq!(
+            format_next_run(&next),
+            "~1970-01-01 00:00:00Z (UTC; schedule zone: America/New_York)"
+        );
+    }
+
+    #[test]
+    fn truncated_slug_has_no_trailing_separator() {
+        assert_eq!(slug(&format!("{} b", "a".repeat(31))), "a".repeat(31));
+    }
+
+    #[tokio::test]
+    async fn request_id_cannot_run_a_disabled_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = atomcode_schedule::Store::new(dir.path().to_path_buf());
+        let mut task = build_task(
+            "disabled task",
+            "must not execute",
+            dir.path().to_str().unwrap(),
+            Schedule::Hourly,
+            "plan",
+            "off",
+        );
+        task.enabled = false;
+        store.put(&task, None).unwrap();
+        let error = run_task_in(store, &task.id, Some("manual-retry"), None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disabled"));
+    }
 
     // ── Pure-function tests (no I/O, no env) ──────────────────────────────────
 
@@ -982,9 +1128,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_schedule_cron_ok() {
-        let s = parse_schedule(None, None, None, false, Some("0 9 * * *")).unwrap();
-        assert!(matches!(s, Schedule::Cron { expr } if expr == "0 9 * * *"));
+    fn parse_schedule_cron_is_explicitly_unsupported() {
+        for expr in ["", "0 9 * * *", "not a cron"] {
+            assert!(parse_schedule(None, None, None, false, Some(expr))
+                .unwrap_err()
+                .to_string()
+                .contains("not supported"));
+        }
     }
 
     #[test]

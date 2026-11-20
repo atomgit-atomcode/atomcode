@@ -239,8 +239,12 @@ impl View for Tip {
             }
         }
         let (text, role) = if quiet {
-            restart
-                .map(|hint| (hint.to_owned(), Role::Muted))
+            vp.moment
+                .unready
+                .as_deref()
+                .filter(|_| vp.moment.secret.is_none() && !vp.moment.model_setup_required)
+                .map(|hint| (hint.to_owned(), Role::Warning))
+                .or_else(|| restart.map(|hint| (hint.to_owned(), Role::Muted)))
                 .unwrap_or((text, role))
         } else {
             (text, role)
@@ -300,6 +304,18 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    #[test]
+    fn sign_in_guidance_sits_above_the_composer_and_precedes_clipboard_tips() {
+        let hint = "/login · /provider";
+        let moment = Moment {
+            unready: Some(hint.into()),
+            clipboard_hint: true,
+            ..Moment::default()
+        };
+        let row = draw_at(&moment, 80, 1)[0].plain();
+        assert!(row.starts_with(' ') && row.trim() == hint, "{row:?}");
     }
 
     #[test]

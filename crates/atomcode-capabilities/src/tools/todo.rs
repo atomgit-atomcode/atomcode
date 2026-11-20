@@ -81,9 +81,11 @@ pub fn render_todos_text(todos: &[TodoItem], unicode: bool) -> String {
         .join("\n")
 }
 
-/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. This is the shape the
-/// TUI title cache (`parse_todo_titles_into`) reads to learn `id → title`, so an incremental
-/// `todo update id=N` row can render the task NAME, not just `#N`. Empty list → "(no tasks)".
+/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. The coding crate's
+/// plan-continuity reminder re-renders the live plan with this, so `id → content` stays
+/// readable wherever the list is quoted. The TUI derives task titles from the
+/// transcript-derived plan itself (`plan.title_as_of`), not from this shape.
+/// Empty list → "(no tasks)".
 pub fn render_todos_numbered(todos: &[TodoItem], unicode: bool) -> String {
     if todos.is_empty() {
         return "(no tasks)".to_string();
@@ -548,13 +550,63 @@ impl Tool for TodoTool {
                 return err(error);
             }
         }
-        // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
-        // into the transcript; the renderer draws the pretty version separately). The
-        // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
-        // id=N` rows show task names.
+        // Full-list (re)plan shape. The model's own call arguments already
+        // carry the full list, so the receipt need not repeat it. The ids are
+        // 1-based in list order (the tool description and the coding reminder
+        // already say so, and how to update one), and the TUI seeds task
+        // titles from the transcript-derived plan (`named_todo_update` →
+        // `plan.title_as_of`). The receipt is therefore adaptive: a concise
+        // summary (status counts plus the in-progress ids) or the normalized
+        // numbered list, whichever is shorter — a short plan keeps its titles,
+        // a long one stops echoing them into every later resend.
         if v.get("todos").is_some() && !is_incremental_action(&v) {
             return match validate_new_todo_plan(args) {
-                Ok(todos) => ok(render_todos_numbered(&todos, false)),
+                Ok(todos) if todos.is_empty() => ok("Plan cleared: no tasks.".to_string()),
+                Ok(todos) => {
+                    let mut pending = 0usize;
+                    let mut in_progress = Vec::new();
+                    let mut completed = 0usize;
+                    for (i, t) in todos.iter().enumerate() {
+                        match t.status {
+                            TodoStatus::Pending => pending += 1,
+                            TodoStatus::InProgress => in_progress.push(i + 1),
+                            TodoStatus::Completed => completed += 1,
+                        }
+                    }
+                    let ids = |v: &[usize]| {
+                        v.iter()
+                            .map(|i| format!("#{i}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let mut parts = Vec::new();
+                    if !in_progress.is_empty() {
+                        parts.push(format!(
+                            "{} in_progress ({})",
+                            in_progress.len(),
+                            ids(&in_progress)
+                        ));
+                    }
+                    parts.push(format!("{} pending", pending));
+                    if completed > 0 {
+                        parts.push(format!("{} completed", completed));
+                    }
+                    let items = if todos.len() == 1 { "item" } else { "items" };
+                    let summary = format!(
+                        "Plan updated: {} {} — {}.",
+                        todos.len(),
+                        items,
+                        parts.join(", ")
+                    );
+                    // Byte length, not tokens: a cheap, deterministic proxy.
+                    // Ties keep the numbered list (it carries the titles).
+                    let numbered = render_todos_numbered(&todos, false);
+                    ok(if summary.len() < numbered.len() {
+                        summary
+                    } else {
+                        numbered
+                    })
+                }
                 Err(e) => err(e),
             };
         }
@@ -1281,17 +1333,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_echoes_normalized_list() {
+    async fn execute_confirms_plan_without_echoing_list() {
         let t = TodoTool::new();
         let r = t
             .execute(
-                r#"{"todos":[{"content":"verify scheduler registration","status":"pending"}]}"#,
+                r#"{"todos":[{"content":"verify scheduler registration and confirm recurring job execution","status":"pending"}]}"#,
                 &ctx(),
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
+        // Same contract as above: the confirmation without the list — the
+        // names ride in the call arguments of the same round.
+        assert!(r.content.contains("1 item — 1 pending"), "{}", r.content);
         assert!(
-            r.content.contains("verify scheduler registration"),
+            !r.content
+                .contains("verify scheduler registration and confirm recurring job execution"),
+            "the echo must not repeat the list: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_confirms_cleared_plan() {
+        let t = TodoTool::new();
+        let r = t.execute(r#"{"todos":[]}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Plan cleared: no tasks."),
             "{}",
             r.content
         );
@@ -1301,14 +1369,24 @@ mod tests {
     async fn execute_accepts_stringified_todos_from_provider() {
         let result = TodoTool::new()
             .execute(
-                r#"{"todos":"[{\"content\":\"verify scheduler registration\",\"status\":\"pending\"}]"}"#,
+                r#"{"todos":"[{\"content\":\"verify scheduler registration and confirm recurring job execution\",\"status\":\"pending\"}]"}"#,
                 &ctx(),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
+        // The echo is a confirmation, not a second copy of the list: the
+        // model's own call arguments already carry the task names in the same
+        // round.
         assert!(
-            result.content.contains("verify scheduler registration"),
+            result.content.contains("1 item — 1 pending"),
             "{}",
+            result.content
+        );
+        assert!(
+            !result
+                .content
+                .contains("verify scheduler registration and confirm recurring job execution"),
+            "the echo must not repeat the list: {}",
             result.content
         );
     }
@@ -1333,24 +1411,102 @@ mod tests {
     }
 
     #[test]
-    fn todowrite_result_is_numbered_for_title_cache() {
-        // The result must carry `<glyph> <id>. <content>` so the TUI title cache learns ids.
+    fn render_todos_numbered_lists_id_and_content() {
+        // The reminder path re-renders the live plan with ids: `<glyph> <id>. <content>`.
         let out = render_todos_numbered(&parse_todos(PLAN3).unwrap(), false);
         assert!(out.contains("] 1. a"), "{out}");
         assert!(out.contains("] 3. c"), "{out}");
     }
 
     #[tokio::test]
-    async fn todowrite_accepts_full_list_shape() {
+    async fn todowrite_short_plan_keeps_the_numbered_titles() {
         let t = TodoTool::new();
         assert_eq!(t.name(), "todowrite");
         let r = t.execute(PLAN3, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(
-            r.content.contains("1. a"),
-            "numbered list echoed: {}",
-            r.content
+        assert_eq!(
+            r.content,
+            render_todos_numbered(&parse_todos(PLAN3).unwrap(), false)
         );
+    }
+
+    #[tokio::test]
+    async fn adaptive_receipts_never_expand_the_numbered_plan() {
+        for count in [1, 3, 6, 20] {
+            for label in ["verify parser behavior", "验证解析器的边界行为和回归测试"]
+            {
+                for active in [None, Some(count)] {
+                    let tasks: Vec<_> = (1..=count).map(|id| json!({
+                        "content":format!("{label} {id}"),
+                        "status": if active == Some(id) { "in_progress" } else if id % 3 == 0 { "completed" } else { "pending" }
+                    })).collect();
+                    let args = json!({"todos":tasks}).to_string();
+                    let numbered = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+                    let result = TodoTool::new().execute(&args, &ctx()).await;
+                    assert!(!result.is_error, "{}", result.content);
+                    assert!(
+                        result.content.len() <= numbered.len(),
+                        "receipt expanded {count} tasks: {}",
+                        result.content
+                    );
+                    assert!(!result.content.contains("Ids are 1-based"));
+                    if result.content.starts_with("Plan updated:") {
+                        if let Some(id) = active {
+                            assert!(
+                                result.content.contains(&format!("in_progress (#{id})")),
+                                "{}",
+                                result.content
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_plan_reports_status_counts_without_repeating_titles() {
+        let tasks: Vec<_> = (1..=20).map(|id| json!({
+            "content":format!("verify scheduler registration and recurring job execution {id}"),
+            "status": if id == 12 { "in_progress" } else if id <= 10 { "completed" } else { "pending" }
+        })).collect();
+        let result = TodoTool::new()
+            .execute(&json!({"todos":tasks}).to_string(), &ctx())
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(
+            result.content,
+            "Plan updated: 20 items — 1 in_progress (#12), 9 pending, 10 completed."
+        );
+    }
+
+    #[tokio::test]
+    async fn equally_sized_receipts_prefer_numbered_titles() {
+        let args = json!({"todos":[{"content":"x".repeat(28),"status":"pending"}]}).to_string();
+        let numbered = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+        assert_eq!(numbered.len(), "Plan updated: 1 item — 1 pending.".len());
+        assert_eq!(
+            TodoTool::new().execute(&args, &ctx()).await.content,
+            numbered
+        );
+    }
+
+    #[tokio::test]
+    async fn measure_adaptive_receipts_for_representative_plans() {
+        for count in [1, 3, 6, 20] {
+            let tasks: Vec<_> = (1..=count).map(|id| json!({"content":format!("verify parser behavior {id}"),"status":"pending"})).collect();
+            let args = json!({"todos":tasks}).to_string();
+            let original = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+            let result = TodoTool::new().execute(&args, &ctx()).await;
+            assert!(!result.is_error);
+            assert!(result.content.len() <= original.len());
+            println!(
+                "items={count} numbered_bytes={} adaptive_bytes={} receipt={}",
+                original.len(),
+                result.content.len(),
+                result.content
+            );
+        }
     }
 
     #[tokio::test]

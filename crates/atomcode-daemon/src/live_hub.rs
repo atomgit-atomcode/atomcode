@@ -87,6 +87,7 @@ pub struct LiveObservation {
 pub struct LiveJoin {
     pub binding: LiveBinding,
     pub snapshot: Arc<SessionSnapshot>,
+    pub mode: atomcode_coding::RuntimeMode,
     pub model: Option<String>,
     /// Latest Goal controller state. Unlike turn replay, this must survive a
     /// completed turn so late `/live` subscribers can restore the Goal UI.
@@ -182,6 +183,7 @@ struct HubState {
     next_cursor: u64,
     binding: Option<BoundRuntime>,
     snapshot: Option<Arc<SessionSnapshot>>,
+    mode: atomcode_coding::RuntimeMode,
     model: Option<String>,
     pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     snapshot_error: Option<String>,
@@ -413,6 +415,7 @@ impl LiveViewHub {
         if status.generation != view.generation {
             return Err(HubError::StaleBinding);
         }
+        let mode = view.mode;
         let staged = Self::new();
         let binding = staged.bind_initial(
             view.session_id,
@@ -423,11 +426,14 @@ impl LiveViewHub {
             control.clone(),
             true,
         )?;
-        staged
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .model = view.model;
+        {
+            let mut state = staged
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.mode = mode;
+            state.model = view.model;
+        }
         for event in view.events {
             staged.publish(&binding, event)?;
         }
@@ -559,6 +565,7 @@ impl LiveViewHub {
             control,
         });
         state.snapshot = Some(Arc::new(snapshot));
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
@@ -598,6 +605,7 @@ impl LiveViewHub {
         Ok(LiveJoin {
             binding,
             snapshot,
+            mode: state.mode,
             model: state.model.clone(),
             pending_turn_model: state.pending_turn_model.clone(),
             goal_progress: sampled_goal_progress(&state),
@@ -617,6 +625,13 @@ impl LiveViewHub {
             .ok_or(HubError::Unbound)
     }
 
+    /// Current runtime mode from the installed presentation view. `None`
+    /// means no live runtime is bound and callers may use their configured default.
+    pub fn current_mode(&self) -> Option<atomcode_coding::RuntimeMode> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.binding.as_ref().map(|_| state.mode)
+    }
+
     pub fn unbind(&self, binding: &LiveBinding) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let current_binding_id = state
@@ -632,6 +647,7 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
@@ -672,6 +688,7 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
@@ -796,14 +813,33 @@ impl LiveViewHub {
         echo_input: UserInput,
         client_input_id: Option<String>,
     ) -> Result<SubmitReceipt, HubError> {
-        let (binding, handle) = self.bound_handle()?;
-        let correlation_registered = if let Some(client_input_id) = client_input_id.clone() {
+        let (binding, _) = self.bound_handle()?;
+        self.submit_confirmed_with_echo_for(&binding, runtime_input, echo_input, client_input_id)
+            .await
+    }
+
+    /// Preserve the binding captured before HTTP input preparation. Both the
+    /// hub identity and the runtime generation must still match at admission.
+    pub async fn submit_confirmed_with_echo_for(
+        &self,
+        binding: &LiveBinding,
+        runtime_input: UserInput,
+        echo_input: UserInput,
+        client_input_id: Option<String>,
+    ) -> Result<SubmitReceipt, HubError> {
+        let handle = self.bound_handle_for(binding)?;
+        let correlation_registered = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(error) = &state.snapshot_error {
+                return Err(HubError::SnapshotUnavailable(error.clone()));
+            }
             let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
-            if current.identity.id != binding.id {
+            if current.identity.id != binding.id
+                || current.identity.generation != binding.generation
+            {
                 return Err(HubError::StaleBinding);
             }
-            if state.turn_active {
+            if let Some(client_input_id) = client_input_id.clone().filter(|_| state.turn_active) {
                 state.pending_web_steers.push_back(PendingWebSteer {
                     runtime_input: runtime_input.clone(),
                     client_input_id,
@@ -812,15 +848,16 @@ impl LiveViewHub {
             } else {
                 false
             }
-        } else {
-            false
         };
-        let receipt = handle.submit(runtime_input).await.map_err(|error| {
-            if correlation_registered {
-                self.remove_pending_web_steer(client_input_id.as_deref());
-            }
-            HubError::RuntimeRejected(error.to_string())
-        })?;
+        let receipt = handle
+            .submit_at_generation(binding.generation, runtime_input)
+            .await
+            .map_err(|error| {
+                if correlation_registered {
+                    self.remove_pending_web_steer(client_input_id.as_deref());
+                }
+                HubError::RuntimeRejected(error.to_string())
+            })?;
         let receipt_generation = match receipt {
             SubmitReceipt::Started { generation, .. }
             | SubmitReceipt::Steered { generation, .. }
@@ -1410,6 +1447,9 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        if let CodingRuntimeEvent::ModeChanged { mode } = &event {
+            state.mode = *mode;
+        }
         if let CodingRuntimeEvent::RequestResolved { id, kind } = &event {
             // A terminal/TUI response bypasses the HTTP response route. Retire
             // its replay entry here too; the route may already have done so.
@@ -2567,6 +2607,62 @@ mod tests {
 
     fn snapshot(text: &str) -> SessionSnapshot {
         SessionSnapshot::new(vec![Message::user(text)])
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prepared_message_does_not_follow_a_rebound_hub() {
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        let control = Arc::new(RealControl {
+            handle: runtime.handle.clone(),
+        });
+        hub.bind("A", project.path().into(), snapshot("A"), control.clone())
+            .unwrap();
+        let captured = hub.join().unwrap().binding;
+        // A projection failure discovered during preparation must still fail
+        // closed, just like an ordinary confirmed submission.
+        hub.state.lock().unwrap().snapshot_error = Some("projection failed".into());
+        let input = UserInput::from("only for A");
+        assert_eq!(
+            hub.submit_confirmed_with_echo_for(&captured, input.clone(), input, None)
+                .await,
+            Err(HubError::SnapshotUnavailable("projection failed".into()))
+        );
+        hub.state.lock().unwrap().snapshot_error = None;
+        // The HTTP handler is suspended preparing A's input; navigation wins.
+        hub.bind("B", project.path().into(), snapshot("B"), control)
+            .unwrap();
+        let mut view = hub.join().unwrap();
+        let input = UserInput::from("only for A");
+        assert_eq!(
+            hub.submit_confirmed_with_echo_for(
+                &captured,
+                input.clone(),
+                input,
+                Some("A-send".into())
+            )
+            .await,
+            Err(HubError::StaleBinding)
+        );
+        assert!(
+            runtime.commands.try_recv().is_err(),
+            "no message reached the agent"
+        );
+        assert!(
+            view.receiver.try_recv().is_err(),
+            "no accepted echo reached B"
+        );
+
+        let input = UserInput::from("only for B");
+        hub.submit_confirmed_with_echo_for(&view.binding, input.clone(), input, None)
+            .await
+            .unwrap();
+        assert!(matches!(runtime.commands.recv().await,
+            Some(atomcode_kernel::event::AgentCommand::SendMessage { text, .. }) if text == "only for B"));
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[test]
@@ -4065,6 +4161,39 @@ mod tests {
         )
         .unwrap();
         assert!(hub.join().unwrap().model.is_none());
+    }
+
+    #[test]
+    fn late_join_uses_runtime_mode_after_idle_mode_change() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "session-1".into(),
+            PathBuf::from("/one"),
+            snapshot("done"),
+        );
+        view.mode = atomcode_coding::RuntimeMode::Auto;
+        let binding = hub
+            .bind_live_view(view, "provider-a".into(), "fingerprint".into(), control)
+            .unwrap();
+
+        assert_eq!(hub.join().unwrap().mode, atomcode_coding::RuntimeMode::Auto);
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::ModeChanged {
+                    mode: atomcode_coding::RuntimeMode::Plan,
+                },
+            },
+        )
+        .unwrap();
+
+        let reconnected = hub.join().unwrap();
+        assert_eq!(reconnected.mode, atomcode_coding::RuntimeMode::Plan);
+        assert!(reconnected.replay.is_empty(), "idle mode is snapshot state");
     }
 
     #[test]

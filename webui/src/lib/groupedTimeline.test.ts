@@ -51,3 +51,25 @@ test('retained user history and system notices stay visible inside a completed g
   const page = groupedTimelinePage(messages, 12, null, 1024 * 1024, turnProcesses(messages), () => false);
   assert.deepEqual(page.indexes, [0, 2, 3, messages.length - 1]);
 });
+
+
+test('leaving the bottom freezes the bounded window without dropping recent conversations', () => {
+  for (const size of [12, 32]) for (const budget of [4096, 3 * 1024 * 1024]) {
+    const messages: ProcessMessage[] = [...fixture(), ...Array.from({ length: 4 }, (_, index) => [
+      { role: 'user' as const, parts: [{ kind: 'text' as const, text: `recent ${index}` }] },
+      { role: 'assistant' as const, parts: [{ kind: 'text' as const, text: `answer ${index}` }] },
+    ]).flat()];
+    const processes = turnProcesses(messages);
+    const latest = groupedTimelinePage(messages, size, null, budget, processes, () => false);
+    assert.ok(latest.windowStart > latest.range.start, 'the collapsed group extends before the raw window');
+    const frozen = groupedTimelinePage(messages, size, latest.windowStart, budget, processes, () => false);
+    assert.deepEqual(frozen.indexes, latest.indexes);
+    assert.deepEqual(frozen.range, latest.range);
+    assert.deepEqual(frozen.processIndexes, latest.processIndexes);
+    // Server history prepends shift indexes; they must not replace the current window either.
+    const older: ProcessMessage[] = [{ role: 'user', parts: [] }, { role: 'assistant', parts: [] }];
+    const prepended = [...older, ...messages];
+    const shifted = groupedTimelinePage(prepended, size, latest.windowStart + older.length, budget, turnProcesses(prepended), () => false);
+    assert.deepEqual(shifted.indexes, latest.indexes.map(index => index + older.length));
+  }
+});

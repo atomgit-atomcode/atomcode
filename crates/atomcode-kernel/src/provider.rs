@@ -170,6 +170,19 @@ pub trait LlmProvider: Send + Sync {
     fn effort_levels(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Whether a prior assistant message's flat `reasoning` text goes back on the
+    /// wire when the history is replayed. A size estimate of the outgoing request
+    /// reads this: counting thinking the adapter drops overstates a thinking-heavy
+    /// conversation severalfold and compacts a context that still fits.
+    ///
+    /// TRUE by default — the conservative answer for an adapter that cannot say,
+    /// since overstating only compacts early while understating overflows.
+    ///
+    /// A wrapper that delegates MUST forward this, exactly as it forwards
+    /// [`context_window`](Self::context_window).
+    fn replays_reasoning(&self) -> bool {
+        true
+    }
     /// Bind this provider to its owning Agent's session id, ONCE. The kernel calls
     /// this at spawn — the single point where the session id (allocated by the coding
     /// layer's `prepare`, threaded in via `AgentBuilder::session_id`) meets the

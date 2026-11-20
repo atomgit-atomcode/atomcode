@@ -7,6 +7,9 @@ import type { TurnProcess } from './turnProcess.ts';
 export function groupedTimelinePage(messages: readonly TimelineMessage[], size: number, start: number | null,
   budget: number, processes: ReadonlyMap<number, TurnProcess>, expanded: (process: TurnProcess) => boolean) {
   const range = boundedTimelineRange(messages, size, start, budget);
+  // Group expansion is presentation only. Freeze/resume the original bounded
+  // window so an earlier collapsed process cannot evict newer conversations.
+  const windowStart = range.start;
   const groups: { start: number; end: number }[] = [];
   for (let index = 0; index < messages.length;) {
     let end = index + 1;
@@ -45,5 +48,5 @@ export function groupedTimelinePage(messages: readonly TimelineMessage[], size: 
       }
     }
   }
-  return { range, indexes: [...selected].sort((a, b) => a - b), processIndexes };
+  return { range, windowStart, indexes: [...selected].sort((a, b) => a - b), processIndexes };
 }

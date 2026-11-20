@@ -490,6 +490,224 @@ async fn a_request_that_would_not_fit_is_compacted_before_it_is_sent() {
     );
 }
 
+/// Commit a tool result far larger than a 30k window, as a first turn leaves one.
+fn commit_a_large_result(app: &App) {
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::AssistantMessage {
+            turn,
+            round: 2,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "big".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        },
+    );
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::ToolResultLogged {
+            turn,
+            round: 2,
+            call_id: "big".into(),
+            content: "a line of a very large file\n".repeat(6_000),
+            is_error: false,
+            images: vec![],
+        },
+    );
+}
+
+/// The conversation's own provider.
+fn conversation_provider(app: &App) -> Arc<dyn atomcode_kernel::provider::LlmProvider> {
+    app.context()
+        .service::<atomcode_harness::seams::LlmSvc>()
+        .expect("an llm is mounted")
+}
+
+/// Anchor the history as it stands at `measured` tokens through `provider`.
+fn anchor_now(
+    app: &App,
+    provider: &Arc<dyn atomcode_kernel::provider::LlmProvider>,
+    measured: u64,
+) {
+    let log = app.context().only_session().unwrap();
+    let estimated = log
+        .derive_messages()
+        .iter()
+        .map(|m| u64::from(m.estimate_tokens()))
+        .sum();
+    log.set_prompt_anchor(Some(atomcode_harness::session::PromptAnchor {
+        provider: Arc::downgrade(provider),
+        measured,
+        estimated,
+        through: log.last_seq(),
+    }));
+}
+
+const REPLAY_30K: &str = "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\n\
+                          config = { context_window = 30000, script = [ { text = \"ok\" } ] }";
+
+/// The provider measured the history well inside the window; the byte estimate
+/// says otherwise. The measurement wins. Estimating a long session whole —
+/// thinking the adapter drops, CJK, JSON — compacted a 1M-window conversation at
+/// 40% of its window, four times in an hour.
+#[tokio::test]
+async fn a_request_the_provider_measured_as_fitting_is_not_compacted_on_an_estimate() {
+    let dir = scratch("overflow-anchored");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    run_turn(&app, "first").await.unwrap();
+    commit_a_large_result(&app);
+    anchor_now(&app, &conversation_provider(&app), 5_000);
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w > 100_000),
+        "a request that fits was compacted: {widest:?}"
+    );
+}
+
+/// A measurement is of one adapter's tokenizer and wire format; through
+/// another — even for a model of the same name — the history is sized whole.
+#[tokio::test]
+async fn a_measurement_through_another_provider_does_not_size_this_one() {
+    let dir = scratch("overflow-anchor-other-provider");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    run_turn(&app, "first").await.unwrap();
+    commit_a_large_result(&app);
+    let swapped_out: Arc<dyn atomcode_kernel::provider::LlmProvider> =
+        Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![]));
+    anchor_now(&app, &swapped_out, 5_000);
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w < 10_000),
+        "a request went out carrying the whole result: {widest:?}"
+    );
+}
+
+/// A measurement holds for a history that only grew. Once something is taken
+/// out, what is left would be priced at the estimate's own error — so the
+/// next request is sized whole, and this one is too large whole.
+#[tokio::test]
+async fn a_measurement_does_not_outlive_a_compaction() {
+    let dir = scratch("overflow-anchor-compacted");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    run_turn(&app, "first").await.unwrap();
+    commit_a_large_result(&app);
+    anchor_now(&app, &conversation_provider(&app), 5_000);
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::MessagesRewritten {
+            turn,
+            texts: Vec::new(),
+        },
+    );
+    assert!(
+        log.prompt_anchor().is_none(),
+        "a rewrite ends the measurement"
+    );
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = ctx.on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w < 10_000),
+        "a request went out carrying the whole result: {widest:?}"
+    );
+}
+
+/// Answers with the given prompt usage.
+struct Measured(u32);
+
+#[async_trait]
+impl Waterfall<AgentRequest> for Measured {
+    async fn handle(
+        &self,
+        _req: &mut ModelRequest,
+        _next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        Ok(ModelResponse {
+            text: "measured".into(),
+            usage: Some(atomcode_kernel::stream::TokenUsage {
+                prompt: self.0,
+                completion: 1,
+                cached: 0,
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_answered_request_is_remembered_at_the_size_the_provider_measured() {
+    let dir = scratch("overflow-anchor-recorded");
+    let app = start(tree(&dir, &[REPLAY_30K])).await;
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(Measured(1_234)), false);
+    run_turn(&app, "go").await.unwrap();
+
+    let log = app.context().only_session().unwrap();
+    let anchor = log.prompt_anchor().expect("a measured answer anchors");
+    assert!(
+        std::ptr::addr_eq(
+            anchor.provider.as_ptr(),
+            Arc::as_ptr(&conversation_provider(&app))
+        ),
+        "anchored to the provider that answered"
+    );
+    assert_eq!(anchor.measured, 1_234);
+    assert!(anchor.estimated > 0, "{anchor:?}");
+}
+
+/// A refusal proves the projection ran low, so the retries are sized whole.
+#[tokio::test]
+async fn a_refused_request_forgets_the_measurement() {
+    let dir = scratch("overflow-anchor-forgotten");
+    let app = start(tree(&dir, &[])).await;
+    run_turn(&app, "first").await.unwrap();
+    run_turn(&app, "second").await.unwrap();
+    anchor_now(&app, &conversation_provider(&app), 10);
+
+    let run = run_with(&app, 1, overflowing()).await;
+    assert_eq!(run.attempts, 2, "one overflow, one retry");
+    assert!(
+        app.context()
+            .only_session()
+            .unwrap()
+            .prompt_anchor()
+            .is_none(),
+        "an answer without usage must not restore the refuted anchor"
+    );
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn an_unshrinkable_preflight_overflow_stops_before_the_provider_and_keeps_history() {
     let dir = scratch("overflow-preserve-history");
@@ -1916,8 +2134,13 @@ async fn cancelling_an_ordinary_retry_backoff_never_opens_another_request() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancelling_stream_recovery_backoff_never_opens_another_request() {
     use atomcode_kernel::stream::StreamEvent;
-    for with_tool in [false, true] {
-        let mut broken = vec![StreamEvent::TextDelta("saved before cancellation".into())];
+    for kind in 0..3 {
+        let with_tool = kind == 1;
+        let mut broken = vec![if kind == 2 {
+            StreamEvent::Reasoning("unfinished thinking".into())
+        } else {
+            StreamEvent::TextDelta("saved before cancellation".into())
+        }];
         if with_tool {
             broken.push(StreamEvent::ToolCallDelta {
                 index: 0,
@@ -1997,11 +2220,7 @@ async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
             Some("[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 0 }"),
             Msg::StreamRecoveryExhausted { max_recoveries: 0 },
         ),
-        (
-            vec![StreamEvent::Reasoning("thinking only".into()), transport()],
-            None,
-            Msg::StreamRecoveryNoProgress,
-        ),
+        (vec![transport()], None, Msg::StreamRecoveryNoProgress),
         (
             vec![
                 StreamEvent::TextDelta("saved".into()),
@@ -2027,6 +2246,373 @@ async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
         assert_eq!(provider.recorded().len(), 1);
         let events = app.context().only_session().unwrap().events();
         assert!(format!("{events:?}").contains(t(reason).as_ref()));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_only_interruptions_retry_twice_and_keep_history_out_of_the_prompt() {
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    for succeeds in [false, true] {
+        let broken = || {
+            vec![
+                StreamEvent::Reasoning("unfinished thinking".into()),
+                StreamEvent::Error(ProviderError {
+                    code: Some(atomcode_harness::plugins::agent_loop::STREAM_IDLE_CODE.into()),
+                    message: "idle timeout".into(),
+                    ..Default::default()
+                }),
+            ]
+        };
+        let (app, provider, count) = streamed_app(
+            vec![
+                broken(),
+                broken(),
+                if succeeds { finished() } else { broken() },
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            outcome.stop,
+            if succeeds {
+                StopReason::Stopped
+            } else {
+                StopReason::Timeout
+            }
+        );
+        assert_eq!(provider.recorded().len(), 3);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let log = app.context().only_session().unwrap();
+        let display = atomcode_kernel::session::derive_messages_with_meta(&log.events());
+        assert_eq!(
+            display
+                .iter()
+                .filter(|m| m.reasoning.as_deref() == Some("unfinished thinking"))
+                .count(),
+            if succeeds { 2 } else { 3 }
+        );
+        for (messages, _, _) in provider.recorded() {
+            assert!(!messages
+                .iter()
+                .any(|m| m.reasoning.as_deref() == Some("unfinished thinking")));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_restart_spends_the_existing_text_continuation_budget() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![StreamEvent::TextDelta("saved".into()), transport()],
+            vec![StreamEvent::Reasoning("thinking".into()), transport()],
+            vec![StreamEvent::Reasoning("still thinking".into()), transport()],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::ProviderError
+    );
+    assert_eq!(provider.recorded().len(), 3);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_only_without_dispatch_proof_is_not_restarted() {
+    let dir = scratch("reasoning-unknown-dispatch");
+    let app = start(tree(&dir, &[])).await;
+    let error = RequestError {
+        code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+        ..RequestError::message("interrupted")
+    }
+    .with_partial(ModelResponse {
+        reasoning: "thinking".into(),
+        ..Default::default()
+    });
+    let result = run_with(&app, 1, error).await;
+    assert_eq!(result.stop, StopReason::ProviderError);
+    assert_eq!(result.attempts, 1);
+}
+
+struct ImageMutation(Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait]
+impl atomcode_kernel::tool::Tool for ImageMutation {
+    fn name(&self) -> &str {
+        "image_mutation"
+    }
+    fn description(&self) -> &str {
+        "A mutation returning an inline image"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        atomcode_kernel::tool::ToolResult {
+            content: "image saved".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                // A real 2×1 PNG: one that does not decode is left out.
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+/// What the redaction puts in place of a picture: a different picture that still
+/// decodes (a PNG followed by two zero bytes) — one that does not is left out of
+/// the request.
+const REDACTED_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJgggAA";
+
+struct ImageRedaction(bool);
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for ImageRedaction {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        let mut results = next.run(batch).await;
+        // Only transform the original batch, so reuse must read the committed
+        // image itself rather than rely on this transform being repeated.
+        for result in &mut results {
+            if result.call_id == "first" {
+                result.images[0].data = if self.0 {
+                    REDACTED_PNG.into()
+                } else {
+                    String::new()
+                };
+            }
+        }
+        results
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn image_tool_recovery_reuses_committed_images_without_repeating_the_mutation() {
+    use atomcode_kernel::stream::StreamEvent;
+    for retained in [true, false] {
+        let (app, provider, count) = streamed_app(
+            vec![
+                completed_call("first", "image_mutation"),
+                vec![StreamEvent::Reasoning("inspect image".into()), transport()],
+                completed_call("repeat", "image_mutation"),
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        app.context()
+            .require::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .register(Arc::new(ImageMutation(count.clone())))
+            .unwrap();
+        let _guard = app
+            .context()
+            .on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(
+                Arc::new(ImageRedaction(retained)),
+                false,
+            );
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            outcome.stop,
+            if retained {
+                StopReason::Stopped
+            } else {
+                StopReason::ProviderError
+            },
+            "{outcome:?}; events={:?}",
+            app.context().only_session().unwrap().events()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.recorded().len(), if retained { 4 } else { 2 });
+        if retained {
+            let events = app.context().only_session().unwrap().events();
+            assert!(events.iter().any(|e| matches!(&e.event,
+                SessionEvent::ToolResultLogged { call_id, content, images, .. }
+                if call_id == "repeat" && content.contains("tool not executed again") && images.len() == 1 && images[0].data == REDACTED_PNG)));
+            let calls = provider.recorded();
+            let images: Vec<_> = calls[3].0.iter().flat_map(|m| &m.images).collect();
+            assert_eq!(images.len(), 2);
+            assert!(images.iter().all(|i| i.data == REDACTED_PNG));
+        }
+    }
+}
+
+// No injected timeout error: the production watchdog must expire while this
+// provider keeps yielding metadata after its last reasoning content.
+struct SilentAfterImages {
+    stalls: usize,
+    requests: std::sync::Mutex<Vec<Vec<atomcode_kernel::message::Message>>>,
+}
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for SilentAfterImages {
+    fn model_name(&self) -> &str {
+        "silent-after-images"
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[atomcode_kernel::message::Message],
+        _: &[atomcode_kernel::tool::ToolDef],
+        _: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        use atomcode_kernel::stream::StreamEvent;
+        use futures::StreamExt;
+        let attempt = {
+            let mut requests = self.requests.lock().unwrap();
+            let attempt = requests.len();
+            requests.push(messages.to_vec());
+            attempt
+        };
+        if attempt > 0 && attempt <= self.stalls {
+            return Ok(Box::pin(
+                futures::stream::iter(vec![StreamEvent::Reasoning(
+                    "inspect the saved image".into(),
+                )])
+                .chain(futures::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Some((StreamEvent::Usage(Default::default()), ()))
+                })),
+            ));
+        }
+        Ok(Box::pin(futures::stream::iter(if attempt == 0 {
+            completed_call("first", "image_mutation")
+        } else if attempt == self.stalls + 1 {
+            completed_call("repeat", "image_mutation")
+        } else {
+            finished()
+        })))
+    }
+}
+
+async fn silent_image_app(
+    stalls: usize,
+) -> (
+    App,
+    Arc<SilentAfterImages>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = scratch("real-content-idle");
+    let provider = Arc::new(SilentAfterImages {
+        stalls,
+        requests: Default::default(),
+    });
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(StreamScript(provider.clone())));
+    let loop_config = format!(
+        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?}, stream_idle_ms = 300000, stream_first_content_ms = 600000 }}",
+        root = dir.to_string_lossy()
+    );
+    let mut app = App::new(
+        registry,
+        tree(
+            &dir,
+            &[
+                "[[patch]]\nid = \"llm\"\nname = \"recovery-stream-script\"\nconfig = {}",
+                &loop_config,
+            ],
+        ),
+    );
+    app.start().await.unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    app.context()
+        .require::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .register(Arc::new(ImageMutation(count.clone())))
+        .unwrap();
+    (app, provider, count)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn actual_content_idle_after_image_tools_recovers_twice_then_succeeds_or_stops() {
+    for stalls in [2, 3] {
+        let (app, provider, count) = silent_image_app(stalls).await;
+        let started = Instant::now();
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            outcome.stop,
+            if stalls == 2 {
+                StopReason::Stopped
+            } else {
+                StopReason::Timeout
+            }
+        );
+        // Each idle deadline is 300s; the only extra time is 1s + 2s backoff.
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(stalls as u64 * 300 + 3)
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the mutation must never run twice"
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), if stalls == 2 { 5 } else { 4 });
+        for messages in requests.iter().skip(1) {
+            assert!(messages
+                .iter()
+                .flat_map(|m| &m.images)
+                .any(|i| i.data.starts_with("iVBORw0KGgo")));
+            assert!(!messages
+                .iter()
+                .any(|m| m.reasoning.as_deref() == Some("inspect the saved image")));
+        }
+        let log = app.context().only_session().unwrap();
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::ToolStarted { .. }))
+                .count(),
+            1
+        );
+        let display = atomcode_kernel::session::derive_messages_with_meta(&log.events());
+        assert_eq!(
+            display
+                .iter()
+                .filter(|m| m.reasoning.as_deref() == Some("inspect the saved image"))
+                .count(),
+            stalls
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelling_actual_content_idle_or_its_backoff_never_reissues_the_request() {
+    for cancel_after in [Duration::from_secs(100), Duration::from_millis(300_500)] {
+        let (app, provider, count) = silent_image_app(2).await;
+        let agent = atomcode_harness::create_agent(&app).await.unwrap();
+        agent.send("go");
+        let started = Instant::now();
+        let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
+            tokio::time::sleep(cancel_after).await;
+            agent.interrupt();
+        });
+        assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
+        assert_eq!(started.elapsed(), cancel_after);
+        tokio::time::sleep(Duration::from_secs(1000)).await;
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -2308,6 +2894,24 @@ async fn a_partial_tool_fold_keeps_the_summary_failure_when_the_ladder_is_exhaus
     );
     assert!(error.contains("AI summary failed"), "{error}");
     assert!(error.contains("context_window=30000"), "{error}");
+    let notice = log
+        .events()
+        .into_iter()
+        .find_map(|event| match event.event {
+            SessionEvent::Notice {
+                notice: atomcode_harness::session::NoticeKind::OverflowCompacted,
+                detail,
+                ..
+            } => Some(detail),
+            _ => None,
+        })
+        .expect("tool reduction is visible");
+    assert!(notice.contains("tool output reduced"), "{notice}");
+    assert!(notice.contains("estimated tokens; step 1/1"), "{notice}");
+    assert!(
+        !notice.contains("summary completed"),
+        "a tool fold must not claim summary success"
+    );
     assert!(
         log.derive_messages()
             .iter()

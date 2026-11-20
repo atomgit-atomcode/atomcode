@@ -98,6 +98,12 @@ pub fn format_compaction_diagnostic(
 ) -> String {
     let reason = t(match code {
         "summary_timed_out" => Msg::CompactSummaryTimedOut,
+        "summary_context_exceeded" => Msg::CompactSummaryContextExceeded,
+        "summary_incomplete" => Msg::CompactSummaryIncomplete,
+        "summary_request_failed" => Msg::CompactSummaryRequestFailed,
+        "summary_authentication_failed" => Msg::CompactSummaryAuthenticationFailed,
+        "summary_request_rejected" => Msg::CompactSummaryRequestRejected,
+        "summary_rate_limited" => Msg::CompactSummaryRateLimited,
         "not_smaller" => Msg::CompactNotSmaller,
         _ => Msg::CompactSummaryFailed,
     });
@@ -144,6 +150,18 @@ mod tests {
             let timeout = format_compaction_diagnostic("summary_timed_out", 100, 100, false);
             let refused = format_compaction_diagnostic("not_smaller", 100, 100, false);
             let reduced = format_compaction_diagnostic("summary_failed", 100, 50, true);
+            for code in [
+                "summary_context_exceeded",
+                "summary_incomplete",
+                "summary_request_failed",
+                "summary_authentication_failed",
+                "summary_request_rejected",
+                "summary_rate_limited",
+            ] {
+                let specific = format_compaction_diagnostic(code, 100, 100, false);
+                assert_ne!(specific, failed);
+                assert_ne!(specific, timeout);
+            }
             assert_ne!(failed, timeout);
             assert_ne!(failed, refused);
             assert_ne!(failed, reduced);

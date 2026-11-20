@@ -374,6 +374,7 @@ pub(crate) fn attach(
                     if !watched.tell_unavailable(reason) {
                         continue;
                     }
+                    watched.redescribe();
                     if let Some(event) =
                         translate(CodingRuntimeEvent::ProviderUnavailable { reason, forced })
                     {
@@ -1288,6 +1289,11 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
         }
         // 没有可用的 provider。话与「改去哪里」都已经有现成的 ——
         // `readiness_for` 就是干这个的,只是只在开屏那一次被问过。
+        // The explicit sign-out command already confirms success in the transcript.
+        CodingRuntimeEvent::ProviderUnavailable {
+            reason: ProviderUnavailableReason::SignedOut,
+            ..
+        } => None,
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
             match readiness_for(Some(reason)) {
                 HostReply::Readiness { why: Some(why), .. } => Some(said(why.into())),
@@ -1696,9 +1702,16 @@ impl RuntimeControl {
                         needs_newer_version: entry.needs_newer_version,
                         scheduled: entry.origin
                             == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
+                        held: None,
                     },
                 )
             })
+            .collect();
+        let sessions_root =
+            SessionManager::sessions_root(atomcode_coding::config::product_dirs_from_env().user());
+        let buckets: std::collections::HashMap<String, String> = all
+            .iter()
+            .map(|(bucket, session)| (session.id.clone(), bucket.clone()))
             .collect();
         let here_bucket = working_dir.as_deref().map(|dir| {
             SessionManager::project_hash(
@@ -1707,8 +1720,37 @@ impl RuntimeControl {
             )
         });
         let mut sessions = scope_sessions(all, working_dir.as_deref(), here_bucket.as_deref());
+        // Only the rows the picker shows are probed: a lease and a log tail each.
+        for session in &mut sessions {
+            if let Some(bucket) = buckets.get(&session.id) {
+                session.held = held_activity(
+                    &SessionManager::with_root(sessions_root.join(bucket)),
+                    &session.id,
+                );
+            }
+        }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions
+    }
+}
+
+/// What another runtime holding `id` is doing with it. A failed probe leaves
+/// the row unmarked: the mark is a hint, resuming still decides.
+fn held_activity(
+    bucket: &atomcode_capabilities::session::SessionManager,
+    id: &str,
+) -> Option<atomcode_host_api::HeldActivity> {
+    use atomcode_capabilities::session::SessionActivity;
+    use atomcode_host_api::HeldActivity;
+    match bucket.activity(id) {
+        Ok(Some(SessionActivity::Open)) => Some(HeldActivity::Open),
+        Ok(Some(SessionActivity::Running)) => Some(HeldActivity::Running),
+        Ok(Some(SessionActivity::Waiting)) => Some(HeldActivity::Waiting),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(session = id, %error, "session activity probe failed");
+            None
+        }
     }
 }
 
@@ -2121,13 +2163,7 @@ impl HostControl for RuntimeControl {
                 let scan = SessionManager::scan_all(
                     atomcode_coding::config::product_dirs_from_env().user(),
                 );
-                let Some(entry) = scan
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id == target && entry.message_count > 0)
-                else {
-                    return Err(HostError::NotFound);
-                };
+                let entry = find_switchable_entry(&scan.entries, &target)?;
                 if entry.needs_newer_version {
                     return Err(HostError::Failed {
                         message: format!(
@@ -2891,7 +2927,7 @@ impl HostControl for RuntimeControl {
                         message: error.to_string(),
                     })?;
                 self.handle
-                    .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+                    .deactivate_provider(ProviderUnavailableReason::SignedOut)
                     .await
                     .map_err(refused)?;
                 Ok(HostReply::Done)
@@ -3272,20 +3308,9 @@ pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
                 fix: None,
             }
         }
-        Some(ProviderUnavailableReason::NotConfigured) => {
-            // Nothing is run for the person: the sentence names `/login` and
-            // `/provider`, and they pick. It says "in the atomcode terminal"
-            // because the same sentence reaches ACP clients (a refused send,
-            // the runtime's `ProviderUnavailable`), which offer neither. This used to name the first-run
-            // wizard (`tui_onboarding`), which the screen then opened on its
-            // own at every start without a provider — a full-screen walkthrough
-            // over someone who only needed to sign in. `/onboarding` is still
-            // there to type.
-            (tr(SMsg::NoProviderConfigured), None)
-        }
-        Some(ProviderUnavailableReason::AuthenticationRequired) => {
-            (tr(SMsg::LoginExpired), Some("login"))
-        }
+        Some(ProviderUnavailableReason::NotConfigured) => (tr(SMsg::NoProviderConfigured), None),
+        Some(ProviderUnavailableReason::SignedOut) => (tr(SMsg::SignedOutHint), None),
+        Some(ProviderUnavailableReason::AuthenticationRequired) => (tr(SMsg::LoginExpired), None),
         Some(ProviderUnavailableReason::UnsupportedBuild) => {
             (tr(SMsg::ProviderUnsupportedByBuild), None)
         }
@@ -3323,6 +3348,22 @@ fn file_change(
     }
 }
 
+/// The destination of a session switch, looked up in the catalog. A
+/// session with no messages is found but not switchable: say so, instead of
+/// answering "not found" for a session that exists.
+pub(crate) fn find_switchable_entry<'a>(
+    entries: &'a [atomcode_capabilities::session::CatalogEntry],
+    target: &str,
+) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
+    match entries.iter().find(|entry| entry.id == target) {
+        Some(entry) if entry.message_count > 0 => Ok(entry),
+        Some(_) => Err(HostError::Failed {
+            message: "That session has no messages yet, so there is nothing to switch to.".into(),
+        }),
+        None => Err(HostError::NotFound),
+    }
+}
+
 pub fn refused(error: RuntimeError) -> HostError {
     {
         match error {
@@ -3337,7 +3378,8 @@ pub fn refused(error: RuntimeError) -> HostError {
                     ProviderUnavailableReason::NotConfigured => {
                         atomcode_host_api::ProviderUnavailableReason::NotConfigured
                     }
-                    ProviderUnavailableReason::AuthenticationRequired => {
+                    ProviderUnavailableReason::AuthenticationRequired
+                    | ProviderUnavailableReason::SignedOut => {
                         atomcode_host_api::ProviderUnavailableReason::AuthenticationRequired
                     }
                     ProviderUnavailableReason::UnsupportedBuild => {
@@ -3647,6 +3689,38 @@ fn catalog_tool(listing: atomcode_harness::seams::ToolListing) -> atomcode_host_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_switchable_entry_tells_missing_from_empty() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+        fn entry(id: &str, message_count: usize) -> CatalogEntry {
+            CatalogEntry {
+                id: id.into(),
+                name: String::new(),
+                fork_root_id: None,
+                project_bucket: "bucket".into(),
+                working_dir: std::path::PathBuf::from("/tmp"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                message_count,
+                turn_count: 0,
+                presence: CatalogPresence::NativeOnly,
+                needs_newer_version: false,
+                origin: atomcode_capabilities::session::manager::SessionOrigin::Manual,
+            }
+        }
+        let entries = vec![entry("empty", 0), entry("full", 2)];
+        assert!(matches!(
+            find_switchable_entry(&entries, "ghost"),
+            Err(HostError::NotFound)
+        ));
+        assert!(matches!(
+            find_switchable_entry(&entries, "empty"),
+            Err(HostError::Failed { message }) if message.contains("no messages")
+        ));
+        let found = find_switchable_entry(&entries, "full").expect("switchable");
+        assert_eq!(found.id, "full");
+    }
 
     /// 运行时说了话的事件,不能在转给屏幕的路上被 `_ => None` 吃掉。
     ///

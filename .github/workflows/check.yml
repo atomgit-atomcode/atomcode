@@ -92,6 +92,52 @@ jobs:
         continue-on-error: true
         run: cargo test --workspace --doc
 
+  webui:
+    name: webui unit + e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install webui dependencies
+        run: npm ci --prefix webui
+
+      # BLOCKING. The webui unit tests are pure node — no browser, no daemon —
+      # so they are cheap enough to gate every PR on. They include the
+      # composer-collapse guards that keep the mobile toolbar reachable.
+      - name: webui unit tests
+        run: npm test --prefix webui
+
+      - name: Typecheck webui
+        run: npm run typecheck --prefix webui
+
+      # The browser e2e runs against the built bundle, so it needs the build
+      # first. The script picks Playwright's bundled chromium off a non-darwin
+      # runner, and MOBILE_COLLAPSE_BROWSER overrides the local Chrome.
+      - name: Build webui
+        run: npm run build --prefix webui
+
+      - name: Install Playwright chromium
+        run: npx --prefix webui playwright install --with-deps chromium
+
+      # Report-only for now, on the same contract as the nextest and clippy
+      # steps above: the suite has not yet run on a Linux runner, and a gate
+      # that has never been green should not be able to fail a PR.
+      # PROMOTE THIS: once a run is green here, delete the
+      # `continue-on-error` line below — a test gate that cannot fail a PR is
+      # not a gate.
+      - name: mobile composer collapse e2e
+        continue-on-error: true
+        run: npm run test:mobile-model-collapse --prefix webui
+
   lint:
     name: fmt (blocking) + clippy (report only)
     runs-on: ubuntu-latest

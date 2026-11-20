@@ -491,6 +491,8 @@ pub struct Moment {
     pub suggestion: Option<String>,
     pub scroll: ScrollPos,
     pub scrollbar_mode: ScrollbarMode,
+    /// Inverted so a default screen wraps diffs without a launcher override.
+    pub clip_diff: bool,
     pub scrollbar_until: Option<tokio::time::Instant>,
     pub scrollbar_dragging: bool,
     /// What the pointer has selected, if anything. Screen state, not a fact —
@@ -786,6 +788,8 @@ pub struct Moment {
     /// a module that folded "is a question waiting?" from facts would be folding
     /// something that is not in them. See `modules::ask`.
     pub asking: Option<Ask>,
+    /// A tool approval rendered in the stream when the panel row is absent.
+    pub(crate) fallback_approval: Option<Ask>,
     /// The password a running process is blocked on, if one is being asked for:
     /// the asking program's own words, and how many characters have been typed.
     ///
@@ -990,9 +994,9 @@ pub struct Moment {
     /// It must not be written into a member's conversation.
     pub held_goal_end: Option<HeldGoalEnd>,
     /// 开屏时问到的「现在发不出回合」的原因(没有可用 provider、登录过期……),
-    /// `None` 是能发。画在状态行里、常挂着,而不是写进对话流顶上:和 tuix 一样,
-    /// 页面照常打开(欢迎块照画),原因在底下。agent 起来(`Described`)时清掉。
+    /// 输入框上方显示恢复提示，模型可用时清空。
     pub unready: Option<String>,
+    pub(crate) model_setup_required: bool,
     /// 有更新的版本时状态行那一句(启动器给的原话,`None` 是没有或没问到)。
     pub update: Option<String>,
     /// The installation changed while this process stayed alive. Shown above the

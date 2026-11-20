@@ -17,6 +17,7 @@ import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
 import { mergeOptimisticSession } from '../lib/sessionList';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
+import { pollSessionActivity, sessionActivityBadge } from '../lib/sessionActivity';
 import { sidebarRelativeTime } from '../lib/sidebarTime';
 import {
   loadSidebarViewMode,
@@ -322,6 +323,9 @@ function BellGlyph() {
     </svg>
   );
 }
+
+/** How often the open groups' session activity is re-read. */
+const SESSION_ACTIVITY_POLL_MS = 5_000;
 
 export function Sidebar({
   runningSessionId,
@@ -659,6 +663,39 @@ export function Sidebar({
     loadSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey, viewMode, projectHash]);
+
+  // A session another runtime holds — a TUI in another terminal — starts and
+  // ends turns without telling this page. Re-read the activity of the open
+  // groups' rows (only that field, so rows never jump or flash a spinner).
+  useEffect(() => {
+    if (viewMode !== 'workspace' || collapsed) return;
+    const hashes = [...expandedProjects].filter((hash) => loadedProjects.has(hash));
+    if (hashes.length === 0) return;
+    return pollSessionActivity({
+      hashes,
+      delay: SESSION_ACTIVITY_POLL_MS,
+      hidden: () => document.hidden,
+      load: listProjectSessions,
+      apply: (hash, list) => {
+        const activity = new Map(list.map((session) => [session.id, session.activity]));
+        setSessions((current) => {
+          let changed = false;
+          const next = current.map((session) => {
+            if (session.project_hash !== hash || !activity.has(session.id)) return session;
+            const now = activity.get(session.id);
+            if (now === session.activity) return session;
+            changed = true;
+            return { ...session, activity: now };
+          });
+          return changed ? next : current;
+        });
+      },
+      schedule: (task, delay) => {
+        const timer = window.setTimeout(task, delay);
+        return () => window.clearTimeout(timer);
+      },
+    });
+  }, [viewMode, collapsed, expandedProjects, loadedProjects]);
 
   // A real project switch makes the new working directory the sole expanded
   // group. Other projects remain visible as collapsed peer rows.
@@ -1350,6 +1387,7 @@ export function Sidebar({
   const renderItem = (s: SessionMetaWithProject) => {
     const active = s.id === activeSessionId;
     const label = s.name || s.id.slice(0, 8);
+    const activity = sessionActivityBadge(s.activity, s.id === runningSessionId, active);
     return (
       <div
         key={s.id}
@@ -1362,7 +1400,10 @@ export function Sidebar({
       >
         <SessionHoverCard title={label} directory={s.working_dir} onSelect={() => onSelect(s)}>
           <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
-          {s.id === runningSessionId && <span class="session-running-mark">{t('browse.running')}</span>}
+          {activity === 'running' && <span class="session-running-mark">{t('browse.running')}</span>}
+          {activity === 'waiting' && <span class="session-running-mark">{t('browse.waiting')}</span>}
+          {/* This page holds its own session open; only another holder is news. */}
+          {activity === 'open' && <span class="session-running-mark session-open-mark" title={t('browse.openElsewhereHint')}>{t('browse.openElsewhere')}</span>}
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>

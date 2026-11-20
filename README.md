@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.2.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.2.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -350,17 +350,12 @@ By default credentials (`auth.toml`, `mcp.json`, `config.toml`, `ATOMCODE.md`) a
 atomcode
 ```
 
-On first run, a setup wizard will guide you through configuring your LLM provider:
+On first launch without a configured provider, choose how to connect a model:
 
-```
-Welcome to AtomCode! Let's set up your first provider.
+1. **Sign in with AtomGit** to claim free Coding Plan credits.
+2. **Connect your own model provider** to use a third-party or self-hosted model.
 
-Select provider:
-  [1] Claude (Anthropic)
-  [2] OpenAI
-  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
-  [4] Ollama (local)
-```
+Use the arrow keys and Enter to choose. Press Esc while waiting for AtomGit authorization to return to the choices. The chat input appears once a model is ready.
 
 ### 2. Configuration
 
@@ -585,7 +580,6 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/reload` | Reload `~/.atomcode/config.toml` from disk |
 | `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
 | `/setup` | First run: install the recommended skill and run it |
-| `/welcome` | Re-run the onboarding wizard |
 | `/language` | Switch display and default Git commit-message language |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |

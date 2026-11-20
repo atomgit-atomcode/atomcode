@@ -13,6 +13,7 @@ export function CompactionHistory(props: {
   viewport: () => HTMLElement | null;
   onBeforeRead: () => void;
   onWindow: (active: boolean, showLive: boolean, liveStart: number) => void;
+  isNavigating?: () => boolean;
   onNavigate: (node: HTMLElement) => void;
   onReadingTurn?: (turnId: number | null) => void;
   renderTurn: (turn: TranscriptTurn, onEdges: (before: boolean, after: boolean) => void) => ComponentChildren;
@@ -167,7 +168,7 @@ export function CompactionHistory(props: {
         if (y <= line && (!reading || y > reading.top)) reading = { id, top: y, bottom: rect.bottom };
       }
       latest.current.onReadingTurn?.(reading && reading.bottom > line ? reading.id : null);
-      if (performance.now() < ignoreScrollUntil.current) { previous = top; return; }
+      if (performance.now() < ignoreScrollUntil.current || latest.current.isNavigating?.()) { previous = top; return; }
       if (top < previous) older();
       else if (top > previous && viewport.scrollHeight - top - viewport.clientHeight < 160 && windowRef.current) newer();
       previous = top;

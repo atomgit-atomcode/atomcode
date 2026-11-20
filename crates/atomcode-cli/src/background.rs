@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use atomcode_capabilities::session::manager::SessionOrigin;
 use atomcode_coding::front_end::FrontEnd;
-use atomcode_coding::runtime::{RuntimeMode, RuntimePhase, UserInput};
+use atomcode_coding::runtime::{RuntimePhase, UserInput};
 use atomcode_coding::{CodingAgentConfig, CodingRuntime};
 use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
@@ -34,7 +34,7 @@ use atomcode_kernel::session::{LoggedEvent, SessionEvent};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
-use crate::host::{HostConfig, RuntimeControl};
+use crate::host::{find_switchable_entry, HostConfig, RuntimeControl};
 
 /// 后台最多放这么多个会话。与 tuix 一致。
 pub const MOST: usize = 16;
@@ -114,6 +114,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
         working_dir: &std::path::Path,
         task: String,
         scope: Option<String>,
+        files: usize,
     ) -> Option<Result<atomcode_review::DelegatedReview, String>> {
         let background = self
             .home
@@ -129,6 +130,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
                 task,
                 scope,
                 Some("code-review".to_string()),
+                files,
             )
             .await
         {
@@ -217,8 +219,9 @@ struct Track {
 /// `None` = 这里问不出来(不在 git 仓库里、没有那个 base、或 git 不在):那就不说数,
 /// 而不是说一个谁都没量过的 0。`scope` 就是 `/review` 自己的词汇 —— 一行说"范围是
 /// 未提交的改动",另一行说"X 个文件",两处不能各算一半。
-fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
-    let mut git = std::process::Command::new("git");
+async fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
+    let mut git = tokio::process::Command::new("git");
+    git.kill_on_drop(true);
     git.current_dir(dir);
     match scope {
         "staged" => {
@@ -226,7 +229,7 @@ fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
         }
         "working_tree" => {
             // `status`,不是 `diff`:这次还没提交的包括还没被 git 看见的那些新文件。
-            git.args(["status", "--porcelain"]);
+            git.args(["status", "--porcelain", "-uall"]);
         }
         // `-` 开头的是 git 的选项,不是 ref:`/review --output=x` 会让 git 写一个
         // 文件。TUI 已经不把它当范围,这里再挡一次 —— 这条命令收的是任何宿主。
@@ -238,7 +241,10 @@ fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
             git.args(["diff", "--name-only", &range]);
         }
     }
-    let out = git.output().ok()?;
+    let out = tokio::time::timeout(std::time::Duration::from_secs(3), git.output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -315,6 +321,11 @@ impl Track {
     /// 记下一件事。返回面板要不要重画。
     fn saw(&mut self, event: &AgentEvent) -> bool {
         match event {
+            AgentEvent::TurnStarted { .. } => {
+                self.error = None;
+                self.ended = None;
+                true
+            }
             AgentEvent::Request { .. } => {
                 self.pending = Some(event.clone());
                 true
@@ -668,6 +679,17 @@ fn name_of(log: &[LoggedEvent]) -> String {
         .unwrap_or_default()
 }
 
+fn review_title(scope: Option<&str>) -> String {
+    use atomcode_i18n::screen::{t, Msg};
+    let scope = match scope {
+        None => return "code-review".into(),
+        Some("working_tree") => t(Msg::ReviewWhatUncommitted),
+        Some("staged") => t(Msg::ReviewWhatStaged),
+        Some(base) => t(Msg::ReviewWhatRange { base }),
+    };
+    format!("code-review · {scope}")
+}
+
 /// 一行里放得下的一句:第一行非空的,压掉首尾空白。
 fn one_line(text: &str) -> Option<String> {
     text.lines()
@@ -928,9 +950,22 @@ async fn stop(live: Live) {
     let handle = live.control.runtime().clone();
     if in_turn(&live) {
         // 取消失败不挡停:停本身也会把回合带走,取消只是让它以「被打断」落盘。
-        let _ = handle.cancel().await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.cancel()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "background cancel failed; proceeding to runtime shutdown")
+            }
+            Err(_) => tracing::warn!(
+                "background cancel exceeded five seconds; proceeding to runtime shutdown"
+            ),
+        }
     }
-    let _ = handle.shutdown().await;
+    // Keep awaiting the owner's terminal: it is published only after kernel,
+    // transport and session-lease cleanup. Dropping this wait on a timer would
+    // allow an editor to outlive its slot and a replacement to race its lease.
+    if let Err(error) = handle.shutdown().await {
+        tracing::warn!(%error, "background runtime shutdown unavailable");
+    }
 }
 
 impl Background {
@@ -1036,6 +1071,11 @@ impl Background {
                         for _ in 0..SETTLE_TRIES {
                             if holds_note_from(&home, &sender) {
                                 came_home_now(&mark, &sender);
+                                return;
+                            }
+                            // Never mark an unconfirmed delivery as received. A retired
+                            // home cannot add another fact; leave the result recoverable.
+                            if home.runtime().is_stopped() || home.front_end().app().is_none() {
                                 return;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1178,10 +1218,9 @@ impl Background {
                     if lead {
                         state.gate = true;
                     }
-                    let waiting = lead
-                        && state.front.control.runtime().status().phase
-                            == RuntimePhase::WaitingApproval;
-                    let pending = waiting
+                    // Request publication can precede the phase watch update.
+                    // Track is the authority for an unanswered live request.
+                    let pending = lead
                         .then(|| {
                             state
                                 .front
@@ -1244,6 +1283,7 @@ impl Background {
                 // Which session is in front, read **before** the stop goes out:
                 // after it the App is gone and its log with it.
                 self.record_exit_front();
+                self.settle_before_exit();
                 let front = self.front_commands();
                 let _ = front.send(command);
                 if let Some(me) = self.me.upgrade() {
@@ -1667,7 +1707,8 @@ impl Background {
         }
         .working_dir_now()
         .await;
-        self.start_locked(working_dir, text, scope, None).await
+        self.start_locked(working_dir, text, scope, None, None)
+            .await
     }
 
     /// [`Self::start`],替 `front_end` 那个 runtime —— 只在它**此刻**就是前台那个时。
@@ -1687,6 +1728,7 @@ impl Background {
         text: String,
         scope: Option<String>,
         name: Option<String>,
+        files: usize,
     ) -> Result<Option<HostReply>, HostError> {
         let Ok(_op) = self.op.try_lock() else {
             return Ok(None);
@@ -1708,7 +1750,7 @@ impl Background {
         // The parent's request is context, not another assignment. In
         // particular, its authorized edits/commit/PR remain the parent's job.
         let text = review_task(request.as_deref(), &text);
-        self.start_locked(working_dir, text, scope, name)
+        self.start_locked(working_dir, text, scope, name, Some(files))
             .await
             .map(Some)
     }
@@ -1720,6 +1762,7 @@ impl Background {
         text: String,
         scope: Option<String>,
         name: Option<String>,
+        confirmed_files: Option<usize>,
     ) -> Result<HostReply, HostError> {
         let control = {
             let state = self.state.lock().expect("background poisoned");
@@ -1731,25 +1774,49 @@ impl Background {
         // Read the live owner's mode, not the launch-time configuration. Take
         // one snapshot for this new task; later changes do not alter it.
         let review_only = scope.is_some() || name.as_deref() == Some("code-review");
-        let mode = if review_only {
-            RuntimeMode::Plan
-        } else {
-            control
-                .runtime()
-                .mode()
-                .await
-                .map_err(crate::host::refused)?
-        };
+        // ReviewHandoffRow confines an unopened review to its read-only reviewer;
+        // its approval mode still follows the conversation that assigned it.
+        let mode = control
+            .runtime()
+            .mode()
+            .await
+            .map_err(crate::host::refused)?;
         // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
-        let files = scope
-            .as_deref()
-            .and_then(|scope| changed_files(&working_dir, scope));
+        let files = match (confirmed_files, scope.as_deref()) {
+            (Some(files), _) => Some(files),
+            (None, Some(scope)) => changed_files(&working_dir, scope).await,
+            (None, None) => None,
+        };
         let mut live = self.spawn_at(working_dir.clone()).await?;
         // Configure before publishing the slot or submitting any work. Failure
         // retires the candidate and never runs it with a fallback permission.
         if let Err(error) = live.control.runtime().set_mode(mode).await {
             stop(live).await;
             return Err(crate::host::refused(error));
+        }
+        if review_only {
+            // Name the assignment before its first prompt can launch the model
+            // titler. The same logged fact serves the panel and resumed sessions.
+            let session = live.control.session_id();
+            let agent = live
+                .control
+                .front_end()
+                .app()
+                .and_then(|app| Feed::find(&app, &session));
+            let Some(agent) = agent else {
+                stop(live).await;
+                return Err(HostError::Unavailable);
+            };
+            let log = agent.session();
+            atomcode_harness::session::commit(
+                agent.ctx(),
+                &log,
+                SessionEvent::Titled {
+                    turn: log.current_turn(),
+                    title: review_title(scope.as_deref()),
+                    user_set: false,
+                },
+            );
         }
         // 它是替**前台那个**干的:干完把结果投回去,而不是留在这里等人来读。
         live.origin = control.session_id();
@@ -1949,22 +2016,6 @@ impl HostControl for Background {
         let (tx, rx) = mpsc::unbounded_channel();
         self.watchers.lock().expect("watchers poisoned").push(tx);
         rx
-    }
-}
-
-/// The destination of a shared project switch, looked up in the catalog. A
-/// session with no messages is found but not switchable: say so, instead of
-/// answering "not found" for a session that exists.
-fn find_switchable_entry<'a>(
-    entries: &'a [atomcode_capabilities::session::CatalogEntry],
-    target: &str,
-) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
-    match entries.iter().find(|entry| entry.id == target) {
-        Some(entry) if entry.message_count > 0 => Ok(entry),
-        Some(_) => Err(HostError::Failed {
-            message: "That session has no messages yet, so there is nothing to switch to.".into(),
-        }),
-        None => Err(HostError::NotFound),
     }
 }
 
@@ -2186,43 +2237,11 @@ mod tests {
         assert!(!fallback.contains("internal detail"), "{fallback}");
     }
 
-    #[test]
-    fn find_switchable_entry_tells_missing_from_empty() {
-        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
-        fn entry(id: &str, message_count: usize) -> CatalogEntry {
-            CatalogEntry {
-                id: id.into(),
-                name: String::new(),
-                fork_root_id: None,
-                project_bucket: "bucket".into(),
-                working_dir: std::path::PathBuf::from("/tmp"),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                message_count,
-                turn_count: 0,
-                presence: CatalogPresence::NativeOnly,
-                needs_newer_version: false,
-                origin: atomcode_capabilities::session::manager::SessionOrigin::Manual,
-            }
-        }
-        let entries = vec![entry("empty", 0), entry("full", 2)];
-        assert!(matches!(
-            find_switchable_entry(&entries, "ghost"),
-            Err(HostError::NotFound)
-        ));
-        assert!(matches!(
-            find_switchable_entry(&entries, "empty"),
-            Err(HostError::Failed { message }) if message.contains("no messages")
-        ));
-        let found = find_switchable_entry(&entries, "full").expect("switchable");
-        assert_eq!(found.id, "full");
-    }
-
     /// 范围里有几个文件在变,是真的去问 git。
     ///
     /// 三种范围各过一遍:这个数是给人读的("这次有 2 个文件在变"),编不出来。
-    #[test]
-    fn a_scope_counts_the_files_it_touches() {
+    #[tokio::test]
+    async fn a_scope_counts_the_files_it_touches() {
         if std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -2247,28 +2266,32 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one").expect("write");
         std::fs::write(dir.join("b.txt"), "two").expect("write");
         assert_eq!(
-            changed_files(&dir, "working_tree"),
+            changed_files(&dir, "working_tree").await,
             Some(2),
             "两个还没提交的文件,包括 git 还没看见的那个"
         );
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/c.txt"), "three").unwrap();
+        std::fs::write(dir.join("nested/d.txt"), "four").unwrap();
+        assert_eq!(changed_files(&dir, "working_tree").await, Some(4));
         git(&["add", "a.txt"]);
-        assert_eq!(changed_files(&dir, "staged"), Some(1));
+        assert_eq!(changed_files(&dir, "staged").await, Some(1));
         git(&["add", "b.txt"]);
         git(&["commit", "-qm", "one"]);
         std::fs::write(dir.join("b.txt"), "two again").expect("write");
         git(&["add", "b.txt"]);
         git(&["commit", "-qm", "two"]);
         assert_eq!(
-            changed_files(&dir, "HEAD~1"),
+            changed_files(&dir, "HEAD~1").await,
             Some(1),
             "已提交的那一段:HEAD~1..HEAD 只动了 b.txt"
         );
         // 一个选项不是 ref:交给 git 就成了 `--output=…`,它会去写那个文件。
-        assert_eq!(changed_files(&dir, "--output=written"), None);
+        assert_eq!(changed_files(&dir, "--output=written").await, None);
         assert!(!dir.join("written..HEAD").exists(), "git 没把它当选项");
         // 问不出来的地方说"问不出来",而不是一个谁都没量过的零。
         assert_eq!(
-            changed_files(std::path::Path::new("/"), "working_tree"),
+            changed_files(std::path::Path::new("/"), "working_tree").await,
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2413,6 +2436,23 @@ mod tests {
         assert!(failed.contains("review budget exhausted"));
         assert!(failed.contains("补充:第三处也要改"));
         assert!(failed.contains("不是成功结论") || failed.contains("not a successful conclusion"));
+    }
+
+    #[test]
+    fn a_new_turn_forgets_the_previous_error() {
+        let mut track = Track {
+            error: Some("previous failure".into()),
+            ended: Some(BackgroundState::Failed),
+            ..Track::default()
+        };
+        track.saw(&AgentEvent::TurnStarted { turn: Some(2) });
+        track.saw(&AgentEvent::TurnComplete {
+            turn: Some(2),
+            reason: StopReason::MaxRounds,
+            provider_failure: None,
+        });
+        assert!(track.error.is_none());
+        assert_eq!(track.ended, Some(BackgroundState::Failed));
     }
 
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。

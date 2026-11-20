@@ -1,5 +1,6 @@
 import { PromptHistory, promptHistoryDirection } from '../lib/promptHistory';
 import { HistoryLoading } from './HistoryLoading';
+import { TurnArtifactsCard } from './TurnArtifactsCard';
 import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
@@ -10,8 +11,10 @@ import { TaskSpecifications } from './TaskSpecifications';
 import { ApiCallError, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
-import { processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
+import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
+import { BrowseActivityStatus } from './BrowseActivityStatus';
+import { browseActiveTurn } from '../lib/browseTurn';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
 import { groupedTimelinePage } from '../lib/groupedTimeline.ts';
@@ -20,7 +23,7 @@ import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { detectSlashMenuQuery } from '../lib/slashCommands';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
-import type { LiveGoalProgress, LiveLoopProgress } from '../api';
+import type { LiveGoalProgress, LiveLoopProgress, SessionActivity } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -52,7 +55,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -70,7 +73,7 @@ import { CompactionHistory } from './CompactionHistory';
 import { historyMessages } from '../lib/inlineHistory';
 import { TurnNavRail } from './TurnNavRail';
 import type { TranscriptTurn } from '../api';
-import { deriveTurnNavigation, createTurnNavigationIntent } from '../lib/turnNavigation';
+import { deriveTurnNavigation, createTurnNavigationIntent, turnAtReadingSpan } from '../lib/turnNavigation';
 import { ModelSelector } from './ModelSelector';
 import { mayFollowModelDefault, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { ModeSelector } from './ModeSelector';
@@ -141,6 +144,7 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  retryDiagnostics?: string[];
   turnStop?: string;
   sourceSeq?: number;
   specPinned?: boolean;
@@ -199,13 +203,14 @@ function notificationDedupeKey(
 /** Zero-pad a local date/time component to 2 digits. */
 const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
 
-/** Format a message timestamp as a stable, always-visible local wall clock. */
-function formatMsgTime(ts: number | undefined): string {
+/** Local wall clock: compact user metadata, full dates for tooltips and replies. */
+function formatMsgTime(ts: number | undefined, compact = false): string {
   // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
   // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
   if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
+  if (compact) return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
@@ -299,6 +304,11 @@ interface ChatProps {
   browseSession?: SessionMetaWithProject | null;
   onReturnToBound?: () => void;
   onContinueBrowse?: () => void;
+  /** Set while another runtime (a TUI in another terminal) holds the browsed session. */
+  browseActivity?: SessionActivity | null;
+  onForkBrowse?: () => void;
+  browseForking?: boolean;
+  browseForkError?: string | null;
   onExecutionState?: (active: boolean) => void;
   sessionId: string | null;
   onSessionId: (id: string) => void;
@@ -488,7 +498,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, onForkSession, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseActivity, onForkBrowse, browseForking, browseForkError, onExecutionState, sessionId, onSessionId, onForkSession, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
@@ -621,20 +631,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [compacting, setCompacting] = useState(false);
-  const [summaryCount, setSummaryCount] = useState<number | null>(null);
   const summaryCountRef = useRef<number | null>(null);
   function resetSummaryCount() {
     summaryCountRef.current = null;
-    setSummaryCount(null);
   }
   function updateSummaryCount(count?: number, record = false) {
     const next = nextContextSummary(summaryCountRef.current, count, record);
     summaryCountRef.current = next.count;
-    setSummaryCount(next.count);
     if (next.notice) pushCommandNotice(t('context.summaryRecorded', { count: next.count! }), true);
   }
 
-  const latestSummaryIndex = messages.map(message => message.contextSummary === true).lastIndexOf(true);
   const [processExpanded, setProcessExpanded] = useState<Record<string, boolean>>({});
   const processReadIntent = useRef(false);
   const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
@@ -760,10 +766,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
   const turnAnchorRef = useRef<string | null>(null);
-  const turnSpaceRef = useRef<HTMLDivElement>(null);
   const positionedTurnRef = useRef<string | null>(null);
   const atBottomRef = useRef(true);
   const timelineScrollRef = useRef(0);
+  const timelineScrollbarDragRef = useRef(false);
   const timelineIgnoreScrollRef = useRef(0);
   const timelineTouchRef = useRef<number | null>(null);
   const timelineAnchorRef = useRef<{ index: number; top: number; start: number; before: boolean } | null>(null);
@@ -1170,13 +1176,50 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const pendingSwitch = switchReadyRef.current;
     const accepted = pendingSwitch?.id === loadId && pendingSwitch.generation === loadGeneration
       ? pendingSwitch.ready : undefined;
+    // Live snapshots replace history and abort its fetch. Detached-operation
+    // discovery must survive that replacement or the composer stays checking.
+    void loadAfterSessionSwitch(accepted,
+      () => activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration,
+      () => Promise.allSettled([getActiveChatSessions()]))
+      .then(results => {
+        if (!results || activeIdRef.current !== loadId || sessionGenerationRef.current !== loadGeneration) return;
+        const [activeResult] = results;
+        let nextHint: string | null = null;
+        if (activeResult.status === 'fulfilled') {
+          const active = activeResult.value.includes(loadId);
+          transitionChatRecovery({ type: 'active_check_succeeded', active });
+          if (active) {
+            requestIdRef.current = loadId;
+            if (!syncRef.current) setBusy(false);
+            setQueued([]);
+            nextHint = t('chat.detachedActive');
+            pushCommandNotice(t('chat.detachedActive'));
+          } else if (requestIdRef.current === loadId) {
+            requestIdRef.current = null;
+          }
+        } else {
+          // `/chat` has no stream reattach endpoint. The registry is authoritative
+          // when available; if discovery fails, keep the canonical stop alias and
+          // fail closed instead of allowing a possibly concurrent send.
+          requestIdRef.current = loadId;
+          transitionChatRecovery({ type: 'active_check_failed' });
+          if (!syncRef.current) setBusy(false);
+          setQueued([]);
+          nextHint = t('chat.activeCheckFailed', { error: String(activeResult.reason) });
+          pushCommandNotice(nextHint);
+          // Allow a later metadata/session refresh to retry discovery.
+          loadedForRef.current = null;
+        }
+
+        if (nextHint) setHistoryHint(nextHint);
+      });
     loadAfterSessionSwitch(accepted,
       () => !historyController.signal.aborted && activeIdRef.current === loadId
         && sessionGenerationRef.current === loadGeneration,
-      () => Promise.allSettled([getSessionPage(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
+      () => Promise.allSettled([getSessionPage(projectHash, loadId, historyController.signal)]))
       .then((results) => {
         if (!results || historyController.signal.aborted) return;
-        const [sessionResult, activeResult] = results;
+        const [sessionResult] = results;
         // Generation also covers A -> B -> A; id equality alone is insufficient.
         if (
           activeIdRef.current !== loadId ||
@@ -1223,31 +1266,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
         }
 
-        if (activeResult.status === 'fulfilled') {
-          const active = activeResult.value.includes(loadId);
-          transitionChatRecovery({ type: 'active_check_succeeded', active });
-          if (active) {
-            requestIdRef.current = loadId;
-            if (!syncRef.current) setBusy(false);
-            setQueued([]);
-            nextHint = t('chat.detachedActive');
-            pushCommandNotice(t('chat.detachedActive'));
-          } else if (requestIdRef.current === loadId) {
-            requestIdRef.current = null;
-          }
-        } else {
-          // `/chat` has no stream reattach endpoint. The registry is authoritative
-          // when available; if discovery fails, keep the canonical stop alias and
-          // fail closed instead of allowing a possibly concurrent send.
-          requestIdRef.current = loadId;
-          transitionChatRecovery({ type: 'active_check_failed' });
-          if (!syncRef.current) setBusy(false);
-          setQueued([]);
-          nextHint = t('chat.activeCheckFailed', { error: String(activeResult.reason) });
-          pushCommandNotice(nextHint);
-          // Allow a later metadata/session refresh to retry discovery.
-          loadedForRef.current = null;
-        }
 
         setHistoryHint(nextHint);
         setLoading(false);
@@ -1273,7 +1291,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       ? scrollRestorationRef.current.onScroll()
       : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
     if (atBottom === null) return;
-    if (!atBottom && timelineStart === null) setTimelineStart(range.start);
+    if (!atBottom && timelineStart === null) setTimelineStart(timeline.windowStart);
     if (atBottom && timelineStart !== null && range.end >= messages.length) setTimelineStart(null);
     atBottomRef.current = atBottom;
     setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
@@ -1312,18 +1330,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   useEffect(() => {
     const restore = createScrollRestoration({
       viewport: () => scrollRef.current,
-      prepareLayout: () => {
-        const viewport = scrollRef.current;
-        const space = turnSpaceRef.current;
-        if (!viewport || !space || viewport.clientHeight <= 0) return;
-        const anchor = Array.from(viewport.querySelectorAll<HTMLElement>('[data-turn-anchor]'))
-          .find(node => node.dataset.turnAnchor === turnAnchorRef.current);
-        const padding = getComputedStyle(viewport);
-        const available = viewport.clientHeight - parseFloat(padding.paddingTop) - parseFloat(padding.paddingBottom);
-        const content = anchor ? space.getBoundingClientRect().top - anchor.getBoundingClientRect().top : available;
-        const height = Math.max(0, Math.ceil(available - content));
-        if (space.style.height !== `${height}px`) space.style.height = `${height}px`;
-      },
       followingTop: bottom => {
         const viewport = scrollRef.current;
         if (!viewport || positionedTurnRef.current === turnAnchorRef.current) return bottom;
@@ -1372,6 +1378,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       window.removeEventListener('pageshow', pageshow);
       window.removeEventListener('resize', layout);
       window.visualViewport?.removeEventListener('resize', layout);
+    };
+  }, []);
+
+  useEffect(() => {
+    const release = () => { timelineScrollbarDragRef.current = false; };
+    window.addEventListener('pointerup', release);
+    window.addEventListener('pointercancel', release);
+    window.addEventListener('blur', release);
+    return () => {
+      window.removeEventListener('pointerup', release);
+      window.removeEventListener('pointercancel', release);
+      window.removeEventListener('blur', release);
     };
   }, []);
 
@@ -1777,6 +1795,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       case 'context_summary': return e;
       case 'context_compacting': return e;
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
+      case 'provider_retry': return { type: 'provider_retry', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
       case 'persistence_warning': return { type: 'persistence_warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
@@ -2412,7 +2431,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     setMessages(current=>current.map(message=>message.sourceSeq===seq?{...message,specPinned:pinned}:message));
   }
   async function chooseMessageSpec(message:Message) {
-    if(!sessionId||!message.sourceSeq||busyRef.current||specActionBusy)return;
+    if(!sessionId||busyRef.current||specActionBusy)return;
+    if(!message.sourceSeq){setSpecPicker('list');return;}
     if(!message.specPinned){setSpecPicker('show '+message.sourceSeq);return;}
     const generation=sessionGenerationRef.current;
     setSpecActionBusy(true);
@@ -2928,6 +2948,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           stopReason: 'error',
           sessionId: activeIdRef.current ?? undefined,
           message: event.message,
+        });
+        break;
+
+      case 'provider_retry':
+        // Presentation only: the server retains ownership of retries and termination.
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== 'assistant') return prev;
+          return [...prev.slice(0, -1), { ...last,
+            retryDiagnostics: [...(last.retryDiagnostics ?? []), event.message] }];
         });
         break;
 
@@ -3716,7 +3746,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true);
   const range = timeline.range;
   const page = useTimelinePage(messages,
-    historyDisplay.showLive ? timeline.indexes.filter(index => index >= liveFrom) : [], readTimelineMessage);
+    historyDisplay.showLive ? timeline.indexes.filter(index => index >= liveFrom) : [], readTimelineMessage,
+    `${sessionId}/${sessionGenerationRef.current}`);
   const visibleMessages = page.items.filter((item): item is { msg: Message; origIdx: number } => item.msg !== undefined);
   function showTimelinePage(start: number | null, preserve = false) {
     if (historyDisplay.active) {
@@ -3773,7 +3804,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         start: older.length + range.start, before: true,
       };
       atBottomRef.current = false;
-      setTimelineStart(older.length + range.start);
+      setTimelineStart(older.length + timeline.windowStart);
       setMessages(current => [...older, ...current]);
       setServerHistory({ session: id, cursor: detail.history_older, baseline: serverHistoryRef.current.baseline });
     } catch (error) {
@@ -3809,7 +3840,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const direction = top - timelineScrollRef.current;
     timelineScrollRef.current = top;
     recomputeAtBottom(); updateActiveTurn();
-    if (direction) pageTimeline(direction);
+    // Native clamping, anchoring and restoration also emit scroll events.
+    // Only an active scrollbar drag may turn those events into pagination.
+    if (direction && timelineScrollbarDragRef.current) pageTimeline(direction);
   }
   async function copyAssistantTurn(index: number): Promise<string> {
     const snapshot = messagesRef.current;
@@ -3838,25 +3871,47 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     new Set(pendingSteers.filter(steer => steer.confirmed).map(steer => steer.id))), [messages, pendingSteers]);
   function updateActiveTurn() {
     const el = scrollRef.current;
-    if (!el || navTurns.length === 0) return;
+    if (!el || page.loading || navTurns.length === 0) return;
+    // At the end of the live timeline, short replies may leave several older
+    // turns above the latest one. The bottom means the latest turn, regardless
+    // of which older prompt happens to intersect the top reading line.
+    if ((!historyDisplay.active || historyDisplay.showLive) && range.end === messages.length
+      && el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK) {
+      setActiveNavIndex(navTurns.length - 1);
+      return;
+    }
     const readingLine = el.getBoundingClientRect().top + 48;
     // Offscreen user anchors are intentionally unmounted. Only measure the
     // bounded visible slice; Infinity placeholders are not a sorted DOM index.
-    let index = Math.max(0, navTurns.findIndex(turn => turn.endIndex >= range.start));
-    for (let i = index; i < navTurns.length && navTurns[i].messageIndex < range.end; i++) {
+    const spans: { index: number; bottom: number }[] = [];
+    const start = Math.max(0, navTurns.findIndex(turn => turn.endIndex >= range.start));
+    for (let i = start; i < navTurns.length && navTurns[i].messageIndex < range.end; i++) {
       const turn = navTurns[i];
-      let node: HTMLElement | null | undefined;
+      let bottom: number | undefined;
       for (let j = Math.max(range.start, turn.messageIndex); j <= Math.min(range.end - 1, turn.endIndex); j++) {
-        const candidate = matchRefs.current[j];
-        if (candidate?.isConnected) { node = candidate; break; }
+        const node = matchRefs.current[j];
+        if (node?.isConnected) bottom = Math.max(bottom ?? -Infinity, node.getBoundingClientRect().bottom);
       }
-      if (node && node.getBoundingClientRect().top <= readingLine) index = i;
+      if (bottom !== undefined) spans.push({ index: i, bottom });
     }
-    setActiveNavIndex(previous => previous === index ? previous : index);
+    const index = turnAtReadingSpan(spans, readingLine);
+    if (index !== null) setActiveNavIndex(previous => previous === index ? previous : index);
   }
   function interactWithTimeline(event: Event) {
     processReadIntent.current = true;
-    if (timelineStart === null && !atBottomRef.current) setTimelineStart(range.start);
+    if (timelineStart === null && !atBottomRef.current) setTimelineStart(timeline.windowStart);
+    if (event.type === 'pointerdown') {
+      timelineScrollbarDragRef.current = event.target === scrollRef.current
+        && (event as PointerEvent).pointerType === 'mouse';
+    }
+    if (event.type === 'keydown') {
+      const key = event as KeyboardEvent;
+      const editing = (key.target as Element | null)?.closest('input, textarea, select, [contenteditable="true"]');
+      if (!editing && !key.ctrlKey && !key.metaKey && !key.altKey) {
+        if (['ArrowUp', 'PageUp', 'Home'].includes(key.key)) pageTimeline(-1);
+        if (['ArrowDown', 'PageDown', 'End'].includes(key.key)) pageTimeline(1);
+      }
+    }
     if (event.type === 'wheel') pageTimeline((event as WheelEvent).deltaY);
     if (event.type === 'touchstart') timelineTouchRef.current = (event as TouchEvent).touches[0]?.clientY ?? null;
     if (event.type === 'touchmove') {
@@ -3886,6 +3941,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   }
   function navigateTurn(messageIndex: number) {
+    // Resetting the live window can itself scroll before its anchor is mounted.
+    // Archive paging must ignore both this reflow and the subsequent smooth jump.
+    timelineIgnoreScrollRef.current = performance.now() + 800;
     const generation = sessionGenerationRef.current;
     setTimelineStart(targetTimelineStart(messages, messageIndex, limits.mounted, limits.pageBytes));
     setHistoryTarget(null); setHistoryReset(value => value + 1);
@@ -3911,9 +3969,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return () => { if (navFlashTimer.current) clearTimeout(navFlashTimer.current); };
   }, [navigationScope]);
   useEffect(() => {
+    // A page swap or process collapse can replace the visible turn without a
+    // scroll event (especially when it fits in the viewport). Wait for hydrated
+    // content and measure the new DOM instead of leaving the old rail marker.
+    if (page.loading) return;
     const frame = requestAnimationFrame(updateActiveTurn);
     return () => cancelAnimationFrame(frame);
-  }, [navTurns, navigationScope]);
+  }, [navTurns, navigationScope, range.start, range.end, page.loading, processExpanded, searchTrim]);
 
   useEffect(() => {
     if (navHighlight === null || page.loading) return;
@@ -4192,9 +4254,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               {(tokens.total / 1000).toFixed(1)}k tokens
             </span>
           )}
-          {summaryCount != null && summaryCount > 0 && (latestSummaryIndex >= 0
-            ? <button class="footer-tokens footer-summary-count" type="button" onClick={() => navigateTurn(latestSummaryIndex)}>{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</button>
-            : <span class="footer-tokens">{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</span>)}
         </div>
         <div class="input-footer-actions">
           <ModeSelector
@@ -4421,19 +4480,36 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
   if (browseSession) {
     const target = activeSession?.name || sessionId || '';
+    const localBusy = busy || hasBlockingInteraction;
+    // Held by another runtime: only a copy can be continued here.
+    const held = browseActivity ?? null;
+    const description = held === 'running' ? t('browse.heldRunning')
+      : held === 'waiting' ? t('browse.heldWaiting')
+      : held === 'open' ? t('browse.heldOpen')
+      : t(localBusy ? 'browse.background' : 'browse.ready', { name: target });
     return withInteraction(<>
-      <div class="session-browse-notice" role="status">
-        <div class="session-browse-summary">
-          <span class="session-browse-label">{t('browse.label')}</span>
-          <strong class="session-browse-title" title={browseSession.name}>{browseSession.name}</strong>
-          <span class="session-browse-description">{t(busy || hasBlockingInteraction ? 'browse.background' : 'browse.ready', { name: target })}</span>
-        </div>
-        <div class="session-browse-actions">
-          <button class="session-browse-return" onClick={onReturnToBound}>{t(busy || hasBlockingInteraction ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
-          {!busy && !hasBlockingInteraction && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession}
+        live={held === 'running' || held === 'waiting'}
+        renderMessages={(raw, viewport, executing) => <BrowseMessagesView messages={sessionMessagesToDisplay(raw, false)}
+          sessionId={browseSession.id} viewport={viewport} executing={executing}
+          activity={held === 'waiting' ? 'waiting' : held === 'running' ? 'running' : 'syncing'} />} />
+      <div class="input-container session-browse-composer">
+        <div class="session-browse-notice session-browse-card" role="status">
+          <svg class="session-browse-lock" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <rect x="5" y="10" width="14" height="11" rx="3" /><path d="M8 10V7a4 4 0 0 1 8 0v3" />
+          </svg>
+          <div class="session-browse-summary">
+            <strong class="session-browse-label">{t('browse.label')}</strong>
+            <span class="session-browse-description">{description}</span>
+            {browseForkError && <span class="session-browse-description" role="alert">{browseForkError}</span>}
+          </div>
+          <div class="session-browse-actions">
+            <button class="session-browse-return" onClick={onReturnToBound}>{t(localBusy ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
+            {!localBusy && held && <button class="session-browse-continue" disabled={browseForking} onClick={onForkBrowse}>{t('browse.forkContinue')}</button>}
+            {!localBusy && !held && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+          </div>
         </div>
       </div>
-      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession} />
       {blockingInteraction && <div class="interaction-dock-seat" ref={interactionSeat} aria-label={target}></div>}
     </>);
   }
@@ -4502,6 +4578,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           canLoadBefore={!serverHistory.cursor && (historyDisplay.active || range.start <= liveFrom)} compact={compactTimeline}
           focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null}
           viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onNavigate={navigateNode}
+          isNavigating={() => performance.now() < timelineIgnoreScrollRef.current}
           onWindow={(active, showLive, liveStart) => {
             setHistoryDisplay({ active, showLive, liveStart });
             if (!active) setActiveHistoryTurn(null);
@@ -4562,7 +4639,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                   isActiveSearchMatch={isActiveSearchMatch}
                   steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
                   onSpec={()=>void chooseMessageSpec(msg)}
-                  specDisabled={busy||specActionBusy||!msg.sourceSeq}
+                  specDisabled={busy||specActionBusy}
+                  onEdit={() => {
+                    setInput(current => [messageText(msg), current].filter(Boolean).join('\n'));
+                    if (msg.images?.length) setPendingImages(current => [...msg.images!, ...current]);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
                 />
               );
             }
@@ -4653,7 +4735,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           </div>
         )}
 
-        <div ref={turnSpaceRef} class="turn-reply-space" aria-hidden="true" />
         </div>
         {/* Zero-height sticky seat, following Harness: the control belongs to the
             conversation scroller and is centered on the same content lane. */}
@@ -4672,7 +4753,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       </div>
 
       <TurnNavRail key={`${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`}
-        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={activeHistoryTurn}
+        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={atBottomRef.current ? null : activeHistoryTurn}
         projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined}
         sessionId={sessionId ?? undefined} streaming={busy}
         onNavigate={navigateTurn} onHistory={navigateHistoricalTurn} />
@@ -4858,10 +4939,79 @@ function TodoProgressPanel({ items, projectHash, sessionId, sourceRevision }: { 
   );
 }
 
-/** Render an assistant message's ordered parts in chronological order: each
- *  text run becomes Markdown; runs of consecutive tool calls share one
- *  `.tool-list` container. This is what preserves the text→tool→text→tool
- *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+/** Display history with the live message components, without projecting runtime state. */
+function BrowseMessagesView({ messages, sessionId, viewport, executing, activity }: {
+  messages: Message[]; sessionId: string; viewport: () => HTMLElement | null;
+  executing: boolean; activity: 'running' | 'waiting' | 'syncing';
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [active, setActive] = useState(0);
+  const refs = useRef<(HTMLElement | null)[]>([]);
+  const turns = deriveTurnNavigation(messages);
+  const processes = turnProcesses(messages, executing);
+  const current = browseActiveTurn(messages, executing);
+  const ends = assistantTurnEndFlags(messages.map(message => message.role));
+  const artifacts = artifactsByAssistantIndex(messages);
+  const polls = groupEmptyPolls(messages);
+  function updateActive() {
+    const el = viewport();
+    if (!el || !turns.length) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 2) {
+      setActive(turns.length - 1); return;
+    }
+    const line = el.getBoundingClientRect().top + 24;
+    const spans = turns.map((turn, index) => {
+      let bottom = 0;
+      for (let n = turn.messageIndex; n <= turn.endIndex; n++) {
+        const node = refs.current[n];
+        if (node?.isConnected) bottom = Math.max(bottom, node.getBoundingClientRect().bottom);
+      }
+      return { index, bottom };
+    });
+    setActive(turnAtReadingSpan(spans, line) ?? 0);
+  }
+  useLayoutEffect(() => {
+    const el = viewport(); if (!el) return;
+    const frame = requestAnimationFrame(updateActive);
+    el.addEventListener('scroll', updateActive, { passive: true });
+    const observer = new ResizeObserver(updateActive);
+    observer.observe(el); if (el.firstElementChild) observer.observe(el.firstElementChild);
+    return () => { cancelAnimationFrame(frame); el.removeEventListener('scroll', updateActive); observer.disconnect(); };
+  }, [messages, expanded]);
+  const host = viewport()?.parentElement;
+  return <>
+    {messages.map((msg, index) => {
+      const ref = (el: HTMLElement | null) => { refs.current[index] = el; };
+      // This reader only prepends older pages, so distance from the tail stays stable.
+      const key = messages.length - index;
+      if (msg.role === 'user') return <UserMessageView key={key} msg={msg} searchRef={ref}
+        timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} />;
+      const process = processes.get(index);
+      const processKey = process ? String(messages.length - process.last) : '';
+      const folded = process?.foldable && !expanded[processKey];
+      const toggle = process?.foldable && process.first === index
+        ? <TurnProcessToggle process={process} expanded={!folded}
+            onToggle={() => setExpanded(previous => ({ ...previous, [processKey]: !previous[processKey] }))} /> : null;
+      if (folded && process && index !== process.last) return <Fragment key={key}>{toggle}</Fragment>;
+      const display = folded && process ? { ...msg, parts: process.finalParts } : msg;
+      return <Fragment key={key}>{toggle}<AssistantMessageView msg={display}
+        isLast={index === messages.length - 1 || index === current.assistant} busy={executing} lastIdx={messages.length - 1}
+        isLastInTurn={ends[index]} copyText={() => {
+          const turn = turns.find(turn => index >= turn.messageIndex && index <= turn.endIndex);
+          return Promise.resolve(messages.slice(turn ? turn.messageIndex + 1 : index, index + 1)
+            .filter(message => message.role === 'assistant').map(messageFullText).join('\n\n'));
+        }} artifacts={artifacts.get(index) ?? []} sessionId={sessionId} searchRef={ref}
+        timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} pollGroups={polls} /></Fragment>;
+    })}
+    {executing && <BrowseActivityStatus state={activity} startedAt={current.startedAt} />}
+    {host && createPortal(<TurnNavRail items={turns} activeIndex={active} streaming={executing}
+      onNavigate={index => {
+        const el = viewport(); const node = refs.current[index];
+        if (el && node) el.scrollTo({ top: el.scrollTop + node.getBoundingClientRect().top - el.getBoundingClientRect().top - 20 });
+      }} onHistory={() => {}} />, host)}
+  </>;
+}
+
 /** A single archived user turn may itself contain thousands of tools. */
 function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBeforeRead, onEdges }: {
   turn: TranscriptTurn; compact: boolean; sessionId: string | null; search: string;
@@ -4985,11 +5135,7 @@ function AssistantMessageView({
 }) {
   const t = useT();
   const text = messageText(msg);
-  const isError =
-    text.includes('[错误:') ||
-    text.includes('[连接错误:') ||
-    text.includes('[Error:') ||
-    text.includes('[Connection error:');
+  const isError = hasChatErrorNotice(text);
   const streaming = isLast && busy;
   // 三点 loading 覆盖整个回合：思考（无可见输出）和文本输出阶段都显示，
   // 直到回合结束（busy 变 false）才消失。不再使用闪烁光标。
@@ -5007,7 +5153,6 @@ function AssistantMessageView({
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
-  const [artifactError, setArtifactError] = useState('');
   const [copyError, setCopyError] = useState(false);
 
   function handleCopy() {
@@ -5049,7 +5194,7 @@ function AssistantMessageView({
   const groups = pollGroups ?? groupEmptyPolls(search.trim() ? [] : [msg]);
   const onlyHiddenPolls = msg.parts.every(part => part.kind === 'tool'
     ? groups.hidden.has(part.tool.id) : part.kind === 'text' && !part.text.trim());
-  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0) return null;
+  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length) return null;
 
   return (
     <div class={cls} ref={searchRef}>
@@ -5070,7 +5215,7 @@ function AssistantMessageView({
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts, search, groups)}
+          {renderAssistantParts(msg.parts, search, groups, sessionId)}
           {streaming && (
             <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
               <span class="waiting-dot" />
@@ -5081,36 +5226,14 @@ function AssistantMessageView({
         </>
       )}
       {isLastInTurn && !streaming && artifacts.length > 0 && (
-        <div class="turn-artifacts" aria-label={t('chat.artifacts')}>
-          <span class="turn-artifacts-label">{t('chat.artifacts')}</span>
-          <div class="turn-artifacts-list">
-            {artifacts.slice(0, 6).map((artifact) => (
-              <button
-                key={artifact.path}
-                type="button"
-                class="turn-artifact-chip"
-                title={artifact.path}
-                onClick={() => {
-                  setArtifactError('');
-                  if (sessionId) {
-                    window.dispatchEvent(new CustomEvent('workbench-open-file', { detail: { session: sessionId, path: artifact.path } }));
-                    return;
-                  }
-                  void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
-                    setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
-                  });
-                }}
-              >
-                {artifact.label}
-              </button>
-            ))}
-            {artifacts.length > 6 && (
-              <span class="turn-artifact-more">+{artifacts.length - 6}</span>
-            )}
-          </div>
-          {artifactError && <div class="turn-artifact-error" role="status">{artifactError}</div>}
-        </div>
+        <TurnArtifactsCard artifacts={artifacts} sessionId={sessionId} />
       )}
+      {!busy && msg.retryDiagnostics?.length ? (
+        <details class="provider-diagnostics">
+          <summary>{t('chat.requestDiagnostics')}</summary>
+          <pre>{msg.retryDiagnostics.join('\n')}</pre>
+        </details>
+      ) : null}
       {(copyBtn || showTimestamp) && (
         <div class="msg-actions msg-actions-left">
           {copyBtn}
@@ -5123,7 +5246,7 @@ function AssistantMessageView({
   );
 }
 
-function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups, sessionId: string | null): VNode[] {
   const out: VNode[] = [];
   let i = 0;
   while (i < parts.length) {
@@ -5162,7 +5285,7 @@ function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: Poll
       );
       i++;
     } else {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} />);
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} sessionId={sessionId} />);
       i++;
     }
   }
@@ -5206,6 +5329,7 @@ function UserMessageView({
   steerPending,
   onSpec,
   specDisabled,
+  onEdit,
 }: {
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
@@ -5215,6 +5339,7 @@ function UserMessageView({
   steerPending?: boolean;
   onSpec?:()=>void;
   specDisabled?:boolean;
+  onEdit?:()=>void;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
@@ -5252,8 +5377,12 @@ function UserMessageView({
     </button>
   );
 
-  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={!msg.sourceSeq?t('spec.awaitSaved'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
+  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={specDisabled?t('spec.running'):!msg.sourceSeq?t('spec.manage'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
     <svg width="14" height="14" viewBox="0 0 16 16" fill={msg.specPinned?'currentColor':'none'} aria-hidden="true"><path d="m5 2 6 0-1 4 3 3H9v4l-1 2-1-2V9H3l3-3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+  </button>;
+  const editBtn = onEdit && <button type="button" class="msg-copy-btn" onClick={onEdit}
+    title={t('chat.editMessageHint')} aria-label={t('chat.editMessage')}>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m10 2 4 4-8 8H2v-4Z M8 4l4 4" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
   </button>;
   const wrapperClass = 'user-message-wrapper'
     + (isActiveSearchMatch ? ' is-active-search-match' : '')
@@ -5281,8 +5410,8 @@ function UserMessageView({
         </button>
         {steerBadge}
         <div class="msg-actions">
-          {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-          {copyBtn}{specButton}
+          {timeLabel && <div class="msg-time msg-time-user" title={timeLabel}>{formatMsgTime(msg.ts, true) || timeLabel}</div>}
+          {copyBtn}{editBtn}{specButton}
         </div>
       </div>
     );
@@ -5303,8 +5432,8 @@ function UserMessageView({
         {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
-        {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-        {copyBtn}{specButton}
+        {timeLabel && <div class="msg-time msg-time-user" title={timeLabel}>{formatMsgTime(msg.ts, true) || timeLabel}</div>}
+        {copyBtn}{editBtn}{specButton}
       </div>
       {steerBadge}
     </div>

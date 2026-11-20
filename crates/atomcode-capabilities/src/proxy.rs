@@ -61,6 +61,8 @@ fn force_tls12() -> bool {
 /// Apply the process proxy policy to an async reqwest client builder, then cap at
 /// TLS 1.2 when [`force_tls12`] is set.
 pub(crate) fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    #[cfg(feature = "provider")]
+    let builder = atomcode_auth::dns::apply_async(builder);
     let builder = if proxy_disabled() {
         builder.no_proxy()
     } else {
@@ -79,6 +81,8 @@ pub(crate) fn apply_async_proxy_policy(builder: reqwest::ClientBuilder) -> reqwe
 pub(crate) fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
+    #[cfg(feature = "provider")]
+    let builder = atomcode_auth::dns::apply_blocking(builder);
     let builder = if proxy_disabled() {
         builder.no_proxy()
     } else {

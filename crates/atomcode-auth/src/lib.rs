@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+pub mod dns;
 pub mod gateway_crypto;
+pub mod git_ssh;
 pub mod grape;
 pub mod oauth;
 pub mod openrouter;

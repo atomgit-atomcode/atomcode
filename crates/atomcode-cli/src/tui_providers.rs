@@ -134,6 +134,38 @@ impl ConfigProviders {
                 .map(|level| level.to_string())
                 .collect(),
         )
+        .with_connections(
+            provider_preset::PRESETS
+                .iter()
+                .filter_map(|preset| {
+                    let choices = provider_preset::connections(preset.id);
+                    (!choices.is_empty()).then(|| {
+                        (
+                            preset.id.to_string(),
+                            choices
+                                .iter()
+                                .map(|choice| atomcode_tui::providers::PresetConnection {
+                                    protocol: Protocol {
+                                        id: choice.preset_id.to_string(),
+                                        label: protocol_label(choice.provider_type),
+                                        endpoint: choice
+                                            .base_urls
+                                            .first()
+                                            .map(|url| (*url).to_string()),
+                                        needs_key: true,
+                                    },
+                                    base_urls: choice
+                                        .base_urls
+                                        .iter()
+                                        .map(|url| (*url).to_string())
+                                        .collect(),
+                                })
+                                .collect(),
+                        )
+                    })
+                })
+                .collect(),
+        )
     }
 }
 
@@ -236,6 +268,7 @@ fn models(config: &Config) -> Vec<ModelRow> {
                 account: model.account.clone(),
                 model: model.model.clone(),
                 window: model.context_window,
+                max_tokens: model.max_tokens,
                 vision: model.supports_vision,
                 effort: model.reasoning_effort.clone(),
                 levels: model.reasoning_effort_levels.clone().unwrap_or_default(),
@@ -244,6 +277,10 @@ fn models(config: &Config) -> Vec<ModelRow> {
                 // by "the one I am on" — see `ProvidersView::with_current`.
                 current: default.as_deref() == Some(id.as_str()),
                 managed: config.selection_is_codingplan_managed(id),
+                alias: model.alias.clone(),
+                desc: model.desc.clone(),
+                alias_en: model.alias_en.clone(),
+                desc_en: model.desc_en.clone(),
             })
         })
         .collect()
@@ -341,11 +378,13 @@ fn discovery_future(
                     .into_iter()
                     .map(|model| atomcode_tui::providers::Discovered {
                         id: model.id,
+                        catalog_only: model.catalog_only,
                         window: model.context_window,
                         name: model.name,
                         max_tokens: model.max_tokens,
                         vision: model.supports_vision,
                         effort: model.reasoning_effort,
+                        catalog_default_effort: model.catalog_default_effort,
                         levels: model.reasoning_effort_levels,
                     })
                     .collect()
@@ -439,8 +478,55 @@ impl Providers for ConfigProviders {
             .map_err(said)
     }
 
+    fn enrich_models(
+        &self,
+        drafts: &[ModelDraft],
+    ) -> Option<atomcode_tui::providers::EnrichModelsFuture> {
+        use atomcode_capabilities::provider::discovery::{catalog, DiscoveredModel};
+        let account = &drafts.first()?.account;
+        if !drafts.iter().any(|d| {
+            d.window.is_none() || d.max_tokens.is_none() || d.vision.is_none() || d.levels.is_none()
+        }) {
+            return None;
+        }
+        let endpoint = self.load().account_endpoint(account)?;
+        let base_url = endpoint.base_url?;
+        let wire = endpoint.provider_type;
+        if !catalog::supports_lookup(&base_url, &wire) {
+            return None;
+        }
+        let mut drafts = drafts.to_vec();
+        Some(Box::pin(async move {
+            let ids: Vec<_> = drafts.iter().map(|d| d.model.trim()).collect();
+            let entries = catalog::models(&base_url, &wire, &ids).await;
+            for draft in &mut drafts {
+                let Some(entry) = entries.iter().find(|entry| entry.id == draft.model.trim())
+                else {
+                    continue;
+                };
+                let mut metadata = DiscoveredModel {
+                    id: entry.id.clone(),
+                    name: draft.name.clone(),
+                    context_window: draft.window,
+                    max_tokens: draft.max_tokens,
+                    supports_vision: draft.vision,
+                    reasoning_effort: draft.effort.clone(),
+                    reasoning_effort_levels: draft.levels.clone(),
+                    ..Default::default()
+                };
+                catalog::fill_missing(&mut metadata, entry);
+                draft.name = metadata.name;
+                draft.window = metadata.context_window;
+                draft.max_tokens = metadata.max_tokens;
+                draft.vision = metadata.supports_vision;
+                draft.levels = metadata.reasoning_effort_levels;
+            }
+            drafts
+        }))
+    }
+
     /// The panel shows every field it owns, so each one is set or cleared —
-    /// and the two it does not show (a display name, an output cap) are kept.
+    /// while the display name, which the panel does not edit, is kept.
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
         self.book()
             .edit_model(
@@ -452,7 +538,7 @@ impl Providers for ConfigProviders {
                     effort: Edit::from_option(draft.effort.as_deref()),
                     levels: Edit::from_option(draft.levels.as_deref()),
                     display_name: Edit::Keep,
-                    max_tokens: draft.max_tokens.map(Edit::Set).unwrap_or(Edit::Keep),
+                    max_tokens: Edit::from_option(draft.max_tokens),
                     reasoning_history: Edit::Keep,
                     default: draft.default,
                 },
@@ -468,7 +554,9 @@ impl Providers for ConfigProviders {
     /// listing the web UI's `/providers/discover-models` reads, by the same
     /// code (`atomcode_capabilities::provider::discovery`).
     fn discover(&self, account: &str) -> Option<atomcode_tui::providers::DiscoverFuture> {
-        use atomcode_capabilities::provider::discovery::{discovery_protocol, DiscoveryTransport};
+        use atomcode_capabilities::provider::discovery::{
+            catalog, discovery_protocol, DiscoveryTransport,
+        };
         let config = self.load();
         // The service's own models; nothing to pick from here.
         if config.account_is_codingplan_managed(account) {
@@ -477,7 +565,9 @@ impl Providers for ConfigProviders {
         let endpoint = config.account_endpoint(account)?;
         let base_url = endpoint.base_url.clone()?;
         let wire = endpoint.provider_type.clone();
-        discovery_protocol(&wire)?;
+        if discovery_protocol(&wire).is_none() && !catalog::supports_lookup(&base_url, &wire) {
+            return None;
+        }
         let transport = DiscoveryTransport {
             headers: endpoint.headers.clone(),
             api_key: endpoint.api_key.clone(),
@@ -703,7 +793,7 @@ rank = 2
             .map(|row| row.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            &offers[..14],
+            &offers[..21],
             &[
                 "deepseek",
                 "zhipu",
@@ -713,11 +803,18 @@ rank = 2
                 "minimax",
                 "minimax-token-plan",
                 "moonshot",
+                "kimi-code",
                 "aliyun",
+                "aliyun-token-plan",
+                "aliyun-coding",
                 "xiaomi-mimo",
+                "xiaomi-token-plan",
                 "longcat",
                 "volcengine",
                 "volcengine-coding",
+                "tencent-tokenhub",
+                "tencent-token-plan",
+                "tencent-coding",
                 "siliconflow",
             ]
         );
@@ -1238,6 +1335,73 @@ rank = 2
         let out = text(&path);
         assert!(out.starts_with("# hand written"), "{out}");
         assert!(out.contains(r#"default_model = "mine/c""#), "{out}");
+    }
+
+    #[test]
+    fn output_budget_round_trips_through_edit_form_and_can_be_cleared() {
+        use atomcode_tui::providers::{Form, ModelForm, Panel, Step};
+        use atomcode_tui::surface::{Key, KeyPress};
+        for id in ["mine/a", "deepseek"] {
+            let (port, path) = port("output-budget");
+            let row = port
+                .rows()
+                .models()
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .clone();
+            let mut draft = ModelDraft {
+                account: row.account.clone(),
+                model: row.model.clone(),
+                window: (row.window > 0).then_some(row.window),
+                max_tokens: Some(393216),
+                ..Default::default()
+            };
+            port.edit_model(id, &draft).unwrap();
+            let view = port.rows();
+            let row = view.models().iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.max_tokens, Some(393216));
+            let mut panel = Panel::new();
+            panel.form = Some(Form::Model(ModelForm::edit(&view, row).unwrap()));
+            let Step::SaveModel {
+                draft: unchanged, ..
+            } = atomcode_tui::providers::key(
+                &view,
+                &mut panel,
+                &mut String::new(),
+                KeyPress::plain(Key::Enter),
+            )
+            else {
+                panic!("edit form saves")
+            };
+            port.edit_model(id, &unchanged).unwrap();
+            assert_eq!(
+                port.rows()
+                    .models()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .max_tokens,
+                Some(393216)
+            );
+            draft.max_tokens = Some(4096);
+            port.edit_model(id, &draft).unwrap();
+            assert!(text(&path).contains("max_tokens = 4096"));
+            draft.max_tokens = None;
+            port.edit_model(id, &draft).unwrap();
+            assert!(!text(&path).contains("max_tokens"));
+            assert_eq!(
+                port.rows()
+                    .models()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .max_tokens,
+                None
+            );
+            assert!(text(&path).contains("sk-legacy"));
+            assert!(text(&path).contains("sk-one"));
+        }
     }
 
     #[test]

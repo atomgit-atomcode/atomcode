@@ -18,8 +18,6 @@ impl atomcode_plexus::ServiceKey for Progress {
 struct Turn {
     number: u64,
     used: u32,
-    reasoning_used: bool,
-    reasoning_active: bool,
     recovering: bool,
     overflow: bool,
     receipts: Vec<Receipt>,
@@ -29,7 +27,14 @@ struct Receipt {
     call: ToolCall,
     round: u32,
     cwd: std::path::PathBuf,
-    result: ToolResult,
+    bytes: usize,
+}
+// Images in the event log are inline, not paths to expiring temporary files.
+// Reuse only payloads that retained their data and type after batch transforms.
+fn retained_images(images: &[atomcode_kernel::message::ImageContent]) -> bool {
+    images
+        .iter()
+        .all(|image| image.media_type.starts_with("image/") && !image.data.trim().is_empty())
 }
 fn arguments(args: &str) -> String {
     // serde_json's default map is ordered, including nested object keys.
@@ -63,22 +68,22 @@ impl Progress {
         tool: Arc<dyn Tool>,
         call: ToolCall,
         cwd: std::path::PathBuf,
-        result: ToolResult,
+        result: &ToolResult,
     ) {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let state = all.entry(session.id().to_owned()).or_default();
         if state.number != session.current_turn() {
             return;
         }
-        let bytes = state
-            .receipts
-            .iter()
-            .map(|r| r.result.content.len() + r.call.arguments.len())
-            .sum::<usize>();
-        if state.overflow
-            || state.receipts.len() >= 128
-            || bytes + result.content.len() + call.arguments.len() > 8 * 1024 * 1024
-        {
+        let bytes = state.receipts.iter().map(|r| r.bytes).sum::<usize>();
+        let result_bytes = result.content.len()
+            + call.arguments.len()
+            + result
+                .images
+                .iter()
+                .map(|i| i.data.len() + i.media_type.len())
+                .sum::<usize>();
+        if state.overflow || state.receipts.len() >= 128 || bytes + result_bytes > 8 * 1024 * 1024 {
             state.overflow = true;
             return;
         }
@@ -87,7 +92,7 @@ impl Progress {
             call,
             round,
             cwd,
-            result,
+            bytes: result_bytes,
         });
     }
     pub(crate) fn confirmed(&self, session: &SessionLog) -> bool {
@@ -116,36 +121,30 @@ impl Progress {
         calls.iter().all(|call| {
             state.receipts.iter().any(|r| r.round == round && r.call.id == call.id)
                 && events.iter().any(|e| matches!(&e.event, SessionEvent::ToolResultLogged { turn, round: r, call_id, is_error: false, images, .. }
-                    if *turn == state.number && *r == round && call_id == &call.id && images.is_empty()))
+                    if *turn == state.number && *r == round && call_id == &call.id && retained_images(images)))
         })
     }
-    pub(crate) fn begin_reasoning_recovery(&self, session: &SessionLog, protect: bool) -> bool {
-        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let state = all.entry(session.id().to_owned()).or_default();
-        if state.number != session.current_turn() || state.reasoning_used {
+    /// A restart must not bypass an uncertain earlier tool batch merely
+    /// because the latest failed attempt contains only reasoning.
+    pub(crate) fn restart_safe(&self, session: &SessionLog) -> bool {
+        let events = session.events();
+        let all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = all.get(session.id()) else {
+            return false;
+        };
+        if state.number != session.current_turn() || state.overflow {
             return false;
         }
-        state.reasoning_used = true;
-        state.reasoning_active = true;
-        state.recovering |= protect;
-        true
-    }
-    pub(crate) fn reasoning_active(&self, session: &SessionLog) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(session.id())
-            .is_some_and(|s| s.number == session.current_turn() && s.reasoning_active)
-    }
-    pub(crate) fn end_reasoning_recovery(&self, session: &SessionLog) {
-        if let Some(state) = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(session.id())
-        {
-            state.reasoning_active = false;
-        }
+        events.iter().all(|e| match &e.event {
+            SessionEvent::AssistantMessage { turn, round, tool_calls, .. }
+                if *turn == state.number => tool_calls.iter().all(|call| {
+                    state.receipts.iter().any(|r| r.round == *round && r.call.id == call.id)
+                        && events.iter().any(|e| matches!(&e.event,
+                            SessionEvent::ToolResultLogged { turn, round: r, call_id, is_error: false, images, .. }
+                            if *turn == state.number && r == round && call_id == &call.id && retained_images(images)))
+                }),
+            _ => true,
+        })
     }
     pub(crate) fn recover(&self, session: &SessionLog, max: u32, protect: bool) -> Option<u32> {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,7 +177,7 @@ impl Progress {
                 && arguments(&r.call.arguments) == arguments(&call.arguments)
         })?;
         // A raw successful execute is insufficient: the result must have committed.
-        let content = session
+        let (content, images) = session
             .events()
             .into_iter()
             .rev()
@@ -193,48 +192,23 @@ impl Progress {
                 } if turn == state.number
                     && round == receipt.round
                     && call_id == receipt.call.id
-                    && images.is_empty() =>
+                    && retained_images(&images) =>
                 {
-                    Some(content)
+                    Some((content, images))
                 }
                 _ => None,
             })?;
-        let mut result = receipt.result.clone();
-        result.call_id = call.id.clone();
         // Batch transforms may cap or redact AFTER execute_one. The committed
-        // result is authoritative, never the pre-batch payload in the receipt.
-        result.content = format!(
+        // result is authoritative, never the pre-batch payload from execute.
+        let content = format!(
             "[Recovery: confirmed result reused; tool not executed again]\n{}",
             content
         );
-        Some(result)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn automatic_reasoning_recovery_is_once_per_turn_and_isolated_by_session() {
-        let progress = Progress::default();
-        let a = SessionLog::new("a");
-        let b = SessionLog::new("b");
-        for session in [&a, &b] {
-            assert_eq!(session.next_turn(), 1);
-            session.append(SessionEvent::TurnStart { turn: 1 });
-            progress.reset(session.id(), 1, false);
-        }
-        assert!(progress.begin_reasoning_recovery(&a, true));
-        assert!(progress.0.lock().unwrap().get("a").unwrap().recovering);
-        assert!(!progress.0.lock().unwrap().get("b").unwrap().recovering);
-        progress.end_reasoning_recovery(&a);
-        progress.reset(a.id(), 1, false); // steer does not renew the budget
-        assert!(!progress.begin_reasoning_recovery(&a, true));
-        assert!(progress.begin_reasoning_recovery(&b, false));
-        progress.reset(a.id(), 1, true);
-        assert_eq!(a.next_turn(), 2);
-        a.append(SessionEvent::TurnStart { turn: 2 });
-        progress.reset(a.id(), 2, false);
-        assert!(progress.begin_reasoning_recovery(&a, true));
+        Some(ToolResult {
+            call_id: call.id.clone(),
+            content,
+            is_error: false,
+            images,
+        })
     }
 }

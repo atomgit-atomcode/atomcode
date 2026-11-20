@@ -1,4 +1,4 @@
-import { apiFetch } from './lib/transport.ts';
+import { apiFetch, ApiStreamInterruptedError } from './lib/transport.ts';
 
 // Task 12 — API client for atomcode webui
 
@@ -89,6 +89,7 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'provider_retry'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | PolicyInterventionEvent
@@ -184,7 +185,7 @@ export async function cancelDetachedChat(
 async function readEventStream<T>(
   response: Response,
   onEvent: (event: T) => void,
-  options: { onActivity?: () => void; flushTrailing?: boolean } = {},
+  options: { onActivity?: () => void; flushTrailing?: boolean; signal?: AbortSignal } = {},
 ): Promise<void> {
   if (!response.ok) throw await failure(response);
   const reader = response.body!.getReader();
@@ -200,7 +201,12 @@ async function readEventStream<T>(
   };
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        if (options.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw error;
+        }
+        throw new ApiStreamInterruptedError();
+      });
       if (done) break;
       options.onActivity?.();
       buffer += decoder.decode(value, { stream: true });
@@ -233,16 +239,22 @@ export async function streamChat(
   });
 
   let terminalSeen = false;
-  await readEventStream<SSEEvent>(resp, event => {
-    // Preserve /chat's existing callback isolation; /live dispatch errors
-    // propagate so its caller can reconnect rather than appear healthy.
-    try {
-      if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
-        terminalSeen = true;
-      }
-      onEvent(event);
-    } catch { /* legacy /chat dispatch isolation */ }
-  }, { flushTrailing: true });
+  try {
+    await readEventStream<SSEEvent>(resp, event => {
+      // Preserve /chat's existing callback isolation; /live dispatch errors
+      // propagate so its caller can reconnect rather than appear healthy.
+      try {
+        if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
+          terminalSeen = true;
+        }
+        onEvent(event);
+      } catch { /* legacy /chat dispatch isolation */ }
+    }, { flushTrailing: true, signal });
+  } catch (error) {
+    // An authoritative terminal has already settled the turn. A late
+    // transport failure cannot put the chat back into detached recovery.
+    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError)) throw error;
+  }
 
   if (signal?.aborted) {
     const error = new Error('chat stream aborted');
@@ -289,7 +301,12 @@ export interface SessionMeta {
   file_size?: number;
   working_directory_available?: boolean;
   scheduled?: boolean;
+  /** What a runtime holding the session (another terminal, this daemon) is
+   *  doing with it. Only the per-project listing reports it; absent = nobody. */
+  activity?: SessionActivity;
 }
+
+export type SessionActivity = 'open' | 'running' | 'waiting';
 
 export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
@@ -322,8 +339,9 @@ export interface SessionMessage {
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
   images?: ImageData[];
-  /** Epoch ms for the message's completed turn. Older sessions without a native
-   *  transcript omit it; the UI must not replace it with the current wall clock. */
+  /** Epoch ms: a user's real turn start, or an assistant/tool's real completion.
+   *  In-progress replies and older sessions may omit it; never replace it with
+   *  the browser's current wall clock. */
   created_at?: number;
 }
 
@@ -380,8 +398,9 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
 // project of its own history when many other projects have newer sessions.
 // The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
 // stamp it back on for the client's project-scoped dedup/filter.
-export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
+export async function listProjectSessions(projectHash: string, signal?: AbortSignal): Promise<SessionMetaWithProject[]> {
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
+    signal,
     headers: authHeaders(),
   });
   const list: SessionMeta[] = await readJson(resp);
@@ -406,6 +425,16 @@ export async function resolveSession(id: string): Promise<SessionMetaWithProject
   });
   if (resp.status === 404) return null;
   return readJson(resp);
+}
+
+/** What a runtime holding one session is doing — `null` when nobody holds it. */
+export async function getSessionActivity(projectHash: string, sessionId: string): Promise<SessionActivity | null> {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/activity`, {
+    headers: authHeaders(),
+  });
+  const body = await readJson(resp) as { activity?: unknown };
+  const activity = body?.activity;
+  return activity === 'open' || activity === 'running' || activity === 'waiting' ? activity : null;
 }
 
 export interface CreateSessionResponse {
@@ -538,10 +567,13 @@ export interface ProviderPresetInfo {
   model_source?: 'embedded' | 'discovery_api' | 'manual';
   /** Its models can be listed from the endpoint. */
   discoverable?: boolean;
+  connections?: { type: string; base_urls: string[] }[];
 }
 
 export interface DiscoveredModelInfo {
   id: string;
+  catalog_only?: boolean;
+  catalog_default_effort?: string;
   supports_vision?: boolean;
   reasoning_effort_levels?: string[];
   reasoning_effort?: string;
@@ -557,6 +589,8 @@ export interface NotificationConfigInfo {
 }
 
 export interface ConfigInfo {
+  vision_preprocessor_provider?: string | null;
+  vision_preprocessor_status?: 'unconfigured' | 'resolved' | 'unresolvable' | 'unsupported';
   path: string;
   default_provider: string;
   default_workdir?: string;
@@ -576,6 +610,12 @@ export interface ConfigInfo {
 export async function getConfig(): Promise<ConfigInfo> {
   const resp = await apiFetch('/config', { headers: authHeaders() });
   return readJson(resp);
+}
+
+export async function saveVisionPreprocessor(provider: string): Promise<ConfigInfo> {
+  return readJson(await apiFetch('/config/vision-preprocessor', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ provider }),
+  }));
 }
 
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
@@ -801,6 +841,7 @@ export interface CreateAccountBody {
   id?: string;
   /** A vendor preset id or a protocol id. */
   provider: string;
+  protocol?: string;
   display_name?: string;
   base_url?: string;
   api_key?: string;
@@ -1133,6 +1174,7 @@ export type LiveWireEvent =
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string; stats?: TurnStats }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'provider_retry'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
@@ -1157,7 +1199,7 @@ export async function streamLive(
 ): Promise<void> {
   const params = sessionId ? `?recent=true&session_id=${encodeURIComponent(sessionId)}` : '?recent=true';
   const resp = await apiFetch(`/live${params}`, { headers: authHeaders(), signal });
-  await readEventStream(resp, onEvent, { onActivity });
+  await readEventStream(resp, onEvent, { onActivity, signal });
 }
 
 export async function postLiveMessage(
@@ -1524,8 +1566,8 @@ export async function workbenchRequest<T>(path: string, body?: unknown, method?:
   if (response.status === 204) return undefined as T;
   return readJson<T>(response);
 }
-export async function workbenchPreview(session: string, path: string): Promise<Blob> {
-  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders() });
+export async function workbenchPreview(session: string, path: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders(), signal });
   if (!response.ok) throw await failure(response);
   return response.blob();
 }
@@ -1586,6 +1628,7 @@ export async function saveModeModels(bindings: ModeBindings): Promise<ModeModels
 export interface HookEntry {
   id: string; name: string; event: string; matcher: string | null; command: string;
   timeout_ms: number; source: string; scope: string; disabled: boolean; testable: boolean; args?: string[];
+  required_approval?: boolean;
 }
 export interface HookCatalogue {
   cwd: string;

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { messages } from '../i18n.ts';
 import { parseSlashCommand } from './slashCommands.ts';
 
 test('parses a bare command', () => {
@@ -118,6 +119,30 @@ test('menu lists matching commands before skills', () => {
   assert.equal(items[0].kind, 'command');
   assert.equal(items[0].name, 'plan');
   assert.ok(items.some((i) => i.kind === 'skill' && i.name === 'plan-trip'));
+});
+
+test('menu searches localized descriptions and puts names and aliases first', () => {
+  const commands = [
+    { name: 'exit', descKey: 'exit', run: () => {} },
+    { name: 'session', aliases: ['new'], descKey: 'session', run: () => {} },
+  ];
+  const skills = [
+    { name: 'resume', description: '打开工作区的新会话' },
+    { name: 'workbench', display_name: 'New workbench' },
+  ];
+  const t = (key: string) => key === 'exit' ? 'Quit before starting a new session' : '新会话';
+  assert.deepEqual(buildSlashMenuItems(commands, skills, 'NEW', t).map(item => item.name),
+    ['session', 'workbench', 'exit']);
+  assert.deepEqual(buildSlashMenuItems(commands, skills, '新会话', t).map(item => item.name),
+    ['session', 'resume']);
+  assert.deepEqual(buildSlashMenuItems(commands, skills, '新会话', t, true).map(item => item.name),
+    ['resume']);
+});
+
+test('Chinese code review keyword completes to /review', () => {
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS, [], '代码审查',
+    key => messages.zh[key as keyof typeof messages.zh]);
+  assert.equal(items[0]?.name, 'review');
 });
 
 test('empty query returns all commands then all skills', () => {
@@ -239,6 +264,7 @@ test('plugin names beyond 30 characters remain completable, paths and arguments 
   const name = 'atomcode-smoke-test:atomcode-smoke-test';
   assert.equal(detectSlashMenuQuery(`/${name}`)?.query, name);
   assert.equal(detectSlashMenuQuery('/Users/theo/file'), null);
+  assert.equal(detectSlashMenuQuery('/file.txt'), null);
   assert.equal(detectSlashMenuQuery('/review staged'), null);
   assert.equal(detectSlashMenuQuery('/skills atom\nother'), null);
   assert.deepEqual(detectSlashMenuQuery('hello /atom'), { start: 6, query: 'atom', skillsOnly: false });

@@ -54,6 +54,7 @@ pub mod frame;
 pub mod history;
 pub mod host;
 pub mod image_cache;
+pub mod migration;
 mod tmux_mouse;
 
 pub mod i18n;
@@ -63,6 +64,7 @@ pub mod layout;
 pub mod markdown;
 pub mod mcp;
 pub mod menu;
+pub mod model_setup;
 pub mod module;
 pub mod modules;
 pub mod moment;

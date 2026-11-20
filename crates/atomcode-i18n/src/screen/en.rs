@@ -141,6 +141,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MentionEmpty => "  No matching items".into(),
         Msg::MentionLegend => "  enter/tab insert · esc close · up/down select · left/right category".into(),
         Msg::MentionSessions => "Sessions".into(),
+        Msg::MentionSessionsWorkspace => "Sessions · this workspace".into(),
         Msg::MentionSelected => "Selected".into(),
         Msg::MentionFilter => "Filter · Enter / Tab".into(),
         Msg::MenuFolder => "folder".into(),
@@ -193,8 +194,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Output was repeatedly cut off; automatic recovery has stopped. Go on?"
                 .into()
         }
-        Msg::AskReasoningTimeoutQuestion => "The model is still reasoning without an answer and reached the client waiting limit. Continue?".into(),
-        Msg::AskReasoningTimeoutTitle => "reasoning waiting limit".into(),
         Msg::AskReasoningTruncatedQuestion => "The model repeatedly exhausted its output budget during reasoning without an answer. Try again?".into(),
         Msg::AskNoProgressTruncatedQuestion => "The output limit was reached without an answer or a complete tool call. Automatic recovery has stopped. Try again?".into(),
         Msg::AskLowerEffortOnce => "Retry once with lower reasoning effort".into(),
@@ -312,6 +311,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelCurrent => "(current)".into(),
         Msg::RewindPanelNoCodeChanges => "no code changes".into(),
         Msg::RewindPanelFiles { files } => format!("{files} files").into(),
+        Msg::RewindPanelTurnNoCheckpoint => "No code checkpoint was kept for this turn.".into(),
         Msg::RewindPanelScopeAsk => "  going back there takes what with it?".into(),
         Msg::RewindCodeNotEnabled => "workspace rewind is turned off by ATOMCODE_CODE_REWIND; unset it to turn it back on".into(),
         Msg::RewindCodeNoSession => "this session is not written down, so the workspace cannot go back".into(),
@@ -337,6 +337,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CdPinned { dir } => format!("{dir} is marked — /cd offers it first").into(),
         Msg::CdUnpinned { dir } => format!("{dir} is no longer marked").into(),
         Msg::ResumeDeleteArmed => "once more to throw it away".into(),
+        Msg::ResumeHeldRunning => "● running elsewhere".into(),
+        Msg::ResumeHeldWaiting => "● waiting elsewhere".into(),
+        Msg::ResumeHeldOpen => "● open elsewhere".into(),
         Msg::ResumePreviewWaiting => "reading what it last talked about…".into(),
         Msg::ResumeDeleted { id } => format!("Session {id} is gone").into(),
         Msg::ResumeDeleteFailed { why } => format!("It was not deleted: {why}").into(),
@@ -399,6 +402,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "Will use".into(),
         Msg::ProviderSetUse => "Use this model".into(),
         Msg::ProviderBatchChoose => "Use focused model".into(),
+        Msg::ProviderCatalogCandidates => "models.dev suggestions · account access unverified".into(),
         Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),
@@ -457,6 +461,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PatchReady => "Apply this imported user patch with apply_patch using its artifact_id and exact file_paths. Do not reproduce its body:".into(),
         Msg::CmdAboutPaste => "put the clipboard (or a file) into the composer; for when the terminal or the system eats Ctrl+V".into(),
         Msg::CmdAboutConfig => "open the settings panel: search, change a value; esc closes it".into(),
+        Msg::CmdAboutTheme => "open the terminal theme setting (applies after restart)".into(),
         Msg::CmdAboutProviderPanel => "open the provider panel: accounts and models, add/edit/remove; enter switches, esc closes".into(),
         Msg::CmdAboutCopy => "copy the model's last reply; /copy code copies a code block (N picks which one, all takes every one)".into(),
         Msg::CmdAboutSave => "save this conversation as markdown".into(),
@@ -802,6 +807,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ShellTimedOut { secs } => format!("(still going after {secs}s — stopped)").into(),
         Msg::ShellFailed { code } => format!("(exit {code})").into(),
+        Msg::ShellContextHeading => "Previously run locally".into(),
+        Msg::ShellWorkingDir { dir } => format!("Working directory: {dir}").into(),
         Msg::ShellSaidNothing => "(completed with no output)".into(),
         Msg::CompactionInterrupted => {
             "the compaction was interrupted — the context is as long as it was".into()
@@ -863,7 +870,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "Reload complete. See /status for loaded instruction sources; a lightweight skill reload keeps instruction text unchanged.".into(),
-        Msg::SignedOut => "signed out; /login signs in again".into(),
+        Msg::SignedOutHint => "Signed out of AtomGit. /model to switch models · /login to sign in · /provider to configure providers".into(),
+        Msg::SignedOut => "Signed out.".into(),
         Msg::SignedIn => "signed in".into(),
 
         // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
@@ -1192,6 +1200,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "Model service authentication failed".into(),
         Msg::ProviderRateLimitError => "Model service rate limit reached".into(),
         Msg::ProviderConnectionError => "Cannot connect to the model service".into(),
+        Msg::ProviderResponseTimeout => "The model service did not respond in time".into(),
         Msg::ProviderConnectionTimeout => "Connection to the model service timed out".into(),
         Msg::ProviderTlsInterrupted => "The TLS connection was interrupted".into(),
         Msg::ProviderPartialReply => "Response interrupted; partial reply preserved".into(),
@@ -1203,6 +1212,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCheckRequest => "Check the error details and model configuration, or contact the service provider.".into(),
         Msg::ProviderCheckConnection => "Check the network connection and model service URL, then try again.".into(),
         Msg::ProviderNoFallback => "No available fallback route was found for this model; automatic switching failed.".into(),
+        Msg::ProviderRetryProlonged => "The model service is temporarily unstable; retrying automatically. Keep waiting or cancel. Details: /errors".into(),
         Msg::ProviderRetryDetailsHint => "details: /errors".into(),
         Msg::ProviderErrorDetails => "Original error details · click to expand/collapse, or /errors show".into(),
         Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),
@@ -1320,6 +1330,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendToggleLevel => "turn this level on/off (✓ is on)".into(),
         Msg::LegendPickLevel => "pick a level".into(),
         Msg::WindowAutomatic => "unspecified (protocol default)".into(),
+        Msg::FieldOutputTokens => "Max output tokens".into(),
+        Msg::OutputAutomatic => "automatic (clear output override)".into(),
+        Msg::LegendTypeOutput => "positive tokens, e.g. 4096 or 32k; per-request output budget, automatic uses runtime defaults".into(),
+        Msg::OutputInvalid => "invalid: enter 1–4294967295 tokens (k/m allowed), or use arrows for automatic".into(),
         Msg::WindowCustom => "custom".into(),
         Msg::LegendTypeWindow => "type the tokens, e.g. 200000, 200k, 1m".into(),
         Msg::LegendBackToPresets => "back to presets".into(),
@@ -1356,7 +1370,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "thinking".into(),
         Msg::RuntimeAlreadyStopped => "this session's runtime has already stopped".into(),
         Msg::NoProviderConfigured => "no provider is available — in the atomcode terminal, sign in with /login or add one with /provider".into(),
-        Msg::LoginExpired => "the login has expired; sign in again".into(),
+        Msg::LoginExpired => "Sign-in expired. /login to sign in again · /provider to select a provider".into(),
         Msg::ProviderUnsupportedByBuild => "this build cannot use the official AtomGit gateway — install an official build, or switch with /model or /provider".into(),
         Msg::ScreenNotConnectedAgent => "the screen is not connected to an agent".into(),
         Msg::HostHasNoControl => "this host has no control surface".into(),
@@ -1436,38 +1450,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ScanOrOpen => "scan it with your phone, or open it in a browser:".into(),
         Msg::InternalError { error } => format!("internal error: {error}").into(),
 
-        // ── the first-run wizard (`atomcode-cli`) ──
-        Msg::OnboardIntroTitle => "let us set this machine up first".into(),
-        Msg::OnboardIntroLine1 => "there is no usable provider yet, so there is no work to be done.".into(),
-        Msg::OnboardIntroLine2 => "pick the language, decide where the provider comes from, and look at what came of it.".into(),
-        Msg::OnboardIntroLine3 => "esc leaves at any step; /onboarding comes back to it.".into(),
-        Msg::OnboardLanguageTitle => "interface language".into(),
-        Msg::OnboardLanguageChinese => "中文".into(),
-        Msg::OnboardLanguageFollowSystem => "follow the system".into(),
-        Msg::OnboardLanguageFollowSystemAbout => "decided by the environment variables".into(),
-        Msg::OnboardSetupTitle => "where the provider comes from".into(),
-        Msg::OnboardSetupCodingPlan => "sign in to CodingPlan".into(),
-        Msg::OnboardSetupCodingPlanAbout => "scan a code; the free allowance comes with it".into(),
-        Msg::OnboardSetupManual => "configure one myself".into(),
-        Msg::OnboardSetupManualAbout => "for an API key of your own, or a model you host".into(),
-        Msg::OnboardSetupSkip => "not now".into(),
-        Msg::OnboardSetupSkipAbout => "this machine still cannot do any work".into(),
-        Msg::OnboardSetupByHand => "opening the provider panel next: the API key, the address and the model all go in there".into(),
-        Msg::OnboardWouldClearTitle => "this clears the screen".into(),
-        Msg::OnboardWouldClearLine1 => "there is a conversation going here. a sign-in that succeeds opens a new session, and what is on screen now will not be in it.".into(),
-        Msg::OnboardWouldClearLine2 => "enter goes on, esc leaves it alone.".into(),
-        Msg::OnboardLoginTitle => "sign in".into(),
-        Msg::OnboardFetchingLoginUrl => "fetching the sign-in address…".into(),
-        Msg::OnboardConfirmTitle => "that is it".into(),
-        Msg::OnboardModalTitle => "before you start".into(),
-        Msg::OnboardAlreadyFinished => "the walkthrough is over".into(),
-        Msg::OnboardLanguageSet { language } => format!("interface language: {language}").into(),
-        Msg::OnboardLanguageNotWritten { error } => format!("the interface language was not written: {error}").into(),
-        Msg::OnboardLoginSkipped => "signing in was skipped — there is still no provider, and /onboarding comes back to it".into(),
-        Msg::OnboardSkipHint => "not now? enter skips it.".into(),
-        Msg::OnboardSignedInConfigNotWritten { error } => format!("signed in, but the config was not written: {error}").into(),
-        Msg::CmdAboutOnboarding => "set this machine up to work: language, sign in, and a look at the result".into(),
-        Msg::CmdAboutOnboardingFinished => "the walkthrough is done".into(),
+        Msg::RecoveryTitle => "Sign-in expired. Choose how to continue".into(),
+        Msg::RecoveryLogin => "Sign in to AtomGit again".into(),
+        Msg::RecoveryProvider => "Switch or connect another model provider".into(),
+        Msg::ModelSetupTitle => "Choose how to connect a model".into(),
+        Msg::ModelSetupLogin => "Sign in with AtomGit".into(),
+        Msg::ModelSetupLoginAbout => "Authorize to claim free Coding Plan credits.".into(),
+        Msg::ModelSetupProvider => "Connect your own model provider".into(),
+        Msg::ModelSetupProviderAbout => "Use a third-party or self-hosted service. Enter its API URL and key as needed.".into(),
+        Msg::ModelSetupKeys => "↑/↓ Select · Enter Confirm".into(),
+        Msg::ModelSetupWaiting => "Waiting for AtomGit authorization…".into(),
+        Msg::ModelSetupOpenLink => "Open this link in your browser.".into(),
+        Msg::ModelSetupCompleting => "Applying the sign-in result…".into(),
+        Msg::LoginLinkKeys => "Click to open · c Copy link · Esc Cancel sign-in and go back".into(),
+        Msg::LoginCancelKey => "Esc Cancel sign-in and go back".into(),
+        Msg::LoginCancelled => "Sign-in cancelled.".into(),
+        Msg::LoginAlreadyRunning => "Sign-in is already in progress.".into(),
         Msg::RollbackConfirmSwitch => "AtomCode switches to the previous version and starts again in this directory.".into(),
         Msg::RollbackConfirmNoUpdates => {
             "Automatic updates stay off afterwards; to go back to the newer version, run /upgrade (or `atomcode upgrade` on the command line).".into()
@@ -1674,6 +1672,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "Appended instructions: unknown".into(),
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerPlaceholder => "Ask AtomCode to do Anything".into(),
         Msg::WaitsForTheTurn { command } => format!(
             "A reply is in progress: /{command} has to wait for this turn to end; Esc stops the turn now"
         )
@@ -1716,7 +1715,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
         )
         .into(),
-    }
+
+        Msg::CmdAboutImport => "Look at the assets another AI coding agent left behind".into(),
+        Msg::NoMigrationPort => "No migration service is available".into(),
+        Msg::MigrationReportTitle => "Assets another agent left behind".into(),
+        Msg::MigrationNoAssets => "This source has no assets".into(),
+        Msg::MigrationSourceUnavailable => "That agent has no assets in the current project.".into(),
+        Msg::MigrationPickSource => "Which agent's assets do you want to see?".into(),
+        Msg::MigrationAssetsCount => "assets".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}: {count} assets").into()
+        }
+}
 }
 
 /// `team · 2 members · 1 background task`, leaving out a count that is zero.

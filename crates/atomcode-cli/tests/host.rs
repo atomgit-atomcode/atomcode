@@ -739,6 +739,53 @@ async fn a_new_session_is_a_session_change_and_the_rebuilt_app_feeds_the_same_ch
 }
 
 #[tokio::test]
+async fn resume_distinguishes_an_empty_session_from_a_missing_one() {
+    use atomcode_capabilities::session::{SessionManager, SessionMeta};
+    use atomcode_kernel::session::SessionHeader;
+    let env = env();
+    let mut connection = connected(&env).await;
+    let source = connection.session.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let target = "empty-resume-target";
+    let lease = manager.acquire_lease(target).unwrap();
+    let mut meta = SessionMeta::new(target, env.project.path().to_string_lossy().as_ref(), 1);
+    meta.owner = atomcode_capabilities::session::manager::StorageOwner::Native;
+    manager
+        .create_event_session(&lease, &SessionHeader::new(target), &meta)
+        .unwrap();
+    drop(lease);
+    for (target, empty) in [(target, true), ("missing-resume-target", false)] {
+        let result = connection
+            .control
+            .call(HostCommand::Resume {
+                session: source.clone(),
+                target: target.into(),
+            })
+            .await;
+        if empty {
+            assert!(
+                matches!(result, Err(HostError::Failed { message }) if message.contains("no messages"))
+            );
+        } else {
+            assert_eq!(result, Err(HostError::NotFound));
+        }
+    }
+    connection.commands.send(subscribe(&source)).unwrap();
+    connection
+        .commands
+        .send(message("still on the original session"))
+        .unwrap();
+    let events = through_turn(&mut connection).await;
+    assert_eq!(
+        user_messages(&events, &source),
+        vec!["still on the original session"]
+    );
+}
+
+#[tokio::test]
 async fn a_stored_session_is_listed_and_resumed_with_its_history() {
     let env = env();
     let mut connection = connected(&env).await;
@@ -2156,7 +2203,11 @@ impl HostConfig for Models {
         }
         let mut config = CodingAgentConfig::new(
             "key",
-            "https://example.test/v1",
+            if model == "gateway-test" {
+                "https://llm-api.atomgit.com/v1"
+            } else {
+                "https://example.test/v1"
+            },
             model,
             &self.0,
             atomcode_coding::config::product_dirs_from_env(),
@@ -2248,6 +2299,16 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
     let session = connection.session.clone();
     connection.commands.send(message("hello")).unwrap();
     through_turn(&mut connection).await;
+    let last_model = || {
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .clone()
+    };
     let apps = front_end.apps_fed();
 
     assert!(matches!(
@@ -2272,15 +2333,7 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
     );
     connection.commands.send(message("which model")).unwrap();
     through_turn(&mut connection).await;
-    assert_eq!(
-        env.script
-            .requests
-            .lock()
-            .unwrap()
-            .last()
-            .map(|(m, _)| m.clone()),
-        Some("glm-5".to_string())
-    );
+    assert_eq!(last_model(), "glm-5");
 
     assert_eq!(
         connection
@@ -2291,6 +2344,52 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
             .await,
         Ok(HostReply::Done)
     );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Readiness {
+                session: session.clone(),
+            })
+            .await,
+        Ok(atomcode::host::readiness_for(None))
+    );
+    connection
+        .commands
+        .send(message("still on my external model"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(last_model(), "glm-5");
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "gateway-test".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignOut {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Readiness {
+                session: session.clone()
+            })
+            .await,
+        Ok(atomcode::host::readiness_for(Some(
+            ProviderUnavailableReason::SignedOut
+        )))
+    );
     let asked = env.script.requests.lock().unwrap().len();
     connection.commands.send(message("anyone there")).unwrap();
     let _ = quiet(&mut connection).await;
@@ -2299,6 +2398,21 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
         asked,
         "signed out: nothing reached a model"
     );
+
+    // The gateway is offline, but a configured external model is still selectable.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "external".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("carry on")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(last_model(), "external");
 
     assert_eq!(
         connection
@@ -2952,15 +3066,9 @@ async fn mcp_act_disable_writes_config_and_withdraws() {
     );
 }
 
-/// Every reason a provider cannot serve has an answer for the person, and only
-/// a cause this build can actually fix names a command.
-///
-/// The table exists so a new reason cannot be added without deciding what the
-/// screen says about it — the same rule the error table above follows. The
-/// `None` arms are the point: a command named here is one the person will run,
-/// so naming one that cannot help is worse than saying nothing.
+/// Reason text should help users recover without launching a sign-in flow on their behalf.
 #[test]
-fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix() {
+fn provider_readiness_explains_recovery_without_automatically_signing_in() {
     use atomcode::host::readiness_for;
 
     assert_eq!(
@@ -2972,28 +3080,20 @@ fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix(
         }
     );
 
-    let cases = [
-        // Nothing is run on its own: the sentence names /login and /provider.
-        (ProviderUnavailableReason::NotConfigured, None),
-        (
-            ProviderUnavailableReason::AuthenticationRequired,
-            Some("login"),
-        ),
-        (ProviderUnavailableReason::UnsupportedBuild, None),
-    ];
-    for (reason, fix) in cases {
+    for reason in [
+        ProviderUnavailableReason::NotConfigured,
+        ProviderUnavailableReason::AuthenticationRequired,
+        ProviderUnavailableReason::UnsupportedBuild,
+    ] {
         match readiness_for(Some(reason.clone())) {
-            HostReply::Readiness {
-                ready,
-                why,
-                fix: named,
-            } => {
+            HostReply::Readiness { ready, why, fix } => {
                 assert!(!ready, "{reason:?}");
-                assert!(
-                    why.is_some_and(|w| !w.trim().is_empty()),
-                    "{reason:?} owes the person a reason"
-                );
-                assert_eq!(named.as_deref(), fix, "{reason:?}");
+                let why = why.expect("an unavailable provider owes the user a reason");
+                assert!(!why.trim().is_empty(), "{reason:?}");
+                assert!(fix.is_none(), "{reason:?}");
+                if reason != ProviderUnavailableReason::UnsupportedBuild {
+                    assert!(why.contains("/login") && why.contains("/provider"), "{why}");
+                }
             }
             other => panic!("{reason:?} answered with {other:?}"),
         }

@@ -5,7 +5,8 @@ use atomcode_capabilities::provider::{
     AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider,
     ReasoningPolicy, RequestSigner, ResponsesProvider, RetryPolicy,
 };
-use atomcode_kernel::provider::LlmProvider;
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort};
+use tracing::Instrument;
 
 use crate::CodingAgentConfig;
 use crate::{SubagentModelProviders, SubagentModelResolver, SubagentProvider, TierProvider};
@@ -102,6 +103,102 @@ impl DefaultCodingProviderFactory {
     }
 }
 
+/// Immutable defaults of THIS model selection, shared by main and direct side
+/// calls. The runtime still owns provider rebuilding; adapters still own wire
+/// capability checks and rejection latches. Explicit per-call values win.
+struct ModelDefaultsProvider {
+    inner: Arc<dyn LlmProvider>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for ModelDefaultsProvider {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
+    fn effort_levels(&self) -> Vec<String> {
+        self.inner.effort_levels()
+    }
+    fn replays_reasoning(&self) -> bool {
+        self.inner.replays_reasoning()
+    }
+    fn bind_session_id(&self, id: &str) {
+        self.inner.bind_session_id(id);
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[atomcode_kernel::message::Message],
+        tools: &[atomcode_kernel::tool::ToolDef],
+        options: &ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        let mut resolved = options.clone();
+        resolved.reasoning_effort = options.reasoning_effort.or(self.reasoning_effort);
+        let source = match options.reasoning_effort {
+            Some(value) if Some(value) != self.reasoning_effort => "call_override",
+            // Main middleware may already have filled the same model default;
+            // do not label an equal value as a deliberate downgrade/override.
+            Some(_) => "request_value",
+            None if self.reasoning_effort.is_some() => "model_default",
+            None => "api_default",
+        };
+        let span = tracing::info_span!(
+            "model_request_options",
+            effort_source = source,
+            requested_effort = options
+                .reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("omitted"),
+            model_default_effort = self
+                .reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("omitted"),
+            resolved_effort = resolved
+                .reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("omitted")
+        );
+        self.inner
+            .chat_stream(messages, tools, &resolved)
+            .instrument(span)
+            .await
+    }
+}
+
+/// Model/provider overrides win over the process-wide fallback. Never disable
+/// the deadline with zero or an invalid environment value.
+fn response_header_timeout(cfg: &CodingAgentConfig) -> std::time::Duration {
+    resolve_response_header_timeout(
+        cfg.response_header_timeout_secs,
+        std::env::var("ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+fn resolve_response_header_timeout(
+    configured: Option<std::num::NonZeroU64>,
+    env: Option<&str>,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        configured
+            .map(|n| n.get())
+            .or_else(|| {
+                env.and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(300),
+    )
+}
+
 impl CodingProviderFactory for DefaultCodingProviderFactory {
     fn build(
         &self,
@@ -112,6 +209,12 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             .user_agent
             .clone()
             .unwrap_or_else(|| self.default_user_agent.clone());
+        // Direct provider calls may omit ChatOptions::max_tokens. They must
+        // inherit the selected model's budget too, just like the main loop.
+        let max_tokens = cfg
+            .chat_options
+            .max_tokens
+            .unwrap_or_else(|| default_max_tokens(cfg.context_window));
         let provider: Arc<dyn LlmProvider> = match cfg.provider_type.as_str() {
             "claude" | "anthropic" | "deepseek-messages" => {
                 let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
@@ -120,7 +223,8 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.context_window = cfg.context_window;
                 ac.idle_timeout = cfg.stream_timeout;
                 ac.first_token_timeout = cfg.first_token_timeout;
-                ac.max_tokens = default_max_tokens(cfg.context_window);
+                ac.open_timeout = response_header_timeout(cfg);
+                ac.max_tokens = max_tokens;
                 ac.supports_vision = cfg.supports_vision;
                 ac.effort_levels = cfg.effort_levels.clone();
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -140,7 +244,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.context_window = cfg.context_window;
                 oc.idle_timeout = cfg.stream_timeout;
                 oc.first_token_timeout = cfg.first_token_timeout;
-                oc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                oc.max_tokens = Some(max_tokens);
                 // Explicit opt-in: pin the Ollama runtime window only when the user set
                 // ATOMCODE_OLLAMA_NUM_CTX. Unset ⇒ leave the daemon's own default alone.
                 oc.num_ctx =
@@ -165,9 +269,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.first_token_timeout = cfg.first_token_timeout;
+                pc.open_timeout = response_header_timeout(cfg);
                 pc.supports_vision = cfg.supports_vision;
                 pc.effort_levels = cfg.effort_levels.clone();
-                pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                pc.max_tokens = Some(max_tokens);
                 pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
                 pc.reasoning_policy =
                     ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
@@ -195,9 +300,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.first_token_timeout = cfg.first_token_timeout;
+                pc.open_timeout = response_header_timeout(cfg);
                 pc.supports_vision = cfg.supports_vision;
                 pc.effort_levels = cfg.effort_levels.clone();
-                pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                pc.max_tokens = Some(max_tokens);
                 // An explicit per-model default is also an explicit capability
                 // declaration. CodingPlan's DeepSeek V4 Flash predates server-side
                 // capability metadata, so keep that one exact built-in fallback.
@@ -225,6 +331,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 )
             }
         };
+        let provider: Arc<dyn LlmProvider> = Arc::new(ModelDefaultsProvider {
+            inner: provider,
+            reasoning_effort: cfg.chat_options.reasoning_effort,
+        });
         if let Some(session_id) = session_id {
             provider.bind_session_id(session_id);
         }
@@ -320,8 +430,7 @@ pub fn derive_tier_config(
     tier.headers = provider.headers.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
     tier.retry_max_attempts = provider.retry_max_attempts;
-    tier.reasoning_timeout =
-        crate::config::model_reasoning_timeout(provider.reasoning_timeout_secs);
+    tier.response_header_timeout_secs = provider.response_header_timeout_secs;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_model_providers = None;
@@ -383,8 +492,7 @@ pub fn derive_tier_config_from_resolved(
     tier.headers = resolved.headers.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
     tier.retry_max_attempts = resolved.retry_max_attempts;
-    tier.reasoning_timeout =
-        crate::config::model_reasoning_timeout(resolved.reasoning_timeout_secs);
+    tier.response_header_timeout_secs = resolved.response_header_timeout_secs;
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_model_providers = None;
@@ -511,6 +619,137 @@ mod tests {
         assert_eq!(parse_ollama_num_ctx(Some("  8192 ")), Some(8_192));
     }
 
+    #[derive(Default)]
+    struct CapturedProvider {
+        calls: std::sync::Mutex<Vec<ChatOptions>>,
+        bindings: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturedProvider {
+        fn model_name(&self) -> &str {
+            "configured-model"
+        }
+        fn context_window(&self) -> u32 {
+            123_456
+        }
+        fn supports_vision(&self) -> bool {
+            true
+        }
+        fn effort_levels(&self) -> Vec<String> {
+            vec!["low".into(), "high".into(), "max".into()]
+        }
+        fn bind_session_id(&self, id: &str) {
+            self.bindings.lock().unwrap().push(id.into());
+        }
+        async fn chat_stream(
+            &self,
+            _: &[atomcode_kernel::message::Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            options: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            self.calls.lock().unwrap().push(options.clone());
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn direct_calls_inherit_model_effort_and_explicit_calls_override_it() {
+        let inner = Arc::new(CapturedProvider::default());
+        let provider = ModelDefaultsProvider {
+            inner: inner.clone(),
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let options = ChatOptions {
+            max_tokens: Some(77),
+            temperature: Some(0.25),
+            tool_choice: atomcode_kernel::provider::ToolChoice::None,
+            ..Default::default()
+        };
+        for effort in [
+            None,
+            None,
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Max),
+        ] {
+            let mut request = options.clone();
+            request.reasoning_effort = effort;
+            drop(provider.chat_stream(&[], &[], &request).await.unwrap());
+            assert_eq!(
+                request.reasoning_effort, effort,
+                "caller-owned options are not mutated"
+            );
+        }
+        let calls = inner.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.reasoning_effort).collect::<Vec<_>>(),
+            vec![
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Max)
+            ]
+        );
+        for call in calls.iter() {
+            assert_eq!(call.max_tokens, options.max_tokens);
+            assert_eq!(call.temperature, options.temperature);
+            assert_eq!(call.tool_choice, options.tool_choice);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn rebuilding_with_api_default_and_other_model_defaults_keeps_them_independent() {
+        let inner = Arc::new(CapturedProvider::default());
+        for effort in [
+            Some(ReasoningEffort::High),
+            None,
+            Some(ReasoningEffort::Low),
+        ] {
+            let provider = ModelDefaultsProvider {
+                inner: inner.clone(),
+                reasoning_effort: effort,
+            };
+            drop(
+                provider
+                    .chat_stream(&[], &[], &ChatOptions::default())
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            inner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.reasoning_effort)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ReasoningEffort::High),
+                None,
+                Some(ReasoningEffort::Low)
+            ]
+        );
+    }
+
+    #[test]
+    fn model_defaults_forward_capabilities_and_session_affinity() {
+        let inner = Arc::new(CapturedProvider::default());
+        let provider = ModelDefaultsProvider {
+            inner: inner.clone(),
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        assert_eq!(provider.model_name(), inner.model_name());
+        assert_eq!(provider.context_window(), inner.context_window());
+        assert_eq!(provider.supports_vision(), inner.supports_vision());
+        assert_eq!(provider.effort_levels(), inner.effort_levels());
+        provider.bind_session_id("test-session");
+        assert_eq!(*inner.bindings.lock().unwrap(), ["test-session"]);
+    }
+
     fn config(provider_type: &str) -> CodingAgentConfig {
         let mut cfg = CodingAgentConfig::new(
             "key",
@@ -578,6 +817,95 @@ mod tests {
             32_000,
             "128K/4 sits just under the ceiling"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn configured_output_budget_reaches_every_wire_format() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // This tests real local HTTP serialization, not timeout behavior.
+        tokio::time::resume();
+        for protocol in [
+            "openai",
+            "responses",
+            "anthropic",
+            "deepseek-messages",
+            "ollama",
+        ] {
+            for budget in [None, Some(4096_u32), Some(393216)] {
+                for call_override in [None, Some(1024_u32)] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base_url = format!("http://{}", listener.local_addr().unwrap());
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut bytes = Vec::new();
+                        let (body_start, length) = loop {
+                            let mut chunk = [0_u8; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap();
+                            assert!(n > 0, "request ended before headers");
+                            bytes.extend_from_slice(&chunk[..n]);
+                            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers =
+                                    String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                                let length: usize = headers
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .unwrap()
+                                    .trim()
+                                    .parse()
+                                    .unwrap();
+                                break (end + 4, length);
+                            }
+                        };
+                        while bytes.len() < body_start + length {
+                            let mut chunk = [0_u8; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap();
+                            assert!(n > 0, "request ended before body");
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&bytes[body_start..body_start + length])
+                                .unwrap();
+                        // A terminal response is sufficient: assertions concern the request.
+                        socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        body
+                    });
+                    let catalog: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+                        "providers": {"selected": {
+                            "type": protocol, "model": "test-model", "base_url": base_url,
+                            "context_window": 512000, "max_tokens": budget, "retry_max_attempts": 1
+                        }}
+                    })).unwrap();
+                    let selected = catalog.resolve_model(Some("selected")).unwrap();
+                    let cfg = derive_tier_config_from_resolved(&config("openai"), &selected);
+                    let provider = DefaultCodingProviderFactory::new("test")
+                        .build(&cfg, None)
+                        .unwrap();
+                    let result = provider
+                        .chat_stream(
+                            &[atomcode_kernel::message::Message::user("hi")],
+                            &[],
+                            &ChatOptions {
+                                max_tokens: call_override,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                    let body = server.await.unwrap();
+                    let sent = match protocol {
+                        "responses" => &body["max_output_tokens"],
+                        "ollama" => &body["options"]["num_predict"],
+                        _ => &body["max_tokens"],
+                    };
+                    let expected = call_override.or(budget).unwrap_or(32768);
+                    assert_eq!(
+                        sent.as_u64(),
+                        Some(u64::from(expected)),
+                        "{protocol}, {budget:?}, {call_override:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -660,7 +988,6 @@ mod tests {
             Some(atomcode_kernel::provider::ReasoningEffort::Medium)
         );
         assert_eq!(tier.retry_max_attempts, Some(7));
-        assert_eq!(tier.reasoning_timeout, std::time::Duration::from_secs(900));
     }
 
     #[test]
@@ -704,6 +1031,82 @@ mod tests {
 
         let tier = derive_tier_config(&config("openai"), "tier-provider", &provider);
         assert_eq!(tier.retry_max_attempts, Some(6));
-        assert!(tier.reasoning_timeout.is_zero());
+    }
+}
+
+#[cfg(test)]
+mod response_header_timeout_tests {
+    use super::*;
+    #[test]
+    fn runtime_and_tiers_take_the_selected_models_timeout() {
+        let source: atomcode_config::Config = toml::from_str(
+            r#"
+[providers.slow]
+type = "anthropic"
+model = "slow"
+response_header_timeout_secs = 600
+[providers.fast]
+type = "openai"
+model = "fast"
+"#,
+        )
+        .unwrap();
+        let runtime = crate::CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/tmp"),
+            crate::config::product_dirs_from_env(),
+            Some("slow"),
+            None,
+            false,
+            true,
+        );
+        let base = runtime.agent_config();
+        assert_eq!(
+            response_header_timeout(&base),
+            std::time::Duration::from_secs(600)
+        );
+        let tier = derive_tier_config(&base, "fast", &source.providers["fast"]);
+        assert!(
+            tier.response_header_timeout_secs.is_none(),
+            "do not inherit the host override"
+        );
+        let resolved = source.resolve_model(Some("fast")).unwrap();
+        assert!(derive_tier_config_from_resolved(&base, &resolved)
+            .response_header_timeout_secs
+            .is_none());
+        let mut switched = base;
+        crate::config::apply_provider_config(&mut switched, &resolved.to_provider_config());
+        assert!(switched.response_header_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn provider_override_wins_and_invalid_env_cannot_disable_the_deadline() {
+        use std::{num::NonZeroU64, time::Duration};
+        assert_eq!(
+            resolve_response_header_timeout(None, None),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_response_header_timeout(None, Some("600")),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            resolve_response_header_timeout(NonZeroU64::new(120), Some("600")),
+            Duration::from_secs(120)
+        );
+        for invalid in ["0", "-1", "invalid", ""] {
+            assert_eq!(
+                resolve_response_header_timeout(None, Some(invalid)),
+                Duration::from_secs(300)
+            );
+        }
+        assert_eq!(
+            AnthropicConfig::new("", "http://localhost", "test").open_timeout,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            OpenAiCompatConfig::new("", "http://localhost", "test").open_timeout,
+            Duration::from_secs(300)
+        );
     }
 }

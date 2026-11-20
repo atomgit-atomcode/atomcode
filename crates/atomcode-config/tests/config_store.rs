@@ -4,6 +4,7 @@ use atomcode_config::{Config, ConfigStore, ProviderConfig};
 
 fn provider(model: &str) -> ProviderConfig {
     ProviderConfig {
+        api_key_is_resolved: false,
         headers: Default::default(),
         provider_type: "openai".into(),
         api_key: None,
@@ -19,13 +20,17 @@ fn provider(model: &str) -> ProviderConfig {
         reasoning_history: None,
         reasoning_effort: None,
         reasoning_effort_levels: None,
+        alias: None,
+        desc: None,
+        alias_en: None,
+        desc_en: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
         capable_model: None,
         retry_max_attempts: None,
-        reasoning_timeout_secs: None,
+        response_header_timeout_secs: None,
     }
 }
 

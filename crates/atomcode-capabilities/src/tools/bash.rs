@@ -68,6 +68,22 @@ fn apply_non_interactive_env(cmd: &mut tokio::process::Command) {
     for (key, value) in non_interactive_env_vars() {
         cmd.env(key, value);
     }
+    #[cfg(unix)]
+    let interactive = crate::askpass::current_env().is_some();
+    #[cfg(not(unix))]
+    let interactive = false;
+    apply_auth_prompt_policy(cmd, interactive);
+}
+
+// Keep agent sockets and credential helpers intact. Without a human askpass
+// consumer, OpenSSH and GCM must not open a GUI to ask for missing credentials.
+// Custom helpers can implement their own UI; the existing process timeout remains
+// the bound for those. Do not override GIT_SSH_COMMAND or core.sshCommand.
+fn apply_auth_prompt_policy(cmd: &mut tokio::process::Command, interactive: bool) {
+    if !interactive {
+        cmd.env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GCM_INTERACTIVE", "never");
+    }
 }
 
 /// Detach the just-forked child from the controlling terminal. Called from BOTH
@@ -498,9 +514,10 @@ fn shell_tool_description(
              text, or rewrite the whole file with write_file — do not fall back to sed. \
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do. For long builds/tests use `bash_start`, then \
-             `bash_poll` with wait_ms (up to 60000); it collects output until exit, status change or timeout. \
-             Do not use shell sleep to wait or duplicate a running build.\n\
+             the dedicated tools can't do. For long builds/tests use `bash_start` and wait \
+             for it the way the host's background completion policy says; unless the host \
+             says it resumes you when a job finishes, wait with `bash_poll` until the job \
+             ends before answering. Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
              editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
@@ -1643,10 +1660,22 @@ fn format_output(stdout: &str, stderr: &str, code: Option<i32>) -> ToolResult {
     ok(s)
 }
 
-/// Match Git's fatal HTTP credential diagnostics, not arbitrary programs'
+/// Match Git's fatal HTTP diagnostics or SSH failures paired with Git's remote error, not arbitrary programs'
 /// "Authentication failed" messages. This remains a diagnostic heuristic, not
 /// proof of why credentials are unavailable or a request to refresh AtomCode login.
 fn is_git_auth_failure(stderr: &str) -> bool {
+    let ssh_failure = stderr.lines().any(|line| {
+        line.contains("Permission denied (publickey")
+            || line.contains("Permission denied (password")
+            || line.contains("Host key verification failed.")
+    });
+    if ssh_failure
+        && stderr
+            .lines()
+            .any(|line| line.trim() == "fatal: Could not read from remote repository.")
+    {
+        return true;
+    }
     stderr.lines().any(|line| {
         let Some(message) = line.trim_start().strip_prefix("fatal: ") else {
             return false;
@@ -1675,7 +1704,7 @@ fn append_git_auth_hint(output: &mut String, code: Option<i32>, auth_failure: bo
     if !output.is_empty() && !output.ends_with('\n') {
         output.push('\n');
     }
-    output.push_str("[hint] Git reported a credential failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. Check or refresh this remote's Git credential helper/PAT in an external terminal before retrying.");
+    output.push_str("[hint] Git reported an authentication or host-key verification failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. For SSH, check the agent inherited by this process and unlock/load the intended key in an external terminal; verify the server host key there if needed. For HTTPS, check or refresh this remote's Git credential helper/PAT externally. `atomcode git-auth status` reports local agent/helper setup only, not remote access. Never provide passwords or tokens in chat; do not retry authentication failures blindly.");
 }
 
 /// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
@@ -2004,6 +2033,9 @@ pub(super) fn normalize_invocation_for_grant(invocation: BashInvocation) -> Stri
 /// normalizes simple quoting, strips wrappers, and recurses into subshells / eval /
 /// compound parts / pipe-to-shell so a destructive command cannot hide one layer down.
 pub fn check_destructive_command(command: &str) -> Option<String> {
+    if super::git_index::risky(command) {
+        return Some("Git index mutation requires review of the staging/commit scope".into());
+    }
     // Strip comments first — the classifier is substring-based, so a `# rm -rf everything` note
     // would otherwise read as a destructive command.
     let command = strip_bash_comments(command);
@@ -2529,7 +2561,7 @@ const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
 /// Parse `command` as bash with tree-sitter. `None` on parser-load failure or a
 /// completely unparseable input. The caller must still reject trees containing
 /// ERROR/MISSING nodes (a partial parse) — see `is_read_only_bash`.
-fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
+pub(crate) fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
     use std::cell::RefCell;
     thread_local! {
         static PARSER: RefCell<Option<tree_sitter::Parser>> = RefCell::new(None);
@@ -3188,6 +3220,23 @@ async fn pump<R>(
 
 #[async_trait]
 impl crate::world::Shell for LocalShell {
+    fn dialect(&self) -> crate::world::ShellDialect {
+        if cfg!(windows) && !windows_bash_active() {
+            crate::world::ShellDialect::Cmd
+        } else {
+            crate::world::ShellDialect::Bash
+        }
+    }
+
+    async fn spawn_program(
+        &self,
+        program: &str,
+        arguments: &[String],
+        options: &crate::world::SpawnOptions,
+    ) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+        spawn_local_program(program, arguments, options).await
+    }
+
     fn describe(&self) -> String {
         if cfg!(target_os = "windows") {
             format!(
@@ -3234,6 +3283,18 @@ impl crate::world::Shell for LocalShell {
             build_command(&effective_command).map_err(crate::world::SpawnError::Unsupported)?;
         spawn_local_command(cmd, options).await
     }
+}
+
+/// Direct native execution, sharing the shell's cwd/env/output/kill ownership.
+/// No shell discovery, quoting, script generation, or platform-specific fallback.
+pub(crate) async fn spawn_local_program(
+    program: &str,
+    arguments: &[String],
+    options: &crate::world::SpawnOptions,
+) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(arguments);
+    spawn_local_command(command, options).await
 }
 
 /// Shared process ownership, output pumps and tree cancellation for local shells.
@@ -4488,6 +4549,51 @@ mod tests {
     /// model can diagnose `could not read Username` instead of retrying blindly
     /// (issue #1645).
     #[test]
+    fn unattended_auth_preserves_agent_and_helper_configuration() {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .env("SSH_AUTH_SOCK", "test-agent")
+            .env("GIT_ASKPASS", "existing-helper");
+        apply_auth_prompt_policy(&mut command, false);
+        let env: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(env["SSH_AUTH_SOCK"], "test-agent");
+        assert_eq!(env["GIT_ASKPASS"], "existing-helper");
+        assert_eq!(env["SSH_ASKPASS_REQUIRE"], "never");
+        assert_eq!(env["GCM_INTERACTIVE"], "never");
+        let mut interactive = tokio::process::Command::new("git");
+        apply_auth_prompt_policy(&mut interactive, true);
+        assert_eq!(interactive.as_std().get_envs().count(), 0);
+    }
+
+    #[test]
+    fn ssh_auth_hint_requires_the_git_remote_failure_and_preserves_exit_status() {
+        for message in [
+            "git@example.com: Permission denied (publickey).",
+            "Host key verification failed.",
+        ] {
+            assert!(!format_output("", message, Some(255))
+                .content
+                .contains("[hint]"));
+            let stderr = format!("{message}\nfatal: Could not read from remote repository.\n");
+            let result = format_output("", &stderr, Some(128));
+            assert!(result.content.contains("git-auth status"));
+            assert!(result.content.contains("[exit code 128]"));
+            assert!(!format_output("", &stderr, Some(0))
+                .content
+                .contains("[hint]"));
+        }
+    }
+
+    #[test]
     fn format_output_appends_hint_on_git_auth_failure() {
         let stderr =
             "fatal: could not read Username for 'https://atomgit.com': terminal prompts disabled\n";
@@ -5037,6 +5143,14 @@ mod tests {
     }
 
     #[test]
+    fn staging_and_commits_require_scope_review() {
+        for command in ["git add -A", "git add .", "git commit -m wip"] {
+            assert_eq!(risk_of(command), RiskLevel::Risky, "{command}");
+        }
+        assert_eq!(risk_of("git add -- src/main.rs"), RiskLevel::Safe);
+    }
+
+    #[test]
     fn safe_commands_are_safe() {
         for c in [
             "ls -la",
@@ -5045,7 +5159,6 @@ mod tests {
             "grep -rn TODO .",
             "cargo build",
             "git status",
-            "git commit -m wip",
             "rm -rf node_modules",
             "rm -rf target dist",
             "cd if=/dev/foo", // dd false-positive must NOT fire (not a dd command)

@@ -29,17 +29,20 @@ fn _tests_assert_in_chinese() {
 pub mod askpass;
 pub mod browser_cmd;
 pub mod desktop;
+pub mod git_auth_cmd;
 pub mod grape_connect;
+pub mod import_cmd;
 mod mcp_setup;
 pub mod project_setup;
 pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
 pub mod tui_command_meter;
+pub mod tui_git_auth;
 pub mod tui_grape;
 pub mod tui_login;
 pub mod tui_mcp;
-pub mod tui_onboarding;
+pub mod tui_migration;
 pub mod tui_opening;
 pub mod tui_openrouter;
 pub mod tui_places;
@@ -250,11 +253,6 @@ pub mod tui_front {
         // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
         // is the panel `/config` pulls up. They are not alternatives — one is
         // what a host can be asked, the other is what this screen can show.
-        // Six rows and three ports. The onboarding row is here rather than
-        // behind a condition because what it contributes is a command: whether
-        // it runs is readiness's answer, asked when the screen starts, and a
-        // machine that is already set up simply never names it.
-        //
         // The welcome-words row is the same shape as the settings one: the
         // screen owns the opening block, this launcher owns the sentences in it
         // (they live in `atomcode-config`, which the screen must not depend on),
@@ -263,6 +261,25 @@ pub mod tui_front {
         // resolves project-scoped installs against it, and it is the one thing
         // here that is about *where this session is* rather than about the
         // configuration file.
+        // A resumed conversation keeps its command input so the user can
+        // recover with /login or /provider without losing access to history.
+        let reason = runtime.handle.provider_unavailable_reason();
+        let needs_model_setup = !runtime
+            .session
+            .as_ref()
+            .is_some_and(|session| session.resumed)
+            && matches!(
+                reason,
+                Some(atomcode_coding::ProviderUnavailableReason::NotConfigured)
+                    | Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
+            );
+        let model_setup = Arc::new(atomcode_tui::model_setup::ModelSetup::new(
+            needs_model_setup,
+            matches!(
+                reason,
+                Some(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
+            ),
+        ));
         let working_dir = config.working_dir.clone();
         let dirs = config.dirs.clone();
         let (connection, background) = match spawn {
@@ -290,8 +307,8 @@ pub mod tui_front {
             crate::tui_rewind::row_layer(),
             crate::tui_resume::row_layer(),
             crate::tui_bg::row_layer(),
-            crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
+            crate::tui_git_auth::row_layer(),
             // Grape consent is not deployed on the public cloud yet. Keep its
             // TUI command unmounted until the service is ready.
             crate::tui_welcome_words::row_layer(),
@@ -323,13 +340,15 @@ pub mod tui_front {
             Arc::new(crate::tui_rewind::RewindRow),
             Arc::new(crate::tui_resume::ResumeRow),
             Arc::new(crate::tui_bg::BgRow),
-            Arc::new(crate::tui_onboarding::OnboardingRow {
+            Arc::new(crate::tui_login::LoginRow {
+                model_setup,
                 config_path: config_path.clone(),
                 telemetry: telemetry.clone(),
             }),
-            Arc::new(crate::tui_login::LoginRow {
-                config_path: config_path.clone(),
-                telemetry: telemetry.clone(),
+            Arc::new(crate::tui_git_auth::GitAuthRow {
+                user_dir: atomcode_coding::config::product_dirs_from_env()
+                    .user()
+                    .to_path_buf(),
             }),
             Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
             Arc::new(crate::tui_opening::OpeningRow {
@@ -383,6 +402,11 @@ pub mod tui_front {
                     config_path.clone(),
                 )),
                 plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir.clone())),
+                migration: Some(Arc::new(crate::tui_migration::DiskMigration::new(
+                    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
+                    dirs.clone(),
+                    config_path.clone(),
+                ))),
                 setup: Some(crate::tui_setup::DiskSetup::new(
                     working_dir,
                     dirs.clone(),
@@ -479,6 +503,7 @@ pub mod tui_front {
             // As the interactive runtime's is built at start.
             let mut agent = crate::automation_agent_config(&runtime);
             agent.round_cap_checkpoint = true;
+            agent.background_wakeups = true;
             Ok(agent)
         }
     }

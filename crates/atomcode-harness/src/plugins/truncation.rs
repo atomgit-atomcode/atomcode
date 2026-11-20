@@ -12,6 +12,11 @@
 //!   same content from the top, in which case nudging again only spends the
 //!   budget, and the response is treated as final instead.
 //!
+//! A response the provider ended normally after reasoning alone is handled
+//! here too: nothing was produced the turn can act on, which is the same
+//! situation as a reasoning-only cut, and replaying the request only reasons
+//! the same way again. It gets the same small budget of nudges.
+//!
 //! Both are listeners, so a deployment that would rather see the raw truncation
 //! removes the row.
 
@@ -44,6 +49,13 @@ const REASONING_NUDGE: &str =
 Use the reasoning already done to take the next concrete step or give a concise answer. \
 Avoid restarting the analysis or repeating it.";
 
+const ENDED_IN_REASONING_NUDGE: &str = "\
+Your last response ended after reasoning, with no answer and no tool call, so nothing was done. \
+Do not restart or repeat the analysis. Take the next concrete step now: call a tool or give a \
+concise answer. If the work is large, do only its first part in this response (for example, \
+write the first section of a file and add the rest with later edits) instead of working \
+everything out before acting.";
+
 fn no_visible_progress(response: &ModelResponse) -> bool {
     response.text.trim().is_empty()
         && response
@@ -59,7 +71,9 @@ fn reasoning_only(response: &ModelResponse) -> bool {
 }
 
 fn resume_nudge(response: &ModelResponse) -> &'static str {
-    if reasoning_only(response) {
+    if response.ended_in_reasoning {
+        ENDED_IN_REASONING_NUDGE
+    } else if reasoning_only(response) {
         REASONING_NUDGE
     } else if no_visible_progress(response) {
         "Your last response reached its output limit without a usable answer or a complete tool call. \
@@ -208,7 +222,10 @@ impl OnTruncation {
         let Some(session) = scoped.service::<SessionSvc>() else {
             return false;
         };
-        if self.checkpoint {
+        // A normal reasoning-only stop did not hit an output limit. Once its
+        // small recovery budget is spent, end it rather than asking the person
+        // an output-truncation question with a false premise.
+        if self.checkpoint && !response.ended_in_reasoning {
             let lower = if no_visible_progress(response) {
                 scoped
                     .service::<crate::seams::LlmSvc>()
@@ -265,7 +282,9 @@ impl OnTruncation {
             SessionEvent::Notice {
                 turn: session.current_turn(),
                 notice: crate::session::NoticeKind::OutputLeftCutOff,
-                detail: if reasoning_only(response) {
+                detail: if response.ended_in_reasoning {
+                    "模型这次只输出了思考，没有给出正文或工具调用，本轮已结束。".to_string()
+                } else if reasoning_only(response) {
                     "模型思考已达到输出上限，尚未生成正文。可以调整输出预算或思考强度后重试。"
                         .to_string()
                 } else if no_visible_progress(response) {
@@ -301,7 +320,11 @@ impl Waterfall<AgentRequest> for OnTruncation {
             req.options.reasoning_effort = Some(effort);
         }
         let mut response = next.run(req).await?;
-        if !response.truncated {
+        // A reasoning-only reply to the harness's own note is the loop's to
+        // settle as "nothing to add"; nudging it again would answer a nudge
+        // with a nudge.
+        let ended_in_reasoning = response.ended_in_reasoning && !req.answering_a_nudge;
+        if !response.truncated && !ended_in_reasoning {
             self.reset(session.id());
             return Ok(response);
         }
@@ -381,7 +404,9 @@ impl Waterfall<AgentRequest> for OnTruncation {
                     notice: crate::session::NoticeKind::OutputTruncated,
                     detail: format!(
                         "{}（连续恢复第 {attempt}/{limit} 次）",
-                        if reasoning_only(&response) {
+                        if response.ended_in_reasoning {
+                            "模型思考后没有给出正文，正在请它直接推进任务"
+                        } else if reasoning_only(&response) {
                             "模型思考达到输出上限，正在请求直接推进任务"
                         } else if no_visible_progress(&response) {
                             "输出达到上限，尚无正文或完整工具调用，正在请求直接推进任务"
@@ -410,6 +435,8 @@ impl Waterfall<AgentRequest> for OnTruncation {
                 },
             );
         }
+        // Kept cut off so the loop asks once more.
+        response.truncated = true;
         Ok(response)
     }
 }

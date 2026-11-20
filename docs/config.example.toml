@@ -226,6 +226,7 @@ mode = "follow_system"
 #   {"action":"modify","args":{...}}, or Claude Code's
 #   {"hookSpecificOutput":{"permissionDecision":"allow|deny|ask"}}; exit code 2 with a
 #   reason also blocks.
+#   With "required_approval": true, only exit 0 and explicit allow authorize a tool.
 # UserPromptSubmit can block via {"decision":"block","reason":"..."} or add context via
 #   {"hookSpecificOutput":{"additionalContext":"..."}}.
 #
@@ -372,6 +373,23 @@ eager = "auto"
 max_concurrent = 3      # 并发子 agent 上限（下限 1）
 max_rounds = 200        # 单个子任务模型轮次高水位（0=不设上限）
 
+# 可选的只读外部子代理。使用各 CLI 自己已配置的登录和模型。
+# Grok Build 的只读沙箱支持 macOS / Linux。
+# [[subagent.external]]
+# name = "grok"
+# kind = "grok"
+# permission = "read-only"
+# timeout_secs = 600
+#
+# [[subagent.external]]
+# name = "opencode"
+# kind = "opencode"
+# permission = "read-only"
+# model = "provider/model"  # 可省略
+# timeout_secs = 600
+#
+# Grok Build 的单次任务文本经命令行参数传递，避免在委派文本中放入凭据。
+
 [team]
 max_members = 6         # 每个 lead 最多保留的成员数；空闲成员也占名额，stop 后释放
 
@@ -500,3 +518,12 @@ theme = "auto"
 # the window is unknown, a configured value is capped at 256000 tokens. Summary/overflow policies remain unchanged.
 # Rewriting old output may invalidate provider prompt-cache entries; savings
 # depend on the model, cache behavior, and workload.
+
+# 网页搜索：auto 为默认，限流/认证/网络/服务或协议故障时有界切换。
+# 显式选择会固定后端，不再自动切换；/config 也可修改此选项。
+[web_search]
+provider = "auto" # auto | exa | parallel | tavily | firecrawl | tinyfish | duckduckgo
+auto_default_migrated = true # 保留此标记：旧配置的 exa 仅自动迁移一次，之后尊重用户选择。
+# api_key = "..." # 仅 Exa；优先使用 EXA_API_KEY，勿将真实 Key 提交到仓库。
+# 其他后端可选环境变量：PARALLEL_API_KEY、TAVILY_API_KEY、FIRECRAWL_API_KEY、TINYFISH_API_KEY。
+# 未提供 Key 时使用上游 keyless 接口，仍受上游匿名额度/速率限制。

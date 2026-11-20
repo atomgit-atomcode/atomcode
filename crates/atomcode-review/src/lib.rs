@@ -40,8 +40,10 @@ pub mod rules;
 
 mod assemble;
 mod confine;
+mod review_batches;
 mod review_tool;
 mod round_budget;
+mod timing;
 
 pub use assemble::{
     build_review_agent, build_review_agent_with, build_review_agent_with_cancel,
@@ -54,7 +56,8 @@ pub use persona::review_persona;
 /// The `code_review` SUB-AGENT tool — mount it in a host agent (e.g. coding) to give that
 /// agent a read-only "review the current changes" capability.
 pub use review_tool::{
-    DelegatedReview, ReviewDelegate, ReviewTool, ReviewToolConfig, SharedReviewProvider,
+    review_deadline_detail, review_open_timeout_detail, DelegatedReview, ReviewDelegate,
+    ReviewTool, ReviewToolConfig, SharedReviewProvider,
 };
 pub use rules::{changed_files_from_diff, is_low_signal_file, render_rules_section};
 

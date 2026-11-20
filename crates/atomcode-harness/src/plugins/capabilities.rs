@@ -396,7 +396,7 @@ impl Plugin for WebPlugin {
             .or_else(crate::model_source::web_search_provider);
         let search = match &provider {
             Some(name) => WebSearchTool::with_provider_and_key(name, self.api_key.clone()),
-            None => WebSearchTool::with_provider_and_key("exa", self.api_key.clone()),
+            None => WebSearchTool::with_provider_and_key("auto", self.api_key.clone()),
         };
         mount(
             ctx,
@@ -439,7 +439,23 @@ impl Plugin for WebPlugin {
 /// product once mounted the tool and not this, so on the product `/review`
 /// did not exist.
 pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
-    crate::commands::register(ctx, Arc::new(ReviewCommand(tool)))
+    register_review_command_with_policy(ctx, tool, false)
+}
+
+/// Register the built-in slash command with an explicit inline execution
+/// policy. Use this for tools whose command path must bypass model-oriented
+/// delegation; generic third-party reviewer tools should use
+/// [`register_review_command`] so their argument contract stays untouched.
+pub fn register_review_command_inline(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
+    register_review_command_with_policy(ctx, tool, true)
+}
+
+fn register_review_command_with_policy(
+    ctx: &Context,
+    tool: Arc<dyn Tool>,
+    inline: bool,
+) -> Result<(), String> {
+    crate::commands::register(ctx, Arc::new(ReviewCommand(tool, inline)))
 }
 
 /// `review`: the reviewer over the current changes, run by a person.
@@ -447,7 +463,7 @@ pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(),
 /// The same tool the row mounted, with the same rules and the same provider
 /// slot. What "the current changes" means — staged, a base, a range — is the
 /// tool's own argument, passed through as typed.
-struct ReviewCommand(Arc<dyn Tool>);
+struct ReviewCommand(Arc<dyn Tool>, bool);
 
 #[async_trait]
 impl crate::commands::CatalogCommand for ReviewCommand {
@@ -485,6 +501,13 @@ impl crate::commands::CatalogCommand for ReviewCommand {
             base => {
                 call.insert("base".into(), serde_json::Value::String(base.to_string()));
             }
+        }
+        // The command is already the user's explicit review request. Mark it
+        // internally so ReviewTool runs its read-only reviewer directly
+        // instead of handing the task to a second agent that only calls this
+        // same tool. This field is not part of the model-facing schema.
+        if self.1 {
+            call.insert("_inline_command".into(), serde_json::Value::Bool(true));
         }
         let result = self
             .0
@@ -1769,7 +1792,7 @@ mod tests {
         std::fs::create_dir(&tmp).unwrap();
         std::fs::create_dir(tmp.as_path().join("sample")).unwrap();
         std::fs::write(
-            tmp.as_path().join("sample/SKILL.md"),
+            tmp.as_path().join("sample").join("SKILL.md"),
             "---\nname: sample\ndescription: test\n---\nbody",
         )
         .unwrap();
@@ -1780,9 +1803,15 @@ mod tests {
         let command = super::ListSkills(registry.clone());
         let output = command.listing(&[]);
         assert!(output.contains("sample · test"));
-        assert!(output.contains(&tmp.as_path().join("sample/SKILL.md").display().to_string()));
+        assert!(output.contains(
+            &tmp.as_path()
+                .join("sample")
+                .join("SKILL.md")
+                .display()
+                .to_string()
+        ));
         std::fs::write(
-            tmp.as_path().join("sample/SKILL.md"),
+            tmp.as_path().join("sample").join("SKILL.md"),
             "---\nname: invalid.name\n---\nbody",
         )
         .unwrap();

@@ -352,6 +352,81 @@
   .workbench-resizer {
     display: none;
   }
+  /* On a phone the workspace covers the chat entirely (the chat keeps its own
+     scroll underneath); close (×) or Escape returns to it. */
+  .workbench,
+  .workbench.workbench-fullscreen {
+    inset: 0;
+    width: 100% !important;
+    height: 100dvh;
+    border-left: 0;
+    box-shadow: none;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    box-sizing: border-box;
+  }
+  .workbench header small {
+    max-width: calc(100vw - 120px);
+  }
+  .workbench-file-mode,
+  .workbench-diff-actions {
+    flex-wrap: wrap;
+  }
+  .workbench-file-mode button,
+  .workbench-diff-actions button {
+    min-height: 36px;
+  }
+  /* A compact, scrollable tree so the selected file gets most of the screen;
+     an empty directory shrinks to its content instead of a fixed block. */
+  .workbench-tree {
+    height: auto;
+    min-height: 0;
+    max-height: min(18dvh, 120px);
+    flex-shrink: 0;
+    resize: none;
+    overscroll-behavior: contain;
+  }
+}
+.workbench:focus {
+  outline: none;
+}
+.workbench-session-name {
+  font-family: inherit !important;
+  opacity: 0.8 !important;
+}
+.workbench-read-only-note {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  background: color-mix(in srgb, var(--app-brand, #d97757) 7%, transparent);
+  color: var(--app-primary-foreground, inherit);
+}
+.workbench-preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: -4px 0 8px;
+  font-size: 0.75rem;
+}
+.workbench-preview-actions a {
+  color: var(--app-primary-foreground, inherit);
+  text-decoration: underline;
+  padding: 4px 2px;
+}
+.workbench-status {
+  margin: 0;
+  padding: 12px;
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+.workbench-error p {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+.workbench-error button {
+  padding: 4px 10px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
 }
 
 html[data-theme="dark"] .workbench {

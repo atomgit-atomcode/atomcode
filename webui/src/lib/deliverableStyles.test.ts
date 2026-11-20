@@ -16,8 +16,9 @@ test('jump-to-bottom uses a centered zero-height sticky seat above the scroll ed
   assert.match(button, /margin-top:\s*-36px/);
 });
 
-test('artifact filenames truncate without hiding their full-path title target', () => {
+test('artifact paths wrap inside the summary card on narrow screens', () => {
   const chip = css.match(/\.turn-artifact-chip\s*\{([^}]*)\}/)?.[1] ?? '';
-  assert.match(chip, /text-overflow:\s*ellipsis/);
-  assert.match(chip, /white-space:\s*nowrap/);
+  assert.match(chip, /overflow-wrap:\s*anywhere/);
+  assert.match(chip, /width:\s*100%/);
+  assert.doesNotMatch(chip, /white-space:\s*nowrap/);
 });

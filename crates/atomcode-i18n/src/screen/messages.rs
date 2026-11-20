@@ -156,6 +156,7 @@ pub enum Msg<'a> {
     MentionEmpty,
     MentionLegend,
     MentionSessions,
+    MentionSessionsWorkspace,
     MentionSelected,
     MentionFilter,
 
@@ -230,8 +231,6 @@ pub enum Msg<'a> {
     AskStepLimitTitle,
     AskTruncatedQuestion,
     AskReasoningTruncatedQuestion,
-    AskReasoningTimeoutQuestion,
-    AskReasoningTimeoutTitle,
     AskNoProgressTruncatedQuestion,
     AskLowerEffortOnce,
     AskTruncatedTitle,
@@ -443,6 +442,7 @@ pub enum Msg<'a> {
     /// Checkpoint details are logged, not expanded in the panel.
     RewindCodeFailed,
     RewindPanelTurnNoFiles,
+    RewindPanelTurnNoCheckpoint,
     RewindLegendChoose,
     RewindLegendContinue,
     RewindLegendGo,
@@ -467,6 +467,13 @@ pub enum Msg<'a> {
     },
     /// On the row a second Delete would throw away.
     ResumeDeleteArmed,
+    /// Another runtime (another terminal) is running this session; picking it
+    /// opens a copy.
+    ResumeHeldRunning,
+    /// Another runtime's turn on this session is waiting for an answer.
+    ResumeHeldWaiting,
+    /// Another runtime has this session open, between turns.
+    ResumeHeldOpen,
     /// While the last words of the selected session are being fetched.
     ResumePreviewWaiting,
     ResumeDeleted {
@@ -530,6 +537,7 @@ pub enum Msg<'a> {
     CmdAboutMouse,
     /// `/provider`'s model picker: the listing had nothing the account lacks.
     ProviderDiscoverNothingNew,
+    ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
@@ -616,6 +624,7 @@ pub enum Msg<'a> {
     PatchLeadOnly,
     PatchContextChanged,
     CmdAboutConfig,
+    CmdAboutTheme,
     CmdAboutProviderPanel,
     CmdAboutCopy,
     CmdAboutSave,
@@ -1119,6 +1128,10 @@ pub enum Msg<'a> {
     ShellFailed {
         code: &'a str,
     },
+    ShellContextHeading,
+    ShellWorkingDir {
+        dir: &'a str,
+    },
     ShellSaidNothing,
     CostNothingYet,
     CostTokens {
@@ -1217,6 +1230,7 @@ pub enum Msg<'a> {
     },
     Reloaded,
     SignedOut,
+    SignedOutHint,
     SignedIn,
 
     // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
@@ -1810,6 +1824,7 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderResponseTimeout,
     ProviderConnectionTimeout,
     ProviderTlsInterrupted,
     ProviderPartialReply,
@@ -1827,6 +1842,7 @@ pub enum Msg<'a> {
     ProviderNoFallback,
     ProviderErrorDetails,
     ProviderRetryDetailsHint,
+    ProviderRetryProlonged,
     TeamPanelEmpty,
     TeamPanelExpanded,
     TeamPanelCollapsed,
@@ -2000,6 +2016,10 @@ pub enum Msg<'a> {
     WindowAutomatic,
     /// The last stop on a model form's window row: a window typed by hand.
     WindowCustom,
+    FieldOutputTokens,
+    OutputAutomatic,
+    LegendTypeOutput,
+    OutputInvalid,
     /// What the custom window field takes.
     LegendTypeWindow,
     /// The arrows on the custom window field: leave it for the presets.
@@ -2209,44 +2229,22 @@ pub enum Msg<'a> {
         error: &'a str,
     },
 
-    // ── the first-run wizard (`atomcode-cli`) ──
-    OnboardIntroTitle,
-    OnboardIntroLine1,
-    OnboardIntroLine2,
-    OnboardIntroLine3,
-    OnboardLanguageTitle,
-    OnboardLanguageChinese,
-    OnboardLanguageFollowSystem,
-    OnboardLanguageFollowSystemAbout,
-    OnboardSetupTitle,
-    OnboardSetupCodingPlan,
-    OnboardSetupCodingPlanAbout,
-    OnboardSetupManual,
-    OnboardSetupManualAbout,
-    OnboardSetupSkip,
-    OnboardSetupSkipAbout,
-    OnboardSetupByHand,
-    OnboardLoginTitle,
-    OnboardFetchingLoginUrl,
-    OnboardConfirmTitle,
-    OnboardWouldClearTitle,
-    OnboardWouldClearLine1,
-    OnboardWouldClearLine2,
-    OnboardModalTitle,
-    OnboardAlreadyFinished,
-    OnboardLanguageSet {
-        language: &'a str,
-    },
-    OnboardLanguageNotWritten {
-        error: &'a str,
-    },
-    OnboardLoginSkipped,
-    OnboardSkipHint,
-    OnboardSignedInConfigNotWritten {
-        error: &'a str,
-    },
-    CmdAboutOnboarding,
-    CmdAboutOnboardingFinished,
+    RecoveryTitle,
+    RecoveryLogin,
+    RecoveryProvider,
+    ModelSetupTitle,
+    ModelSetupLogin,
+    ModelSetupLoginAbout,
+    ModelSetupProvider,
+    ModelSetupProviderAbout,
+    ModelSetupKeys,
+    ModelSetupWaiting,
+    ModelSetupOpenLink,
+    ModelSetupCompleting,
+    LoginCancelKey,
+    LoginLinkKeys,
+    LoginCancelled,
+    LoginAlreadyRunning,
     /// The confirmation before a rollback (titled by the product's
     /// `UpgradeOptRollback`).
     RollbackConfirmSwitch,
@@ -2464,6 +2462,7 @@ pub enum Msg<'a> {
     ComposerSuggested {
         text: &'a str,
     },
+    ComposerPlaceholder,
     /// A command that replaces or rewinds the conversation, typed while a turn
     /// is running: it has to wait for the turn, and Esc stops the turn now.
     WaitsForTheTurn {
@@ -2515,5 +2514,21 @@ pub enum Msg<'a> {
         releases: usize,
         highlights: &'a [String],
         more: bool,
+    },
+    CmdAboutImport,
+    NoMigrationPort,
+    /// The sheet's title: the assets another agent left behind.
+    MigrationReportTitle,
+    /// The sheet when the chosen source has no assets.
+    MigrationNoAssets,
+    /// Picking which source to look at, when more than one has assets.
+    MigrationPickSource,
+    MigrationSourceUnavailable,
+    /// How many assets a source has.
+    MigrationAssetsCount,
+    /// The sheet's summary line: which source, how many assets.
+    MigrationSummaryLine {
+        source: &'a str,
+        count: usize,
     },
 }

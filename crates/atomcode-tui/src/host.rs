@@ -1882,6 +1882,8 @@ impl Host {
         // over the window, which is worse, because a window is what a person
         // picks between.
         m.title = None;
+        // The replacement session's mode is read from its host after switching.
+        m.mode = None;
     }
 
     /// Where the session on screen works, as its host answered: what the status
@@ -2243,6 +2245,25 @@ impl Host {
             }
         }
         false
+    }
+
+    /// Update the setup view without adding a transcript entry or moving history.
+    pub(crate) fn refresh_opening(&self, opening: &crate::module::Opening) -> bool {
+        let content = self
+            .modules
+            .producers()
+            .iter()
+            .find_map(|producer| producer.opening(crate::block::Coord::default(), opening));
+        let changed = content.is_some_and(|content| {
+            self.stream
+                .write()
+                .expect("stream poisoned")
+                .replace_opening(content)
+        });
+        if changed {
+            self.forget_row_index();
+        }
+        changed
     }
 
     /// Seed sidebars/producer indexes without presenting old transcript bodies.
@@ -2934,20 +2955,29 @@ impl Host {
     ///
     /// **True when a frame is owed.**
     pub fn sync_asking(&self) -> bool {
-        // Only when the panel is mounted. Unmounted, there is no panel to draw
-        // the question and no panel for the composer to step aside for: the
-        // question goes to the foot of the stream the way it did before there was
-        // a panel, and the composer stays exactly where it was. Gating here rather
-        // than in each of the four places that read `asking` is what keeps them
-        // from disagreeing about whether a question is on screen.
-        let waiting = self.ask_panel_mounted().then(|| self.asks.peek()).flatten();
+        // Without the panel, an approval still needs a sheet to track its
+        // selection. Its sheet is drawn in the stream and leaves the composer up.
+        let mounted = self.ask_panel_mounted();
+        let waiting = self.asks.peek().filter(|(_, asked)| {
+            mounted
+                || asked
+                    .first()
+                    .is_some_and(crate::ask::Asked::is_tool_approval)
+        });
         let mut m = self.moment.write().expect("moment poisoned");
+        let (shown, cleared) = if mounted {
+            let cleared = m.fallback_approval.take().is_some();
+            (&mut m.asking, cleared)
+        } else {
+            let cleared = m.asking.take().is_some();
+            (&mut m.fallback_approval, cleared)
+        };
         match waiting {
-            None => m.asking.take().is_some(),
+            None => shown.take().is_some() || cleared,
             // The same request keeps its sheet — the lit row, the page, what
             // has been ticked and typed. Keyed on the request's id rather than
             // on its words: two questions worded alike are still two questions.
-            Some((id, _)) if m.asking.as_ref().is_some_and(|had| had.id == id) => false,
+            Some((id, _)) if shown.as_ref().is_some_and(|had| had.id == id) => cleared,
             Some((id, asked)) => {
                 let mut sheet = crate::moment::Ask::new(id, asked);
                 let key = m
@@ -2959,7 +2989,11 @@ impl Host {
                     .unwrap_or("ctrl+e");
                 sheet.edit_key = crate::keymap::parse_question_edit_key(key)
                     .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
-                m.asking = Some(sheet);
+                if mounted {
+                    m.asking = Some(sheet);
+                } else {
+                    m.fallback_approval = Some(sheet);
+                }
                 true
             }
         }
@@ -2968,14 +3002,58 @@ impl Host {
     /// Move the highlight to a row, by index. True when it moved.
     pub fn point_ask_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        m.asking.as_mut().is_some_and(|a| a.point_at(row))
+        m.asking.as_mut().is_some_and(|a| a.hover_at(row))
     }
 
     /// Give a key to the question panel, and say what it came to.
     pub fn ask_key(&self, press: crate::surface::KeyPress) -> Option<(u64, crate::ask::Step)> {
         let mut m = self.moment.write().expect("moment poisoned");
-        let sheet = m.asking.as_mut()?;
+        let sheet = m
+            .asking
+            .as_mut()
+            .filter(|sheet| !sheet.is_tool_approval())?;
         Some((sheet.id, sheet.key(press)))
+    }
+
+    pub(crate) fn approval_key(
+        &self,
+        presented: crate::ask::PresentedApproval,
+        press: crate::surface::KeyPress,
+    ) -> crate::ask::Step {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let sheet = match m.asking.as_mut() {
+            Some(sheet) => Some(sheet),
+            None => m.fallback_approval.as_mut(),
+        };
+        let Some(sheet) =
+            sheet.filter(|sheet| sheet.id == presented.id && sheet.is_tool_approval())
+        else {
+            return crate::ask::Step::Stay;
+        };
+        if press.key == crate::surface::Key::Enter
+            && !presented
+                .selected
+                .is_some_and(|row| sheet.row_selected(row))
+        {
+            return crate::ask::Step::Stay;
+        }
+        sheet.key(press)
+    }
+
+    pub(crate) fn click_ask(
+        &self,
+        row: usize,
+        approval_on_screen: Option<u64>,
+    ) -> Option<(u64, crate::ask::Step)> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let sheet = m.asking.as_mut()?;
+        if sheet.option_edit().is_some()
+            || (sheet.is_tool_approval() && approval_on_screen != Some(sheet.id))
+        {
+            return None;
+        }
+        sheet.point_at(row);
+        Some((sheet.id, sheet.enter()))
     }
 
     /// Paste into the question panel's typing row. True when it took it.
@@ -2993,6 +3071,20 @@ impl Host {
     /// showing a prompt nobody is waiting on from being possible.
     pub fn ask_secret(&self, prompt: &str, reply: tokio::sync::oneshot::Sender<Option<String>>) {
         self.secrets.ask(prompt, reply);
+        self.sync_secret();
+    }
+
+    pub(crate) fn try_ask_protected_secret(
+        &self,
+        prompt: &str,
+        reply: tokio::sync::oneshot::Sender<Option<zeroize::Zeroizing<String>>>,
+    ) -> Option<u64> {
+        let id = self.secrets.try_ask_protected(prompt, reply);
+        self.sync_secret();
+        id
+    }
+    pub(crate) fn refuse_owned_secret(&self, id: u64) {
+        self.secrets.refuse_owned(id);
         self.sync_secret();
     }
 
@@ -3086,6 +3178,19 @@ impl Host {
             self.toggle_settings();
         }
         self.show_settings_tab(tab);
+    }
+
+    /// Open Config with the requested setting selected.
+    pub fn open_settings_for(&self, id: &str) {
+        if !self.settings_open() {
+            self.toggle_settings();
+        }
+        let mut moment = self.moment.write().expect("moment poisoned");
+        moment.settings_panel = Some(crate::settings::Panel {
+            query: id.to_owned(),
+            query_caret: id.len(),
+            ..crate::settings::Panel::new()
+        });
     }
 
     /// Put the settings panel away. True when it was up.
@@ -4722,7 +4827,7 @@ impl Host {
     /// is a new list in the old one's place. What goes *behind* a page (Esc's
     /// way back) is decided by whoever opened it ([`crate::sheet::Sheet::back`]),
     /// not here.
-    pub fn open_sheet(&self, sheet: crate::sheet::Sheet) -> bool {
+    pub fn open_sheet(&self, mut sheet: crate::sheet::Sheet) -> bool {
         if !self.modules.has_view(crate::modules::sheet::ID) {
             return false;
         }
@@ -4740,6 +4845,7 @@ impl Host {
         m.mcp_panel = None;
         m.resume_panel = None;
         m.bg_panel = None;
+        sheet.set_diff_wrap(!m.clip_diff);
         m.sheet = Some(sheet);
         true
     }
@@ -4840,6 +4946,7 @@ impl Host {
         current.pending = None;
         m.sheet = match next {
             Some(mut next) => {
+                next.set_diff_wrap(!m.clip_diff);
                 let behind = m.sheet.take().map(|sheet| sheet.page);
                 if let (Page::Read(_) | Page::Doc(_), None, Some(list @ Page::List(_))) =
                     (&next.page, &next.back, behind)
@@ -5058,8 +5165,16 @@ impl Host {
     /// 键盘此刻是不是在一个问询之外的东西手里：密码框、modal、菜单、各个面板、反查、
     /// 团队面板 —— 主循环分键时排在问询前面或会吃掉字母的那些（`plugin.rs` 的键路由）。
     /// 一个地方列全，分键那边加了新的面板，这里跟着加一行。
+    pub(crate) fn model_setup_required(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .model_setup_required
+    }
+
     pub fn keyboard_held_elsewhere(&self) -> bool {
-        self.secret_waiting()
+        self.model_setup_required()
+            || self.secret_waiting()
             || self.overlays.is_open()
             || self.context_menu_open()
             || self.settings_open()
@@ -6305,6 +6420,27 @@ impl Host {
         out
     }
 
+    /// Fit the first-run Provider form immediately below the opening when
+    /// both fit. The ordinary Provider panel still follows the conversation's tail.
+    fn setup_pane_room(&self, mut room: Rect, heights: &[(String, u16)], moment: &Moment) -> Rect {
+        if moment.model_setup_required
+            && moment.scroll.0 == 0
+            && heights
+                .iter()
+                .any(|(id, height)| id == crate::modules::providers::ID && *height > 0)
+        {
+            let tail_rows = heights
+                .iter()
+                .map(|(_, height)| usize::from(*height))
+                .sum::<usize>();
+            let rows = self
+                .block_total_in(room.w, moment, usize::from(room.h))
+                .max(1);
+            room.h = rows.saturating_add(tail_rows).min(usize::from(room.h)) as u16;
+        }
+        room
+    }
+
     fn pane_geometry_capped(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
         // Everything below is in "distance from the bottom of the pane", which
         // is the coordinate `scroll` is already measured in: `d = 0` is the last
@@ -6359,7 +6495,7 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let ctx = crate::block::RenderCtx {
             width: rect.w,
-            caps: crate::block::ShapeCaps::of(&moment.caps),
+            caps: crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
         };
         let index = self.row_index_window(
             &ctx,
@@ -6444,9 +6580,10 @@ impl Host {
         rect: Rect,
         scroll: usize,
         caps: crate::block::ShapeCaps,
-        activity: crate::moment::Activity,
-        tick: u64,
+        moment: &Moment,
     ) -> (Vec<Line>, Vec<RowOwner>) {
+        let activity = moment.activity;
+        let tick = moment.tick;
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let calls_apart = pres.calls_apart();
@@ -6470,17 +6607,14 @@ impl Host {
         // is what makes the row a product's decision instead of a dependency of
         // the front end.
         if !self.ask_panel_mounted() {
-            if let Some(asked) = self.asks.current() {
-                let pending = fallback_question(&asked);
-                let mut lines =
-                    crate::block::Content::lines(&pending, &crate::block::RenderCtx::bare(rect.w));
-                lines.reverse();
-                for line in lines {
-                    if out.len() < want {
-                        out.push(line);
-                        owner.push(None); // a question is not a block yet
-                    }
-                }
+            for line in self
+                .fallback_ask_lines(rect.w, want, moment)
+                .into_iter()
+                .rev()
+                .take(want)
+            {
+                out.push(line);
+                owner.push(None); // a question is not a block yet
             }
         }
         // The same table `stream_height` summed, so the two cannot disagree
@@ -6756,7 +6890,15 @@ impl Host {
 
     /// Compose one frame.
     pub fn compose(&self, size: (u16, u16)) -> Frame {
+        self.compose_with_approval(size).0
+    }
+
+    pub(crate) fn compose_with_approval(
+        &self,
+        size: (u16, u16),
+    ) -> (Frame, Option<crate::ask::PresentedApproval>) {
         let (w, h) = size;
+        let mut approval = None;
         let mut frame = Frame::new(w, h);
         self.hits.lock().expect("hits poisoned").scrollbar = None;
         let mut moment = self.moment.read().expect("moment poisoned").clone();
@@ -6773,7 +6915,7 @@ impl Host {
         // rather than read inside `rows_at` because `stream_height`'s contract is
         // that the caller may already hold the moment's write lock (two callers
         // in `plugin.rs` do), so nothing below may take it again.
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
 
         let layout = self.layout.tree();
         let modules = self.modules.clone();
@@ -6797,7 +6939,8 @@ impl Host {
                     // is why every layout in this build still composes the same
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
-                    let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    let pane_room = self.setup_pane_room(rect, &heights, &moment);
+                    let mut pane = Self::pane_geometry(pane_room, moment.scroll.0, &heights);
                     let header_rect =
                         Rect::new(pane.block_rect.x, pane.block_rect.y, pane.block_rect.w, 1);
                     if let Some(header) = self.reserve_prompt_header(&mut pane, &moment) {
@@ -6816,13 +6959,14 @@ impl Host {
                             head: view.screen_of(sel.head),
                         });
                     }
-                    let (lines, owners) = self.stream_lines(
-                        pane.block_rect,
-                        pane.block_scroll,
-                        caps,
-                        moment.activity,
-                        moment.tick,
-                    );
+                    let (lines, owners) =
+                        self.stream_lines(pane.block_rect, pane.block_scroll, caps, &moment);
+                    if let Some(sheet) = moment.fallback_approval.as_ref() {
+                        if !self.ask_panel_mounted() {
+                            approval =
+                                crate::modules::ask::presented_approval(sheet, pane.block_rect);
+                        }
+                    }
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
                         rows: owners,
@@ -6896,6 +7040,14 @@ impl Host {
                         // have to reproduce the tail's split.
                         if id == crate::modules::ask::ID {
                             self.hits.lock().expect("hits poisoned").ask = Some(*tail_rect);
+                            if let Some(sheet) = moment
+                                .asking
+                                .as_ref()
+                                .filter(|sheet| sheet.is_tool_approval())
+                            {
+                                approval =
+                                    crate::modules::ask::presented_approval(sheet, *tail_rect);
+                            }
                         }
                         if id == crate::modules::todo::ID {
                             let mut hits = self.hits.lock().expect("hits poisoned");
@@ -7181,7 +7333,7 @@ impl Host {
             frame.containment_violations()
         );
         *self.painted.lock().expect("counter poisoned") += 1;
-        frame
+        (frame, approval)
     }
 
     /// How many rows the conversation gets on a screen this size.
@@ -7344,7 +7496,8 @@ impl Host {
             let idx = self.row_index.lock().expect("row index poisoned");
             if idx.loaded_start != 0
                 || idx.width != width
-                || idx.caps != crate::block::ShapeCaps::of(&moment.caps)
+                || idx.caps
+                    != crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff)
                 || idx.presentation != presentation
                 || idx.activity != moment.activity
             {
@@ -7558,7 +7711,8 @@ impl Host {
                 _ => None,
             })?;
         let heights = self.tail_heights_of(&tail, rect.w, moment);
-        let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+        let pane_room = self.setup_pane_room(rect, &heights, moment);
+        let mut pane = Self::pane_geometry(pane_room, moment.scroll.0, &heights);
         self.reserve_prompt_header(&mut pane, moment);
         Some(BlockView {
             rect: pane.block_rect,
@@ -7570,7 +7724,11 @@ impl Host {
     /// How many rows the conversation's blocks render to at `width` — the
     /// painter's own count ([`Host::row_index_window`]), tail not included.
     fn block_total(&self, width: u16, moment: &Moment) -> usize {
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        self.block_total_in(width, moment, 0)
+    }
+
+    fn block_total_in(&self, width: u16, moment: &Moment, height: usize) -> usize {
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         self.row_index_window(
@@ -7578,7 +7736,7 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            self.selection_layout_budget(width, moment, moment.scroll.0, 0, pres.revision()),
+            self.selection_layout_budget(width, moment, moment.scroll.0, height, pres.revision()),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         )
         .total
@@ -7591,7 +7749,8 @@ impl Host {
             .row_index_window(
                 &crate::block::RenderCtx {
                     width,
-                    caps: crate::block::ShapeCaps::of(&moment.caps),
+                    caps: crate::block::ShapeCaps::of(&moment.caps)
+                        .with_diff_wrap(!moment.clip_diff),
                 },
                 stream.slots(),
                 &pres,
@@ -7618,7 +7777,7 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let ctx = crate::block::RenderCtx {
             width: 120,
-            caps: crate::block::ShapeCaps::of(&moment.caps),
+            caps: crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
         };
         let mut text = String::new();
         for slot in stream.slots() {
@@ -7641,7 +7800,7 @@ impl Host {
     /// tall and a long session is not.
     pub fn transcript_lines(&self, width: u16, moment: &Moment) -> Vec<Line> {
         let total = self.full_block_total(width, moment);
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         // A question in flight with no panel to ride is drawn under the
         // blocks in every window (`stream_lines`), taking rows the count above
         // does not know about; each slice asks for that much more room so the
@@ -7650,13 +7809,7 @@ impl Host {
         let asked = if self.ask_panel_mounted() {
             0
         } else {
-            self.asks.current().map_or(0, |asked| {
-                crate::block::Content::lines(
-                    &fallback_question(&asked),
-                    &crate::block::RenderCtx::bare(width),
-                )
-                .len()
-            })
+            self.fallback_ask_lines(width, usize::MAX, moment).len()
         };
         let most = (u16::MAX as usize).saturating_sub(asked).max(1);
         let mut out = Vec::with_capacity(total);
@@ -7667,8 +7820,7 @@ impl Host {
                 Rect::new(0, 0, width, (rows + asked).min(u16::MAX as usize) as u16),
                 total - start - rows,
                 caps,
-                moment.activity,
-                moment.tick,
+                moment,
             );
             out.extend(lines.into_iter().take(rows));
             start += rows;
@@ -7708,9 +7860,8 @@ impl Host {
         let (lines, _) = self.stream_lines(
             rect,
             end - last,
-            crate::block::ShapeCaps::of(&moment.caps),
-            moment.activity,
-            moment.tick,
+            crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
+            moment,
         );
         let width = view.rect.w;
         let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -7726,14 +7877,7 @@ impl Host {
                 out.push(String::new());
                 continue;
             }
-            let text = line.plain();
-            let head = crate::width::take_width(&text, a as usize);
-            #[allow(
-                clippy::string_slice,
-                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
-            )]
-            let rest = &text[head.len()..];
-            let piece = crate::width::take_width(rest, (b - a) as usize);
+            let piece = line.selected_text(a as usize, b as usize);
             out.push(piece.trim_end().to_string());
         }
         out.join("\n")
@@ -7778,7 +7922,7 @@ impl Host {
     /// until one of them changed.
     fn stream_height_in(&self, room: Rect, moment: &Moment) -> (usize, usize) {
         let width = room.w;
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         // The sum, from the one place both this and the painter read it — see
@@ -7819,15 +7963,27 @@ impl Host {
         // see `stream_lines`. Counted here for the reason the tail is: a row the
         // frame drew and this did not would be out of reach at the bottom of the
         // scroll, which is the whole failure `row_index` exists to prevent.
-        let pending = match self.ask_panel_mounted() {
-            false => self.asks.current(),
-            true => None,
+        let question = if self.ask_panel_mounted() {
+            0
+        } else {
+            self.fallback_ask_lines(width, usize::MAX, moment).len()
         };
-        let question = pending.map_or(0, |asked| {
-            let block = fallback_question(&asked);
-            crate::block::Content::lines(&block, &crate::block::RenderCtx::bare(width)).len()
-        });
         (total + tail + question, tail)
+    }
+
+    fn fallback_ask_lines(&self, width: u16, height: usize, moment: &Moment) -> Vec<Line> {
+        if let Some(sheet) = &moment.fallback_approval {
+            return crate::modules::ask::render_sheet(sheet, moment, width, height);
+        }
+        self.asks
+            .current()
+            .filter(|asked| !asked.is_tool_approval())
+            .map_or_else(Vec::new, |asked| {
+                crate::block::Content::lines(
+                    &fallback_question(&asked),
+                    &crate::block::RenderCtx::bare(width),
+                )
+            })
     }
 
     /// The view modules riding the stream's tail, with the height each asks for
@@ -8086,7 +8242,7 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
     // covers, read as one more row of the panel. Asked here for the same reason
     // the composer is: it is what the screen does with the row, not what the
     // row needs.
-    if id == crate::modules::status::ID && panel_is_up(moment) {
+    if id == crate::modules::status::ID && (panel_is_up(moment) || moment.model_setup_required) {
         return 0;
     }
     asked
@@ -8154,7 +8310,8 @@ pub fn displaces_composer(moment: &Moment) -> bool {
     // The background panel has a box of its own, where the keys go while it is
     // up; a second one under it would leave a person asking which one they are
     // typing into.
-    moment.asking.is_some()
+    moment.model_setup_required
+        || moment.asking.is_some()
         || moment.settings_panel.is_some()
         || moment.providers_panel.is_some()
         || moment.bg_panel.is_some()
@@ -8408,21 +8565,16 @@ mod tests {
             model: "m".into(),
             reason: atomcode_harness::session::HeaderReason::Append,
         });
-        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(10_000);
-        h.absorb(&SessionEvent::AssistantChunk {
-            turn: 1,
-            round: 1,
-            delta: "a".repeat(400),
-            reasoning: true,
-        });
-        assert_eq!(
-            h.moment
-                .read()
-                .unwrap()
-                .generation
-                .rate(crate::moment::Timestamp::millis(12_000)),
-            Some(8)
-        );
+        for at in [10_000, 12_000] {
+            h.moment.write().unwrap().now = crate::moment::Timestamp::millis(at);
+            h.absorb(&SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "a".repeat(800),
+                reasoning: true,
+            });
+        }
+        assert_eq!(h.moment.read().unwrap().generation.rate(), Some(100));
         h.absorb(&SessionEvent::TurnEnd {
             turn: 1,
             stop: atomcode_kernel::event::StopReason::Stopped,
@@ -8510,6 +8662,7 @@ mod tests {
             tips: Vec::new(),
             brand: Arc::new(crate::content::Brand::default()),
             note: None,
+            model_setup: None,
         };
         h.stream
             .write()
@@ -8649,8 +8802,11 @@ mod tests {
             Rect::sized(80, 20),
             0,
             caps,
-            crate::moment::Activity::Working,
-            tick,
+            &Moment {
+                activity: crate::moment::Activity::Working,
+                tick,
+                ..Moment::default()
+            },
         );
         // The call's opening row is the one naming the file; its first span is
         // the `●` mark, whose colour the pulse moves.
@@ -8712,8 +8868,10 @@ mod tests {
                 Rect::sized(80, 20),
                 0,
                 caps,
-                crate::moment::Activity::Working,
-                0,
+                &Moment {
+                    activity: crate::moment::Activity::Working,
+                    ..Moment::default()
+                },
             )
             .0
             .iter()
@@ -12454,17 +12612,11 @@ mod tests {
         }
         let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
         let draw = |rows: u16, scroll: usize| -> Vec<String> {
-            h.stream_lines(
-                Rect::sized(80, rows),
-                scroll,
-                caps,
-                crate::moment::Activity::Idle,
-                0,
-            )
-            .0
-            .iter()
-            .map(|l| l.plain())
-            .collect()
+            h.stream_lines(Rect::sized(80, rows), scroll, caps, &Moment::default())
+                .0
+                .iter()
+                .map(|l| l.plain())
+                .collect()
         };
         let whole = draw(400, 0);
         let total = whole.iter().rposition(|l| !l.is_empty()).unwrap() + 1;

@@ -23,6 +23,7 @@ fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
     force_tls12: bool,
 ) -> reqwest::blocking::ClientBuilder {
+    let builder = atomcode_auth::dns::apply_blocking(builder);
     atomcode_config::proxy::ensure_runtime_initialized();
     let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
         .ok()
@@ -243,15 +244,15 @@ impl Client {
         })
     }
 
-    /// `GET /coding-plan/models-v2?plan_type=<tier>` — model catalogue
+    /// `GET /coding-plan/models-v3?plan_type=<tier>` — model catalogue
     /// from the v2 endpoint. Every entry now carries `plan_available`
     /// telling the caller whether the user's tier covers that model;
     /// the renderer uses it to apply strikethrough on locked entries.
     /// Empty list is a legitimate return when the entitlement hasn't
     /// been provisioned yet.
-    pub fn list_models_v2(&self, plan_type: PlanType) -> Result<Vec<ModelEntry>> {
+    pub fn list_models_v3(&self, plan_type: PlanType) -> Result<Vec<ModelEntry>> {
         let url = format!(
-            "{}/coding-plan/models-v2?plan_type={}",
+            "{}/coding-plan/models-v3?plan_type={}",
             api_base_url(),
             plan_type.as_str()
         );
@@ -271,11 +272,11 @@ impl Client {
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{}", format_api_error("models-v2", status, &body)));
+            return Err(anyhow!("{}", format_api_error("models-v3", status, &body)));
         }
         serde_json::from_str::<Vec<ModelEntry>>(&body).with_context(|| {
             format!(
-                "parse models-v2 response (body: {})",
+                "parse models-v3 response (body: {})",
                 truncate_for_error(&body, 200)
             )
         })
@@ -527,7 +528,7 @@ mod tests {
 
     /// `is_auth_expired` finds the marker on a direct `AuthExpired`
     /// error AND through the `with_context` chain that callers wrap
-    /// around it ("build client: ...", "list models-v2: ..."). Without
+    /// around it ("build client: ...", "list models-v3: ..."). Without
     /// walking the chain we'd miss it the moment any step layers a
     /// context onto the original anyhow::Error.
     #[test]
@@ -536,7 +537,7 @@ mod tests {
         assert!(is_auth_expired(&raw));
 
         let wrapped: anyhow::Error = Err::<(), _>(anyhow::Error::new(AuthExpired { status: 401 }))
-            .context("list models-v2")
+            .context("list models-v3")
             .unwrap_err();
         assert!(is_auth_expired(&wrapped));
 

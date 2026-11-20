@@ -397,6 +397,164 @@ async fn consecutive_reasoning_only_truncations_stop_without_an_unbounded_retry(
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn reasoning_stop() -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::Reasoning("long unfinished analysis".into()),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_only_stops_end_without_an_output_limit_checkpoint() {
+    let root = std::env::temp_dir().join(format!(
+        "atomcode-reasoning-stop-checkpoint-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let provider = Arc::new(Provider {
+        streams: Mutex::new((0..2).map(|_| reasoning_stop()).collect()),
+        requests: Mutex::new(Vec::new()),
+        options: Mutex::new(Vec::new()),
+    });
+    let driver = Arc::new(CheckpointDriver {
+        // Any checkpoint is a failure, even if it would have been declined.
+        answers: Mutex::new(VecDeque::new()),
+        asked: Mutex::new(Vec::new()),
+    });
+    let mut app = app_with_driver(&root, provider.clone(), false, Some(driver.clone())).await;
+    let outcome = run_turn(&app, "start").await.unwrap();
+    assert_eq!(outcome.stop, atomcode_harness::seams::StopReason::Stopped);
+    assert!(outcome.error.is_none());
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    assert!(driver.asked.lock().unwrap().is_empty());
+    let events = app.context().only_session().unwrap().events();
+    assert!(events.iter().any(|fact| matches!(&fact.event,
+        atomcode_harness::session::SessionEvent::Notice { detail, .. }
+            if detail.contains("只输出了思考") && detail.contains("本轮已结束"))));
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_suppressed_reasoning_reply_to_an_internal_note_keeps_its_usage() {
+    let root = std::env::temp_dir().join(format!(
+        "atomcode-internal-reasoning-usage-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let usage = TokenUsage {
+        prompt: 100,
+        cached: 70,
+        completion: 25,
+    };
+    let provider = Arc::new(Provider {
+        streams: Mutex::new(VecDeque::from([vec![
+            StreamEvent::Reasoning("Nothing to add to this note".into()),
+            StreamEvent::Usage(usage),
+            StreamEvent::Done { truncated: false },
+        ]])),
+        requests: Mutex::new(Vec::new()),
+        options: Mutex::new(Vec::new()),
+    });
+    let mut app = app(&root, provider.clone(), false).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    agent.send_from(
+        "verify if needed",
+        atomcode_harness::agent::MessageOrigin::Internal,
+    );
+    let outcome = atomcode_harness::drive(&app, &agent).await.unwrap();
+    assert_eq!(outcome.stop, atomcode_harness::seams::StopReason::Stopped);
+    assert!(outcome.error.is_none());
+    assert!(outcome.text.is_empty());
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    let events = app.context().only_session().unwrap().events();
+    let receipts: Vec<_> = events
+        .iter()
+        .filter_map(|fact| match &fact.event {
+            atomcode_harness::session::SessionEvent::Usage { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        receipts,
+        vec![usage],
+        "exactly one receipt survives suppression"
+    );
+    assert!(!events.iter().any(|fact| matches!(
+        &fact.event,
+        atomcode_harness::session::SessionEvent::AssistantMessage { .. }
+    )));
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A gateway that closes a long request at its own time limit reports a plain
+/// stop with reasoning and nothing else. Replaying that request reasons the
+/// same way again; the model is asked to act on what it already worked out.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_reasoning_only_stop_is_nudged_to_act_instead_of_replayed() {
+    let root = std::env::temp_dir().join(format!(
+        "atomcode-reasoning-stop-nudge-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let provider = Arc::new(Provider {
+        streams: Mutex::new(VecDeque::from([
+            reasoning_stop(),
+            vec![
+                StreamEvent::TextDelta("acted".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ])),
+        requests: Mutex::new(Vec::new()),
+        options: Mutex::new(Vec::new()),
+    });
+    let mut app = app(&root, provider.clone(), false).await;
+    let outcome = run_turn(&app, "start").await.unwrap();
+    assert_eq!(outcome.text, "acted", "{outcome:?}");
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].iter().any(|m| m
+        .text
+        .contains("ended after reasoning, with no answer and no tool call")));
+    drop(requests);
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn repeated_reasoning_only_stops_end_the_turn_without_a_provider_error() {
+    let root = std::env::temp_dir().join(format!(
+        "atomcode-reasoning-stop-cap-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let provider = Arc::new(Provider {
+        streams: Mutex::new((0..2).map(|_| reasoning_stop()).collect()),
+        requests: Mutex::new(Vec::new()),
+        options: Mutex::new(Vec::new()),
+    });
+    let mut app = app(&root, provider.clone(), false).await;
+    let outcome = run_turn(&app, "start").await.unwrap();
+    assert_eq!(
+        provider.requests.lock().unwrap().len(),
+        2,
+        "one nudge, never a blind replay of the same request"
+    );
+    assert_eq!(
+        outcome.stop,
+        atomcode_harness::seams::StopReason::Stopped,
+        "{outcome:?}"
+    );
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let events = app.context().only_session().unwrap().events();
+    assert!(events.iter().any(|fact| matches!(&fact.event,
+        atomcode_harness::session::SessionEvent::Notice { detail, .. } if detail.contains("只输出了思考"))));
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn repeated_text_is_only_a_redump_within_a_consecutive_truncation_streak() {
     for break_streak in [false, true] {

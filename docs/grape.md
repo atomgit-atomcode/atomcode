@@ -39,6 +39,13 @@ If remote revocation cannot be confirmed, disconnect retains the local record an
 
 ## Use from a conversation
 
+Grape tools are temporarily disabled in the CLI and daemon builds: neither host enables
+the coding crate's `grape` feature. This also excludes them from the TUI, headless,
+background and ACP runtimes supplied by these hosts, so their descriptions and schemas
+are not sent to the model. The implementation and CLI connection commands are retained;
+connecting does not enable conversation tools. The examples below apply only to a build
+that explicitly enables `atomcode-coding/grape`.
+
 - “List the Grape scenes available for owner/repo.”
 - “Hand Issue #123 and PR #456 to Grape's QA role. Review pushed commit abc only; then show me the event ID.”
 - “Check that event's state and fetch the next ten log messages.”

@@ -209,7 +209,7 @@ impl Tool for GrepTool {
                             .map(|x| x.eq_ignore_ascii_case("log"))
                             .unwrap_or(false))
                         || (walks_a_dir
-                            && sensitive.references(&json!({"path": path}).to_string())
+                            && sensitive.references_path(path)
                             && !(explicitly_sensitive
                                 && named_roots.iter().any(|root| path.starts_with(root))))
                         || (walks_a_dir
@@ -666,5 +666,46 @@ mod tests {
         let args = serde_json::json!({ "pattern": needle, "path": named }).to_string();
         let r = GrepTool::default().execute(&args, &ctx(&home)).await;
         assert!(r.content.contains(needle), "{}", r.content);
+    }
+
+    /// A walk that includes hidden entries still skips the secret `.env`
+    /// variants while searching the committed template. This is the per-file
+    /// check the sensitive-path filter applies directly to the walked path.
+    #[tokio::test]
+    async fn a_walk_skips_dotenv_secrets_but_searches_templates() {
+        let d = tempfile::tempdir().unwrap();
+        let needle = "grep-walk-dotenv-criterion";
+        for name in [".env", ".env.local", ".env'backup", ".env.example"] {
+            std::fs::write(d.path().join(name), format!("KEY={needle}\n")).unwrap();
+        }
+
+        let args = serde_json::json!({
+            "pattern": needle,
+            "path": d.path(),
+            "include_hidden": true,
+        })
+        .to_string();
+        let r = GrepTool::default().execute(&args, &ctx(d.path())).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            !r.content.contains(".env:1:"),
+            "a secret .env must not be searched by a walk: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains(".env.local:1:"),
+            "a secret variant must not be searched by a walk: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains(".env'backup:1:"),
+            "the legacy apostrophe boundary must stay protected: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains(".env.example:1:"),
+            "a committed template must stay searchable: {}",
+            r.content
+        );
     }
 }

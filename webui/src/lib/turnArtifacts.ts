@@ -5,6 +5,40 @@ export interface TurnArtifact {
   label: string;
 }
 
+/** Display workspace-relative paths without trimming a sibling's prefix. */
+export function artifactDisplayPath(path: string, cwd?: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const root = cwd?.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (root) {
+    const windows = /^[a-z]:\//i.test(root);
+    const comparable = windows ? normalized.toLowerCase() : normalized;
+    const prefix = (windows ? root.toLowerCase() : root) + '/';
+    if (comparable.startsWith(prefix)) return normalized.slice(root.length + 1);
+  }
+  return normalized.replace(/^\.\//, '');
+}
+
+/**
+ * The workspace-relative path the Workbench can open, or null when the path
+ * leaves the workspace (absolute outside `cwd`, `~`) or has any `..` segment.
+ * `..` is never collapsed lexically — a symlinked parent makes that wrong — so
+ * callers pass the raw path on and the daemon canonicalizes it.
+ */
+export function workspaceRelativePath(path: string, cwd?: string): string | null {
+  const normalized = path.replace(/\\/g, '/');
+  const absolute = normalized.startsWith('/') || /^[a-z]:\//i.test(normalized);
+  const relative = artifactDisplayPath(normalized, cwd);
+  if (absolute && /^\/|^[a-z]:\//i.test(relative)) return null;
+  if (!absolute && normalized.startsWith('~')) return null;
+  const segments: string[] = [];
+  for (const segment of relative.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') return null;
+    segments.push(segment);
+  }
+  return segments.length ? segments.join('/') : null;
+}
+
 interface ArtifactMessage {
   archiveArtifacts?: TurnArtifact[];
   role: 'user' | 'assistant' | 'system';

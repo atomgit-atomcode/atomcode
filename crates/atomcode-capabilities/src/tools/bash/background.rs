@@ -49,9 +49,12 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// the map unbounded; this caps it (codex uses the same 64 for its exec sessions) and turns
 /// the overflow into a clear, actionable error rather than a silent leak.
 const MAX_BACKGROUND_JOBS: usize = 64;
+/// Output a single completion notice carries.
+const NOTICE_TAIL_CHARS: usize = 2000;
 
 const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
 const MAX_POLL_WAIT_MS: u64 = 60_000;
+static NEXT_POLL_WAIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// After the tracked shell exits, how long its pipes get to close before the job counts as
 /// having left something running. A grandchild that inherited stdout (`some-daemon &`)
@@ -174,6 +177,12 @@ impl BackgroundCompletion {
     /// Build a bounded, non-consuming notice only while output remains collectable.
     /// A terminal poll removes the job, suppressing a redundant model wakeup.
     pub fn notification(&self) -> Option<String> {
+        self.notification_within(NOTICE_TAIL_CHARS)
+    }
+
+    /// [`Self::notification`] with at most `tail_chars` of output, for a notice
+    /// that shares one wakeup with others.
+    pub fn notification_within(&self, tail_chars: usize) -> Option<String> {
         let (world, raw) = {
             let guard = store().lock().unwrap();
             let job = guard.get(&self.job_id)?;
@@ -184,14 +193,14 @@ impl BackgroundCompletion {
         let tail: String = text
             .chars()
             .rev()
-            .take(2000)
+            .take(tail_chars)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
         Some(format!(
-            "Background job {} has finished (exit code: {:?}, killed: {}). Captured output tail (up to 2000 characters):\n{}\nUse bash_poll with job_id {:?} to collect remaining output. This is a process completion notification, not proof that the task succeeded.",
-            self.job_id, self.exit_code, self.killed, tail, self.job_id,
+            "Background job {} has finished (exit code: {:?}, killed: {}). Captured output tail (up to {} characters):\n{}\nUse bash_poll with job_id {:?} to collect remaining output. This is a process completion notification, not proof that the task succeeded.",
+            self.job_id, self.exit_code, self.killed, tail_chars, tail, self.job_id,
         ))
     }
 }
@@ -236,6 +245,17 @@ pub(crate) async fn start(
     let exit_status_note = super::exit_diagnostic::may_mask_status(command);
     // Bound the store BEFORE spawning so a runaway starter can't grow it (or leak processes)
     // without limit; count under the lock, drop it before the await-y spawn below.
+    {
+        let mut jobs = store().lock().unwrap();
+        if jobs.len() >= MAX_BACKGROUND_JOBS {
+            // A stopped job may never be polled after termination, so reclaim
+            // its output under pressure to make room for new work.
+            jobs.retain(|_, job| {
+                !(job.shared.finished.load(Ordering::Acquire)
+                    && *job.shared.status.lock().unwrap() == Status::Killed)
+            });
+        }
+    }
     if store().lock().unwrap().len() >= MAX_BACKGROUND_JOBS {
         return Err(format!(
             "bash_start: too many background jobs (limit {MAX_BACKGROUND_JOBS}); poll or kill \
@@ -372,12 +392,22 @@ async fn wait_for_poll(
     };
     // Construct only after looking up an internal job id: arbitrary caller input
     // from an invalid id must not be copied into diagnostic logs.
+    let wait_id = NEXT_POLL_WAIT_ID.fetch_add(1, Ordering::Relaxed);
     let mut timing = PollWaitTiming {
+        wait_id,
         job_id,
         started_at: wait_started,
         requested_wait_ms: wait_ms,
         outcome: "abandoned",
     };
+    tracing::info!(
+        pid = std::process::id(),
+        wait_id,
+        job_id,
+        requested_wait_ms = wait_ms,
+        effective_wait_ms = wait_ms.min(MAX_POLL_WAIT_MS),
+        "background_poll_wait_started"
+    );
     let initial_status = shared.status.lock().unwrap().clone();
     let initial_left_running = shared.left_running();
     let deadline =
@@ -426,6 +456,7 @@ async fn wait_for_poll(
 
 /// Observability only. Dropping a caller's wait never owns or stops its process.
 struct PollWaitTiming<'a> {
+    wait_id: u64,
     job_id: &'a str,
     started_at: tokio::time::Instant,
     requested_wait_ms: u64,
@@ -434,8 +465,9 @@ struct PollWaitTiming<'a> {
 
 impl Drop for PollWaitTiming<'_> {
     fn drop(&mut self) {
-        tracing::debug!(
+        tracing::info!(
             pid = std::process::id(),
+            wait_id = self.wait_id,
             job_id = self.job_id,
             requested_wait_ms = self.requested_wait_ms,
             effective_wait_ms = self.requested_wait_ms.min(MAX_POLL_WAIT_MS),
@@ -786,12 +818,17 @@ impl Tool for BashStartTool {
             }
         };
         match start(&self.world, &a.command, ctx).await {
+            // The prefix up to "Collect output with bash_poll " is parsed back by
+            // the coding runtime (`discipline::started_job`). How to wait is the
+            // host's call (its background completion policy): a concrete wait
+            // command here is what a model copies, whatever the policy says.
             Ok(id) if a.notify_on_exit => ok(format!(
-                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
-                 after the requested host completion notification. Do useful independent work, or finish \
-                 this response and wait for the notification; do not repeatedly poll just to wait. \
-                 A host without notification support still requires manual polling. \
-                 Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
+                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\"}} \
+                 once it has finished; wait for it the way this host's background completion policy \
+                 says. Where the host resumes you, ending your response does not end the task: the \
+                 completion notice starts your next turn and you continue the remaining steps from \
+                 there. Unless the host says it resumes you, wait with bash_poll until the job ends \
+                 before answering. Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
             )),
             Ok(id) => ok(format!(
                 "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
@@ -855,7 +892,10 @@ fn poll_description(preview: bool) -> &'static str {
          whether it is still running or has exited. Waits up to wait_ms (default 10000, max \
          60000), collecting output until exit, status change or timeout. Set wait_until to \
          output to return early on new output; 0 checks immediately. Use this instead \
-         of shell sleep, and repeat until it reports it exited. A wait timeout leaves the \
+         of shell sleep. If this job has notify_on_exit enabled and the host resumes you on \
+         completion, end your response and collect once with wait_ms 0 after the notification. \
+         Otherwise wait with bash_poll and repeat while it reports \
+         running. A wait timeout leaves the \
          job running; it does not mean failure. Do not restart a running build. \
          When a poll has no new output and still reports running, avoid repeated waiting \
          narration or a new status update for each check. Report meaningful new output, \
@@ -1231,6 +1271,45 @@ mod tests {
         (id, process)
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_full_store_makes_room_only_from_ended_killed_jobs() {
+        let exit = Exit {
+            code: Some(0),
+            signal: None,
+        };
+        let mut ids = Vec::new();
+        for _ in 0..MAX_BACKGROUND_JOBS {
+            ids.push(auth_job(Vec::new(), exit).await.0);
+        }
+        let extra = || -> Arc<dyn Shell> {
+            Arc::new(AuthWorld(Arc::new(AuthProcess {
+                chunks: Mutex::new(Default::default()),
+                drained: tokio::sync::Notify::new(),
+                finish: tokio_util::sync::CancellationToken::new(),
+                exit,
+            })))
+        };
+        assert!(
+            start(&extra(), "more", &ctx(Path::new("."))).await.is_err(),
+            "running jobs keep their slots"
+        );
+        kill(&ids[0]).unwrap();
+        while !store().lock().unwrap()[&ids[0]]
+            .shared
+            .finished
+            .load(Ordering::Acquire)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let id = start(&extra(), "more", &ctx(Path::new(".")))
+            .await
+            .expect("an ended killed job gives up its slot");
+        let jobs = store().lock().unwrap();
+        assert!(!jobs.contains_key(&ids[0]));
+        assert!(ids[1..].iter().all(|id| jobs.contains_key(id)));
+        assert!(jobs.contains_key(&id));
+    }
+
     struct PollProcess {
         chunks: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Chunk>>,
         finish: tokio_util::sync::CancellationToken,
@@ -1560,6 +1639,17 @@ mod tests {
             .filter(|e| e["message"] == "background_poll_wait_finished")
             .collect();
         assert_eq!(polls.len(), 2);
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_started")
+            .collect();
+        assert_eq!(starts.len(), polls.len());
+        for (start, end) in starts.iter().zip(&polls) {
+            assert_eq!(start["level"], "INFO");
+            assert_eq!(start["wait_id"], end["wait_id"]);
+            assert_eq!(end["level"], "INFO");
+        }
+
         assert_eq!(polls[0]["outcome"], "output");
         assert_eq!(polls[0]["waited_ms"], 200);
         assert_eq!(polls[1]["outcome"], "finished");
@@ -1683,13 +1773,64 @@ mod tests {
             (polls[1], "cancelled", 100),
             (polls[2], "abandoned", 75),
         ] {
-            assert_eq!(event["level"], "DEBUG");
+            assert_eq!(event["level"], "INFO");
             assert_eq!(event["outcome"], reason);
             assert_eq!(event["waited_ms"], elapsed);
         }
         assert!(!serde_json::to_string(&*events)
             .unwrap()
             .contains("PRIVATE_INVALID_JOB"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn concurrent_poll_waits_are_clamped_and_have_paired_info_records() {
+        let capture = TimingCapture::default();
+        async {
+            let mut jobs = Vec::new();
+            for _ in 0..4 {
+                jobs.push(poll_job().await);
+            }
+            let started = tokio::time::Instant::now();
+            let waits = jobs.iter().map(|(id, _, _)| async move {
+                let context = ctx(Path::new("PRIVATE_CWD"));
+                wait_for_poll(id, MAX_POLL_WAIT_MS * 2, PollWaitUntil::Exit, &context)
+                    .await
+                    .unwrap();
+            });
+            futures::future::join_all(waits).await;
+            assert_eq!(started.elapsed(), Duration::from_millis(MAX_POLL_WAIT_MS));
+            for (id, _, _) in jobs {
+                kill(&id).unwrap();
+                let _ = drain(&id).await;
+            }
+        }
+        .with_subscriber(capture.clone())
+        .await;
+        let events = capture.0.lock().unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_started")
+            .collect();
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_finished")
+            .collect();
+        assert_eq!(starts.len(), 4);
+        assert_eq!(ends.len(), 4);
+        for start in starts {
+            let end = ends
+                .iter()
+                .find(|end| end["wait_id"] == start["wait_id"])
+                .unwrap();
+            assert_eq!(start["effective_wait_ms"], MAX_POLL_WAIT_MS);
+            assert_eq!(start["requested_wait_ms"], MAX_POLL_WAIT_MS * 2);
+            assert_eq!(end["outcome"], "deadline");
+            assert_eq!(end["waited_ms"], MAX_POLL_WAIT_MS);
+            assert_eq!(end["level"], "INFO");
+        }
+        assert!(!serde_json::to_string(&*events)
+            .unwrap()
+            .contains("PRIVATE_"));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1718,6 +1859,32 @@ mod tests {
         assert!(second.content.ends_with("status: exited (code 0)"));
         assert_eq!(started.elapsed(), Duration::from_millis(500));
         assert!(poll(&id).is_err(), "a collected terminal job is reaped");
+    }
+
+    /// The receipt is read by every host; how to wait is the host policy's call,
+    /// so a notified job's receipt names no wait for the model to copy.
+    #[tokio::test]
+    async fn a_notified_start_leaves_the_wait_to_the_host_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = BashStartTool::default()
+            .execute(&json!({"command":"true"}).to_string(), &ctx(dir.path()))
+            .await;
+        assert!(!started.is_error, "{}", started.content);
+        let id = started
+            .content
+            .strip_prefix("Started background job ")
+            .and_then(|rest| rest.split_once(". Collect output with bash_poll "))
+            .map(|(id, _)| id.to_owned())
+            .expect("prefix parsed by the coding runtime");
+        assert!(!started.content.contains("wait_ms"), "{}", started.content);
+        assert!(started.content.contains("does not end the task"));
+        // Bundles without a completion policy still learn to wait for the job.
+        assert!(started
+            .content
+            .contains("Unless the host says it resumes you"));
+        let _ = BashKillTool
+            .execute(&json!({"job_id":id}).to_string(), &ctx(dir.path()))
+            .await;
     }
 
     #[test]
@@ -1870,6 +2037,28 @@ mod tests {
         assert_eq!(text.matches("[hint]").count(), 1, "{text}");
         assert!(text.contains("Git credential"), "{text}");
         assert!(poll(&id).is_err(), "a finished job is reaped");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ssh_auth_hint_survives_split_background_stderr() {
+        use crate::world::Chunk;
+        let (id, process) = auth_job(
+            vec![
+                Chunk::Stderr(b"git@example.com: Permission denied (public".to_vec()),
+                Chunk::Stderr(b"key).\nfatal: Could not read from remote ".to_vec()),
+                Chunk::Stderr(b"repository.\n".to_vec()),
+            ],
+            Exit {
+                code: Some(128),
+                signal: None,
+            },
+        )
+        .await;
+        process.finish.cancel();
+        let (text, status) = drain(&id).await;
+        assert_eq!(status, Status::Exited(128));
+        assert_eq!(text.matches("[hint]").count(), 1);
+        assert!(text.contains("git-auth status"));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2139,3 +2328,6 @@ mod tests {
         assert!(bytes.is_empty());
     }
 }
+
+#[cfg(all(test, unix))]
+mod output_experiment;

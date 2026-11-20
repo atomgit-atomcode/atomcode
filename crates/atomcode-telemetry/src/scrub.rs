@@ -43,17 +43,29 @@ pub fn redact_secrets(s: &str) -> String {
     tokens.replace_all(&step1, "<REDACTED>").into_owned()
 }
 
+/// A path worth replacing. A bare `/`, `.` or `..` would match separators or
+/// dots all over the message (URLs, versions), turning the diagnostic into
+/// unreadable text without hiding anything; an empty string matches wherever
+/// the message has one. All of them have no alphanumeric character.
+fn usable_path(path: Option<&Path>) -> Option<&str> {
+    path.and_then(Path::to_str)
+        .filter(|p| p.chars().any(|c| c.is_alphanumeric()))
+}
+
 pub fn scrub_path(s: &str, home: Option<&Path>, cwd: Option<&Path>) -> String {
     let mut out = s.to_string();
-    if let Some(h) = home.and_then(|p| p.to_str()) {
-        if !h.is_empty() {
-            out = out.replace(h, "<HOME>");
-        }
+    let mut paths: Vec<(&str, &str)> = Vec::new();
+    if let Some(c) = usable_path(cwd) {
+        paths.push((c, "<CWD>"));
     }
-    if let Some(c) = cwd.and_then(|p| p.to_str()) {
-        if !c.is_empty() {
-            out = out.replace(c, "<CWD>");
-        }
+    if let Some(h) = usable_path(home) {
+        paths.push((h, "<HOME>"));
+    }
+    // Longest first: the more specific prefix must be replaced before a
+    // shorter ancestor can hide the rest of the path behind it.
+    paths.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (path, marker) in paths {
+        out = out.replace(path, marker);
     }
     out
 }
@@ -107,6 +119,45 @@ mod tests {
             scrub_path(s, None, Some(&cwd)),
             "error in <CWD>/src/main.rs:3"
         );
+    }
+
+    #[test]
+    fn cwd_wins_over_home_for_a_project_below_it() {
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/home/u/proj");
+        let s = "error in /home/u/proj/src/main.rs:3";
+        assert_eq!(
+            scrub_path(s, Some(&home), Some(&cwd)),
+            "error in <CWD>/src/main.rs:3"
+        );
+    }
+
+    #[test]
+    fn home_wins_when_cwd_is_its_parent() {
+        let home = PathBuf::from("/home/u");
+        let cwd = PathBuf::from("/home");
+        let s = "error in /home/u/proj/src/main.rs:3";
+        assert_eq!(
+            scrub_path(s, Some(&home), Some(&cwd)),
+            "error in <HOME>/proj/src/main.rs:3"
+        );
+    }
+
+    #[test]
+    fn degenerate_roots_do_not_replace_separators() {
+        let message = "HTTP 400 https://api.openai.com/v1/chat/completions v1.2.3";
+        for degenerate in ["", "/", ".", ".."] {
+            assert_eq!(
+                scrub_path(message, None, Some(Path::new(degenerate))),
+                message,
+                "cwd {degenerate:?} must not scrub the message"
+            );
+            assert_eq!(
+                scrub_path(message, Some(Path::new(degenerate)), None),
+                message,
+                "home {degenerate:?} must not scrub the message"
+            );
+        }
     }
 
     #[test]

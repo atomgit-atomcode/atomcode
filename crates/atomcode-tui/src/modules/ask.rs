@@ -28,7 +28,7 @@
 //! approval row's business; what an answer *means*, and what each key does, are
 //! [`crate::ask`]'s. This draws the sheet and says which row is which.
 
-use crate::ask::{Asked, Form, Sheet, Slot};
+use crate::ask::{Asked, Form, PresentedApproval, Sheet, Slot};
 use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
 use atomcode_harness::seams::ANSWER_ALWAYS;
@@ -72,15 +72,7 @@ impl View for Ask {
         let Some(sheet) = vp.moment.asking.as_ref() else {
             return Vec::new();
         };
-        let w = vp.rect.w as usize;
-        if w == 0 || vp.rect.h == 0 {
-            return Vec::new();
-        }
-        let caps = vp.moment.caps;
-        layout(sheet, w, vp.rect.h as usize)
-            .into_iter()
-            .map(|row| draw(sheet, row, caps, w))
-            .collect()
+        render_sheet(sheet, vp.moment, vp.rect.w, vp.rect.h as usize)
     }
 
     /// What the panel needs, at this width and with this page up.
@@ -103,13 +95,46 @@ impl View for Ask {
     }
 }
 
+pub(crate) fn render_sheet(sheet: &Sheet, moment: &Moment, width: u16, height: usize) -> Vec<Line> {
+    let width = width as usize;
+    let arrows_used_for_scrolling =
+        moment.mouse_handed_back && crate::ansi::alternate_scroll_enabled();
+    layout(sheet, width, height)
+        .into_iter()
+        .map(|row| draw(sheet, row, moment.caps, width, arrows_used_for_scrolling))
+        .collect()
+}
+
+pub(crate) fn presented_approval(
+    sheet: &Sheet,
+    rect: crate::frame::Rect,
+) -> Option<PresentedApproval> {
+    let rows = layout(sheet, rect.w as usize, rect.h as usize);
+    if !rows.iter().any(|row| matches!(row, Row::Slot(_))) {
+        return None;
+    }
+    let selected = rows.iter().find_map(|row| match row {
+        Row::Slot(i) if sheet.row_selected(*i) => Some(*i),
+        _ => None,
+    });
+    Some(PresentedApproval {
+        id: sheet.id,
+        selected,
+    })
+}
+
 /// What the legend says: the keys this page answers to, and nothing about what
 /// an answer *means* — that is the harness's, and the wording of each answer
 /// comes from the answerer.
-fn legend(sheet: &Sheet) -> Vec<(String, String)> {
+fn legend(sheet: &Sheet, arrows_used_for_scrolling: bool) -> Vec<(String, String)> {
     let mut keys = Vec::new();
     if sheet.option_edit().is_none() {
-        keys.push(("↑↓".into(), t(Msg::AskLegendChoose).into_owned()));
+        let choose = if sheet.is_tool_approval() && arrows_used_for_scrolling {
+            "ctrl+p/n"
+        } else {
+            "↑↓"
+        };
+        keys.push((choose.into(), t(Msg::AskLegendChoose).into_owned()));
     }
     if sheet.can_edit_option() {
         keys.push((
@@ -392,7 +417,7 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     rows
 }
 
-fn draw(sheet: &Sheet, row: Row, caps: Caps, w: usize) -> Line {
+fn draw(sheet: &Sheet, row: Row, caps: Caps, w: usize, arrows_used_for_scrolling: bool) -> Line {
     match row {
         // The same run of `─` the composer spans its own rect with: the panel
         // holds the foot of the screen while a question is up, and the edge is
@@ -402,7 +427,10 @@ fn draw(sheet: &Sheet, row: Row, caps: Caps, w: usize) -> Line {
         }
         Row::Blank | Row::Margin => Line::empty(),
         Row::Legend => Line::styled(
-            format!("  {}", crate::widget::keys(&legend(sheet), caps)),
+            format!(
+                "  {}",
+                crate::widget::keys(&legend(sheet, arrows_used_for_scrolling), caps)
+            ),
             theme::fg(Role::Muted),
         )
         .truncate(w),
@@ -518,7 +546,7 @@ fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
     let Some(&slot) = slots.get(k) else {
         return Line::empty();
     };
-    let here = sheet.cursor() == k;
+    let here = sheet.row_highlighted(k);
     // The pointed-at row is the same panel one step brighter, not a reversed
     // video bar — see `theme::Role::PanelSelBg` for why, and `menu::Menu::render`
     // for the same choice made for the same reason.
@@ -1063,10 +1091,15 @@ mod tests {
     /// Only one row is pointed at, and it is the one a confirm takes.
     #[test]
     fn exactly_one_answer_is_lit_and_it_is_the_one_a_confirm_takes() {
+        use crate::surface::{Key, KeyPress};
         let question = approval(None, "write_file", "{}", None);
         let pointer = Caps::default().g(Glyph::Prompt);
         for cursor in 0..question.options.len() {
-            let moment = asking(question.clone(), cursor);
+            let mut sheet = Sheet::one(question.clone());
+            for _ in 0..=cursor {
+                sheet.key(KeyPress::plain(Key::Down));
+            }
+            let moment = with(sheet);
             let lines = framed(&moment, 60);
             let lit: Vec<&String> = lines.iter().filter(|l| l.starts_with(pointer)).collect();
             assert_eq!(
@@ -1082,7 +1115,7 @@ mod tests {
             );
             let mut sheet = moment.asking.clone().unwrap();
             assert_eq!(
-                sheet.enter(),
+                sheet.key(KeyPress::plain(Key::Enter)),
                 crate::ask::Step::Deliver(vec![Some(crate::ask::Reply::from(a.value.as_str()))]),
                 "and a confirm takes it"
             );
@@ -1182,6 +1215,7 @@ mod tests {
         assert!(out.contains("↑↓ 选择"), "{out}");
         assert!(out.contains("⏎ 确认"), "{out}");
         assert!(out.contains("esc 拒绝"), "{out}");
+        assert!(!out.contains("ctrl+p/n"), "{out}");
         assert!(
             !out.contains("space"),
             "nothing to tick on a choice:\n{out}"
@@ -1191,6 +1225,14 @@ mod tests {
         assert!(boxes.contains("space 勾选"), "{boxes}");
         let pages = framed(&with(Sheet::new(1, vec![text(), multiple()])), 80).join("\n");
         assert!(pages.contains("←→ 切换题目"), "{pages}");
+    }
+
+    #[test]
+    fn the_approval_legend_shows_ctrl_p_and_n_when_arrows_are_used_for_scrolling() {
+        let approval = Sheet::one(approval(None, "write_file", "{}", None));
+        assert_eq!(legend(&approval, true)[0].0, "ctrl+p/n");
+        assert_eq!(legend(&approval, false)[0].0, "↑↓");
+        assert_eq!(legend(&Sheet::one(multiple()), true)[0].0, "↑↓");
     }
 
     /// A model's multiple choice is a box per answer, what each answer means

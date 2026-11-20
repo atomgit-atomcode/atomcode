@@ -224,12 +224,18 @@ mod tests {
             account: "account".into(),
             model: wire.into(),
             window: 12345,
+            max_tokens: None,
             vision: Some(true),
             effort: None,
             levels: vec![],
             current: true,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         };
+
         (
             ProvidersView::new(vec![], vec![model.clone()], vec![], vec![]),
             model,

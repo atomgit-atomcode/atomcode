@@ -2029,7 +2029,7 @@ function testWebviewBridgeClearsQueuedMessagesOnHostInstruction() {
 function testLatePanelSessionBindingIsPersistedForRestore() {
   const source = readSource(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'));
   const selectedCase = source.match(/case 'sessionSelected':[\s\S]*?break;/)?.[0] ?? '';
-  assert.match(selectedCase, /getVSCodeApi\(\)\.setState\(\{ sessionId: msg\.sessionId, projectHash: msg\.projectHash \}\)/);
+  assert.match(selectedCase, /updateWebviewState\(\{ sessionId: msg\.sessionId, projectHash: msg\.projectHash \}\)/);
 }
 
 async function testInitialStateDoesNotClearPendingApprovalModeSwitch() {

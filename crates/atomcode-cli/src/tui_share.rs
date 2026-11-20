@@ -460,9 +460,8 @@ async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String
         .arg(format!("http://127.0.0.1:{port}"))
         .arg("--supervise-daemon")
         .arg("false")
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .kill_on_drop(true);
+    crate::relay::capture_relay_output(&mut command, "app");
     if let Some(name) = &machine {
         command.arg("--machine-name").arg(name);
     }
@@ -488,6 +487,18 @@ async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String
         return Err(why);
     }
     Ok(pair_uri(&https_base, &token, machine.as_deref()))
+}
+
+/// 进程退出时收掉手机中继子进程。
+///
+/// 子进程挂在静态槽里,而静态槽从不析构:`kill_on_drop` 在那里不会生效,
+/// 不收的话它在本进程退出后成了孤儿,还连着 App 端口——下一个占到这个端口的
+/// atomcode 就被这个旧配对的手机连上了。
+pub struct PhoneRelayGuard;
+impl Drop for PhoneRelayGuard {
+    fn drop(&mut self) {
+        stop_for_phone();
+    }
 }
 
 /// 收掉中继客户端和 App server。返回是否真有东西被收掉。
@@ -701,7 +712,7 @@ fn webui_feedback(
 #[derive(Debug, PartialEq, Eq)]
 struct WebuiOptions {
     host: String,
-    port: u16,
+    port: Option<u16>,
     open_browser: bool,
     remote: bool,
 }
@@ -750,7 +761,7 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
     Ok(WebuiOptions {
         remote,
         host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
-        port: port.unwrap_or(atomcode_daemon::WEBUI_DEFAULT_PORT),
+        port,
         open_browser,
     })
 }
@@ -967,10 +978,7 @@ mod tests {
 
     #[test]
     fn webui_passes_explicit_ports_and_browser_options() {
-        assert_eq!(
-            webui_options("").unwrap().port,
-            atomcode_daemon::WEBUI_DEFAULT_PORT
-        );
+        assert_eq!(webui_options("").unwrap().port, None);
         for args in [
             "--port 20001 --host 127.0.0.1 --no-open",
             "--no-open --host=127.0.0.1 --port=20001",
@@ -979,15 +987,16 @@ mod tests {
                 webui_options(args).unwrap(),
                 WebuiOptions {
                     host: "127.0.0.1".to_string(),
-                    port: 20001,
+                    port: Some(20001),
                     open_browser: false,
                     remote: false,
                 }
             );
         }
         assert_eq!(webui_options("lan --port 20001").unwrap().host, "0.0.0.0");
-        assert_eq!(webui_options("--port=0").unwrap().port, 0);
-        assert_eq!(webui_options("--port 65535").unwrap().port, 65535);
+        assert_eq!(webui_options("--port=0").unwrap().port, Some(0));
+        assert_eq!(webui_options("--port 13457").unwrap().port, Some(13457));
+        assert_eq!(webui_options("--port 65535").unwrap().port, Some(65535));
     }
 
     #[test]

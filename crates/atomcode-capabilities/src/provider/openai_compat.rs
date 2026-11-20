@@ -207,13 +207,10 @@ pub struct OpenAiCompatConfig {
     /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
-    /// accepts the connection but never responds would otherwise hang FOREVER —
-    /// no overall request timeout is set here (deliberately: a streaming response
-    /// must not be capped). Applied to EACH attempt, not to the retry loop as a
-    /// whole, so a slow-but-alive gateway still gets the full budget. `send()`
-    /// resolves once the response HEAD arrives, so this never truncates a slow body.
-    /// A timeout is classified retryable.
+    /// Per-attempt HTTP response-header timeout (default 300s). `send()` resolves
+    /// when headers arrive, so this never caps response-body streaming. The OPEN
+    /// retry loop additionally has a cumulative 2x allowance; native requests
+    /// share it across outer retries and include their reserved backoff.
     pub open_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
@@ -309,7 +306,7 @@ impl OpenAiCompatConfig {
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
             first_token_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
+            open_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             request_signer: None,
@@ -619,6 +616,11 @@ pub(crate) struct SwappableClient {
         Option<atomcode_config::proxy::ProxyConfig>,
     )>,
     refresh: tokio::sync::Mutex<()>,
+    /// Test-only: pin the request path to "no proxy". A judge that counts pool
+    /// rebuilds must not see the developer's own system proxy add one (nor its
+    /// refresh latency, which is spent inside the open budget).
+    #[cfg(test)]
+    direct_requests: std::sync::atomic::AtomicBool,
     #[allow(clippy::type_complexity)]
     build: Box<
         dyn Fn(
@@ -662,6 +664,8 @@ impl SwappableClient {
             headers: Default::default(),
             current: std::sync::RwLock::new((initial, force_tls12, None)),
             refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            direct_requests: std::sync::atomic::AtomicBool::new(false),
             build: Box::new(build),
         })
     }
@@ -683,8 +687,26 @@ impl SwappableClient {
     /// allocating another retry. Cancellation drops this future; the blocking
     /// resolver only returns data and cannot later mutate this client.
     pub(crate) async fn for_request(&self) -> Result<reqwest::Client, ProviderError> {
+        #[cfg(test)]
+        if self
+            .direct_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.for_request_with(std::future::ready(Ok(None))).await;
+        }
         self.for_request_with(super::auto_proxy::for_request())
             .await
+    }
+
+    /// Test-only: resolve every request as "no proxy". Without this a machine
+    /// whose system proxy is live rebuilds the pool once just to APPLY that
+    /// route (and spends the proxy probe inside the open budget), which makes a
+    /// rebuild-counting judge fail for reasons that have nothing to do with the
+    /// behaviour under test.
+    #[cfg(test)]
+    pub(crate) fn skip_auto_proxy(&self) {
+        self.direct_requests
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn for_request_with(
@@ -753,6 +775,12 @@ impl LlmProvider for OpenAiCompatProvider {
         self.cfg.effort_levels.clone()
     }
 
+    /// The same policy `format_messages` encodes with: only `Exclude` drops every
+    /// prior turn's thinking.
+    fn replays_reasoning(&self) -> bool {
+        self.policy != ReasoningPolicy::Exclude
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         // One-shot: the kernel binds exactly once at spawn. Ignore a redundant
         // re-bind (OnceLock keeps the first value) rather than panicking.
@@ -771,6 +799,16 @@ impl LlmProvider for OpenAiCompatProvider {
         let effort_known_unsupported = self
             .effort_unsupported
             .load(std::sync::atomic::Ordering::Relaxed);
+        let requested_effort = options.reasoning_effort;
+        let effort_disposition = if requested_effort.is_none() {
+            "api_default"
+        } else if effort_known_unsupported {
+            "gateway_rejected"
+        } else if !self.cfg.supports_reasoning_effort {
+            "endpoint_capability_disabled"
+        } else {
+            "sent"
+        };
         let stripped_opts;
         let options = if effort_known_unsupported && options.reasoning_effort.is_some() {
             let mut o = options.clone();
@@ -802,6 +840,8 @@ impl LlmProvider for OpenAiCompatProvider {
         timing.mark("request_start");
         timing.span().in_scope(|| tracing::info!(request_id = timing.id, model = %self.cfg.model,
             reasoning_effort = body.get("reasoning_effort").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
+            adapter_requested_effort = requested_effort.map(ReasoningEffort::as_str).unwrap_or("omitted"),
+            reasoning_effort_disposition = effort_disposition,
             thinking_type = body.pointer("/thinking/type").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
             enable_thinking = ?body.get("enable_thinking").and_then(serde_json::Value::as_bool),
             max_tokens = ?body.get("max_tokens").and_then(serde_json::Value::as_u64),
@@ -1209,6 +1249,7 @@ pub(crate) async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
         open_timeout,
+        request_recovery,
         open_stream_attempts(
             client,
             url,
@@ -1334,8 +1375,8 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
-                        open_timeout.as_secs()
+                        "open failed: 等待模型服务响应头超过 {}",
+                        retry::format_wait(open_timeout)
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),
                     ..Default::default()
@@ -1787,6 +1828,18 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
         return;
     };
 
+    // Some strict OpenAI-compatible validators (observed on Volcano Ark
+    // `kimi-k3-1-pro`) reject a bare `enum` without `type` with a 400, although
+    // JSON Schema permits it. Only a non-empty enum whose values all share one
+    // scalar kind gets the matching `type`; the enum itself still constrains the
+    // exact values, so `number` covers integer literals safely. Empty, mixed,
+    // null-bearing, and object/array enums are left untouched.
+    if !map.contains_key("type") {
+        if let Some(kind) = map.get("enum").and_then(homogeneous_scalar_enum_type) {
+            map.insert("type".into(), Value::String(kind.into()));
+        }
+    }
+
     let allows_object = match map.get("type") {
         Some(Value::String(kind)) => kind == "object",
         Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
@@ -1831,6 +1884,23 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
             }
         }
     }
+}
+
+fn homogeneous_scalar_enum_type(values: &Value) -> Option<&'static str> {
+    let Value::Array(values) = values else {
+        return None;
+    };
+    let kind_of = |value: &Value| match value {
+        Value::String(_) => Some("string"),
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        _ => None,
+    };
+    let (first, rest) = values.split_first()?;
+    let kind = kind_of(first)?;
+    rest.iter()
+        .all(|value| kind_of(value) == Some(kind))
+        .then_some(kind)
 }
 
 fn normalize_openai_tool_schema_children(children: &mut Value) {
@@ -3559,6 +3629,11 @@ mod tests {
             Ok(reqwest::Client::builder().no_proxy().build().unwrap())
         })
         .unwrap();
+        // This judge counts pool rebuilds: "initial build + one rebuild caused by
+        // the silent timeout". A live system proxy would add a third build (to
+        // apply that route) and spend its probe inside the open budget, so pin
+        // the request path to direct and assert the behaviour, not the machine.
+        client.skip_auto_proxy();
         let policy = RetryPolicy {
             max_attempts: 3,
             base_delay: Duration::ZERO,
@@ -4127,6 +4202,30 @@ mod tests {
         assert!(
             !s.contains("data:image"),
             "no image_url bytes may leak: {s:?}"
+        );
+    }
+
+    /// The size estimate must count prior thinking exactly where the encoder
+    /// sends it: a model whose policy drops it would otherwise look several
+    /// times larger than it is and be compacted at a fraction of its window.
+    #[test]
+    fn replays_reasoning_follows_the_reasoning_policy() {
+        let provider = |model: &str| {
+            OpenAiCompatProvider::new(OpenAiCompatConfig::new(
+                "k",
+                "https://example.invalid/v1",
+                model,
+            ))
+            .unwrap()
+        };
+        assert!(!provider("lumen-alpha").replays_reasoning(), "Exclude");
+        assert!(provider("deepseek-v4-flash").replays_reasoning(), "Include");
+        assert!(provider("glm-5.2").replays_reasoning(), "Preserve");
+        let mut cfg = OpenAiCompatConfig::new("k", "https://example.invalid/v1", "glm-5.2");
+        cfg.reasoning_policy = Some(ReasoningPolicy::Exclude);
+        assert!(
+            !OpenAiCompatProvider::new(cfg).unwrap().replays_reasoning(),
+            "override"
         );
     }
 
@@ -4724,6 +4823,76 @@ mod tests {
         // Non-object property schemas are untouched (no spurious required).
         assert!(out["properties"]["paths"].get("required").is_none());
         assert!(out["properties"]["depth"].get("required").is_none());
+    }
+
+    #[test]
+    fn bare_scalar_enum_types_reach_the_chat_wire_without_mutating_input() {
+        let schema = json!({"type":"object", "properties": {
+            "action": {"enum":["launch", "status"]},
+            "level": {"enum":[1, 2.5]},
+            "flag": {"enum":[true, false]},
+            "nested": {"type":"array", "items":{"enum":["a"]}},
+            "union": {"anyOf":[{"enum":[false]}, {"type":"null"}]},
+            "map": {"type":"object", "additionalProperties":{"enum":[3]}},
+            "literal": {"default":{"enum":["data"]}, "examples":[{"enum":["data"]}], "const":{"enum":["data"]}}
+        }, "$defs":{"Mode":{"enum":["fast"]}}});
+        let before = schema.clone();
+        let tools = [ToolDef {
+            name: "external".into(),
+            description: "fixture".into(),
+            parameters: schema.clone(),
+        }];
+        let cfg = OpenAiCompatConfig::new("fixture", "http://localhost", "kimi-k3-1-pro");
+        let body = build_request_body(
+            "kimi-k3-1-pro",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+        );
+        let out = &body["tools"][0]["function"]["parameters"];
+        let props = &out["properties"];
+        assert_eq!(props["action"]["type"], "string");
+        assert_eq!(
+            props["action"]["enum"],
+            before["properties"]["action"]["enum"]
+        );
+        assert_eq!(props["level"]["type"], "number");
+        assert_eq!(props["flag"]["type"], "boolean");
+        assert_eq!(props["nested"]["items"]["type"], "string");
+        assert_eq!(props["union"]["anyOf"][0]["type"], "boolean");
+        assert_eq!(props["map"]["additionalProperties"]["type"], "number");
+        assert_eq!(out["$defs"]["Mode"]["type"], "string");
+        assert_eq!(props["literal"], before["properties"]["literal"]);
+        assert_eq!(tools[0].parameters, before);
+        assert_eq!(schema, before);
+        assert_eq!(*out, shared_normalize_tool_schema(&schema));
+        assert_eq!(
+            *out,
+            shared_normalize_tool_schema(out),
+            "normalization is idempotent"
+        );
+    }
+
+    #[test]
+    fn enum_normalization_preserves_ambiguous_and_explicit_schemas() {
+        for schema in [
+            json!({"enum":[]}),
+            json!({"enum":[null]}),
+            json!({"enum":["a",null]}),
+            json!({"enum":[1,"a"]}),
+            json!({"enum":[true,1]}),
+            json!({"enum":[{}]}),
+            json!({"enum":[{"enum":["literal"]}]}),
+            json!({"enum":[[1]]}),
+            json!({"type":"integer", "enum":[1,2]}),
+            json!({"type":["string","null"], "enum":["a",null]}),
+            json!({"enum":"not-an-array"}),
+        ] {
+            assert_eq!(shared_normalize_tool_schema(&schema), schema);
+        }
     }
 
     #[test]

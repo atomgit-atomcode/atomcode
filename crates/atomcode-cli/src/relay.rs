@@ -13,6 +13,50 @@ const INSTALL_SCRIPT: &str =
     "curl -fsSL https://raw.gitcode.com/atomgit_atomcode/atomcode-relay-release/raw/main/scripts/install.sh | sh";
 use std::path::PathBuf;
 
+/// Keep relay diagnostics outside the TUI screen. Each host process and entry
+/// point has its own file, so simultaneous App/WebUI tunnels do not mix logs.
+pub(crate) fn capture_relay_output(command: &mut tokio::process::Command, entry: &str) {
+    let path = atomcode_coding::config::product_dirs_from_env()
+        .user()
+        .join("logs")
+        .join(format!("{entry}-relay-{}.log", std::process::id()));
+    match open_relay_log(&path) {
+        Ok((stdout, stderr)) => {
+            command.stdout(stdout).stderr(stderr);
+            tracing::info!(path = %path.display(), "relay diagnostics enabled");
+        }
+        Err(error) => {
+            // A diagnostic I/O failure must not disable remote access, but it
+            // must be visible in the host log (unlike silently discarding it).
+            command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            tracing::warn!(path = %path.display(), %error, "cannot capture relay diagnostics");
+        }
+    }
+}
+
+fn open_relay_log(path: &std::path::Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut log = options.open(path)?;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    writeln!(log, "\n--- relay started at unix {started} ---")?;
+    Ok((log.try_clone()?, log))
+}
+
 /// 中继客户端 oss 下载地址。
 /// 对应 gitcode.com/atomgit_atomcode/atomcode-relay-release 仓库的 Release。
 const RELAY_CLIENT_DOWNLOAD_BASE: &str =
@@ -467,6 +511,33 @@ impl Drop for PendingDownload {
 
 #[cfg(test)]
 mod download_tests {
+    #[test]
+    fn relay_diagnostics_preserve_both_streams_across_restarts() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/app-relay.log");
+        for _ in 0..2 {
+            let (mut stdout, mut stderr) = super::open_relay_log(&path).unwrap();
+            writeln!(stdout, "connected").unwrap();
+            writeln!(stderr, "reconnecting").unwrap();
+        }
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log.matches("relay started at unix").count(), 2);
+        assert_eq!(log.lines().filter(|line| *line == "connected").count(), 2);
+        assert_eq!(
+            log.lines().filter(|line| *line == "reconnecting").count(),
+            2
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

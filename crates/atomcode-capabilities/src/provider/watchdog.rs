@@ -9,9 +9,6 @@ pub struct StreamWatchdog {
     idle: Option<Duration>,
     started: Instant,
     last_content: Option<Instant>,
-    reasoning_limit: Option<Duration>,
-    first_reasoning: Option<Instant>,
-    visible_progress: bool,
 }
 
 impl StreamWatchdog {
@@ -21,16 +18,7 @@ impl StreamWatchdog {
             idle,
             started: Instant::now(),
             last_content: None,
-            reasoning_limit: None,
-            first_reasoning: None,
-            visible_progress: false,
         }
-    }
-    /// Bound continuous reasoning before the first answer/tool content. Prefill
-    /// does not count, and useful output permanently disarms it for this request.
-    pub fn with_reasoning_limit(mut self, limit: Option<Duration>) -> Self {
-        self.reasoning_limit = limit.filter(|d| !d.is_zero());
-        self
     }
     fn content_deadline(&self) -> Option<Instant> {
         let budget = if self.last_content.is_some() {
@@ -40,26 +28,7 @@ impl StreamWatchdog {
         };
         budget.map(|d| self.last_content.unwrap_or(self.started) + d)
     }
-    fn reasoning_deadline(&self) -> Option<Instant> {
-        if self.visible_progress {
-            return None;
-        }
-        Some(self.first_reasoning? + self.reasoning_limit?)
-    }
-    pub fn reasoning_expired(&self) -> bool {
-        self.reasoning_is_next()
-            && self
-                .reasoning_deadline()
-                .is_some_and(|d| Instant::now() >= d)
-    }
-    fn reasoning_is_next(&self) -> bool {
-        self.reasoning_deadline()
-            .is_some_and(|r| self.content_deadline().map_or(true, |c| r <= c))
-    }
     pub fn budget(&self) -> Option<Duration> {
-        if self.reasoning_is_next() {
-            return self.reasoning_limit;
-        }
         if self.last_content.is_some() {
             self.idle
         } else {
@@ -67,9 +36,6 @@ impl StreamWatchdog {
         }
     }
     pub fn phase(&self) -> &'static str {
-        if self.reasoning_is_next() {
-            return "reasoning_without_output";
-        }
         if self.last_content.is_some() {
             "stream_idle"
         } else {
@@ -77,17 +43,10 @@ impl StreamWatchdog {
         }
     }
     pub fn deadline(&self) -> Option<Instant> {
-        match (self.content_deadline(), self.reasoning_deadline()) {
-            (Some(c), Some(r)) => Some(c.min(r)),
-            (c, r) => c.or(r),
-        }
+        self.content_deadline()
     }
     pub fn silent_for(&self) -> Duration {
-        if self.reasoning_is_next() {
-            self.first_reasoning.unwrap().elapsed()
-        } else {
-            self.last_content.unwrap_or(self.started).elapsed()
-        }
+        self.last_content.unwrap_or(self.started).elapsed()
     }
     /// Enforce the deadline even when a stream continuously yields ready metadata.
     pub async fn next<S: futures::Stream + Unpin>(
@@ -105,28 +64,6 @@ impl StreamWatchdog {
     }
 
     pub fn observe(&mut self, event: &StreamEvent) {
-        match event {
-            StreamEvent::Reasoning(text) if !text.is_empty() => {
-                self.first_reasoning.get_or_insert_with(Instant::now);
-            }
-            StreamEvent::ReasoningSignature { opaque, .. } if !opaque.is_empty() => {
-                self.first_reasoning.get_or_insert_with(Instant::now);
-            }
-            StreamEvent::TextDelta(text) if !text.trim().is_empty() => self.visible_progress = true,
-            StreamEvent::ToolCall(_) => self.visible_progress = true,
-            StreamEvent::ToolCallDelta {
-                id,
-                name,
-                arguments,
-                ..
-            } if !arguments.is_empty()
-                || id.as_ref().is_some_and(|s| !s.is_empty())
-                || name.as_ref().is_some_and(|s| !s.is_empty()) =>
-            {
-                self.visible_progress = true
-            }
-            _ => {}
-        }
         let content = match event {
             StreamEvent::TextDelta(text) | StreamEvent::Reasoning(text) => !text.is_empty(),
             StreamEvent::ReasoningSignature { opaque, .. } => !opaque.is_empty(),
@@ -152,78 +89,6 @@ impl StreamWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn delayed_polling_attributes_the_earliest_deadline_when_both_have_expired() {
-        let mut w = StreamWatchdog::new(None, Some(Duration::from_secs(10)))
-            .with_reasoning_limit(Some(Duration::from_secs(120)));
-        w.observe(&StreamEvent::Reasoning("first".into()));
-        tokio::time::advance(Duration::from_secs(121)).await;
-        assert_eq!(w.phase(), "stream_idle");
-        assert_eq!(w.budget(), Some(Duration::from_secs(10)));
-        assert!(
-            !w.reasoning_expired(),
-            "the earlier idle timeout owns the error"
-        );
-        let mut ready = futures::stream::repeat(StreamEvent::Reasoning("more".into()));
-        assert!(w.next(&mut ready).await.is_err());
-
-        let mut w = StreamWatchdog::new(None, Some(Duration::from_secs(300)))
-            .with_reasoning_limit(Some(Duration::from_secs(120)));
-        w.observe(&StreamEvent::Reasoning("first".into()));
-        tokio::time::advance(Duration::from_secs(301)).await;
-        assert_eq!(w.phase(), "reasoning_without_output");
-        assert_eq!(w.budget(), Some(Duration::from_secs(120)));
-        assert!(w.reasoning_expired());
-    }
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn reasoning_deadline_excludes_prefill_and_cannot_be_extended_by_progress() {
-        let mut w = StreamWatchdog::new(
-            Some(Duration::from_secs(600)),
-            Some(Duration::from_secs(300)),
-        )
-        .with_reasoning_limit(Some(Duration::from_secs(120)));
-        tokio::time::advance(Duration::from_secs(500)).await;
-        assert!(!w.reasoning_expired());
-        w.observe(&StreamEvent::Reasoning("first".into()));
-        let deadline = w.deadline();
-        for i in 0..4 {
-            tokio::time::advance(Duration::from_secs(30)).await;
-            w.observe(&StreamEvent::Reasoning(format!("new reasoning {i}")));
-            w.observe(&StreamEvent::TextDelta(" \n".into()));
-            assert_eq!(w.deadline(), deadline);
-        }
-        assert!(w.reasoning_expired());
-        assert_eq!(w.phase(), "reasoning_without_output");
-        let mut ready = futures::stream::repeat(StreamEvent::Reasoning("more".into()));
-        assert!(w.next(&mut ready).await.is_err());
-    }
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn real_text_or_tool_progress_disarms_the_reasoning_deadline() {
-        for event in [
-            StreamEvent::TextDelta("answer".into()),
-            StreamEvent::ToolCallDelta {
-                index: 0,
-                id: None,
-                name: Some("read_file".into()),
-                arguments: String::new(),
-            },
-        ] {
-            let mut w = StreamWatchdog::new(None, Some(Duration::from_secs(300)))
-                .with_reasoning_limit(Some(Duration::from_secs(120)));
-            w.observe(&StreamEvent::Reasoning("first".into()));
-            tokio::time::advance(Duration::from_secs(60)).await;
-            w.observe(&event);
-            tokio::time::advance(Duration::from_secs(120)).await;
-            assert!(!w.reasoning_expired());
-            assert_eq!(w.phase(), "stream_idle");
-            assert!(w.deadline().unwrap() > Instant::now());
-        }
-        let mut disabled =
-            StreamWatchdog::new(None, None).with_reasoning_limit(Some(Duration::ZERO));
-        disabled.observe(&StreamEvent::Reasoning("first".into()));
-        tokio::time::advance(Duration::from_secs(1000)).await;
-        assert_eq!(disabled.deadline(), None);
-    }
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_slow_but_progressing_stream_can_outlive_both_timeout_budgets() {
         let mut watchdog = StreamWatchdog::new(

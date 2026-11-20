@@ -40,6 +40,7 @@ pub mod profile;
 pub mod seam_map;
 pub mod seams;
 pub mod session;
+pub mod tail;
 
 /// The reasoning-effort levels a model may be asked for, re-exported from the
 /// one place that defines them so a front end can offer exactly the values the

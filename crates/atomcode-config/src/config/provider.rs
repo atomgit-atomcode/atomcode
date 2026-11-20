@@ -6,6 +6,9 @@ pub struct ProviderConfig {
     pub provider_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// This runtime projection already resolved the credential against its account.
+    #[serde(skip)]
+    pub api_key_is_resolved: bool,
     pub model: String,
     pub base_url: Option<String>,
     pub system_prompt: Option<String>,
@@ -68,6 +71,23 @@ pub struct ProviderConfig {
     /// still be sent even when no switchable list is declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias advertised by the CodingPlan gateway's `models-v3`
+    /// (e.g. `"智速模式"`). Persisted verbatim so UI surfaces can show it
+    /// without re-querying the server. `None` keeps the raw model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// English alias / description advertised by the CodingPlan gateway
+    /// (`models-v3`), shown when the interface language is English; `None`
+    /// falls back to [`Self::alias`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_en: Option<String>,
+    /// Human-readable model description advertised by the CodingPlan
+    /// gateway's `models-v3`. Persisted verbatim; `None` means absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
+    /// English description advertised by the CodingPlan gateway (`models-v3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_en: Option<String>,
     /// Whether extended thinking is enabled for this provider.
     /// For Claude: sends `thinking.type = "enabled"` in request body.
     /// Default: not set (thinking disabled).
@@ -100,9 +120,10 @@ pub struct ProviderConfig {
     /// standalone adapters apply it to OPEN retries. `1` disables retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
-    /// Continuous reasoning budget in seconds; 0 disables it. Host environment overrides this.
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_timeout_secs: Option<u64>,
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
 }
 
 /// A provider *account*: a reusable connection + credential identity (new schema,
@@ -119,6 +140,9 @@ pub struct ProviderAccountConfig {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Keep this account's credential independent of process-wide defaults.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_api_key_fallback: bool,
     /// Overrides the preset's default base URL. Required for custom-compatible
     /// providers (which have no preset default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +208,20 @@ pub struct ModelProfileConfig {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias advertised by the CodingPlan gateway (`models-v3`),
+    /// carried through resolution so a folded legacy provider keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// English alias / description advertised by the CodingPlan gateway,
+    /// carried through resolution the same way as [`Self::alias`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_en: Option<String>,
+    /// Human-readable model description advertised by the CodingPlan gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
+    /// English description advertised by the CodingPlan gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_en: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,9 +231,10 @@ pub struct ModelProfileConfig {
     /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
-    /// Continuous reasoning budget in seconds; 0 disables it. Host environment overrides this.
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_timeout_secs: Option<u64>,
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
     /// Who put this entry here, when it was not the person: a command that
     /// manages a set of entries it may later replace — `/openrouter` writes
     /// [`OPENROUTER_FREE_ORIGIN`] on the free models it adds and swaps that set
@@ -270,6 +309,12 @@ pub struct ResolvedModelConfig {
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias / description advertised by the CodingPlan gateway,
+    /// carried through resolution for UI surfaces.
+    pub alias: Option<String>,
+    pub desc: Option<String>,
+    pub alias_en: Option<String>,
+    pub desc_en: Option<String>,
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
@@ -277,7 +322,9 @@ pub struct ResolvedModelConfig {
     /// across request recovery unless overridden by the upstream retry setting;
     /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     pub retry_max_attempts: Option<u32>,
-    pub reasoning_timeout_secs: Option<u64>,
+    /// Maximum wait for HTTP response headers per attempt; positive seconds.
+    /// Unset uses ATOMCODE_RESPONSE_HEADER_TIMEOUT_SECS, then 300 seconds.
+    pub response_header_timeout_secs: Option<std::num::NonZeroU64>,
 }
 
 impl std::fmt::Debug for ResolvedModelConfig {
@@ -306,6 +353,7 @@ impl ResolvedModelConfig {
         ProviderConfig {
             provider_type: self.provider_type.clone(),
             api_key: self.api_key.clone(),
+            api_key_is_resolved: true,
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             system_prompt: self.system_prompt.clone(),
@@ -319,13 +367,17 @@ impl ResolvedModelConfig {
             reasoning_history: self.reasoning_history.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_effort_levels: self.reasoning_effort_levels.clone(),
+            alias: self.alias.clone(),
+            desc: self.desc.clone(),
+            alias_en: self.alias_en.clone(),
+            desc_en: self.desc_en.clone(),
             thinking_enabled: self.thinking_enabled,
             thinking_budget: self.thinking_budget,
             skip_tls_verify: self.skip_tls_verify,
             ephemeral: false,
             capable_model: self.capable_model,
             retry_max_attempts: self.retry_max_attempts,
-            reasoning_timeout_secs: self.reasoning_timeout_secs,
+            response_header_timeout_secs: self.response_header_timeout_secs,
         }
     }
 }
@@ -350,6 +402,9 @@ impl ProviderConfig {
     ///    a. Check provider-type specific environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_API_KEY`).
     ///    b. Check general environment variable `ATOMCODE_API_KEY`.
     pub fn resolved_api_key(&self) -> Option<String> {
+        if self.api_key_is_resolved {
+            return self.api_key.clone();
+        }
         if let Some(key_str) = self.api_key.as_deref() {
             let trimmed = key_str.trim();
             if !trimmed.is_empty() {
@@ -617,6 +672,7 @@ mod tests {
     #[test]
     fn skip_tls_verify_not_serialized_when_false() {
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
             model: "gpt-4o".into(),
@@ -632,13 +688,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -650,6 +710,7 @@ mod tests {
     #[test]
     fn skip_tls_verify_serialized_when_true() {
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("sk-test".into()),
             model: "gpt-4o".into(),
@@ -665,13 +726,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -698,7 +763,7 @@ mod tests {
         let none_cfg = ProviderConfig {
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
             ..cfg
         };
         let s2 = toml::to_string(&none_cfg).expect("serialize");
@@ -732,6 +797,7 @@ mod tests {
         std::env::set_var("TEST_API_KEY_ENV", "sk-from-env-var");
 
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("$TEST_API_KEY_ENV".into()),
             model: "gpt-4o".into(),
@@ -747,13 +813,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-from-env-var".to_string()));
@@ -764,6 +834,7 @@ mod tests {
         std::env::set_var("MY_CUSTOM_KEY_NAME", "sk-custom-123");
 
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: Some("MY_CUSTOM_KEY_NAME".into()),
             model: "gpt-4o".into(),
@@ -779,13 +850,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-custom-123".to_string()));
@@ -796,6 +871,7 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "sk-openai-std");
 
         let cfg = ProviderConfig {
+            api_key_is_resolved: false,
             provider_type: "openai".into(),
             api_key: None,
             model: "gpt-4o".into(),
@@ -811,15 +887,67 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: None,
             retry_max_attempts: None,
-            reasoning_timeout_secs: None,
+            response_header_timeout_secs: None,
         };
 
         assert_eq!(cfg.resolved_api_key(), Some("sk-openai-std".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod header_timeout_tests {
+    #[test]
+    fn model_and_legacy_timeout_survive_resolution_and_projection() {
+        for source in [
+            r#"[providers.slow]
+type = "anthropic"
+model = "slow-model"
+response_header_timeout_secs = 600
+"#,
+            r#"[provider_accounts.test]
+provider = "anthropic-compatible"
+base_url = "https://example.invalid"
+[models.slow]
+account = "test"
+model = "slow-model"
+response_header_timeout_secs = 600
+"#,
+        ] {
+            let cfg: super::super::Config = toml::from_str(source).unwrap();
+            let resolved = cfg.resolve_model(Some("slow")).unwrap();
+            assert_eq!(resolved.response_header_timeout_secs.unwrap().get(), 600);
+            assert_eq!(
+                resolved
+                    .to_provider_config()
+                    .response_header_timeout_secs
+                    .unwrap()
+                    .get(),
+                600
+            );
+            let saved = toml::to_string(&cfg).unwrap();
+            let roundtrip: super::super::Config = toml::from_str(&saved).unwrap();
+            assert_eq!(
+                roundtrip
+                    .resolve_model(Some("slow"))
+                    .unwrap()
+                    .response_header_timeout_secs
+                    .unwrap()
+                    .get(),
+                600
+            );
+            assert!(
+                toml::from_str::<super::super::Config>(&source.replace("= 600", "= 0")).is_err()
+            );
+        }
     }
 }

@@ -22,7 +22,7 @@ fn _isolate_atomcode_home() {
 }
 
 #[tokio::test]
-async fn selected_model_reasoning_budget_reaches_the_watchdog_without_changing_effort() {
+async fn obsolete_model_reasoning_budgets_do_not_install_a_deadline() {
     let project = tempfile::tempdir().unwrap();
     let source: atomcode_config::Config = toml::from_str(
         r#"
@@ -41,7 +41,7 @@ reasoning_timeout_secs = 0
 "#,
     )
     .unwrap();
-    for (selection, seconds) in [("custom/slow", 900), ("custom/unlimited", 0)] {
+    for selection in ["custom/slow", "custom/unlimited"] {
         let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
             &source,
             project.path(),
@@ -51,18 +51,12 @@ reasoning_timeout_secs = 0
             false,
             false,
         );
-        assert_eq!(runtime.reasoning_timeout_secs, Some(seconds));
         let cfg = runtime.agent_config();
-        assert_eq!(
-            cfg.reasoning_timeout,
-            std::time::Duration::from_secs(seconds)
-        );
         assert!(cfg.chat_options.reasoning_effort.is_none());
-        assert!(cfg.reasoning_recovery_timeout.is_zero());
         let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
-        assert!(mounted
-            .dump()
-            .contains(&format!("\"reasoning_timeout_ms\": {}", seconds * 1000)));
+        assert!(!mounted.dump().contains("reasoning_timeout"));
+        assert!(!mounted.dump().contains("reasoning_recovery"));
+        assert!(!mounted.dump().contains("reasoning_checkpoint"));
         mounted.shutdown().await;
     }
 }
@@ -79,8 +73,6 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     );
     cfg.first_token_timeout = std::time::Duration::from_secs(600);
     cfg.stream_timeout = std::time::Duration::from_secs(120);
-    cfg.reasoning_timeout = std::time::Duration::from_secs(90);
-    cfg.reasoning_recovery_timeout = std::time::Duration::from_secs(60);
     cfg.round_cap_checkpoint = true;
     let dump = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
         .await
@@ -90,9 +82,6 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
         "{dump}"
     );
     assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
-    assert!(dump.contains("\"reasoning_timeout_ms\": 90000"), "{dump}");
-    assert!(dump.contains("\"reasoning_recovery_ms\": 60000"), "{dump}");
-    assert!(dump.contains("\"reasoning_checkpoint\": true"), "{dump}");
     assert!(dump.contains("\"max_recoveries\": 3"), "{dump}");
 }
 

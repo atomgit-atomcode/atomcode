@@ -20,6 +20,7 @@
 //! |---|---|
 //! | `Bash` | every `bash` call |
 //! | `Bash(git status)` | exactly that command (whitespace-normalized) |
+//! | `BashExact("git status")` | literal complete command; JSON string, no wildcards |
 //! | `Bash(git *)` | any command starting `git ` |
 //! | `Bash(npm run test:*)` | CC's trailing `:*` prefix form — same as `npm run test*` |
 //! | `Read(~/.zshrc)` | `read_file` on that path (`~` expanded, relative joined to cwd) |
@@ -150,6 +151,8 @@ pub struct PermissionRule {
     tool: String,
     /// `None` ⇒ the bare `Tool` form: matches any arguments.
     pattern: Option<String>,
+    /// Whole-command literal; never participates in wildcard or segment matching.
+    exact_command: Option<String>,
 }
 
 impl PermissionRule {
@@ -161,6 +164,22 @@ impl PermissionRule {
         if raw.is_empty() {
             return None;
         }
+        if let Some(encoded) = raw
+            .strip_prefix("BashExact(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let command: String = serde_json::from_str(encoded).ok()?;
+            if command.trim().is_empty() {
+                return None;
+            }
+            return Some(Self {
+                raw: raw.into(),
+                source: None,
+                tool: "bash".into(),
+                pattern: Some(command.clone()),
+                exact_command: Some(command),
+            });
+        }
         let Some(open) = raw.find('(') else {
             if raw.contains(')') {
                 return None;
@@ -170,6 +189,7 @@ impl PermissionRule {
                 source: None,
                 tool: canonical_tool(raw),
                 pattern: None,
+                exact_command: None,
             });
         };
         if !raw.ends_with(')') {
@@ -188,10 +208,22 @@ impl PermissionRule {
             source: None,
             tool: canonical_tool(tool),
             pattern: Some(pattern.to_string()),
+            exact_command: None,
         })
     }
 
+    fn matches_exact(&self, tool: &str, command: Option<&str>) -> bool {
+        canonical_tool(tool) == "bash"
+            && self
+                .exact_command
+                .as_deref()
+                .is_some_and(|expected| command.is_some_and(|actual| expected == actual))
+    }
+
     fn matches(&self, tool: &str, targets: &[String]) -> bool {
+        if self.exact_command.is_some() {
+            return false;
+        }
         if self.tool != "*" && self.tool != canonical_tool(tool) {
             return false;
         }
@@ -264,7 +296,8 @@ impl PermissionRules {
             .chain(self.allow.iter().map(|r| ("allow", r)));
         let mut notes: Vec<String> = rules
             .filter(|(effect, r)| {
-                r.matches(tool, &targets)
+                r.matches_exact(tool, command.as_deref())
+                    || r.matches(tool, &targets)
                     || (*effect == "deny"
                         && super::powershell::is_powershell_tool(tool)
                         && (r.matches("bash", &targets)
@@ -385,7 +418,8 @@ impl PermissionRules {
             }
         }
         if self.deny.iter().any(|r| {
-            r.matches(tool, &deny_targets)
+            r.matches_exact(tool, command.as_deref())
+                || r.matches(tool, &deny_targets)
                 || (super::powershell::is_powershell_tool(tool)
                     && (r.matches("bash", &targets)
                         || (tool == "pwsh_start" && r.matches("bash_start", &targets))))
@@ -405,8 +439,9 @@ impl PermissionRules {
             // An exact grant of this complete literal script remains valid. A
             // wildcard prefix, however, must vouch for each segment separately.
             let exact_script = self.allow.iter().any(|r| {
-                r.pattern.as_ref().is_some_and(|p| !p.contains(['*', '?']))
-                    && r.matches(tool, &targets)
+                r.matches_exact(tool, command.as_deref())
+                    || (r.pattern.as_ref().is_some_and(|p| !p.contains(['*', '?']))
+                        && r.matches(tool, &targets))
             });
             let mut authorized = exact_script;
             for segment in segments {
@@ -586,6 +621,115 @@ impl ToolMiddleware for PermissionRuleGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_commands_preserve_windows_prefixes_and_do_not_expand_wildcards() {
+        let guard = crate::tools::sensitive_path::test_guard();
+        let command = r#"rm '\\?\C:\repo\target?*'"#;
+        let rule = format!("BashExact({})", serde_json::to_string(command).unwrap());
+        let parsed = rules(&[&rule], &[]);
+        for (actual, expected) in [
+            (command.to_owned(), RuleDecision::Allow),
+            (command.replace('?', "X"), RuleDecision::NoMatch),
+            (command.replace('*', "other"), RuleDecision::NoMatch),
+            (format!("{command} && rm other"), RuleDecision::NoMatch),
+        ] {
+            assert_eq!(
+                parsed.decide(
+                    &guard,
+                    "bash",
+                    &serde_json::json!({"command":actual}).to_string(),
+                    &cwd()
+                ),
+                expected
+            );
+        }
+        let deny = rules(&[&rule], &["Bash(rm *)"]);
+        assert_eq!(
+            deny.decide(
+                &guard,
+                "bash",
+                &serde_json::json!({"command":command}).to_string(),
+                &cwd()
+            ),
+            RuleDecision::Deny
+        );
+        assert_eq!(
+            rules(&[], &[&rule]).decide(
+                &guard,
+                "bash",
+                &serde_json::json!({"command":command}).to_string(),
+                &cwd()
+            ),
+            RuleDecision::Deny
+        );
+        assert!(PermissionRule::parse("BashExact(not-json)").is_none());
+    }
+
+    #[test]
+    fn exact_commands_keep_sensitive_and_shell_eligibility_floors() {
+        let guard = crate::tools::sensitive_path::test_guard();
+        for command in ["rm ~/.ssh/id_rsa", "rm $(echo target)"] {
+            let rule = format!("BashExact({})", serde_json::to_string(command).unwrap());
+            assert_eq!(
+                rules(&[&rule], &[]).decide(
+                    &guard,
+                    "bash",
+                    &serde_json::json!({"command":command}).to_string(),
+                    &cwd()
+                ),
+                RuleDecision::NoMatch
+            );
+        }
+        let rule = r#"BashExact("rm scratch")"#;
+        for tool in ["pwsh", "bash_start"] {
+            assert_eq!(
+                rules(&[rule], &[]).decide(
+                    &guard,
+                    tool,
+                    &serde_json::json!({"command":"rm scratch"}).to_string(),
+                    &cwd()
+                ),
+                RuleDecision::NoMatch
+            );
+        }
+    }
+
+    #[test]
+    fn exact_commands_do_not_collapse_quoted_whitespace() {
+        let guard = crate::tools::sensitive_path::test_guard();
+        let rule = format!("BashExact({})", serde_json::to_string("rm 'a  b'").unwrap());
+        let parsed = rules(&[&rule], &[]);
+        for command in [" rm 'a  b'", "rm 'a  b' ", "rm 'a  b'\n"] {
+            assert_eq!(
+                parsed.decide(
+                    &guard,
+                    "bash",
+                    &serde_json::json!({"command":command}).to_string(),
+                    &cwd()
+                ),
+                RuleDecision::NoMatch
+            );
+        }
+        assert_eq!(
+            parsed.decide(
+                &guard,
+                "bash",
+                &serde_json::json!({"command":"rm 'a  b'"}).to_string(),
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            parsed.decide(
+                &guard,
+                "bash",
+                &serde_json::json!({"command":"rm 'a b'"}).to_string(),
+                &cwd()
+            ),
+            RuleDecision::NoMatch
+        );
+    }
 
     #[test]
     fn powershell_deny_patterns_match_commands_and_bash_allows_never_cross_dialects() {

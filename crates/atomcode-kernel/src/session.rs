@@ -323,8 +323,9 @@ pub enum SessionEvent {
         round: u32,
         usage: TokenUsage,
     },
-    /// Tool results at or below `through` are shown to the model as a one-line
-    /// stub from here on.
+    /// Tool results at or below `through` are shown to the model as a stub
+    /// from here on — the first-line shape within the preview budget, the
+    /// head+tail preview for oversized ones.
     ///
     /// No longer written: [`SessionEvent::MessagesRewritten`] carries the text
     /// itself. Still projected, so a log that holds one replays as it ran.
@@ -1393,6 +1394,16 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 meta,
                 ..
             } => {
+                // Keep interrupted thinking in the display/history projection,
+                // but do not replay an empty answer or an unfinished signature
+                // as a completed assistant message to a provider.
+                if !with_meta
+                    && text.trim().is_empty()
+                    && tool_calls.is_empty()
+                    && meta.as_ref().is_some_and(|m| m.finish_reason == "error")
+                {
+                    continue;
+                }
                 let mut message = Message::assistant(text_of(text), tool_calls.clone());
                 if !reasoning.is_empty() {
                     message.reasoning = Some(reasoning.clone());
@@ -1646,11 +1657,124 @@ pub struct RateLimitPause {
     pub server_message: Option<String>,
 }
 
-/// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]`. For a bash
-/// result whose first line is the `[elapsed: …]` metadata prefix, the SECOND line is used
-/// so `first:` surfaces real output, not the exit-code banner.
+/// Whether `text` matches a complete compact-stub envelope
+/// (`[<tool> ok|FAILED: <N> lines, first:|head: …]` for any tool name).
+/// Compaction strategies use this to skip already-stubbed results, so a
+/// second pass stays a no-op: re-stubbing would nest envelopes and re-bust
+/// the prefix cache the first stub paid for. The detection is tool-name
+/// agnostic on purpose — a strategy whose tool lookup falls back to a
+/// generic name must still recognize a stub produced under the real name.
+pub fn text_is_compact_stub(text: &str) -> bool {
+    let Some(envelope) = text
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let Some((name, tail)) = envelope.split_once(' ') else {
+        return false;
+    };
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some(after_status) = tail
+        .strip_prefix("ok: ")
+        .or_else(|| tail.strip_prefix("FAILED: "))
+    else {
+        return false;
+    };
+    let Some((digits, preview)) = after_status.split_once(" lines, ") else {
+        return false;
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(first) = preview.strip_prefix("first: ") {
+        return first.chars().take(STUB_FIRST_LINE + 1).count() <= STUB_FIRST_LINE
+            && !first.contains('\n');
+    }
+    let Some(head_and_tail) = preview.strip_prefix("head: ") else {
+        return false;
+    };
+    let Some((head_end, _)) = head_and_tail.char_indices().nth(STUB_PREVIEW_HEAD) else {
+        return false;
+    };
+    let Some((omitted, tail)) = head_and_tail[head_end..]
+        .strip_prefix(STUB_OMISSION_START)
+        .and_then(|rest| rest.split_once(STUB_OMISSION_END))
+    else {
+        return false;
+    };
+    omitted.bytes().all(|byte| byte.is_ascii_digit())
+        && omitted
+            .parse::<usize>()
+            .is_ok_and(|count| count > STUB_PREVIEW_MIN_OMITTED)
+        && tail.chars().take(STUB_PREVIEW_TAIL + 1).count() == STUB_PREVIEW_TAIL
+}
+
+const STUB_FIRST_LINE: usize = 80;
+const STUB_OMISSION_START: &str = " … [omitted ";
+const STUB_OMISSION_END: &str = " chars] … ";
+
+/// The head/tail preview budgets for oversized stubbed tool results: the head
+/// carries what ran, the tail carries how it ended (exit codes, error
+/// diagnostics), and the omission marker accounts for the cut middle — the
+/// dsh-context-guard balanced policy scaled so the total stub stays under the
+/// 2,000-char envelope the collapse chain and provider-refusal handling treat
+/// as "folded far enough" in a single pass.
+const STUB_PREVIEW_HEAD: usize = 1_400;
+const STUB_PREVIEW_TAIL: usize = 400;
+/// The preview only fires when the cut middle is at least half the head: a
+/// near-threshold rewrite would bust the prefix cache for almost no saving,
+/// and the corpus's mean tool result sits right in that dead zone.
+const STUB_PREVIEW_MIN_OMITTED: usize = 896;
+
+/// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]` for
+/// results within the preview budget; oversized results instead keep a
+/// bounded head + tail preview with the omission marker, so exit codes and
+/// error tails survive the cut while the replayed middle — the bulk of the
+/// stub cost — does not. For a bash result whose first line is the
+/// `[elapsed: …]` metadata prefix, the SECOND line is used so `first:`
+/// surfaces real output, not the exit-code banner.
+///
+/// The function is idempotent: an already-stubbed result passes through
+/// unchanged, so a second compaction pass neither nests envelopes nor
+/// re-busts the prefix cache the first stub paid for.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
+    let status = if success { "ok" } else { "FAILED" };
+    if text_is_compact_stub(output) {
+        return output.to_string();
+    }
     let line_count = output.lines().count();
+    // The preview fires only when the cut middle is at least half the head
+    // (a near-threshold rewrite busts the prefix cache for almost no
+    // saving), and the candidate is compared against the original: one that
+    // is not strictly shorter falls back to the first-line shape, so no
+    // fixed overhead approximation can ever let a stub grow past the text
+    // it replaces.
+    let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL;
+    let char_count = output.chars().count();
+    if char_count > budget + STUB_PREVIEW_MIN_OMITTED {
+        let head_end = output
+            .char_indices()
+            .nth(STUB_PREVIEW_HEAD)
+            .map(|(i, _)| i)
+            .unwrap_or(output.len());
+        let tail_start = output
+            .char_indices()
+            .nth(char_count - STUB_PREVIEW_TAIL)
+            .map(|(i, _)| i)
+            .unwrap_or(output.len());
+        let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
+        let candidate = format!(
+            "[{tool_name} {status}: {line_count} lines, head: {}{STUB_OMISSION_START}{omitted}{STUB_OMISSION_END}{}]",
+            &output[..head_end],
+            &output[tail_start..]
+        );
+        if candidate.chars().count() < char_count {
+            return candidate;
+        }
+    }
     let first_line: String = {
         let mut iter = output.lines();
         let l1 = iter.next().unwrap_or("(empty)");
@@ -1659,8 +1783,7 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
         } else {
             l1
         };
-        chosen.chars().take(80).collect()
+        chosen.chars().take(STUB_FIRST_LINE).collect()
     };
-    let status = if success { "ok" } else { "FAILED" };
     format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]")
 }

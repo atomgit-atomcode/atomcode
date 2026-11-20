@@ -50,12 +50,13 @@ pub struct TurnRecord {
     pub usage: UsageRecord,
 }
 
-/// Display clocks retained for one completed turn. `started_at` is optional for
-/// transcripts written before per-turn start timestamps were introduced.
+/// Display clocks retained for a turn, including one still running.
+/// `started_at` is optional for transcripts written before per-turn starts were recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnTimestamp {
     pub started_at: Option<i64>,
-    pub completed_at: i64,
+    /// Absent until a real TurnEnd; a start/checkpoint is not completion.
+    pub completed_at: Option<i64>,
 }
 
 /// One tool call + its paired result within a turn.

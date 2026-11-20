@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { getModelCards, type ModelInfo } from '../api';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
@@ -58,7 +59,10 @@ export function ModelCardDialog({ model, onClose }: { model: ModelInfo; onClose:
     for (const row of remaining) rows.push({ b: row });
   }
   const cardHeading = (card: ModelCard) => <><strong>{card.name}</strong><small>{card.maker}</small></>;
-  return <dialog class="model-card-dialog" ref={dialog} aria-labelledby="model-card-title">
+  // Portalled to the body: the dialog lives inside .model-controls, which the
+  // mobile composer hides when it collapses. A <dialog> in the top layer is
+  // still laid out inside a display:none ancestor, so it would be invisible.
+  return createPortal(<dialog class="model-card-dialog" ref={dialog} aria-labelledby="model-card-title">
     <header><div><h2 id="model-card-title">{t('cards.title')}</h2><p>{model.model}</p></div><button type="button" onClick={onClose} aria-label={t('cards.close')}>×</button></header>
     <div class="mc-body">
       <div class="mc-config"><span>{t('cards.context')}: {model.context_window?.toLocaleString() ?? '—'}</span><span>{t('cards.vision')}: {t(model.supports_vision == null ? 'cards.unknown' : model.supports_vision ? 'cards.yes' : 'cards.no')}</span></div>
@@ -100,5 +104,5 @@ export function ModelCardDialog({ model, onClose }: { model: ModelInfo; onClose:
         </details>
       </>}
     </div>
-  </dialog>;
+  </dialog>, document.body);
 }

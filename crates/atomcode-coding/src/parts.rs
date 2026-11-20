@@ -562,12 +562,40 @@ fn resolve_skill_dirs_at(
     if !opts.tools {
         return (Vec::new(), Vec::new(), Vec::new());
     }
-    if let Some(dirs) = &opts.skill_dirs {
-        return (dirs.clone(), dirs.clone(), Vec::new());
+    resolve_skill_dirs_from(
+        &cfg.extra_skill_dirs,
+        &cfg.working_dir,
+        &cfg.dirs,
+        home,
+        opts.skill_dirs.as_deref(),
+    )
+}
+
+/// The skill roots, from the inputs a HOST has.
+///
+/// **The same rule [`resolve_skill_dirs_at`] applies**, reading these five
+/// inputs instead of a config and a prepare-options struct. One body, two
+/// callers: the runtime resolves the roots it will load, and the migration
+/// report resolves the roots the runtime will load. If they were two
+/// bodies, they would drift — and the report would claim a skill is in
+/// effect that the runtime does not read (or the other way round).
+///
+/// `explicit` is the driver's own override (`PrepareOptions::skill_dirs`):
+/// given one, ONLY it is used — not even the standard directories. That is
+/// what an override means, and a host must honour it the same way.
+pub fn resolve_skill_dirs_from(
+    extra_dirs: &[String],
+    project: &std::path::Path,
+    product_dirs: &atomcode_capabilities::ProductDirs,
+    home: Option<&std::path::Path>,
+    explicit: Option<&[PathBuf]>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    if let Some(dirs) = explicit {
+        return (dirs.to_vec(), dirs.to_vec(), Vec::new());
     }
     let mut warnings = Vec::new();
     let mut extra = Vec::new();
-    for value in &cfg.extra_skill_dirs {
+    for value in extra_dirs {
         let path = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
             let Some(home) = home else {
                 warnings.push(
@@ -586,7 +614,7 @@ fn resolve_skill_dirs_at(
             if path.is_absolute() {
                 path
             } else {
-                cfg.working_dir.join(path)
+                project.join(path)
             }
         };
         extra.push(path.canonicalize().unwrap_or(path));
@@ -594,8 +622,8 @@ fn resolve_skill_dirs_at(
     let mut dirs = extra.clone();
     dirs.extend(standard_skill_dirs(SkillRoots {
         home: home.unwrap_or(std::path::Path::new(".")),
-        project: &cfg.working_dir,
-        dirs: &cfg.dirs,
+        project,
+        dirs: product_dirs,
     }));
     let mut seen = std::collections::BTreeSet::new();
     dirs.reverse();
@@ -717,6 +745,10 @@ pub struct CodingParts {
     /// Current real-user turn's explicit execution restriction. The same instance is
     /// a lifecycle hook and a pre-approval Bash middleware.
     pub(crate) turn_execution_policy: Arc<TurnExecutionPolicy>,
+    /// Which background jobs a completion will wake the model for, written by
+    /// the runtime and read by `background-wait-hint`. Rebuilt with the parts:
+    /// a new assembly is a new generation, whose pending notifications start over.
+    pub(crate) background_waits: crate::background_jobs::BackgroundWaits,
     /// Session grant store for mutating MCP tools the user approved "always" while in
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
@@ -739,7 +771,7 @@ pub struct CodingParts {
     pub subagent_provider: Option<SharedReviewProvider>,
     /// The provider for model calls made outside a round — summaries — recorded
     /// and metered; filled with the others by [`wire_side_providers`].
-    side_provider: SharedReviewProvider,
+    side_provider: crate::on_harness::SharedCompactionProviders,
     /// Child-agent assembly prepared from the same live tier-provider cells and
     /// execution policy as `task`. The `team` tool is mounted in the next phase.
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
@@ -786,6 +818,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
+    let cc_hooks = if cfg.require_approval_hook {
+        CCExternalHooks::load_with_required_approval(
+            &cfg.working_dir,
+            cfg.dirs.user(),
+            plugin_cc_hooks,
+        )?
+    } else {
+        CCExternalHooks::load_with_extra(&cfg.working_dir, cfg.dirs.user(), plugin_cc_hooks)
+    };
     let bypass_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
@@ -833,6 +874,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string()),
         );
+        host_only_tools.push("git_status".into());
     }
     let request_user_input_enabled = opts.tools
         && opts.request_user_input
@@ -1277,8 +1319,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // (`plugin_cc_hooks`, resolved by the host), mounted by the `cc-hooks-host` row on
     // both the lifecycle and the tool-middleware seam. Only when hooks actually exist.
     let cc_external = {
-        let mut cc =
-            CCExternalHooks::load_with_extra(&cfg.working_dir, cfg.dirs.user(), plugin_cc_hooks);
+        let mut cc = cc_hooks;
         // Stamp the persistent session id into every CC payload (CC `session_id`), so a
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
@@ -1338,6 +1379,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         bypass_mode,
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_execution_policy,
+        background_waits: Default::default(),
         mcp_plan_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
@@ -1413,6 +1455,9 @@ impl LlmProvider for SlotProvider {
         self.current()
             .map(|p| p.effort_levels())
             .unwrap_or_default()
+    }
+    fn replays_reasoning(&self) -> bool {
+        self.current().is_none_or(|p| p.replays_reasoning())
     }
     async fn chat_stream(
         &self,
@@ -1588,7 +1633,7 @@ impl CodingParts {
 
     /// Where the provider for out-of-round model calls lives, refilled on every
     /// model change.
-    pub(crate) fn side_provider_slot(&self) -> SharedReviewProvider {
+    pub(crate) fn side_provider_slot(&self) -> crate::on_harness::SharedCompactionProviders {
         Arc::clone(&self.side_provider)
     }
 
@@ -2314,7 +2359,10 @@ pub(crate) fn wire_side_providers(
     }
 
     if let Ok(mut slot) = parts.side_provider.write() {
-        *slot = Some(metered_provider.clone());
+        *slot = Some(crate::on_harness::CompactionProviders {
+            primary: provider.clone(),
+            summary: metered_provider.clone(),
+        });
     }
     metered_provider
 }

@@ -111,7 +111,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NetworkConnectHint =>
             "Network connect failed. If this works in a browser you may be behind a proxy/firewall: configure a proxy with /proxy or set HTTPS_PROXY, or open the login URL above in a browser to finish. Press Esc to skip and /login later.".into(),
         Msg::NetworkConnectHintNoResolver =>
-            "Network connect failed, and /etc/resolv.conf is not readable on this host. The Linux artifacts are statically linked against musl, whose resolver sends queries to 127.0.0.1 when it cannot read that file, so name resolution fails on Android / Termux. Mount a resolver configuration, for example: proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode.".into(),
+            "Network connect failed, and /etc/resolv.conf is not readable on this host. Termux uses $PREFIX/etc/resolv.conf as a fallback; check its nameserver entries, network and proxy settings. A temporary alternative is to mount a valid configuration: proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode.".into(),
         Msg::CpSetupHeader =>
             "  {brand} CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
@@ -844,7 +844,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeOptForce => "Reinstall the latest version".into(),
         Msg::UpgradeOptRollback => "Roll back to the previous version".into(),
 
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider: {}\n  Config: {}\n\n", provider, path).into(),
@@ -1397,9 +1396,15 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CtxSystemPromptEmpty => "(empty — wait for one complete turn to capture)".into(),
         Msg::CtxTokensSuffix => "tokens".into(),
         Msg::CompactSummaryFailed => "AI summary failed or returned an invalid/incomplete answer".into(),
-        Msg::CompactSummaryTimedOut => "AI summary timed out".into(),
+        Msg::CompactSummaryTimedOut => "AI summary first-response or idle timeout".into(),
+        Msg::CompactSummaryContextExceeded => "AI summary input cannot fit the model window".into(),
+        Msg::CompactSummaryIncomplete => "AI summary was empty, truncated, or incomplete".into(),
+        Msg::CompactSummaryAuthenticationFailed => "AI summary authentication or access denied; check credentials and model access".into(),
+        Msg::CompactSummaryRequestRejected => "AI summary request rejected; check model, parameters, quota or service restrictions".into(),
+        Msg::CompactSummaryRateLimited => "AI summary rate limited; wait before retrying".into(),
+        Msg::CompactSummaryRequestFailed => "AI summary request failed after bounded retries".into(),
         Msg::CompactNotSmaller => "The proposed compaction did not reduce context".into(),
-        Msg::CompactDiagnosticRetained { reason, before, after } => format!("{reason}; history retained unchanged ({before} → {after} text bytes). Retry /compact or check model access.").into(),
+        Msg::CompactDiagnosticRetained { reason, before, after } => format!("{reason}; history retained unchanged ({before} → {after} text bytes). Address the cause above before retrying /compact; check logs for diagnostics.").into(),
         Msg::CompactDiagnosticReduced { reason, before, after } => format!("{reason}; only tool output was folded ({before} → {after} text bytes). Conversation history retained.").into(),
         Msg::CompactNothingShort => "(nothing to compact — conversation is short)\n".into(),
         Msg::CompactStarting => "(compacting with LLM summary...)\n".into(),
@@ -1516,6 +1521,48 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdCatalogRememberUsage => "[--topic <topic>] [--source <source>] [--pin] [--ttl-days N] <what to remember>".into(),
         Msg::CmdCatalogForget => "Delete one of the lines you remembered".into(),
         Msg::CmdCatalogForgetUsage => "<keyword> | --id <ID>".into(),
+        Msg::MigrationSkillActive => "Already in effect: read directly, nothing to move.".into(),
+        Msg::MigrationSkillRejected { reason } => {
+            format!("The skill loader rejected it: {reason}").into()
+        }
+        Msg::MigrationSkillOverridden { name } => {
+            format!("Overridden by a \"{name}\" in another directory.").into()
+        }
+        Msg::MigrationUnreadableFile { reason } => {
+            format!("The file could not be read: {reason}").into()
+        }
+        Msg::MigrationSkillDepthLimit => "the grouping depth limit was exceeded".into(),
+        Msg::MigrationSkillSymlinkCycle => "a symlink cycle was detected".into(),
+        Msg::MigrationSkillMdNotAFile => {
+            "SKILL.md here is not a regular file, so this skill cannot load.".into()
+        }
+        Msg::MigrationSkillCopyable { target } => {
+            format!("Not in effect yet. Copy it to {target} to bring it over.").into()
+        }
+        Msg::MigrationSkillNotInEffect => {
+            "Not in effect, and the skill loader gives no reason why.".into()
+        }
+        Msg::MigrationForeignUnparseable => {
+            "This file cannot be parsed, so it would not load even if it were copied over.".into()
+        }
+        Msg::MigrationBrokenLink => {
+            "This is a broken symlink: its target is gone, so nothing can load it.".into()
+        }
+        Msg::MigrationNotARegularFile => {
+            "This is not a regular file, so it cannot be loaded as a skill.".into()
+        }
+        Msg::MigrationNotADirectory => {
+            "This is not a directory, so it cannot be scanned for skills.".into()
+        }
+        Msg::MigrationReportDepthLimit => {
+            "the scan stopped here: the grouping depth limit was exceeded".into()
+        }
+        Msg::MigrationReportSymlinkCycle => {
+            "the scan stopped here: a symlink cycle was detected".into()
+        }
+        Msg::MigrationReportEntryUnusable { reason } => {
+            format!("This entry cannot be used as a skill: {reason}").into()
+        }
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \
@@ -1765,7 +1812,153 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::ResumeHintBackground { cmd } => {
             format!("To resume the background session, run: {cmd}").into()
         }
-    }
+
+        Msg::MigrationInstructionsActive => {
+            "Read directly from this project — already in effect".into()
+        }
+        Msg::MigrationInstructionsCopyable { target } => {
+            format!("Copy it to {target} to make it apply to every project").into()
+        }
+        Msg::MigrationInstructionsShadowed { by } => {
+            format!("Not read: {by} takes precedence in this project").into()
+        }
+        Msg::MigrationInstructionsEmpty => {
+            "The file is empty, so nothing is loaded from it".into()
+        }
+        Msg::MigrationPermissionsActive => {
+            "Merged into this project's permission rules — already in effect".into()
+        }
+        Msg::MigrationPermissionsCopyable { target } => {
+            format!("Copy it to {target} to make it a global permission rule").into()
+        }
+        Msg::MigrationMcpCopyable { count, target } => {
+            format!("{count} MCP server(s) — copy them into {target}").into()
+        }
+        Msg::MigrationMcpActive { count } => {
+            format!("{count} MCP server(s) — read directly from this project").into()
+        }
+        Msg::MigrationMcpAllDisabled { count } => {
+            format!("{count} MCP server(s) are configured but disabled — none of them run").into()
+        }
+        Msg::MigrationMcpRemoteNotCopyable => {
+            "A remote MCP server (url only) — it cannot be copied as a stdio command".into()
+        }
+        Msg::MigrationRulesRejected => {
+            "Our loader would reject this file, so none of its rules apply".into()
+        }
+        Msg::MigrationHooksCopyable { target } => {
+            format!("Copy them into {target}").into()
+        }
+        Msg::MigrationProviderCopyable { base_url, key } => {
+            format!(
+                "Provider settings (endpoint {base_url}, credential {key}) can be imported — \
+                 review them before writing"
+            )
+            .into()
+        }
+        Msg::MigrationProviderNameUnusable { name } => {
+            format!("{name}: this name cannot be an account id — not imported").into()
+        }
+        Msg::MigrationProviderProtocolUnsupported { protocol } => {
+            format!("This endpoint speaks {protocol}, which we do not support — not imported")
+                .into()
+        }
+        Msg::MigrationProviderNothingToConnectTo => {
+            "This provider names no endpoint and no credential — there is nothing to connect to"
+                .into()
+        }
+        Msg::MigrationCredentialHasDollar => {
+            "This key contains `$`, which the configuration would expand — not imported".into()
+        }
+        Msg::MigrationOpencodePlaintextCredentials => {
+            "This file holds plaintext keys — they are not moved, only reported".into()
+        }
+        Msg::MigrationAgentsBlocked => {
+            "Our role files need `permission` and `difficulty` frontmatter, which these do not \
+             have — not migrated"
+                .into()
+        }
+        Msg::MigrationPluginsBlocked => {
+            "The plugin manifest format is theirs, not ours — not migrated".into()
+        }
+        Msg::MigrationSessionsBlocked { count } => {
+            format!("{count} session file(s) — converting history is lossy, not done yet").into()
+        }
+
+        Msg::MigrationUnreadableConfig => {
+            "This config file could not be parsed, so nothing could be read from it".into()
+        }
+
+        Msg::MigrationReportEmpty => {
+            "No assets from another AI coding agent were found.".into()
+        }
+        Msg::MigrationSummary {
+            total,
+            active,
+            imported,
+            actionable,
+            blocked,
+        } => format!(
+            "\n{total} assets: {active} already in effect, {imported} already imported, \
+             {actionable} can be brought over, {blocked} cannot.\n"
+        )
+        .into(),
+        Msg::MigrationStatusActive => "in effect".into(),
+        Msg::MigrationStatusImported => "already imported".into(),
+        Msg::MigrationStatusActionable => "can move".into(),
+        Msg::MigrationStatusBlocked => "cannot move".into(),
+        Msg::MigrationAlreadyImported => {
+            "Already in your configuration — nothing left to bring over".into()
+        }
+
+        Msg::MigrationImportDone { imported } => format!("Imported: {imported}.").into(),
+        Msg::MigrationImportSkipped { skipped } => format!("Not imported: {skipped}.").into(),
+        Msg::MigrationImportNone => "No provider accounts were found to import.".into(),
+        Msg::MigrationProvidersUnreadable { reasons } => {
+            format!("The provider configuration could not be read: {reasons}").into()
+        }
+        Msg::MigrationImportAlreadyThere { already } => {
+            format!("Already there: {already}.").into()
+        }
+        Msg::MigrationImportConflict { id } => {
+            format!("{id}: an account with that id exists but differs — not overwritten").into()
+        }
+        Msg::MigrationCredentialReferenceUnsupported => "This endpoint or credential reference needs manual configuration.".into(),
+        Msg::MigrationClaudeAuthAmbiguous => "Both Claude Code authentication methods are configured. Choose the intended credential manually.".into(),
+        Msg::MigrationProjectConfirmationRequired => "A project account requires interactive confirmation.".into(),
+        Msg::MigrationImportConfirm {
+            id,
+            protocol,
+            endpoint,
+            models,
+            credential,
+            destination,
+            source,
+        } => {
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!(" with models {models}")
+            };
+            // **The credential's fate is spelled out.** For a literal it
+            // says the secret is COPIED INTO the file, and names the file.
+            let credential = match credential.strip_prefix("plaintext") {
+                Some(_) => format!(
+                    " and copy its PLAINTEXT KEY into {destination}"
+                ),
+                None => match credential.strip_prefix("env:") {
+                    Some(name) => {
+                        format!(" and use the environment variable {name} (the secret stays put)")
+                    }
+                    None => String::new(),
+                },
+            };
+            format!(
+                "Import account `{id}` from {source} ({protocol} -> {endpoint}){models}{credential}? [y/N] "
+            )
+            .into()
+        }
+}
 }
 
 #[cfg(test)]

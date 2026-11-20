@@ -560,9 +560,15 @@ impl Waterfall<AgentRequest> for Bridge {
         self.hook.pre_request(&mut proposed, &ctx).await;
         timing.returned();
         drop(timing);
-        if proposed.len() > before && proposed[..before] == handed[..] {
-            req.messages.extend(proposed.drain(before..));
-        }
+        // Taken off again once the request is answered (`with_tail`): a row
+        // nearer the front that sends it again must not find it already here.
+        let tail: Vec<Message> = if proposed.len() > before && proposed[..before] == handed[..] {
+            proposed.drain(before..).collect()
+        } else {
+            Vec::new()
+        };
+        let at = req.messages.len();
+        req.messages.extend(tail.iter().cloned());
         let mut timing =
             atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request_options");
         self.hook
@@ -582,7 +588,9 @@ impl Waterfall<AgentRequest> for Bridge {
         // `response_meta` measures for the session log — measured again here
         // because the meta that reaches a hook is built here, not there.
         let started = std::time::Instant::now();
-        match next.run(req).await {
+        let result = next.run(req).await;
+        atomcode_harness::tail::take_off(&mut req.messages, at, &tail);
+        match result {
             Ok(response) => {
                 let mut message =
                     Message::assistant(response.text.clone(), response.tool_calls.clone());
@@ -874,13 +882,13 @@ impl Waterfall<AgentRequest> for PlanModeLive {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
-        if self.active() {
-            req.messages
-                .push(atomcode_capabilities::reminder::synthetic_system_reminder(
-                    crate::plan_mode::PLAN_MODE_REMINDER_BODY,
-                ));
+        if !self.active() {
+            return next.run(req).await;
         }
-        next.run(req).await
+        let reminder = atomcode_capabilities::reminder::synthetic_system_reminder(
+            crate::plan_mode::PLAN_MODE_REMINDER_BODY,
+        );
+        atomcode_harness::tail::with_tail(req, vec![reminder], next).await
     }
 }
 
@@ -1196,7 +1204,10 @@ impl Plugin for HostToolsPlugin {
         // — or `/review` does not exist on the product at all, which is what it
         // was until 2026-09-22.
         if let Some(review) = self.0.iter().find(|tool| tool.name() == "code_review") {
-            atomcode_harness::plugins::capabilities::register_review_command(ctx, review.clone())?;
+            atomcode_harness::plugins::capabilities::register_review_command_inline(
+                ctx,
+                review.clone(),
+            )?;
         }
         let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {
@@ -2367,7 +2378,7 @@ impl Listener<TurnFinishing> for WorkspaceCaptureBarrier {
 /// person asks for is that summary, steered by their focus. Every summary is
 /// billed to the session through the side provider, and every way it can fail
 /// falls back to something model-free.
-pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedReviewProvider);
+pub(crate) struct CompactionCodingPlugin(pub(crate) crate::on_harness::SharedCompactionProviders);
 
 #[derive(serde::Deserialize)]
 struct CompactionCodingRow {
@@ -2386,24 +2397,32 @@ fn default_compaction_threshold() -> f32 {
 struct CodingCompaction {
     token_limit: Option<u32>,
     stub_recent_budget: Option<u32>,
-    provider: atomcode_review::SharedReviewProvider,
+    provider: crate::on_harness::SharedCompactionProviders,
 }
 
 impl CodingCompaction {
     /// Resolved per call: `/model` and a logout swap the provider under it.
-    fn strategy(&self) -> (atomcode_capabilities::compaction::OverflowCompaction, bool) {
+    fn strategy(
+        &self,
+    ) -> (
+        atomcode_capabilities::compaction::OverflowCompaction,
+        Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+    ) {
         let provider = self.provider.read().ok().and_then(|slot| slot.clone());
-        let writes = provider.is_some();
         let stub = match self.stub_recent_budget {
             Some(limit) => {
                 atomcode_capabilities::compaction::StubCompaction::new(limit as usize, true)
             }
             None => atomcode_capabilities::compaction::StubCompaction::default(),
         };
+        let (primary, summary) = match provider {
+            Some(provider) => (Some(provider.primary), Some(provider.summary)),
+            None => (None, None),
+        };
         (
-            atomcode_capabilities::compaction::OverflowCompaction::new(stub, provider)
+            atomcode_capabilities::compaction::OverflowCompaction::new(stub, summary)
                 .with_auto_token_limit(self.token_limit),
-            writes,
+            primary,
         )
     }
 }
@@ -2431,8 +2450,8 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> bool {
-        let (strategy, writes) = self.strategy();
-        writes
+        let (strategy, provider) = self.strategy();
+        provider.is_some()
             && atomcode_harness::plugins::compaction::strategy_would_summarize(&strategy, log, ask)
     }
 
@@ -2441,8 +2460,7 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> Option<atomcode_harness::seams::CompactionDecision> {
-        let (strategy, _) = self.strategy();
-        atomcode_harness::plugins::compaction::decide_with_strategy(&strategy, log, ask).await
+        self.compact_attempt(log, ask).await.decision
     }
 
     async fn compact_attempt(
@@ -2450,8 +2468,14 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> atomcode_harness::seams::CompactionAttempt {
-        let (strategy, _) = self.strategy();
-        atomcode_harness::plugins::compaction::attempt_with_strategy(&strategy, log, ask).await
+        let (strategy, provider) = self.strategy();
+        atomcode_harness::plugins::compaction::attempt_with_sent_prompt(
+            &strategy,
+            log,
+            ask,
+            provider.as_ref(),
+        )
+        .await
     }
 }
 
@@ -2507,6 +2531,9 @@ impl Plugin for CompactionCodingPlugin {
 pub(crate) struct CapabilityCommandsPlugin(
     pub(crate) Arc<dyn crate::runtime::RuntimeCommands>,
     pub(crate) std::path::PathBuf,
+    /// `Some` when the driver shows the turn a background completion starts
+    /// (`CodingAgentConfig::background_wakeups`): the jobs it will wake for.
+    pub(crate) Option<crate::background_jobs::BackgroundWaits>,
 );
 
 #[async_trait]
@@ -2523,25 +2550,71 @@ impl Plugin for CapabilityCommandsPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         // This policy belongs to the host that actually observes completions,
         // not to the portable shell tool or a second waiting state machine.
+        // Completions are delivered only after a response ends, so a model that
+        // keeps its turn open to poll only delays them; but only a driver that
+        // stays attached shows the turn a completion starts (`-p` exits at its
+        // first turn terminal), so only there may the model end its response.
+        let (policy, knowledge) = if let Some(waits) = &self.2 {
+            // The policy said once, at mount, reaches a model that has read
+            // many rounds since; the job it is polling right now is better
+            // evidence. Only on the request, so the tool result the front end
+            // groups and the loop guard counts stays the tool's own.
+            let _ = ctx.on_waterfall::<AgentRequest>(
+                Arc::new(crate::background_jobs::BackgroundWaitHint::new(
+                    waits.clone(),
+                )),
+                false,
+            );
+            (
+                "This host resumes you when a background job finishes. For bounded work \
+                 that may take a long time, including downloads, SDK installation, builds \
+                 and tests, use bash_start (notify_on_exit defaults to true). Keep the real \
+                 operation in that tracked job so its exit status and output are available. \
+                 While it runs, do independent work if useful; otherwise end your response. \
+                 Ending your response does not end the task, even when the next step needs \
+                 the job's result: the completion notification starts your next turn with \
+                 that result and you continue the remaining steps from there. The \
+                 notification is delivered only after your response ends, and every \
+                 bash_poll wait that times out with the job still running costs a whole \
+                 request; shell sleep, ls and pgrep wait without the job's status at all. \
+                 After the notification, \
+                 collect each finished job once with bash_poll and wait_ms 0, then check the \
+                 result. A file existing or a process disappearing does not prove success. \
+                 Leave completion notifications off for servers and watchers. If a job was \
+                 already started without notifications, use bash_poll to collect or wait for \
+                 that tracked job; do not restart the operation just to enable \
+                 notifications. Do not claim an untracked external process is being \
+                 observed by the host.",
+                "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement (switching model or session) retire pending notifications, so a person may need to resume the session then. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.",
+            )
+        } else {
+            (
+                "This host does not resume you when a background job finishes: the run ends \
+                 with your response. For bounded work that may take a long time, including \
+                 downloads, SDK installation, builds and tests, use bash_start and keep the \
+                 real operation in that tracked job so its exit status and output are \
+                 available. While it runs, do independent work if useful; when you are \
+                 blocked on it, wait with bash_poll using a long wait_ms, and repeat while it \
+                 reports running. Before your final answer, collect every job whose result \
+                 matters and bash_kill jobs that stopped mattering. Do not wait with shell \
+                 sleep, ls or pgrep. A file existing or a process disappearing does not prove \
+                 success. Do not claim an untracked external process is being observed by \
+                 the host.",
+                "This host does not resume the session when a background job finishes; the run ends with the model's response, so a bash_start job is waited for with bash_poll before answering.",
+            )
+        };
         atomcode_harness::plugins::tools::contribute_prompt(
             ctx,
             "background-completion-policy",
             52,
-            "This host supports background completion notifications. For bounded work that \
-             may take a long time, including downloads, SDK installation, builds and tests, \
-             use bash_start (notify_on_exit defaults to true). Keep the real operation in that \
-             tracked job so its exit status and output are available. While it runs, do \
-             independent work if useful; otherwise end your response and wait for the host \
-             notification, then collect output with bash_poll and check the result. Do not \
-             spend repeated model requests waiting with shell sleep, ls, pgrep, or empty \
-             polls. A file existing or a process disappearing does not prove success. \
-             Leave completion notifications off for servers and watchers. If a job was \
-             already started without notifications, use bash_poll to collect or wait for \
-             that tracked job; do not restart the operation just to enable notifications. \
-             Do not claim an untracked external process is being observed by the host.",
+            policy,
         );
-        atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
-            "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
+        atomcode_harness::plugins::self_knowledge::describes(
+            ctx,
+            "background-completion",
+            42,
+            knowledge,
+        );
         for command in [
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,
@@ -3681,8 +3754,9 @@ mod tests {
             used_tokens: 500,
             utilization: 0.5,
             sacred_floor: floor,
+            parent: None,
         };
-        let provider: atomcode_review::SharedReviewProvider =
+        let provider: crate::on_harness::SharedCompactionProviders =
             std::sync::Arc::new(std::sync::RwLock::new(None));
 
         let small = super::CodingCompaction {
@@ -4802,6 +4876,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let error = ctx
                 .waterfall::<AgentRequest, _>(&mut request, |_| {
@@ -4848,6 +4923,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let seen = std::sync::atomic::AtomicU32::new(0);
             let began = tokio::time::Instant::now();

@@ -128,17 +128,70 @@ impl ConfigSettings {
                             applies: Applies::Reprepare,
                         }),
                 )
+                .chain(std::iter::once(SettingRow {
+                    id: atomcode_config::vision_preprocessor::SETTING_ID.into(),
+                    label: atomcode_config::vision_preprocessor::setting_label(&config),
+                    value: config
+                        .vision_preprocessor_provider
+                        .clone()
+                        .unwrap_or_default(),
+                    kind: SettingKind::Choice(
+                        atomcode_config::vision_preprocessor::vision_preprocessor_choices(&config),
+                    ),
+                    applies: Applies::NextTurn,
+                }))
+                .chain(std::iter::once(SettingRow {
+                    id: SEARCH_PROVIDER.into(),
+                    label: if atomcode_config::i18n::current_locale()
+                        == atomcode_config::locale::Locale::ZhCn
+                    {
+                        "网页搜索后端（auto 自动切换）"
+                    } else {
+                        "Web search provider (auto: failover)"
+                    }
+                    .into(),
+                    value: config.web_search.provider.clone(),
+                    kind: SettingKind::Choice(
+                        atomcode_config::config::WebSearchConfig::PROVIDERS
+                            .iter()
+                            .map(|name| (*name).into())
+                            .collect(),
+                    ),
+                    applies: Applies::Reprepare,
+                }))
                 .chain(retry_row(&config))
                 .collect(),
         )
     }
 }
 
-/// The id of the one setting that is not in the static catalog.
-///
-/// It cannot be: what it reads and writes lives under the *current selection* —
-/// `[models.<id>]` or `[providers.<id>]` — and which one that is changes with
-/// `/model`. A static spec would have to name a path, and there is no one path.
+const SEARCH_PROVIDER: &str = "web_search.provider";
+
+fn write_search_provider(path: &std::path::Path, provider: Option<&str>) -> Result<(), String> {
+    if let Some(provider) = provider {
+        if !atomcode_config::config::WebSearchConfig::PROVIDERS.contains(&provider) {
+            return Err("Unknown web search provider".into());
+        }
+    }
+    atomcode_config::ConfigStore::new(path.to_owned())
+        .update_document(|document| {
+            document["web_search"]["auto_default_migrated"] = toml_edit::value(true);
+            if let Some(provider) = provider {
+                document["web_search"]["provider"] = toml_edit::value(provider);
+            } else if let Some(table) = document
+                .get_mut("web_search")
+                .and_then(toml_edit::Item::as_table_like_mut)
+            {
+                table.remove("provider");
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(())
+}
+
+/// This setting is built dynamically because it reads and writes the current
+/// model selection, whose config path changes with `/model`.
 const RETRY: &str = "model.retry_max_attempts";
 
 /// How many times the current model's requests are retried, when it says.
@@ -225,6 +278,18 @@ impl Settings for ConfigSettings {
                 .map_err(|error| format!("{error:#}"))?;
             return Ok(self.read());
         }
+        if id == atomcode_config::vision_preprocessor::SETTING_ID {
+            atomcode_config::ConfigStore::new(self.path.clone())
+                .update_document(|document| {
+                    atomcode_config::vision_preprocessor::patch_setting(document, value)
+                })
+                .map_err(|error| format!("{error:#}"))?;
+            return Ok(self.read());
+        }
+        if id == SEARCH_PROVIDER {
+            write_search_provider(&self.path, Some(value))?;
+            return Ok(self.read());
+        }
         if id == RETRY {
             write_retry(&self.path, Some(value))?;
             return Ok(self.read());
@@ -259,6 +324,13 @@ impl Settings for ConfigSettings {
                     atomcode_config::mode_models::patch_setting(document, id, None)
                 })
                 .map_err(|error| format!("{error:#}"))?;
+            return Ok(self.read());
+        }
+        if id == atomcode_config::vision_preprocessor::SETTING_ID {
+            return self.set(id, "");
+        }
+        if id == SEARCH_PROVIDER {
+            write_search_provider(&self.path, None)?;
             return Ok(self.read());
         }
         if id == RETRY {
@@ -337,6 +409,107 @@ fn applies_of(policy: atomcode_config::settings::ApplyPolicy) -> Applies {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selecting_exa_before_the_first_read_is_an_explicit_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[web_search]\nprovider = 'exa'\n").unwrap();
+        let port = super::ConfigSettings::new(path.clone());
+        port.set(SEARCH_PROVIDER, "exa").unwrap();
+        let config = atomcode_config::Config::load(&path).unwrap();
+        assert_eq!(config.web_search.provider, "exa");
+        assert!(config.web_search.auto_default_migrated);
+        assert_eq!(
+            port.rows()
+                .rows()
+                .iter()
+                .find(|r| r.id == SEARCH_PROVIDER)
+                .unwrap()
+                .value,
+            "exa"
+        );
+    }
+
+    #[test]
+    fn web_search_selector_defaults_to_auto_and_preserves_credentials_when_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep\n[web_search]\napi_key = 'fixture-exa-secret'\n",
+        )
+        .unwrap();
+        let port = super::ConfigSettings::new(path.clone());
+        let view = port.rows();
+        let row = view
+            .rows()
+            .iter()
+            .find(|row| row.id == SEARCH_PROVIDER)
+            .unwrap();
+        assert_eq!(row.value, "auto");
+        assert_eq!(row.applies, Applies::Reprepare);
+        for provider in atomcode_config::config::WebSearchConfig::PROVIDERS {
+            let view = port.set(SEARCH_PROVIDER, provider).unwrap();
+            assert_eq!(
+                view.rows()
+                    .iter()
+                    .find(|row| row.id == SEARCH_PROVIDER)
+                    .unwrap()
+                    .value,
+                *provider
+            );
+        }
+        assert!(port.set(SEARCH_PROVIDER, "unknown").is_err());
+        port.reset(SEARCH_PROVIDER).unwrap();
+        let saved = atomcode_config::Config::load(&path).unwrap();
+        assert_eq!(saved.web_search.provider, "auto");
+        assert_eq!(
+            saved.web_search.api_key.as_deref(),
+            Some("fixture-exa-secret")
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# keep"));
+    }
+    #[test]
+    fn config_offers_only_image_models_for_vl_and_preserves_invalid_values() {
+        use atomcode_tui::settings::{Applies, SettingKind, Settings};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+# retained
+vision_preprocessor_provider = "removed"
+[providers.vl]
+type = "openai"
+model = "custom"
+supports_vision = true
+[providers.text]
+type = "openai"
+model = "gpt-4o"
+supports_vision = false
+"#,
+        )
+        .unwrap();
+        let port = super::ConfigSettings::new(path.clone());
+        let id = atomcode_config::vision_preprocessor::SETTING_ID;
+        let view = port.rows();
+        let row = view.rows().iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.value, "removed");
+        assert_eq!(row.kind, SettingKind::Choice(vec!["".into(), "vl".into()]));
+        assert_eq!(row.applies, Applies::NextTurn);
+        assert!(port.set(id, "text").is_err());
+        port.set(id, "vl").unwrap();
+        let saved = atomcode_config::Config::load(&path).unwrap();
+        assert_eq!(saved.vision_preprocessor_provider.as_deref(), Some("vl"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# retained"));
+        port.reset(id).unwrap();
+        assert!(atomcode_config::Config::load(&path)
+            .unwrap()
+            .vision_preprocessor_provider
+            .is_none());
+    }
     use super::*;
 
     #[test]
@@ -523,6 +696,8 @@ mod tests {
             .collect();
         assert!(
             extra.iter().all(|id| *id == RETRY
+                || *id == SEARCH_PROVIDER
+                || *id == atomcode_config::vision_preprocessor::SETTING_ID
                 || [
                     "modes.plan.model",
                     "modes.plan.reasoning_effort",
@@ -757,7 +932,12 @@ reasoning_effort_levels=["low","high"]
         std::fs::write(&path, "this is not toml {{{").unwrap();
         let port = ConfigSettings::new(path);
         let rows = port.rows();
-        assert_eq!(rows.len(), atomcode_config::settings::SETTINGS.len() + 4);
+        assert_eq!(
+            rows.len(),
+            atomcode_config::settings::SETTINGS.len()
+                + atomcode_config::mode_models::setting_rows(&Default::default()).len()
+                + 2, // VL and web search selectors are present without configured models.
+        );
     }
 
     #[test]

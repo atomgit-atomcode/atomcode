@@ -47,6 +47,7 @@ use tokio::sync::oneshot;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Asked {
     pub question: Question,
+    authorization_required: bool,
     /// The request as the model sent it, when the question is a model's own
     /// `request_user_input` read off the wire. `None` for everything else —
     /// including a `request_user_input` the log already recorded, which is the
@@ -64,6 +65,7 @@ impl From<Question> for Asked {
     fn from(question: Question) -> Self {
         Self {
             question,
+            authorization_required: false,
             input: None,
             from_background: None,
         }
@@ -85,7 +87,14 @@ pub enum Form {
 }
 
 impl Asked {
+    pub(crate) fn is_tool_approval(&self) -> bool {
+        self.authorization_required || self.question.about.is_some()
+    }
+
     pub fn form(&self) -> Form {
+        if self.is_tool_approval() {
+            return Form::Choice;
+        }
         match self.input.as_ref().map(|r| &r.mode) {
             None => Form::Choice,
             Some(UserInputMode::Single) => Form::Single,
@@ -269,20 +278,28 @@ impl Asks {
     /// The question the fallback at the foot of the stream is showing: the
     /// first of the front request's that it has not answered yet.
     pub fn current(&self) -> Option<Asked> {
+        self.current_with_id().map(|(_, _, asked)| asked)
+    }
+
+    pub(crate) fn current_with_id(&self) -> Option<(u64, usize, Asked)> {
         let q = self.queue.lock().expect("asks poisoned");
         let front = q.first()?;
-        front.asked.get(front.got.len()).cloned()
+        let page = front.got.len();
+        Some((front.id, page, front.asked.get(page)?.clone()))
     }
 
     /// Answer the question [`Asks::current`] names, and deliver the request
     /// once every one of its questions has an answer. The fallback's way of
     /// answering a batch: one question at a time, in the order they were asked.
-    pub fn answer_current(&self, choice: Option<Reply>) {
+    pub(crate) fn answer_current(&self, id: u64, page: usize, choice: Option<Reply>) {
         let done = {
             let mut q = self.queue.lock().expect("asks poisoned");
             let Some(front) = q.first_mut() else {
                 return;
             };
+            if front.id != id || front.got.len() != page {
+                return;
+            }
             front.got.push(choice);
             match front.got.len() >= front.asked.len() {
                 true => Some(q.remove(0)),
@@ -626,6 +643,10 @@ pub fn call_asking(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Optio
 pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Asked> {
     if kind == REQUEST_USER_INPUT_KIND {
         let request: UserInputRequest = serde_json::from_value(payload.clone()).ok()?;
+        let authorization_required = payload
+            .get("authorization_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let recorded = events.iter().rev().find_map(|logged| match &logged.event {
             SessionEvent::Asked { question, .. } if question.prompt == request.question => {
                 Some(question.clone())
@@ -635,8 +656,12 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
         return Some(match recorded {
             // The seam's own question, asked over this wire: drawn as recorded,
             // and answered as the choice it is.
-            Some(question) => Asked::from(question),
+            Some(question) => Asked {
+                authorization_required,
+                ..Asked::from(question)
+            },
             None => Asked {
+                authorization_required,
                 question: Question {
                     prompt: request.question.clone(),
                     // The answer's own name is what is drawn; what it means is
@@ -644,7 +669,14 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
                     options: request
                         .options
                         .iter()
-                        .map(|o| Answer::labelled(o.label.clone(), o.label.clone()))
+                        .map(|o| {
+                            let label = if authorization_required {
+                                o.description.as_deref().unwrap_or(&o.label)
+                            } else {
+                                &o.label
+                            };
+                            Answer::labelled(&o.label, label)
+                        })
                         .collect(),
                     asker: request
                         .header
@@ -720,15 +752,9 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
         // screen that says nothing means downstream is "stop", so a turn simply
         // ended and nobody was told why.
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
-        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-        | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND => {
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
             let (prompt, asker) = if kind == atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND {
                 (t(Msg::AskStepLimitQuestion), t(Msg::AskStepLimitTitle))
-            } else if kind == atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND {
-                (
-                    t(Msg::AskReasoningTimeoutQuestion),
-                    t(Msg::AskReasoningTimeoutTitle),
-                )
             } else {
                 (
                     t(
@@ -752,7 +778,6 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
             if matches!(
                 kind,
                 atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-                    | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND
             ) && (payload.get("reasoning_only").and_then(Value::as_bool) == Some(true)
                 || payload.get("no_visible_progress").and_then(Value::as_bool) == Some(true))
                 && payload
@@ -932,12 +957,10 @@ pub fn response_for(kind: &str, reply: Option<Reply>) -> Value {
         // going" is a stop — the kernel degrades a missing or malformed answer
         // to `false`, and this agrees with it rather than hoping.
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
-        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-        | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND => {
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
             if matches!(
                 kind,
                 atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND
-                    | atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND
             ) && answer.as_deref() == Some("lower_effort")
             {
                 serde_json::json!({ "continue": true, "lower_effort": true })
@@ -1039,6 +1062,8 @@ pub struct Sheet {
     /// The review page's lit row.
     pub review: usize,
     pub edit_key: crate::surface::KeyPress,
+    approval_selected: bool,
+    approval_hover: Option<usize>,
 }
 
 /// What a key did to the panel.
@@ -1048,6 +1073,13 @@ pub enum Step {
     Stay,
     /// The request is answered: one reply per question, `None` declined.
     Deliver(Vec<Option<Reply>>),
+}
+
+/// The approval and selected option that were actually drawn in one frame.
+#[derive(Clone, Copy)]
+pub(crate) struct PresentedApproval {
+    pub(crate) id: u64,
+    pub(crate) selected: Option<usize>,
 }
 
 impl Sheet {
@@ -1067,6 +1099,8 @@ impl Sheet {
             drafts,
             review: 0,
             edit_key: crate::surface::KeyPress::ctrl('e'),
+            approval_selected: false,
+            approval_hover: None,
         }
     }
 
@@ -1130,8 +1164,34 @@ impl Sheet {
         self.slots().get(self.cursor()).copied()
     }
 
+    pub(crate) fn is_tool_approval(&self) -> bool {
+        self.page().is_some_and(Asked::is_tool_approval)
+    }
+
+    pub(crate) fn row_selected(&self, row: usize) -> bool {
+        self.cursor() == row && (!self.is_tool_approval() || self.approval_selected)
+    }
+
+    pub(crate) fn row_highlighted(&self, row: usize) -> bool {
+        self.row_selected(row) || (!self.approval_selected && self.approval_hover == Some(row))
+    }
+
+    pub(crate) fn hover_at(&mut self, row: usize) -> bool {
+        if !self.is_tool_approval() {
+            return self.point_at(row);
+        }
+        if self.approval_selected || self.approval_hover == Some(row) {
+            return false;
+        }
+        self.approval_hover = Some(row);
+        true
+    }
+
     /// The number row `k` is drawn with, 1-based, when it has one.
     pub fn number(&self, k: usize) -> Option<usize> {
+        if self.is_tool_approval() {
+            return None;
+        }
         let slots = self.slots();
         slots.get(k).filter(|s| s.numbered())?;
         Some(slots[..=k].iter().filter(|s| s.numbered()).count())
@@ -1298,9 +1358,9 @@ impl Sheet {
         })
     }
 
-    /// Answer a key. Every key is the panel's while it is up.
+    /// Answer a key. Tool approvals require an explicit selection and confirmation.
     ///
-    /// **Every answer is reachable by one key.** Up/down walk the rows; enter
+    /// For other questions, up/down walk the rows; enter
     /// takes the lit one; a digit goes straight to a numbered row; a letter picks
     /// the answer it starts; left/right (or tab) turn a batch's pages; esc
     /// declines. On a row that takes words the letters, digits and space are
@@ -1318,6 +1378,25 @@ impl Sheet {
             // Esc and ctrl-c decline — the whole request. Declining is an
             // answer; it is never consent, and it is always one keystroke away.
             (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => return self.decline(),
+            (Key::Up | Key::Down, Mods::NONE) | (Key::Char('n' | 'p'), Mods::CTRL)
+                if self.is_tool_approval() =>
+            {
+                let down = matches!(press.key, Key::Down | Key::Char('n'));
+                if self.approval_selected {
+                    self.move_by(if down { 1 } else { -1 });
+                } else {
+                    self.point_at(if down {
+                        0
+                    } else {
+                        self.slots().len().saturating_sub(1)
+                    });
+                    self.approval_selected = true;
+                }
+            }
+            (Key::Enter, Mods::NONE) if self.is_tool_approval() && self.approval_selected => {
+                return self.enter();
+            }
+            _ if self.is_tool_approval() => {}
             (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
                 self.move_by(-1);
             }
@@ -1768,30 +1847,6 @@ mod tests {
     /// down. Answered here: nothing does — the panel is already gone, and the
     /// fact is the screen's own answer coming back.
     #[test]
-    fn reasoning_timeout_has_its_own_title_and_all_explicit_choices() {
-        let kind = atomcode_kernel::event::REASONING_TIMEOUT_CHECKPOINT_KIND;
-        let question = q(
-            kind,
-            &serde_json::json!({"reasoning_only":true,"lower_effort":"medium"}),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(question.prompt, t(Msg::AskReasoningTimeoutQuestion));
-        assert_eq!(
-            question.asker.as_deref(),
-            Some(t(Msg::AskReasoningTimeoutTitle).as_ref())
-        );
-        assert_eq!(nth(&question, 2).as_deref(), Some("lower_effort"));
-        assert_eq!(
-            response_for(kind, Some(Reply::from("lower_effort"))),
-            serde_json::json!({"continue":true,"lower_effort":true})
-        );
-        assert_eq!(
-            response_for(kind, None),
-            serde_json::json!({"continue":false})
-        );
-    }
-    #[test]
     fn a_ledger_takes_down_what_closed_elsewhere_and_nothing_it_answered() {
         let mut l = Ledger::default();
         l.asked("lead", &asked_q("Allow `write_file`?", None));
@@ -2117,6 +2172,35 @@ mod tests {
             let value = response_for(APPROVAL_KIND, answer.map(Reply::from));
             assert_eq!(value["decision"], decision, "{answer:?}");
         }
+    }
+
+    #[test]
+    fn an_authorization_marker_requires_confirmation_without_an_asked_fact() {
+        let asked = question_for(
+            REQUEST_USER_INPUT_KIND,
+            &serde_json::json!({
+                "header": "Question",
+                "question": "Allow the tool to run?",
+                "mode": "single",
+                "options": [{"label": "allow", "description": "Allow once"}],
+                "custom": true,
+                "authorization_required": true
+            }),
+            &[],
+        )
+        .expect("an approval can arrive before its log entry");
+        let mut sheet = Sheet::one(asked);
+        use crate::surface::{Key, KeyPress};
+        assert_eq!(sheet.page().unwrap().form(), Form::Choice);
+        assert!(sheet.hover_at(0));
+        assert_eq!(sheet.key(KeyPress::ch('1')), Step::Stay);
+        assert_eq!(sheet.key(KeyPress::ctrl('j')), Step::Stay);
+        assert_eq!(sheet.key(KeyPress::plain(Key::Enter)), Step::Stay);
+        assert_eq!(sheet.key(KeyPress::ctrl('n')), Step::Stay);
+        assert_eq!(
+            sheet.key(KeyPress::plain(Key::Enter)),
+            Step::Deliver(vec![Some(Reply::from("allow"))])
+        );
     }
 
     #[test]
@@ -2814,10 +2898,11 @@ mod tests {
 
         // Without a panel, the fallback answers a batch one question at a time.
         let answer = asks.push_batch(vec![single(), text()]);
+        let id = asks.peek().unwrap().0;
         assert_eq!(asks.current().unwrap(), single());
-        asks.answer_current(Some(Reply::from("pistachio")));
+        asks.answer_current(id, 0, Some(Reply::from("pistachio")));
         assert_eq!(asks.current().unwrap(), text());
-        asks.answer_current(None);
+        asks.answer_current(id, 1, None);
         assert!(!asks.is_waiting());
         assert_eq!(
             answer.await.unwrap(),

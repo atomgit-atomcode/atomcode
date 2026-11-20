@@ -22,6 +22,49 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CHAT_PATH: &str = "/chat/completions";
 
+/// Neutralizes the developer machine's ambient proxy for the duration of a test.
+///
+/// The provider installs an explicit proxy only when its system probe returns
+/// one. When the probe returns nothing, reqwest falls back to its own
+/// environment detection, so a machine with `HTTPS_PROXY` set sends a loopback
+/// request to the proxy instead of the local gateway — and the proxy probe is
+/// spent out of the open budget, which turns the expected TTFB timeout into a
+/// non-retryable budget exhaustion. `nextest` runs one test per process, so
+/// saving and restoring the variables here cannot leak into another test.
+struct NoAmbientProxy(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl NoAmbientProxy {
+    fn new() -> Self {
+        const KEYS: [&str; 6] = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ];
+        let saved = KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for NoAmbientProxy {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// A final-answer SSE response (text + stop + usage + [DONE]).
 const FINAL_SSE: &str = "data: {\"id\":\"resp-final\",\"choices\":[{\"delta\":{\"content\":\"It is noon.\"}}]}\n\
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":4}}\n\
@@ -641,6 +684,76 @@ async fn retry_replays_the_request_even_when_server_read_it_fully() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_oversized_stream_line_terminates_without_reopening_the_request() {
+    use atomcode_capabilities::provider::{
+        AnthropicConfig, AnthropicProvider, OllamaConfig, OllamaProvider, ResponsesProvider,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (wire, code) in [
+        ("anthropic", "sse_line_too_large"),
+        ("ollama", "ndjson_line_too_large"),
+        ("responses", "sse_line_too_large"),
+    ] {
+        // The large TCP transfer needs real socket readiness. An idle
+        // current-thread runtime can otherwise advance the paused watchdog
+        // before the next socket wakeup, even though the server is writing.
+        tokio::time::resume();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let line = vec![b'x'; 16 * 1024 * 1024 + 1];
+            // 声明多一个字节，关闭连接时客户端会收到传输错误。
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                line.len() + 1
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&line).await.unwrap();
+            (listener, socket)
+        });
+        let provider: Box<dyn LlmProvider> = match wire {
+            "anthropic" => Box::new(
+                AnthropicProvider::new(AnthropicConfig::new("test-key", &base, "test-model"))
+                    .unwrap(),
+            ),
+            "ollama" => {
+                Box::new(OllamaProvider::new(OllamaConfig::new(&base, "test-model")).unwrap())
+            }
+            _ => Box::new(
+                ResponsesProvider::new(OpenAiCompatConfig::new("test-key", &base, "test-model"))
+                    .unwrap(),
+            ),
+        };
+        let mut stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the local gateway should deliver the oversized line");
+        assert!(
+            matches!(&event, Some(StreamEvent::Error(error))
+                if !error.retryable && error.code.as_deref() == Some(code)),
+            "{wire} must report a terminal line limit error, got {event:?}"
+        );
+        let (listener, mut connection) = gateway.await.unwrap();
+        connection.shutdown().await.unwrap();
+        // Any erroneous reconnect or retry after the terminal event can
+        // advance virtual time and fail the assertion without a wall-clock wait.
+        tokio::time::pause();
+        tokio::select! {
+            biased;
+            _ = listener.accept() => panic!("{wire} reopened after a terminal error"),
+            next = stream.next() => assert!(next.is_none(), "{wire} yielded {next:?}"),
+        }
+    }
+}
+
 /// Accepts the connection but never responds and never closes — an upstream that
 /// hangs with no first byte.
 fn black_hole_gateway() -> String {
@@ -659,9 +772,18 @@ fn black_hole_gateway() -> String {
 
 #[tokio::test]
 async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
+    // The budget this test measures is the open budget: a live system proxy
+    // would spend part of it on its own probe and change which error surfaces.
+    let _no_ambient_proxy = NoAmbientProxy::new();
     let base = black_hole_gateway();
     let mut cfg = OpenAiCompatConfig::new("k", &base, "test-model");
-    cfg.open_timeout = Duration::from_millis(300);
+    // The open budget is `2 × open_timeout`, and the system-proxy probe (bounded
+    // by its own 2 s deadline) is spent from that budget on every attempt. With a
+    // tight `open_timeout` a slow probe turns the expected TTFB timeout into a
+    // budget exhaustion, which reports `retryable: false` — the machine's probe
+    // latency, not the timeout contract. Keep the budget strictly larger than
+    // probe + timeout so this judge measures the contract.
+    cfg.open_timeout = Duration::from_millis(2500);
     cfg.retry = RetryPolicy::none(); // single attempt, so the timing is unambiguous
     let provider = OpenAiCompatProvider::new(cfg).unwrap();
     let msgs = vec![Message::user("hi")];
@@ -675,7 +797,7 @@ async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_secs(8),
         "took {elapsed:?} — not bounded by open_timeout"
     );
     assert!(

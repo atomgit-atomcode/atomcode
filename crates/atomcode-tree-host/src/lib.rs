@@ -276,6 +276,7 @@ impl TreeHost {
                 updated_at: 0,
                 turns: u32::try_from(summary.turns).unwrap_or(u32::MAX),
                 scheduled: false,
+                held: None,
                 needs_newer_version: header
                     .as_ref()
                     .is_some_and(|h| h.version > atomcode_harness::session::SESSION_FORMAT_VERSION),

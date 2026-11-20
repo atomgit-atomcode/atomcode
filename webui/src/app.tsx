@@ -1,8 +1,8 @@
 // Two-column layout: sidebar + chat, header with cwd breadcrumb + config.
 // VSCode design system: timeline messages, violet brand, floating input.
 
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
-import { sessionSelectionDisposition } from './lib/sessionBrowse';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { createBrowseRefresh, sessionSelectionDisposition } from './lib/sessionBrowse';
 import { Chat } from './components/Chat';
 import { Workbench, hasUnsavedWorkbenchDrafts, persistWorkbenchState } from './components/Workbench';
 import { Sidebar } from './components/Sidebar';
@@ -12,10 +12,13 @@ import { ModelConfigDialog } from './components/ModelProviders';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, postCommand, SessionMetaWithProject } from './api';
+import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, getSessionActivity, postCommand, SessionMetaWithProject, type SessionActivity } from './api';
 import { useT, useSettings, SettingsSection } from './settings';
 import { applyConfigDefaults, initNotificationPermissionPrompt } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
+import { ArtifactWorkspaceProvider } from './components/TurnArtifactsCard';
+import { FileViewerContext, type FileViewerRoute, type FileViewerView } from './lib/fileViewer';
+import { workspaceRelativePath } from './lib/turnArtifacts';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
@@ -49,8 +52,23 @@ function readSidebarWidth(): number | null {
   return null;
 }
 
+/** One counter for chat→Workbench git/file requests. Workbench keeps a
+ *  module-level watermark of the last seq it applied per session, so ids must
+ *  never repeat across request kinds or App/Workbench remounts. */
+let workbenchRequestSeq = 0;
+
+/** How often a browsed session's holder is asked what it is doing. */
+const BROWSE_ACTIVITY_POLL_MS = 3_000;
+
 export function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workbenchGitRequest, setWorkbenchGitRequest] = useState<{ sessionId: string; path: string; seq: number }>();
+  const [workbenchFileRequest, setWorkbenchFileRequest] = useState<{ sessionId: string; path: string; seq: number }>();
+  /** The browsed (historical) session whose read-only workspace is open. */
+  const [historyWorkbench, setHistoryWorkbench] = useState<string | null>(null);
+  const [historyRequest, setHistoryRequest] = useState<{ sessionId: string; path: string; seq: number; view: FileViewerView }>();
+  /** What had focus when a chat link opened the workspace; closing returns there. */
+  const viewerOpener = useRef<HTMLElement | null>(null);
   useEffect(()=>{
     const warn=(event:BeforeUnloadEvent)=>{persistWorkbenchState();if(hasUnsavedWorkbenchDrafts()){event.preventDefault();event.returnValue='';}};
     window.addEventListener('beforeunload',warn);
@@ -58,7 +76,16 @@ export function App() {
   },[]);
   const t = useT();
   const { lang } = useSettings();
-  const [browseSession, setBrowseSession] = useState<SessionMetaWithProject | null>(null);
+  const [browseSession, updateBrowseSession] = useState<SessionMetaWithProject | null>(null);
+  const browseNavigation = useRef(0);
+  function setBrowseSession(session: SessionMetaWithProject | null) {
+    browseNavigation.current++;
+    updateBrowseSession(session);
+  }
+  // What the runtime holding the browsed session (another terminal) is doing
+  // with it; re-read while browsing so the view follows it there.
+  const [browseActivity, setBrowseActivity] = useState<SessionActivity | null>(null);
+  const [browseForkError, setBrowseForkError] = useState<string | null>(null);
   const [executionActive, setExecutionActive] = useState(false);
   const executionActiveRef = useRef(false);
   const reportExecution = useCallback((active: boolean) => {
@@ -72,17 +99,6 @@ export function App() {
   const forkingRef = useRef(false);
   const [forking, setForking] = useState(false);
   const [forkNotice, setForkNotice] = useState<{id:string;text:string}|null>(null);
-  const [workbenchFile, setWorkbenchFile] = useState<{session:string;path:string;seq:number}|null>(null);
-  useEffect(() => {
-    const open = (event: Event) => {
-      const detail = (event as CustomEvent<{session:string;path:string}>).detail;
-      if (detail?.session !== sessionId || typeof detail.path !== 'string') return;
-      setWorkbenchFile({ ...detail, seq: Date.now() });
-      setWorkbenchOpen(true);
-    };
-    window.addEventListener('workbench-open-file', open);
-    return () => window.removeEventListener('workbench-open-file', open);
-  }, [sessionId]);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
   // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
@@ -383,7 +399,7 @@ export function App() {
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
-    const disposition = sessionSelectionDisposition(sessionId, session.id, executionActiveRef.current, browseSession !== null);
+    const disposition = sessionSelectionDisposition(sessionId, session.id, executionActiveRef.current, browseSession !== null, session.activity != null);
     if (disposition === 'return') { setBrowseSession(null); setSidebarOpen(false); return; }
     if (disposition === 'browse') {
       setBrowseSession(session); setSidebarOpen(false); return;
@@ -466,6 +482,89 @@ export function App() {
     if (id === sessionId) {
       setActiveSession((prev) => (prev ? { ...prev, name } : prev));
     }
+  }
+
+  useEffect(() => {
+    setBrowseActivity(browseSession?.activity ?? null);
+    setBrowseForkError(null);
+    const hash = browseSession?.project_hash;
+    const id = browseSession?.id;
+    if (!hash || !id) return;
+    const refresh = createBrowseRefresh({
+      needed: () => true,
+      ready: () => !document.hidden,
+      read: () => getSessionActivity(hash, id),
+      apply: setBrowseActivity,
+    });
+    const read = () => { void refresh.run(); };
+    read();
+    const timer = window.setInterval(read, BROWSE_ACTIVITY_POLL_MS);
+    document.addEventListener('visibilitychange', read);
+    return () => { refresh.stop(); window.clearInterval(timer); document.removeEventListener('visibilitychange', read); };
+  }, [browseSession?.id, browseSession?.project_hash]);
+
+  // A read-only workspace belongs to one browsed session: leaving it (another
+  // session, or back to the bound one) closes it instead of revealing it later.
+  useEffect(() => {
+    setHistoryWorkbench(open => open && open === browseSession?.id ? open : null);
+  }, [browseSession?.id]);
+
+  const displayedSessionId = browseSession?.id ?? sessionId;
+  const displayedCwd = browseSession?.working_dir || activeSession?.working_dir || cwd;
+  const browsing = browseSession !== null;
+  // Every local file link and artifact click lands here. Requests name the
+  // session whose message or document holds the link; one for a session that
+  // is no longer displayed is stale and dropped. The bound session opens its
+  // own Workbench; a browsed session gets a read-only one and is never activated.
+  const fileViewer = useMemo<FileViewerRoute>(() => ({
+    open({ sessionId: owner, path, view }) {
+      if (!owner || owner !== displayedSessionId) return;
+      const request = { sessionId: owner, path: workspaceRelativePath(path, displayedCwd) ?? path, seq: ++workbenchRequestSeq };
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && !focused.closest('.workbench')) viewerOpener.current = focused;
+      if (browsing) {
+        setHistoryRequest({ ...request, view });
+        setHistoryWorkbench(owner);
+        return;
+      }
+      if (view === 'diff') {
+        setWorkbenchFileRequest(undefined);
+        setWorkbenchGitRequest(request);
+      } else {
+        setWorkbenchGitRequest(undefined);
+        setWorkbenchFileRequest(request);
+      }
+      setWorkbenchOpen(true);
+    },
+  }), [displayedSessionId, displayedCwd, browsing]);
+  function restoreViewerFocus() {
+    const opener = viewerOpener.current;
+    viewerOpener.current = null;
+    // preventScroll: returning focus must not move the chat the person was reading.
+    if (opener) requestAnimationFrame(() => { if (opener.isConnected) opener.focus({ preventScroll: true }); });
+  }
+
+  // Continue a session another runtime holds as a copy of what it committed.
+  async function handleForkBrowse() {
+    const source = browseSession;
+    if (!source || executionActiveRef.current || forkingRef.current) return;
+    const navigation = browseNavigation.current;
+    const stillBrowsing = () => browseNavigation.current === navigation && !executionActiveRef.current;
+    forkingRef.current = true;
+    setForking(true);
+    setBrowseForkError(null);
+    try {
+      const result = await postCommand({command:'fork', arg:'', session_id:source.id, working_dir:source.working_dir, project_hash:source.project_hash});
+      if (result.kind === 'error') throw new Error(result.message);
+      if (result.kind !== 'fork') throw new Error(t('cmd.fork.failed'));
+      const record = await resolveSession(result.session_id).catch(() => null);
+      setSessionListVersion(value => value + 1);
+      if (!stillBrowsing()) return;
+      activateSession(record ?? {...source, id:result.session_id, name:`${source.name} (fork)`, activity:undefined});
+      setForkNotice({id:result.session_id, text:t('cmd.fork.done',{source:result.source_id}) + (result.warning ? ` ${result.warning}` : '')});
+    } catch (error) {
+      if (stillBrowsing()) setBrowseForkError(error instanceof Error ? error.message : String(error));
+    } finally { forkingRef.current = false; setForking(false); }
   }
 
   async function handleForkSession() {
@@ -567,7 +666,11 @@ export function App() {
 
       {/* ===== Main column: sticky session-title header + chat (no top bar) ===== */}
       <div class="main-column">
-        {(!workbenchOpen || !sessionId) && <button class="workbench-toggle" disabled={restoring} onClick={() => { if (!sessionId) openNewSession(cwd || undefined); setWorkbenchOpen(true); }} aria-expanded={workbenchOpen && !!sessionId}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>}
+        {browseSession
+          // Browsing never activates the session: its workspace opens read-only.
+          ? historyWorkbench !== browseSession.id && <button class="workbench-toggle" aria-expanded={false}
+              onClick={() => setHistoryWorkbench(browseSession.id)}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>
+          : (!workbenchOpen || !sessionId) && <button class="workbench-toggle" disabled={restoring} onClick={() => { if (!sessionId) openNewSession(cwd || undefined); setWorkbenchOpen(true); }} aria-expanded={workbenchOpen && !!sessionId}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>}
         {/* Mobile-only floating menu button (the old top bar carried the ☰; the
             redesign has no top bar, so a fixed button gives mobile drawer access). */}
         <button
@@ -651,14 +754,26 @@ export function App() {
           </header>
         )}
 
+        {browseSession && <header class="session-header session-browse-header">
+          <span class="session-title-text session-browse-title" title={browseSession.name}>{browseSession.name}</span>
+        </header>}
         <div class="session-body app-sidebar">
+          <FileViewerContext.Provider value={fileViewer}>
           <div class="session-chat-column">
           {forkNotice?.id === sessionId && <div class="session-fork-notice" role="status"><span>{forkNotice.text}</span></div>}
+          <ArtifactWorkspaceProvider version={`${sessionListVersion}:${executionActive}:${browseActivity}`} value={{
+            sessionId: displayedSessionId,
+            cwd: displayedCwd,
+          }}>
           <Chat
             browseSession={browseSession}
             onExecutionState={reportExecution}
             onReturnToBound={() => setBrowseSession(null)}
             onContinueBrowse={() => { if (!executionActiveRef.current && browseSession) activateSession(browseSession); }}
+            browseActivity={browseActivity}
+            onForkBrowse={() => void handleForkBrowse()}
+            browseForking={forking}
+            browseForkError={browseForkError}
             sessionId={sessionId}
             onSessionId={handleSessionAssigned}
             cwd={cwd}
@@ -680,8 +795,15 @@ export function App() {
             onForkSession={handleForkSession}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
+          </ArtifactWorkspaceProvider>
           </div>
-          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} /></div>}
+          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} gitRequest={workbenchGitRequest} fileRequest={workbenchFileRequest} onClose={() => { setWorkbenchOpen(false); restoreViewerFocus(); }} /></div>}
+          {browseSession && historyWorkbench === browseSession.id && <Workbench key={`read-only:${browseSession.id}`} readOnly
+            session={browseSession.id} cwd={browseSession.working_dir || cwd} title={browseSession.name}
+            gitRequest={historyRequest?.view === 'diff' ? historyRequest : undefined}
+            fileRequest={historyRequest?.view === 'content' ? historyRequest : undefined}
+            onClose={() => { setHistoryWorkbench(null); restoreViewerFocus(); }} />}
+          </FileViewerContext.Provider>
         </div>
       </div>
 

@@ -15,7 +15,7 @@
 set -eu
 
 # ---- manifest (must mirror crates/atomcode-cli/src/uninstall/paths.rs) ----
-ATOMCODE_GROUP2_FILES="auth.toml mcp.json config.toml ATOMCODE.md"
+ATOMCODE_GROUP2_FILES="auth.toml mcp.json config.toml ATOMCODE.md auth/ssh-keys.json auth/ssh-keys.lock"
 ATOMCODE_GROUP3_FILES="history input_history.txt recent_dirs.txt codingplan_sync.json device_id"
 ATOMCODE_GROUP3_DIRS="staged telemetry plugins commands skills"
 ATOMCODE_GROUP3_PREFIXES="notice."

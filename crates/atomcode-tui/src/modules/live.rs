@@ -89,7 +89,6 @@ pub struct State {
     /// All input and cached tokens reported in this turn, for weighted reuse.
     cache_prompt: u64,
     cached: u64,
-    retry: Option<atomcode_harness::session::RetryAttempt>,
 }
 
 pub struct Live;
@@ -116,18 +115,14 @@ impl View for Live {
 
             SessionEvent::RequestHeader { .. } => {
                 state.phase = Phase::Waiting;
-                state.retry = None;
             }
             SessionEvent::Notice {
                 notice: atomcode_harness::session::NoticeKind::ProviderRetry,
-                retry,
                 ..
             } => {
                 state.phase = Phase::Waiting;
-                state.retry = *retry;
             }
             SessionEvent::AssistantChunk { reasoning, .. } => {
-                state.retry = None;
                 state.phase = if *reasoning {
                     Phase::Thinking
                 } else {
@@ -403,25 +398,6 @@ fn waiting_on_background(state: &State, moment: &Moment) -> Option<String> {
 /// would have this row ticking away at a turn that ended with the process. Every
 /// other row shows a record of something that happened; this one is a claim
 /// about now, so it asks whoever owns now.
-/// How long the turn has had nothing new, once that is past [`QUIET_AFTER`].
-///
-/// `None` while something is still arriving (or while tools are running, where
-/// a long wait is the tool's and the row already names it).
-fn quiet_for(state: &State, moment: &Moment) -> Option<u64> {
-    if matches!(state.phase, Phase::Tools) {
-        return None;
-    }
-    let since = moment.quiet_since?;
-    let quiet = moment.now.as_millis().saturating_sub(since.as_millis());
-    (quiet >= QUIET_AFTER_MS).then_some(quiet / 1000)
-}
-
-/// How long a turn may say nothing before the row says so, in milliseconds.
-/// Short enough that a stall is named well inside the inter-token budget that
-/// ends it, long enough that an ordinary prefill or a long reasoning burst
-/// never trips it.
-const QUIET_AFTER_MS: u64 = 30_000;
-
 fn doing(state: &State, moment: &Moment) -> Option<String> {
     // A compaction's summary is being written, and the request is waiting on it.
     // It takes the line over wherever it happens — mid-turn or from idle for a
@@ -463,30 +439,6 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
         Activity::Idle => None,
         Activity::Stopping => Some(t(Msg::LiveStopping).into_owned()),
         Activity::Working => {
-            if let Some(retry) = state.retry {
-                let elapsed = moment
-                    .provider_retry_started
-                    .map(|since| moment.now.as_millis().saturating_sub(since.as_millis()))
-                    .unwrap_or(0);
-                let delay = retry.backoff_secs.saturating_mul(1000);
-                return Some(if elapsed < delay {
-                    t(Msg::LiveRetryWait {
-                        secs: (delay - elapsed).div_ceil(1000),
-                        attempt: retry.attempt,
-                        max: retry.max_attempts,
-                    })
-                    .into_owned()
-                } else {
-                    let requesting = t(Msg::LiveRetryRequest {
-                        attempt: retry.attempt,
-                        max: retry.max_attempts,
-                    });
-                    match quiet_for(state, moment) {
-                        Some(secs) => format!("{requesting} · {}", t(Msg::LiveSilentFor { secs })),
-                        None => requesting.into_owned(),
-                    }
-                });
-            }
             let verb = match state.phase {
                 Phase::Waiting => t(Msg::LiveWaiting),
                 Phase::Thinking => t(Msg::LiveThinkingReceiving),
@@ -499,19 +451,7 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
                 }),
             }
             .into_owned();
-            // A turn's age says how long it has been going. This says how long
-            // since it last did anything — the only thing on screen that tells
-            // a slow model from a stalled one, and the answer to the five
-            // minutes a person spent watching a row that said only "waiting".
-            // Tools are left out: a build that takes two minutes is not silence.
-            Some(match quiet_for(state, moment) {
-                Some(secs) => format!(
-                    "{} · {}",
-                    t(Msg::LiveWaiting),
-                    t(Msg::LiveSilentFor { secs })
-                ),
-                None => verb,
-            })
+            Some(verb)
         }
     }
 }
@@ -520,13 +460,14 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 ///
 /// The order is what a person does with them: the clock answers "is it stuck",
 /// the two token counts answer "is it getting anywhere", the cache share answers
-/// "is the context being re-sent or re-read". Estimated generation throughput
-/// follows the authoritative token counts and cache share. On a
-/// narrow screen, the trailing figures are dropped whole.
+/// "is the context being re-sent or re-read". Decode speed sits between the
+/// token counts and the cache share. On a narrow screen, the trailing figures
+/// are dropped whole.
 ///
 /// Input is the latest context size; output and cache reuse cover the whole
-/// turn. Speed follows current generation and retains its last completed reading during tools and waits.
-/// Elapsed time includes waiting and tools; generation time does not.
+/// turn. Speed covers the turn's decode windows (first output to end of each
+/// request) and holds through tools and first-output waits. Elapsed time
+/// includes waiting and tools; speed does not.
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     // Compacting keeps the cumulative goal clock, or its own phase clock for
@@ -578,7 +519,7 @@ fn append_usage(out: &mut Vec<String>, state: &State, moment: &Moment) {
     };
     let mut figures = crate::content::usage_parts(input, output, cached);
     if moment.compacting_since.is_none() {
-        if let Some(rate) = moment.generation.rate(moment.now) {
+        if let Some(rate) = moment.generation.rate() {
             // usage_parts emits input, output, then optional cache share.
             let before_cache = usize::from(input > 0) + usize::from(output > 0);
             figures.insert(before_cache, t(Msg::LiveSpeed { rate }).into_owned());
@@ -1018,15 +959,9 @@ mod tests {
         );
     }
 
-    /// A turn that has gone quiet says so, and one that is merely working does
-    /// not.
-    ///
-    /// The row's clock counts the turn's age, which keeps ticking whether or not
-    /// anything is arriving — so against a stream that opened and stalled it
-    /// reads exactly like a model that is working. A person watched five minutes
-    /// of that (2026-09-23) before the inter-token budget recovered the stream.
+    /// Waiting does not add silence warnings to the normal activity label.
     #[test]
-    fn streaming_reasoning_and_a_quiet_stream_have_distinct_statuses() {
+    fn streaming_status_does_not_warn_about_silence() {
         let state = fold(&a_turn()[..4]);
         let mut moment = Moment::default().working().at_tick(0);
         moment.now = Timestamp::millis(10_000);
@@ -1038,15 +973,12 @@ mod tests {
         );
         moment.now = Timestamp::millis(40_000);
         let quiet = doing(&state, &moment).unwrap();
-        assert!(
-            quiet.contains("正在等待模型") && quiet.contains("31 秒"),
-            "{quiet}"
-        );
-        assert!(!quiet.contains("接收中"));
+        assert!(quiet == receiving, "{quiet}");
+        assert!(!quiet.contains("没有新内容"));
     }
 
     #[test]
-    fn retry_status_counts_down_and_is_replaced_by_streaming_output() {
+    fn retry_keeps_normal_waiting_status_until_output_arrives() {
         use atomcode_harness::session::{NoticeKind, RetryAttempt};
         let mut state = fold(&a_turn()[..4]);
         let notice = |attempt, backoff_secs| SessionEvent::Notice {
@@ -1062,21 +994,13 @@ mod tests {
         Live::absorb(&mut state, &notice(1, 3));
         let mut moment = Moment::default().working().at_tick(0);
         moment.provider_retry_started = Some(Timestamp::millis(10_000));
-        moment.now = Timestamp::millis(10_500);
-        assert!(doing(&state, &moment).unwrap().contains("3s 后重试（1/2）"));
-        moment.now = Timestamp::millis(12_001);
-        assert!(doing(&state, &moment).unwrap().contains("1s 后重试"));
-        moment.now = Timestamp::millis(13_000);
-        assert!(doing(&state, &moment)
-            .unwrap()
-            .contains("正在重新请求模型（1/2）"));
-        moment.quiet_since = moment.provider_retry_started;
-        moment.now = Timestamp::millis(50_000);
-        assert!(doing(&state, &moment).unwrap().contains("40 秒没有新内容"));
-        moment.now = Timestamp::millis(13_000);
+        for ms in [10_500, 12_001, 13_000, 50_000, 300_000] {
+            moment.now = Timestamp::millis(ms);
+            moment.quiet_since = moment.provider_retry_started;
+            assert_eq!(doing(&state, &moment).unwrap(), t(Msg::LiveWaiting));
+        }
         Live::absorb(&mut state, &notice(2, 6));
-        moment.provider_retry_started = Some(moment.now);
-        assert!(doing(&state, &moment).unwrap().contains("6s 后重试（2/2）"));
+        assert_eq!(doing(&state, &moment).unwrap(), t(Msg::LiveWaiting));
         Live::absorb(&mut state, &a_turn()[3]);
         assert!(doing(&state, &moment).unwrap().contains("接收中"));
         Live::absorb(
@@ -1091,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_that_has_gone_quiet_says_how_long_it_has_been() {
+    fn a_quiet_turn_keeps_normal_status_and_elapsed_clock() {
         let state = fold(&[
             SessionEvent::TurnStart { turn: 1 },
             SessionEvent::StepStart { turn: 1, step: 1 },
@@ -1117,8 +1041,8 @@ mod tests {
 
         let stalled = quiet(95_000);
         assert!(
-            stalled.contains("已 95 秒没有新内容"),
-            "a stalled stream must be tellable from a slow one: {stalled}"
+            !stalled.contains("没有新内容") && stalled.contains("正在等待模型"),
+            "waiting should stay quiet: {stalled}"
         );
 
         // Something arriving resets it: 95s into the turn, 2s since the last
@@ -1495,18 +1419,20 @@ mod tests {
             },
             Timestamp::millis(0),
         );
-        moment.generation.absorb(
-            &SessionEvent::AssistantChunk {
-                turn: 1,
-                round: 1,
-                delta: "a".repeat(400),
-                reasoning: true,
-            },
-            Timestamp::millis(10_000),
-        );
+        for at in [10_000, 12_000] {
+            moment.generation.absorb(
+                &SessionEvent::AssistantChunk {
+                    turn: 1,
+                    round: 1,
+                    delta: "a".repeat(800),
+                    reasoning: true,
+                },
+                Timestamp::millis(at),
+            );
+        }
         let line = line_at(&state, &moment, 180);
         assert!(
-            line.contains("↑ 150.7K · ↓ 20.1K · 8 tok/s · 缓存 96.49%"),
+            line.contains("↑ 150.7K · ↓ 20.1K · 100 tok/s · 缓存 96.49%"),
             "{line}"
         );
         assert!(!line.contains("均速"), "{line}");
@@ -1523,7 +1449,7 @@ mod tests {
                 round: 1,
                 usage: TokenUsage {
                     prompt: 100,
-                    completion: 200,
+                    completion: 400,
                     cached: 50,
                 },
             },
@@ -1540,9 +1466,9 @@ mod tests {
         moment.now = Timestamp::millis(120_000);
         let waiting = line_at(&state, &moment, 180);
         assert!(waiting.contains("正在等待模型"), "{waiting}");
-        assert!(waiting.contains("8 tok/s"), "{waiting}");
+        assert!(waiting.contains("100 tok/s"), "{waiting}");
         assert!(
-            waiting.find("8 tok/s").unwrap() < waiting.find("缓存").unwrap(),
+            waiting.find("100 tok/s").unwrap() < waiting.find("缓存").unwrap(),
             "{waiting}"
         );
         assert!(

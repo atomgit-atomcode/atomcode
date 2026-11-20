@@ -59,6 +59,7 @@ plexus_service!(WelcomeWordsSvc => dyn crate::content::WelcomeWords, "tui-welcom
 // `content::OpeningNotices`. Unfilled means a launch with nothing to report,
 // which is the ordinary case.
 plexus_service!(OpeningNoticesSvc => crate::content::OpeningNotices, "tui-opening-notices", Seam, "What the launcher has to say about this launch, the moment the screen opens");
+plexus_service!(ModelSetupSvc => crate::model_setup::ModelSetup, "tui-model-setup", Seam, "First-run model choice and interactive sign-in cancellation");
 plexus_service!(WelcomeNoteSeenSvc => dyn crate::content::WelcomeNoteSeen, "tui-welcome-note-seen", Seam, "Told once the welcome's note has actually been drawn");
 // 跑一条本机命令。手势(`!`)归屏幕,开一个进程归启动器 —— 这块屏幕
 // 碰不到操作系统。没填就没有这个功能,`!git status` 还是一句发给模型的话。
@@ -147,6 +148,7 @@ plexus_service!(PlacesSvc => dyn crate::places::Places, "tui-places", Seam, "The
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and
 // `/setup` on a brand-new machine is the one thing that needs more than that.
 plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Inspecting project capabilities, reviewing setup actions, and bootstrapping seed skills");
+plexus_service!(MigrationSvc => dyn crate::migration::Migration, "tui-migration", Seam, "Read the assets another AI coding agent left behind");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -1208,6 +1210,41 @@ async fn answer_prompts(
 /// for this long. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Where a key goes while an approval or question panel waits: the panel, or —
+/// when the composer is still on screen AND holds text the person was
+/// mid-typing — the composer, so the tail of an interrupted IME composition
+/// cannot be mistaken for an answer to a question nobody has read.
+pub enum AskKeyRoute {
+    Panel,
+    Composer(char),
+}
+
+/// Keep plain text going into a visible draft. The ask handler owns digits
+/// and navigation, and applies the appropriate rules to the pending request.
+pub fn route_ask_key(
+    input_holds_text: bool,
+    composer_hidden: bool,
+    press: &crate::surface::KeyPress,
+) -> AskKeyRoute {
+    use crate::surface::{Key, Mods};
+    if composer_hidden {
+        // The composer has stepped aside for the panel: typing into the field
+        // would be writing where nobody looks. The panel takes the key — its
+        // typing rows live on characters.
+        return AskKeyRoute::Panel;
+    }
+    let typed = match &press.key {
+        Key::Char(c) if press.mods == Mods::NONE || press.mods == Mods::SHIFT => {
+            (!c.is_ascii_digit()).then_some(*c)
+        }
+        _ => None,
+    };
+    match (input_holds_text, typed) {
+        (true, Some(c)) => AskKeyRoute::Composer(c),
+        _ => AskKeyRoute::Panel,
+    }
+}
+
 /// The most lines of history to bring in from this project's other sessions.
 ///
 /// The number the other front end settled on for its own history file. This is
@@ -1250,6 +1287,30 @@ async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ApprovalInput {
+    presentation: crate::ask::PresentedApproval,
+    frame: u64,
+}
+
+impl ApprovalInput {
+    fn for_input(self, input: &Input, current: Self) -> Option<crate::ask::PresentedApproval> {
+        if self.presentation.id != current.presentation.id {
+            return None;
+        }
+        match input {
+            Input::Mouse(..) if self.frame != current.frame => None,
+            Input::Key(press)
+                if press.key == crate::surface::Key::Enter
+                    && self.presentation.selected != current.presentation.selected =>
+            {
+                None
+            }
+            _ => Some(self.presentation),
+        }
+    }
+}
+
 enum Wake {
     History {
         session: String,
@@ -1263,6 +1324,13 @@ enum Wake {
         message: String,
     },
     Fact,
+    ProviderModelsEnriched {
+        original: crate::providers::Step,
+        drafts: Vec<crate::providers::ModelDraft>,
+        before: Option<crate::providers::Panel>,
+        after: Option<crate::providers::Panel>,
+        session: String,
+    },
     SessionReferences,
     Foreground {
         request: u64,
@@ -1280,6 +1348,7 @@ enum Wake {
     /// The host replaced the session.
     Host(HostEvent),
     Input(Input),
+    InputOverApproval(Input, ApprovalInput),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
     /// A command the far end (phone, browser) asked this screen to run.
@@ -1302,11 +1371,25 @@ enum Wake {
 /// The scrollbar is screen policy. The old knob — `mascot = true` — is now
 /// `[[insert]] name = "tui-panel-mascot"`, which is the point: a panel is a row,
 /// not a boolean on somebody else's row.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
     #[serde(default)]
     scrollbar: crate::moment::ScrollbarMode,
+    #[serde(default = "default_diff_wrap")]
+    wrap_diff: bool,
+}
+
+fn default_diff_wrap() -> bool {
+    true
+}
+impl Default for Row {
+    fn default() -> Self {
+        Self {
+            scrollbar: Default::default(),
+            wrap_diff: true,
+        }
+    }
 }
 
 /// Whether a fact is the line a turn opens with on screen — what the working
@@ -1540,9 +1623,58 @@ impl TeamRoster for Roster {
 /// Cached metadata for asynchronous session reference discovery.
 #[derive(Default)]
 struct SessionSuggestions {
-    entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    entries: Vec<SessionSuggestion>,
     checked: Option<std::time::Instant>,
     loading: bool,
+}
+
+struct SessionSuggestion {
+    entry: atomcode_capabilities::session::CatalogEntry,
+    preview: Option<String>,
+}
+
+impl SessionSuggestion {
+    fn scan(root: &std::path::Path) -> Vec<Self> {
+        use atomcode_capabilities::session::{reference, SessionManager, SessionMeta};
+
+        let mut candidates: Vec<_> = SessionManager::scan_catalog(root)
+            .entries
+            .into_iter()
+            .filter(reference::available)
+            .map(|entry| Self {
+                entry,
+                preview: None,
+            })
+            .collect();
+        // The catalog is newest first. Cap preview reads per refresh.
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| {
+                let entry = &candidate.entry;
+                entry.name.trim().is_empty()
+                    || SessionMeta::name_needs_fallback(&entry.name, &entry.id)
+            })
+            .take(200)
+        {
+            let entry = &candidate.entry;
+            candidate.preview = SessionManager::with_root(root.join(&entry.project_bucket))
+                .first_prompt_preview(&entry.id)
+                .ok()
+                .flatten();
+        }
+        candidates
+    }
+
+    fn label(&self) -> &str {
+        self.preview.as_deref().unwrap_or_else(|| {
+            let name = self.entry.name.trim();
+            if name.is_empty() {
+                &self.entry.id
+            } else {
+                name
+            }
+        })
+    }
 }
 
 /// Own and abort superseded panel reads.
@@ -1739,6 +1871,7 @@ impl UserInterface for Tui {
         // Kept before the connection takes it: the one question asked of the
         // host before a person has typed anything.
         let readiness = control.clone();
+        let model_setup = ctx.service::<ModelSetupSvc>();
         // And the second one — which mode this session is in, which a host may
         // have set before this screen subscribed.
         let mode_of_session = control.clone();
@@ -1847,6 +1980,7 @@ impl UserInterface for Tui {
             let mut m = self.host.moment.write().expect("moment poisoned");
             m.lead = session.clone();
             m.viewing = session.clone();
+            m.model_setup_required = model_setup.as_ref().is_some_and(|setup| setup.required());
         }
 
         // What the launcher has to say about this launch
@@ -1939,21 +2073,37 @@ impl UserInterface for Tui {
         // its opening prefix when the model becomes known; later pages always
         // go below that prefix, independent of event arrival order.
         let mut owes_opening = true;
+        let mut setup_opening: Option<crate::module::Opening> = None;
 
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
         let keys_tx = wake_tx.clone();
+        let presented_approval = Arc::new(Mutex::new(None));
+        let input_approval = presented_approval.clone();
         let reader = match self.surface.take_input() {
             Some(mut scripted) => tokio::spawn(async move {
                 while let Some(input) = scripted.recv().await {
-                    if keys_tx.send(Wake::Input(input)).is_err() {
+                    if keys_tx
+                        .send(input_wake(
+                            input,
+                            *input_approval.lock().expect("approval poisoned"),
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                 }
             }),
             None => {
                 let surface = self.surface.clone();
-                tokio::spawn(async move { read_input(keys_tx, move || !surface.mouse()).await })
+                tokio::spawn(async move {
+                    read_input(
+                        keys_tx,
+                        move || !surface.mouse(),
+                        move || *input_approval.lock().expect("approval poisoned"),
+                    )
+                    .await
+                })
             }
         };
         // Keep the existing transient hint too; the welcome carries the durable
@@ -1983,10 +2133,7 @@ impl UserInterface for Tui {
                 else {
                     return;
                 };
-                // On the status row, not at the top of the conversation: the
-                // page opens as it always does (the welcome is drawn — see
-                // `owes_opening`) and the reason stands under it, the way tuix
-                // shows "no provider" in its footer.
+                // Keep the recovery commands available above the composer.
                 if let Some(why) = why {
                     host.moment.write().expect("moment poisoned").unready = Some(why);
                     let _ = keys.send(Wake::Fact);
@@ -2094,6 +2241,9 @@ impl UserInterface for Tui {
         // Wakes answered since that frame. See [`COALESCE_LIMIT`].
         let mut coalesced = 0usize;
         let mut painted_size = self.surface.size();
+        let mut approval_on_screen = None;
+        let mut frame = 0;
+        let mut composer_on_screen = false;
         let mut last_menu_hover = None;
         // Whether the screen could take a background question at the last frame,
         // so the moment it can is seen once (see [`became_ready`]).
@@ -2151,16 +2301,51 @@ impl UserInterface for Tui {
                     .expect("moment poisoned")
                     .unready
                     .is_some();
+                let setup_view = model_setup
+                    .as_ref()
+                    .filter(|setup| setup.required())
+                    .and_then(|setup| {
+                        if self.host.providers_open() {
+                            Some(crate::model_setup::SetupView::Provider)
+                        } else {
+                            setup.view(self.surface.size().1)
+                        }
+                    });
+                if let Some(opening) = setup_opening.as_mut() {
+                    if opening.model_setup != setup_view {
+                        opening.model_setup = setup_view.clone();
+                        if setup_view.is_none() {
+                            opening.model =
+                                client.described().and_then(|description| description.model);
+                        }
+                        stale |= self.host.refresh_opening(opening);
+                    }
+                    if setup_view.is_none() {
+                        setup_opening = None;
+                    }
+                }
                 if owes_opening {
                     let described = client.described();
-                    if described.is_some() || unready {
-                        let cwd = self
-                            .host
-                            .moment
-                            .read()
-                            .expect("moment poisoned")
-                            .cwd
-                            .clone();
+                    if described.is_some()
+                        || unready
+                        || model_setup.as_ref().is_some_and(|setup| setup.required())
+                    {
+                        let (cwd, providers) = {
+                            let m = self.host.moment.read().expect("moment poisoned");
+                            (m.cwd.clone(), m.providers.clone())
+                        };
+                        // The welcome names the model the way the picker and the
+                        // status row do: by the gateway's display alias when the
+                        // live model has one, the wire name otherwise.
+                        let model = described.as_ref().and_then(|d| d.model.clone());
+                        let model = model.map(|name| {
+                            providers
+                                .models()
+                                .iter()
+                                .find(|m| m.model == name || m.id == name)
+                                .and_then(|m| m.localized_alias().map(str::to_string))
+                                .unwrap_or(name)
+                        });
                         let open =
                             crate::module::Opening {
                                 // Folded upstream: reading the environment is this
@@ -2172,7 +2357,7 @@ impl UserInterface for Tui {
                                 // is what `tests/guards.rs`
                                 // (`the_screen_reads_no_service_of_the_agents`)
                                 // forbids.
-                                model: described.as_ref().and_then(|d| d.model.clone()),
+                                model,
                                 version: env!("CARGO_PKG_VERSION"),
                                 commands: self.host.commands.all(),
                                 // Resolved **here**, not when the welcome producer
@@ -2184,12 +2369,16 @@ impl UserInterface for Tui {
                                     |ctx| ctx.service::<crate::plugin::WelcomeWordsSvc>(),
                                 ),
                                 note: welcome_note.clone(),
+                                model_setup: setup_view.clone(),
                             };
                         // Spent only by a welcome that was drawn: a session whose
                         // history stood the welcome down leaves it for the next.
                         let opened = self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);
+                        if opened && setup_view.is_some() {
+                            setup_opening = Some(open);
+                        }
                         if opened && welcome_note.take().is_some() && launcher_note_pending {
                             // Drawn: only now is it spent on the launcher's side.
                             if let Some(seen) = self
@@ -2250,7 +2439,14 @@ impl UserInterface for Tui {
                 was_ready = ready;
                 painted_size = self.surface.size();
                 last_menu_hover = None;
-                self.paint(painted_size);
+                let (approval, composer) = self.paint(painted_size);
+                frame += 1;
+                approval_on_screen = approval.map(|presentation| ApprovalInput {
+                    presentation,
+                    frame,
+                });
+                composer_on_screen = composer;
+                *presented_approval.lock().expect("approval poisoned") = approval_on_screen;
                 stale = false;
                 coalesced = 0;
             }
@@ -2305,6 +2501,14 @@ impl UserInterface for Tui {
                     None => wake.recv().await.unwrap_or(Wake::Closed),
                 },
             };
+            let (woke, input_approval) = match woke {
+                Wake::InputOverApproval(input, receipt) => {
+                    let approval =
+                        approval_on_screen.and_then(|current| receipt.for_input(&input, current));
+                    (Wake::Input(input), approval)
+                }
+                other => (other, None),
+            };
             if matches!(woke, Wake::EdgeScroll) {
                 edge_due = None;
             }
@@ -2315,6 +2519,8 @@ impl UserInterface for Tui {
             // (the turn streaming on, a resize) goes on as usual — the frames
             // it asks for are not drawn until the screen is back.
             if self.surface.showing_transcript() {
+                approval_on_screen = None;
+                *presented_approval.lock().expect("approval poisoned") = None;
                 match &woke {
                     Wake::Input(Input::Key(_)) => {
                         self.surface.back_from_transcript();
@@ -2375,6 +2581,7 @@ impl UserInterface for Tui {
             }
             let closed = matches!(woke, Wake::Closed | Wake::TerminalInputFailed(_));
             match woke {
+                Wake::InputOverApproval(..) => unreachable!("input was normalized"),
                 Wake::Closed => quit = true,
                 Wake::TerminalInputFailed(error) => {
                     terminal_input_error = Some(error);
@@ -2412,6 +2619,38 @@ impl UserInterface for Tui {
                     if client.take_remark() {
                         self.refresh_providers();
                     }
+                }
+                Wake::ProviderModelsEnriched {
+                    original,
+                    mut drafts,
+                    before,
+                    after,
+                    session,
+                } => {
+                    use crate::providers::Step;
+                    let still_here = self.client.session() == session
+                        && self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .providers_panel
+                            == after;
+                    if !still_here {
+                        for draft in &mut drafts {
+                            draft.use_now = false;
+                        }
+                    }
+                    let step = match original {
+                        Step::SaveModel { id: None, draft } => Step::SaveModel {
+                            id: None,
+                            draft: drafts.pop().unwrap_or(draft),
+                        },
+                        Step::SaveModels { .. } => Step::SaveModels { drafts },
+                        step => step,
+                    };
+                    self.finish_provider_step(step, before.filter(|_| still_here));
+                    stale = true;
                 }
                 // Most of what arrives here moves nothing on the screen: a
                 // streamed delta is already in the transcript by the time it is
@@ -2464,6 +2703,18 @@ impl UserInterface for Tui {
                                 current_label: pending.label,
                             });
                         }
+                        // This runtime may have changed mode while it was in the
+                        // background, when its host events were not forwarded.
+                        if let Some(control) = client.control() {
+                            if let Ok(HostReply::Mode { mode }) = control
+                                .call(HostCommand::Mode {
+                                    session: session.clone(),
+                                })
+                                .await
+                            {
+                                took_mode(&self.host.moment, &session, mode);
+                            }
+                        }
                         // The session that arrives owes its own first word.
                         // `switch_session` empties the stream (`host.rs`
                         // `switch_view`), so the question below is live again —
@@ -2472,6 +2723,7 @@ impl UserInterface for Tui {
                         // welcome block is produced by `open_conversation` alone,
                         // and nothing else asks.
                         owes_opening = true;
+                        setup_opening = None;
                         self.host.say(
                             t(Msg::SwitchedToSession { session: &session }).into_owned(),
                             false,
@@ -2891,8 +3143,12 @@ impl UserInterface for Tui {
                             // another one's row.
                             if self.host.asks.is_waiting() {
                                 if let Some(row) = self.host.answer_row_at(x, y) {
-                                    let _ = self.host.point_ask_at(row);
-                                    quit = self.confirm_question();
+                                    if let Some((id, step)) = self
+                                        .host
+                                        .click_ask(row, input_approval.map(|approval| approval.id))
+                                    {
+                                        self.deliver_answer(id, step);
+                                    }
                                     stale = true;
                                     continue;
                                 }
@@ -3358,6 +3614,8 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Paste(text)) if self.host.mcp_open() => {
                     stale |= self.host.mcp_paste(&text);
                 }
+                Wake::Input(Input::Paste(_))
+                    if model_setup.as_ref().is_some_and(|setup| setup.required()) => {}
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
                     stale = true;
@@ -3489,7 +3747,100 @@ impl UserInterface for Tui {
                 // place its keys are routed — and focus is still arbitration,
                 // not composition: exactly one thing can hold it.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
-                    quit = self.answer_question(press);
+                    let holds = !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .input
+                        .is_empty();
+                    match route_ask_key(holds, !composer_on_screen, &press) {
+                        AskKeyRoute::Composer(c) => {
+                            // Through `act`, so the insert keeps its side
+                            // effects (draft history, suggestion dismissal).
+                            quit = self.act(Action::Insert(c), &client);
+                            stale = true;
+                        }
+                        AskKeyRoute::Panel => {
+                            quit = self.answer_question(press, input_approval);
+                            stale = true;
+                        }
+                    }
+                }
+                Wake::Input(Input::Key(press))
+                    if press.key == crate::surface::Key::Esc
+                        && model_setup
+                            .as_ref()
+                            .is_some_and(|setup| setup.cancel_login()) =>
+                {
+                    if !model_setup.as_ref().is_some_and(|setup| setup.required()) {
+                        self.host.say(t(Msg::LoginCancelled).into_owned(), false);
+                    }
+                    stale = true;
+                }
+                Wake::Input(Input::Key(press))
+                    if model_setup.as_ref().is_some_and(|setup| setup.required()) =>
+                {
+                    use crate::surface::{Key, Mods};
+                    let setup = model_setup.as_ref().expect("setup is required");
+                    match (press.key, press.mods) {
+                        (Key::Char('c' | 'd'), Mods::CTRL) => quit = true,
+                        (Key::Char('c'), Mods::NONE) => {
+                            if let Some(crate::model_setup::SetupView::Authorize {
+                                url: Some(url),
+                                ..
+                            }) = setup.view(self.surface.size().1)
+                            {
+                                self.copy_text(url, t(Msg::CopiedSelection).into_owned());
+                            }
+                        }
+                        (key, Mods::NONE) if !setup.signing_in() => {
+                            let choice = match key {
+                                Key::Up | Key::Down => {
+                                    setup.select(!setup.second());
+                                    None
+                                }
+                                Key::Char('1') => Some(false),
+                                Key::Char('2') => Some(true),
+                                Key::Enter => Some(setup.second()),
+                                _ => None,
+                            };
+                            if let Some(second) = choice {
+                                setup.select(second);
+                                let command = if second { "/provider" } else { "/login" };
+                                match self.host.commands.dispatch(command, ctx).await {
+                                    crate::command::Outcome::Do(action) => {
+                                        quit = self.act(action, &client)
+                                    }
+                                    outcome => deliver(&self.host, &wake_tx, outcome),
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    stale = true;
+                }
+                Wake::Input(Input::Key(press))
+                    if press.mods == crate::surface::Mods::ALT
+                        && matches!(press.key, crate::surface::Key::Char('1' | '2'))
+                        && composer_on_screen
+                        && self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .unready
+                            .is_some() =>
+                {
+                    let command = if press.key == crate::surface::Key::Char('1') {
+                        "/login"
+                    } else {
+                        "/provider"
+                    };
+                    match self.host.commands.dispatch(command, ctx).await {
+                        crate::command::Outcome::Do(action) => quit = self.act(action, &client),
+                        outcome => deliver(&self.host, &wake_tx, outcome),
+                    }
                     stale = true;
                 }
                 // A reverse search owns the keyboard while it is up — the
@@ -3606,6 +3957,9 @@ impl UserInterface for Tui {
         // A question brought up from a background session is taken back first,
         // unanswered: refusing it would be deciding for that session, and the
         // host stops it on the way out anyway.
+        if let Some(setup) = model_setup.as_ref() {
+            setup.cancel_login();
+        }
         self.host.withdraw_any_bg_question();
         self.host.asks.refuse_all();
         // And the password, for the same reason and with the same meaning: a
@@ -3912,7 +4266,8 @@ impl Tui {
     /// there belongs here too, or the wheel scrolls under it.
     fn arrows_reach_the_composer(&self) -> bool {
         let up = crate::surface::KeyPress::plain(crate::surface::Key::Up);
-        !(self.host.secret_waiting()
+        !(self.host.model_setup_required()
+            || self.host.secret_waiting()
             || self.host.overlays.is_open()
             || self.host.context_menu_open()
             || self.host.settings_open()
@@ -3930,7 +4285,7 @@ impl Tui {
             || self.host.team_focused())
     }
 
-    fn paint(&self, size: (u16, u16)) {
+    fn paint(&self, size: (u16, u16)) -> (Option<crate::ask::PresentedApproval>, bool) {
         self.name_the_window();
         // Where the pointer is, for the status row's marker: the surface is the
         // one that knows, and every way it changes (ctrl+g, `[ui] mouse`, the
@@ -3942,8 +4297,11 @@ impl Tui {
                 m.mouse_handed_back = back;
             }
         }
-        let frame = self.host.compose(size);
+        let (frame, approval) = self.host.compose_with_approval(size);
+        let approval = approval.filter(|_| !self.surface.showing_transcript());
+        let composer = frame.part("input").is_some();
         self.surface.present(&frame);
+        (approval, composer)
     }
 
     /// Put the session's name in the window title, when it has changed.
@@ -4156,6 +4514,13 @@ impl Tui {
             sheet.edit_key = crate::keymap::parse_question_edit_key(edit_key)
                 .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
         }
+        if let Some(row) = view.rows().iter().find(|row| row.id == "ui.wrap_diff") {
+            moment.clip_diff = row.value == "false";
+            let wrap = !moment.clip_diff;
+            if let Some(sheet) = moment.sheet.as_mut() {
+                sheet.set_diff_wrap(wrap);
+            }
+        }
         if moment.settings == view {
             return false;
         }
@@ -4217,10 +4582,65 @@ impl Tui {
         } else {
             None
         };
+        let returns_to_setup = press.key == crate::surface::Key::Esc && {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.model_setup_required
+                && matches!(
+                    moment.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
+                    Some(crate::providers::Form::Account(form)) if form.editing.is_none()
+                )
+        };
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
+            if returns_to_setup {
+                return self.host.toggle_providers() || changed;
+            }
             return changed;
         };
+        use crate::providers::Step;
+        let drafts = match &step {
+            Step::SaveModel { id: None, draft } => std::slice::from_ref(draft),
+            Step::SaveModels { drafts } => drafts.as_slice(),
+            _ => &[],
+        };
+        if !drafts.is_empty() {
+            let ctx = self.ctx.lock().expect("ctx poisoned").clone();
+            let wake = self.wake.lock().expect("wake poisoned").clone();
+            if let Some((job, wake)) = ctx
+                .and_then(|ctx| ctx.service::<ProvidersSvc>())
+                .and_then(|port| port.enrich_models(drafts))
+                .zip(wake)
+            {
+                let after = self
+                    .host
+                    .moment
+                    .read()
+                    .expect("moment poisoned")
+                    .providers_panel
+                    .clone();
+                let session = self.client.session();
+                tokio::spawn(async move {
+                    let drafts = job.await;
+                    let _ = wake.send(Wake::ProviderModelsEnriched {
+                        original: step,
+                        drafts,
+                        before,
+                        after,
+                        session,
+                    });
+                });
+                return true;
+            }
+        }
+        self.finish_provider_step(step, before);
+        true
+    }
+
+    fn finish_provider_step(
+        &self,
+        step: crate::providers::Step,
+        before: Option<crate::providers::Panel>,
+    ) {
         let key = match &step {
             crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
             crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
@@ -4248,7 +4668,6 @@ impl Tui {
             }
         }
         self.refresh_providers();
-        true
     }
 
     /// Send one change over the providers seam, then tell the runtime.
@@ -4669,24 +5088,45 @@ impl Tui {
     }
 
     /// Ask the host again whether a turn would be taken, and put its answer on
-    /// the status row (`Moment::unready`): the reason while it still holds,
+    /// the tip row (`Moment::unready`): the reason while it still holds,
     /// nothing once it does not.
     fn recheck_readiness(&self, session: String) {
         let Some(control) = self.client.control() else {
             return;
         };
+        let setup = self
+            .ctx
+            .lock()
+            .expect("ctx poisoned")
+            .as_ref()
+            .and_then(|ctx| ctx.service::<ModelSetupSvc>());
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
-            let unready = match control.call(HostCommand::Readiness { session }).await {
+            let (ready, unready) = match control
+                .call(HostCommand::Readiness {
+                    session: session.clone(),
+                })
+                .await
+            {
                 Ok(HostReply::Readiness {
                     ready: false, why, ..
-                }) => why,
-                Ok(HostReply::Readiness { ready: true, .. }) => None,
+                }) => (false, why),
+                Ok(HostReply::Readiness { ready: true, .. }) => (true, None),
                 _ => return,
             };
             let mut moment = host.moment.write().expect("moment poisoned");
-            if moment.unready != unready {
+            if moment.lead != session {
+                return;
+            }
+            let finished = ready && moment.model_setup_required;
+            if finished {
+                if let Some(setup) = setup.as_ref() {
+                    setup.ready();
+                }
+                moment.model_setup_required = false;
+            }
+            if moment.unready != unready || finished {
                 moment.unready = unready;
                 drop(moment);
                 if let Some(keys) = keys {
@@ -5432,6 +5872,9 @@ impl Tui {
             // 那句原因只在 `ran.output` 里。不画它的话,人只看到一个「退出码 —」。
             if lines.is_empty() && !ran.output.trim().is_empty() {
                 lines = ran.output.trim_end().lines().map(str::to_string).collect();
+            }
+            if ran.failed() && !ran_in.is_empty() {
+                lines.push(t(Msg::ShellWorkingDir { dir: &ran_in }).into_owned());
             }
             let tail = match (ran.timed_out, ran.code) {
                 (true, _) => Some(
@@ -7073,7 +7516,7 @@ impl Tui {
                     // turn would now be taken is the host's to say, so it is asked
                     // again rather than assumed: a session whose sign-in expired
                     // still has an agent that describes itself.
-                    if moment.unready.is_some() {
+                    if description.session == moment.lead {
                         self.recheck_readiness(moment.lead.clone());
                     }
                     let changed = moment.ctx_window != window
@@ -9047,6 +9490,14 @@ impl Tui {
                 self.fetch_status();
                 return false;
             }
+            Action::OpenSetting(id) => {
+                drop(m);
+                self.host.open_settings_for(id);
+                self.refresh_settings();
+                self.fetch_usage();
+                self.fetch_status();
+                return false;
+            }
             // Put another session on screen. The lock goes first: `switch_to`
             // draws that session and writes the moment, which is a lock this
             // guard still holds.
@@ -9530,19 +9981,23 @@ impl Tui {
 
     /// Route one key to the question on screen. Returns `true` to quit.
     ///
-    /// A question is a panel riding the stream's tail, not a modal, so the keys come
-    /// here directly — there is no overlay that holds the keyboard first. What has
-    /// not changed is the rule: while a question is waiting, every key is the
-    /// question's. Exactly one thing can hold focus, and this is what holds it.
-    ///
-    /// **Every answer is reachable by one key.** Up/down walk the list, which is what
-    /// a highlighted row is for; enter takes the row that is lit; a digit or a first
-    /// letter goes straight to an answer, which is faster once the list is known; esc
-    /// declines. With the panel up, what each key does is the panel's own
-    /// ([`crate::ask::Sheet::key`]) — the rows it draws and the keys that take them are
-    /// one implementation rather than two that agree until one changes.
-    fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
+    /// Tool approval answers belong to the request shown when the input arrived.
+    /// Ordinary questions retain their panel and stream shortcuts.
+    fn answer_question(
+        &self,
+        press: crate::surface::KeyPress,
+        approval_at_input: Option<crate::ask::PresentedApproval>,
+    ) -> bool {
         use crate::surface::{Key, Mods};
+        let Some((id, page, asked)) = self.host.asks.current_with_id() else {
+            return false;
+        };
+        if asked.is_tool_approval() {
+            if let Some(approval) = approval_at_input.filter(|approval| approval.id == id) {
+                self.deliver_answer(id, self.host.approval_key(approval, press));
+            }
+            return false;
+        }
         if self.panel_mounted() {
             if let Some((id, step)) = self.host.ask_key(press) {
                 self.deliver_answer(id, step);
@@ -9552,9 +10007,6 @@ impl Tui {
         // No panel: the question at the foot of the stream, one at a time. It
         // marks no row, so there is no highlight to trust — enter takes an
         // answer only when there is exactly one to take.
-        let Some(asked) = self.host.asks.current() else {
-            return false;
-        };
         let question = asked.question;
         let chosen = match (press.key, press.mods) {
             // Esc and ctrl-c decline. Declining is an answer; it is never consent,
@@ -9574,7 +10026,7 @@ impl Tui {
         if let Some(answer) = chosen {
             self.host
                 .asks
-                .answer_current(answer.map(crate::ask::Reply::from));
+                .answer_current(id, page, answer.map(crate::ask::Reply::from));
         }
         false
     }
@@ -9603,31 +10055,6 @@ impl Tui {
             .is_some()
     }
 
-    /// Take the row the panel has lit, as a return would. `true` to quit, for the
-    /// key path.
-    ///
-    /// One path for both the return key and a click on a row, so a confirm and a
-    /// pick cannot disagree about what is pointed at.
-    fn confirm_question(&self) -> bool {
-        // A click elsewhere in the card must not accidentally commit an edit.
-        if self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .asking
-            .as_ref()
-            .is_some_and(|sheet| sheet.option_edit().is_some())
-        {
-            return false;
-        }
-        let press = crate::surface::KeyPress::plain(crate::surface::Key::Enter);
-        if let Some((id, step)) = self.host.ask_key(press) {
-            self.deliver_answer(id, step);
-        }
-        false
-    }
-
     /// What has been typed after the slash, while a command is being named.
     ///
     /// `None` when the line is not a command being typed: no slash, or one with
@@ -9645,6 +10072,9 @@ impl Tui {
             .input
             .clone();
         let rest = typed.strip_prefix('/')?;
+        if !rest.is_empty() && !crate::command::looks_like_command(&typed) {
+            return None;
+        }
         if let Some((name, args)) = rest.split_once(char::is_whitespace) {
             let command = self.host.commands.find(name)?;
             if command.options.is_empty() {
@@ -9674,7 +10104,7 @@ impl Tui {
         use atomcode_capabilities::session::SessionManager;
         let kind = *self.mention_kind.lock().expect("mention kind poisoned");
         let mut rows = Vec::new();
-        if kind != 2 {
+        if kind != 2 && kind != 3 {
             rows.extend(paths_under(
                 &self.files,
                 cwd,
@@ -9682,7 +10112,7 @@ impl Tui {
                 self.host.project_dir_name(),
             ));
         }
-        if kind == 2 {
+        if kind == 2 || kind == 3 {
             let mut cache = self
                 .session_references
                 .lock()
@@ -9694,7 +10124,7 @@ impl Tui {
                     let shared = self.session_references.clone();
                     let wake = self.wake.lock().expect("wake poisoned").clone();
                     std::thread::spawn(move || {
-                        let entries = SessionManager::scan_catalog(&root).entries;
+                        let entries = SessionSuggestion::scan(&root);
                         {
                             let mut held = shared.lock().expect("session suggestions poisoned");
                             held.entries = entries;
@@ -9712,27 +10142,37 @@ impl Tui {
             let mut candidates: Vec<_> = cache
                 .entries
                 .iter()
-                .filter(|e| {
-                    atomcode_capabilities::session::reference::available(e)
+                .filter(|candidate| {
+                    let e = &candidate.entry;
+                    (kind == 2 || e.working_dir == std::path::Path::new(cwd))
                         && (e.id != current || e.working_dir != std::path::Path::new(cwd))
-                        && format!("{} {}", e.name, e.working_dir.display())
-                            .to_lowercase()
-                            .contains(&query)
+                        && format!(
+                            "{} {} {} {}",
+                            e.name,
+                            e.id,
+                            e.working_dir.display(),
+                            candidate.preview.as_deref().unwrap_or_default()
+                        )
+                        .to_lowercase()
+                        .contains(&query)
                 })
                 .collect();
-            candidates.sort_by_key(|e| {
+            candidates.sort_by_key(|candidate| {
+                let e = &candidate.entry;
                 (
                     e.working_dir != std::path::Path::new(cwd),
                     std::cmp::Reverse(e.updated_at_ms),
                 )
             });
-            for e in candidates {
+            for candidate in candidates {
+                let e = &candidate.entry;
+                let label = candidate.label();
                 let reference = atomcode_capabilities::session::reference::SessionReference {
                     bucket: e.project_bucket.clone(),
                     id: e.id.clone(),
                 };
                 rows.push(
-                    crate::menu::Item::new(reference.spelling(&e.name), e.name.clone())
+                    crate::menu::Item::new(reference.spelling(label), label)
                         .about(format!(
                             "{} · {}",
                             chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
@@ -9898,12 +10338,17 @@ impl Tui {
             let tabs = [
                 ("files", t(Msg::MentionFiles)),
                 ("sessions", t(Msg::MentionSessions)),
+                ("workspace", t(Msg::MentionSessionsWorkspace)),
             ]
             .into_iter()
             .map(|(key, label)| crate::menu::Item::new(format!("@\0mention-filter:{key}"), label))
             .collect();
-            self.host
-                .set_mention_menu(menu, tabs, usize::from(kind == 2));
+            let tab = match kind {
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            };
+            self.host.set_mention_menu(menu, tabs, tab);
         } else {
             self.host.set_menu(menu);
         }
@@ -9917,7 +10362,7 @@ impl Tui {
     /// sits on its first row.
     ///
     /// **Tab completes and enter takes.** Tab puts the lit name on the line so
-    /// its argument can be typed; enter dispatches the lit name outright, and a
+    /// its argument can be typed; enter takes the lit name, and a
     /// command that needs an argument answers with a panel to pick it from —
     /// which is where the second level of a command comes from, not from this
     /// screen knowing what the arguments are.
@@ -9981,7 +10426,8 @@ impl Tui {
     /// business. This screen knows how to lay a list out; it does not know that
     /// `/effort` takes a level.
     ///
-    /// The one exception is a command with a closed set of values: taking its
+    /// A description-only match completes the name before dispatch. A command
+    /// with a closed set of values also completes: taking its
     /// row opens that set — one row per value — rather than running it bare,
     /// because the pick a person came for is a level below. That is [`complete`]
     /// followed by the menu recomputing into the values, the same as tab. A row
@@ -10029,15 +10475,21 @@ impl Tui {
         // has nothing after it. If the person has already typed arguments
         // (`/rename hello`), the tokens are two or more and the pick is a
         // dispatch, not a completion.
-        let line_is_bare_pick = {
-            let line = self
-                .host
-                .moment
-                .read()
-                .expect("moment poisoned")
-                .input
-                .clone();
-            line.trim_start_matches('/').split_whitespace().count() <= 1
+        let (line_is_bare_pick, description_pick) = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let description_pick = command.as_ref().is_some_and(|c| {
+                m.input
+                    .strip_prefix('/')
+                    .filter(|query| !query.contains(char::is_whitespace))
+                    .is_some_and(|query| {
+                        let query = query.to_lowercase();
+                        !c.matches_prefix(&query) && c.matches_description(&query)
+                    })
+            });
+            (
+                m.input.trim_start_matches('/').split_whitespace().count() <= 1,
+                description_pick,
+            )
         };
         // `Required` is routed here the same as `Optional`: the person's
         // first Enter on a required command asks for the argument's slot, and
@@ -10058,7 +10510,8 @@ impl Tui {
                         | atomcode_kernel::agent::ArgsRequirement::Required
                 )
         });
-        if argument_completion_bare_pick
+        if description_pick
+            || argument_completion_bare_pick
             || command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
             || option_owner.is_some_and(|c| c.require_arg && name != "skills --list")
         {
@@ -10141,6 +10594,7 @@ impl Tui {
             *self.mention_kind.lock().expect("mention kind poisoned") = match kind {
                 "files" => 1,
                 "sessions" => 2,
+                "workspace" => 3,
                 _ => 0,
             };
             self.refresh_menu();
@@ -10673,6 +11127,42 @@ impl Tui {
     }
 }
 
+/// A TUI-only password field: no kernel question, tool parameter or session fact.
+#[async_trait]
+pub trait SecretInput: Send + Sync {
+    async fn read(&self, prompt: &str) -> Option<zeroize::Zeroizing<String>>;
+}
+plexus_service!(SecretInputSvc => dyn SecretInput, "tui-secret-input", Seam, "Host-only masked input that is never recorded as a conversation fact");
+struct ScreenSecretInput {
+    host: Arc<Host>,
+    repaint: Arc<dyn Repaint>,
+}
+struct SecretFlight {
+    host: Arc<Host>,
+    repaint: Arc<dyn Repaint>,
+    id: u64,
+}
+impl Drop for SecretFlight {
+    fn drop(&mut self) {
+        self.host.refuse_owned_secret(self.id);
+        self.repaint.now();
+    }
+}
+#[async_trait]
+impl SecretInput for ScreenSecretInput {
+    async fn read(&self, prompt: &str) -> Option<zeroize::Zeroizing<String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = self.host.try_ask_protected_secret(prompt, tx)?;
+        let _flight = SecretFlight {
+            host: self.host.clone(),
+            repaint: self.repaint.clone(),
+            id,
+        };
+        self.repaint.now();
+        rx.await.ok().flatten()
+    }
+}
+
 /// Ask for a frame.
 ///
 /// The loop paints when something wakes it, and everything that wakes it today
@@ -11197,7 +11687,7 @@ fn take_suggestion(m: &mut crate::moment::Moment) -> bool {
     if !m.input.is_empty() || m.activity != crate::moment::Activity::Idle || m.secret.is_some() {
         return false;
     }
-    let Some(words) = m.suggestion.take() else {
+    let Some(words) = m.suggestion.take().filter(|words| !words.trim().is_empty()) else {
         return false;
     };
     m.input = words;
@@ -11364,6 +11854,13 @@ fn arrows_scroll(
     !mouse_held && (mouse_reported || alternate_scroll) && would_scroll
 }
 
+fn input_wake(input: Input, approval: Option<ApprovalInput>) -> Wake {
+    match approval {
+        Some(receipt) => Wake::InputOverApproval(input, receipt),
+        None => Wake::Input(input),
+    }
+}
+
 /// Read the terminal, gathering keystroke bursts that are really a paste.
 ///
 /// **Why this is not just a loop over events.** A terminal without bracketed
@@ -11387,12 +11884,13 @@ fn arrows_scroll(
 async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
+    presented_approval: impl Fn() -> Option<ApprovalInput> + Send + 'static,
 ) {
     let events = crate::terminal_modes::input_records(
         crossterm::event::EventStream::new(),
         crate::terminal_modes::ensure_input,
     );
-    pump_terminal_input(events, wake, handed_back).await;
+    pump_terminal_input(events, wake, handed_back, presented_approval).await;
 }
 
 /// Keep read/mode failures visible and stop accepting input after the first one.
@@ -11400,6 +11898,7 @@ async fn pump_terminal_input<S>(
     events: S,
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
+    presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = std::io::Result<crossterm::event::Event>>,
 {
@@ -11419,6 +11918,7 @@ async fn pump_terminal_input<S>(
         wake.clone(),
         handed_back,
         crate::ansi::alternate_scroll_enabled(),
+        presented_approval,
     )
     .await;
     let _ = wake.send(Wake::Closed);
@@ -11436,7 +11936,7 @@ async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
             KeyModifiers::NONE,
         ))),
     ]);
-    pump_terminal_input(events, wake, || false).await;
+    pump_terminal_input(events, wake, || false, || None).await;
     assert!(
         matches!(received.recv().await, Some(Wake::TerminalInputFailed(message)) if message.contains("console mode refused"))
     );
@@ -11455,6 +11955,7 @@ async fn pump_input<S>(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
     alternate_scroll: bool,
+    presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
 {
@@ -11468,10 +11969,12 @@ async fn pump_input<S>(
                 if key.kind == crossterm::event::KeyEventKind::Release
         ))
     });
+    // Sample before burst detection can defer a key past a frame boundary.
+    let events = events.map(|event| (event, presented_approval()));
     futures::pin_mut!(events);
-    let forward = |event| -> bool {
+    let forward = |event, approval| -> bool {
         match crate::surface::from_crossterm(event) {
-            Some(input) => wake.send(Wake::Input(input)).is_ok(),
+            Some(input) => wake.send(input_wake(input, approval)).is_ok(),
             // Not an event this screen has a use for; the reader lives on.
             None => true,
         }
@@ -11480,7 +11983,7 @@ async fn pump_input<S>(
     // after a replayed paste) goes round again, through every check above —
     // forwarded straight on, a reversed wheel's first arrow was one ↑ into the
     // composer, and a paste's first character was a keystroke.
-    let mut next_up: Option<crossterm::event::Event> = None;
+    let mut next_up = None;
     let mut paste_continuation = false;
     loop {
         // Reaching the allocation cap is not a paste boundary. Carry its
@@ -11495,13 +11998,14 @@ async fn pump_input<S>(
                 }
             }
         }
-        let event = match next_up.take() {
+        let (event, approval) = match next_up.take() {
             Some(event) => event,
             None => match events.next().await {
                 Some(event) => event,
                 None => break,
             },
         };
+        let approval_id = approval.map(|receipt| receipt.presentation.id);
         // **The wheel, turned into arrow keys by the terminal.** With the
         // pointer handed back, iTerm2 ("scroll wheel sends arrow keys when in
         // alternate screen mode", on by default) and Terminal.app send the
@@ -11515,10 +12019,15 @@ async fn pump_input<S>(
         if let Some(up) = crate::surface::bare_arrow(&event).filter(|_| handed_back()) {
             paste_continuation = false;
             let mut n = 1usize;
-            let mut after: Option<crossterm::event::Event> = None;
+            let mut after = None;
             loop {
                 match tokio::time::timeout(crate::surface::BURST_PENDING, events.next()).await {
-                    Ok(Some(next)) if crate::surface::bare_arrow(&next) == Some(up) => n += 1,
+                    Ok(Some(next))
+                        if next.1.map(|receipt| receipt.presentation.id) == approval_id
+                            && crate::surface::bare_arrow(&next.0) == Some(up) =>
+                    {
+                        n += 1;
+                    }
                     Ok(Some(next)) => {
                         after = Some(next);
                         break;
@@ -11531,7 +12040,7 @@ async fn pump_input<S>(
             // history; Ctrl+P/Ctrl+N remain unambiguous history keys. Other
             // terminals preserve the usual single-arrow keyboard behavior.
             let sent = if n == 1 && !alternate_scroll {
-                forward(event)
+                forward(event, approval)
             } else {
                 wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
             };
@@ -11543,13 +12052,13 @@ async fn pump_input<S>(
         }
         let Some(first) = crate::surface::burst_char(&event) else {
             paste_continuation = false;
-            if !forward(event) {
+            if !forward(event, approval) {
                 break;
             }
             continue;
         };
-        let mut held: Vec<(char, crossterm::event::Event)> = vec![(first, event)];
-        let mut after: Option<crossterm::event::Event> = None;
+        let mut held = vec![(first, event, approval)];
+        let mut after = None;
         // The wider window opens only once a second character has confirmed
         // there is something to bridge: until then a lone keystroke must not
         // pay for the paste case.
@@ -11564,9 +12073,11 @@ async fn pump_input<S>(
                 break; // quiet: whatever this was, it is over
             };
             let Some(next) = next else { break };
-            match crate::surface::burst_char(&next) {
+            match crate::surface::burst_char(&next.0)
+                .filter(|_| next.1.map(|receipt| receipt.presentation.id) == approval_id)
+            {
                 Some(c) => {
-                    held.push((c, next));
+                    held.push((c, next.0, next.1));
                     confirmed = true;
                 }
                 None => {
@@ -11575,13 +12086,14 @@ async fn pump_input<S>(
                 }
             }
         }
-        let chars: Vec<char> = held.iter().map(|(c, _)| *c).collect();
+        let chars: Vec<char> = held.iter().map(|(c, _, _)| *c).collect();
         let capped = held.len() == crate::surface::BURST_CAP;
         let sent = if paste_continuation || capped || crate::surface::is_paste_burst(&chars) {
             wake.send(Wake::Input(Input::Paste(chars.into_iter().collect())))
                 .is_ok()
         } else {
-            held.into_iter().all(|(_, event)| forward(event))
+            held.into_iter()
+                .all(|(_, event, receipt)| forward(event, receipt))
         };
         if !sent {
             break;
@@ -11685,6 +12197,7 @@ impl Plugin for TuiUiPlugin {
             // launcher's audit is for.
             "tui-team-roster",
             "tui-repaint",
+            "tui-secret-input",
             "tui-mcp-phase",
         ]
     }
@@ -11705,6 +12218,7 @@ impl Plugin for TuiUiPlugin {
         let surface = ctx.require::<SurfaceSvc>().map_err(|e| e.to_string())?;
         let (host, tui) = assemble(surface);
         host.moment.write().expect("moment poisoned").scrollbar_mode = row.scrollbar;
+        host.moment.write().expect("moment poisoned").clip_diff = !row.wrap_diff;
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
             .map_err(|e| e.to_string())?;
@@ -11746,6 +12260,12 @@ impl Plugin for TuiUiPlugin {
         // starts.
         let _ = ctx
             .provide::<RepaintSvc>(Arc::new(Waker(tui.clone())) as Arc<dyn Repaint>)
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<SecretInputSvc>(Arc::new(ScreenSecretInput {
+                host: tui.host.clone(),
+                repaint: Arc::new(Waker(tui.clone())),
+            }) as Arc<dyn SecretInput>)
             .map_err(|e| e.to_string())?;
         let _ = ctx.provide::<UiSvc>(tui).map_err(|e| e.to_string())?;
         Ok(())
@@ -12330,7 +12850,12 @@ mod suggestion_tests {
 
         // 没有猜的话,空编辑区上的 → 什么也不做 —— 这个键不许让人意外。
         let empty = idle("lead");
-        assert!(!accept_ghost(&mut empty.write().unwrap()));
+        let mut m = empty.write().unwrap();
+        assert!(!accept_ghost(&mut m));
+        m.suggestion = Some(" \t".into());
+        assert!(!accept_ghost(&mut m));
+        assert!(m.input.is_empty());
+        assert_eq!(m.caret, 0);
     }
 }
 
@@ -13542,7 +14067,7 @@ mod paste_burst_tests {
         .fuse();
         futures::pin_mut!(events);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        super::pump_input(events, tx, move || handed_back, alternate_scroll).await;
+        super::pump_input(events, tx, move || handed_back, alternate_scroll, || None).await;
         let mut seen = Vec::new();
         while let Ok(Wake::Input(input)) = rx.try_recv() {
             seen.push(input);
@@ -14671,12 +15196,18 @@ mod provider_probe_tests {
                     account: account.into(),
                     model: wire.into(),
                     window: 128_000,
+                    max_tokens: None,
                     vision: None,
                     effort: None,
                     levels: Vec::new(),
                     current,
                     managed: false,
+                    alias: None,
+                    desc: None,
+                    alias_en: None,
+                    desc_en: None,
                 };
+
             ProvidersView::new(
                 Vec::new(),
                 vec![
@@ -15960,6 +16491,49 @@ mod paste_habit_tests {
         }
     }
 
+    #[test]
+    fn the_theme_command_selects_the_theme_setting_in_the_existing_panel() {
+        use crate::settings::{Applies, SettingKind, SettingRow, SettingsView, Step, Tab};
+        let (host, tui) = screen();
+        host.moment.write().unwrap().settings = SettingsView::new(vec![
+            SettingRow {
+                id: "ui.mouse".into(),
+                label: "Mouse".into(),
+                value: "true".into(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Restart,
+            },
+            SettingRow {
+                id: "ui.theme".into(),
+                label: "Theme".into(),
+                value: "dark".into(),
+                kind: SettingKind::Choice(vec!["auto".into(), "dark".into(), "light".into()]),
+                applies: Applies::Restart,
+            },
+        ]);
+        tui.act(Action::OpenStatus, &tui.client);
+        for _ in 0..2 {
+            tui.act(Action::OpenSetting("ui.theme"), &tui.client);
+            let moment = host.moment.read().unwrap();
+            let panel = moment.settings_panel.as_ref().unwrap();
+            assert_eq!(panel.tab, Tab::Config);
+            assert_eq!(panel.query, "ui.theme");
+            assert_eq!(panel.query_caret, panel.query.len());
+            let rows = moment.settings.matching(&panel.query);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[panel.cursor].id, "ui.theme");
+        }
+        let (_, step) =
+            host.settings_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert_eq!(
+            step,
+            Some(Step::Set {
+                id: "ui.theme".into(),
+                value: "light".into(),
+            })
+        );
+    }
+
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
     }
@@ -15980,6 +16554,7 @@ mod paste_habit_tests {
                 tips: Vec::new(),
                 brand: Arc::new(crate::content::Brand::default()),
                 note: None,
+                model_setup: None,
             }),
         );
         {
@@ -16069,6 +16644,42 @@ mod paste_habit_tests {
             assert_eq!(host.compose((60, 24)).selected_text(&selection), text);
             tui.act(Action::Backspace, &tui.client);
             assert!(host.moment.read().unwrap().input.is_empty());
+        }
+    }
+
+    #[test]
+    fn transcript_selection_copies_user_text_without_its_display_prompt() {
+        for text in ["你好世界", "❯ literal", "  indented"] {
+            let (host, tui) = screen();
+            host.modules
+                .add_producer(crate::modules::transcript::Transcript::new())
+                .unwrap();
+            host.absorb(&atomcode_harness::session::SessionEvent::UserMessage {
+                turn: 1,
+                text: text.into(),
+                images: Vec::new(),
+            });
+            let size = (60, 24);
+            let frame = host.compose(size);
+            let y = frame
+                .rows()
+                .iter()
+                .position(|row| row.contains(text))
+                .unwrap() as u16;
+            tui.act(Action::SelectLine(3, y), &tui.client);
+            assert_eq!(tui.surface.clipboard_text().as_deref(), Some(text));
+            if text == "你好世界" {
+                tui.act(Action::SelectWord(3, y), &tui.client);
+                assert_eq!(tui.surface.clipboard_text().as_deref(), Some(text));
+            }
+            let moment = host.moment.read().unwrap();
+            let row = host.block_view(size, &moment).unwrap().row_at(y).unwrap();
+            let selected = crate::moment::StreamSelection {
+                anchor: (0, row),
+                head: (59, row),
+                extended: false,
+            };
+            assert_eq!(host.block_text(size, &moment, &selected), text);
         }
     }
 
@@ -16602,7 +17213,7 @@ mod skills_menu_tests {
         for _ in 0..3 {
             assert!(!tui.act(Action::EndOfInput, &tui.client));
         }
-        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d')));
+        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d'), None));
         assert!(!tui.team_key(crate::surface::KeyPress::ctrl('d')));
     }
 
@@ -16897,6 +17508,18 @@ mod args_requirement_menu_tests {
         m.caret = line.len();
         Arc::make_mut(&mut m.history).clear();
         m.history_at = None;
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_description_match_completes_before_dispatch() {
+        let (host, tui) = screen_with(ArgsRequirement::None);
+        type_line(&host, "/thing");
+        tui.refresh_menu();
+        assert_eq!(host.menu_selected().as_deref(), Some("cmd"));
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(m.input, "/cmd");
+        assert!(m.history.is_empty());
     }
 
     #[tokio::test]
@@ -17304,6 +17927,65 @@ mod newline_settings_tests {
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
 
     struct Port(Mutex<String>);
+    struct DiffPort(Mutex<bool>);
+    impl Settings for DiffPort {
+        fn rows(&self) -> SettingsView {
+            SettingsView::new(vec![SettingRow {
+                id: "ui.wrap_diff".into(),
+                label: "Wrap diff".into(),
+                value: self.0.lock().unwrap().to_string(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Immediately,
+            }])
+        }
+        fn set(&self, _: &str, value: &str) -> Result<SettingsView, String> {
+            *self.0.lock().unwrap() = value.parse().map_err(|_| "invalid boolean")?;
+            Ok(self.rows())
+        }
+        fn reset(&self, id: &str) -> Result<SettingsView, String> {
+            self.set(id, "true")
+        }
+    }
+
+    #[test]
+    fn settings_reflow_an_open_diff_without_rebuilding_the_runtime() {
+        let (host, tui) = assemble(crate::surface::Headless::new(30, 24));
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .unwrap();
+        assert!(
+            host.open_sheet(crate::sheet::Sheet::read(crate::sheet::Read::diff(
+                "diff",
+                "a",
+                "@@ -0,0 +1 @@\n+longlonglonglonglonglonglonglonglonglonglonglong",
+            )))
+        );
+        let port = Arc::new(DiffPort(Mutex::new(false)));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<SettingsSvc>(port).unwrap();
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.refresh_settings();
+        {
+            let moment = host.moment.read().unwrap();
+            assert!(moment.clip_diff);
+            let crate::sheet::Page::Read(read) = &moment.sheet.as_ref().unwrap().page else {
+                unreachable!()
+            };
+            assert!(!read.wrap_diff);
+        }
+        tui.apply_setting("ui.wrap_diff", "true").unwrap();
+        // The settings panel refreshes its projection after a successful edit.
+        tui.refresh_settings();
+        let moment = host.moment.read().unwrap();
+        assert!(!moment.clip_diff);
+        let crate::sheet::Page::Read(read) = &moment.sheet.as_ref().unwrap().page else {
+            unreachable!()
+        };
+        assert!(read.wrap_diff);
+        assert!(read.display_len(20) > 1);
+    }
     impl Settings for Port {
         fn rows(&self) -> SettingsView {
             SettingsView::new(vec![SettingRow {
@@ -17385,6 +18067,82 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 0);
         tui.complete_path("@\0mention-filter:sessions");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
+        tui.complete_path("@\0mention-filter:workspace");
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn preview_labels_and_workspace_filters_keep_their_reference_identity() {
+        use atomcode_capabilities::session::{
+            reference, SessionManager, SessionMeta, StorageOwner,
+        };
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+        let root = tempfile::tempdir().unwrap();
+        let local = "0123456789abcdef";
+        let other = "fedcba9876543210";
+        for (bucket, cwd, prompt) in [
+            (local, "/local", "  Local\n  question  "),
+            (other, "/another", "Other question"),
+        ] {
+            let manager = SessionManager::with_root(root.path().join(bucket));
+            let lease = manager.acquire_lease("same-id").unwrap();
+            let mut meta = SessionMeta::new("same-id", cwd, 1);
+            meta.owner = StorageOwner::Native;
+            manager
+                .create_event_session(&lease, &SessionHeader::new("same-id"), &meta)
+                .unwrap();
+            manager
+                .append_events(
+                    &lease,
+                    &[
+                        LoggedEvent {
+                            seq: 1,
+                            at: 1,
+                            event: SessionEvent::TurnStart { turn: 1 },
+                        },
+                        LoggedEvent {
+                            seq: 2,
+                            at: 2,
+                            event: SessionEvent::UserMessage {
+                                turn: 1,
+                                text: prompt.into(),
+                                images: Vec::new(),
+                            },
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+
+        let (_, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut cache = tui.session_references.lock().unwrap();
+            cache.entries = super::SessionSuggestion::scan(root.path());
+            cache.checked = Some(std::time::Instant::now());
+        }
+        *tui.mention_kind.lock().unwrap() = 2;
+        let rows = tui.mention_rows("/local", "same-id");
+        assert_eq!(rows.len(), 2);
+        for (row, label, bucket) in [
+            (&rows[0], "Local question", local),
+            (&rows[1], "Other question", other),
+        ] {
+            assert_eq!(row.label, label);
+            assert_eq!(
+                reference::parse(&row.value).unwrap(),
+                vec![reference::SessionReference {
+                    bucket: bucket.into(),
+                    id: "same-id".into(),
+                }]
+            );
+        }
+        assert_eq!(
+            tui.mention_rows("/local", "other question"),
+            vec![rows[1].clone()]
+        );
+        *tui.mention_kind.lock().unwrap() = 3;
+        assert_eq!(tui.mention_rows("/local", "same-id"), vec![rows[0].clone()]);
     }
 }
 
@@ -17598,6 +18356,187 @@ mod allowance_switch_tests {
         assert!(
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ask_route_tests {
+    use super::*;
+    use crate::surface::Key;
+
+    fn press(key: Key) -> crate::surface::KeyPress {
+        crate::surface::KeyPress::plain(key)
+    }
+
+    #[test]
+    fn a_committed_tail_goes_to_the_draft_not_the_panel() {
+        assert!(matches!(
+            route_ask_key(true, false, &press(Key::Char('m'))),
+            AskKeyRoute::Composer('m')
+        ));
+    }
+
+    #[test]
+    fn a_composer_stepped_aside_never_takes_the_key() {
+        // With the panel mounted the composer is hidden: the key must not be
+        // written into a field nobody can see.
+        assert!(matches!(
+            route_ask_key(true, true, &press(Key::Char('m'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn digits_stay_with_the_panel_even_over_a_draft() {
+        assert!(matches!(
+            route_ask_key(true, false, &press(Key::Char('1'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn an_empty_composer_leaves_the_keys_with_the_panel() {
+        assert!(matches!(
+            route_ask_key(false, false, &press(Key::Char('y'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn navigation_keys_stay_with_the_panel_while_the_draft_holds_text() {
+        for key in [Key::Enter, Key::Esc, Key::Up, Key::Tab] {
+            assert!(
+                matches!(route_ask_key(true, false, &press(key)), AskKeyRoute::Panel),
+                "navigation key stays with the panel"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_dispatch_requires_the_presented_request_and_selection() {
+        use atomcode_capabilities::tools::approval::APPROVAL_KIND;
+        use tokio::sync::oneshot::error::TryRecvError;
+        let approval = || {
+            crate::ask::question_for(
+                APPROVAL_KIND,
+                &serde_json::json!({"tool": "write_file", "args": r#"{"file_path":"note.txt"}"#}),
+                &[],
+            )
+            .expect("a tool approval")
+        };
+
+        for mounted in [false, true] {
+            let (host, tui) = assemble(Headless::new(100, 30));
+            if mounted {
+                host.modules
+                    .add_view(Arc::new(
+                        crate::module::Mounted::<crate::modules::ask::Ask>::new(),
+                    ))
+                    .unwrap();
+            }
+            let (id, mut answer) = host.asks.push_with_id(approval());
+            for key in [Key::Char('1'), Key::Down, Key::Enter] {
+                tui.answer_question(press(key), None);
+            }
+            assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
+
+            host.sync_asking();
+            let (shown, _) = tui.paint((100, 30));
+            assert_eq!(shown.unwrap().id, id);
+            tui.answer_question(press(Key::Down), shown);
+            tui.answer_question(press(Key::Enter), shown);
+            assert_eq!(
+                answer.try_recv(),
+                Err(TryRecvError::Empty),
+                "selection has not been painted"
+            );
+            let (selected, _) = tui.paint((100, 30));
+            assert_eq!(selected.unwrap().selected, Some(0));
+
+            let (next, mut next_answer) = host.asks.push_with_id(approval());
+            assert!(host.asks.withdraw(id));
+            host.sync_asking();
+            tui.answer_question(press(Key::Enter), selected);
+            assert_eq!(next_answer.try_recv(), Err(TryRecvError::Empty));
+
+            let (next_shown, _) = tui.paint((100, 30));
+            assert_eq!(next_shown.unwrap().id, next);
+            tui.answer_question(press(Key::Down), next_shown);
+            let (next_selected, _) = tui.paint((100, 30));
+            tui.answer_question(press(Key::Enter), next_selected);
+            assert_eq!(
+                next_answer.try_recv(),
+                Ok(Some(crate::ask::Reply::from("allow")))
+            );
+        }
+    }
+
+    #[test]
+    fn queued_confirmation_cannot_pick_up_a_later_selection_or_mouse_layout() {
+        let before = ApprovalInput {
+            presentation: crate::ask::PresentedApproval {
+                id: 1,
+                selected: None,
+            },
+            frame: 1,
+        };
+        let after = ApprovalInput {
+            presentation: crate::ask::PresentedApproval {
+                id: 1,
+                selected: Some(0),
+            },
+            frame: 2,
+        };
+        let enter = Input::Key(press(Key::Enter));
+        assert!(before.for_input(&enter, after).is_none());
+        assert_eq!(after.for_input(&enter, after).unwrap().selected, Some(0));
+
+        let click = Input::Mouse(crate::surface::Click::Press, 0, 0);
+        assert!(before.for_input(&click, after).is_none());
+        assert!(after.for_input(&click, after).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn queued_keys_keep_the_approval_seen_when_they_arrived() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (wake, mut received) = mpsc::unbounded_channel();
+        // The input reader replays short candidate lines as individual keys.
+        let keys = futures::stream::iter(
+            [
+                KeyCode::Char('1'),
+                KeyCode::Enter,
+                KeyCode::Char('2'),
+                KeyCode::Enter,
+            ]
+            .map(|key| Event::Key(KeyEvent::new(key, KeyModifiers::NONE))),
+        );
+        let sampled = std::cell::Cell::new(0);
+        pump_input(
+            keys,
+            wake,
+            || false,
+            false,
+            || {
+                let frame = sampled.get();
+                sampled.set(frame + 1);
+                Some(ApprovalInput {
+                    presentation: crate::ask::PresentedApproval {
+                        id: 1,
+                        selected: (frame > 0).then_some(0),
+                    },
+                    frame,
+                })
+            },
+        )
+        .await;
+        assert!(
+            matches!(received.try_recv(), Ok(Wake::InputOverApproval(Input::Key(key), receipt))
+            if key.key == Key::Char('1') && receipt.presentation.selected.is_none())
+        );
+        assert!(
+            matches!(received.try_recv(), Ok(Wake::InputOverApproval(Input::Key(key), receipt))
+            if key.key == Key::Enter && receipt.presentation.selected == Some(0))
         );
     }
 }

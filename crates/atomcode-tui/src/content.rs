@@ -161,6 +161,7 @@ pub struct WelcomeBlock {
     /// A dim line under the working directory and the model
     /// (`OpeningNotices::welcome_note`).
     pub note: Option<String>,
+    pub model_setup: Option<crate::model_setup::SetupView>,
 }
 
 /// What the welcome block says, in the language in force.
@@ -355,6 +356,28 @@ impl Content for WelcomeBlock {
         for (command, about) in &self.tips {
             parts.push(command);
             parts.push(about);
+        }
+        use crate::model_setup::SetupView;
+        match &self.model_setup {
+            Some(SetupView::Choose { second, expired }) => {
+                if *expired {
+                    parts.push("expired");
+                }
+                parts.push(if *second {
+                    "setup-provider"
+                } else {
+                    "setup-login"
+                });
+            }
+            Some(SetupView::Authorize { url, .. }) => {
+                parts.push("setup-authorize");
+                if let Some(url) = url {
+                    parts.push(url);
+                }
+            }
+            Some(SetupView::Completing) => parts.push("setup-completing"),
+            Some(SetupView::Provider) => parts.push("setup-provider-form"),
+            None => {}
         }
         hash_of(&parts)
     }
@@ -567,7 +590,156 @@ impl Content for WelcomeBlock {
                 rows.push(line);
             }
         }
-        rows.extend(below);
+        rows.append(&mut below);
+
+        use crate::model_setup::SetupView;
+        if let Some(setup) = self.model_setup.as_ref() {
+            rows.push(Line::empty());
+            let heading = if matches!(setup, SetupView::Provider) {
+                Msg::ModelSetupProvider
+            } else if matches!(setup, SetupView::Authorize { .. } | SetupView::Completing) {
+                Msg::ModelSetupLogin
+            } else if matches!(setup, SetupView::Choose { expired: true, .. }) {
+                Msg::RecoveryTitle
+            } else {
+                Msg::ModelSetupTitle
+            };
+            rows.extend(wrapped(&t(heading), content_w as u16, muted(), &pad));
+            match setup {
+                SetupView::Choose {
+                    second: selected,
+                    expired,
+                } => {
+                    for (second, label, about) in [
+                        (
+                            false,
+                            if *expired {
+                                Msg::RecoveryLogin
+                            } else {
+                                Msg::ModelSetupLogin
+                            },
+                            Msg::ModelSetupLoginAbout,
+                        ),
+                        (
+                            true,
+                            if *expired {
+                                Msg::RecoveryProvider
+                            } else {
+                                Msg::ModelSetupProvider
+                            },
+                            Msg::ModelSetupProviderAbout,
+                        ),
+                    ] {
+                        rows.push(Line::empty());
+                        let active = second == *selected;
+                        let marker = if active {
+                            ctx.caps.g(Glyph::Prompt)
+                        } else {
+                            " "
+                        };
+                        let prefix = format!("{pad}{marker} {}. ", if second { 2 } else { 1 });
+                        let style = if active {
+                            theme::fg(Role::Accent).bold()
+                        } else {
+                            Style::default()
+                        };
+                        rows.extend(wrapped(&t(label), content_w as u16, style, &prefix));
+                        if *expired {
+                            continue;
+                        }
+                        rows.extend(wrapped(
+                            &t(about),
+                            content_w as u16,
+                            muted(),
+                            &format!("{pad}     "),
+                        ));
+                    }
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupKeys),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                SetupView::Authorize { .. } => {
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupWaiting),
+                        content_w as u16,
+                        Style::default(),
+                        &pad,
+                    ));
+                }
+                SetupView::Provider => {
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupProviderAbout),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                SetupView::Completing => {
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupCompleting),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+            }
+        }
+        if let Some(SetupView::Authorize { url, screen_rows }) = &self.model_setup {
+            let cancel = wrapped(
+                &t(if url.is_some() {
+                    Msg::LoginLinkKeys
+                } else {
+                    Msg::LoginCancelKey
+                }),
+                content_w as u16,
+                muted(),
+                &pad,
+            );
+            if let Some(url) = url {
+                rows.push(Line::empty());
+                let url_rows = crate::markdown::wrap_spans(
+                    &[Span::linked(
+                        url,
+                        theme::fg(Role::Accent).underline(),
+                        url.as_str(),
+                    )],
+                    content_w as u16,
+                    &pad,
+                    muted(),
+                );
+                let qr_rows = crate::qr::CodeBlock::new(url).map_or_else(Vec::new, |qr| {
+                    qr.lines(&RenderCtx {
+                        width: content_w as u16,
+                        ..*ctx
+                    })
+                });
+                let scan = wrapped(&t(Msg::ScanOrOpen), content_w as u16, muted(), &pad);
+                // Include the gap before the cancel hint and the trailing blank.
+                let with_code =
+                    rows.len() + scan.len() + qr_rows.len() + url_rows.len() + cancel.len() + 2;
+                if !qr_rows.is_empty() && with_code <= usize::from(*screen_rows) {
+                    rows.extend(scan);
+                    rows.extend(qr_rows);
+                } else {
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupOpenLink),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                rows.extend(url_rows);
+            }
+            rows.push(Line::empty());
+            rows.extend(cancel);
+        }
 
         // A trailing blank, so whatever arrives next (a connection notice, an
         // upgrade hint) does not butt against the last row. Tuix keeps one too.
@@ -751,15 +923,7 @@ impl Content for UserSaid {
         }
         let room = (width as usize).saturating_sub(2);
         let text = clip(&text, room);
-        input_bar(
-            &text,
-            width,
-            &format!("{} ", Caps::default().g(Glyph::Prompt)),
-            None,
-            user(),
-        )
-        .into_iter()
-        .next()
+        user_bar(&text, width).into_iter().next()
     }
 
     fn content_hash(&self) -> ContentHash {
@@ -781,27 +945,19 @@ impl Content for UserSaid {
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        // The `!` commands that rode along are the model's reading, not what
-        // was typed: the person's words lead the bar, and each command follows
-        // as one muted `! command` row — said, so a resumed session still shows
-        // that the message carried it, but not as the tags the model reads.
         let (ran, said) = crate::shell::split_context(&self.0);
-        let mut rows = input_bar(
-            said,
-            ctx.width,
-            &format!("{} ", Caps::default().g(Glyph::Prompt)),
-            None,
-            user(),
-        );
-        let room = (ctx.width as usize).saturating_sub(4);
-        for command in ran {
-            rows.extend(input_bar(
-                &clip(&command, room),
+        let mut rows = user_bar(said, ctx.width);
+        if !ran.is_empty() && ctx.width > 0 {
+            rows.push(Line::default());
+            rows.extend(wrapped(
+                &t(Msg::ShellContextHeading),
                 ctx.width,
-                "  ! ",
-                None,
                 muted(),
+                "  ",
             ));
+            for command in ran {
+                rows.extend(wrapped(&command, ctx.width, muted(), "  ! "));
+            }
         }
         rows
     }
@@ -839,6 +995,25 @@ fn input_bar(text: &str, w: u16, mark: &str, mark_style: Option<Style>, style: S
             Line::from_spans(spans)
         })
         .collect()
+}
+
+fn user_bar(text: &str, width: u16) -> Vec<Line> {
+    let mut rows = input_bar(
+        text,
+        width,
+        &format!("{} ", Caps::default().g(Glyph::Prompt)),
+        None,
+        user(),
+    );
+    for row in &mut rows {
+        // The wrapper keeps its prompt/continuation indent in its own span.
+        // Only that span is decoration; literal chevrons and indentation in
+        // the person's message remain copyable.
+        if let Some(prefix) = row.spans.first_mut() {
+            *prefix = prefix.clone().decoration();
+        }
+    }
+    rows
 }
 
 /// A `!` command the person ran here, echoed as Claude Code echoes one: the
@@ -1562,7 +1737,7 @@ impl ToolCallBlock {
     /// diff, or `write_file`'s content as all-additions — when it succeeded and
     /// there is a change worth colouring. `None` for every other call and state,
     /// which then renders its result as text.
-    fn diff_view(&self, w: u16) -> Option<crate::diff::Rendered> {
+    fn diff_view(&self, w: u16, wrap: bool) -> Option<crate::diff::Rendered> {
         const MAX: usize = 400;
         // The indent the plain result body uses too, so folding one for the other
         // does not shift the column.
@@ -1571,7 +1746,7 @@ impl ToolCallBlock {
             return None;
         };
         match self.name.as_str() {
-            "edit_file" => crate::diff::render_edit(output, w, indent, MAX),
+            "edit_file" => crate::diff::render_edit_with_wrap(output, w, indent, MAX, wrap),
             "write_file" => {
                 let content = serde_json::from_str::<serde_json::Value>(&self.args)
                     .ok()?
@@ -1581,7 +1756,9 @@ impl ToolCallBlock {
                 if content.trim().is_empty() {
                     return None;
                 }
-                Some(crate::diff::render_written(&content, w, indent, MAX))
+                Some(crate::diff::render_written_with_wrap(
+                    &content, w, indent, MAX, wrap,
+                ))
             }
             _ => None,
         }
@@ -2192,7 +2369,7 @@ impl Content for ToolCallBlock {
         // row: the subject line when the model gave a reason, the head otherwise),
         // right after the file, and the line is re-clipped so the suffix cannot
         // push it past the width.
-        if let Some(diff) = self.diff_view(w) {
+        if let Some(diff) = self.diff_view(w, ctx.caps.wrap_diff) {
             if let Some(mut last) = out.pop() {
                 last.spans
                     .extend(self.diff_count_spans(diff.added, diff.removed));
@@ -4256,7 +4433,55 @@ mod tests {
             ],
             brand: std::sync::Arc::new(Brand::default()),
             note: None,
+            model_setup: None,
         }
+    }
+
+    #[test]
+    fn model_setup_choices_follow_the_welcome_tips_and_directory() {
+        let block = WelcomeBlock {
+            model_setup: Some(crate::model_setup::SetupView::Choose {
+                second: false,
+                expired: true,
+            }),
+            ..welcome()
+        };
+        for width in [32, 100] {
+            let rows = block.lines(&wctx(width, true));
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+            let find = |text: &str| {
+                rows.iter()
+                    .position(|row| row.plain().contains(text))
+                    .unwrap()
+            };
+            let directory = find("~/proj");
+            let setup = find(t(Msg::RecoveryTitle).as_ref());
+            assert!(find("上手提示") < find("/resume"));
+            assert!(find("/resume") < directory && directory < setup);
+            assert!(setup < find("1.") && find("1.") < find("2."));
+        }
+    }
+
+    #[test]
+    fn the_setup_authorization_falls_back_to_a_link_in_a_short_terminal() {
+        let url = "https://example.test/authorize";
+        let shows_qr = |screen_rows| {
+            let block = WelcomeBlock {
+                model_setup: Some(crate::model_setup::SetupView::Authorize {
+                    url: Some(url.into()),
+                    screen_rows,
+                }),
+                ..welcome()
+            };
+            let lines = lines_of(&block, 80, true);
+            assert!(lines.iter().any(|line| line.contains(url)));
+            assert!(lines.iter().any(|line| line.contains("Esc")));
+            lines
+                .iter()
+                .any(|line| line.chars().filter(|ch| *ch == '▀').count() > 9)
+        };
+        assert!(shows_qr(40));
+        assert!(!shows_qr(12));
     }
 
     #[test]
@@ -4294,6 +4519,7 @@ mod tests {
                 colors: crate::caps::Colors::Ansi256,
                 cell_background,
                 graphics: crate::caps::Graphics::None,
+                wrap_diff: true,
             },
         }
     }
@@ -4346,6 +4572,7 @@ mod tests {
             width: 100,
             caps: crate::block::ShapeCaps {
                 colors: crate::caps::colors_for(&env, false),
+                wrap_diff: true,
                 unicode: crate::caps::unicode_for(&env),
                 basic_glyphs: caps.basic_glyphs,
                 cell_background: crate::caps::cell_background_for(&env, false, false),
@@ -4497,6 +4724,7 @@ mod tests {
         let block = WelcomeBlock {
             brand: std::sync::Arc::new(mine.clone()),
             note: None,
+            model_setup: None,
             ..welcome()
         };
         let all = lines_of(&block, 80, true).join("\n");
@@ -5377,6 +5605,39 @@ mod tests {
     }
 
     #[test]
+    fn diff_wrap_remeasures_settled_tools_without_changing_source_or_copy() {
+        let text = "https://example.com/".repeat(10);
+        let block = ToolCallBlock {
+            call_id: "wrap".into(),
+            name: "edit_file".into(),
+            args: r#"{"file_path":"a.rs"}"#.into(),
+            outcome: Outcome::Ok(format!("@@ -0,0 +1 @@\n+{text}")),
+            dir: None,
+            progress: None,
+        };
+        let wrap = crate::block::RenderCtx::bare(30);
+        let clip = crate::block::RenderCtx {
+            caps: wrap.caps.with_diff_wrap(false),
+            ..wrap
+        };
+        assert_eq!(block.reading_text(&wrap), block.reading_text(&clip));
+        let mut stream = crate::block::Stream::new();
+        let mut writer = stream.writer("test");
+        let id = writer.emit(Default::default(), std::sync::Arc::new(block));
+        writer.settle_all();
+        let slot = stream.get(id).unwrap();
+        let hash = slot.block().content.content_hash();
+        let clipped = slot.rows_at(&clip).0;
+        let wrapped = slot.rows_at(&wrap).0;
+        assert!(wrapped > clipped);
+        assert!(
+            slot.rows_at(&clip).1.is_some(),
+            "changing wrapping invalidates row measurements"
+        );
+        assert_eq!(slot.block().content.content_hash(), hash);
+    }
+
+    #[test]
     fn a_write_file_call_renders_its_content_as_green_additions() {
         let block = ToolCallBlock {
             call_id: "c".into(),
@@ -6193,9 +6454,7 @@ mod tests {
         assert!(rows[1].contains("⎿ $ make ·"), "{rows:?}");
     }
 
-    /// The `!` commands a message carried are not drawn as the tags the model
-    /// reads: the person's words lead the bar, each command follows as a muted
-    /// `! command` row.
+    /// A message's local command context is labelled below the user bar.
     #[test]
     fn a_message_that_carried_a_shell_command_shows_the_words_and_the_command() {
         let text = format!(
@@ -6209,8 +6468,10 @@ mod tests {
             .collect();
         assert!(!rows.iter().any(|r| r.contains("bash-")), "{rows:?}");
         assert!(rows[0].contains("分析下这个项目"), "{rows:?}");
+        assert!(rows[1].is_empty(), "{rows:?}");
+        assert_eq!(rows[2].trim(), t(Msg::ShellContextHeading));
         assert!(
-            rows[1].trim_end().ends_with("! rm -rf pelican-bike.html"),
+            rows[3].trim_end().ends_with("! rm -rf pelican-bike.html"),
             "{rows:?}"
         );
         assert!(rows.iter().all(|r| width::str_width(r) <= 60), "{rows:?}");
@@ -6705,5 +6966,37 @@ mod prompt_header_tests {
         assert!(!header.plain().contains('\x1b'));
         assert!(!header.plain().contains('\n'));
         assert_eq!(prompt.content_hash(), hash);
+    }
+}
+
+#[cfg(test)]
+mod user_clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn user_prompt_is_decoration_but_literal_chevrons_and_indents_are_text() {
+        let ctx = RenderCtx::bare(40);
+        for text in ["你好世界", "❯ literal", "  indented"] {
+            let user = UserSaid(text.into());
+            let lines = user.lines(&ctx);
+            assert_eq!(lines[0].selected_text(0, 40).trim_end(), text);
+            assert_eq!(user.reading_text(&ctx), text);
+            let mut frame = crate::frame::Frame::new(40, 2);
+            frame.place("user", crate::frame::Rect::sized(40, 2), lines);
+            assert_eq!(frame.selected_text(&frame.line_at(0).unwrap()), text);
+            if text == "你好世界" {
+                assert_eq!(frame.selected_text(&frame.word_at(3, 0).unwrap()), text);
+            }
+            let header = user.prompt_header(40).unwrap();
+            assert_eq!(header.selected_text(0, 40).trim_end(), text.trim_start());
+        }
+        let user = UserSaid("abcdefghij".into());
+        let lines = user.lines(&RenderCtx::bare(6));
+        assert!(lines.len() > 1);
+        let copied: String = lines
+            .iter()
+            .map(|line| line.selected_text(0, 6).trim_end().to_owned())
+            .collect();
+        assert_eq!(copied, "abcdefghij");
     }
 }

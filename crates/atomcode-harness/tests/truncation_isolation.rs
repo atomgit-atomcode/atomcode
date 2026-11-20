@@ -110,6 +110,7 @@ async fn request(ctx: &Context, response: ModelResponse) -> (ModelResponse, Chat
         turn: 1,
         round: 1,
         answering_a_nudge: false,
+        images: Default::default(),
     };
     let result = as_agent(
         ctx.clone(),

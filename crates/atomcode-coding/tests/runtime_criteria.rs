@@ -108,7 +108,33 @@ fn is_summary_request(request: &[Message]) -> bool {
     request.first().is_some_and(|m| {
         m.text
             .starts_with("You are an anchored context summarization assistant")
+    }) || request.last().is_some_and(|m| {
+        m.text
+            .starts_with("This is a maintenance task, not a conversational turn")
     })
+}
+
+fn assert_compaction_replays_sent_prefix(recorder: &Recorder, at: usize) {
+    let requests = recorder.requests.lock().unwrap();
+    let defs = recorder.defs.lock().unwrap();
+    let options = recorder.options.lock().unwrap();
+    let prior = requests[..at]
+        .iter()
+        .rposition(|request| !is_summary_request(request))
+        .unwrap();
+    let (instruction, prefix) = requests[at].split_last().unwrap();
+    assert!(instruction.text.starts_with("This is a maintenance task"));
+    assert!(prefix.len() > 1);
+    assert!(
+        requests[prior].starts_with(prefix),
+        "summary did not replay the exact sent prefix"
+    );
+    assert!(!defs[prior].is_empty());
+    assert_eq!(defs[at], defs[prior]);
+    assert_eq!(
+        options[at].reasoning_effort,
+        options[prior].reasoning_effort
+    );
 }
 
 /// Long enough that a second copy reads as a re-dump rather than a coincidence.
@@ -163,6 +189,23 @@ impl LlmProvider for RecordingProvider {
                 retry_after_secs: None,
             });
         }
+        // A provider that will not take the pictures in a request (DeepSeek's
+        // words for a picture it cannot read).
+        if messages
+            .iter()
+            .any(|m| m.role == Role::User && m.text == "refuse pictures")
+            && messages.iter().any(|m| !m.images.is_empty())
+        {
+            return Err(ProviderError {
+                retryable: false,
+                message:
+                    "HTTP 400: .messages[3].content[0]: You have uploaded an unsupported image."
+                        .into(),
+                http_status: Some(400),
+                code: None,
+                retry_after_secs: None,
+            });
+        }
         // A long task: plan, dig for a while without touching the list, stop.
         if let Some(steps) = dig_steps(messages) {
             let event = match steps {
@@ -190,7 +233,30 @@ impl LlmProvider for RecordingProvider {
                 StreamEvent::Done { truncated: false },
             ])));
         }
+        // A job left running in the background, polled once, then the answer.
+        let backgrounding = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.synthetic)
+            .is_some_and(|m| m.text.starts_with("background "));
         let first = match last {
+            Some(m) if backgrounding && m.role == Role::User => StreamEvent::ToolCall(ToolCall {
+                id: format!("call-{n}"),
+                name: "bash_start".into(),
+                arguments: serde_json::json!({ "command": &m.text[11..] }).to_string(),
+            }),
+            Some(m) if backgrounding && m.text.starts_with("Started background job ") => {
+                let job = m.text["Started background job ".len()..]
+                    .split_once(". ")
+                    .map(|(job, _)| job)
+                    .unwrap_or_default();
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "bash_poll".into(),
+                    arguments: serde_json::json!({ "job_id": job, "wait_ms": 0 }).to_string(),
+                })
+            }
+            Some(_) if backgrounding => StreamEvent::TextDelta("polled".into()),
             Some(m) if m.role == Role::User && m.text == "launch debug fixture" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -227,6 +293,16 @@ impl LlmProvider for RecordingProvider {
                         serde_json::json!({ "file_path": &m.text[6..], "content": "written\n" })
                             .to_string(),
                 })
+            }
+            // A provider refusal that quotes the path the prompt named.
+            Some(m) if m.role == Role::User && m.text.starts_with("fail at ") => {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: format!("HTTP 400: {}", &m.text[8..]),
+                    http_status: Some(400),
+                    code: Some("invalid_request".into()),
+                    retry_after_secs: None,
+                });
             }
             // A provider-side failure the retry tier is meant to ride out.
             Some(m) if m.role == Role::User && m.text == "fail every time" => {
@@ -1569,6 +1645,119 @@ fn system_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// Completions are delivered after a response ends, so only a driver that shows
+/// the turn a completion starts lets the model end its response to wait; a run
+/// that ends with the response (`-p`) is told to wait with `bash_poll` instead.
+async fn the_model_is_told_how_this_host_waits_for_background_work() {
+    for wakeups in [true, false] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.background_wakeups = wakeups;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, "hello").await;
+        let shown = system_text(&recorder.last_request());
+        assert_eq!(
+            shown.contains("This host resumes you when a background job finishes"),
+            wakeups,
+            "{shown}"
+        );
+        assert_eq!(
+            shown.contains("This host does not resume you when a background job finishes"),
+            !wakeups,
+            "{shown}"
+        );
+        let defs = recorder.defs.lock().unwrap().last().cloned().unwrap();
+        for name in ["bash", "bash_start"] {
+            assert!(
+                defs.iter().any(|def| def.name == name),
+                "the request must advertise {name}"
+            );
+        }
+        if wakeups {
+            // A model that needs the result next reads "end your response" as
+            // giving up the task, and copies any long poll it is shown instead —
+            // in the system prompt or in a tool definition sent beside it.
+            assert!(
+                shown.contains("Ending your response does not end the task"),
+                "{shown}"
+            );
+            assert!(!shown.contains("up to 60000"), "{shown}");
+            for def in &defs {
+                assert!(
+                    !def.description.contains("up to 60000"),
+                    "{}: {}",
+                    def.name,
+                    def.description
+                );
+            }
+        } else {
+            assert!(
+                shown.contains("wait with bash_poll using a long wait_ms"),
+                "{shown}"
+            );
+        }
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    }
+}
+
+/// A model whose poll found a job still running, where the host will wake it
+/// when the job finishes, is told on that request to end its response. The
+/// reminder rides the request only: the poll's result stays the tool's own for
+/// the front end that groups quiet polls and the loop guard that counts them,
+/// and a note after the status line does not hide the job's state from it.
+/// Under `-p` polling is how the model waits, so nothing is said.
+async fn a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request() {
+    for (command, wakeups, quiet) in [
+        ("sleep 20", true, true),
+        ("sleep 20 && cargo build | tail -n 5", true, false),
+        ("sleep 20", false, true),
+    ] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.background_wakeups = wakeups;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, &format!("background {command}")).await;
+        // The request that answered the poll, not a side call made after it.
+        let sent = recorder
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|request| request.iter().any(|m| m.role == Role::Tool))
+            .cloned()
+            .expect("a request answered the poll");
+        let poll = sent
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("the poll's result was sent");
+        if quiet {
+            assert_eq!(poll.text, "status: running", "{command}");
+        } else {
+            assert!(
+                poll.text.contains("status: running\n\n[execution note"),
+                "{command}: {}",
+                poll.text
+            );
+        }
+        let reminded = sent
+            .iter()
+            .skip_while(|m| m.role != Role::Tool || m.text != poll.text)
+            .any(|m| m.synthetic && m.text.contains("end your response instead of polling"));
+        let shape: Vec<String> = sent
+            .iter()
+            .map(|m| format!("{:?} synthetic={} {:.120}", m.role, m.synthetic, m.text))
+            .collect();
+        assert_eq!(reminded, wakeups, "{command}: {shape:#?}");
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    }
+}
+
 /// The model is told where it is working, and a resumed session keeps the git
 /// snapshot it started with — rewriting it would break the cached prefix of the
 /// whole resumed conversation.
@@ -1660,6 +1849,58 @@ async fn a_turn_is_transcribed_and_metered() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// The runtime assembly hands the session's working directory to the
+/// telemetry hook: a provider error quoting a path inside it is scrubbed to
+/// `<CWD>`. The hook's own unit test starts with a directory; this one proves
+/// the runtime actually passes the one the session runs in.
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn a_provider_error_is_scrubbed_with_the_session_working_dir() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    let path = env.project.path().join("src/main.rs");
+    turn(
+        &mut runtime,
+        &format!("fail at cannot open {}", path.display()),
+    )
+    .await;
+
+    let raw = env.project.path().display().to_string();
+    let mut reason = None;
+    for _ in 0..100 {
+        for record in captured.lock().await.iter() {
+            if let atomcode_telemetry::Event::LlmChat {
+                had_error: true,
+                error_data: Some(data),
+                ..
+            } = &record.event
+            {
+                reason = Some(data.clone());
+            }
+        }
+        if reason.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let reason = reason.expect("a failed LlmChat carries its reason");
+    let normalized = reason.replace('\\', "/");
+    assert!(
+        normalized.contains("<CWD>/src/main.rs"),
+        "the session path was not scrubbed relative to its working directory: {reason}"
+    );
+    assert!(
+        !reason.contains(&raw),
+        "the raw working directory leaked: {reason}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// The person's `hooks.json` runs, and so does a hook a plugin contributed.
 async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
     let env = env();
@@ -1690,6 +1931,7 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         },
     ]));
     let mut runtime = CodingRuntime::start(start).await.unwrap();
@@ -1698,6 +1940,101 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
 
     assert!(from_file.exists(), "the hooks.json hook did not run");
     assert!(from_plugin.exists(), "the plugin's hook did not run");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Even in accept-edits mode, a required approval must authorize the write.
+#[cfg(unix)]
+async fn a_failed_required_approval_prevents_the_tool_from_writing() {
+    let env = env();
+    let project = env.project.path();
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "guard": {
+                    "event": "PreToolUse",
+                    "matcher": "write_file",
+                    "command": "exit 127",
+                    "required_approval": true,
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    turn(&mut runtime, "write denied.txt").await;
+    assert!(!project.join("denied.txt").exists());
+    assert!(recorder.last_request().iter().any(
+        |message| message.role == Role::Tool && message.text.contains("Required approval hook")
+    ));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+async fn managed_required_approval_is_checked_on_the_hooks_the_runtime_loads() {
+    let env = env();
+    let project = env.project.path();
+    let hooks = serde_json::json!({"hooks": {"guard": {
+        "event": "PreToolUse",
+        "matcher": "",
+        "command": "exit 127",
+        "required_approval": true
+    }}})
+    .to_string();
+    std::fs::write(project.join(".hooks.json"), &hooks).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let managed = || {
+        let mut input = start(project, &recorder, SessionMode::Fresh);
+        input.agent.require_approval_hook = true;
+        input
+    };
+    let user_hooks = env._home.path().join("hooks.json");
+    for content in [None, Some("{invalid")] {
+        if let Some(content) = content {
+            std::fs::write(&user_hooks, content).unwrap();
+        }
+        let Err(error) = CodingRuntime::start(managed()).await else {
+            panic!("managed startup must reject a missing or malformed user hook file");
+        };
+        assert!(
+            error.to_string().contains("--require-approval-hook"),
+            "{error}"
+        );
+    }
+
+    std::fs::remove_file(project.join(".hooks.json")).unwrap();
+    std::fs::write(&user_hooks, hooks).unwrap();
+    let mut runtime = CodingRuntime::start(managed()).await.unwrap();
+    let generation = runtime.handle.status().generation;
+    std::fs::remove_file(user_hooks).unwrap();
+    let mut reload = start(project, &recorder, SessionMode::Fresh).agent;
+    reload.todo.enabled = !reload.todo.enabled;
+    let error = runtime.handle.reprepare_config(reload).await.unwrap_err();
+    assert!(
+        error.to_string().contains("--require-approval-hook"),
+        "{error}"
+    );
+    assert_eq!(runtime.handle.status().generation, generation);
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    turn(&mut runtime, "write denied.txt").await;
+    assert!(!project.join("denied.txt").exists());
+    assert!(recorder.last_request().iter().any(
+        |message| message.role == Role::Tool && message.text.contains("Required approval hook")
+    ));
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -4516,6 +4853,91 @@ async fn an_exhausted_plan_window_pauses_until_its_reset() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// How many reminders the host added to a request, and how many say plan
+/// mode is on. A request sent again — a limit waited out, a picture refused —
+/// must carry each of them once, as the first did.
+fn reminders(request: &[Message]) -> (usize, usize) {
+    let tails = request
+        .iter()
+        .filter(|m| m.text.contains("<system-reminder>"))
+        .count();
+    let plan = request
+        .iter()
+        .filter(|m| m.text.contains("PLAN MODE is active"))
+        .count();
+    (tails, plan)
+}
+
+/// Every attempt at one turn carries the host's reminders once — the rows
+/// that add them are run again on the same request whenever it is resent.
+async fn a_request_sent_again_carries_each_reminder_once() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.supports_vision = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+
+    // A limit that clears in a moment: waited out, the request goes again.
+    let (reason, _) = turn_to_rate_limit(&mut runtime, "blip").await;
+    assert_eq!(reason, Some(atomcode_kernel::event::StopReason::Stopped));
+    let attempts: Vec<(usize, usize)> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| reminders(r))
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].1, 1, "plan mode said once: {attempts:?}");
+    assert_eq!(
+        attempts[1], attempts[0],
+        "resent after the limit: {attempts:?}"
+    );
+
+    // A picture the provider refuses: sent again without it.
+    recorder.requests.lock().unwrap().clear();
+    runtime
+        .handle
+        .submit(UserInput {
+            text: "refuse pictures".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let attempts: Vec<(usize, usize, usize)> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let (tails, plan) = reminders(r);
+            (r.iter().map(|m| m.images.len()).sum(), tails, plan)
+        })
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!((attempts[0].0, attempts[1].0), (1, 0), "{attempts:?}");
+    assert_eq!(attempts[0].2, 1, "plan mode said once: {attempts:?}");
+    assert_eq!(
+        (attempts[1].1, attempts[1].2),
+        (attempts[0].1, attempts[0].2),
+        "resent without the picture: {attempts:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A limit that clears in a moment is waited out, and the turn goes on.
 async fn a_brief_rate_limit_is_waited_out() {
     let env = env();
@@ -5403,13 +5825,17 @@ async fn a_requested_compaction_is_summarized_by_the_model_about_the_focus() {
     };
     assert!(outcome.committed, "the compaction was refused");
 
-    let summary_call = recorder.requests.lock().unwrap()[asked_before..]
+    let summary_call = recorder
+        .requests
+        .lock()
+        .unwrap()
         .iter()
-        .any(|request| request.iter().any(|m| m.text.contains("the zebra parser")));
-    assert!(
-        summary_call,
-        "no model was asked to summarize with the focus"
-    );
+        .enumerate()
+        .skip(asked_before)
+        .find(|(_, request)| request.iter().any(|m| m.text.contains("the zebra parser")))
+        .map(|(index, _)| index)
+        .expect("the summary request must carry the focus");
+    assert_compaction_replays_sent_prefix(&recorder, summary_call);
     let meta = SessionManager::for_project(
         env.project.path(),
         &atomcode_coding::config::product_dirs_from_env(),
@@ -5487,18 +5913,20 @@ async fn the_prompt_teaches_each_product_tool_once() {
 async fn a_picture_read_reaches_a_model_that_can_see_it() {
     for vision in [true, false] {
         let env = env();
-        std::fs::write(
-            env.project.path().join("cover.jpg"),
-            [
-                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
-            ],
-        )
-        .unwrap();
+        // A real 2×1 PNG: a picture that does not decode is never attached.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x7B, 0x40, 0xE8, 0xDD, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0x00, 0x04, 0xFF, 0x01, 0x07, 0x00, 0x01, 0xFF, 0xE2, 0x23,
+            0x9E, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(env.project.path().join("cover.png"), PNG).unwrap();
         let recorder = Arc::new(Recorder::default());
         let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
         config.agent.supports_vision = vision;
         let mut runtime = CodingRuntime::start(config).await.unwrap();
-        turn(&mut runtime, "read cover.jpg").await;
+        turn(&mut runtime, "read cover.png").await;
         let shown = recorder.last_request().iter().any(|m| !m.images.is_empty());
         assert_eq!(shown, vision, "vision = {vision}");
         runtime.handle.shutdown().await.unwrap();
@@ -6026,10 +6454,13 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
     // A 128k window keeps about 32k tokens of recent turns; each prompt is ~10k.
     recorder.window.store(128_000, Ordering::SeqCst);
     recorder.prompt_tokens.store(104_000, Ordering::SeqCst);
-    let mut runtime =
-        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
-            .await
-            .unwrap();
+    // Every answer reports 104k however much was cut, so each next request
+    // measures 104k plus a ~10k prompt. A short completion keeps that inside the
+    // window; the default 16k would leave no room, and the pre-send guard —
+    // not the summary threshold under test — would act first.
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.chat_options.max_tokens = Some(1_024);
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
     let id = runtime.session.clone().unwrap().id;
 
     for n in 0..6 {
@@ -6042,6 +6473,17 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
 
     let summaries = recorder.summary_requests();
     assert_eq!(summaries.len(), 2, "one summary, then one update of it");
+    let summary_indices = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_summary_request(request).then_some(index))
+        .collect::<Vec<_>>();
+    for index in summary_indices {
+        assert_compaction_replays_sent_prefix(&recorder, index);
+    }
     assert!(
         summaries[1]
             .last()
@@ -7038,11 +7480,18 @@ mod criteria {
         an_undone_turn_is_not_offered_as_a_rewind_point,
         a_restored_snapshot_is_what_the_model_sees,
         plan_mode_refuses_a_write_and_says_so,
+        a_request_sent_again_carries_each_reminder_once,
         accept_edits_applies_a_write_without_asking,
         an_always_allow_survives_an_undo,
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
+        the_model_is_told_how_this_host_waits_for_background_work,
+        a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        #[cfg(unix)]
+        a_failed_required_approval_prevents_the_tool_from_writing,
+        #[cfg(unix)]
+        managed_required_approval_is_checked_on_the_hooks_the_runtime_loads,
         #[cfg(unix)]
         the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused,
         a_stop_hook_is_pointed_at_the_sessions_log,
@@ -7417,7 +7866,8 @@ async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() 
                         text: task.into(),
                         images: vec![atomcode_kernel::message::ImageContent {
                             media_type: "image/png".into(),
-                            data: "cGljdHVyZQ==".into(),
+                            // A real 2×1 PNG: one that does not decode is left out.
+                            data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
                         }],
                     },
                 )

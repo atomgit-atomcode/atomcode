@@ -55,6 +55,15 @@ export function validBaseUrl(raw: string): boolean {
   }
 }
 
+/** Convert only a catalogued pair, preserving its plan/region. Custom URLs
+ * stay visible and unchanged instead of being replaced with vendor defaults. */
+export function switchConnectionUrl(raw: string, previous: string[], next: string[]): string {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!value) return next[0] ?? '';
+  const index = previous.indexOf(value);
+  return index >= 0 && next[index] ? next[index] : raw;
+}
+
 /** A model's reasoning settings in a form. Declaring levels is what makes a
  * model offer a level picker in the chat; `effort` is the level requests carry
  * by default, `null` for the endpoint's own default. */
@@ -100,10 +109,46 @@ export interface ModelDraft {
   /** `null` is "decide for me". */
   vision: boolean | null;
   reasoning: ReasoningDraft;
+  discoveredFields?: ModelMetadataField[];
+  discoveredReasoningLevels?: boolean;
+  discoveredReasoningEffort?: boolean;
+  reasoningEdited?: boolean;
 }
+
+const modelMetadataFields = ['displayName', 'window', 'maxTokens', 'vision'] as const;
+type ModelMetadataField = typeof modelMetadataFields[number];
 
 export function emptyModelDraft(model = ''): ModelDraft {
   return { model, displayName: '', window: '', maxTokens: '', vision: null, reasoning: noReasoning() };
+}
+
+export function updateModelDraft(row: ModelDraft, patch: Partial<ModelDraft>): ModelDraft {
+  const changedModel = patch.model !== undefined && patch.model.trim() !== row.model.trim();
+  const discovered = row.discoveredFields ?? [];
+  const defaults = changedModel && discovered.length ? emptyModelDraft() : undefined;
+  const base = defaults
+    ? { ...row, ...Object.fromEntries(discovered.map((field) => [field, defaults[field]])) }
+    : row;
+  const reasoning = patch.reasoning ?? row.reasoning;
+  const levelsChanged = reasoning.levels !== row.reasoning.levels;
+  const effortChanged = reasoning.effort !== row.reasoning.effort;
+  const discoveredLevels = row.discoveredReasoningLevels && !levelsChanged;
+  const discoveredEffort = row.discoveredReasoningEffort && !effortChanged;
+  const reasoningEdited = row.reasoningEdited || levelsChanged || reasoning.enabled !== row.reasoning.enabled;
+  const levels = changedModel && discoveredLevels ? [] : reasoning.levels;
+  const effort = changedModel && discoveredEffort ? null : reasoning.effort;
+  const enabled = reasoning.enabled && (
+    !changedModel || levels.length > 0 || effort !== null || reasoningEdited === true
+  );
+  return {
+    ...base,
+    ...patch,
+    reasoning: { enabled, levels, effort },
+    discoveredFields: changedModel ? undefined : discovered.filter((field) => !(field in patch)),
+    discoveredReasoningLevels: !changedModel && discoveredLevels,
+    discoveredReasoningEffort: !changedModel && discoveredEffort,
+    reasoningEdited,
+  };
 }
 
 /** The add form, in either mode. */
@@ -195,7 +240,9 @@ export function modelBody(m: ModelDraft): {
     ...(typeof window === 'number' ? { context_window: window } : {}),
     ...(typeof maxTokens === 'number' ? { max_tokens: maxTokens } : {}),
     ...(m.vision !== null ? { supports_vision: m.vision } : {}),
-    ...(m.reasoning.enabled ? { reasoning_effort_levels: m.reasoning.levels } : {}),
+    ...(m.reasoning.enabled || m.reasoningEdited
+      ? { reasoning_effort_levels: m.reasoning.enabled ? m.reasoning.levels : [] }
+      : {}),
     ...(m.reasoning.enabled && m.reasoning.effort ? { reasoning_effort: m.reasoning.effort } : {}),
   };
 }
@@ -241,6 +288,9 @@ export function adoptPicked(
         levels: p.reasoning_effort_levels ?? [],
         effort: p.reasoning_effort_levels?.includes(p.reasoning_effort ?? '') ? p.reasoning_effort! : null,
       },
+      discoveredFields: modelMetadataFields.slice(),
+      discoveredReasoningLevels: !!p.reasoning_effort_levels?.length,
+      discoveredReasoningEffort: p.reasoning_effort_levels?.includes(p.reasoning_effort ?? ''),
     }));
   return [...kept, ...added];
 }

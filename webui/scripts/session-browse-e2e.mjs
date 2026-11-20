@@ -8,12 +8,15 @@ const root = resolve(import.meta.dirname, '../dist');
 const id = 'context-summary-fixture';
 const meta = { id, name: 'Context summary', working_dir: '/fixture', project_hash: 'fixture', created_at: 1700000000, updated_at: 1700000001, message_count: 2 };
 const specificationText = 'MUST NOT change public API\r\nconst exact = 42;';
-const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
+const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false, created_at:1700000000000 }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conversation with a long title for layout coverage' };
 let releaseSlowHistory = null;
 let switchRejection = null;
 let switches = 0;
+let pagedBrowse = false;
+let failOlder = false;
+let refreshOnConnect = true;
 let specificationPinned = false;
 const patchUploads = [];
 let patchReplyMode = 'ok';
@@ -55,13 +58,35 @@ const server = createServer(async (req, res) => {
     if(switchRejection && JSON.parse(body).session_id!==id) return json(switchRejection);
     return json({ok:true});
   }
-  if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other, messages: [{role:'user', content:'Historical question'}, {role:'assistant', content:'Historical answer'}] });
+  if (path === '/projects/fixture/sessions/' + other.id && pagedBrowse && new URL(req.url,'http://localhost').searchParams.has('before')) {
+    if (failOlder) {failOlder=false; res.statusCode=503; return json({error:'temporary history failure'});}
+    return json({...other,messages:[
+      {role:'user',content:'Older tool request',created_at:1699999990000},
+      {role:'assistant',content:'Inspecting the older file.',tool_calls:[{id:'old-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'old-tool',success:true,summary:'Older tool output'}},
+      {role:'assistant',content:'Older tool answer',created_at:1699999991000}
+    ]});
+  }
+  if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other,
+    ...(pagedBrowse ? {history_older:{session:other.id,before:4,digest:'fixture'}} : {}), messages: [
+    {role:'user', content:'Earlier historical question', created_at:1700000000000},
+    {role:'assistant', content:'## Original heading\n\n'+('Earlier paragraph with **bold** and `code`.\n\n'.repeat(24)), created_at:1700000001000},
+    {role:'user', content:'Historical question', ...(pagedBrowse ? {} : {created_at:1700000002000})},
+    ...(pagedBrowse ? [
+      {role:'assistant',content:'Inspecting the recent file.',tool_calls:[{id:'recent-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'recent-tool',success:true,summary:'Recent tool output'}}
+    ] : []),
+    {role:'assistant', content:'Historical answer', created_at:1700000003000}
+  ] });
   if (path === '/projects/fixture/sessions/' + third.id) { releaseSlowHistory = () => json({ ...third, messages: [{role:'user',content:'Stale slow history'}] }); return; }
   if (path === '/live') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
     res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
     res.write('data: {"type":"state","running":false}\n\n');
-    clients.add(res); req.on('close', () => clients.delete(res)); return;
+    // Reconnect snapshot replaces an in-flight history load before active discovery resolves.
+    const refresh = refreshOnConnect ? setTimeout(() => res.write(`data: ${JSON.stringify(snapshot())}\n\n`), 80) : undefined;
+    refreshOnConnect = false;
+    clients.add(res); req.on('close', () => { clearTimeout(refresh); clients.delete(res); }); return;
   }
   if (path === '/project') return json({ working_dir: '/fixture', project_hash: 'fixture' });
   if (path === '/config') return json({ providers: [], notifications: { enabled: false } });
@@ -71,7 +96,7 @@ const server = createServer(async (req, res) => {
   if (path.endsWith('/transcript')) return json({ session_id: id, turns: [] });
   if (path === '/live/mode') return json({ mode: 'build' });
   if (path === '/live/session') return json({ success: true, session_id: id });
-  if (path === '/chat/active') return json([]);
+  if (path === '/chat/active') { setTimeout(() => json([]), 200); return; }
   if (path === '/sessions' || path === '/projects/fixture/sessions') return json([meta, other, third]);
   if (path === '/projects' || path === '/skills') return json([]);
   try {
@@ -95,6 +120,9 @@ try {
   await page.locator('.message-input').waitFor();
   await page.waitForTimeout(1000);
   assert(clients.size > 0);
+  await page.locator('.message-input').fill('composer remains available after snapshot');
+  assert.equal(await page.locator('.btn-send').isEnabled(), true);
+  await page.locator('.message-input').fill('');
   if (width === 1200) {
     const sidebar = page.locator('.session-list');
     const handle = page.locator('.sidebar-resize-handle');
@@ -203,6 +231,9 @@ try {
   assert(await hoverCard.isVisible(), 'selecting card text does not dismiss it');
   await page.locator('.session-list-body').dispatchEvent('scroll');
   await hoverCard.waitFor({state:'hidden'});
+  const liveTypography = await page.locator('.assistant-message-content').first().evaluate(el => {
+    const css=getComputedStyle(el); return {font:css.fontFamily,size:css.fontSize,color:css.color};
+  });
   await page.locator('.session-item-main').filter({hasText:'Other conversation'}).click();
   await page.getByText('Historical answer', {exact:true}).waitFor();
   assert.equal(switches, before);
@@ -230,7 +261,30 @@ try {
   for(const button of await page.locator('.session-browse-actions button').all()) {
     const bounds=await button.boundingBox(); assert(bounds.x>=banner.x&&bounds.x+bounds.width<=banner.x+banner.width+1);
   }
+  const scroller = page.locator('.session-chat-column .messages-container');
+  const messageBounds = await scroller.boundingBox();
+  assert(banner.y >= messageBounds.y + messageBounds.height - 2, 'browse notice replaces the bottom composer');
+  assert(banner.y + banner.height <= 900, 'browse card stays inside viewport');
+  assert.equal(await page.locator('.user-message-bubble').count(), 2, 'history retains user bubbles');
+  assert.equal(await page.locator('.assistant-message-content').count(), 2, 'history uses normal assistant renderer');
+  assert.deepEqual(await page.locator('.assistant-message-content').first().evaluate(el => {
+    const css=getComputedStyle(el); return {font:css.fontFamily,size:css.fontSize,color:css.color};
+  }), liveTypography, 'read-only history keeps normal typography');
+  assert.equal(await page.locator('.timeline-inner > .markdown-body').count(), 0, 'no exported Markdown document');
+  const nav = page.locator('.turn-nav-rail');
+  await nav.waitFor();
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[1]?.classList.contains('is-active'));
+  if (width < 600) await nav.locator('.turn-nav-toggle').click();
+  await nav.locator('.turn-nav-node').first().click();
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[0]?.classList.contains('is-active'));
+  assert(await scroller.evaluate(el => el.scrollTop < 100), 'rail navigates to first historical turn');
+  await scroller.evaluate(el => {el.scrollTop=el.scrollHeight;});
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[1]?.classList.contains('is-active'));
   await page.screenshot({path:`/tmp/atomcode-session-browse-${width}.png`});
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme','dark'));
+  await page.screenshot({path:`/tmp/atomcode-session-browse-dark-${width}.png`});
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme','light'));
+
   emit({type:'text', content:' Background stream stays with A.'});
   emit({type:'permission_request', tool_name:'bash', reason:'Approval from running A', call_id:'browse-call', arguments:'{"command":"pwd"}'});
   await page.getByText('Approval from running A', {exact:true}).waitFor();
@@ -343,6 +397,20 @@ try {
   await composer.waitFor();
   emit({type:'state', running:false});
   assert.equal(await composer.inputValue(), 'Draft before leaving');
+  const userRow = page.locator('.user-message-wrapper').first();
+  {
+    await page.mouse.move(0,0);
+    await page.waitForTimeout(150);
+    assert.equal(await userRow.locator('.msg-actions').evaluate(el=>getComputedStyle(el).opacity), '0');
+    await userRow.hover();
+  }
+  assert.match(await userRow.locator('.msg-time').textContent(), /^\d{2}:\d{2}$/);
+  assert.match(await userRow.locator('.msg-time').getAttribute('title'), /^\d{4}-/);
+  await userRow.getByRole('button',{name:'Edit message',exact:true}).click();
+  assert.equal(await composer.inputValue(), specificationText.replace(/\r\n/g,'\n')+'\nDraft before leaving');
+  assert.equal(specificationPinned,false,'editing only populates the draft');
+  await composer.fill('Draft before leaving');
+  await userRow.hover();
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).click();
   const specifications=page.getByRole('dialog',{name:'Task specifications'});
   await specifications.waitFor();
@@ -363,6 +431,20 @@ try {
   await inlineUnpin.click();
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).waitFor();
   assert.equal(specificationPinned,false);
+  delete messages[0].source_seq;
+  emit(snapshot());
+  const fallbackPin=page.getByRole('button',{name:'Pin as task specification',exact:true});
+  await page.waitForFunction(()=>document.querySelector('[title="Manage task specifications"]'));
+  await page.locator('.user-message-wrapper').first().hover();
+  await fallbackPin.click();
+  await specifications.waitFor();
+  await specifications.locator('.task-spec-list button').first().click();
+  await specifications.locator('pre').waitFor();
+  assert.equal(await specifications.locator('pre').textContent(),specificationText);
+  assert.equal(specificationPinned,false,'missing event identity opens original-message review instead of guessing');
+  await specifications.getByRole('button',{name:'Close',exact:true}).click();
+  messages[0].source_seq=12;
+  emit(snapshot());
 
   // Finishing does not silently activate the viewed history; continuing is explicit.
   emit({type:'state', running:true});
@@ -381,6 +463,39 @@ try {
   assert.deepEqual(errors, []);
   await page.close();
  }
+  {
+    pagedBrowse=true; failOlder=true;
+    const page=await browser.newPage({viewport:{width:1200,height:900}});
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
+    await page.goto(base+'/?sync=1&session=context-summary');
+    await page.locator('.message-input').waitFor();
+    emit({type:'state',running:true});
+    await page.locator('.session-running-mark').waitFor();
+    const before=switches;
+    await page.locator('.session-item-main').filter({hasText:other.name}).click();
+    await page.getByText('Historical answer',{exact:true}).waitFor();
+    await page.locator('.turn-process-toggle').click();
+    await page.locator('.tool-header').click();
+    await page.getByText('Recent tool output',{exact:true}).waitFor();
+    const prompt=page.getByText('Historical question',{exact:true});
+    const top=(await prompt.boundingBox()).y;
+    await page.locator('.history-load-more').evaluate(el=>el.click());
+    await page.locator('.messages-container [role="alert"]').waitFor();
+    assert.equal(await page.getByText('Historical answer',{exact:true}).count(),1,'older-page failure retains displayed history');
+    await page.locator('.messages-container [role="alert"] button').evaluate(el=>el.click());
+    await page.getByText('Older tool answer',{exact:true}).waitFor();
+    assert.equal(await page.locator('.user-message-bubble').count(),3);
+    assert.equal(await page.locator('.turn-nav-node').count(),3);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const afterTop=(await prompt.boundingBox()).y;
+    assert(Math.abs(afterTop-top)<3,`prepending history preserves reading position: ${top} -> ${afterTop}`);
+    assert.equal(await page.getByText('Recent tool output',{exact:true}).count(),1,'prepending preserves the expanded recent process and tool');
+    await page.locator('.turn-process-toggle').first().click();
+    await page.locator('.tool-header').first().click();
+    await page.getByText('Older tool output',{exact:true}).waitFor();
+    assert.equal(switches,before,'paging and expanding history never rebind the live runtime');
+    await page.close(); pagedBrowse=false;
+  }
   for (const refusal of [
     {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn'},
     {ok:false,active_turn:false,error:'session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")'},
