@@ -6888,23 +6888,29 @@ pub fn clear_webui_relay_access() {
     }
 }
 
-/// What to try when a port cannot be bound for a reason other than being in
-/// use. On Windows that is usually WSAEACCES (10013): the port sits in a range
-/// reserved for Hyper-V / WSL / Docker (WinNAT), which moves on a reboot or a
-/// network service restart. Retained when the bounded port scan is exhausted.
-fn bind_failure_hint(error: &anyhow::Error) -> &'static str {
-    let denied = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
-        e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(10013)
-    });
-    if !denied {
-        return "";
-    }
-    "。这个端口可能落在 Windows 的保留端口范围里（Hyper-V / WSL / Docker 会保留，重启后会变），\
-     可在 PowerShell 运行 `netsh int ipv4 show excludedportrange protocol=tcp` 查看，\
-     并用 `--port` 换一个不在范围内的端口。"
+fn port_unavailable(error: &std::io::Error, windows: bool) -> bool {
+    error.kind() == std::io::ErrorKind::AddrInUse
+        || (windows && matches!(error.raw_os_error(), Some(10013 | 10048)))
 }
 
-/// 从 `start_port` 起尝试绑定 `host`，遇端口占用或 Windows 10013 递增，直到成功或试满
+fn bind_failure_hint(error: &anyhow::Error, windows: bool) -> &'static str {
+    if !error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| port_unavailable(error, windows))
+    {
+        return "";
+    }
+    if windows {
+        "\n端口可能已被占用或由 Windows 保留（例如 Docker、Hyper-V、WSL2）。\
+         可用 `/webui --port 20000` 或 `atomcode webui --port 20000` 换端口，\
+         也可指定 `--port 0` 让系统分配。"
+    } else {
+        "\n可用 `/webui --port 20000` 或 `atomcode webui --port 20000` 换端口，\
+         也可指定 `--port 0` 让系统分配。"
+    }
+}
+
+/// 从 `start_port` 起尝试绑定 `host`，遇端口不可用则递增，直到成功或试满
 /// `max_tries` 个端口。返回已绑定的监听器与其真实端口（取自 `local_addr`，
 /// 故 `start_port == 0` 时也会回填 OS 分配的端口）。其他绑定错误立即返回。
 async fn bind_scanning(
@@ -6912,7 +6918,7 @@ async fn bind_scanning(
     start_port: u16,
     max_tries: u16,
 ) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
-    bind_scanning_with(host, start_port, max_tries, cfg!(windows), |addr| {
+    bind_scanning_with(host, start_port, max_tries, cfg!(windows), false, |addr| {
         tokio::net::TcpListener::bind(addr)
     })
     .await
@@ -6923,6 +6929,7 @@ async fn bind_scanning_with<B, F>(
     start_port: u16,
     max_tries: u16,
     windows: bool,
+    dynamic_fallback: bool,
     mut bind: B,
 ) -> anyhow::Result<(tokio::net::TcpListener, u16)>
 where
@@ -6940,10 +6947,7 @@ where
                 let actual = listener.local_addr()?.port();
                 return Ok((listener, actual));
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AddrInUse
-                    || (windows && e.raw_os_error() == Some(10013)) =>
-            {
+            Err(e) if port_unavailable(&e, windows) => {
                 last_err = Some(e);
                 continue;
             }
@@ -6951,12 +6955,21 @@ where
             Err(e) => return Err(e.into()),
         }
     }
-    let error = last_err
+    let try_dynamic = windows && dynamic_fallback && start_port != 0 && last_err.is_some();
+    let scan_error = last_err
         .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow::anyhow!("no ports attempted"));
-    Err(error.context(format!(
-        "no free port after at most {max_tries} attempts from {host}:{start_port}"
-    )))
+        .unwrap_or_else(|| anyhow::anyhow!("no ports attempted"))
+        .context(format!(
+            "no free port after at most {max_tries} attempts from {host}:{start_port}"
+        ));
+    if try_dynamic {
+        let listener = bind(format!("{host}:0")).await.map_err(|error| {
+            scan_error.context(format!("failed to bind a system-assigned port: {error}"))
+        })?;
+        let actual = listener.local_addr()?.port();
+        return Ok((listener, actual));
+    }
+    Err(scan_error)
 }
 
 /// 探测本机主用的非回环 IPv4（用 UDP connect 选路，不实际发包）。绑定非回环地址
@@ -7007,7 +7020,7 @@ pub struct WebuiRelayTarget {
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
 /// `host` 为绑定地址（默认 `127.0.0.1`；`0.0.0.0` 暴露到局域网/外网）。
-/// `port` 为首选端口（CLI 子命令可自定义；TUI 默认 13457）；被占用时自动向上扫描。
+/// `port` 为首选端口，被占用时自动向上扫描。
 ///
 /// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
 /// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
@@ -7018,12 +7031,20 @@ pub async fn ensure_server_and_open(
     sync: bool,
     open_browser: bool,
 ) -> String {
-    launch_webui(host, port, sync, open_browser).await.message
+    launch_webui(host, Some(port), sync, open_browser)
+        .await
+        .message
 }
 
 /// Start/reuse the embedded server and return its actual access URL separately
 /// from presentation text, so frontends never need to parse a translated report.
-pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool) -> WebuiLaunch {
+pub async fn launch_webui(
+    host: &str,
+    requested_port: Option<u16>,
+    sync: bool,
+    open_browser: bool,
+) -> WebuiLaunch {
+    let port = requested_port.unwrap_or(WEBUI_DEFAULT_PORT);
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
@@ -7040,7 +7061,16 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
         (tokens, p, h)
     } else {
         // 2) 预绑定端口：首选 `port`，被占则递增扫描（拿到真实端口）。按请求的 host 绑定。
-        let (listener, actual_port) = match bind_scanning(host, port, 100).await {
+        let (listener, actual_port) = match bind_scanning_with(
+            host,
+            port,
+            100,
+            cfg!(windows),
+            requested_port.is_none(),
+            |addr| tokio::net::TcpListener::bind(addr),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 // Into the log as well as the answer: `atomcode webui` run from a
@@ -7050,17 +7080,17 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
                 return WebuiLaunch {
                     message: format!(
                         "webui 启动失败：{host}:{port} 起的端口绑定失败（{e:#}）{}",
-                        bind_failure_hint(&e)
+                        bind_failure_hint(&e, cfg!(windows))
                     ),
                     qr_url: None,
                     relay_target: None,
                 };
             }
         };
-        if actual_port != port {
+        if port != 0 && actual_port != port {
             // An installed app (PWA) is tied to the port it was installed from;
             // on another one it finds nothing. Said where it can be found later.
-            tracing::warn!(target: "atomcode::webui", requested = port, actual = actual_port, "webui port was unavailable; bound the next free one");
+            tracing::warn!(target: "atomcode::webui", requested = port, actual = actual_port, "webui port was unavailable; bound a different port");
         }
         tracing::info!(target: "atomcode::webui", %host, port = actual_port, "webui listening");
         let tokens = auth_token::WebuiTokenStore::new();
@@ -12231,12 +12261,12 @@ done
     }
 
     #[tokio::test]
-    async fn bind_scanning_skips_an_entire_windows_reserved_range() {
+    async fn bind_scanning_skips_unavailable_windows_ports_within_the_window() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let actual_port = listener.local_addr().unwrap().port();
         let mut available = Some(listener);
         let mut attempts = Vec::new();
-        let (_, port) = bind_scanning_with("127.0.0.1", 13457, 100, true, |addr| {
+        let (_, port) = bind_scanning_with("127.0.0.1", 13457, 100, true, false, |addr| {
             attempts.push(addr.clone());
             std::future::ready(if addr == "127.0.0.1:13517" {
                 Ok(available.take().unwrap())
@@ -12259,14 +12289,14 @@ done
     async fn bind_scanning_keeps_the_reserved_port_hint_when_attempts_run_out() {
         for (start, limit, expected) in [(13457, 3, 3), (65534, 100, 2)] {
             let mut attempts = 0;
-            let error = bind_scanning_with("127.0.0.1", start, limit, true, |_| {
+            let error = bind_scanning_with("127.0.0.1", start, limit, true, false, |_| {
                 attempts += 1;
                 std::future::ready(Err(std::io::Error::from_raw_os_error(10013)))
             })
             .await
             .unwrap_err();
             assert_eq!(attempts, expected);
-            assert!(bind_failure_hint(&error).contains("excludedportrange"));
+            assert!(bind_failure_hint(&error, true).contains("Windows 保留"));
             assert!(format!("{error:#}").contains("10013"));
         }
     }
@@ -12287,7 +12317,7 @@ done
             let kind = error.kind();
             let mut error = Some(error);
             let mut attempts = 0;
-            let result = bind_scanning_with("127.0.0.1", 13457, 100, windows, |_| {
+            let result = bind_scanning_with("127.0.0.1", 13457, 100, windows, true, |_| {
                 attempts += 1;
                 std::future::ready(Err(error.take().unwrap()))
             })
@@ -12301,22 +12331,72 @@ done
         }
     }
 
-    /// A port refused rather than taken — Windows' reserved ranges answer
-    /// WSAEACCES (10013) — gets the hint that names where to look; a port that
-    /// is simply unavailable does not.
-    #[test]
-    fn a_refused_port_is_told_where_to_look_and_others_are_not() {
-        let denied =
-            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(bind_failure_hint(&denied).contains("excludedportrange"));
-        let wsaeacces = anyhow::Error::from(std::io::Error::from_raw_os_error(10013));
-        if cfg!(windows) {
-            assert!(bind_failure_hint(&wsaeacces).contains("excludedportrange"));
+    #[tokio::test]
+    async fn windows_default_webui_escapes_a_reserved_range_wider_than_the_scan() {
+        for code in [10013, 10048] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let actual_port = listener.local_addr().unwrap().port();
+            let mut available = Some(listener);
+            let mut attempts = Vec::new();
+            let (_, port) =
+                bind_scanning_with("127.0.0.1", WEBUI_DEFAULT_PORT, 100, true, true, |addr| {
+                    let (_, port) = addr.rsplit_once(':').unwrap();
+                    let port = port.parse::<u16>().unwrap();
+                    attempts.push(port);
+                    std::future::ready(if port == 0 {
+                        Ok(available.take().unwrap())
+                    } else {
+                        assert!((13225..=17320).contains(&port), "{addr}");
+                        Err(std::io::Error::from_raw_os_error(code))
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(port, actual_port);
+            assert_eq!(attempts, (13457..=13556).chain([0]).collect::<Vec<_>>());
         }
-        let unavailable =
-            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable));
-        assert_eq!(bind_failure_hint(&unavailable), "");
-        assert_eq!(bind_failure_hint(&anyhow::anyhow!("no free port")), "");
+    }
+
+    #[tokio::test]
+    async fn dynamic_fallback_requires_windows_and_preserves_the_bind_address() {
+        for windows in [false, true] {
+            let mut attempts = Vec::new();
+            let error =
+                bind_scanning_with("192.0.2.1", WEBUI_DEFAULT_PORT, 1, windows, true, |addr| {
+                    attempts.push(addr);
+                    std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::AddrInUse)))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(attempts[0], "192.0.2.1:13457");
+            assert!(format!("{error:#}").contains("no free port"));
+            if windows {
+                assert_eq!(&attempts[1..], ["192.0.2.1:0"]);
+                assert!(format!("{error:#}").contains("failed to bind a system-assigned port"));
+            } else {
+                assert_eq!(attempts.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_port_collision_suggests_both_webui_commands() {
+        for code in [10013, 10048] {
+            let error = anyhow::Error::from(std::io::Error::from_raw_os_error(code));
+            let hint = bind_failure_hint(&error, true);
+            assert!(hint.contains("Windows 保留"));
+            assert!(hint.contains("`/webui --port 20000`"));
+            assert!(hint.contains("`atomcode webui --port 20000`"));
+        }
+        for kind in [
+            std::io::ErrorKind::AddrNotAvailable,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert_eq!(
+                bind_failure_hint(&std::io::Error::from(kind).into(), true),
+                ""
+            );
+        }
     }
 
     #[tokio::test]

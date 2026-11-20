@@ -855,8 +855,8 @@ enum Commands {
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
         /// 端口（默认 13457，刻意错开 VSCode 守护进程的 13456，避免抢端口导致扩展 401/无响应）
-        #[arg(long, default_value_t = atomcode_daemon::WEBUI_DEFAULT_PORT)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
         /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -5850,6 +5850,18 @@ mod tests {
         ));
         // `--resume` conflicts with `--continue`.
         assert!(Cli::try_parse_from(["atomcode", "-p", "hi", "-c", "--resume", "x"]).is_err());
+    }
+
+    #[test]
+    fn webui_distinguishes_an_omitted_port_from_an_explicit_port() {
+        for (args, expected) in [
+            (vec!["atomcode", "webui"], None),
+            (vec!["atomcode", "webui", "--port", "13457"], Some(13457)),
+            (vec!["atomcode", "webui", "--port", "0"], Some(0)),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Some(Commands::Webui { port, .. }) if port == expected));
+        }
     }
 
     #[test]

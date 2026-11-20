@@ -712,7 +712,7 @@ fn webui_feedback(
 #[derive(Debug, PartialEq, Eq)]
 struct WebuiOptions {
     host: String,
-    port: u16,
+    port: Option<u16>,
     open_browser: bool,
     remote: bool,
 }
@@ -761,7 +761,7 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
     Ok(WebuiOptions {
         remote,
         host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
-        port: port.unwrap_or(atomcode_daemon::WEBUI_DEFAULT_PORT),
+        port,
         open_browser,
     })
 }
@@ -978,10 +978,7 @@ mod tests {
 
     #[test]
     fn webui_passes_explicit_ports_and_browser_options() {
-        assert_eq!(
-            webui_options("").unwrap().port,
-            atomcode_daemon::WEBUI_DEFAULT_PORT
-        );
+        assert_eq!(webui_options("").unwrap().port, None);
         for args in [
             "--port 20001 --host 127.0.0.1 --no-open",
             "--no-open --host=127.0.0.1 --port=20001",
@@ -990,15 +987,16 @@ mod tests {
                 webui_options(args).unwrap(),
                 WebuiOptions {
                     host: "127.0.0.1".to_string(),
-                    port: 20001,
+                    port: Some(20001),
                     open_browser: false,
                     remote: false,
                 }
             );
         }
         assert_eq!(webui_options("lan --port 20001").unwrap().host, "0.0.0.0");
-        assert_eq!(webui_options("--port=0").unwrap().port, 0);
-        assert_eq!(webui_options("--port 65535").unwrap().port, 65535);
+        assert_eq!(webui_options("--port=0").unwrap().port, Some(0));
+        assert_eq!(webui_options("--port 13457").unwrap().port, Some(13457));
+        assert_eq!(webui_options("--port 65535").unwrap().port, Some(65535));
     }
 
     #[test]

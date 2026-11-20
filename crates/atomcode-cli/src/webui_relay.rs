@@ -39,7 +39,7 @@ pub fn stop() -> bool {
 
 pub async fn launch(
     host: &str,
-    port: u16,
+    port: Option<u16>,
     sync: bool,
     open_browser: bool,
     remote: bool,
