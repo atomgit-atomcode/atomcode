@@ -616,6 +616,11 @@ pub(crate) struct SwappableClient {
         Option<atomcode_config::proxy::ProxyConfig>,
     )>,
     refresh: tokio::sync::Mutex<()>,
+    /// Test-only: pin the request path to "no proxy". A judge that counts pool
+    /// rebuilds must not see the developer's own system proxy add one (nor its
+    /// refresh latency, which is spent inside the open budget).
+    #[cfg(test)]
+    direct_requests: std::sync::atomic::AtomicBool,
     #[allow(clippy::type_complexity)]
     build: Box<
         dyn Fn(
@@ -659,6 +664,8 @@ impl SwappableClient {
             headers: Default::default(),
             current: std::sync::RwLock::new((initial, force_tls12, None)),
             refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            direct_requests: std::sync::atomic::AtomicBool::new(false),
             build: Box::new(build),
         })
     }
@@ -680,8 +687,26 @@ impl SwappableClient {
     /// allocating another retry. Cancellation drops this future; the blocking
     /// resolver only returns data and cannot later mutate this client.
     pub(crate) async fn for_request(&self) -> Result<reqwest::Client, ProviderError> {
+        #[cfg(test)]
+        if self
+            .direct_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.for_request_with(std::future::ready(Ok(None))).await;
+        }
         self.for_request_with(super::auto_proxy::for_request())
             .await
+    }
+
+    /// Test-only: resolve every request as "no proxy". Without this a machine
+    /// whose system proxy is live rebuilds the pool once just to APPLY that
+    /// route (and spends the proxy probe inside the open budget), which makes a
+    /// rebuild-counting judge fail for reasons that have nothing to do with the
+    /// behaviour under test.
+    #[cfg(test)]
+    pub(crate) fn skip_auto_proxy(&self) {
+        self.direct_requests
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn for_request_with(
@@ -1350,8 +1375,8 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待模型服务响应头超过 {}s",
-                        open_timeout.as_secs()
+                        "open failed: 等待模型服务响应头超过 {}",
+                        retry::format_wait(open_timeout)
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),
                     ..Default::default()
@@ -3604,6 +3629,11 @@ mod tests {
             Ok(reqwest::Client::builder().no_proxy().build().unwrap())
         })
         .unwrap();
+        // This judge counts pool rebuilds: "initial build + one rebuild caused by
+        // the silent timeout". A live system proxy would add a third build (to
+        // apply that route) and spend its probe inside the open budget, so pin
+        // the request path to direct and assert the behaviour, not the machine.
+        client.skip_auto_proxy();
         let policy = RetryPolicy {
             max_attempts: 3,
             base_delay: Duration::ZERO,

@@ -596,8 +596,8 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待模型服务响应头超过 {}s",
-                        open_timeout.as_secs()
+                        "open failed: 等待模型服务响应头超过 {}",
+                        retry::format_wait(open_timeout)
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),
                     ..Default::default()

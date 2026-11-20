@@ -1329,6 +1329,18 @@ mod tests {
     }
 }
 
+/// Render a wait bound the way a person reads it. A sub-second bound must not
+/// collapse to `0s`: the default open budget is 400 ms, and every timeout report
+/// used to read "已达到 0s" — i.e. "waited for nothing" — which sent more than
+/// one investigation in the wrong direction.
+pub(crate) fn format_wait(duration: Duration) -> String {
+    if duration.as_millis() < 1_000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}s", duration.as_secs())
+    }
+}
+
 /// Bound all OPEN attempts and backoffs together; an exhausted budget must not
 /// be retried again by a runtime row. Streaming bodies are outside this scope.
 pub(crate) async fn bounded_open<T>(
@@ -1370,8 +1382,8 @@ pub(crate) async fn bounded_open<T>(
             Err(atomcode_kernel::stream::ProviderError {
                 retryable: false,
                 message: format!(
-                    "等待模型服务响应头超时：连接与重试累计等待已达到 {}s，请稍后重试",
-                    budget.as_secs()
+                    "等待模型服务响应头超时：连接与重试累计等待已达到 {}，请稍后重试",
+                    format_wait(budget)
                 ),
                 code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.into()),
                 ..Default::default()
