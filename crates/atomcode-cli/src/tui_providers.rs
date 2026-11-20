@@ -497,7 +497,8 @@ impl Providers for ConfigProviders {
         }
         let mut drafts = drafts.to_vec();
         Some(Box::pin(async move {
-            let entries = catalog::models(&base_url, &wire).await;
+            let ids: Vec<_> = drafts.iter().map(|d| d.model.trim()).collect();
+            let entries = catalog::models(&base_url, &wire, &ids).await;
             for draft in &mut drafts {
                 let Some(entry) = entries.iter().find(|entry| entry.id == draft.model.trim())
                 else {

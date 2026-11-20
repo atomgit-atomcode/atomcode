@@ -298,7 +298,8 @@ pub(crate) async fn enrich_new_models(models: &mut [NewModelRequest], base_url: 
     }) {
         return;
     }
-    let entries = catalog::models(base_url, wire).await;
+    let ids: Vec<_> = models.iter().map(|m| m.model.trim()).collect();
+    let entries = catalog::models(base_url, wire, &ids).await;
     for model in models {
         let Some(entry) = entries.iter().find(|entry| entry.id == model.model.trim()) else {
             continue;

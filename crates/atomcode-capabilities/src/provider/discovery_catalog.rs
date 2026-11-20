@@ -66,12 +66,14 @@ struct ReasoningDefault {
 }
 
 #[derive(Default)]
-struct Cache {
-    catalog: Option<Arc<Catalog>>,
+struct Cache<T> {
+    catalog: Option<Arc<T>>,
     retry_at: Option<Instant>,
 }
 
-async fn download() -> Option<Catalog> {
+async fn download<T: serde::de::DeserializeOwned + Send + 'static>(
+    url: &str,
+) -> Option<BTreeMap<String, T>> {
     let proxy = super::super::auto_proxy::for_request().await.ok()?;
     let client = discovery_client(
         &DiscoveryTransport::default(),
@@ -80,23 +82,30 @@ async fn download() -> Option<Catalog> {
         proxy.as_ref(),
     )
     .ok()?;
-    let response = client.get(URL).send().await.ok()?.error_for_status().ok()?;
+    let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
     let bytes = read_bounded_response(response, LIMIT).await.ok()?;
-    let catalog: Catalog = tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes))
-        .await
-        .ok()?
-        .ok()?;
+    let catalog: BTreeMap<String, T> =
+        tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes))
+            .await
+            .ok()?
+            .ok()?;
     (!catalog.is_empty()).then_some(catalog)
 }
 
-async fn load() -> Option<Arc<Catalog>> {
-    static CACHE: tokio::sync::Mutex<Cache> = tokio::sync::Mutex::const_new(Cache {
+impl<T> Cache<T> {
+    const EMPTY: Self = Self {
         catalog: None,
         retry_at: None,
-    });
-    let mut cache = CACHE.lock().await;
+    };
+}
+
+async fn load<T: serde::de::DeserializeOwned + Send + 'static>(
+    cache: &tokio::sync::Mutex<Cache<BTreeMap<String, T>>>,
+    url: &str,
+) -> Option<Arc<BTreeMap<String, T>>> {
+    let mut cache = cache.lock().await;
     if cache.retry_at.is_none_or(|when| Instant::now() >= when) {
-        let loaded = tokio::time::timeout(TIMEOUT, download())
+        let loaded = tokio::time::timeout(TIMEOUT, download(url))
             .await
             .ok()
             .flatten();
@@ -228,17 +237,89 @@ fn positive(value: Option<usize>) -> Option<usize> {
     value.filter(|n| *n > 0 && *n <= u32::MAX as usize)
 }
 
-pub async fn models(base_url: &str, wire: &str) -> Vec<DiscoveredModel> {
+// Canonical limits describe the model itself. Only enrich IDs that the endpoint
+// advertised or the user entered; this catalog cannot establish availability.
+#[derive(Deserialize)]
+struct CanonicalModel {
+    name: Option<String>,
+    limit: Option<Limits>,
+    modalities: Option<Modalities>,
+}
+
+fn enrich_canonical(
+    entries: &mut Vec<DiscoveredModel>,
+    ids: &[&str],
+    catalog: &BTreeMap<String, CanonicalModel>,
+) {
+    let mut short = BTreeMap::new();
+    for (key, model) in catalog {
+        if let Some((_, id)) = key.split_once('/') {
+            short
+                .entry(id)
+                .and_modify(|v| *v = None)
+                .or_insert(Some(model));
+        }
+    }
+    let mut positions: BTreeMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.id.clone(), index))
+        .collect();
+    for &id in ids {
+        let Some(model) = catalog.get(id).or_else(|| short.get(id).copied().flatten()) else {
+            continue;
+        };
+        let reference = DiscoveredModel {
+            id: id.to_owned(),
+            name: model.name.clone(),
+            context_window: model.limit.as_ref().and_then(|l| positive(l.context)),
+            max_tokens: model.limit.as_ref().and_then(|l| positive(l.output)),
+            supports_vision: model
+                .modalities
+                .as_ref()
+                .and_then(|m| m.input.as_ref())
+                .map(|input| {
+                    input
+                        .iter()
+                        .any(|m| m == "image" || m.starts_with("image/"))
+                }),
+            catalog_only: true,
+            ..Default::default()
+        };
+        if let Some(&index) = positions.get(id) {
+            fill_missing(&mut entries[index], &reference);
+        } else {
+            positions.insert(id.to_owned(), entries.len());
+            entries.push(reference);
+        }
+    }
+}
+
+pub async fn models(base_url: &str, wire: &str, ids: &[&str]) -> Vec<DiscoveredModel> {
+    static PROVIDERS: tokio::sync::Mutex<Cache<Catalog>> =
+        tokio::sync::Mutex::const_new(Cache::EMPTY);
+    static CANONICAL: tokio::sync::Mutex<Cache<BTreeMap<String, CanonicalModel>>> =
+        tokio::sync::Mutex::const_new(Cache::EMPTY);
     let Some(route) = route(wire) else {
         return Vec::new();
     };
     let Some(base) = endpoint(base_url, route) else {
         return Vec::new();
     };
-    let Some(catalog) = load().await else {
-        return Vec::new();
-    };
-    candidates(&catalog, &base, route)
+    let (providers, canonical) = tokio::join!(load(&PROVIDERS, URL), async {
+        if ids.is_empty() {
+            None
+        } else {
+            load(&CANONICAL, "https://models.dev/models.json").await
+        }
+    });
+    let mut entries = providers
+        .map(|catalog| candidates(&catalog, &base, route))
+        .unwrap_or_default();
+    if let Some(canonical) = canonical {
+        enrich_canonical(&mut entries, ids, &canonical);
+    }
+    entries
 }
 
 pub fn supports_lookup(base_url: &str, wire: &str) -> bool {
@@ -313,6 +394,38 @@ pub(super) fn merge_listing(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn canonical_metadata_fills_only_requested_unambiguous_models_and_preserves_plan_limits() {
+        let catalog = serde_json::from_value(json!({
+            "alibaba/qwen4-max": {"limit": {"context": 1000000, "output": 262144}, "modalities": {"input": ["text", "image"]}},
+            "lab/shared": {"limit": {"output": 128}},
+            "other/shared": {"limit": {"output": 64}},
+            "lab/unrequested": {}
+        })).unwrap();
+        let mut entries = vec![DiscoveredModel {
+            id: "qwen4-max".into(),
+            context_window: Some(32000),
+            ..Default::default()
+        }];
+        enrich_canonical(
+            &mut entries,
+            &[
+                "qwen4-max",
+                "shared",
+                "lab/shared",
+                "qwen4-max-preview",
+                "lab/shared",
+            ],
+            &catalog,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].context_window, Some(32000));
+        assert_eq!(entries[0].max_tokens, Some(262144));
+        assert_eq!(entries[0].supports_vision, Some(true));
+        assert_eq!(entries[1].id, "lab/shared");
+        assert_eq!(entries[1].max_tokens, Some(128));
+    }
 
     #[test]
     fn plan_route_limits_catalog_metadata_to_the_exact_model_and_protocol() {

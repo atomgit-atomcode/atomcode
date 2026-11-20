@@ -60,7 +60,14 @@ pub async fn discover(
     if !use_public_catalog(&result) {
         return result;
     }
-    catalog::merge_listing(result, catalog::models(base_url, provider_type).await)
+    let ids: Vec<_> = result
+        .iter()
+        .flatten()
+        .filter(|m| catalog::needs_metadata(m))
+        .map(|m| m.id.as_str())
+        .collect();
+    let entries = catalog::models(base_url, provider_type, &ids).await;
+    catalog::merge_listing(result, entries)
 }
 
 fn use_public_catalog(result: &Result<Vec<DiscoveredModel>, DiscoveryError>) -> bool {
