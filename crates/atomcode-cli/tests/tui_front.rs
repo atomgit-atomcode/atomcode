@@ -725,7 +725,7 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
 
     term.press(KeyPress::plain(Key::Down));
     term.press(KeyPress::plain(Key::Enter));
-    let providers = wait_for("手动添加").await;
+    let providers = wait_for("＋ 添加提供商").await;
     assert!(!providers.contains("添加 provider"));
     assert!(!providers.contains("使用 AtomCode 开始工作"));
     assert!(
@@ -734,7 +734,7 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
     );
     let picker_line = providers
         .lines()
-        .position(|line| line.contains("账号"))
+        .position(|line| line.trim() == "provider")
         .unwrap();
     assert!(
         picker_line < 18,
@@ -785,7 +785,7 @@ async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_rea
         Key::Char('2'),
         atomcode_tui::surface::Mods::ALT,
     ));
-    wait_for("账号").await;
+    wait_for("＋ 添加提供商").await;
     term.press(KeyPress::plain(Key::Esc));
     assert!(wait_for("draft").await.contains("answer 1"));
 

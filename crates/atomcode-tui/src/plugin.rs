@@ -1330,6 +1330,9 @@ enum Wake {
         before: Option<crate::providers::Panel>,
         after: Option<crate::providers::Panel>,
         session: String,
+        /// The account's generation when the add was sent
+        /// (`Host::provider_generation`).
+        generation: u64,
     },
     SessionReferences,
     Foreground {
@@ -2622,34 +2625,13 @@ impl UserInterface for Tui {
                 }
                 Wake::ProviderModelsEnriched {
                     original,
-                    mut drafts,
+                    drafts,
                     before,
                     after,
                     session,
+                    generation,
                 } => {
-                    use crate::providers::Step;
-                    let still_here = self.client.session() == session
-                        && self
-                            .host
-                            .moment
-                            .read()
-                            .expect("moment poisoned")
-                            .providers_panel
-                            == after;
-                    if !still_here {
-                        for draft in &mut drafts {
-                            draft.use_now = false;
-                        }
-                    }
-                    let step = match original {
-                        Step::SaveModel { id: None, draft } => Step::SaveModel {
-                            id: None,
-                            draft: drafts.pop().unwrap_or(draft),
-                        },
-                        Step::SaveModels { .. } => Step::SaveModels { drafts },
-                        step => step,
-                    };
-                    self.finish_provider_step(step, before.filter(|_| still_here));
+                    self.models_enriched(original, drafts, before, after, session, generation);
                     stale = true;
                 }
                 // Most of what arrives here moves nothing on the screen: a
@@ -3337,16 +3319,18 @@ impl UserInterface for Tui {
                                     stale = true;
                                     continue;
                                 }
-                                if let Some(tab) = self.host.providers_tab_at(x, y) {
-                                    let _ = self.host.show_providers_tab(tab);
-                                    stale = true;
-                                    continue;
-                                }
-                                // Discovery rows toggle their checkboxes; other
-                                // rows use the same Enter path as the keyboard.
+                                // A press on a row selects it; a press on the
+                                // row already selected is its Enter — the same
+                                // path as the keyboard's, so a click and a key
+                                // cannot come to mean different things.
                                 if let Some(row) = self.host.providers_row_at(x, y) {
-                                    let _ = self.host.point_providers_at(row);
-                                    self.run_providers_key(self.host.provider_row_key());
+                                    if self.host.providers_cursor() == Some(row) {
+                                        self.run_providers_key(crate::surface::KeyPress::plain(
+                                            crate::surface::Key::Enter,
+                                        ));
+                                    } else {
+                                        let _ = self.host.point_providers_at(row);
+                                    }
                                     stale = true;
                                     continue;
                                 }
@@ -4570,9 +4554,11 @@ impl Tui {
     ///
     /// **True when a frame is owed.**
     fn run_providers_key(&self, press: crate::surface::KeyPress) -> bool {
-        let before = if press.key == crate::surface::Key::Enter
-            || press == crate::surface::KeyPress::ctrl('s')
-        {
+        // Only a form's write is put back when it fails, so the person need not
+        // type it again. An add from a detail page keeps its failure on its own
+        // row instead: putting back the panel as it stood before the press
+        // would undo every cursor move made while the write was on its way.
+        let before = if press.key == crate::surface::Key::Enter && self.host.provider_form_open() {
             self.host
                 .moment
                 .read()
@@ -4619,6 +4605,7 @@ impl Tui {
                     .providers_panel
                     .clone();
                 let session = self.client.session();
+                let generation = self.host.provider_generation(&drafts[0].account);
                 tokio::spawn(async move {
                     let drafts = job.await;
                     let _ = wake.send(Wake::ProviderModelsEnriched {
@@ -4627,6 +4614,7 @@ impl Tui {
                         before,
                         after,
                         session,
+                        generation,
                     });
                 });
                 return true;
@@ -4634,6 +4622,59 @@ impl Tui {
         }
         self.finish_provider_step(step, before);
         true
+    }
+
+    /// An add's metadata came back off the frame: write it — unless what it
+    /// was aimed at has changed since.
+    fn models_enriched(
+        &self,
+        original: crate::providers::Step,
+        mut drafts: Vec<crate::providers::ModelDraft>,
+        before: Option<crate::providers::Panel>,
+        after: Option<crate::providers::Panel>,
+        session: String,
+        generation: u64,
+    ) {
+        use crate::providers::Step;
+        // The connection was saved again or the account deleted while the
+        // metadata was on its way: the add was aimed at a connection that no
+        // longer exists — and the port would re-create a deleted account to
+        // hold it. Dropped, not written. Closing the panel is not a change: an
+        // add the person confirmed still lands.
+        let account = drafts
+            .first()
+            .map(|d| d.account.clone())
+            .unwrap_or_default();
+        if self.host.provider_generation(&account) != generation {
+            self.host
+                .say(t(Msg::ProviderConnectionChanged).into_owned(), true);
+            return;
+        }
+        // Another session on screen: the write still lands, but it does not
+        // take that session to the model.
+        if self.client.session() != session {
+            for draft in &mut drafts {
+                draft.use_now = false;
+            }
+        }
+        // A form is put back on failure only when the panel is still the one
+        // that sent it.
+        let still_here = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .providers_panel
+            == after;
+        let step = match original {
+            Step::SaveModel { id: None, draft } => Step::SaveModel {
+                id: None,
+                draft: drafts.pop().unwrap_or(draft),
+            },
+            Step::SaveModels { .. } => Step::SaveModels { drafts },
+            step => step,
+        };
+        self.finish_provider_step(step, before.filter(|_| still_here));
     }
 
     fn finish_provider_step(
@@ -4655,7 +4696,23 @@ impl Tui {
                 | crate::providers::Step::SaveModel { .. }
                 | crate::providers::Step::SaveModels { .. }
         );
-        match self.apply_provider_step(step) {
+        // An add from a server row: its in-flight mark is cleared however the
+        // write ends, and a failure stays on the row to be tried again.
+        let added = match &step {
+            crate::providers::Step::SaveModel { id: None, draft } => {
+                Some((draft.account.clone(), draft.model.clone()))
+            }
+            _ => None,
+        };
+        let outcome = self.apply_provider_step(step);
+        if let Some((account, model)) = &added {
+            let settled = match &outcome {
+                Ok(_) => Ok(()),
+                Err(why) => Err(why.clone()),
+            };
+            self.host.provider_add_settled(account, model, settled);
+        }
+        match outcome {
             Ok(Some(said)) => self.host.say(&said, false),
             Ok(None) => {}
             Err(why) => {
@@ -4734,24 +4791,23 @@ impl Tui {
         // Listing an endpoint's models writes nothing, so it is not followed by
         // a reload: the answer fills the picker the form put up, off the frame.
         if let Step::Discover { account } = step {
-            let Some(request) = self.host.provider_discovery_id() else {
+            let Some(request) = self.host.provider_listing_request(&account) else {
                 return Ok(None);
             };
             let Some(listing) = port.discover(&account) else {
-                let said = self.host.providers_discovered(
+                self.host.providers_discovered(
                     &account,
                     request,
                     Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
                 );
-                return said.map_or(Ok(None), Err);
+                return Ok(None);
             };
             let host = self.host.clone();
             let keys = self.wake.lock().expect("wake poisoned").clone();
             tokio::spawn(async move {
                 let listed = listing.await;
-                if let Some(said) = host.providers_discovered(&account, request, listed) {
-                    host.say(&said, true);
-                }
+                // A failure is drawn on the page, where the person is looking.
+                host.providers_discovered(&account, request, listed);
                 if let Some(keys) = keys {
                     let _ = keys.send(Wake::Fact);
                 }
@@ -4774,6 +4830,11 @@ impl Tui {
             } => {
                 port.edit_account(&id, &draft)?;
                 check = Some((id.clone(), None));
+                if let Some(step) = self.host.provider_account_changed(&id, false) {
+                    if let Err(why) = self.apply_provider_step(step) {
+                        self.host.say(&why, true);
+                    }
+                }
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveAccount {
@@ -4783,28 +4844,14 @@ impl Tui {
             } => {
                 let id = port.add_account(&draft)?;
                 check = Some((id.clone(), None));
-                // Straight into its model list: an account with no model under
-                // it cannot be talked to, so "what now" is answered by showing
-                // the one thing left to do.
+                // Straight into its page: an account with no model under it
+                // cannot be talked to, so "what now" is answered by standing
+                // where the models to add are listed.
                 self.host.show_providers(port.rows());
-                self.host.walk_into_provider(&id);
-                if self.host.connect_provider_models(&id) {
-                    if let Some(listed) = listed {
-                        if let Some(request) = self.host.provider_discovery_id() {
-                            if let Some(why) =
-                                self.host.providers_discovered(&id, request, Ok(listed))
-                            {
-                                self.host.say(&why, true);
-                            }
-                        }
-                    } else if let Err(why) = self.apply_provider_step(Step::Discover {
-                        account: id.clone(),
-                    }) {
+                if let Some(step) = self.host.enter_provider_detail(&id, listed) {
+                    if let Err(why) = self.apply_provider_step(step) {
                         self.host.say(&why, true);
                     }
-                    // Saving a new credential does not change the live model.
-                    // The selected model is activated through /model below.
-                    return Ok(Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned()));
                 }
                 Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned())
             }
@@ -4871,6 +4918,7 @@ impl Tui {
             }
             Step::DeleteAccount { id } => {
                 port.delete_account(&id)?;
+                self.host.provider_account_changed(&id, true);
                 Some(t(Msg::ProviderDeletedWithModels { id: &id }).into_owned())
             }
             Step::DeleteModel { id } => {
@@ -14598,6 +14646,9 @@ mod provider_probe_tests {
         saved: std::sync::atomic::AtomicBool,
         fail: std::sync::atomic::AtomicBool,
         models: std::sync::Mutex<Vec<ModelDraft>>,
+        /// Fill in model metadata off the frame, the way a port that asks a
+        /// catalog does — so an add is still on its way when the test acts.
+        slow: std::sync::atomic::AtomicBool,
     }
 
     impl Providers for Connects {
@@ -14659,6 +14710,19 @@ mod provider_probe_tests {
         fn delete_model(&self, _: &str) -> Result<(), String> {
             Ok(())
         }
+        fn enrich_models(
+            &self,
+            drafts: &[ModelDraft],
+        ) -> Option<crate::providers::EnrichModelsFuture> {
+            if !self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            let drafts = drafts.to_vec();
+            Some(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                drafts
+            }))
+        }
         fn discover(&self, _: &str) -> Option<crate::providers::DiscoverFuture> {
             Some(Box::pin(async {
                 Ok(vec![crate::providers::Discovered {
@@ -14680,86 +14744,217 @@ mod provider_probe_tests {
         m.providers_panel = Some(crate::providers::Panel::new());
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_connection_only_needs_a_key_and_a_model_and_sends_one_switch() {
-        let port = Arc::new(Connects::default());
-        let (host, tui, mut woken) = screen_with(port.clone());
-        open_connect(&host, &port);
-        tui.run_providers_key(KeyPress::plain(Key::Enter));
-        assert!(host.providers_paste("sk-private"));
-        tui.run_providers_key(KeyPress::plain(Key::Enter));
-        checked(&mut woken).await;
-        tui.run_providers_key(KeyPress::plain(Key::Enter)); // pick
-        tui.run_providers_key(KeyPress::plain(Key::Enter)); // connect and use
-        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
-            panic!("switch");
-        };
-        assert_eq!(line, "/model deepseek/flash high");
-        assert!(!host.providers_open());
-        let models = port.models.lock().unwrap();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].vision, Some(true));
-        assert_eq!(models[0].window, Some(1048576));
-        assert_eq!(models[0].max_tokens, Some(393216));
-        assert_eq!(
-            models[0].levels.as_deref(),
-            Some(["low".into(), "high".into(), "max".into()].as_slice())
-        );
-        assert!(woken.try_recv().is_err());
+    fn flash() -> crate::providers::Discovered {
+        crate::providers::Discovered {
+            id: "flash".into(),
+            window: Some(1048576),
+            ..Default::default()
+        }
     }
 
+    fn panel(host: &Host) -> crate::providers::Panel {
+        host.moment
+            .read()
+            .unwrap()
+            .providers_panel
+            .clone()
+            .expect("the panel is up")
+    }
+
+    /// The row the cursor is on, as the panel lists it.
+    fn pointed(host: &Host) -> Option<crate::providers::Listed> {
+        let m = host.moment.read().unwrap();
+        let panel = m.providers_panel.as_ref()?;
+        m.providers.listed(panel).get(panel.cursor).copied()
+    }
+
+    /// Wait until the screen's own channel says `until` happened, handing
+    /// back what else woke it on the way.
+    async fn wait_for(
+        woken: &mut mpsc::UnboundedReceiver<Wake>,
+        mut until: impl FnMut(&Wake) -> bool,
+    ) -> Wake {
+        loop {
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv())
+                .await
+                .expect("woken in time")
+                .expect("channel open");
+            if until(&woke) {
+                return woke;
+            }
+        }
+    }
+
+    /// Connecting an account lands on its page with what its endpoint lists,
+    /// and one Enter there adds one model — saved, not switched to.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_batch_can_be_retried_without_partial_writes_and_switches_once() {
+    async fn a_connection_lands_on_its_page_and_one_enter_adds_one_model() {
         let port = Arc::new(Connects::default());
-        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
         let (host, tui, mut woken) = screen_with(port.clone());
         open_connect(&host, &port);
-        host.connect_provider_models("deepseek");
-        let request = host.provider_discovery_id().unwrap();
-        host.providers_discovered(
-            "deepseek",
-            request,
-            Ok(vec![
-                crate::providers::Discovered {
-                    id: "flash".into(),
-                    ..Default::default()
-                },
-                crate::providers::Discovered {
-                    id: "pro".into(),
-                    effort: Some("high".into()),
-                    ..Default::default()
-                },
-            ]),
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // the unconfigured offer
+        assert!(host.providers_paste("sk-private"));
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // save the connection
+        assert!(port.saved.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            panel(&host).screen,
+            crate::providers::Screen::Detail("deepseek".into())
         );
-        for key in [Key::Char(' '), Key::Down, Key::Char(' '), Key::Enter] {
-            tui.run_providers_key(KeyPress::plain(key));
+        // The listing arrives off the frame; the page then rests on the first
+        // model to add.
+        for _ in 0..4 {
+            if matches!(pointed(&host), Some(crate::providers::Listed::Available(_))) {
+                break;
+            }
+            wait_for(&mut woken, |w| matches!(w, Wake::Fact)).await;
         }
-        assert!(host.point_providers_at(1));
-        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
-        tui.run_providers_key(host.provider_row_key());
-        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
         tui.run_providers_key(KeyPress::plain(Key::Enter));
-        assert!(port.models.lock().unwrap().is_empty());
-        {
-            let m = host.moment.read().unwrap();
-            let Some(crate::providers::Form::Model(form)) =
-                &m.providers_panel.as_ref().unwrap().form
+        let models = port.models.lock().unwrap().clone();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "flash");
+        assert_eq!(models[0].window, Some(1048576));
+        assert_eq!(models[0].max_tokens, Some(393216));
+        assert!(
+            !models[0].use_now && !models[0].default,
+            "added, not switched to"
+        );
+        assert!(host.providers_open(), "the page stays up for the next one");
+        assert!(panel(&host).adding.is_empty());
+        while let Ok(woke) = woken.try_recv() {
+            assert!(!matches!(woke, Wake::Chose(_)), "no switch was sent");
+        }
+    }
+
+    /// A listing asked for a connection that has since been saved again is
+    /// not the new connection's: it cannot fill its page.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_listing_for_a_replaced_connection_is_dropped() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        assert!(host.enter_provider_detail("deepseek", None).is_some());
+        let old = host.provider_listing_request("deepseek").unwrap();
+        let again = host.provider_account_changed("deepseek", false);
+        assert!(
+            matches!(again, Some(Step::Discover { .. })),
+            "the page asks again"
+        );
+        let new = host.provider_listing_request("deepseek").unwrap();
+        assert_ne!(old, new);
+        assert!(!host.providers_discovered("deepseek", old, Ok(vec![flash()])));
+        assert!(host.providers_discovered("deepseek", new, Ok(vec![])));
+        let panel = panel(&host);
+        assert_eq!(
+            panel.discovery["deepseek"].state,
+            crate::providers::DiscoveryState::Ready(vec![])
+        );
+    }
+
+    /// Deleting an account takes its page back to the list and asks nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deleting_an_account_leaves_its_page_without_asking_again() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        assert_eq!(host.provider_account_changed("deepseek", true), None);
+        let panel = panel(&host);
+        assert_eq!(panel.screen, crate::providers::Screen::Providers);
+        assert!(panel.discovery.is_empty());
+    }
+
+    /// An add whose connection was saved again, or whose account was deleted,
+    /// while its metadata was on its way is dropped — never written, so a
+    /// deleted account is not re-created to hold it. Only closing the panel is
+    /// no change: a confirmed add still lands.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_add_is_dropped_when_its_connection_changed() {
+        for (change, written) in [(Some(true), false), (Some(false), false), (None, true)] {
+            let port = Arc::new(Connects::default());
+            port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+            port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (host, tui, mut woken) = screen_with(port.clone());
+            open_connect(&host, &port);
+            host.enter_provider_detail("deepseek", Some(vec![flash()]));
+            tui.run_providers_key(KeyPress::plain(Key::Enter));
+            assert!(port.models.lock().unwrap().is_empty(), "still on its way");
+            match change {
+                Some(deleted) => {
+                    host.provider_account_changed("deepseek", deleted);
+                }
+                None => {
+                    host.close_providers();
+                }
+            }
+            let Wake::ProviderModelsEnriched {
+                original,
+                drafts,
+                before,
+                after,
+                session,
+                generation,
+            } = wait_for(&mut woken, |w| {
+                matches!(w, Wake::ProviderModelsEnriched { .. })
+            })
+            .await
             else {
-                panic!("restored");
+                unreachable!()
             };
-            assert_eq!(form.selected.len(), 2);
-            assert_eq!(form.batch_cursor, 1);
-            assert_eq!(form.model, "pro");
+            tui.models_enriched(original, drafts, before, after, session, generation);
+            assert_eq!(
+                port.models.lock().unwrap().len(),
+                usize::from(written),
+                "{change:?}"
+            );
         }
-        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A second Enter on a row whose add is on its way is not a second write.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_row_being_added_is_written_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
         tui.run_providers_key(KeyPress::plain(Key::Enter));
-        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
-            panic!("switch");
+        // The cursor moved on to the manual row; walk back and press again.
+        tui.run_providers_key(KeyPress::plain(Key::Up));
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let Wake::ProviderModelsEnriched {
+            original,
+            drafts,
+            before,
+            after,
+            session,
+            generation,
+        } = wait_for(&mut woken, |w| {
+            matches!(w, Wake::ProviderModelsEnriched { .. })
+        })
+        .await
+        else {
+            unreachable!()
         };
-        assert_eq!(line, "/model deepseek/pro high");
-        assert_eq!(port.models.lock().unwrap().len(), 2);
-        assert!(woken.try_recv().is_err());
-        assert!(!host.providers_open());
+        tui.models_enriched(original, drafts, before, after, session, generation);
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderModelsEnriched { .. }),
+                "no second add was sent"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -14789,30 +14984,6 @@ mod provider_probe_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn an_old_listing_cannot_fill_a_new_picker_for_the_same_account() {
-        let port = Arc::new(Connects::default());
-        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (host, _, _) = screen_with(port.clone());
-        open_connect(&host, &port);
-        assert!(host.connect_provider_models("deepseek"));
-        let old = host.provider_discovery_id().unwrap();
-        assert!(host.connect_provider_models("deepseek"));
-        let new = host.provider_discovery_id().unwrap();
-        assert_ne!(old, new);
-        host.providers_discovered("deepseek", old, Err("stale".into()));
-        let m = host.moment.read().unwrap();
-        let Some(crate::providers::Form::Model(form)) = &m.providers_panel.as_ref().unwrap().form
-        else {
-            panic!("model");
-        };
-        assert!(matches!(
-            form.picking,
-            Some(crate::providers::Picking::Loading { .. })
-        ));
-        assert_eq!(form.discovery_error, None);
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_saved_model_is_kept_when_the_switch_cannot_be_dispatched() {
         let port = Arc::new(Connects::default());
         let (host, tui, woken) = screen_with(port.clone());
@@ -14836,63 +15007,6 @@ mod provider_probe_tests {
         let m = host.moment.read().unwrap();
         assert!(m.providers_panel.as_ref().unwrap().form.is_none());
         assert!(m.notice.as_ref().unwrap().refused);
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn clicking_a_discovered_model_picks_that_row_and_changing_tabs_cancels_discovery() {
-        let port = Arc::new(Connects::default());
-        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (host, _, _) = screen_with(port.clone());
-        open_connect(&host, &port);
-        assert!(!host.connect_provider_models("missing"));
-        host.connect_provider_models("deepseek");
-        let request = host.provider_discovery_id().unwrap();
-        host.providers_discovered(
-            "deepseek",
-            request,
-            Ok(vec![
-                crate::providers::Discovered {
-                    id: "first".into(),
-                    ..Default::default()
-                },
-                crate::providers::Discovered {
-                    id: "second".into(),
-                    ..Default::default()
-                },
-            ]),
-        );
-        assert!(host.point_providers_at(1));
-        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
-        host.providers_key(host.provider_row_key());
-        {
-            let m = host.moment.read().unwrap();
-            let Some(crate::providers::Form::Model(form)) =
-                &m.providers_panel.as_ref().unwrap().form
-            else {
-                panic!("picker");
-            };
-            assert_eq!(form.selected[0].id, "second");
-            assert!(
-                form.picking.is_some(),
-                "clicks leave the list available for more checks"
-            );
-        }
-        host.providers_key(KeyPress::plain(Key::Enter));
-        {
-            let m = host.moment.read().unwrap();
-            let Some(crate::providers::Form::Model(form)) =
-                &m.providers_panel.as_ref().unwrap().form
-            else {
-                panic!("model");
-            };
-            assert_eq!(form.model, "second");
-        }
-        host.connect_provider_models("deepseek");
-        let request = host.provider_discovery_id().unwrap();
-        host.show_providers_tab(crate::providers::Tab::Accounts);
-        host.providers_discovered("deepseek", request, Err("cancelled".into()));
-        let m = host.moment.read().unwrap();
-        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
     }
 
     /// A port that takes every write and answers every check with what it was

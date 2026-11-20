@@ -2029,6 +2029,41 @@ pub enum Msg<'a> {
     LegendSwitchToIt,
     LegendChange,
 
+    // ── the providers panel: list → detail (2026-11 redesign) ──
+    /// The detail page's heading over the models the account already has.
+    ProviderSectionAdded,
+    /// …over the models the endpoint lists that it does not have yet.
+    ProviderSectionServer,
+    /// The detail page's first row: the account's connection.
+    ProviderConnectionRow,
+    /// The pinned last row of the provider list.
+    ProviderAddProviderRow,
+    /// The pinned last row of `/model`: opens the provider list.
+    ProviderAddModelRow,
+    /// The pinned last row of a detail page.
+    ProviderManualRow,
+    /// …the same row while a filter is typed: adds what was typed.
+    ProviderManualRowWith {
+        query: &'a str,
+    },
+    /// A server row whose write is in flight.
+    ProviderAdding,
+    /// The server section while the listing is on its way.
+    ProviderDiscoveryLoading,
+    /// A managed account's connection row: how to sign in or out instead.
+    ProviderManagedHint,
+    /// An add that was dropped because the connection changed under it.
+    ProviderConnectionChanged,
+    /// The row a second Ctrl+D would delete.
+    ProviderArmedDelete,
+    LegendEditIt,
+    LegendDelete,
+    LegendRemove,
+    LegendSwitch,
+    LegendAddIt,
+    LegendEditThenAdd,
+    LegendRetry,
+
     // ── the host side of the screen (`atomcode-cli`) ──
     HostConfigNotEditable,
     HostHeld,

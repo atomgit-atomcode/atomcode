@@ -30,8 +30,8 @@ use crate::modules::chrome::{
 };
 use crate::moment::{Moment, Viewport};
 use crate::providers::{
-    picked_rows, AccountField, AccountForm, Form, Listed, ModelField, ModelForm, Panel, Picking,
-    ProvidersView, Tab,
+    AccountField, AccountForm, DiscoveryState, Form, Listed, ModelField, ModelForm, Panel,
+    ProvidersView, Screen, Section,
 };
 use crate::theme::{self, Role};
 use crate::width;
@@ -115,7 +115,7 @@ enum Row {
     Card(String),
     /// The rule the panel starts with.
     Rule,
-    /// The name and the two lists: `provider  账号  模型`.
+    /// The name of the screen: `model`, `provider`, `provider › deepseek`.
     Header,
     BoxTop,
     Search,
@@ -125,7 +125,7 @@ enum Row {
     Listed(usize),
     /// A model row's description, on its own line under the model — dim,
     /// indented, and never selectable. By the model's index into
-    /// [`ProvidersView::listed`].
+    /// [`ProvidersView::models`].
     ModelDesc(usize),
     /// What a filter that matched nothing says.
     Nothing,
@@ -136,21 +136,12 @@ enum Row {
     },
     /// One field of the form that is up, by its index into the form's fields.
     Field(usize),
-    /// What the form is for: `添加账号`, `改 deepseek`, …
+    /// What the form is for: `添加 provider`, `改 deepseek`, …
     FormHead,
     Legend,
     Capabilities(usize),
-    BatchCount,
-    BatchModel(usize),
-    BatchCapabilities(usize, usize),
     DiscoveryMessage(String),
     AccountSection(bool),
-    /// The model picker over the add form: the listing is on its way.
-    PickLoading,
-    /// …what is typed to filter it.
-    PickFilter,
-    /// …one listed model, by its index into the filtered rows.
-    Pick(usize),
 }
 
 fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
@@ -182,73 +173,6 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
         return rows;
     }
 
-    if let Some(Form::Model(ModelForm {
-        picking: Some(picking),
-        ..
-    })) = &panel.form
-    {
-        rows.push(Row::FormHead);
-        rows.push(Row::Blank);
-        match picking {
-            Picking::Loading { .. } => rows.push(Row::PickLoading),
-            Picking::Ready {
-                items,
-                query,
-                cursor,
-            } => {
-                rows.push(Row::PickFilter);
-                if items.iter().any(|item| item.catalog_only) {
-                    rows.push(Row::DiscoveryMessage(
-                        t(Msg::ProviderCatalogCandidates).into_owned(),
-                    ));
-                }
-                let listed = picked_rows(items, query).len();
-                if listed == 0 {
-                    rows.push(Row::Nothing);
-                } else {
-                    // The same budget and window the list keeps (below).
-                    let cap = h.saturating_sub(rows.len() + 2).min(MOST);
-                    let (from, to) = if listed > cap {
-                        let room = cap.saturating_sub(1).max(1);
-                        let (from, to) = window(listed, *cursor, room);
-                        rows.push(Row::Scroll {
-                            above: from,
-                            below: listed - to,
-                        });
-                        (from, to)
-                    } else {
-                        (0, listed)
-                    };
-                    rows.extend((from..to).map(Row::Pick));
-                }
-            }
-        }
-        rows.push(Row::Blank);
-        rows.push(Row::Legend);
-        return rows;
-    }
-    if let Some(Form::Model(form)) = &panel.form {
-        if form.is_batch() {
-            rows.extend([Row::FormHead, Row::Blank, Row::BatchCount]);
-            let room = (h.saturating_sub(8) / 3).clamp(1, MOST / 3);
-            let (from, to) = window(form.selected.len(), form.batch_cursor, room);
-            if from > 0 || to < form.selected.len() {
-                rows.push(Row::Scroll {
-                    above: from,
-                    below: form.selected.len() - to,
-                });
-            }
-            for at in from..to {
-                rows.extend([
-                    Row::BatchModel(at),
-                    Row::BatchCapabilities(at, 0),
-                    Row::BatchCapabilities(at, 1),
-                ]);
-            }
-            rows.extend([Row::Blank, Row::Legend]);
-            return rows;
-        }
-    }
     match &panel.form {
         Some(form) => {
             rows.push(Row::FormHead);
@@ -283,13 +207,6 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                 if !form.model.is_empty() {
                     rows.extend((0..3).map(Row::Capabilities));
                 }
-                if let Some(error) = &form.discovery_error {
-                    rows.extend(
-                        width::wrap(error, w.saturating_sub(2).max(1))
-                            .into_iter()
-                            .map(Row::DiscoveryMessage),
-                    );
-                }
             }
             if let Form::Account(form) = form {
                 if let Some(discovery) = &form.discovery {
@@ -316,9 +233,18 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
             rows.push(Row::Search);
             rows.push(Row::BoxBottom);
             let listed = view.listed(panel);
+            // The screen's add row is drawn under the scrolling part, so a long
+            // list never takes it out of sight.
+            let pinned = listed
+                .last()
+                .filter(|row| row.pinned())
+                .map(|_| listed.len() - 1);
             let mut entries = Vec::new();
             let mut section = None;
             for (at, item) in listed.iter().enumerate() {
+                if Some(at) == pinned {
+                    continue;
+                }
                 if let Listed::Account(i) = item {
                     let configured = view.accounts()[*i].configured;
                     if section != Some(configured) {
@@ -330,7 +256,7 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                 // A model the gateway gave a description to says it on the line
                 // under its own, dim and not selectable — the row budget and
                 // the scroll window treat it like any other row.
-                if let Listed::Model(i) = item {
+                if let Listed::Model(i) | Listed::Configured(i) = item {
                     if view
                         .models()
                         .get(*i)
@@ -341,15 +267,24 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                 }
             }
             if entries.is_empty() {
-                rows.push(Row::Nothing);
+                if !panel.query.is_empty() || pinned.is_none() {
+                    rows.push(Row::Nothing);
+                }
             } else {
-                // Section headings consume the same row budget as entries.
-                // The cursor still refers to the selectable list's indices.
-                let cap = h.saturating_sub(rows.len() + 2).min(MOST);
-                let cursor = entries
-                    .iter()
-                    .position(|row| *row == Row::Listed(panel.cursor))
-                    .unwrap_or(0);
+                // Section headings consume the same row budget as entries, and
+                // so does the pinned row under them.
+                let reserved = rows.len() + 2 + usize::from(pinned.is_some());
+                let cap = h.saturating_sub(reserved).min(MOST);
+                // On the pinned row the window rests at the end of the list:
+                // that is where the row it is under left off.
+                let cursor = if pinned == Some(panel.cursor) {
+                    entries.len() - 1
+                } else {
+                    entries
+                        .iter()
+                        .position(|row| *row == Row::Listed(panel.cursor))
+                        .unwrap_or(0)
+                };
                 let (from, to) = if entries.len() > cap {
                     let room = cap.saturating_sub(1).max(1);
                     let (from, to) = window(entries.len(), cursor, room);
@@ -362,6 +297,9 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
                     (0, entries.len())
                 };
                 rows.extend_from_slice(&entries[from..to]);
+            }
+            if let Some(at) = pinned {
+                rows.push(Row::Listed(at));
             }
             rows.push(Row::Blank);
             rows.push(Row::Legend);
@@ -389,10 +327,7 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
     match row {
         Row::Rule => panel_edge(w, caps),
         Row::Header => {
-            let labels: Vec<String> = Tab::ALL.iter().map(|t| t.label()).collect();
-            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-            let at = Tab::ALL.iter().position(|t| *t == panel.tab).unwrap_or(0);
-            Line::from_spans(chrome::header_parts(NAME, &labels, at).0).truncate(w)
+            Line::from_spans(chrome::header_parts(&header_title(view, panel), &[], 0).0).truncate(w)
         }
         Row::BoxTop => box_edge(w, caps, true),
         Row::Search => search_line(&panel.query, Some(panel.query.len()), w, caps),
@@ -474,141 +409,22 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             };
             Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
         }
-        Row::BatchCount => {
-            let n = match &panel.form {
-                Some(Form::Model(form)) => form.selected.len(),
-                _ => 0,
-            };
-            Line::styled(
-                format!("  {}", t(Msg::ProviderBatchCount { n })),
-                theme::fg(Role::Secondary),
-            )
-            .truncate(w)
-        }
-        Row::BatchModel(at) => {
-            let Some(Form::Model(form)) = &panel.form else {
-                return Line::empty();
-            };
-            let Some(item) = form.selected.get(at) else {
-                return Line::empty();
-            };
-            let focused = at == form.batch_cursor;
-            let using = item.id == form.model;
-            let label = t(if using {
-                Msg::ProviderWillUse
-            } else {
-                Msg::ProviderSetUse
-            });
-            let mark = if focused {
-                caps.g(crate::caps::Glyph::Pointer)
-            } else {
-                " "
-            };
-            let style = theme::fg(if focused {
-                Role::Accent
-            } else {
-                Role::Secondary
-            });
-            let suffix = format!("  [{label}]");
-            let name = width::take_width(
-                &item.id,
-                w.saturating_sub(width::str_width(&suffix) + width::str_width(mark) + 1),
-            );
-            Line::styled(format!("{mark} {name}{suffix}"), style).truncate(w)
-        }
-        Row::BatchCapabilities(at, line) => {
-            let Some(Form::Model(form)) = &panel.form else {
-                return Line::empty();
-            };
-            let Some(item) = form.selected.get(at) else {
-                return Line::empty();
-            };
-            let unknown = t(Msg::ProviderNotProvided);
-            let text = if line == 0 {
-                let number = |n: Option<usize>| {
-                    n.map(|n| crate::content::token_count(n as u32))
-                        .unwrap_or_else(|| unknown.to_string())
-                };
-                format!(
-                    "{} {} · {} {}",
-                    t(Msg::FieldWindow),
-                    number(item.window),
-                    t(Msg::ProviderOutputLimit),
-                    number(item.max_tokens)
-                )
-            } else {
-                let vision = item
-                    .vision
-                    .map(|yes| t(if yes { Msg::VisionYes } else { Msg::VisionNo }).into_owned())
-                    .unwrap_or_else(|| unknown.to_string());
-                let levels = item
-                    .levels
-                    .as_ref()
-                    .filter(|levels| !levels.is_empty())
-                    .map(|levels| levels.join("/"))
-                    .unwrap_or_else(|| unknown.to_string());
-                let effort = item
-                    .effort
-                    .as_deref()
-                    .or(item.catalog_default_effort.as_deref())
-                    .unwrap_or(&unknown);
-                format!(
-                    "{} {} · {} {} · {} {}",
-                    t(Msg::FieldVision),
-                    vision,
-                    t(Msg::FieldEffort),
-                    levels,
-                    t(Msg::StatusEffortDefault),
-                    effort
-                )
-            };
-            Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
-        }
         Row::DiscoveryMessage(text) => {
             Line::styled(format!("  {text}"), theme::fg(Role::Warning)).truncate(w)
         }
-        Row::PickLoading => Line::styled(
-            width::take_width(&format!("  {}", t(Msg::ProviderDiscovering)), w),
-            theme::fg(Role::Muted),
-        ),
-        Row::PickFilter => {
-            let (query, count) = match &panel.form {
-                Some(Form::Model(ModelForm {
-                    picking: Some(Picking::Ready { query, .. }),
-                    selected,
-                    ..
-                })) => (query.as_str(), selected.len()),
-                _ => ("", 0),
-            };
-            Line::styled(
-                width::take_width(
-                    &format!("  [x] {count} · {}", t(Msg::ProviderPickFilter { query })),
-                    w,
-                ),
-                theme::fg(Role::Secondary),
-            )
-        }
-        Row::Pick(at) => pick_line(panel, at, w),
         Row::Card(text) => {
             Line::styled(format!("  {text}"), theme::fg(Role::Secondary)).truncate(w)
         }
         Row::Legend => {
             let mut line = Line::styled("  ", theme::fg(Role::Muted));
-            for (index, (text, key)) in legend_buttons(view, panel, caps).into_iter().enumerate() {
+            for (index, (text, _)) in legend_buttons(view, panel, caps, w).into_iter().enumerate() {
                 if index > 0 {
                     line.push(Span::styled(
                         format!(" {} ", caps.g(crate::caps::Glyph::Separator)),
                         theme::fg(Role::Muted),
                     ));
                 }
-                line.push(Span::styled(
-                    text,
-                    theme::fg(if key.is_some() {
-                        Role::Accent
-                    } else {
-                        Role::Muted
-                    }),
-                ));
+                line.push(Span::styled(text, theme::fg(Role::Muted)));
             }
             line.truncate(w)
         }
@@ -661,56 +477,6 @@ fn capability_text(
     }
 }
 
-/// One row of the model picker: the id, and the context window the listing
-/// gave at the right when it gave one. The row the arrows are on is lit.
-fn pick_line(panel: &Panel, at: usize, w: usize) -> Line {
-    let Some(Form::Model(ModelForm {
-        picking:
-            Some(Picking::Ready {
-                items,
-                query,
-                cursor,
-            }),
-        ..
-    })) = &panel.form
-    else {
-        return Line::empty();
-    };
-    let rows = picked_rows(items, query);
-    let Some(item) = rows.get(at) else {
-        return Line::empty();
-    };
-    let here = at == *cursor;
-    let selected = matches!(&panel.form, Some(Form::Model(form)) if form.selected.iter().any(|row| row.id == item.id));
-    let mark = match (here, selected) {
-        (true, true) => "› [x] ",
-        (false, true) => "  [x] ",
-        (true, false) => "› [ ] ",
-        (false, false) => "  [ ] ",
-    };
-    let window = capability_text(
-        item.window,
-        None,
-        item.vision,
-        None,
-        item.levels.as_deref().unwrap_or_default(),
-    );
-    // Keep the model id legible even when its capability list is long.
-    let left = format!("  {mark}{}", item.id);
-    let minimum = width::str_width(&left).min(w / 2).max(16).min(w);
-    let window = width::take_width(&window, w.saturating_sub(minimum + 1));
-    let room = w.saturating_sub(width::str_width(&window) + 1);
-    let left = width::take_width(&left, room);
-    let pad = w.saturating_sub(width::str_width(&left) + width::str_width(&window));
-    let text = format!("{left}{}{window}", " ".repeat(pad));
-    let style = if here {
-        theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
-    } else {
-        theme::fg(Role::Secondary)
-    };
-    Line::styled(text, style).truncate(w)
-}
-
 fn form_title(panel: &Panel) -> String {
     match &panel.form {
         Some(Form::Account(form)) if form.preset.is_some() => t(Msg::ProviderConnectTitle {
@@ -732,24 +498,33 @@ fn form_title(panel: &Panel) -> String {
     }
 }
 
-/// The same right-hand edit cells are used for drawing and hit testing.
-fn row_edit_button(
-    view: &ProvidersView,
-    panel: &Panel,
-    at: usize,
-    w: usize,
-) -> Option<(usize, String)> {
-    let Listed::Model(i) = *view.listed(panel).get(at)? else {
-        return None;
-    };
-    if view.models().get(i)?.managed || w < 32 {
-        return None;
+/// The panel's title for the screen that is showing.
+fn header_title(view: &ProvidersView, panel: &Panel) -> String {
+    match &panel.screen {
+        Screen::Models => "model".to_string(),
+        Screen::Providers => NAME.to_string(),
+        Screen::Detail(account) => {
+            let label = view
+                .account(account)
+                .map(|row| row.label.as_str())
+                .unwrap_or(account.as_str());
+            format!("{NAME} › {label}")
+        }
     }
-    let text = format!("[ {} ]", t(Msg::ProviderEdit));
-    Some((w.checked_sub(width::str_width(&text))?, text))
 }
 
-/// One row of the list: what it is, and what is worth knowing about it.
+/// What a listed row says: its mark, its label, the facts worth knowing about
+/// it (dropped from the end when they do not fit), whether it is drawn dim,
+/// and whether the facts are a warning.
+struct Parts {
+    mark: String,
+    label: String,
+    about: Vec<String>,
+    dim: bool,
+    warn: bool,
+}
+
+/// One row of the list.
 fn listed_line(
     view: &ProvidersView,
     panel: &Panel,
@@ -761,102 +536,209 @@ fn listed_line(
     let Some(what) = listed.get(at).copied() else {
         return Line::empty();
     };
-    let here = at == panel.cursor;
+    let Some(parts) = listed_parts(view, panel, what, caps) else {
+        return Line::empty();
+    };
+    let here = view.pointed(panel).map(|(row, _)| row) == Some(at);
     let base = if here {
         theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
     } else {
         Style::new()
     };
+    // Headings sit flush with the labels under them and carry no pointer.
+    if matches!(what, Listed::Group(_) | Listed::Section(_)) {
+        return Line::styled(
+            width::take_width(&format!("  {}", parts.label), w),
+            theme::fg(Role::Muted),
+        );
+    }
     let pointer = if here {
         format!("{} ", caps.g(crate::caps::Glyph::Pointer))
     } else {
         "  ".to_string()
     };
-    let Some((mark, label, about, dim)) = listed_parts(view, panel, what, caps) else {
-        return Line::empty();
-    };
-    // The row a second ctrl-d would delete says so where the row's own
+    // The row a second Ctrl+D would delete says so where the row's own
     // description was: a person about to throw something away should read it on
     // the thing being thrown away, not in a corner.
-    // `is_some_and`, not `==`: two `None`s compare equal, and an unarmed panel
-    // would then draw the warning on the add row, which has no id at all.
     let armed = panel.pending_delete.as_deref().is_some_and(|armed| {
         Some(armed)
             == match what {
                 Listed::Account(i) => view.accounts().get(i).map(|r| r.id.as_str()),
-                Listed::Model(i) => view.models().get(i).map(|r| r.id.as_str()),
-                Listed::Effort(_) | Listed::Group(_) | Listed::Add => None,
+                Listed::Model(i) | Listed::Configured(i) => {
+                    view.models().get(i).map(|r| r.id.as_str())
+                }
+                _ => None,
             }
     });
-    let edit = row_edit_button(view, panel, at, w);
-    let content_w = edit
-        .as_ref()
-        .map(|(start, _)| start.saturating_sub(1))
-        .unwrap_or(w);
-    let label_room = label_column(view, panel, content_w, caps);
-    let shown = width::take_width(&label, label_room);
-    let pad = label_room.saturating_sub(width::str_width(&shown));
-    let label_style = if dim {
+    // Rows that are actions rather than things — the add rows, a failed
+    // listing — span the width: there is no column of facts to line up with.
+    let wide = what.pinned() || matches!(what, Listed::Failed | Listed::Loading);
+    let label_room = if wide {
+        w.saturating_sub(LEAD + 2)
+    } else {
+        label_column(view, panel, w, caps)
+    };
+    let shown = width::take_width(&parts.label, label_room);
+    let pad = if wide {
+        0
+    } else {
+        label_room.saturating_sub(width::str_width(&shown))
+    };
+    let label_style = if parts.dim {
         base.under(theme::fg(Role::Muted))
     } else {
         base
     };
-    let about_style = if armed {
+    let about_style = if armed || parts.warn {
         base.under(theme::fg(Role::Warning))
     } else {
         base.under(theme::fg(Role::Muted))
     };
+    let room = w.saturating_sub(LEAD + 2 + width::str_width(&shown) + pad + 2);
     let about = if armed {
-        t(Msg::ArmedDelete).into_owned()
+        width::take_width(&t(Msg::ProviderArmedDelete), room)
     } else {
-        about
+        fit_facts(&parts.about, room)
     };
     let spans = vec![
         Span::styled(pointer, base),
-        Span::styled(format!("{mark} "), label_style),
+        Span::styled(format!("{} ", parts.mark), label_style),
         Span::styled(shown, label_style),
         Span::styled(" ".repeat(pad + 2), base),
         Span::styled(about, about_style),
     ];
-    let mut line = pad_to(Line::from_spans(spans), content_w, base);
-    if let Some((_, text)) = edit {
-        line.push(Span::styled(" ", base));
-        line.push(Span::styled(text, base.under(theme::fg(Role::Accent))));
-    }
-    line
+    pad_to(Line::from_spans(spans), w, base)
 }
 
-/// What one listed row says: its mark, its label, what is worth knowing about
-/// it, and whether it is drawn dim. `None` for a row the view no longer has.
+/// As many of `facts` as fit in `room`, joined, dropping from the end: the
+/// facts are listed most-important-first, so a narrow terminal loses the
+/// reasoning levels before the vision mark, and that before the output budget —
+/// the context window, first, stays.
+fn fit_facts(facts: &[String], room: usize) -> String {
+    for keep in (1..=facts.len()).rev() {
+        let text = facts[..keep].join(" · ");
+        if width::str_width(&text) <= room {
+            return text;
+        }
+    }
+    facts
+        .first()
+        .map(|first| width::take_width(first, room))
+        .unwrap_or_default()
+}
+
+/// A model's facts, most important first: window, output, vision, reasoning.
+fn model_facts(
+    window: Option<usize>,
+    output: Option<usize>,
+    vision: Option<bool>,
+    levels: &[String],
+    effort: Option<&str>,
+) -> Vec<String> {
+    let mut facts = Vec::new();
+    if let Some(window) = window.filter(|w| *w > 0) {
+        facts.push(crate::providers::window_label(window));
+    }
+    if let Some(output) = output {
+        facts.push(format!(
+            "{} {}",
+            t(Msg::ProviderOutputLimit),
+            crate::content::token_count(output as u32)
+        ));
+    }
+    if vision == Some(true) {
+        facts.push(t(Msg::ProviderVision).into_owned());
+    }
+    if !levels.is_empty() {
+        facts.push(format!("{} {}", t(Msg::FieldEffort), levels.join("/")));
+    } else if let Some(effort) = effort {
+        facts.push(format!("{} {effort}", t(Msg::FieldEffort)));
+    }
+    facts
+}
+
+/// What one listed row says. `None` for a row the view no longer has.
 fn listed_parts(
     view: &ProvidersView,
     panel: &Panel,
     what: Listed,
     caps: crate::caps::Caps,
-) -> Option<(String, String, String, bool)> {
+) -> Option<Parts> {
+    let plain = |label: String, about: Vec<String>, dim: bool| Parts {
+        mark: " ".to_string(),
+        label,
+        about,
+        dim,
+        warn: false,
+    };
     Some(match what {
-        // 一组的小标题:账号的名字,暗一档,没有标记也没有右侧说明——它不是
-        // 一行可以做点什么的东西,是一条分界。
-        Listed::Group(first) => {
-            let Some(row) = view.models().get(first) else {
-                return None;
-            };
-            (" ".to_string(), row.account.clone(), String::new(), true)
-        }
-        Listed::Add => (
-            " ".to_string(),
-            match panel.tab {
-                Tab::Accounts => t(Msg::ProviderFormAddAccount),
-                Tab::Models => t(Msg::ProviderFormAddModel),
-            }
+        // 一组的小标题:账号的名字——它不是一行可以做点什么的东西,是一条分界。
+        Listed::Group(first) => plain(view.models().get(first)?.account.clone(), vec![], true),
+        Listed::Section(section) => plain(
+            t(match section {
+                Section::Added => Msg::ProviderSectionAdded,
+                Section::Server => Msg::ProviderSectionServer,
+                Section::Catalog => Msg::ProviderCatalogCandidates,
+            })
             .into_owned(),
-            "^a".to_string(),
+            vec![],
             true,
         ),
-        Listed::Account(i) => {
-            let Some(row) = view.accounts().get(i) else {
+        Listed::AddModel => plain(t(Msg::ProviderAddModelRow).into_owned(), vec![], false),
+        Listed::AddAccount => plain(t(Msg::ProviderAddProviderRow).into_owned(), vec![], false),
+        Listed::Manual => {
+            let typed = panel.query.trim();
+            let label = if typed.is_empty() || view.exact_server_match(panel) {
+                t(Msg::ProviderManualRow).into_owned()
+            } else {
+                t(Msg::ProviderManualRowWith { query: typed }).into_owned()
+            };
+            plain(label, vec![], false)
+        }
+        Listed::Loading => plain(t(Msg::ProviderDiscoveryLoading).into_owned(), vec![], true),
+        Listed::Failed => {
+            let why = match &panel.screen {
+                Screen::Detail(account) => match panel.discovery.get(account).map(|d| &d.state) {
+                    Some(DiscoveryState::Failed(why)) => why.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            Parts {
+                mark: " ".to_string(),
+                label: why,
+                about: vec![],
+                dim: false,
+                warn: true,
+            }
+        }
+        Listed::Connection => {
+            let Screen::Detail(account) = &panel.screen else {
                 return None;
             };
+            let row = view.account(account)?;
+            let about = if row.managed {
+                vec![t(Msg::ProviderManagedHint).into_owned()]
+            } else {
+                let mut about = vec![row.protocol.clone()];
+                let host = row.endpoint_host();
+                if !host.is_empty() {
+                    about.push(host.to_string());
+                }
+                about.push(
+                    t(if row.has_key {
+                        Msg::ProviderHasKey
+                    } else {
+                        Msg::ProviderNoKey
+                    })
+                    .into_owned(),
+                );
+                vec![about.join(" · ")]
+            };
+            plain(t(Msg::ProviderConnectionRow).into_owned(), about, false)
+        }
+        Listed::Account(i) => {
+            let row = view.accounts().get(i)?;
             let host = row.endpoint_host();
             let choices = view.connections(&row.id);
             let protocol = if !row.configured && choices.len() > 1 {
@@ -868,78 +750,105 @@ fn listed_parts(
             } else {
                 row.protocol.clone()
             };
-            let mut about = vec![protocol];
-            if !host.is_empty() {
-                about.push(host.to_string());
-            }
+            let mut about = Vec::new();
             if row.configured {
-                about.push(t(Msg::ProviderModelCount { n: row.models }).into_owned());
-                about.push(
-                    if row.has_key {
-                        t(Msg::ProviderHasKey)
-                    } else {
-                        t(Msg::ProviderNoKey)
-                    }
-                    .into_owned(),
-                );
                 if row.managed {
                     about.push(t(Msg::ProviderManaged).into_owned());
+                } else {
+                    about.push(
+                        t(if row.has_key {
+                            Msg::ProviderHasKey
+                        } else {
+                            Msg::ProviderNoKey
+                        })
+                        .into_owned(),
+                    );
                 }
+                about.push(t(Msg::ProviderModelCount { n: row.models }).into_owned());
+            }
+            about.push(protocol);
+            if !host.is_empty() {
+                about.push(host.to_string());
             }
             let on = view
                 .models()
                 .iter()
                 .any(|m| m.current && m.account == row.id);
-            (
-                mark_for(on, caps),
-                row.label.clone(),
-                about.join(" · "),
-                !row.configured,
-            )
+            Parts {
+                mark: mark_for(on, caps),
+                label: row.label.clone(),
+                about,
+                dim: !row.configured,
+                warn: false,
+            }
         }
         Listed::Effort(i) => {
-            let Some(pick) = panel.efforts.as_ref() else {
-                return None;
-            };
-            let Some(level) = pick.levels.get(i) else {
-                return None;
-            };
+            let pick = panel.efforts.as_ref()?;
+            let level = pick.levels.get(i)?;
             // 收尾那一行是把强度交回端点,它要说的正是「不指定」。
             let about = if i + 1 == pick.levels.len() {
-                t(Msg::EffortDefaultAbout).into_owned()
+                vec![t(Msg::EffortDefaultAbout).into_owned()]
             } else {
-                String::new()
+                vec![]
             };
-            (" ".to_string(), level.clone(), about, false)
+            plain(level.clone(), about, false)
         }
-        Listed::Model(i) => {
-            let Some(row) = view.models().get(i) else {
-                return None;
-            };
-            let mut about = vec![crate::providers::window_label(row.window)];
-            if panel.drill.is_none() {
-                about.insert(0, row.account.clone());
-            }
-            if let Some(effort) = &row.effort {
-                about.push(effort.clone());
-            }
-            if row.vision == Some(true) {
-                about.push(t(Msg::ProviderVision).into_owned());
-            }
+        Listed::Model(i) | Listed::Configured(i) => {
+            let row = view.models().get(i)?;
+            let mut about = model_facts(
+                Some(row.window),
+                row.max_tokens,
+                row.vision,
+                &[],
+                row.effort.as_deref(),
+            );
             if row.managed {
-                about.push(t(Msg::ProviderManaged).into_owned());
+                about.insert(0, t(Msg::ProviderManaged).into_owned());
             }
-            (
-                mark_for(row.current, caps),
+            Parts {
+                mark: mark_for(row.current, caps),
                 // The gateway's display alias wins when it has one, in the
                 // interface language: the name a person picks by is the one
                 // the server labels the model with, not the wire id.
-                row.localized_alias()
+                label: row
+                    .localized_alias()
                     .map(str::to_string)
                     .unwrap_or_else(|| row.id.clone()),
-                about.join(" · "),
-                false,
-            )
+                about,
+                dim: false,
+                warn: false,
+            }
+        }
+        Listed::Available(j) => {
+            let item = view.available(panel, j)?;
+            let Screen::Detail(account) = &panel.screen else {
+                return None;
+            };
+            let key = (account.clone(), item.id.clone());
+            let (about, warn) = if panel.adding.contains(&key) {
+                (vec![t(Msg::ProviderAdding).into_owned()], false)
+            } else if let Some(why) = panel.add_errors.get(&key) {
+                (vec![why.clone()], true)
+            } else {
+                let facts = model_facts(
+                    item.window,
+                    item.max_tokens,
+                    item.vision,
+                    item.levels.as_deref().unwrap_or_default(),
+                    item.effort.as_deref(),
+                );
+                match facts.is_empty() {
+                    true => (vec![t(Msg::ProviderNotProvided).into_owned()], false),
+                    false => (facts, false),
+                }
+            };
+            Parts {
+                mark: " ".to_string(),
+                label: item.id.clone(),
+                about,
+                dim: false,
+                warn,
+            }
         }
     })
 }
@@ -954,15 +863,20 @@ const ABOUT_MIN: usize = 20;
 /// Not the form's [`LABEL_MAX`] cap: a form's labels are short field names,
 /// while a list's are model ids, and an OpenRouter id
 /// (`openrouter/thinkingmachines/…`) is past thirty columns before it says
-/// which model it is. Capped at thirty, every such row was cut to the same
-/// prefix on a terminal with a hundred columns to spare, and rows that differ
-/// only at the end could not be told apart.
+/// which model it is.
 fn label_column(view: &ProvidersView, panel: &Panel, w: usize, caps: crate::caps::Caps) -> usize {
     let widest = view
         .listed(panel)
         .into_iter()
+        .filter(|what| {
+            !what.pinned()
+                && !matches!(
+                    what,
+                    Listed::Group(_) | Listed::Section(_) | Listed::Failed | Listed::Loading
+                )
+        })
         .filter_map(|what| listed_parts(view, panel, what, caps))
-        .map(|(_, label, _, _)| width::str_width(&label))
+        .map(|parts| width::str_width(&parts.label))
         .max()
         .unwrap_or(0);
     // Pointer and mark before the label, two spaces after it.
@@ -1095,13 +1009,6 @@ fn model_field(
     caps: crate::caps::Caps,
 ) -> (String, String, bool, bool, usize) {
     match field {
-        ModelField::Account => (
-            "provider".into(),
-            cycled(form.account_id(), focused),
-            focused,
-            false,
-            0,
-        ),
         ModelField::Key => {
             let value = dots(form.key_len, false, caps);
             let caret = value.len();
@@ -1216,20 +1123,6 @@ fn model_field(
                 0,
             ),
         },
-        ModelField::Default => (
-            t(Msg::FieldUseAfterSaving).into_owned(),
-            cycled(
-                &if form.default {
-                    t(Msg::YesWord)
-                } else {
-                    t(Msg::NoWord)
-                },
-                focused,
-            ),
-            focused,
-            false,
-            0,
-        ),
     }
 }
 
@@ -1288,242 +1181,255 @@ fn levels_text(
         .join("")
 }
 
-fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
-    let key = |k: &str, msg: Msg<'_>| (k.to_string(), t(msg).into_owned());
+/// One action in the footer: its key, what it does, and how readily it gives
+/// way on a narrow terminal — 0 never does (the row's main action and Esc),
+/// and the highest number goes first.
+struct Hint {
+    key: String,
+    label: String,
+    yield_rank: u8,
+}
+
+fn hint(key: &str, msg: Msg<'_>, yield_rank: u8) -> Hint {
+    Hint {
+        key: key.to_string(),
+        label: t(msg).into_owned(),
+        yield_rank,
+    }
+}
+
+/// What the footer says for what has the keyboard: only the actions this row
+/// takes, so a key that is listed is a key that does something.
+fn legend(view: &ProvidersView, panel: &Panel) -> Vec<Hint> {
     match &panel.form {
-        Some(Form::Model(ModelForm {
-            picking: Some(picking),
-            ..
-        })) => match picking {
-            Picking::Loading { .. } => vec![
-                key("^n", Msg::ProviderManualAdd),
-                key("esc", Msg::LegendCancel),
-            ],
-            Picking::Ready { .. } => {
-                vec![
-                    key("⏎", Msg::ProviderContinue),
-                    key("space", Msg::LegendSelect),
-                    key("^n", Msg::ProviderManualAdd),
-                    key("esc", Msg::LegendBack),
-                    (t(Msg::ProviderPickKeys).into_owned(), String::new()),
-                ]
-            }
-        },
-        Some(Form::Model(form)) if form.is_batch() => vec![
-            key("↑↓", Msg::LegendSelect),
-            key("space", Msg::ProviderBatchChoose),
-            key(
-                "⏎",
-                if form.connecting {
-                    Msg::ProviderConnectUse
-                } else {
-                    Msg::LegendSave
-                },
-            ),
-            key("^s", Msg::ProviderSaveOnly),
-            key("esc", Msg::LegendBack),
-        ],
         Some(Form::Account(form)) if form.is_ollama(view) => vec![
-            key("⏎", Msg::ProviderContinue),
-            key("^f", Msg::ProviderDiscoverHint),
-            key("^o", Msg::ProviderAdvanced),
-            key("esc", Msg::LegendCancel),
+            hint("⏎", Msg::ProviderContinue, 0),
+            // The only way to ask again on this form: it stays on a narrow
+            // terminal with the main action.
+            hint("Ctrl+F", Msg::ProviderDiscoverHint, 0),
+            hint("Ctrl+O", Msg::ProviderAdvanced, 2),
+            hint("esc", Msg::LegendCancel, 0),
         ],
         Some(Form::Account(form)) if form.preset.is_some() => {
             let mut keys = vec![
-                key("⏎", Msg::ProviderContinue),
-                key("^o", Msg::ProviderAdvanced),
-                key("esc", Msg::LegendCancel),
+                hint("⏎", Msg::ProviderContinue, 0),
+                hint("Ctrl+O", Msg::ProviderAdvanced, 2),
+                hint("esc", Msg::LegendCancel, 0),
             ];
             if form.fields(view).contains(&AccountField::Protocol) {
-                keys.insert(1, key("←→", Msg::LegendChangeValue));
+                keys.insert(1, hint("←→", Msg::LegendChangeValue, 1));
             }
             keys
         }
-        Some(Form::Model(form)) if form.connecting => vec![
-            key("⏎", Msg::ProviderConnectUse),
-            key("^s", Msg::ProviderSaveOnly),
-            key("^o", Msg::ProviderAdvanced),
-            key("^f", Msg::ProviderDiscoverHint),
-            key("esc", Msg::LegendBack),
-        ],
-        // Adding, on the model field: the id can be picked rather than typed.
-        Some(Form::Model(form)) if form.focus == ModelField::Model && form.editing.is_none() => {
-            vec![
-                key("^f", Msg::ProviderDiscoverHint),
-                key("⇥", Msg::LegendNextField),
-                key("⏎", Msg::LegendSave),
-                key("esc", Msg::LegendCancel),
-            ]
-        }
         // On the levels row the keys do something the other fields' legend
         // does not say: Space turns the bracketed level on or off, and the
-        // arrows move between levels rather than change a value. Said where
-        // the eye is, the way the other front end says it on that row.
-        Some(Form::Model(form)) if form.focus == ModelField::Levels => {
-            vec![
-                key("space", Msg::LegendToggleLevel),
-                key("←→", Msg::LegendPickLevel),
-                key("⇥", Msg::LegendNextField),
-                key("⏎", Msg::LegendSave),
-                key("esc", Msg::LegendCancel),
-            ]
-        }
+        // arrows move between levels rather than change a value.
+        Some(Form::Model(form)) if form.focus == ModelField::Levels => vec![
+            hint("space", Msg::LegendToggleLevel, 1),
+            hint("←→", Msg::LegendPickLevel, 2),
+            hint("⇥", Msg::LegendNextField, 3),
+            hint("⏎", Msg::LegendSave, 0),
+            hint("esc", Msg::LegendCancel, 0),
+        ],
         Some(Form::Model(form)) if form.focus == ModelField::Output => {
             let invalid = form
                 .max_tokens_typed
                 .as_deref()
                 .is_some_and(|typed| crate::providers::parse_output_tokens(typed).is_none());
             vec![
-                (
-                    t(if invalid {
+                Hint {
+                    key: String::new(),
+                    label: t(if invalid {
                         Msg::OutputInvalid
                     } else {
                         Msg::LegendTypeOutput
                     })
                     .into_owned(),
-                    String::new(),
-                ),
-                key("←→", Msg::LegendChangeValue),
-                key("⇥", Msg::LegendNextField),
-                key("⏎", Msg::LegendSave),
-                key("esc", Msg::LegendCancel),
+                    yield_rank: 1,
+                },
+                hint("←→", Msg::LegendChangeValue, 2),
+                hint("⇥", Msg::LegendNextField, 3),
+                hint("⏎", Msg::LegendSave, 0),
+                hint("esc", Msg::LegendCancel, 0),
             ]
         }
         // The window row: typing a number is a custom window, and the legend
         // has to say so — on a preset nothing else would tell a person that the
-        // digits keys do anything here, and in the custom field the arrows
-        // leave it rather than move the caret.
+        // digit keys do anything here.
         Some(Form::Model(form)) if form.focus == ModelField::Window => match form.window_typed {
             Some(_) => vec![
-                (t(Msg::LegendTypeWindow).into_owned(), String::new()),
-                key("←→", Msg::LegendBackToPresets),
-                key("⏎", Msg::LegendSave),
-                key("esc", Msg::LegendCancel),
+                Hint {
+                    key: String::new(),
+                    label: t(Msg::LegendTypeWindow).into_owned(),
+                    yield_rank: 1,
+                },
+                hint("←→", Msg::LegendBackToPresets, 2),
+                hint("⏎", Msg::LegendSave, 0),
+                hint("esc", Msg::LegendCancel, 0),
             ],
             None => vec![
-                key("←→", Msg::LegendChangeValue),
-                key("0-9", Msg::WindowCustom),
-                key("⇥", Msg::LegendNextField),
-                key("⏎", Msg::LegendSave),
-                key("esc", Msg::LegendCancel),
+                hint("←→", Msg::LegendChangeValue, 1),
+                hint("0-9", Msg::WindowCustom, 2),
+                hint("⇥", Msg::LegendNextField, 3),
+                hint("⏎", Msg::LegendSave, 0),
+                hint("esc", Msg::LegendCancel, 0),
             ],
         },
-        Some(Form::Account(_)) | Some(Form::Model(_)) => {
-            vec![
-                key("⇥", Msg::LegendNextField),
-                key("←→", Msg::LegendChangeValue),
-                key("⏎", Msg::LegendSave),
-                key("esc", Msg::LegendCancel),
-            ]
-        }
-        None => {
-            // 挑强度那一层:一句话说清这一层是干什么的,按键只有两个要记。
-            if let Some(pick) = &panel.efforts {
-                return vec![
-                    (
-                        t(Msg::EffortPickAfterModel { model: &pick.model }).into_owned(),
-                        String::new(),
-                    ),
-                    key("⏎", Msg::LegendThisOne),
-                    key("esc", Msg::LegendBack),
-                ];
-            }
-            if panel.pending_delete.is_some() {
-                // Says what the next press does, because that is the only thing
-                // about this state a person has to know — and it is the press
-                // that throws something away.
-                return vec![
-                    key("^d", Msg::LegendPressAgainToDelete),
-                    (
-                        t(Msg::LegendAnyOtherKey).into_owned(),
-                        t(Msg::LegendCancel).into_owned(),
-                    ),
-                ];
-            }
-            let mut out = vec![
-                ("^a".to_string(), pt(PMsg::ProviderMenuAdd).into_owned()),
-                key("^n", Msg::ProviderManualAdd),
-                ("^d".to_string(), pt(PMsg::ProviderMenuDelete).into_owned()),
-                key("↑↓", Msg::LegendSelect),
-            ];
-            if panel.tab == Tab::Models {
-                out.insert(0, key("F2", Msg::ModelCardTitle));
-            }
-            if panel.tab == Tab::Accounts {
-                out.insert(1, key("^e", Msg::ProviderEdit));
-            }
-            out.push(match panel.tab {
-                Tab::Accounts => key("⏎", Msg::LegendSeeItsModels),
-                Tab::Models => key("⏎", Msg::LegendSwitchToIt),
-            });
-            out.push(key("⇥", Msg::LegendChangePage));
-            out.push(key("esc", Msg::LegendClose));
-            out
-        }
+        Some(_) => vec![
+            hint("⇥", Msg::LegendNextField, 2),
+            hint("←→", Msg::LegendChangeValue, 1),
+            hint("⏎", Msg::LegendSave, 0),
+            hint("esc", Msg::LegendCancel, 0),
+        ],
+        None => list_legend(view, panel),
     }
 }
 
-/// Draw and hit-test the same button text, including terminal key names.
+fn list_legend(view: &ProvidersView, panel: &Panel) -> Vec<Hint> {
+    // 挑强度那一层:一句话说清这一层是干什么的,按键只有两个要记。
+    if let Some(pick) = &panel.efforts {
+        return vec![
+            Hint {
+                key: String::new(),
+                label: t(Msg::EffortPickAfterModel { model: &pick.model }).into_owned(),
+                yield_rank: 1,
+            },
+            hint("⏎", Msg::LegendThisOne, 0),
+            hint("esc", Msg::LegendBack, 0),
+        ];
+    }
+    if panel.pending_delete.is_some() {
+        // Says what the next press does, because that is the only thing about
+        // this state a person has to know — and it is the press that throws
+        // something away.
+        return vec![
+            hint("Ctrl+D", Msg::LegendPressAgainToDelete, 0),
+            Hint {
+                key: t(Msg::LegendAnyOtherKey).into_owned(),
+                label: t(Msg::LegendCancel).into_owned(),
+                yield_rank: 0,
+            },
+        ];
+    }
+    let esc = match (&panel.screen, panel.from_models) {
+        (Screen::Models, _) | (Screen::Providers, false) => hint("esc", Msg::LegendClose, 0),
+        _ => hint("esc", Msg::LegendBack, 0),
+    };
+    let mut out = match view.pointed(panel).map(|(_, row)| row) {
+        Some(Listed::Model(i) | Listed::Configured(i)) => {
+            let managed = view.models().get(i).is_some_and(|row| row.managed);
+            let mut out = vec![hint("⏎", Msg::LegendSwitch, 0)];
+            if !managed {
+                out.push(hint("Ctrl+E", Msg::LegendEditIt, 1));
+                out.push(hint("Ctrl+D", Msg::LegendRemove, 2));
+            }
+            out.push(hint("F2", Msg::ModelCardTitle, 3));
+            out
+        }
+        Some(Listed::Account(i)) => {
+            let row = view.accounts().get(i);
+            let mut out = vec![hint("⏎", Msg::LegendOpen, 0)];
+            if row.is_some_and(|row| row.configured && !row.managed) {
+                out.push(hint("Ctrl+E", Msg::LegendEditIt, 1));
+                out.push(hint("Ctrl+D", Msg::LegendDelete, 2));
+            }
+            out
+        }
+        Some(Listed::AddModel) => vec![hint("⏎", Msg::LegendOpen, 0)],
+        Some(Listed::AddAccount) => vec![hint("⏎", Msg::LegendAddIt, 0)],
+        Some(Listed::Connection) => {
+            let managed = match &panel.screen {
+                Screen::Detail(account) => view.account(account).is_some_and(|row| row.managed),
+                _ => true,
+            };
+            match managed {
+                true => vec![],
+                false => vec![hint("⏎", Msg::LegendEditIt, 0)],
+            }
+        }
+        Some(Listed::Available(j)) => {
+            let busy = match (&panel.screen, view.available(panel, j)) {
+                (Screen::Detail(account), Some(item)) => {
+                    panel.adding.contains(&(account.clone(), item.id.clone()))
+                }
+                _ => false,
+            };
+            match busy {
+                true => vec![],
+                false => vec![
+                    hint("⏎", Msg::LegendAddIt, 0),
+                    hint("Ctrl+E", Msg::LegendEditThenAdd, 1),
+                ],
+            }
+        }
+        Some(Listed::Failed) => vec![hint("⏎", Msg::LegendRetry, 0)],
+        Some(Listed::Manual) => vec![hint("⏎", Msg::ProviderManualAdd, 0)],
+        _ => vec![],
+    };
+    out.push(esc);
+    out
+}
+
+/// The footer's hints that fit `w`, each with the key a click on it presses.
+///
+/// Drawn and hit-tested from this one list, so a click lands on the hint it
+/// was drawn as. When they do not all fit, the most yielding goes first —
+/// never the row's main action or Esc.
 fn legend_buttons(
     view: &ProvidersView,
     panel: &Panel,
     caps: crate::caps::Caps,
+    w: usize,
 ) -> Vec<(String, Option<crate::surface::KeyPress>)> {
-    use crate::surface::KeyPress;
-    let (editable, deletable) = match view.listed(panel).get(panel.cursor) {
-        Some(Listed::Account(i)) => view
-            .accounts()
-            .get(*i)
-            .map(|row| (!row.managed, !row.managed && row.configured))
-            .unwrap_or_default(),
-        Some(Listed::Model(i)) => view
-            .models()
-            .get(*i)
-            .map(|row| (!row.managed, !row.managed))
-            .unwrap_or_default(),
-        _ => (false, false),
+    use crate::surface::{Key, KeyPress};
+    let mut hints = legend(view, panel);
+    let text_of = |hint: &Hint| match hint.key.is_empty() {
+        true => hint.label.clone(),
+        false => crate::widget::keys(&[(hint.key.as_str(), hint.label.as_str())], caps),
     };
-    legend(view, panel)
-        .into_iter()
-        .map(|(key, label)| {
-            let press = if panel.form.is_some() {
-                match key.as_str() {
-                    "^o" => Some(KeyPress::ctrl('o')),
-                    "^s" => Some(KeyPress::ctrl('s')),
-                    "^f" => Some(KeyPress::ctrl('f')),
-                    "^n" => Some(KeyPress::ctrl('n')),
-                    "space" => Some(KeyPress::plain(crate::surface::Key::Char(' '))),
-                    "⏎" => Some(KeyPress::plain(crate::surface::Key::Enter)),
-                    "esc" => Some(KeyPress::plain(crate::surface::Key::Esc)),
-                    _ => None,
-                }
-            } else if panel.efforts.is_none() {
-                match key.as_str() {
-                    "F2" => Some(KeyPress::plain(crate::surface::Key::F(2))),
-                    "^a" => Some(KeyPress::ctrl('a')),
-                    "^n" => Some(KeyPress::ctrl('n')),
-                    "^e" if editable => Some(KeyPress::ctrl('e')),
-                    "^d" if deletable => Some(KeyPress::ctrl('d')),
-                    _ => None,
-                }
-            } else {
-                None
+    let gap = width::str_width(&format!(" {} ", caps.g(crate::caps::Glyph::Separator)));
+    let room = w.saturating_sub(2);
+    loop {
+        let total: usize = hints
+            .iter()
+            .map(|hint| width::str_width(&text_of(hint)))
+            .sum::<usize>()
+            + gap * hints.len().saturating_sub(1);
+        if total <= room {
+            break;
+        }
+        // The most yielding hint, the later one on a tie.
+        let Some(at) = hints
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| hint.yield_rank > 0)
+            .max_by_key(|(at, hint)| (hint.yield_rank, *at))
+            .map(|(at, _)| at)
+        else {
+            break;
+        };
+        hints.remove(at);
+    }
+    hints
+        .iter()
+        .map(|hint| {
+            let press = match hint.key.as_str() {
+                "⏎" => Some(KeyPress::plain(Key::Enter)),
+                "esc" => Some(KeyPress::plain(Key::Esc)),
+                "space" => Some(KeyPress::plain(Key::Char(' '))),
+                "F2" => Some(KeyPress::plain(Key::F(2))),
+                "Ctrl+E" => Some(KeyPress::ctrl('e')),
+                "Ctrl+D" => Some(KeyPress::ctrl('d')),
+                "Ctrl+O" => Some(KeyPress::ctrl('o')),
+                "Ctrl+F" => Some(KeyPress::ctrl('f')),
+                _ => None,
             };
-            let text = crate::widget::keys(&[(key.clone(), label)], caps);
-            (
-                if press.is_some() {
-                    format!("[ {text} ]")
-                } else {
-                    text
-                },
-                press,
-            )
+            (text_of(hint), press)
         })
         .collect()
 }
 
-/// Only visible cells of a drawn action can activate its existing key path.
+/// Only visible cells of a drawn hint can activate its key.
 pub fn action_at(
     moment: &Moment,
     vp: &Viewport<'_>,
@@ -1531,17 +1437,8 @@ pub fn action_at(
     row: usize,
 ) -> Option<crate::surface::KeyPress> {
     let panel = moment.providers_panel.as_ref()?;
-    let rows = layout(
-        &moment.providers,
-        panel,
-        vp.rect.h as usize,
-        vp.rect.w as usize,
-    );
-    if let Some(Row::Listed(at)) = rows.get(row) {
-        let (start, text) = row_edit_button(&moment.providers, panel, *at, vp.rect.w as usize)?;
-        return (col >= start && col < start + width::str_width(&text))
-            .then(|| crate::surface::KeyPress::ctrl('e'));
-    }
+    let w = vp.rect.w as usize;
+    let rows = layout(&moment.providers, panel, vp.rect.h as usize, w);
     if !matches!(rows.get(row), Some(Row::Legend)) {
         return None;
     }
@@ -1550,9 +1447,9 @@ pub fn action_at(
         " {} ",
         moment.caps.g(crate::caps::Glyph::Separator)
     ));
-    for (text, key) in legend_buttons(&moment.providers, panel, moment.caps) {
+    for (text, key) in legend_buttons(&moment.providers, panel, moment.caps, w) {
         let end = start + width::str_width(&text);
-        if col >= start && col < end && end <= vp.rect.w as usize {
+        if col >= start && col < end && end <= w {
             return key;
         }
         start = end + gap;
@@ -1566,14 +1463,6 @@ pub fn action_at(
 /// up cannot come from two different arrangements of one panel.
 pub struct Geometry {
     rows: Vec<Option<usize>>,
-    /// Which screen row the tabs were drawn on.
-    ///
-    /// Read off the laid-out rows rather than assumed to be the first, for the
-    /// same reason every other hit here is read off the layout: this panel opens
-    /// with a rule, so "the header is the panel's first row" was true of the
-    /// settings panel and false of this one — and a click on a tab did nothing
-    /// at all until the first real run found it.
-    header: Option<usize>,
 }
 
 impl Geometry {
@@ -1581,19 +1470,11 @@ impl Geometry {
     pub fn listed_at(&self, row: usize) -> Option<usize> {
         self.rows.get(row).copied().flatten()
     }
-
-    /// Which screen row carries the tabs.
-    pub fn header_row(&self) -> Option<usize> {
-        self.header
-    }
 }
 
 pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
     let Some(panel) = moment.providers_panel.as_ref() else {
-        return Geometry {
-            rows: Vec::new(),
-            header: None,
-        };
+        return Geometry { rows: Vec::new() };
     };
     let rows = layout(
         &moment.providers,
@@ -1605,23 +1486,14 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
     // 换上——点一条分界线不是在挑东西。
     let listed = moment.providers.listed(panel);
     Geometry {
-        header: rows.iter().position(|row| *row == Row::Header),
         rows: rows
             .into_iter()
             .map(|row| match row {
                 Row::Listed(at) if listed.get(at).is_some_and(|row| row.selectable()) => Some(at),
-                Row::Pick(at) | Row::BatchModel(at) => Some(at),
                 _ => None,
             })
             .collect(),
     }
-}
-
-/// Which list is under this cell of the header row.
-pub fn tab_at(col: usize) -> Option<Tab> {
-    let labels: Vec<String> = Tab::ALL.iter().map(|t| t.label()).collect();
-    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-    chrome::tab_at(NAME, &labels, col).map(|at| Tab::ALL[at])
 }
 
 #[cfg(test)]
@@ -1787,7 +1659,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("ollama serve"));
         assert!(text.contains("11434"));
-        assert!(drawn(&m, 40, 40).contains("^f"));
+        assert!(drawn(&m, 40, 40).contains("Ctrl+F"));
         // Editing an address clears its diagnostic, but must keep retry discoverable.
         let mut edited = m.clone();
         let Some(Form::Account(form)) = edited.providers_panel.as_mut().unwrap().form.as_mut()
@@ -1795,348 +1667,13 @@ mod tests {
             panic!("account");
         };
         form.discovery = None;
-        assert!(drawn(&edited, 40, 40).contains("^f"));
+        assert!(drawn(&edited, 40, 40).contains("Ctrl+F"));
         assert!(
             rows.iter()
                 .filter(|row| matches!(row, Row::DiscoveryMessage(_)))
                 .count()
                 > 1
         );
-    }
-
-    #[test]
-    fn editing_by_click_and_keyboard_opens_the_same_selected_form() {
-        use crate::surface::KeyPress;
-        for tab in Tab::ALL {
-            let mut panel = Panel::new();
-            panel.show(tab);
-            let view = view();
-            view.settle_cursor(&mut panel);
-            let m = moment(Some(panel.clone()));
-            let (col, row) = button_hit(&m, KeyPress::ctrl('e'));
-            let vp = Viewport::new(Rect::sized(240, 30), &m);
-            let click = action_at(&m, &vp, col, row).unwrap();
-            let mut by_click = panel.clone();
-            let mut by_key = panel;
-            let mut secret = String::new();
-            assert_eq!(
-                crate::providers::key(&view, &mut by_click, &mut secret, click),
-                crate::providers::Step::Stay
-            );
-            crate::providers::key(&view, &mut by_key, &mut secret, KeyPress::ctrl('e'));
-            assert_eq!(by_click, by_key);
-            assert!(by_click.form.is_some());
-            let drawn_row = &lines(&m, 240, 30)[row];
-            let text: String = drawn_row
-                .spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect();
-            assert!(
-                text.contains(match tab {
-                    Tab::Accounts => "[ ^e",
-                    Tab::Models => "[ 编辑 ]",
-                }),
-                "{text}"
-            );
-            let narrow = Viewport::new(Rect::sized((col + 1) as u16, 30), &m);
-            assert_eq!(
-                action_at(&m, &narrow, col, row),
-                match tab {
-                    Tab::Accounts => None,
-                    // A row action follows the right edge when the panel resizes.
-                    Tab::Models => Some(KeyPress::ctrl('e')),
-                },
-                "hit testing follows the button's current geometry"
-            );
-        }
-    }
-
-    #[test]
-    fn adding_and_deleting_buttons_use_the_existing_key_actions() {
-        use crate::surface::KeyPress;
-        let mut panel = Panel::new();
-        let view = view();
-        view.settle_cursor(&mut panel);
-        let m = moment(Some(panel.clone()));
-        let vp = Viewport::new(Rect::sized(240, 30), &m);
-        let mut secret = String::new();
-        let (col, row) = button_hit(&m, KeyPress::ctrl('a'));
-        let mut adding = panel.clone();
-        crate::providers::key(
-            &view,
-            &mut adding,
-            &mut secret,
-            action_at(&m, &vp, col, row).unwrap(),
-        );
-        assert!(adding.form.is_some());
-        for confirmation in [false, true] {
-            let m = moment(Some(panel.clone()));
-            let vp = Viewport::new(Rect::sized(240, 30), &m);
-            let (col, row) = button_hit(&m, KeyPress::ctrl('d'));
-            let step = crate::providers::key(
-                &view,
-                &mut panel,
-                &mut secret,
-                action_at(&m, &vp, col, row).unwrap(),
-            );
-            if confirmation {
-                assert!(matches!(step, crate::providers::Step::DeleteAccount { .. }));
-            } else {
-                assert_eq!(step, crate::providers::Step::Stay);
-                assert!(panel.pending_delete.is_some());
-            }
-        }
-    }
-
-    #[test]
-    fn edit_and_manual_add_buttons_are_visible_and_clickable_at_normal_width() {
-        use crate::surface::KeyPress;
-        let panel = Panel::new();
-        let m = moment(Some(panel));
-        let vp = Viewport::new(Rect::sized(80, 30), &m);
-        for wanted in [KeyPress::ctrl('e'), KeyPress::ctrl('n')] {
-            let hit = (0..30)
-                .flat_map(|row| (0..80).map(move |col| (col, row)))
-                .find(|(col, row)| action_at(&m, &vp, *col, *row) == Some(wanted));
-            assert!(hit.is_some(), "{wanted:?} must fit in an 80-column panel");
-            let mut panel = m.providers_panel.clone().unwrap();
-            crate::providers::key(&m.providers, &mut panel, &mut String::new(), wanted);
-            assert!(matches!(panel.form, Some(Form::Account(_))));
-        }
-    }
-
-    #[test]
-    fn every_editable_model_has_its_own_edit_hit_and_body_clicks_still_select() {
-        use crate::surface::KeyPress;
-        let mut panel = Panel::new();
-        panel.tab = Tab::Models;
-        let m = moment(Some(panel));
-        let vp = Viewport::new(Rect::sized(80, 30), &m);
-        let mut checked = 0;
-        for (row, item) in layout(&m.providers, m.providers_panel.as_ref().unwrap(), 30, 80)
-            .iter()
-            .enumerate()
-        {
-            let Row::Listed(at) = item else {
-                continue;
-            };
-            let Some(Listed::Model(i)) = m
-                .providers
-                .listed(m.providers_panel.as_ref().unwrap())
-                .get(*at)
-                .copied()
-            else {
-                continue;
-            };
-            let model = &m.providers.models()[i];
-            assert!(drawn(&m, 80, 30).contains(&model.model));
-            assert_eq!(
-                action_at(&m, &vp, 79, row),
-                (!model.managed).then(|| KeyPress::ctrl('e'))
-            );
-            assert_eq!(action_at(&m, &vp, 4, row), None);
-            if !model.managed {
-                let mut target = m.providers_panel.clone().unwrap();
-                target.cursor = *at;
-                crate::providers::key(
-                    &m.providers,
-                    &mut target,
-                    &mut String::new(),
-                    action_at(&m, &vp, 79, row).unwrap(),
-                );
-                let Some(Form::Model(form)) = target.form else {
-                    panic!("model edit");
-                };
-                assert_eq!(form.editing.as_deref(), Some(model.id.as_str()));
-                checked += 1;
-            }
-        }
-        assert!(checked > 1, "each model needs an independent edit action");
-    }
-
-    #[test]
-    fn an_add_row_has_no_edit_or_delete_button_action() {
-        let mut panel = Panel::new();
-        panel.cursor = view().listed(&panel).len() - 1;
-        let m = moment(Some(panel));
-        let vp = Viewport::new(Rect::sized(240, 30), &m);
-        for row in 0..30 {
-            for col in 0..240 {
-                assert!(
-                    !matches!(action_at(&m, &vp, col, row), Some(key) if key == crate::surface::KeyPress::ctrl('e') || key == crate::surface::KeyPress::ctrl('d'))
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn managed_and_unconfigured_accounts_disable_unavailable_actions() {
-        use crate::surface::KeyPress;
-        for (managed, configured) in [(true, true), (false, false)] {
-            let mut row = account("offered", 0);
-            row.managed = managed;
-            row.configured = configured;
-            let view = ProvidersView::new(vec![row], vec![], vec![], vec![]);
-            let panel = Panel::new();
-            let buttons = legend_buttons(&view, &panel, crate::caps::Caps::default());
-            assert!(!buttons
-                .iter()
-                .any(|(_, key)| *key == Some(KeyPress::ctrl('d'))));
-            assert_eq!(
-                buttons
-                    .iter()
-                    .any(|(_, key)| *key == Some(KeyPress::ctrl('e'))),
-                !managed
-            );
-        }
-    }
-
-    fn picker_panel(picking: Picking) -> Panel {
-        let mut form = ModelForm::add(&view(), Some("local")).expect("an account");
-        form.focus = ModelField::Model;
-        form.picking = Some(picking);
-        Panel {
-            tab: Tab::Models,
-            form: Some(Form::Model(form)),
-            ..Panel::new()
-        }
-    }
-
-    /// The picker draws over the add form: what is being filtered, the rows
-    /// that match with the window the listing gave, the lit one first, and
-    /// its keys — and never wider than its rect.
-    #[test]
-    fn the_model_picker_is_drawn_over_the_form() {
-        let items = vec![
-            crate::providers::Discovered {
-                id: "qwen3-coder".into(),
-                window: Some(256_000),
-                ..Default::default()
-            },
-            crate::providers::Discovered {
-                id: "glm-5".into(),
-                window: None,
-                ..Default::default()
-            },
-        ];
-        let m = moment(Some(picker_panel(Picking::Ready {
-            items: items.clone(),
-            query: "qwen".into(),
-            cursor: 0,
-        })));
-        let screen = drawn(&m, 60, 24);
-        assert!(screen.contains("筛选:qwen"), "{screen}");
-        assert!(screen.contains("› [ ] qwen3-coder"), "{screen}");
-        assert!(screen.contains("256.0K"), "{screen}");
-        assert!(!screen.contains("glm-5"), "filtered out:\n{screen}");
-        assert!(
-            screen.contains("继续") && screen.contains("手动添加"),
-            "{screen}"
-        );
-        for w in [4u16, 20, 60] {
-            for line in lines(&m, w, 24) {
-                assert!(line.width() <= w as usize, "{} > {w}", line.width());
-            }
-        }
-
-        let loading = moment(Some(picker_panel(Picking::Loading {
-            account: "local".into(),
-        })));
-        assert!(drawn(&loading, 60, 24).contains("正在从服务端拉取"));
-    }
-
-    /// Adding, on the model field: the legend names the key that picks it.
-    #[test]
-    fn the_add_form_says_the_model_can_be_fetched() {
-        let mut form = ModelForm::add(&view(), Some("local")).expect("an account");
-        form.focus = ModelField::Model;
-        let m = moment(Some(Panel {
-            tab: Tab::Models,
-            form: Some(Form::Model(form)),
-            ..Panel::new()
-        }));
-        let screen = drawn(&m, 80, 24);
-        assert!(
-            screen.contains("^f") && screen.contains("从服务端拉取"),
-            "{screen}"
-        );
-    }
-
-    fn batch_panel(count: usize) -> Panel {
-        let view = view();
-        let mut form = ModelForm::add(&view, Some("deepseek")).unwrap();
-        form.connecting = true;
-        form.selected = (0..count)
-            .map(|at| crate::providers::Discovered {
-                id: format!("model-{at}"),
-                window: Some((at + 1) * 100_000),
-                vision: Some(at % 2 == 0),
-                ..Default::default()
-            })
-            .collect();
-        let first = form.selected[0].clone();
-        form.take_discovered(&view, &first);
-        Panel {
-            form: Some(Form::Model(form)),
-            ..Panel::new()
-        }
-    }
-
-    #[test]
-    fn batch_models_show_individual_capabilities_and_explicit_unknown_values() {
-        let m = moment(Some(batch_panel(2)));
-        let text = drawn(&m, 120, 24);
-        assert!(
-            text.contains(&t(Msg::ProviderBatchCount { n: 2 }).into_owned()),
-            "{text}"
-        );
-        let first = text.find("model-0").unwrap();
-        let second = text.find("model-1").unwrap();
-        let a = &text[first..second];
-        let b = &text[second..];
-        assert!(
-            a.contains("100.0K") && a.contains(&t(Msg::ProviderWillUse).into_owned()),
-            "{a}"
-        );
-        assert!(
-            b.contains("200.0K") && b.contains(&t(Msg::ProviderSetUse).into_owned()),
-            "{b}"
-        );
-        assert!(a.contains(&t(Msg::VisionYes).into_owned()), "{a}");
-        assert!(b.contains(&t(Msg::VisionNo).into_owned()), "{b}");
-        assert!(
-            a.contains(&t(Msg::ProviderNotProvided).into_owned())
-                && b.contains(&t(Msg::ProviderNotProvided).into_owned())
-        );
-    }
-
-    #[test]
-    fn a_large_batch_scrolls_with_focus_and_hit_tests_the_visible_model() {
-        let mut panel = batch_panel(20);
-        let Some(Form::Model(form)) = &mut panel.form else {
-            unreachable!()
-        };
-        form.batch_cursor = 19;
-        let m = moment(Some(panel));
-        for width in [20, 40, 80, 120] {
-            let vp = Viewport::new(Rect::sized(width, 18), &m);
-            let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 18, 80);
-            assert!(rows.len() <= 18);
-            let at = rows
-                .iter()
-                .position(|row| *row == Row::BatchModel(19))
-                .unwrap();
-            assert_eq!(geometry(&m, &vp).listed_at(at), Some(19));
-            assert_eq!(
-                geometry(&m, &vp).listed_at(at + 1),
-                None,
-                "parameters do not switch models"
-            );
-            for line in lines(&m, width, 18) {
-                assert!(crate::width::str_width(&line.plain()) <= width as usize);
-            }
-        }
     }
 
     #[test]
@@ -2175,7 +1712,7 @@ mod tests {
             for panel in [
                 Panel::new(),
                 Panel {
-                    tab: Tab::Models,
+                    screen: crate::providers::Screen::Models,
                     query: "loc".into(),
                     ..Panel::new()
                 },
@@ -2184,8 +1721,8 @@ mod tests {
                     ..Panel::new()
                 },
                 Panel {
-                    tab: Tab::Models,
-                    form: ModelForm::add(&view(), None).map(Form::Model),
+                    screen: crate::providers::Screen::Models,
+                    form: ModelForm::add(&view(), "deepseek").map(Form::Model),
                     ..Panel::new()
                 },
             ] {
@@ -2227,7 +1764,7 @@ mod tests {
                 Vec::new(),
             ),
             providers_panel: Some(Panel {
-                tab: Tab::Models,
+                screen: crate::providers::Screen::Models,
                 ..Panel::new()
             }),
             ..Moment::default()
@@ -2241,7 +1778,7 @@ mod tests {
             .lines()
             .filter(|l| ids.iter().any(|id| l.contains(id)))
             .map(|l| {
-                let (before, _) = l.split_once("openrouter · ").expect("described");
+                let (before, _) = l.split_once("128K").expect("described");
                 width::str_width(before)
             })
             .collect();
@@ -2253,7 +1790,7 @@ mod tests {
 
         let narrow = drawn(&m, 60, 24);
         assert!(
-            narrow.contains("openrouter · 128K"),
+            narrow.contains("128K"),
             "the description keeps its room when the ids cannot:\n{narrow}"
         );
         for line in lines(&m, 60, 24) {
@@ -2267,7 +1804,7 @@ mod tests {
         assert!(out.contains("deepseek"), "{out}");
         assert!(out.contains("1 个模型"), "{out}");
         assert!(out.contains("有密钥"), "{out}");
-        assert!(out.contains("添加 provider"), "the add row is last: {out}");
+        assert!(out.contains("＋ 添加提供商"), "the add row is last: {out}");
     }
 
     /// The panel draws a key as dots because dots are all it is given — the
@@ -2290,10 +1827,9 @@ mod tests {
     #[test]
     fn the_manual_model_caret_stays_near_its_label_on_wide_terminals() {
         let v = view();
-        let mut form = ModelForm::add(&v, Some("deepseek")).unwrap();
+        let mut form = ModelForm::add(&v, "deepseek").unwrap();
         form.advanced = false;
         form.focus = ModelField::Model;
-        form.discovery_error = Some("HTTP 404".into());
         let at = form
             .fields(&v)
             .iter()
@@ -2334,7 +1870,7 @@ mod tests {
             let mut account = AccountForm::connect(&v, v.account("deepseek").unwrap());
             account.focus = AccountField::Key;
             account.key_len = len;
-            let mut model = ModelForm::add(&v, None).unwrap();
+            let mut model = ModelForm::add(&v, &v.open_accounts()[0]).unwrap();
             model.focus = ModelField::Key;
             model.key_len = len;
             for form in [Form::Account(account), Form::Model(model)] {
@@ -2389,7 +1925,7 @@ mod tests {
     /// Off that row it is the ordinary legend again.
     #[test]
     fn the_levels_row_says_space_turns_a_level_on_or_off() {
-        let mut form = ModelForm::add(&view(), None).expect("an account to add to");
+        let mut form = ModelForm::add(&view(), "deepseek").expect("an account to add to");
         form.focus = ModelField::Levels;
         let m = moment(Some(Panel {
             form: Some(Form::Model(form.clone())),
@@ -2416,7 +1952,7 @@ mod tests {
     /// the custom field says what it takes and how to leave it.
     #[test]
     fn the_output_row_shows_exact_budget_and_validation_hint() {
-        let mut form = ModelForm::add(&view(), None).unwrap();
+        let mut form = ModelForm::add(&view(), "deepseek").unwrap();
         form.advanced = true;
         form.focus = ModelField::Output;
         form.max_tokens = Some(4096);
@@ -2447,7 +1983,7 @@ mod tests {
 
     #[test]
     fn the_window_row_says_how_to_type_a_custom_one() {
-        let mut form = ModelForm::add(&view(), None).expect("an account to add to");
+        let mut form = ModelForm::add(&view(), "deepseek").expect("an account to add to");
         form.focus = ModelField::Window;
         let panel = |form: &ModelForm| {
             moment(Some(Panel {
@@ -2510,7 +2046,7 @@ mod tests {
         let out = drawn(&armed, 80, 24);
         // On the row it is armed on, and nowhere else. (The legend says it too,
         // in its own words — that is the key's caption, not a row's warning.)
-        assert_eq!(out.matches("再按一次 ^d 删除").count(), 1, "{out}");
+        assert_eq!(out.matches("再按一次 Ctrl+D 删除").count(), 1, "{out}");
     }
 
     /// A click is answered from the layout that was drawn, not from a formula
@@ -2528,33 +2064,6 @@ mod tests {
         assert_eq!(geom.listed_at(first), Some(0));
         assert_eq!(geom.listed_at(first + 1), Some(1));
         assert_eq!(geom.listed_at(0), None, "the rule is not a row");
-    }
-
-    /// The panel opens with a rule, so its tabs are not on its first row — and
-    /// a hit test that assumed they were is a tab nobody can click.
-    #[test]
-    fn the_tabs_are_found_on_the_row_they_were_drawn_on() {
-        let m = moment(Some(Panel::new()));
-        let vp = Viewport::new(Rect::sized(80, 24), &m);
-        assert_eq!(geometry(&m, &vp).header_row(), Some(1));
-    }
-
-    #[test]
-    #[allow(
-        clippy::string_slice,
-        reason = "test: `at` is a `find` on the same header, a char boundary"
-    )]
-    fn the_header_is_where_a_click_on_a_tab_lands() {
-        // The hit test walks the same header the frame drew, so the second tab's
-        // own cells answer with the second tab.
-        let out = drawn(&moment(Some(Panel::new())), 80, 24);
-        let header = out.lines().nth(1).expect("the header is the second row");
-        let at = header.find("模型").expect("the tab is drawn");
-        // `find` is a byte offset and the hit test counts cells; the label is
-        // past the ASCII name, so count the cells of what precedes it.
-        let col = crate::width::str_width(&header[..at]);
-        assert_eq!(tab_at(col), Some(Tab::Models));
-        assert_eq!(tab_at(0), None, "the margin belongs to nobody");
     }
 
     /// A list longer than the room scrolls under the cursor rather than pushing
@@ -2585,6 +2094,149 @@ mod tests {
         assert!(
             lines(&m, 60, 14).len() <= 14,
             "never taller than the room it was given"
+        );
+    }
+
+    /// `deepseek`'s page with `n` server models listed and the cursor on `at`.
+    fn page(n: usize, at: Option<usize>) -> Moment {
+        let mut panel = Panel {
+            screen: crate::providers::Screen::Detail("deepseek".into()),
+            ..Panel::new()
+        };
+        panel.start_discovery("deepseek");
+        let request = panel.discovery_request("deepseek").unwrap();
+        let items = (0..n)
+            .map(|i| crate::providers::Discovered {
+                id: format!("server-model-{i}"),
+                window: Some(128_000),
+                max_tokens: Some(8192),
+                vision: Some(true),
+                levels: Some(vec!["low".into(), "high".into()]),
+                ..Default::default()
+            })
+            .collect();
+        panel.discovered(&view(), "deepseek", request, Ok(items));
+        if let Some(at) = at {
+            panel.cursor = at;
+        }
+        moment(Some(panel))
+    }
+
+    #[test]
+    fn the_add_row_stays_in_sight_under_a_long_list() {
+        let m = page(60, Some(2));
+        let out = drawn(&m, 80, 24);
+        assert!(
+            out.contains("＋ 手动添加模型…"),
+            "pinned under the scroll:\n{out}"
+        );
+        assert!(out.contains("↓"), "the rest is out of sight below:\n{out}");
+        // On the pinned row the window rests at the end of the list.
+        let last = m
+            .providers
+            .listed(m.providers_panel.as_ref().unwrap())
+            .len()
+            - 1;
+        let end = page(60, Some(last));
+        let out = drawn(&end, 80, 24);
+        assert!(out.contains("server-model-59"), "{out}");
+        let pinned = out
+            .lines()
+            .find(|l| l.contains("＋ 手动添加模型…"))
+            .unwrap();
+        assert!(
+            pinned.trim_start().starts_with('▸'),
+            "the cursor is on it: {out}"
+        );
+    }
+
+    #[test]
+    fn the_footer_says_what_enter_does_on_this_row() {
+        // On an added model: Enter switches.
+        let out = drawn(&page(2, Some(2)), 100, 24);
+        assert!(
+            out.contains("⏎ 切换") || out.contains("enter 切换"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Ctrl+E 编辑") && out.contains("Ctrl+D 移除"),
+            "{out}"
+        );
+        // On a server model: Enter adds, and Ctrl+E edits it first.
+        let out = drawn(&page(2, Some(4)), 100, 24);
+        assert!(
+            out.contains("添加") && out.contains("Ctrl+E 编辑后添加"),
+            "{out}"
+        );
+        assert!(!out.contains("切换"), "{out}");
+        assert!(!out.contains("^"), "keys are spelled Ctrl+X: {out}");
+        // No row button anywhere: each action is drawn once, in the footer.
+        assert!(!out.contains("[ 编辑 ]") && !out.contains("[ "), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_footer_keeps_enter_and_esc_and_gives_up_f2_first() {
+        let m = Moment {
+            providers: view(),
+            providers_panel: Some(Panel::models()),
+            ..Moment::default()
+        };
+        let footer = |w: u16| {
+            drawn(&m, w, 24)
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let wide = footer(120);
+        for word in ["切换", "Ctrl+E", "Ctrl+D", "F2", "esc"] {
+            assert!(wide.contains(word), "{word}: {wide}");
+        }
+        let mid = footer(50);
+        assert!(!mid.contains("F2"), "F2 goes first: {mid}");
+        assert!(mid.contains("切换") && mid.contains("esc"), "{mid}");
+        let narrow = footer(24);
+        assert!(
+            narrow.contains("切换") && narrow.contains("esc"),
+            "{narrow}"
+        );
+        assert!(!narrow.contains("Ctrl+D"), "{narrow}");
+    }
+
+    #[test]
+    fn a_server_row_says_what_it_can_do_and_drops_detail_when_narrow() {
+        let wide = drawn(&page(1, Some(4)), 120, 24);
+        let row = wide.lines().find(|l| l.contains("server-model-0")).unwrap();
+        for fact in ["128K", "最大输出", "视觉", "low/high"] {
+            assert!(row.contains(fact), "{fact}: {row}");
+        }
+        let narrow = drawn(&page(1, Some(4)), 48, 24);
+        let row = narrow
+            .lines()
+            .find(|l| l.contains("server-model-0"))
+            .unwrap();
+        assert!(row.contains("128K"), "the window stays: {row}");
+        assert!(!row.contains("low/high"), "reasoning goes first: {row}");
+    }
+
+    #[test]
+    fn a_row_being_added_or_that_failed_says_so() {
+        let mut m = page(2, Some(4));
+        let panel = m.providers_panel.as_mut().unwrap();
+        panel
+            .adding
+            .insert(("deepseek".into(), "server-model-0".into()));
+        panel.add_errors.insert(
+            ("deepseek".into(), "server-model-1".into()),
+            "HTTP 500".into(),
+        );
+        let out = drawn(&m, 100, 24);
+        let row = |id: &str| out.lines().find(|l| l.contains(id)).unwrap().to_string();
+        assert!(row("server-model-0").contains("添加中…"), "{out}");
+        assert!(row("server-model-1").contains("HTTP 500"), "{out}");
+        assert!(
+            !out.lines().last().unwrap().contains("添加"),
+            "a row on its way offers no add: {out}"
         );
     }
 }
