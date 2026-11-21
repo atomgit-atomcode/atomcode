@@ -3831,10 +3831,14 @@ impl Host {
         if !waiting {
             return false;
         }
-        // A form opened on the page while it waited is the person at work:
-        // the answer stops being waited on and is only said — the form, its
-        // half-typed fields and its key stay exactly as they are.
-        if let Some(panel) = m.providers_panel.as_mut().filter(|p| p.form.is_some()) {
+        // Something opened on the page while it waited is the person at work —
+        // a form, the reasoning levels of another model, a model card: the
+        // answer stops being waited on and is only said, and what they are in
+        // the middle of (half-typed fields and key included) stays as it is.
+        let busy = |p: &crate::providers::Panel| {
+            p.form.is_some() || p.efforts.is_some() || p.card.is_some()
+        };
+        if let Some(panel) = m.providers_panel.as_mut().filter(|p| busy(p)) {
             panel.awaiting_switch = None;
             if let Some(why) = refused {
                 panel.switch_error = Some((id.to_string(), why.to_string()));

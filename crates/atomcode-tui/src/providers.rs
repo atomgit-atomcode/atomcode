@@ -1242,6 +1242,11 @@ pub struct ModelForm {
     pub discovered_model: Option<String>,
     pub name: Option<String>,
     pub max_tokens: Option<usize>,
+    /// Opened from a server row (「编辑后添加」): saved through the write that
+    /// refuses a model the account already has, like Enter on that row. A model
+    /// added by hand keeps the plain write, so a second entry under another
+    /// name stays possible on purpose.
+    pub listed: bool,
 }
 
 /// One model the account's endpoint lists, as its page shows it.
@@ -1301,6 +1306,7 @@ impl ModelForm {
             discovered_model: None,
             name: None,
             max_tokens: None,
+            listed: false,
         })
     }
 
@@ -1309,6 +1315,7 @@ impl ModelForm {
     pub fn listed(view: &ProvidersView, account: &str, item: &Discovered) -> Option<Self> {
         let mut form = Self::add(view, account)?;
         form.take_discovered(view, item);
+        form.listed = true;
         Some(form)
     }
 
@@ -1337,6 +1344,7 @@ impl ModelForm {
             discovered_model: None,
             name: None,
             max_tokens: row.max_tokens,
+            listed: false,
         })
     }
 
@@ -2268,9 +2276,12 @@ fn begin_edit(view: &ProvidersView, panel: &mut Panel, secret: &mut String, at: 
             .filter(|row| !row.managed)
             .and_then(|row| ModelForm::edit(view, row))
             .map(Form::Model),
+        // A row whose add is on its way has nothing to edit yet: its form
+        // would only send it a second time.
         Some(Listed::Available(j)) => match &panel.screen {
             Screen::Detail(account) => view
                 .available(panel, j)
+                .filter(|item| !panel.adding.contains(&(account.clone(), item.id.clone())))
                 .and_then(|item| ModelForm::listed(view, account, item))
                 .map(Form::Model),
             _ => None,
@@ -2636,6 +2647,11 @@ fn save_model(
     };
     let id = form.editing.clone();
     leave_form(panel, secret);
+    if id.is_none() && form.listed {
+        return Step::SaveModels {
+            drafts: vec![draft],
+        };
+    }
     Step::SaveModel { id, draft }
 }
 
@@ -4443,12 +4459,13 @@ mod tests {
             (None, "flash")
         );
         assert_eq!(form.window, Some(128_000));
-        let Step::SaveModel { id: None, draft } =
-            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        // Through the write that refuses a model the account already has, like
+        // Enter on the row — never the plain one a hand-made alias uses.
+        let Step::SaveModels { drafts } = run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
         else {
             panic!("saving it adds it");
         };
-        assert_eq!(draft.model, "flash");
+        assert_eq!(drafts[0].model, "flash");
     }
 
     #[test]
@@ -4758,5 +4775,37 @@ mod tests {
             );
             assert!(matches!(&panel.form, Some(Form::Account(f)) if f.editing.is_none()));
         }
+    }
+
+    /// Review: a row whose add is on its way has no 「编辑后添加」 — its form
+    /// would only send it again. A model added by hand keeps the plain write.
+    #[test]
+    fn a_row_being_added_has_no_edit_form_and_manual_adds_stay_plain() {
+        let (view, mut panel) = on_page(&["flash"]);
+        let mut secret = String::new();
+        run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Down), press(Key::Down)],
+        );
+        panel.adding.insert(("deepseek".into(), "flash".into()));
+        run(&view, &mut panel, &mut secret, &[ctrl('e')]);
+        assert!(panel.form.is_none(), "nothing to edit while it is written");
+        // By hand: the plain write, so an alias of an existing model is allowed.
+        run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::End), press(Key::Enter)],
+        );
+        let Some(Form::Model(form)) = panel.form.as_mut() else {
+            panic!("the manual form");
+        };
+        form.model = "deepseek/chat".into();
+        assert!(matches!(
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)]),
+            Step::SaveModel { id: None, .. }
+        ));
     }
 }

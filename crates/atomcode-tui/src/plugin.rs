@@ -14997,7 +14997,7 @@ mod provider_probe_tests {
                         max_tokens: draft.max_tokens,
                         vision: draft.vision,
                         effort: draft.effort.clone(),
-                        levels: Vec::new(),
+                        levels: draft.levels.clone().unwrap_or_default(),
                         current: false,
                         managed: false,
                         alias: None,
@@ -15452,6 +15452,79 @@ mod provider_probe_tests {
         tui.run_providers_key(KeyPress::plain(Key::Enter));
         assert_eq!(port.models.lock().unwrap().len(), 2);
         assert_eq!(port.probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Review (reproduced): waiting on A's switch, the person picks the
+    /// reasoning level of another added model on the same page; A's success
+    /// leaves that picker — and the panel — where they are.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_switch_answer_never_closes_another_models_level_picker() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.models.lock().unwrap().push(ModelDraft {
+            account: "deepseek".into(),
+            model: "reasoner".into(),
+            levels: Some(vec!["low".into(), "high".into()]),
+            ..Default::default()
+        });
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::End));
+        tui.run_providers_key(KeyPress::plain(Key::Up));
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // A: add and use
+        let (claim, account, id, _) = switched(&mut woken).await;
+        // To the added reasoner, and into its levels.
+        tui.run_providers_key(KeyPress::plain(Key::Home));
+        tui.run_providers_key(KeyPress::plain(Key::Down));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(panel(&host).efforts.is_some(), "choosing a level");
+        tui.provider_switched(
+            &claim,
+            &account,
+            &id,
+            SwitchResult {
+                model: Ok("switched".into()),
+                effort: Some(Ok(String::new())),
+            },
+        );
+        assert!(host.providers_open(), "the panel stays");
+        assert!(panel(&host).efforts.is_some(), "and so does the picker");
+    }
+
+    /// Review (reproduced): A's add is on its way; the panel is closed and
+    /// opened again; Ctrl+E on A opens nothing, so no second write is sent.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ctrl_e_on_a_row_being_added_sends_nothing_after_a_reopen() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        host.close_providers();
+        reopen(&host);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::ctrl('e'));
+        assert!(!host.provider_form_open(), "no form for a row on its way");
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        enriched(&tui, &mut woken).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderModelsEnriched { .. }),
+                "no second add was sent"
+            );
+        }
+        assert_eq!(port.models.lock().unwrap().len(), 1);
     }
 
     #[test]
