@@ -92,6 +92,61 @@ jobs:
         continue-on-error: true
         run: cargo test --workspace --doc
 
+  native-plugins:
+    name: C plugin self tests + webui tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The Android runtime plugins are C, compiled to `.so` and dlopened by
+      # `pluginhost` INTO the host process. Every Rust gate above — check,
+      # nextest, fmt — is blind to them: a heap overflow in one of these files
+      # is a memory-safety bug in the agent process, and no Rust toolchain in
+      # this repo can see it.
+      #
+      # That is not hypothetical. The `repeat` tool in `example_server.c`
+      # allocated `text_len * times` bytes and wrote `text_len * times +
+      # (times - 1)`, overrunning the buffer by up to 19 bytes at the default
+      # `times = 20`. It lived in the tree for a full release cycle because
+      # the only thing that could have caught it (the host self test) was not
+      # wired to anything.
+      #
+      # These scripts compile the same source against the host libc and drive
+      # it over stdio exactly as a client would, so they need no device and no
+      # NDK — just a C compiler, which every runner has. AddressSanitizer is
+      # used when the compiler supports it, which turns an overrun into a hard
+      # failure instead of a silent corruption.
+      - name: C plugin self tests
+        run: |
+          bash scripts/mcp-example/selftest.sh
+          bash scripts/mcp-filesystem/selftest.sh
+          bash scripts/text-plugin/selftest.sh
+
+      # The webui's own unit tests are not in the Rust workspace, so
+      # `cargo nextest --workspace` never ran them either.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install webui dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: webui unit tests
+        working-directory: webui
+        run: npm test
+
+      # The lock must not carry the private overlay's dependencies. On a
+      # checkout there is no overlay, so this only fires when someone committed
+      # a polluted lock — which is exactly the case worth failing a PR over.
+      # The gate reads the lock from the git index, so it judges the file that
+      # would actually be committed.
+      - name: Cargo.lock has no private dependencies
+        run: bash gates/cargo-lock.sh
+
   lint:
     name: fmt (blocking) + clippy (report only)
     runs-on: ubuntu-latest

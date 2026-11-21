@@ -132,6 +132,7 @@ wire DTO 展开：
 - 纯文档、注释和格式修改可不跑测试，但必须检查 diff 和文档内部一致性。
 - 交付前运行 `cargo fmt --all`，并要求 `cargo fmt --all -- --check` 退出 0；不得绕过阻塞的格式门。纯格式改动单独成 commit，不混进功能提交。
 - 若未修改文件在 fmt 后仍不收敛，检查 match arm 长字符串：改用块和 `\` 续行，不得给门加回 `continue-on-error`。
+- **C 插件（`scripts/*/plugin.c`、`scripts/*-plugin/`）改动必须跑主机自测**：Rust 的编译门、nextest、fmt 门都看不见 C 文件，而这些插件由 `pluginhost` dlopen 进宿主进程——那里的越界写或空指针解引用就是宿主进程崩溃。改到哪个就跑哪个：`bash scripts/mcp-example/selftest.sh`、`bash scripts/mcp-filesystem/selftest.sh`、`bash scripts/text-plugin/selftest.sh`。这三个自测在 CI 的 `native-plugins` job 里跑；新增同类插件时，那个 job 里也要加上一行，否则它和 Rust 代码一样没有门。
 
 ### Cargo.lock 与私有 overlay
 

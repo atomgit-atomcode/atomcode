@@ -125,3 +125,35 @@ grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # �
 - 退役任务的最终说明必须包含：验证基线、达到的四态、实际删除项、仍保留的 importer/legacy surface、测试结果和唯一下一步。
 - 普通功能或修复只需报告行为变化、风险、验证结果和已知未验证范围，不强制套用迁移报告模板。
 - 未删除旧类型、handler、依赖或 fallback 时，必须明确“尚未退役”，不得以功能可用替代完成声明。
+
+### C 插件的主机自测（2026-11-21 实测补）
+
+**Rust 工具链看不见 C 文件。** 仓库里的 C 插件（`scripts/*/plugin.c`、`scripts/*-plugin/`）由
+`pluginhost` dlopen 进**宿主进程**——越界写、空指针解引用都是 agent 进程崩溃，而不是某个
+插件自己的问题。`cargo check`、`cargo nextest`、`cargo fmt` 三道门一个都覆盖不到它们。
+
+这不是理论风险：`example_server.c` 的 `repeat` 工具按 `text_len * times` 分配，却写了
+`text_len * times + (times - 1)` 字节（少算 `times - 1` 个换行分隔符），默认 `times = 2`
+就溢出 1 字节、最大 `times = 20` 溢出 19 字节。它在树里待了整整一个发布周期——唯一能抓住
+它的东西（主机自测）当时没接给任何东西。
+
+**改到哪个就跑哪个**（三个都在 CI 的 `native-plugins` job 里跑）：
+
+```bash
+bash scripts/mcp-example/selftest.sh
+bash scripts/mcp-filesystem/selftest.sh
+bash scripts/text-plugin/selftest.sh
+```
+
+为什么能在构建机上跑：协议逻辑与缓冲区逻辑都是**可移植 C**，同一份源码编到主机 libc 上，
+用同样的 stdio 驱动即可，不需要设备、不需要 NDK。`mcp-example` 的自测在编译器支持时开
+AddressSanitizer，于是越界是**硬失败**而不是静默损坏。
+
+`text-plugin` 特殊一点：渲染路径要 FreeType 和字体文件，构建机两样都没有。但出问题的
+**缓冲区逻辑是纯 C**，所以它被抽成 `scripts/text-plugin/text_buffer.h`，插件与自测**共用同一份
+代码**（不是副本——副本会随实现漂移），分配器通过 `TEXT_BUFFER_REALLOC` 注入，失败路径因此
+可以确定性地走到，不用靠耗尽内存。该自测顺带用桩头（`scripts/text-plugin/stub/`）对
+`plugin.c` 本身做 `-fsyntax-only` 检查：C 源码停止编译，Rust 的门同样发现不了。
+
+**新增同类插件时，`check.yml` 的 `native-plugins` job 里也要加上一行**，否则它和 Rust 代码
+一样没有门。
