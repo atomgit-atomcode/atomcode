@@ -828,6 +828,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::UpgradeFailed { error } =>
             format!("Upgrade failed: {}", error).into(),
+        Msg::UpgradeManifestConnectionFailed =>
+            "Unable to connect to the update server. The upgrade hasn't started. Check your network or proxy settings and try again.".into(),
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ Rolled back. Current binary: {}; other version saved at {}\n  Restarting rolled-back version...\n", exe, backup).into(),
         Msg::RollbackUpdatesPaused =>
