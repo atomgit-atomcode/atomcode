@@ -5981,6 +5981,11 @@ impl Host {
         had
     }
 
+    /// Whether a menu is up: `refresh_menu` plants one, `close_menu` clears it.
+    pub fn menu_is_empty(&self) -> bool {
+        self.menu.read().expect("menu poisoned").is_empty()
+    }
+
     /// The pointer moved over the slash menu: light the row it is over.
     ///
     /// `false` when the menu is closed or the pointer is not on it, so the

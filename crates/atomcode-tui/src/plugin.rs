@@ -1740,6 +1740,9 @@ pub struct Tui {
     /// re-points it rather than silently answering from the old tree.
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     mention_kind: Mutex<u8>,
+    /// The `@` token the person dismissed with Esc, by its byte offset: the
+    /// menu stays away from it until the caret leaves the token.
+    mention_declined: Mutex<Option<usize>>,
     session_references: Arc<Mutex<SessionSuggestions>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
@@ -10329,9 +10332,30 @@ impl Tui {
         };
         let is_mention = {
             let m = self.host.moment.read().expect("moment poisoned");
-            !browsing
-                && mention_context
-                && atomcode_capabilities::file_index::detect_at_mention(&m.input, m.caret).is_some()
+            let range = (!browsing && mention_context)
+                .then(|| {
+                    atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                })
+                .flatten();
+            match range {
+                // The token was explicitly dismissed with Esc and the caret is
+                // still on it: reopening would fight the person typing plain
+                // text. Typing more of the token keeps it declined; leaving the
+                // token clears it.
+                Some((at, _)) => self
+                    .mention_declined
+                    .lock()
+                    .expect("mention declined poisoned")
+                    .map(|declined| declined != at)
+                    .unwrap_or(true),
+                None => {
+                    *self
+                        .mention_declined
+                        .lock()
+                        .expect("mention declined poisoned") = None;
+                    false
+                }
+            }
         };
         if is_mention {
             let kind = *self.mention_kind.lock().expect("mention kind poisoned");
@@ -10386,6 +10410,7 @@ impl Tui {
             // back on the next keystroke that changes it. The one way to say
             // "not that list, this line" without losing the line.
             Key::Esc => {
+                self.decline_current_mention();
                 self.host.close_menu();
             }
             Key::Tab => {
@@ -10577,6 +10602,18 @@ impl Tui {
         m.history_at = None;
         drop(m);
         self.refresh_menu();
+    }
+
+    /// Record the `@` token at the caret as dismissed: the mention menu stays
+    /// away from it until the caret leaves the token (`refresh_menu`).
+    fn decline_current_mention(&self) {
+        let m = self.host.moment.read().expect("moment poisoned");
+        *self
+            .mention_declined
+            .lock()
+            .expect("mention declined poisoned") =
+            atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                .map(|(at, _)| at);
     }
 
     /// Put a path picked from the `@` menu on the line, in place of the `@…`
@@ -12143,6 +12180,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             mention_kind: Mutex::new(0),
+            mention_declined: Mutex::new(None),
             session_references: Arc::new(Mutex::new(SessionSuggestions::default())),
             pressed_at: Mutex::new(None),
             scroll_drag: Mutex::new(None),
@@ -18069,6 +18107,50 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
         tui.complete_path("@\0mention-filter:workspace");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 3);
+    }
+
+    /// Esc on an `@` token declines it: the mention menu stays closed while
+    /// the caret stays on the token — even as more of the token is typed —
+    /// and the decline clears once the caret leaves the token.
+    #[test]
+    fn an_escaped_at_token_keeps_the_menu_closed_until_the_caret_leaves() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(!host.menu_is_empty(), "the mention menu is up");
+
+        tui.decline_current_mention();
+        tui.refresh_menu();
+        assert!(
+            host.menu_is_empty(),
+            "an explicitly declined token does not reopen the menu"
+        );
+
+        // Typing more of the token keeps it declined.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode-notes".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(host.menu_is_empty(), "still the declined token");
+
+        // The caret leaves the token: the decline is stale and the next `@`
+        // may ask again.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "说 @atomcode-notes".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_is_empty(),
+            "a new token at a different position asks again"
+        );
     }
 
     #[test]
