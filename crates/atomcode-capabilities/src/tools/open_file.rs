@@ -298,7 +298,11 @@ fn pick_open_strategy() -> OpenStrategy {
             || std::env::var("WAYLAND_DISPLAY")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
-        return pick_unix_strategy(cfg!(target_env = "ohos"), has_display);
+        return pick_unix_strategy(
+            cfg!(target_env = "ohos"),
+            has_display,
+            is_wsl() && command_on_path("wslview"),
+        );
     }
     #[allow(unreachable_code)]
     OpenStrategy::Headless("unsupported platform".into())
@@ -306,15 +310,33 @@ fn pick_open_strategy() -> OpenStrategy {
 
 /// The Unix opener, split from the env reads above so the HarmonyOS branch is
 /// unit-testable on any host: `ohos` is `cfg!(target_env = "ohos")` at the call site,
-/// `has_display` the `$DISPLAY` / `$WAYLAND_DISPLAY` check.
+/// `has_display` the `$DISPLAY` / `$WAYLAND_DISPLAY` check, and `wsl_with_wslview`
+/// the "this is WSL and `wslview` is installed" answer.
+///
+/// The WSL answer is a parameter for the same reason the other two are: the
+/// helpers that compute it are unix-only, so a strategy function that called
+/// them directly could not be exercised on a Windows or macOS host.
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
-fn pick_unix_strategy(ohos: bool, has_display: bool) -> OpenStrategy {
+fn pick_unix_strategy(ohos: bool, has_display: bool, wsl_with_wslview: bool) -> OpenStrategy {
     // HarmonyOS PC: the system image has no `xdg-open`, and the app sandbox atomcode
     // runs in exports no `$DISPLAY` — so the display check would refuse a URL on a
     // machine that has both a browser and a person in front of it. `aa` is the way to
     // that screen, with or without a reported display.
     if ohos {
         return OpenStrategy::OhosAa;
+    }
+    // `wslview` (wslu) is the canonical WSL opener, but it is an extra package:
+    // plenty of WSL2 installs have WSLg and no wslu. Preferring it unconditionally
+    // made those fail with "failed to launch `wslview`" while `xdg-open` was right
+    // there and working (measured in a Linux container on a WSL2 host). So it is
+    // used only when it is actually installed; otherwise the display check below
+    // decides, exactly as on any other Linux.
+    //
+    // The check comes *before* the display check on purpose: WSLg sessions often
+    // export no `$DISPLAY` into a container, and there `wslview` is the only
+    // thing that can reach the Windows host.
+    if wsl_with_wslview {
+        return OpenStrategy::Wslview;
     }
     if !has_display {
         return OpenStrategy::Headless(
@@ -888,13 +910,35 @@ mod tests {
     /// refuse without a display, `xdg-open` with one.
     #[test]
     fn unix_picks_aa_for_harmonyos_and_xdg_open_elsewhere() {
-        assert_eq!(pick_unix_strategy(true, false), OpenStrategy::OhosAa);
-        assert_eq!(pick_unix_strategy(true, true), OpenStrategy::OhosAa);
-        assert_eq!(pick_unix_strategy(false, true), OpenStrategy::XdgOpen);
+        assert_eq!(pick_unix_strategy(true, false, false), OpenStrategy::OhosAa);
+        assert_eq!(pick_unix_strategy(true, true, false), OpenStrategy::OhosAa);
+        assert_eq!(
+            pick_unix_strategy(false, true, false),
+            OpenStrategy::XdgOpen
+        );
         assert!(matches!(
-            pick_unix_strategy(false, false),
+            pick_unix_strategy(false, false, false),
             OpenStrategy::Headless(_)
         ));
+    }
+
+    /// WSL with `wslview` installed opens through it — even with no `$DISPLAY`,
+    /// which is the normal state inside a WSL container.
+    ///
+    /// The WSL answer is a parameter, so this is assertable on any host. It
+    /// matters because the helpers behind it are unix-only: a strategy function
+    /// that called them directly would have been untestable here, which is how
+    /// the branch went missing in the first place (a merge took it out and
+    /// nothing failed).
+    #[test]
+    fn wsl_with_wslview_opens_through_it_even_without_a_display() {
+        assert_eq!(
+            pick_unix_strategy(false, false, true),
+            OpenStrategy::Wslview
+        );
+        assert_eq!(pick_unix_strategy(false, true, true), OpenStrategy::Wslview);
+        // HarmonyOS wins over it: `aa` is the only opener that reaches a screen.
+        assert_eq!(pick_unix_strategy(true, false, true), OpenStrategy::OhosAa);
     }
 
     /// The argv is the whole contract: `-a MainAbility` and the view-data action
