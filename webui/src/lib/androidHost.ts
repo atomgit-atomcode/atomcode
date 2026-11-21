@@ -191,10 +191,14 @@ export function installedProviders(): string[] | null {
   if (!bridge?.installedProviders) return null;
   try {
     const parsed: unknown = JSON.parse(bridge.installedProviders());
-    if (!Array.isArray(parsed)) return [];
+    // A bridge that answers with something that is not a list has not answered
+    // the question — that is "cannot know", not "nothing is installed". Saying
+    // "nothing" makes the panel ask for a package that is already there.
+    if (!Array.isArray(parsed)) return null;
     return parsed.filter((value): value is string => typeof value === 'string');
   } catch {
-    return [];
+    // A bridge whose answer does not parse failed the same way.
+    return null;
   }
 }
 

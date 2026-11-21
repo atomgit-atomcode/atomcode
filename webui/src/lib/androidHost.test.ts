@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import {
   gatewaySigningAvailable,
   hasAndroidHost,
+  installedProviders,
   openWithHost,
   takeShares,
 } from './androidHost.ts';
@@ -97,4 +98,31 @@ test('opening a path reports whether the host took it', () => {
       assert.equal(openWithHost('/workspace/report.md'), false);
     },
   );
+});
+
+test('the installed providers are listed, or reported as unknown', () => {
+  withBridge({ installedProviders: () => JSON.stringify(['a', 'b']) }, () => {
+    assert.deepEqual(installedProviders(), ['a', 'b']);
+  });
+  // A bridge that answers "nothing" is a real answer.
+  withBridge({ installedProviders: () => '[]' }, () => {
+    assert.deepEqual(installedProviders(), []);
+  });
+  // A bridge whose answer cannot be parsed has not answered the question, and
+  // "unknown" must not become "nothing": that would make the panel ask for a
+  // package the person already has.
+  withBridge({ installedProviders: () => 'not json' }, () => {
+    assert.equal(installedProviders(), null);
+  });
+  withBridge({ installedProviders: () => JSON.stringify({ a: 1 }) }, () => {
+    assert.equal(installedProviders(), null);
+  });
+  // No bridge at all: same answer.
+  withBridge(null, () => {
+    assert.equal(installedProviders(), null);
+  });
+  // An older app without the method: also "cannot know".
+  withBridge({}, () => {
+    assert.equal(installedProviders(), null);
+  });
 });
