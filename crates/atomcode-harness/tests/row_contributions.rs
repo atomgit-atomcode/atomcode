@@ -265,6 +265,11 @@ fn every_prompt_fragment_goes_through_the_door() {
             .unwrap_or(&path)
             .display()
             .to_string();
+        // The paths in `PROMPT_DOORS` are written with `/` (they are also the
+        // paths in commit messages), but `read_dir` hands out native paths — on
+        // Windows that is `crates\atomcode-coding\src\runtime.rs`, so the
+        // comparison never matched and every door looked like a stray.
+        let relative = relative.replace('\\', "/");
         for (no, line) in lines.iter().enumerate() {
             if !names
                 .iter()

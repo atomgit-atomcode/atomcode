@@ -1542,7 +1542,7 @@ mod tests {
         std::fs::create_dir(&tmp).unwrap();
         std::fs::create_dir(tmp.as_path().join("sample")).unwrap();
         std::fs::write(
-            tmp.as_path().join("sample/SKILL.md"),
+            tmp.as_path().join("sample").join("SKILL.md"),
             "---\nname: sample\ndescription: test\n---\nbody",
         )
         .unwrap();
@@ -1553,9 +1553,15 @@ mod tests {
         let command = super::ListSkills(registry.clone());
         let output = command.listing();
         assert!(output.contains("sample · test"));
-        assert!(output.contains(&tmp.as_path().join("sample/SKILL.md").display().to_string()));
+        assert!(output.contains(
+            &tmp.as_path()
+                .join("sample")
+                .join("SKILL.md")
+                .display()
+                .to_string()
+        ));
         std::fs::write(
-            tmp.as_path().join("sample/SKILL.md"),
+            tmp.as_path().join("sample").join("SKILL.md"),
             "---\nname: invalid.name\n---\nbody",
         )
         .unwrap();
