@@ -283,5 +283,8 @@ XML / Kotlin 源文件比对，少改一处就红（加 provider 时会先撞到
   且只在 APK 里真有 `libpython3.so` 时写——既不改用户维护的配置，也不留一条跑不起来的
   条目（`example_mcp::seed_missing`）。
 - **`Cargo.lock` 与私有 overlay**：本机存在私有实现版 overlay 时，构建会把
-  `hkdf`/`hmac`/`zeroize_derive` 写进 lock。提交前必须确认这三项计数为 0
-  （`scripts/` 下没有自动化门，靠 `git ls-files -v Cargo.lock` 与人工核对）。
+  `hkdf`/`hmac`/`zeroize_derive` 写进 lock。现在有自动门了：`bash gates/cargo-lock.sh`
+  查的是 **index 里那份**（= 提交进去的那份），所以无论本机有没有设 `skip-worktree` 都管用；
+  它在 CI 的 `native-plugins` job 里跑。阴性对照在 `gates/cargo-lock.spec.sh`。
+  本机那侧照旧用 `git update-index --skip-worktree Cargo.lock` 止血（背景与实测见
+  `docs/development-verification-notes.md` 的「Cargo.lock 与私有 overlay」）。
