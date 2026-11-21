@@ -1724,9 +1724,10 @@ const STUB_OMISSION_END: &str = " chars] … ";
 /// as "folded far enough" in a single pass.
 const STUB_PREVIEW_HEAD: usize = 1_400;
 const STUB_PREVIEW_TAIL: usize = 400;
-/// The preview only fires when the cut middle is at least half the head: a
-/// near-threshold rewrite would bust the prefix cache for almost no saving,
-/// and the corpus's mean tool result sits right in that dead zone.
+/// The preview only fires when the cut middle is at least 896 chars — well
+/// over half the 1,400-char head: a near-threshold rewrite would bust the
+/// prefix cache for almost no saving, and the corpus's mean tool result sits
+/// right in that dead zone.
 const STUB_PREVIEW_MIN_OMITTED: usize = 896;
 
 /// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]` for
@@ -1742,6 +1743,16 @@ const STUB_PREVIEW_MIN_OMITTED: usize = 896;
 /// re-busts the prefix cache the first stub paid for.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let status = if success { "ok" } else { "FAILED" };
+    // A name with whitespace (or an empty one) would produce an envelope the
+    // predicate cannot recognize — `[my tool ok: …]` parses as name "my" —
+    // and an unrecognized stub gets re-stubbed on the next pass, a stub of a
+    // stub. Fall back to the generic name so every stub built here round-trips
+    // through `text_is_compact_stub`.
+    let tool_name = if tool_name.is_empty() || tool_name.chars().any(char::is_whitespace) {
+        "tool"
+    } else {
+        tool_name
+    };
     if text_is_compact_stub(output) {
         return output.to_string();
     }
@@ -1755,16 +1766,19 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
     let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL;
     let char_count = output.chars().count();
     if char_count > budget + STUB_PREVIEW_MIN_OMITTED {
-        let head_end = output
-            .char_indices()
-            .nth(STUB_PREVIEW_HEAD)
-            .map(|(i, _)| i)
-            .unwrap_or(output.len());
-        let tail_start = output
-            .char_indices()
-            .nth(char_count - STUB_PREVIEW_TAIL)
-            .map(|(i, _)| i)
-            .unwrap_or(output.len());
+        // One char-index pass finds both cut points (the count itself already
+        // took one full scan; a third `nth` pass for the tail would double the
+        // decode work again on every projection).
+        let mut head_end = output.len();
+        let mut tail_start = output.len();
+        for (index, (byte, _)) in output.char_indices().enumerate() {
+            if index == STUB_PREVIEW_HEAD {
+                head_end = byte;
+            }
+            if char_count - index == STUB_PREVIEW_TAIL {
+                tail_start = byte;
+            }
+        }
         let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
         let candidate = format!(
             "[{tool_name} {status}: {line_count} lines, head: {}{STUB_OMISSION_START}{omitted}{STUB_OMISSION_END}{}]",
