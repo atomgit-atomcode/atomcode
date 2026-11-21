@@ -23,7 +23,7 @@ pub struct Entry {
     pub last_run: Option<RunEvent>,
     pub running: bool,
 }
-/// Whether this entry should be started at `now`.
+/// The occurrence that is due at `now`, if any.
 ///
 /// This lives here instead of in the Android-only runner so the rule can be
 /// tested on any machine — that runner is compiled only for `target_os =
@@ -34,18 +34,29 @@ pub struct Entry {
 /// The question is "has an occurrence arrived that no run has covered yet":
 /// the latest occurrence at or before `now` is due when the last recorded run
 /// started or finished before it.
-pub fn due_at(entry: &Entry, now: i64) -> bool {
+///
+/// The answer is the **occurrence's own instant**, not a boolean. That instant
+/// is what identifies the run: it is the same for every sweep within that
+/// occurrence, so a retry after the app was killed recognises the run instead of
+/// starting a second one. (`entry.next_run` cannot serve that purpose — it is
+/// recomputed as "the next future occurrence" on every read, so it changes
+/// between two sweeps of the very same occurrence.)
+pub fn due_occurrence(entry: &Entry, now: i64) -> Option<i64> {
     let task = &entry.definition.task;
     if !task.enabled || entry.running {
-        return false;
+        return None;
     }
-    let Some(occurrence) = crate::timing::previous(task, now) else {
-        return false;
-    };
-    match entry.last_run.as_ref().and_then(last_run_at) {
-        Some(last) => last < occurrence,
-        None => true,
+    let occurrence = crate::timing::previous(task, now)?;
+    let covered = entry.last_run.as_ref().and_then(last_run_at);
+    match covered {
+        Some(last) if last >= occurrence => None,
+        _ => Some(occurrence),
     }
+}
+
+/// Whether this entry should be started at `now`.
+pub fn due_at(entry: &Entry, now: i64) -> bool {
+    due_occurrence(entry, now).is_some()
 }
 
 /// When the recorded run event happened, whatever kind it is.
@@ -274,6 +285,33 @@ mod tests {
             }),
             running,
         }
+    }
+
+    /// The due occurrence's own instant is what identifies a run.
+    ///
+    /// It has to be the *occurrence*, not the schedule's next prediction: the
+    /// next prediction is recomputed as "the next future occurrence" on every
+    /// read, so it changes between two sweeps of the very same occurrence — and
+    /// a run keyed on it is never recognised as the same one, so the lease
+    /// cannot deduplicate it.
+    #[test]
+    fn the_due_occurrence_is_the_same_instant_for_every_sweep_of_it() {
+        let created = 1_800_000_000;
+        // Two sweeps inside the same occurrence (created+120 .. created+180).
+        let first = created + 125;
+        let second = created + 179;
+        let pending = entry(true, false, created, None);
+        assert_eq!(due_occurrence(&pending, first), Some(created + 120));
+        assert_eq!(
+            due_occurrence(&pending, second),
+            Some(created + 120),
+            "the same occurrence, so the same run"
+        );
+        // The next occurrence arrives: now it is a different run.
+        assert_eq!(due_occurrence(&pending, created + 181), Some(created + 180));
+        // A run that already covered this occurrence is not due again.
+        let covered = entry(true, false, created, Some(created + 121));
+        assert_eq!(due_occurrence(&covered, first), None);
     }
 
     #[test]

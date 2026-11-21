@@ -57,18 +57,15 @@ async fn sweep(state: &AppState) -> anyhow::Result<()> {
     let service = crate::api_schedule::system_service();
     let now = unix_seconds();
     for entry in service.catalog()? {
-        // The rule lives in `atomcode_schedule` so it can be tested on a machine
-        // that does not build this Android-only module.
-        if !atomcode_schedule::service::due_at(&entry, now) {
-            continue;
-        }
-        // `next_run` is the schedule's own answer to "when is this due", so the
-        // loop never re-derives timing from the rule and cannot drift from what
-        // the panel shows.
-        let Some(next_run) = entry.next_run.as_ref() else {
+        // The occurrence that is due — its own instant, which is what identifies
+        // this run. `entry.next_run` cannot be used: it is recomputed as "the
+        // next future occurrence" on every read, so it changes between two
+        // sweeps of the very same occurrence, and the run would never be
+        // recognised as the same one.
+        let Some(occurrence) = atomcode_schedule::service::due_occurrence(&entry, now) else {
             continue;
         };
-        run_due(state, &service, &entry, next_run.at).await;
+        run_due(state, &service, &entry, occurrence).await;
     }
     Ok(())
 }
