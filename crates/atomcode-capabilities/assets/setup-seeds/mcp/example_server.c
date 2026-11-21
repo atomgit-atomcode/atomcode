@@ -151,7 +151,13 @@ static void tool_now(const char *id) {
     time_t now = time(NULL);
     struct tm utc;
     char stamp[64];
+    /* `gmtime_r` is POSIX; the host-side self test builds this file with a
+     * Windows compiler too, where the spelling is `gmtime_s`. */
+#if defined(_WIN32)
+    if (gmtime_s(&utc, &now) != 0) {
+#else
     if (gmtime_r(&now, &utc) == NULL) {
+#endif
         emit_text_result(id, "could not read the clock", 1);
         return;
     }
@@ -174,7 +180,10 @@ static void tool_repeat(const char *id, const char *arguments) {
         return;
     }
     size_t text_len = strlen(text);
-    size_t total = text_len * (size_t)times;
+    /* The separators count: `times` copies plus `times - 1` newlines plus the NUL.
+     * Leaving them out of the allocation overran the buffer by `times - 1` bytes
+     * (1 byte at the default `times = 2`, 19 at the maximum). */
+    size_t total = text_len * (size_t)times + (size_t)(times - 1);
     if (total > 8192) {
         emit_text_result(id, "resulting text would be too long", 1);
         return;
@@ -184,11 +193,15 @@ static void tool_repeat(const char *id, const char *arguments) {
         emit_text_result(id, "out of memory", 1);
         return;
     }
-    out[0] = '\0';
+    /* Build by offset instead of `strcat`: the length is known exactly, and
+     * `strcat` would have to re-scan the whole buffer on every copy. */
+    size_t used = 0;
     for (long i = 0; i < times; i++) {
-        strcat(out, text);
-        if (i + 1 < times) strcat(out, "\n");
+        if (i > 0) out[used++] = '\n';
+        memcpy(out + used, text, text_len);
+        used += text_len;
     }
+    out[used] = '\0';
     emit_text_result(id, out, 0);
     free(out);
 }
