@@ -540,21 +540,12 @@ pub enum Msg<'a> {
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
     ProviderDiscovering,
-    ProviderAdvanced,
     ProviderManualAdd,
     ProviderNotProvided,
-    ProviderContinue,
     ProviderConnected,
     ProviderAvailable,
     ProviderCapabilitiesUnknown,
     ProviderOutputLimit,
-    ProviderSavedSwitchFailed {
-        id: &'a str,
-        error: &'a str,
-    },
-    ProviderSavedSwitching {
-        id: &'a str,
-    },
     ProviderConnectTitle {
         id: &'a str,
     },
@@ -2042,15 +2033,17 @@ pub enum Msg<'a> {
     LegendAddAndUse,
     /// The last row of a short connection form: Enter shows every field.
     ProviderMoreSettings,
+    /// The level was refused after the switch went through: said under what
+    /// the switch said.
+    ProviderEffortFailed {
+        why: &'a str,
+    },
+    /// The 「更多设置 ▸」 row's Enter: show every field.
+    LegendShowAll,
     /// An added model whose add-and-use switch is on its way.
     ProviderSwitching,
     /// An added model whose switch was refused: Enter tries again.
     ProviderSwitchFailedOnRow {
-        why: &'a str,
-    },
-    /// The model was switched to; only the reasoning level was refused.
-    ProviderSwitchedEffortFailed {
-        model: &'a str,
         why: &'a str,
     },
 

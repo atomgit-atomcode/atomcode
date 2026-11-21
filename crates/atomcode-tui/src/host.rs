@@ -1536,6 +1536,10 @@ pub struct Host {
     /// How many times the providers panel has been opened: each opening gets
     /// its own number (`Panel::instance`).
     provider_openings: std::sync::atomic::AtomicU64,
+    /// Server rows whose add is in flight, by (account, model) — kept here
+    /// rather than only on the panel, so a panel closed and opened again while
+    /// a write is on its way still says 添加中… and does not send it twice.
+    provider_adding: Mutex<std::collections::BTreeSet<(String, String)>>,
     /// The next token a pick out of the bottom sheet is stamped with
     /// ([`Host::sheet_key`], [`Host::settle_sheet_pick`]).
     sheet_picks: std::sync::atomic::AtomicU64,
@@ -1825,6 +1829,7 @@ impl Host {
             providers_secret: Mutex::new(String::new()),
             provider_generations: Mutex::new(std::collections::BTreeMap::new()),
             provider_openings: std::sync::atomic::AtomicU64::new(0),
+            provider_adding: Mutex::new(std::collections::BTreeSet::new()),
             sheet_picks: std::sync::atomic::AtomicU64::new(1),
             rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
@@ -3686,6 +3691,12 @@ impl Host {
             .expect("provider generations poisoned")
             .entry(account.to_string())
             .or_insert(0) += 1;
+        // Adds in flight against the old connection are dropped when they land
+        // (the generation moved): nothing of them is still on its way.
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .retain(|(a, _)| a != account);
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let panel = m.providers_panel.as_mut()?;
@@ -3720,6 +3731,10 @@ impl Host {
         model: &str,
         outcome: Result<(), String>,
     ) -> bool {
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .remove(&(account.to_string(), model.to_string()));
         let mut m = self.moment.write().expect("moment poisoned");
         let Some(panel) = m.providers_panel.as_mut() else {
             return false;
@@ -3731,16 +3746,40 @@ impl Host {
     /// to — first run, or the one they had stopped answering after a sign-out —
     /// and no add holds the claim (`claim_free`). The host decides both; the
     /// panel only draws and keys by the answer.
+    ///
+    /// The adds in flight are put back on it too: a panel opened again while
+    /// one is still being written has to say so, and refuse it a second time.
     pub fn sync_provider_auto_use(&self, claim_free: bool) -> bool {
+        let adding = self
+            .provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .clone();
         let mut m = self.moment.write().expect("moment poisoned");
         let recovering = m.model_setup_required || m.unready.is_some();
         let Some(panel) = m.providers_panel.as_mut() else {
             return false;
         };
         let want = recovering && claim_free;
-        let moved = panel.auto_use != want;
+        let moved = panel.auto_use != want || panel.adding != adding;
         panel.auto_use = want;
+        panel.adding = adding;
         moved
+    }
+
+    /// Whether the person has no model to talk to: first run, or the one they
+    /// had stopped answering (signed out, say).
+    pub fn provider_recovering(&self) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        m.model_setup_required || m.unready.is_some()
+    }
+
+    /// A server row's add was sent.
+    pub fn provider_add_started(&self, account: &str, model: &str) {
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .insert((account.to_string(), model.to_string()));
     }
 
     /// The panel's opening number, while it is up.
@@ -3784,12 +3823,22 @@ impl Host {
     ) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
-        let ours = m.providers_panel.as_ref().is_some_and(|panel| {
+        let waiting = m.providers_panel.as_ref().is_some_and(|panel| {
             panel.instance == instance
                 && panel.screen == crate::providers::Screen::Detail(account.to_string())
                 && panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request)
         });
-        if !ours {
+        if !waiting {
+            return false;
+        }
+        // A form opened on the page while it waited is the person at work:
+        // the answer stops being waited on and is only said — the form, its
+        // half-typed fields and its key stay exactly as they are.
+        if let Some(panel) = m.providers_panel.as_mut().filter(|p| p.form.is_some()) {
+            panel.awaiting_switch = None;
+            if let Some(why) = refused {
+                panel.switch_error = Some((id.to_string(), why.to_string()));
+            }
             return false;
         }
         match refused {

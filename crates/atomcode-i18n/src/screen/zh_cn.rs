@@ -365,14 +365,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCatalogCandidates => "models.dev 目录候选 · 账号可用性未验证".into(),
         Msg::ProviderNotProvided => "未提供".into(),
         Msg::ProviderManualAdd => "手动添加".into(),
-        Msg::ProviderAdvanced => "高级设置".into(),
-        Msg::ProviderContinue => "继续".into(),
         Msg::ProviderConnected => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::McpStatusConnected),
         Msg::ProviderAvailable => "添加连接".into(),
         Msg::ProviderCapabilitiesUnknown => "能力未声明".into(),
         Msg::ProviderOutputLimit => "最大输出".into(),
-        Msg::ProviderSavedSwitchFailed { id, error } => format!("已保存 {id}，未能发起切换：{error}。可在模型列表重试。").into(),
-        Msg::ProviderSavedSwitching { id } => format!("已保存 {id}，正在切换…").into(),
         Msg::ProviderConnectTitle { id } => format!("连接 {id}").into(),
         Msg::DiscoverNotAListing => "服务端返回的不是模型列表".into(),
         Msg::DiscoverTimedOut => "服务端没在 10 秒内回答".into(),
@@ -1278,11 +1274,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendRetry => "重试".into(),
         Msg::LegendAddAndUse => "添加并使用".into(),
         Msg::ProviderMoreSettings => "更多设置 ▸".into(),
+        Msg::ProviderEffortFailed { why } => format!("推理强度设置失败：{why}").into(),
+        Msg::LegendShowAll => "展开全部".into(),
         Msg::ProviderSwitching => "切换中…".into(),
         Msg::ProviderSwitchFailedOnRow { why } => format!("已添加，切换失败：{why}").into(),
-        Msg::ProviderSwitchedEffortFailed { model, why } => {
-            format!("已切换到 {model}，推理强度设置失败：{why}").into()
-        }
 
         // ── the host side of the screen (`atomcode-cli`) ──
         Msg::HostConfigNotEditable => "这个宿主的配置不能从屏幕上改".into(),

@@ -2025,24 +2025,41 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
         }
         (Key::Enter, _) => enter_key(view, panel, secret, at, &listed),
         (Key::Char('e'), Mods::CTRL) => {
+            // On an offer nobody has set up, editing it is connecting it: the
+            // same form Enter opens, asking the endpoint the same way.
+            if let Some(Listed::Account(i)) = at {
+                if let Some(row) = view.accounts().get(i).filter(|row| !row.configured) {
+                    return connect(view, panel, secret, row);
+                }
+            }
             begin_edit(view, panel, secret, at);
             Step::Stay
         }
         (Key::Char('d'), Mods::CTRL) => delete_key(view, panel, at, armed),
         (Key::Backspace, _) => {
             panel.query.pop();
-            panel.cursor = 0;
-            view.settle_cursor(panel);
+            point_at_first_match(view, panel);
             Step::Stay
         }
         (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
             panel.query.push(c);
-            panel.cursor = 0;
-            view.settle_cursor(panel);
+            point_at_first_match(view, panel);
             Step::Stay
         }
         _ => Step::Stay,
     }
+}
+
+/// After the filter changed: the first row it matched. On a page the
+/// connection row is always listed, so it is passed over while a filter is
+/// typed — Enter then takes the match, or adds what was typed by hand.
+fn point_at_first_match(view: &ProvidersView, panel: &mut Panel) {
+    let listed = view.listed(panel);
+    let skip_connection = matches!(panel.screen, Screen::Detail(_)) && !panel.query.is_empty();
+    panel.cursor = listed
+        .iter()
+        .position(|row| row.selectable() && !(skip_connection && *row == Listed::Connection))
+        .unwrap_or_else(|| settle(&listed, 0));
 }
 
 /// Esc on a list: one screen back, the way every panel steps back before it
@@ -2182,7 +2199,12 @@ fn enter_key(
             // The one add-and-use: this Enter takes the claim, so the next
             // server row says 「添加」 and only saves.
             draft.use_now = std::mem::take(&mut panel.auto_use);
-            Step::SaveModel { id: None, draft }
+            // Through the port's batch write, which refuses a model the account
+            // already has: the guard above is this panel's, and a panel closed
+            // and opened again while the write is on its way has lost it.
+            Step::SaveModels {
+                drafts: vec![draft],
+            }
         }
         Some(Listed::Manual) => {
             let Screen::Detail(account) = panel.screen.clone() else {
@@ -4321,11 +4343,12 @@ mod tests {
             &[press(Key::Down), press(Key::Down)],
         );
         assert_eq!(at(&view, &panel), Listed::Available(0));
-        let Step::SaveModel { id: None, draft } =
-            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        let Step::SaveModels { drafts } = run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
         else {
             panic!("an add");
         };
+        assert_eq!(drafts.len(), 1, "one row, one model");
+        let draft = &drafts[0];
         assert_eq!(
             (draft.account.as_str(), draft.model.as_str()),
             ("deepseek", "flash")
@@ -4352,7 +4375,7 @@ mod tests {
         );
         assert!(matches!(
             run(&view, &mut panel, &mut secret, &[press(Key::Enter)]),
-            Step::SaveModel { .. }
+            Step::SaveModels { .. }
         ));
         assert_eq!(
             at(&view, &panel),
@@ -4378,7 +4401,7 @@ mod tests {
         assert!(
             matches!(
                 run(&view, &mut panel, &mut secret, &[press(Key::Enter)]),
-                Step::SaveModel { .. }
+                Step::SaveModels { .. }
             ),
             "and it can be tried again"
         );
@@ -4596,23 +4619,22 @@ mod tests {
             &mut secret,
             &[press(Key::Down), press(Key::Down)],
         );
-        let Step::SaveModel { draft, .. } =
-            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        let Step::SaveModels { drafts } = run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
         else {
             panic!("an add");
         };
+        let draft = &drafts[0];
         assert!(draft.use_now, "the add-and-use");
         assert!(
             !draft.default,
             "the default follows the switch, not the draft"
         );
         assert!(!panel.auto_use, "taken");
-        let Step::SaveModel { draft, .. } =
-            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        let Step::SaveModels { drafts } = run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
         else {
             panic!("an add");
         };
-        assert!(!draft.use_now, "the next one only adds");
+        assert!(!drafts[0].use_now, "the next one only adds");
     }
 
     #[test]
@@ -4671,5 +4693,70 @@ mod tests {
             panic!("still the form");
         };
         assert_eq!(form.vision, Some(true), "←→ is");
+    }
+
+    /// Review: typing on a page used to leave the cursor on the connection row,
+    /// so Enter opened the connection form instead of the match.
+    #[test]
+    fn typing_on_a_page_lands_on_the_match_never_the_connection() {
+        let (view, mut panel) = on_page(&["flash", "pro"]);
+        let mut secret = String::new();
+        for c in "pro".chars() {
+            run(&view, &mut panel, &mut secret, &[press(Key::Char(c))]);
+        }
+        assert_eq!(at(&view, &panel), Listed::Available(1), "on the match");
+        let step = run(&view, &mut panel, &mut secret, &[press(Key::Enter)]);
+        assert!(matches!(step, Step::SaveModels { .. }), "Enter adds it");
+        // Nothing matches: the manual row, and Enter adds what was typed.
+        let (view, mut panel) = on_page(&["flash"]);
+        for c in "qwen".chars() {
+            run(&view, &mut panel, &mut secret, &[press(Key::Char(c))]);
+        }
+        assert_eq!(at(&view, &panel), Listed::Manual);
+        run(&view, &mut panel, &mut secret, &[press(Key::Enter)]);
+        assert!(matches!(&panel.form, Some(Form::Model(f)) if f.model == "qwen"));
+        // Clearing the filter again is a filter change like any other.
+        let (view, mut panel) = on_page(&["flash"]);
+        run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Char('x')), press(Key::Backspace)],
+        );
+        assert_eq!(
+            at(&view, &panel),
+            Listed::Connection,
+            "no filter: the page's first row"
+        );
+    }
+
+    /// Review: Ctrl+E on an offer nobody set up is connecting it — the same
+    /// form Enter opens, asking the local server for its models the same way.
+    #[test]
+    fn ctrl_e_on_an_unconfigured_offer_is_enters_connect() {
+        let mut view = view();
+        let mut offer = account("ollama", 0);
+        offer.configured = false;
+        offer.has_key = false;
+        offer.protocol = "Ollama".into();
+        offer.endpoint = "http://localhost:11434".into();
+        Arc::make_mut(&mut view.accounts).push(offer);
+        let mut secret = String::new();
+        for gesture in [press(Key::Enter), ctrl('e')] {
+            let mut panel = Panel::new();
+            run(
+                &view,
+                &mut panel,
+                &mut secret,
+                &[press(Key::Down), press(Key::Down)],
+            );
+            assert_eq!(at(&view, &panel), Listed::Account(2));
+            let step = run(&view, &mut panel, &mut secret, &[gesture]);
+            assert!(
+                matches!(step, Step::DiscoverDraft { .. }),
+                "{gesture:?}: {step:?}"
+            );
+            assert!(matches!(&panel.form, Some(Form::Account(f)) if f.editing.is_none()));
+        }
     }
 }

@@ -1222,13 +1222,15 @@ fn legend(view: &ProvidersView, panel: &Panel) -> Vec<Hint> {
         // On the 「更多设置 ▸」 row Enter opens the rest of the form; on every
         // other row of a connection form it saves.
         Some(Form::Account(form)) if form.focus == AccountField::More => vec![
-            hint("⏎", Msg::ProviderAdvanced, 0),
+            hint("⏎", Msg::LegendShowAll, 0),
             hint("↑↓", Msg::LegendNextField, 2),
             hint("esc", Msg::LegendCancel, 0),
         ],
         Some(Form::Account(form)) if form.preset.is_some() || form.is_ollama(view) => {
             let mut keys = vec![
-                hint("⏎", Msg::ProviderContinue, 0),
+                // Enter saves here, at once: the footer says so rather than
+                // promising a next step that is not there.
+                hint("⏎", Msg::LegendSave, 0),
                 hint("↑↓", Msg::LegendNextField, 2),
                 hint("esc", Msg::LegendCancel, 0),
             ];
@@ -2285,5 +2287,33 @@ mod tests {
             row.contains("切换失败") && row.contains("HTTP 403"),
             "{out}"
         );
+    }
+
+    /// Review: Enter saves a connection form at once, so its footer says so;
+    /// on 「更多设置 ▸」 it says what that row does.
+    #[test]
+    fn a_connection_footer_says_enter_saves_and_more_shows_all() {
+        let v = view();
+        let mut form = AccountForm::connect(&v, v.account("deepseek").unwrap());
+        let footer = |form: &AccountForm| {
+            let m = moment(Some(Panel {
+                form: Some(Form::Account(form.clone())),
+                ..Panel::new()
+            }));
+            drawn(&m, 100, 24)
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let on_key = footer(&form);
+        assert!(
+            on_key.contains("保存") && !on_key.contains("继续"),
+            "{on_key}"
+        );
+        form.focus = AccountField::More;
+        let on_more = footer(&form);
+        assert!(on_more.contains("展开全部"), "{on_more}");
+        assert!(!on_more.contains("高级设置"), "{on_more}");
     }
 }

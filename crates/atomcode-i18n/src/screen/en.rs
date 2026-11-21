@@ -398,14 +398,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCatalogCandidates => "models.dev suggestions · account access unverified".into(),
         Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
-        Msg::ProviderAdvanced => "advanced settings".into(),
-        Msg::ProviderContinue => "continue".into(),
         Msg::ProviderConnected => crate::product::t_with(crate::Locale::En, crate::product::Msg::McpStatusConnected),
         Msg::ProviderAvailable => "add a connection".into(),
         Msg::ProviderCapabilitiesUnknown => "capabilities not declared".into(),
         Msg::ProviderOutputLimit => "max output".into(),
-        Msg::ProviderSavedSwitchFailed { id, error } => format!("Saved {id}, but could not start switching: {error}. Retry from the model list.").into(),
-        Msg::ProviderSavedSwitching { id } => format!("Saved {id}; switching…").into(),
         Msg::ProviderConnectTitle { id } => format!("connect {id}").into(),
         Msg::DiscoverNotAListing => "the endpoint did not answer with a model list".into(),
         Msg::DiscoverTimedOut => "the endpoint did not answer within 10 seconds".into(),
@@ -1343,11 +1339,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendRetry => "retry".into(),
         Msg::LegendAddAndUse => "add and use".into(),
         Msg::ProviderMoreSettings => "More settings ▸".into(),
+        Msg::ProviderEffortFailed { why } => format!("Setting the reasoning effort failed: {why}").into(),
+        Msg::LegendShowAll => "show all".into(),
         Msg::ProviderSwitching => "switching…".into(),
         Msg::ProviderSwitchFailedOnRow { why } => format!("added; switching failed: {why}").into(),
-        Msg::ProviderSwitchedEffortFailed { model, why } => {
-            format!("Switched to {model}; setting the reasoning effort failed: {why}").into()
-        }
 
         // ── the host side of the screen (`atomcode-cli`) ──
         Msg::HostConfigNotEditable => "this host's configuration cannot be changed from the screen".into(),
