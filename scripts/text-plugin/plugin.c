@@ -104,8 +104,23 @@ typedef struct {
 static void text_push(Text *text, unsigned int cp, int advance) {
     if (text->count == text->capacity) {
         int grown = text->capacity ? text->capacity * 2 : 256;
-        text->codepoints = realloc(text->codepoints, (size_t)grown * sizeof(*text->codepoints));
-        text->advances = realloc(text->advances, (size_t)grown * sizeof(*text->advances));
+        /* Both reallocs are checked: writing an unchecked result back into the
+         * struct loses the old pointer (a leak) and leaves the field NULL, and
+         * the very next line indexes it — a NULL dereference inside the host
+         * process, because this plugin is dlopened into it. A failed growth
+         * drops the code point instead of taking the process down. */
+        unsigned int *codepoints =
+            realloc(text->codepoints, (size_t)grown * sizeof(*text->codepoints));
+        if (!codepoints) return;
+        int *advances = realloc(text->advances, (size_t)grown * sizeof(*text->advances));
+        if (!advances) {
+            /* The first one already moved: keep the struct consistent with it
+             * so the next push does not reallocate over a stale pointer. */
+            text->codepoints = codepoints;
+            return;
+        }
+        text->codepoints = codepoints;
+        text->advances = advances;
         text->capacity = grown;
     }
     text->codepoints[text->count] = cp;
