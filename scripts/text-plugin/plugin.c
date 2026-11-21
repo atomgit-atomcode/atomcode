@@ -30,6 +30,13 @@
 #define DEFAULT_FONT "/system/fonts/NotoSansCJK-Regular.ttc"
 #define MAX_LINES 4096
 
+/* The text buffer lives in a header so the growth logic can be tested on a
+ * build machine: the rendering path below needs FreeType and a font file,
+ * which a build machine has no use for, but the buffer is pure C — and it is
+ * where the memory-safety bug lived (an unchecked `realloc` result written
+ * back into the struct and then indexed). */
+#include "text_buffer.h"
+
 typedef struct {
     unsigned char r, g, b;
 } Color;
@@ -92,40 +99,6 @@ static unsigned int utf8_decode(const char *text, int *advance) {
     }
     *advance = 1;
     return 0xFFFD;
-}
-
-typedef struct {
-    unsigned int *codepoints;
-    int *advances; /* 每个码点的水平步进（像素） */
-    int count;
-    int capacity;
-} Text;
-
-static void text_push(Text *text, unsigned int cp, int advance) {
-    if (text->count == text->capacity) {
-        int grown = text->capacity ? text->capacity * 2 : 256;
-        /* Both reallocs are checked: writing an unchecked result back into the
-         * struct loses the old pointer (a leak) and leaves the field NULL, and
-         * the very next line indexes it — a NULL dereference inside the host
-         * process, because this plugin is dlopened into it. A failed growth
-         * drops the code point instead of taking the process down. */
-        unsigned int *codepoints =
-            realloc(text->codepoints, (size_t)grown * sizeof(*text->codepoints));
-        if (!codepoints) return;
-        int *advances = realloc(text->advances, (size_t)grown * sizeof(*text->advances));
-        if (!advances) {
-            /* The first one already moved: keep the struct consistent with it
-             * so the next push does not reallocate over a stale pointer. */
-            text->codepoints = codepoints;
-            return;
-        }
-        text->codepoints = codepoints;
-        text->advances = advances;
-        text->capacity = grown;
-    }
-    text->codepoints[text->count] = cp;
-    text->advances[text->count] = advance;
-    text->count++;
 }
 
 /* 把文字按宽度折行：返回行数，行边界写进 starts/ends（按码点下标）。 */

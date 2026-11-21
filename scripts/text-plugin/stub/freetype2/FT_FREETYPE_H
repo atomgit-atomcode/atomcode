@@ -1,0 +1,19 @@
+/*
+ * The FreeType declarations `plugin.c` uses, against the stub types.
+ *
+ * Never linked — see `stub/ft2build.h`. The syntax check passes
+ * `-fsyntax-only`, so no implementation is needed.
+ */
+#ifndef ATOMCODE_FT_FREETYPE_H_STUB
+#define ATOMCODE_FT_FREETYPE_H_STUB
+
+#include "ft2build.h"
+
+int FT_Init_FreeType(FT_Library *library);
+int FT_New_Face(FT_Library library, const char *pathname, long face_index, FT_Face *aface);
+int FT_Set_Pixel_Sizes(FT_Face face, FT_UInt pixel_width, FT_UInt pixel_height);
+int FT_Load_Char(FT_Face face, FT_UInt char_code, FT_Int load_flags);
+int FT_Done_Face(FT_Face face);
+int FT_Done_FreeType(FT_Library library);
+
+#endif
