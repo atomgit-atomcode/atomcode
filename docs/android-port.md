@@ -3028,6 +3028,73 @@ APK 不带运行时，市场页是一张长列表，新装的人没有任何线�
 （上面的探针全部清理：临时 provider、任务、端口映射、临时脚本都删了，`providers: []`、
 `schedules: []`，被卸载的 ninja 已装回。）
 
+### P11：图标、版本号跟随 workspace、包依赖、首启引导（真机验证 2026-11-21）
+
+这一轮都是「上架/新装」路上的硬缺口，外加一处合并回归。
+
+#### 一、应用图标：manifest 里根本没有 `android:icon`
+
+`res/` 下只有 `values/` 与 `xml/`，没有任何 `mipmap-*`——装到桌面上是没有图标的应用。
+minSdk 是 26，所以只做自适应图标，不需要位图、也没有 `mipmap-<density>` 要维护：
+
+| 文件 | 作用 |
+|---|---|
+| `res/mipmap-anydpi-v26/ic_launcher.xml`（+ `_round`） | 自适应图标的背景/前景两层 |
+| `res/drawable/ic_launcher_foreground.xml` | 终端提示符 `>` 与光标；落在 108dp 视口的中间 72dp 安全区内 |
+| `res/values/colors.xml` | 背景色 `#12161C`，与 App 深色底一致，避免启动闪白块 |
+
+#### 二、版本号：手打的那份已经和产品版本跑偏
+
+`build.gradle.kts` 里写死 `versionCode = 50205 / versionName = "5.2.5"`，而 merge 之后
+workspace 是 **5.2.6**——APK 对外宣称的版本与 daemon/CLI 打印的版本不是一个数。
+现在两者都从 `Cargo.toml` 的 `[workspace.package] version` 读，`versionCode` 按
+`major*10000 + minor*100 + patch` 推导（预发布后缀丢弃，否则 versionCode 不单调）。
+真机复验：`Cargo.toml=5.2.6  APK/设备=5.2.6`。
+
+#### 三、包依赖：`requires`
+
+provider 与它需要的数据包是**两个** packages（`clang` 出二进制，`clang-data` 出头文件与
+`lib/`）。只装 provider 的结果是页面显示「已安装」、命令也找得到，但第一次查头文件才失败。
+现在清单可声明 `requires`，安装时在**替换旧版之前**校验并点名缺哪个；`/packages` 每条记录
+带 `requires` 与 `missing_requires`，依赖被卸掉之后仍报缺口；面板上缺依赖是红色提示。
+判据三条见 `packages::tests`（自依赖/非法名/重复名、缺依赖被拒、装了依赖后成功且移除后报缺口）。
+
+#### 四、首启引导：落地区直接说还缺哪几个运行时
+
+APK 不带任何运行时，市场是一张长列表，新装的人停在会话落地区不会主动去插件页。
+`LandingRuntimes` 挂载时读一次已装包与市场清单，缺就出一条说明 + 「去插件页安装」；
+一个都不缺、或页面看不见设备（桌面浏览器没有宿主桥）时整块不渲染。安装仍留给市场——
+每个 provider 都要系统安装器确认一次，这里不做一键全装。
+
+真机证据（2026-11-21，设备上 `packages: []`）：
+
+```text
+# WebView 调试端口直接读 DOM（uiautomator 读不到 WebView 内容）
+{"present":true,"text":"还差 6 个基础运行时：bash、unzip (Info-ZIP)、GNU tar、pkg-config、
+ AtomCode 工具辅助程序、Ninja。不装它们，仓库里的脚本和编译器都跑不起来。去插件页安装",
+ "hasButton":true,"installedCards":0}
+```
+
+#### 五、两处「看起来成功」的坑
+
+1. **gradle 会在 `.so` 是旧的时候照样 `BUILD SUCCESSFUL`**：`assembleDebug` 用的是
+   `jniLibs` 里已有的 `.so`，改过 webui 却没重编 `.so` 时，APK 里跑的仍是旧页面。
+   为此加了 `scripts/verify-android-device.sh`（装包 → 启机 → 从 logcat 捞随机端口与
+   token → 查 `/health` → 比对版本），无设备/装不上/进程不在/日志有崩溃/`/health` 不应答
+   各给一句明确失败原因。
+2. **`rustc` 偶发 `STATUS_STACK_BUFFER_OVERRUN`**：一次 Android 构建在链接 `atomcode` bin
+   时崩掉（并发构建下出现过一次，重跑即成功）。它不会让 gradle 变红（见上一条），所以
+   判据只能是 `.so` 的时间戳与 `EXIT` 码，不是 gradle 的结论。
+
+#### 六、合并回归：手机排版被上游覆盖
+
+merge v5.2.6 时整份 `app.css` 取了上游版本，把本分支 769 行手机端排版（输入框抽屉、
+状态栏与抽屉留白、审批卡片窄屏布局）一起删掉，四条排版判据立刻变红。已取回本分支那份；
+上游那套「未聚焦时收窄成一行」不再合入，因为它与手机端「工具栏常驻」是同一位置的相反
+选择，而这条分支的目标平台是手机。
+
+（本轮探针已清理：WebView 调试转发与端口转发全部撤销，临时截图删除。）
+
 ## 6. 路线
 
 | 阶段 | 内容 |
@@ -3043,6 +3110,7 @@ APK 不带运行时，市场页是一张长列表，新装的人没有任何线�
 | ~~P8~~ | ~~若要上架：SAF + `content://` 的 world 实现，替换全盘访问~~ **已实现（真机验证 2026-11-02）**：`capabilities::saf` 是 content:// 上的 `FileSystem`（后端为 trait，8 项单测在构建机跑），`SafTree.kt` 提供 DocumentsContract 后端，`fs-saf` 行 + `swap("fs","fs-saf")` 完成装配切换。规则是**全盘访问优先**：拿得到就用真实磁盘（bash/git/LSP 都认路径），拿不到才落到授权文件夹 |
 | P9 | 定时任务在 Android 上显式拒绝（不再落到 systemd）、首启播种默认市场基址、`/health` 报 `pending_approvals` 并让通知说「等你批准」——见上面 P9 小节 |
 | P10 | 定时任务改为 daemon 进程内执行、`/fs/search` 走 SAF、C/C++ 接 clangd、首启推荐运行时、语音输入——见上面 P10 小节 |
+| P11 | 上架缺件：应用图标、版本号跟随 workspace、包依赖 `requires`、落地区首启引导——真机验证 2026-11-21，见上面 P11 小节 |
 
 ### SAF 世界：没有路径时的文件系统（真机验证 2026-11-02）
 
