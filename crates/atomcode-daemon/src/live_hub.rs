@@ -87,10 +87,12 @@ pub struct LiveObservation {
 pub struct LiveJoin {
     pub binding: LiveBinding,
     pub snapshot: Arc<SessionSnapshot>,
+    pub mode: atomcode_coding::RuntimeMode,
     pub model: Option<String>,
     /// Latest Goal controller state. Unlike turn replay, this must survive a
     /// completed turn so late `/live` subscribers can restore the Goal UI.
     pub goal_progress: Option<atomcode_coding::GoalProgress>,
+    pub loop_progress: Option<atomcode_coding::LoopProgress>,
     pub pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     pub replay: Vec<LiveObservation>,
     pub receiver: broadcast::Receiver<LiveObservation>,
@@ -128,8 +130,51 @@ struct BoundRuntime {
 /// kept so an answer can act on what was actually asked (e.g. which tool an
 /// approval is for) rather than on what a client claims alongside its answer.
 struct PendingRequest {
+    approval_id: Option<String>,
     kind: String,
     payload: serde_json::Value,
+}
+
+impl PendingRequest {
+    fn claim_approval(&mut self, token: &str, call_id: &str) -> Result<Option<String>, ()> {
+        if self.kind != atomcode_capabilities::tools::APPROVAL_KIND
+            || self.approval_id.as_deref() != Some(token)
+            || self
+                .payload
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(call_id)
+        {
+            return Err(());
+        }
+        self.approval_id = None;
+        Ok(self
+            .payload
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn approval_claim_requires_the_exact_single_use_token() {
+    let mut pending = PendingRequest {
+        approval_id: Some("new-request".into()),
+        kind: atomcode_capabilities::tools::APPROVAL_KIND.into(),
+        payload: serde_json::json!({"call_id":"reused-call", "tool":"mcp__server__tool"}),
+    };
+    assert!(pending
+        .claim_approval("old-request", "reused-call")
+        .is_err());
+    assert!(pending.claim_approval("new-request", "other-call").is_err());
+    assert_eq!(
+        pending.claim_approval("new-request", "reused-call"),
+        Ok(Some("mcp__server__tool".into()))
+    );
+    assert!(pending
+        .claim_approval("new-request", "reused-call")
+        .is_err());
 }
 
 #[derive(Default)]
@@ -138,15 +183,39 @@ struct HubState {
     next_cursor: u64,
     binding: Option<BoundRuntime>,
     snapshot: Option<Arc<SessionSnapshot>>,
+    mode: atomcode_coding::RuntimeMode,
     model: Option<String>,
     pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     snapshot_error: Option<String>,
     replay: Vec<LiveObservation>,
     goal_progress: Option<atomcode_coding::GoalProgress>,
+    loop_progress: Option<atomcode_coding::LoopProgress>,
+    loop_sampled_at: Option<tokio::time::Instant>,
+    goal_sampled_at: Option<tokio::time::Instant>,
     pending_requests: HashMap<RequestId, PendingRequest>,
     turn_active: bool,
     last_runtime_sequence: Option<u64>,
     pending_web_steers: VecDeque<PendingWebSteer>,
+}
+
+fn sampled_goal_progress(state: &HubState) -> Option<atomcode_coding::GoalProgress> {
+    let mut progress = state.goal_progress.clone()?;
+    if let (Some(recovery), Some(at)) = (progress.recovery.as_mut(), state.goal_sampled_at) {
+        recovery.retry_in_secs = recovery
+            .retry_in_secs
+            .saturating_sub(at.elapsed().as_secs());
+    }
+    Some(progress)
+}
+
+fn sampled_loop_progress(state: &HubState) -> Option<atomcode_coding::LoopProgress> {
+    let mut progress = state.loop_progress.clone()?;
+    if let (Some(recovery), Some(at)) = (progress.recovery.as_mut(), state.loop_sampled_at) {
+        recovery.retry_in_secs = recovery
+            .retry_in_secs
+            .saturating_sub(at.elapsed().as_secs());
+    }
+    Some(progress)
 }
 
 #[derive(Clone)]
@@ -346,6 +415,7 @@ impl LiveViewHub {
         if status.generation != view.generation {
             return Err(HubError::StaleBinding);
         }
+        let mode = view.mode;
         let staged = Self::new();
         let binding = staged.bind_initial(
             view.session_id,
@@ -356,11 +426,14 @@ impl LiveViewHub {
             control.clone(),
             true,
         )?;
-        staged
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .model = view.model;
+        {
+            let mut state = staged
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.mode = mode;
+            state.model = view.model;
+        }
         for event in view.events {
             staged.publish(&binding, event)?;
         }
@@ -492,11 +565,13 @@ impl LiveViewHub {
             control,
         });
         state.snapshot = Some(Arc::new(snapshot));
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.turn_active = false;
@@ -530,9 +605,11 @@ impl LiveViewHub {
         Ok(LiveJoin {
             binding,
             snapshot,
+            mode: state.mode,
             model: state.model.clone(),
             pending_turn_model: state.pending_turn_model.clone(),
-            goal_progress: state.goal_progress.clone(),
+            goal_progress: sampled_goal_progress(&state),
+            loop_progress: sampled_loop_progress(&state),
             replay: state.replay.clone(),
             receiver,
         })
@@ -546,6 +623,13 @@ impl LiveViewHub {
             .as_ref()
             .map(|bound| bound.identity.clone())
             .ok_or(HubError::Unbound)
+    }
+
+    /// Current runtime mode from the installed presentation view. `None`
+    /// means no live runtime is bound and callers may use their configured default.
+    pub fn current_mode(&self) -> Option<atomcode_coding::RuntimeMode> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.binding.as_ref().map(|_| state.mode)
     }
 
     pub fn unbind(&self, binding: &LiveBinding) -> Result<(), HubError> {
@@ -563,11 +647,13 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.last_runtime_sequence = None;
@@ -602,11 +688,13 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.mode = atomcode_coding::RuntimeMode::Build;
         state.model = None;
         state.pending_turn_model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.last_runtime_sequence = None;
@@ -661,6 +749,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.turn_active = false;
@@ -724,14 +813,33 @@ impl LiveViewHub {
         echo_input: UserInput,
         client_input_id: Option<String>,
     ) -> Result<SubmitReceipt, HubError> {
-        let (binding, handle) = self.bound_handle()?;
-        let correlation_registered = if let Some(client_input_id) = client_input_id.clone() {
+        let (binding, _) = self.bound_handle()?;
+        self.submit_confirmed_with_echo_for(&binding, runtime_input, echo_input, client_input_id)
+            .await
+    }
+
+    /// Preserve the binding captured before HTTP input preparation. Both the
+    /// hub identity and the runtime generation must still match at admission.
+    pub async fn submit_confirmed_with_echo_for(
+        &self,
+        binding: &LiveBinding,
+        runtime_input: UserInput,
+        echo_input: UserInput,
+        client_input_id: Option<String>,
+    ) -> Result<SubmitReceipt, HubError> {
+        let handle = self.bound_handle_for(binding)?;
+        let correlation_registered = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(error) = &state.snapshot_error {
+                return Err(HubError::SnapshotUnavailable(error.clone()));
+            }
             let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
-            if current.identity.id != binding.id {
+            if current.identity.id != binding.id
+                || current.identity.generation != binding.generation
+            {
                 return Err(HubError::StaleBinding);
             }
-            if state.turn_active {
+            if let Some(client_input_id) = client_input_id.clone().filter(|_| state.turn_active) {
                 state.pending_web_steers.push_back(PendingWebSteer {
                     runtime_input: runtime_input.clone(),
                     client_input_id,
@@ -740,15 +848,16 @@ impl LiveViewHub {
             } else {
                 false
             }
-        } else {
-            false
         };
-        let receipt = handle.submit(runtime_input).await.map_err(|error| {
-            if correlation_registered {
-                self.remove_pending_web_steer(client_input_id.as_deref());
-            }
-            HubError::RuntimeRejected(error.to_string())
-        })?;
+        let receipt = handle
+            .submit_at_generation(binding.generation, runtime_input)
+            .await
+            .map_err(|error| {
+                if correlation_registered {
+                    self.remove_pending_web_steer(client_input_id.as_deref());
+                }
+                HubError::RuntimeRejected(error.to_string())
+            })?;
         let receipt_generation = match receipt {
             SubmitReceipt::Started { generation, .. }
             | SubmitReceipt::Steered { generation, .. }
@@ -836,6 +945,14 @@ impl LiveViewHub {
         Self::dispatch_locked(&state, command)
     }
 
+    pub async fn refresh_quota_wait(&self) -> Result<bool, HubError> {
+        self.bound_handle()?
+            .1
+            .refresh_quota_wait()
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     pub async fn update_mode_bindings(
         &self,
         bindings: atomcode_config::mode_models::ModeModels,
@@ -864,6 +981,46 @@ impl LiveViewHub {
             .model_selection()
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
+    pub async fn mcp_session(
+        &self,
+        session: String,
+        paused: Option<bool>,
+    ) -> Result<bool, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::StaleBinding);
+        }
+        if let Some(paused) = paused {
+            let changed = handle
+                .set_mcp_paused(session.clone(), paused)
+                .await
+                .map_err(|e| HubError::RuntimeRejected(e.to_string()))?;
+            self.commit_changed_snapshot(&binding, &handle, &changed)
+                .await?;
+        }
+        let snapshot = handle
+            .mcp_rows()
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))?;
+        if snapshot.session_id.as_deref() != Some(session.as_str()) {
+            return Err(HubError::StaleBinding);
+        }
+        Ok(snapshot.paused)
+    }
+
+    pub async fn quality(&self, session: String, args: String) -> Result<String, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::RuntimeRejected(
+                "Quality command targets a different session.".into(),
+            ));
+        }
+        handle
+            .quality_for_session(Some(session), args)
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))
     }
 
     pub async fn set_mode(&self, mode: atomcode_coding::RuntimeMode) -> Result<(), HubError> {
@@ -967,6 +1124,26 @@ impl LiveViewHub {
     /// Move an idle runtime to a fresh staged session. CodingRuntime owns the
     /// transition and releases the previous session lease before returning the
     /// terminal, which lets callers safely delete the old aggregate afterwards.
+    pub async fn fork_session(
+        &self,
+        expected: &LiveBinding,
+    ) -> Result<FreshSessionOutcome, HubError> {
+        let handle = self.bound_handle_for(expected)?;
+        let changed = handle
+            .fork_session(&expected.session_id)
+            .await
+            .map_err(map_session_transition_error)?;
+        let projection_error = self
+            .commit_changed_snapshot(expected, &handle, &changed)
+            .await
+            .err();
+        wait_mcp_ready_after_transition(&handle).await;
+        Ok(FreshSessionOutcome {
+            changed,
+            projection_error,
+        })
+    }
+
     pub async fn fresh_session(
         &self,
         expected: &LiveBinding,
@@ -1120,6 +1297,61 @@ impl LiveViewHub {
         Ok(())
     }
 
+    /// Claim one exact approval before awaiting the runtime. Tokens are single use
+    /// and survive replay, but never survive replacement of the pending request.
+    pub async fn respond_approval_confirmed(
+        &self,
+        id: RequestId,
+        token: &str,
+        call_id: &str,
+        value: serde_json::Value,
+        persist: bool,
+    ) -> Result<(), HubError> {
+        let (binding, handle, tool) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let bound = state.binding.as_ref().ok_or(HubError::Unbound)?;
+            let binding = bound.identity.clone();
+            let handle = bound.control.handle().ok_or(HubError::RuntimeUnavailable)?;
+            let pending = state
+                .pending_requests
+                .get_mut(&id)
+                .ok_or(HubError::UnknownRequest(id))?;
+            let tool = pending
+                .claim_approval(token, call_id)
+                .map_err(|()| HubError::UnknownRequest(id))?;
+            (binding, handle, tool)
+        };
+        handle
+            .respond_at_generation(binding.generation, id, value)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        let same_binding = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let same = state
+                .binding
+                .as_ref()
+                .is_some_and(|current| current.identity == binding);
+            if same && state.pending_requests.contains_key(&id) {
+                self.resolve_request_locked(&mut state, id)?;
+            }
+            same
+        };
+        if persist && same_binding {
+            if let Some(tool) = tool.filter(|tool| tool.starts_with("mcp__")) {
+                match handle
+                    .approve_mcp_tool_at_generation(binding.generation, tool.clone())
+                    .await
+                {
+                    Ok(approval) => crate::live_api::report_mcp_tool_approval(&tool, approval),
+                    Err(error) => {
+                        tracing::warn!(?error, "MCP approval persistence was not applied")
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn respond_pending_kind(
         &self,
         kind: &str,
@@ -1221,6 +1453,7 @@ impl LiveViewHub {
                 state.model = None;
                 state.pending_turn_model = None;
                 state.goal_progress = None;
+                state.loop_progress = None;
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
@@ -1230,6 +1463,9 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        if let CodingRuntimeEvent::ModeChanged { mode } = &event {
+            state.mode = *mode;
+        }
         if let CodingRuntimeEvent::RequestResolved { id, kind } = &event {
             // A terminal/TUI response bypasses the HTTP response route. Retire
             // its replay entry here too; the route may already have done so.
@@ -1257,8 +1493,13 @@ impl LiveViewHub {
             }
         }
         if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+            state.goal_sampled_at = Some(tokio::time::Instant::now());
             state.goal_progress =
                 (progress.phase != atomcode_coding::GoalPhase::Ended).then(|| progress.clone());
+        }
+        if let CodingRuntimeEvent::LoopChanged(progress) = &event {
+            state.loop_sampled_at = Some(tokio::time::Instant::now());
+            state.loop_progress = progress.active.then(|| progress.clone());
         }
         let mapped_steer = match &event {
             CodingRuntimeEvent::SteerAcknowledged { inputs } => {
@@ -1277,6 +1518,22 @@ impl LiveViewHub {
             _ => None,
         };
         let mut replay = state.turn_active;
+        if matches!(
+            &event,
+            CodingRuntimeEvent::GoalChanged(_) | CodingRuntimeEvent::LoopChanged(_)
+        ) {
+            // Latest controller state is seeded separately, with an aged retry
+            // countdown. Replaying older samples would reset it on reconnect.
+            state.replay.retain(|observation| {
+                !matches!(
+                    &observation.event,
+                    LiveViewEvent::Runtime(
+                        CodingRuntimeEvent::GoalChanged(_) | CodingRuntimeEvent::LoopChanged(_)
+                    )
+                )
+            });
+            replay = false;
+        }
         if matches!(
             &event,
             CodingRuntimeEvent::TurnFinished(_) | CodingRuntimeEvent::RuntimeStopped(_)
@@ -1313,6 +1570,8 @@ impl LiveViewHub {
                 state.pending_requests.insert(
                     request.id,
                     PendingRequest {
+                        approval_id: (request.kind == atomcode_capabilities::tools::APPROVAL_KIND)
+                            .then(|| uuid::Uuid::new_v4().to_string()),
                         kind: request.kind.clone(),
                         payload: request.payload.clone(),
                     },
@@ -1447,6 +1706,7 @@ impl LiveViewHub {
                     state.snapshot_error = Some("session snapshot pending".into());
                     state.replay.clear();
                     state.goal_progress = None;
+                    state.loop_progress = None;
                     state.pending_requests.clear();
                     state.pending_web_steers.clear();
                     state.turn_active = false;
@@ -1534,6 +1794,7 @@ impl LiveViewHub {
         if current.identity.id != binding.id {
             return Err(HubError::StaleBinding);
         }
+        state.goal_sampled_at = Some(tokio::time::Instant::now());
         state.goal_progress = Some(progress.clone());
         self.publish_view_locked(
             &mut state,
@@ -1704,6 +1965,7 @@ impl LiveViewHub {
                 state.model = None;
                 state.pending_turn_model = None;
                 state.goal_progress = None;
+                state.loop_progress = None;
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
@@ -1736,7 +1998,16 @@ impl LiveViewHub {
         Ok(())
     }
 
-    fn publish_view_locked(&self, state: &mut HubState, event: LiveViewEvent, replay: bool) {
+    fn publish_view_locked(&self, state: &mut HubState, mut event: LiveViewEvent, replay: bool) {
+        if let LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) = &mut event {
+            if let Some(token) = state
+                .pending_requests
+                .get(&request.id)
+                .and_then(|p| p.approval_id.as_ref())
+            {
+                request.payload["approval_id"] = serde_json::json!(token);
+            }
+        }
         let Some(binding) = state.binding.as_ref() else {
             return;
         };
@@ -2204,6 +2475,58 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn quality_changes_reject_another_session_without_rebinding() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        hub.bind(
+            "session-a",
+            project.path().to_path_buf(),
+            snapshot("one"),
+            Arc::new(RealControl {
+                handle: runtime.handle.clone(),
+            }),
+        )
+        .unwrap();
+        let before = hub.binding().unwrap();
+        let result = hub.quality("session-b".into(), "off".into()).await;
+        assert!(
+            matches!(result, Err(HubError::RuntimeRejected(message)) if message.contains("different session"))
+        );
+        assert_eq!(hub.binding().unwrap().id, before.id);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mcp_session_pause_rejects_another_session_without_rebinding() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        hub.bind(
+            "session-a",
+            project.path().to_path_buf(),
+            snapshot("one"),
+            Arc::new(RealControl {
+                handle: runtime.handle.clone(),
+            }),
+        )
+        .unwrap();
+        let before = hub.binding().unwrap();
+        for paused in [None, Some(true), Some(false)] {
+            assert_eq!(
+                hub.mcp_session("session-b".into(), paused).await,
+                Err(HubError::StaleBinding)
+            );
+            assert_eq!(hub.binding().unwrap().id, before.id);
+        }
+        runtime.handle.shutdown().await.unwrap();
+    }
+
     #[derive(Clone)]
     struct FakeControl {
         status: Arc<Mutex<RuntimeStatus>>,
@@ -2347,6 +2670,62 @@ mod tests {
         SessionSnapshot::new(vec![Message::user(text)])
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prepared_message_does_not_follow_a_rebound_hub() {
+        let project = tempfile::tempdir().unwrap();
+        let mut runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        let control = Arc::new(RealControl {
+            handle: runtime.handle.clone(),
+        });
+        hub.bind("A", project.path().into(), snapshot("A"), control.clone())
+            .unwrap();
+        let captured = hub.join().unwrap().binding;
+        // A projection failure discovered during preparation must still fail
+        // closed, just like an ordinary confirmed submission.
+        hub.state.lock().unwrap().snapshot_error = Some("projection failed".into());
+        let input = UserInput::from("only for A");
+        assert_eq!(
+            hub.submit_confirmed_with_echo_for(&captured, input.clone(), input, None)
+                .await,
+            Err(HubError::SnapshotUnavailable("projection failed".into()))
+        );
+        hub.state.lock().unwrap().snapshot_error = None;
+        // The HTTP handler is suspended preparing A's input; navigation wins.
+        hub.bind("B", project.path().into(), snapshot("B"), control)
+            .unwrap();
+        let mut view = hub.join().unwrap();
+        let input = UserInput::from("only for A");
+        assert_eq!(
+            hub.submit_confirmed_with_echo_for(
+                &captured,
+                input.clone(),
+                input,
+                Some("A-send".into())
+            )
+            .await,
+            Err(HubError::StaleBinding)
+        );
+        assert!(
+            runtime.commands.try_recv().is_err(),
+            "no message reached the agent"
+        );
+        assert!(
+            view.receiver.try_recv().is_err(),
+            "no accepted echo reached B"
+        );
+
+        let input = UserInput::from("only for B");
+        hub.submit_confirmed_with_echo_for(&view.binding, input.clone(), input, None)
+            .await
+            .unwrap();
+        assert!(matches!(runtime.commands.recv().await,
+            Some(atomcode_kernel::event::AgentCommand::SendMessage { text, .. }) if text == "only for B"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
     #[test]
     fn same_generation_and_identity_is_a_noop_session_change() {
         let binding = LiveBinding {
@@ -2395,6 +2774,7 @@ mod tests {
                 state.pending_requests.insert(
                     id,
                     PendingRequest {
+                        approval_id: None,
                         kind: kind.into(),
                         payload: serde_json::json!({}),
                     },
@@ -2583,6 +2963,54 @@ mod tests {
             Some((42, serde_json::json!({ "tool": "mcp__fs__read" })))
         );
         assert_eq!(hub.pending_of_kind("request_user_input"), None);
+        let token = |hub: &LiveViewHub| {
+            let replay = hub.join().unwrap().replay;
+            replay
+                .iter()
+                .find_map(|item| match &item.event {
+                    LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) => request
+                        .payload
+                        .get("approval_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .expect("approval replay has a token")
+        };
+        let first = token(&hub);
+        assert_eq!(
+            token(&hub),
+            first,
+            "reconnect keeps the same request identity"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({"tool":"mcp__fs__read"}),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        let newest = hub
+            .state
+            .lock()
+            .unwrap()
+            .pending_requests
+            .get(&42)
+            .unwrap()
+            .approval_id
+            .clone()
+            .unwrap();
+        assert_ne!(
+            first, newest,
+            "reused runtime IDs must not reuse approval identities"
+        );
         hub.respond(42, serde_json::json!({ "decision": "allow" }))
             .unwrap();
         assert_eq!(
@@ -3828,6 +4256,39 @@ mod tests {
     }
 
     #[test]
+    fn late_join_uses_runtime_mode_after_idle_mode_change() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "session-1".into(),
+            PathBuf::from("/one"),
+            snapshot("done"),
+        );
+        view.mode = atomcode_coding::RuntimeMode::Auto;
+        let binding = hub
+            .bind_live_view(view, "provider-a".into(), "fingerprint".into(), control)
+            .unwrap();
+
+        assert_eq!(hub.join().unwrap().mode, atomcode_coding::RuntimeMode::Auto);
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::ModeChanged {
+                    mode: atomcode_coding::RuntimeMode::Plan,
+                },
+            },
+        )
+        .unwrap();
+
+        let reconnected = hub.join().unwrap();
+        assert_eq!(reconnected.mode, atomcode_coding::RuntimeMode::Plan);
+        assert!(reconnected.replay.is_empty(), "idle mode is snapshot state");
+    }
+
+    #[test]
     fn provider_event_updates_the_bound_runtime_projection() {
         let hub = LiveViewHub::new();
         let (control, _) = control();
@@ -3941,5 +4402,109 @@ mod tests {
             hub.respond(42, serde_json::Value::Null).unwrap_err(),
             HubError::UnknownRequest(42)
         );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn late_join_ages_the_quota_countdown_without_replaying_old_goal_samples() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            },
+        )
+        .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    active: true,
+                    terminal: None,
+                    phase: GoalPhase::Pursuing,
+                    round: 1,
+                    max_rounds: None,
+                    elapsed_secs: 1,
+                    condition: "finish".into(),
+                    last_reason: None,
+                    recovery: Some(atomcode_coding::GoalRecoveryProgress {
+                        kind: atomcode_coding::GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                    report: Default::default(),
+                    evaluation_ready: false,
+                }),
+            },
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(10800)).await;
+        let join = hub.join().unwrap();
+        let recovery = join.goal_progress.unwrap().recovery.unwrap();
+        assert_eq!(recovery.retry_in_secs, 20);
+        assert!(recovery.waiting_for_quota);
+        assert!(!join.replay.iter().any(|observation| matches!(
+            &observation.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::GoalChanged(_))
+        )));
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            hub.join()
+                .unwrap()
+                .goal_progress
+                .unwrap()
+                .recovery
+                .unwrap()
+                .retry_in_secs,
+            0
+        );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_loop_quota_wait_is_aged_and_retained_for_a_late_viewer() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("loop", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::LoopChanged(atomcode_coding::LoopProgress {
+                    active: true,
+                    round: 1,
+                    elapsed_secs: 0,
+                    label: "check".into(),
+                    last_reason: None,
+                    recovery: Some(atomcode_coding::GoalRecoveryProgress {
+                        kind: atomcode_coding::GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                }),
+            },
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        let join = hub.join().unwrap();
+        assert_eq!(
+            join.loop_progress.unwrap().recovery.unwrap().retry_in_secs,
+            20
+        );
+        assert!(!join.replay.iter().any(|event| matches!(
+            &event.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::LoopChanged(_))
+        )));
     }
 }

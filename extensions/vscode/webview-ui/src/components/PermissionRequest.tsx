@@ -14,15 +14,16 @@ export function PermissionRequest({ request }: PermissionRequestProps) {
   const t = useT();
 
   const handleRespond = useCallback((decision: PermissionDecision) => {
-    dispatch({ type: 'PERMISSION_RESPOND', id: request.id, decision });
+    dispatch({ type: 'PERMISSION_RESPOND', id: request.id, approvalId: request.approvalId, decision });
     postMessage({
       type: 'permissionResponse',
       sessionId: request.sessionId,
       id: request.id,
+      approvalId: request.approvalId,
       toolName: request.toolName,
       decision,
     });
-  }, [request.id, request.sessionId, request.toolName, dispatch]);
+  }, [request.id, request.approvalId, request.sessionId, request.toolName, dispatch]);
 
   if (request.status === 'allowed' || request.status === 'denied') return null;
 

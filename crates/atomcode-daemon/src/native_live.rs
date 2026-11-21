@@ -205,6 +205,10 @@ pub fn join_for_provider(expected_session_id: Option<&str>) -> Result<LiveJoin, 
     hub().join_for_provider(expected_session_id)
 }
 
+pub async fn refresh_quota_wait() -> Result<bool, HubError> {
+    hub().refresh_quota_wait().await
+}
+
 pub fn binding() -> Result<LiveBinding, HubError> {
     hub().binding()
 }
@@ -231,12 +235,13 @@ pub async fn submit_confirmed(
 /// webui image path so the VL caption feeds the model but the user's original
 /// message + image is what displays.
 pub async fn submit_confirmed_with_echo(
+    binding: &crate::live_hub::LiveBinding,
     runtime_input: UserInput,
     echo_input: UserInput,
     client_input_id: Option<String>,
 ) -> Result<atomcode_coding::SubmitReceipt, HubError> {
     hub()
-        .submit_confirmed_with_echo(runtime_input, echo_input, client_input_id)
+        .submit_confirmed_with_echo_for(binding, runtime_input, echo_input, client_input_id)
         .await
 }
 
@@ -364,6 +369,10 @@ pub async fn current_turn_model(
 
 pub async fn model_selection() -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
     hub().model_selection().await
+}
+
+pub fn current_mode() -> Option<RuntimeMode> {
+    hub().current_mode()
 }
 
 pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
@@ -503,6 +512,12 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
 /// Move the bound runtime to a fresh staged session. This is the only safe way
 /// for the daemon to release the current idle session's lease before deleting
 /// that session from disk.
+pub async fn fork_session(
+    expected: &LiveBinding,
+) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {
+    hub().fork_session(expected).await
+}
+
 pub async fn fresh_session(
     expected: &LiveBinding,
 ) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {
@@ -540,6 +555,10 @@ pub async fn approve_mcp_tool(
     alias: String,
 ) -> Result<Option<atomcode_coding::McpToolApproval>, HubError> {
     hub().approve_mcp_tool(alias).await
+}
+
+pub async fn mcp_session(session: String, paused: Option<bool>) -> Result<bool, HubError> {
+    hub().mcp_session(session, paused).await
 }
 
 pub async fn mcp_servers() -> Result<(PathBuf, Vec<crate::live_hub::LiveMcpServer>), HubError> {
@@ -973,4 +992,20 @@ pub async fn follow_up(
     args: String,
 ) -> Result<serde_json::Value, crate::live_hub::HubError> {
     hub().follow_up(session, args).await
+}
+
+pub async fn quality(session: String, args: String) -> Result<String, HubError> {
+    hub().quality(session, args).await
+}
+
+pub async fn respond_approval_confirmed(
+    id: u64,
+    token: &str,
+    call_id: &str,
+    value: serde_json::Value,
+    persist: bool,
+) -> Result<(), crate::live_hub::HubError> {
+    hub()
+        .respond_approval_confirmed(id, token, call_id, value, persist)
+        .await
 }

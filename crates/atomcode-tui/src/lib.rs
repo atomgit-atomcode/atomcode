@@ -52,8 +52,10 @@ pub mod content;
 pub mod diff;
 pub mod el;
 pub mod frame;
+pub mod history;
 pub mod host;
 pub mod image_cache;
+pub mod migration;
 mod tmux_mouse;
 
 pub mod i18n;
@@ -63,6 +65,7 @@ pub mod layout;
 pub mod markdown;
 pub mod mcp;
 pub mod menu;
+pub mod model_setup;
 pub mod module;
 pub mod modules;
 pub mod moment;
@@ -128,3 +131,5 @@ fn _tests_assert_in_chinese() {
 mod generation;
 
 mod model_cards;
+
+mod git_branch;

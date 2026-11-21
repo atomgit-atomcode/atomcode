@@ -26,6 +26,14 @@ use agent_client_protocol::{Client, ConnectionTo};
 use atomcode_kernel::event::AgentCommand;
 use tokio::sync::mpsc;
 
+/// Show exactly the arguments the native gate is asking the person to approve.
+pub(crate) fn approval_input(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    payload
+        .get("args")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::acp::replay::raw_input_from_arguments)
+}
+
 /// The three standard permission options, each with a stable `option_id` string
 /// that `outcome_to_decision` maps back to the kernel's decision JSON.
 ///
@@ -120,7 +128,9 @@ pub async fn handle_approval(
 
     let tc = ToolCallUpdate::new(
         ToolCallId::new(call_id),
-        ToolCallUpdateFields::new().title(tool),
+        ToolCallUpdateFields::new()
+            .title(tool)
+            .raw_input(approval_input(&payload)),
     );
 
     // The `session/request_permission` round-trip must NEVER propagate its error:
@@ -193,7 +203,9 @@ pub async fn handle_approval_v2(
         .to_string();
 
     let subject = RequestPermissionSubject::ToolCall(Box::new(ToolCallPermissionSubject::new(
-        V2ToolCallUpdate::new(V2ToolCallId::new(call_id)).title(tool.clone()),
+        V2ToolCallUpdate::new(V2ToolCallId::new(call_id))
+            .title(tool.clone())
+            .raw_input(approval_input(&payload)),
     )));
     let request =
         V2RequestPermissionRequest::new(session_id.clone(), tool, v2_permission_options())

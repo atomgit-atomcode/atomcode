@@ -12,8 +12,8 @@
 //! [`crate::acp::v2::replay_entries_to_v2_updates`]).
 //!
 //! Display rules mirror the daemon's display merge: synthetic / cold-summary /
-//! system-reminder entries are hidden; kernel tool results (User messages
-//! carrying a `tool_call_id`) are not user input and are skipped as
+//! system-reminder entries are hidden; native Tool messages are not user
+//! input and are skipped as
 //! conversation, but their content feeds the paired [`ReplayEntry::ToolCall`];
 //! presentation entries anchored at a pruned/missing turn are dropped
 //! best-effort instead of failing the whole replay.
@@ -23,9 +23,20 @@ use std::path::Path;
 
 use atomcode_capabilities::reminder::is_system_reminder;
 use atomcode_capabilities::session::{
-    DisplayAnchor, PresentationEntry, PresentationRole, SessionManager,
+    DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionManager,
+    SessionMeta,
 };
 use atomcode_kernel::message::{ImageContent, Role as KernelRole, LEGACY_COLD_SUMMARY_ORIGIN};
+use atomcode_kernel::session::{
+    derive_messages_with_meta, derive_traced, LoggedEvent, Provenance, SessionEvent,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayToolResult {
+    pub content: String,
+    pub is_error: bool,
+    pub images: Vec<ImageContent>,
+}
 
 /// One displayable conversation unit, in conversation order. The `kind` drives
 /// the wire mapping; `text` carries the message/thought text and `images` the
@@ -51,8 +62,8 @@ pub enum ReplayEntry {
         name: String,
         /// Raw JSON arguments string, as persisted.
         arguments: String,
-        /// Recorded result, if one was persisted: `(content, is_error)`.
-        result: Option<(String, bool)>,
+        /// Recorded result, including the images belonging to this exact fact.
+        result: Option<ReplayToolResult>,
     },
 }
 
@@ -90,15 +101,45 @@ pub fn build_replay_entries(
         .load_native_session(native_id)
         .map_err(|e| format!("acp: replay failed to load session history: {e}"))?;
 
+    // Resume has already opened/upgraded the native event session. Never infer
+    // tool images from synthetic model carriers or fall back to a snapshot.
+    let events = manager
+        .load_events(native_id)
+        .map_err(|e| format!("acp: replay failed to read session events: {e}"))?;
+    Ok(project_replay_entries(
+        &loaded.meta,
+        &loaded.presentation,
+        &events,
+    ))
+}
+
+fn project_replay_entries(
+    meta: &SessionMeta,
+    presentation: &PresentationFile,
+    events: &[LoggedEvent],
+) -> Vec<ReplayEntry> {
+    // Human-facing text must not inherit the model-only retained-input framing.
+    let traced = derive_traced(events);
+    let messages = derive_messages_with_meta(events);
+    let images_by_seq: HashMap<_, _> = events
+        .iter()
+        .filter_map(|entry| {
+            if let SessionEvent::ToolResultLogged { images, .. } = &entry.event {
+                Some((entry.seq, images.as_slice()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Presentation entries keyed by the snapshot-message position they follow
     // (`AtStart` → 0, `AfterTurn{turn_id}` → that turn's `after_message`).
     let mut presentation_at: BTreeMap<usize, Vec<&PresentationEntry>> = BTreeMap::new();
-    for entry in &loaded.presentation.entries {
+    for entry in &presentation.entries {
         let position = match entry.anchor {
             DisplayAnchor::AtStart => 0,
             DisplayAnchor::AfterTurn { turn_id } => {
-                let Some(stat) = loaded
-                    .meta
+                let Some(stat) = meta
                     .turn_stats
                     .iter()
                     .find(|s| s.position_valid && s.turn_id == turn_id)
@@ -126,26 +167,38 @@ pub fn build_replay_entries(
     // call in conversation order pairs the Nth `id` call with the Nth `id`
     // result. Without this, two calls sharing an id (or several empty-id calls)
     // would all resolve to the last result, misattributing tool output.
-    let mut tool_results: HashMap<&str, VecDeque<(&str, bool)>> = HashMap::new();
-    for message in &loaded.snapshot.messages {
+    let mut tool_results: HashMap<&str, VecDeque<ReplayToolResult>> = HashMap::new();
+    for traced in &traced {
+        let message = &traced.message;
         if let Some(id) = &message.tool_call_id {
+            let images = match traced.source {
+                Provenance::Event(seq) => images_by_seq
+                    .get(&seq)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_vec(),
+                _ => Vec::new(),
+            };
             tool_results
                 .entry(id.as_str())
                 .or_default()
-                .push_back((message.text.as_str(), message.is_error));
+                .push_back(ReplayToolResult {
+                    content: message.text.clone(),
+                    is_error: message.is_error,
+                    images,
+                });
         }
     }
 
     let mut entries: Vec<ReplayEntry> = Vec::new();
     push_presentation_entries(&mut presentation_at, 0, &mut entries);
-    for (index, message) in loaded.snapshot.messages.iter().enumerate() {
+    for (index, message) in messages.iter().enumerate() {
         // Hide kernel-internal entries the way the daemon display merge does:
         // synthetic summaries, cold-summary placeholders, system reminders, and
         // tool-result echoes are never shown as conversation.
         let hidden = message.synthetic
             || message.internal_origin.as_deref() == Some(LEGACY_COLD_SUMMARY_ORIGIN)
-            || (message.role == KernelRole::User
-                && (message.tool_call_id.is_some() || is_system_reminder(&message.text)));
+            || (message.role == KernelRole::User && is_system_reminder(&message.text));
         if !hidden {
             match message.role {
                 KernelRole::User => entries.push(ReplayEntry::User {
@@ -181,8 +234,7 @@ pub fn build_replay_entries(
                             // all collapsing onto the last result.
                             result: tool_results
                                 .get_mut(call.id.as_str())
-                                .and_then(|q| q.pop_front())
-                                .map(|(text, is_error)| (text.to_string(), is_error)),
+                                .and_then(|q| q.pop_front()),
                         });
                     }
                 }
@@ -196,7 +248,7 @@ pub fn build_replay_entries(
     for position in leftover {
         push_presentation_entries(&mut presentation_at, position, &mut entries);
     }
-    Ok(entries)
+    entries
 }
 
 /// Append the presentation entries anchored at `position` to the replay
@@ -225,6 +277,115 @@ fn push_presentation_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_log() -> Vec<LoggedEvent> {
+        use atomcode_kernel::event::StopReason;
+        let mut events = Vec::new();
+        for (turn, image) in [(1, "FIRST"), (2, "SECOND")] {
+            let call = atomcode_kernel::tool::ToolCall {
+                id: "reused".into(),
+                name: "browser_take_screenshot".into(),
+                arguments: "{}".into(),
+            };
+            events.extend([
+                SessionEvent::TurnStart { turn },
+                SessionEvent::UserMessage {
+                    turn,
+                    text: format!("turn {turn}"),
+                    images: vec![],
+                },
+                SessionEvent::AssistantMessage {
+                    turn,
+                    round: 1,
+                    text: String::new(),
+                    tool_calls: vec![call],
+                    reasoning: String::new(),
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+                SessionEvent::ToolResultLogged {
+                    turn,
+                    round: 1,
+                    call_id: "reused".into(),
+                    content: format!("result {turn}"),
+                    is_error: turn == 2,
+                    images: vec![ImageContent {
+                        data: image.into(),
+                        media_type: "image/png".into(),
+                    }],
+                },
+                SessionEvent::TurnEnd {
+                    turn,
+                    stop: StopReason::Stopped,
+                    error: None,
+                },
+            ]);
+        }
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(i, event)| LoggedEvent {
+                seq: i as u64 + 1,
+                at: 0,
+                event,
+            })
+            .collect()
+    }
+
+    fn image_results(log: &[LoggedEvent]) -> Vec<ReplayToolResult> {
+        project_replay_entries(
+            &SessionMeta::new("image-session", "/project", 0),
+            &PresentationFile::default(),
+            log,
+        )
+        .into_iter()
+        .filter_map(|e| match e {
+            ReplayEntry::ToolCall { result, .. } => result,
+            _ => None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn native_tool_images_pair_by_visible_fact_even_when_provider_ids_repeat() {
+        let results = image_results(&image_log());
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].images[0].data, "FIRST");
+        assert_eq!(results[1].images[0].data, "SECOND");
+        assert!(!results[0].is_error);
+        assert!(results[1].is_error);
+    }
+
+    #[test]
+    fn image_replay_does_not_revive_rewound_or_compacted_tool_results() {
+        let mut log = image_log();
+        log.push(LoggedEvent {
+            seq: 11,
+            at: 0,
+            event: SessionEvent::Rewound {
+                turn: 3,
+                to: 6,
+                scope: atomcode_kernel::session::RewindScope::Conversation,
+            },
+        });
+        let results = image_results(&log);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].images[0].data, "FIRST");
+        let mut log = image_log();
+        log.push(LoggedEvent {
+            seq: 11,
+            at: 0,
+            event: SessionEvent::Compacted {
+                turn: 2,
+                through: 5,
+                from: 0,
+                summary: "folded earlier turn".into(),
+            },
+        });
+        let results = image_results(&log);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].images[0].data, "SECOND");
+    }
 
     #[test]
     fn raw_input_parses_json_and_passes_through_non_json() {

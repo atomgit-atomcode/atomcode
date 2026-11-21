@@ -2,7 +2,7 @@
   "name": "atomcode-tools",
   "displayName": "%atomcode.displayName%",
   "description": "%atomcode.description%",
-  "version": "5.2.6",
+  "version": "5.2.8",
   "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {
@@ -204,6 +204,8 @@
         "atomcode.fontSize": {
           "type": "number",
           "default": 13,
+          "minimum": 9,
+          "maximum": 40,
           "description": "%atomcode.configuration.fontSize.description%"
         },
         "atomcode.showInlineHints": {

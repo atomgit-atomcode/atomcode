@@ -74,6 +74,9 @@ pub use product_dirs::ProductDirs;
 /// `is_running_as_admin` mirror core's copies until core is retired (see module doc).
 pub mod process_utils;
 
+/// Bounded symbolic Git HEAD lookup for frontend display.
+pub mod git_branch;
+
 /// ONE home for Windows path normalization (native-canonical internally,
 /// forward-slash at the LLM/UI boundary). `pub` so native drivers and L2 crates
 /// (`review`, `clix`, `coding`) can reuse it. Local copy of
@@ -88,6 +91,7 @@ pub mod pathnorm;
     feature = "provider",
     feature = "web",
     feature = "atomgit",
+    feature = "grape",
     feature = "mcp"
 ))]
 pub(crate) mod proxy;
@@ -251,3 +255,12 @@ pub mod memory;
 
 /// Shared offline model evaluation data and explicit identity matching.
 pub mod model_cards;
+
+/// Scan the assets other AI coding agents left behind, and report what we
+/// already read natively, what can be brought over, and what is blocked.
+///
+/// Opt-in `migration` feature. Read-only: the provider-account draft this
+/// produces is written by the host, not here. See
+/// `docs/plans/2026-11-17-external-agent-asset-migration-design.md`.
+#[cfg(feature = "migration")]
+pub mod migration;

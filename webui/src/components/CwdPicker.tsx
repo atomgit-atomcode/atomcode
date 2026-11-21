@@ -1,7 +1,8 @@
+import { ModalOverlay } from './ModalOverlay';
 // Task 15b — Working directory picker modal
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo } from '../api';
+import { listDir, getProjects, changeDir, deleteProject, updateProject, mkdir, ProjectInfo } from '../api';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -104,11 +105,12 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
 
   async function handleDeleteProject(hash: string, e: MouseEvent) {
     e.stopPropagation();
+    setConfirmError(null);
     try {
       await deleteProject(hash);
       setProjects((prev) => prev.filter((p) => p.hash !== hash));
-    } catch {
-      setProjects((prev) => prev.filter((p) => p.hash !== hash));
+    } catch (error) {
+      setConfirmError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -140,6 +142,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
         setConfirmError(res.message);
         return;
       }
+      if (res.project_hash) await updateProject(res.project_hash, { hidden: false });
       onPick(res.current_dir || finalPath, res.session_id);
       onClose();
     } catch (error) {
@@ -152,17 +155,13 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   const crumbs = parseBreadcrumb(browsePath);
 
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card cwd-picker">
         <div class="modal-header">
           <span>📁</span>
           <h3>{t('cwd.title')}</h3>
           <span class="modal-sub" style="margin-left:auto">{t('cwd.affectsSession')}</span>
+          <button type="button" class="ghost-btn modal-close" onClick={onClose} aria-label={t('settings.close')}>×</button>
         </div>
 
         <div class="modal-body">
@@ -246,11 +245,11 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
           </div>
 
           {/* Recent projects */}
-          {projects.length > 0 && (
+          {projects.some(p => !p.hidden) && (
             <div class="field-group">
               <span class="modal-label">{t('cwd.recentProjects')}</span>
               <div class="cwd-recent-list">
-                {projects.slice(0, 6).map((p) => {
+                {projects.filter(p => !p.hidden).slice(0, 6).map((p) => {
                   const isCurrent = p.working_dir === browsePath;
                   return (
                     <div
@@ -262,7 +261,8 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                       {isCurrent && <span class="badge">● {t('cwd.current')}</span>}
                       <button
                         type="button"
-                        title="移除此项目"
+                        title={t('workspace.remove')}
+                        aria-label={t('workspace.remove')}
                         style="background:none;border:none;cursor:pointer;padding:2px 4px;opacity:0.6;font-size:0.75rem;margin-left:auto;color:inherit;"
                         onClick={(e) => handleDeleteProject(p.hash, e)}
                       >
@@ -286,6 +286,6 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }

@@ -3,9 +3,9 @@ export interface ParsedCommand {
   arg: string;
 }
 
-// 命令名字符集与 TUI parse_slash_line 对齐：首字符字母，后续字母/数字/_-: 。
+// 命令名支持 Unicode 字母和数字（包括中文技能名），保留 _-: 。
 // 因为遇到空白即停，"/Users/me" 的 name 会含 '/' → 不匹配 → 判为非命令（路径回退聊天）。
-const NAME_RE = /^[A-Za-z][A-Za-z0-9_:-]*$/;
+const NAME_RE = /^[\p{L}\p{N}_:-]+$/u;
 
 /** 解析一行输入为斜杠命令；非命令返回 null（调用方应作为普通聊天发送）。 */
 export function parseSlashCommand(line: string): ParsedCommand | null {
@@ -27,7 +27,7 @@ export function detectSlashMenuQuery(text: string, cursor = text.length): { star
   const slash = before.lastIndexOf('/');
   if (slash < 0 || (slash > 0 && !/\s/.test(before[slash - 1]))) return null;
   const query = before.slice(slash + 1);
-  if (/\s/.test(query) || query.length > 256) return null;
+  if (query.length > 256 || (query && !NAME_RE.test(query))) return null;
   return { start: slash, query, skillsOnly: false };
 }
 
@@ -75,6 +75,7 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
       return h.changeDir(a);
     },
   },
+  { name: 'fork', descKey: 'cmd.fork.desc', run: (a, h) => h.execServerCommand('fork', a) },
   { name: 'resume', descKey: 'cmd.resume.desc', run: (_a, h) => h.openSessionSidebar() },
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
   { name: 'skills', descKey: 'cmd.skills.desc', run: (a, h) => h.openSlashSkillsMenu(a) },
@@ -101,6 +102,7 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'memory', descKey: 'cmd.memory.desc', run: (a, h) => h.execServerCommand('memory', a) },
   { name: 'hooks', descKey: 'hooks.title', run: (a, h) => h.execServerCommand('hooks', a) },
   { name: 'followup', descKey: 'cmd.followup.desc', run: (a, h) => h.execServerCommand('followup', a) },
+  { name: 'quality', descKey: 'cmd.quality.desc', argHint: 'on|off|status|evidence|waive <reason>', run: (a, h) => h.execServerCommand('quality', a) },
   { name: 'context', descKey: 'cmd.context.desc', run: (a, h) => h.execServerCommand('context', a) },
   { name: 'compact', descKey: 'cmd.compact.desc', argHint: '[focus]', run: (a, h) => h.execServerCommand('compact', a) },
   { name: 'whoami', descKey: 'cmd.whoami.desc', run: (a, h) => h.execServerCommand('whoami', a) },
@@ -166,11 +168,12 @@ export interface SlashMenuItem {
   name: string;
   description: string;
   kind: 'command' | 'skill';
+  display_name?: string;
 }
 
 export function buildSlashMenuItems(
   commands: SlashCommandDef[],
-  skills: { name: string; description?: string }[],
+  skills: { name: string; display_name?: string; description?: string }[],
   query: string,
   t: (key: string) => string,
   // `skillsOnly` renders a pure skills browser (the /skills command): commands are
@@ -179,14 +182,24 @@ export function buildSlashMenuItems(
   skillsOnly = false,
 ): SlashMenuItem[] {
   const q = query.toLowerCase();
-  const cmdItems: SlashMenuItem[] = skillsOnly
-    ? []
-    : commands
-        .filter((c) => c.name.toLowerCase().includes(q))
-        .map((c) => ({ name: c.name, description: t(c.descKey), kind: 'command' as const }));
-  const skillItems: SlashMenuItem[] = skills
-    .filter((s) => s.name.toLowerCase().includes(q))
-    .map((s) => ({ name: s.name, description: s.description ?? '', kind: 'skill' as const }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-  return [...cmdItems, ...skillItems];
+  const nameMatches: SlashMenuItem[] = [];
+  const descriptionMatches: SlashMenuItem[] = [];
+  function add(item: SlashMenuItem, names: string[]) {
+    if (names.some((name) => name.toLowerCase().includes(q))) {
+      nameMatches.push(item);
+    } else if (item.description.toLowerCase().includes(q)) {
+      descriptionMatches.push(item);
+    }
+  }
+  if (!skillsOnly) {
+    for (const command of commands) {
+      add({ name: command.name, description: t(command.descKey), kind: 'command' },
+        [command.name, ...(command.aliases ?? [])]);
+    }
+  }
+  for (const skill of [...skills].sort((a, b) => a.name.localeCompare(b.name))) {
+    add({ name: skill.name, display_name: skill.display_name, description: skill.description ?? '', kind: 'skill' },
+      [skill.name, ...(skill.display_name ? [skill.display_name] : [])]);
+  }
+  return [...nameMatches, ...descriptionMatches];
 }

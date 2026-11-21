@@ -363,7 +363,7 @@ async fn sign_in(
 /// `McpManage` 与 `McpAct` 的答复:刷新后的目录(契约里 `McpAct` 就是这么定的)。
 fn listed(reply: Result<HostReply, HostError>) -> Result<McpView, String> {
     match reply {
-        Ok(HostReply::McpRows { rows }) => Ok(view(rows)),
+        Ok(HostReply::McpRows { rows, paused }) => Ok(view(rows).with_paused(paused)),
         Ok(other) => Err(unexpected(&other)),
         // 宿主拒绝的话在屏幕侧只有一份译法:`tui_tools` 那份(`tui_tools.rs:114`),
         // 本 crate 别的端口也共用它。这里不另写一份,免得两处措辞各自漂移。
@@ -395,6 +395,8 @@ fn unexpected(reply: &HostReply) -> String {
 /// `None` 是「认证」:它不是宿主命令,在这一侧跑([`sign_in`])。
 fn wire_action(action: Action) -> Option<McpAction> {
     match action {
+        Action::PauseAll => Some(McpAction::PauseAll),
+        Action::ResumeAll => Some(McpAction::ResumeAll),
         Action::Reconnect => Some(McpAction::Reconnect),
         Action::Trust => Some(McpAction::Trust),
         Action::Untrust => Some(McpAction::Untrust),
@@ -714,6 +716,7 @@ mod tests {
     #[test]
     fn a_rows_reply_becomes_the_screen_directory() {
         let reply = Ok(HostReply::McpRows {
+            paused: false,
             rows: vec![wire_row("fs", McpServerState::Connected, "global")],
         });
         let directory = listed(reply).expect("McpRows 就是一趟列表的答复");
@@ -840,9 +843,13 @@ mod tests {
                     }),
                 ),
                 HostCommand::Reload { .. } => ("Reload", self.reload.clone()),
-                HostCommand::McpManage { .. } => {
-                    ("McpManage", Ok(HostReply::McpRows { rows: Vec::new() }))
-                }
+                HostCommand::McpManage { .. } => (
+                    "McpManage",
+                    Ok(HostReply::McpRows {
+                        rows: Vec::new(),
+                        paused: false,
+                    }),
+                ),
                 HostCommand::McpAct { .. } => ("McpAct", Ok(HostReply::Done)),
                 _ => ("other", Ok(HostReply::Done)),
             };

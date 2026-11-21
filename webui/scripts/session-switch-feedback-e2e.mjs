@@ -13,6 +13,7 @@ const messages = [{role:'user',content:'Persisted question'}, {role:'assistant',
 let mode = 'reject';
 let current = original.id;
 let switches = 0;
+const clients=new Set();
 const server = createServer(async (req,res) => {
   const url = new URL(req.url,'http://localhost');
   const path = url.pathname;
@@ -21,6 +22,12 @@ const server = createServer(async (req,res) => {
     let body='';for await(const chunk of req) body+=chunk;
     const {session_id:id} = JSON.parse(body);switches++;
     if(id === target.id) {
+      if(mode === 'busy-late') {
+        current=target.id;
+        for(const client of clients) client.write(`data: ${JSON.stringify({type:'session_switched',session_id:target.id})}\n\n`);
+        await new Promise(resolve=>setTimeout(resolve,350));
+        return json({ok:false,active_turn:true,error:'session switch rejected: ActiveTurn'});
+      }
       if(mode === 'reject') return json({ok:false,active_turn:false,error:'session is already in use by another runtime'});
       if(mode === 'http') {res.statusCode=409;return json({error:'Fixture session lease refused',code:'session_in_use'});}
       current=copy.id;return json({ok:true,session_id:copy.id,forked_from:target.id});
@@ -30,7 +37,7 @@ const server = createServer(async (req,res) => {
   if(path === '/live') {
     res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store'});
     res.write(`data: ${JSON.stringify({type:'snapshot',session_id:current,session_name:metadata(current).name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages})}\n\n`);
-    res.write('data: {"type":"state","running":false}\n\n');return;
+    res.write('data: {"type":"state","running":false}\n\n');clients.add(res);req.on('close',()=>clients.delete(res));return;
   }
   if(path === '/project') return json({working_dir:'/fixture',project_hash:'fixture'});
   if(path === '/config') return json({providers:[],notifications:{enabled:false}});
@@ -52,7 +59,7 @@ const server = createServer(async (req,res) => {
 await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
 const browser=await chromium.launch({executablePath:process.env.CONTEXT_BROWSER ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
 try {
-  for(const width of [1200,390]) for(const scenario of ['reject','fork','http']) {
+  for(const width of [1200,390]) for(const scenario of ['reject','fork','http','busy-late']) {
     mode=scenario;current=original.id;
     const page=await browser.newPage({viewport:{width,height:900}});
     await page.addInitScript(() => {localStorage.setItem('atomcode.sidebar.view.v1','flat');localStorage.setItem('atomcode.lang','en');});
@@ -62,6 +69,13 @@ try {
     if(width<600) await page.locator('.mobile-menu-btn').click();
     await page.locator('.session-item-main').filter({hasText:'Occupied session'}).click();
     const notice=page.locator('.session-switch-notice');
+    if(scenario === 'busy-late') {
+      await page.waitForTimeout(900);
+      assert.equal(current,target.id);
+      assert.equal(await page.locator('.session-item.active .session-item-name').innerText(),target.name);
+      assert.equal(await notice.count(),0,'late Busy must not undo an acknowledged switch');
+      await page.close();continue;
+    }
     await notice.waitFor();
     if(scenario === 'fork') {
       await page.waitForFunction(() => document.querySelector('.session-switch-notice')?.textContent.includes('forked'));

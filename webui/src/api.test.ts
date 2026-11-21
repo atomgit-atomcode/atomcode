@@ -425,8 +425,8 @@ test('collection APIs reject server error payloads instead of returning non-arra
 
   try {
     const { getModels, getProjects } = await import('./api.ts');
-    await assert.rejects(() => getModels(), /list models failed: 500/);
-    await assert.rejects(() => getProjects(), /list projects failed: 500/);
+    await assert.rejects(() => getModels(), /session metadata is missing/);
+    await assert.rejects(() => getProjects(), /session metadata is missing/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -495,6 +495,76 @@ test('streamChat accepts done, stopped, and error as authoritative terminals', a
     globalThis.fetch = originalFetch;
   }
 });
+
+test('streamChat preserves partial output and identifies a disconnected response body', async () => {
+  const originalFetch = globalThis.fetch;
+  const body = interruptedStreamAfter({ type: 'text', content: 'partial' });
+  globalThis.fetch = async () => new Response(body);
+  try {
+    const { streamChat } = await import('./api.ts');
+    const events: unknown[] = [];
+    await assert.rejects(() => streamChat({ message: 'hello' }, event => events.push(event)), error => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, 'ApiStreamInterruptedError');
+      assert.match(error.message, /正在接收回复时/);
+      assert.doesNotMatch(error.message, /network error/);
+      return true;
+    });
+    assert.deepEqual(events, [{ type: 'text', content: 'partial' }]);
+    assert.equal(body.locked, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a disconnected response body cannot undo a terminal chat event', async () => {
+  const originalFetch = globalThis.fetch;
+  const { streamChat } = await import('./api.ts');
+  try {
+    for (const terminal of [
+      { type: 'done', session_id: 'session-1', tokens: null },
+      { type: 'stopped' },
+      { type: 'error', message: 'provider failed' },
+    ]) {
+      const body = interruptedStreamAfter(terminal);
+      globalThis.fetch = async () => new Response(body);
+      const events: unknown[] = [];
+      await streamChat({ message: 'hello' }, event => events.push(event));
+      assert.deepEqual(events, [terminal]);
+      assert.equal(body.locked, false);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an aborted chat response body stays an abort', async () => {
+  const originalFetch = globalThis.fetch;
+  const abort = new DOMException('aborted', 'AbortError');
+  const body = interruptedStreamAfter({ type: 'text', content: 'partial' }, abort);
+  globalThis.fetch = async () => new Response(body);
+  try {
+    const { streamChat } = await import('./api.ts');
+    await assert.rejects(() => streamChat({ message: 'hello' }, () => {}), error => error === abort);
+    assert.equal(body.locked, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+function interruptedStreamAfter(event: object, failure: Error = new TypeError('network error')): ReadableStream<Uint8Array> {
+  let sent = false;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) {
+        controller.error(failure);
+        return;
+      }
+      sent = true;
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+    },
+  }, { highWaterMark: 0 });
+}
 
 test('cancelDetachedChat aborts the local stream and uses the existing stop protocol', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -739,7 +809,7 @@ test('live stream unlocks its body on normal close and failed reads', async () =
       } });
       globalThis.fetch = (async () => new Response(body)) as typeof fetch;
       const events: unknown[] = [];
-      if (fail) await assert.rejects(streamLive(e => events.push(e)), /disconnected/);
+      if (fail) await assert.rejects(streamLive(e => events.push(e)), { name: 'ApiStreamInterruptedError' });
       else { await streamLive(e => events.push(e)); assert.equal(events.length, 1); }
       assert.equal(body.locked, false);
     }
@@ -851,4 +921,158 @@ test('mode switches preserve independent selection context and explicit API-defa
     assert.deepEqual(result.selection,{model:'planner',reasoning_effort:'high'});
     assert.deepEqual(submitted,{mode:'plan',independent:true,previous_mode:'build',current_model:{model:'fast',reasoning_effort:null},running:false});
   }finally{globalThis.fetch=originalFetch;}
+});
+
+
+test('git branch lookup encodes the checkout path and forwards auth and cancellation', async () => {
+  const original = globalThis.fetch;
+  const controller = new AbortController();
+  let captured: { url: string; init?: RequestInit } | null = null;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    captured = { url: String(url), init };
+    return new Response(JSON.stringify({ working_dir: '/work/a b&c', branch: 'feature/example' }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { getGitBranch } = await import('./api.ts');
+    assert.equal((await getGitBranch('/work/a b&c', controller.signal)).branch, 'feature/example');
+    assert.equal(captured!.url, '/project/git-branch?dir=%2Fwork%2Fa%20b%26c');
+    assert.equal((captured!.init!.headers as Record<string, string>).Authorization, 'Bearer test-token');
+    assert.ok(captured!.init!.signal);
+  } finally { globalThis.fetch = original; }
+});
+
+test('HTTP refusals preserve daemon messages and codes across API domains', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  const requests: Array<() => Promise<unknown>> = [
+    () => api.getModels(), () => api.getProjects(),
+    () => api.listProjectSessions('project'), () => api.searchSessions('query'),
+    () => api.createSession('/workspace'), () => api.renameSession('project', 'session', 'name'),
+    () => api.listDir('/workspace'), () => api.mkdir('/workspace/new'),
+    () => api.openWorkspaceFile('file.ts'), () => api.startTunnelRelay(),
+    () => api.getMcpStatus(), () => api.postLiveMcpTrust(),
+    () => api.stopChat('request'), () => api.getSession('project', 'session'),
+    () => api.postLiveProvider('provider'), () => api.postLiveReasoningEffort('high'),
+    () => api.streamChat({ message: 'hi' }, () => {}), () => api.streamLive(() => {}),
+  ];
+  try {
+    for (const request of requests) {
+      globalThis.fetch = (async () => Response.json({ error: 'daemon explanation', code: 'test_refusal', active_turn: true }, { status: 409 })) as typeof fetch;
+      await assert.rejects(request, (error: unknown) => {
+        assert.ok(error instanceof api.ApiCallError);
+        assert.equal(error.message, 'daemon explanation');
+        assert.equal(error.status, 409);
+        assert.equal(error.code, 'test_refusal');
+        if (error instanceof api.ReasoningEffortError) assert.equal(error.activeTurn, true);
+        return true;
+      });
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('legacy endpoints share string, text and HTML refusal handling', async () => {
+  const originalFetch = globalThis.fetch;
+  const { mkdir, ApiCallError } = await import('./api.ts');
+  try {
+    for (const [body, message] of [
+      [JSON.stringify('ambiguous directory'), 'ambiguous directory'],
+      ['access denied', 'access denied'],
+      ['<html>proxy failed</html>', 'HTTP 502'],
+    ]) {
+      globalThis.fetch = (async () => new Response(body, { status: 502 })) as typeof fetch;
+      await assert.rejects(mkdir('/workspace'), (error: unknown) => {
+        assert.ok(error instanceof ApiCallError);
+        assert.ok(error.message.includes(message));
+        assert.equal(error.status, 502);
+        return true;
+      });
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('both SSE consumers handle split UTF-8, heartbeats and malformed blocks', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  try {
+    for (const live of [false, true]) {
+      const bytes = new TextEncoder().encode(': heartbeat\n\ndata: invalid\n\ndata:\n\nevent: message\ndata: {"type":"text","content":"中文"}\n\ndata: {"type":"stopped"}\n\n');
+      const body = new ReadableStream<Uint8Array>({ start(controller) {
+        // Split in the middle of both UTF-8 characters and SSE delimiters.
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      } });
+      globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+      const events: unknown[] = [];
+      let activity = 0;
+      if (live) await api.streamLive(e => events.push(e), undefined, undefined, () => activity++);
+      else await api.streamChat({ message: 'hi' }, e => events.push(e));
+      assert.deepEqual(events, [{ type: 'text', content: '中文' }, { type: 'stopped' }]);
+      if (live) assert.equal(activity, bytes.length);
+      assert.equal(body.locked, false);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('SSE consumers retain their existing EOF and dispatch policies', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  try {
+    globalThis.fetch = (async () => new Response('data: {"type":"stopped"}')) as typeof fetch;
+    const chat: unknown[] = [];
+    await api.streamChat({ message: 'hi' }, e => chat.push(e));
+    assert.deepEqual(chat, [{ type: 'stopped' }]);
+    const live: unknown[] = [];
+    await api.streamLive(e => live.push(e));
+    assert.deepEqual(live, []);
+    // Chat historically isolates callback errors while retaining its terminal.
+    await api.streamChat({ message: 'hi' }, () => { throw new Error('observer failed'); });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(api.streamChat({ message: 'hi' }, () => {}, controller.signal), { name: 'AbortError' });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('void API successes do not require a JSON response body', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  try {
+    await api.stopChat('request');
+    await api.renameSession('project', 'session', 'name');
+    await api.deleteSession('project', 'session');
+    await api.deleteProject('project');
+    await api.openWorkspaceFile('file.ts', 'session');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('chat permission answers echo tool and one-shot approval identities', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return new Response('{"success":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { respondPermission } = await import('./api.ts');
+    await respondPermission('session', 'allow', 'mcp__browser-use__browser_click', 'call', 'approval');
+    assert.deepEqual(body, {session_id:'session',decision:'allow',tool_name:'mcp__browser-use__browser_click',call_id:'call',approval_id:'approval'});
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('live approval answers carry the one-shot request identity', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(url), '/live/permission');
+    body = JSON.parse(String(init?.body));
+    return new Response('{"accepted":false}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { postLivePermission } = await import('./api.ts');
+    assert.deepEqual(await postLivePermission('allow_persist', 'mcp__s__tool', 'call-1', 'approval-1'), { accepted: false });
+    assert.deepEqual(body, { decision: 'allow_persist', tool_name: 'mcp__s__tool', call_id: 'call-1', approval_id: 'approval-1' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

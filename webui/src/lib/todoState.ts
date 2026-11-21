@@ -20,20 +20,21 @@ export interface TodoProjection {
 }
 
 export type TodoPanelEvent =
-  | { type: 'user_input' }
+  | { type: 'user_input'; hasOpenItems?: boolean }
   | { type: 'todo_call'; success?: boolean }
   | { type: 'user_cancel' };
 
-/** Visibility is presentation-only: a new instruction hides the prior turn's
- * card without deleting its todo state; a valid/pending TodoWrite reveals it. */
+/** Preserve an unfinished plan across interruption and follow-up input.
+ * A completed card can hide on new input without deleting its todo state. */
 export function reduceTodoPanelVisibility(
   visible: boolean,
   event: TodoPanelEvent,
 ): boolean {
   switch (event.type) {
     case 'user_input':
+      return event.hasOpenItems ? visible : false;
     case 'user_cancel':
-      return false;
+      return visible;
     case 'todo_call':
       return event.success === false ? visible : true;
   }

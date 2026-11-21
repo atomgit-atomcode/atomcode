@@ -12,7 +12,6 @@ fn main() -> io::Result<()> {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
     let mut initialized = false;
-
     if std::env::var_os("MCP_TEST_OVERSIZED_STARTUP_LENGTH").is_some() {
         writer.write_all(b"Content-Length: 999999999999\r\n\r\n")?;
         writer.flush()?;
@@ -20,11 +19,22 @@ fn main() -> io::Result<()> {
 
     loop {
         if initialized {
+            append_event_from_env("MCP_TEST_READ_STARTED", "read")?;
+            wait_for_gate("MCP_TEST_READ_GATE")?;
             sleep_from_env("MCP_TEST_READ_DELAY_MS")?;
         }
         let request = match read_frame(&mut reader) {
             Ok(value) => value,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                append_event_from_env("MCP_TEST_EOF_STARTED", "eof")?;
+                if let Some(path) = std::env::var_os("MCP_TEST_EOF_GATE") {
+                    while !std::path::Path::new(&path).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+                append_event_from_env("MCP_TEST_EOF_FINISHED", "disposed")?;
+                return Ok(());
+            }
             Err(err) => return Err(err),
         };
 
@@ -33,8 +43,14 @@ fn main() -> io::Result<()> {
         };
 
         let id = request.get("id").cloned();
-        let response = match method {
+        let mut response = match method {
             "initialize" => {
+                append_event_from_env("MCP_TEST_INITIALIZE_STARTED", "initialize")?;
+                if let Some(path) = std::env::var_os("MCP_TEST_INITIALIZE_GATE") {
+                    while !std::path::Path::new(&path).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
                 sleep_from_env_when_marker_exists(
                     "MCP_TEST_INITIALIZE_DELAY_MARKER",
                     "MCP_TEST_INITIALIZE_DELAY_MS",
@@ -57,7 +73,18 @@ fn main() -> io::Result<()> {
                 })
             }
             "tools/list" => id.map(|id| {
-                if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST").is_some() {
+                if let Some(marker) = std::env::var_os("MCP_TEST_EXIT_ONCE_TOOLS_LIST_MARKER") {
+                    if !std::path::Path::new(&marker).exists() {
+                        if std::fs::write(marker, "exited").is_err() {
+                            std::process::exit(2);
+                        }
+                        std::process::exit(0);
+                    }
+                }
+                if std::env::var_os("MCP_TEST_EXIT_ON_EVERY_TOOLS_LIST").is_some()
+                    || std::env::var_os("MCP_TEST_EXIT_TOOLS_LIST_MARKER")
+                        .is_some_and(|path| std::path::Path::new(&path).exists())
+                {
                     std::process::exit(0);
                 }
                 serde_json::json!({
@@ -112,6 +139,11 @@ fn main() -> io::Result<()> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 sleep_from_env("MCP_TEST_TOOL_RESPONSE_DELAY_MS")?;
+                if let Some(path) = std::env::var_os("MCP_TEST_TOOL_RESPONSE_GATE") {
+                    while !std::path::Path::new(&path).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
                 if std::env::var_os("MCP_TEST_SERVER_REQUEST").is_some() {
                     write_frame(
                         &mut writer,
@@ -170,20 +202,14 @@ fn main() -> io::Result<()> {
                         writer.flush()?;
                     }
                 }
-                id.map(|id| {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": format!("echo:{message}")
-                                }
-                            ]
-                        }
-                    })
-                })
+                let result = match std::env::var("MCP_TEST_TOOL_RESULT") {
+                    Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    Err(_) => serde_json::json!({
+                        "content": [{ "type": "text", "text": format!("echo:{message}") }]
+                    }),
+                };
+                id.map(|id| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
             }
             "notifications/initialized" => {
                 initialized = true;
@@ -208,10 +234,35 @@ fn main() -> io::Result<()> {
             }),
         };
 
+        if method == "initialize"
+            && !std::env::var_os("MCP_TEST_CAPABILITIES_DISABLE_MARKER")
+                .is_some_and(|path| std::path::Path::new(&path).exists())
+        {
+            if let (Some(response), Ok(raw)) = (
+                response.as_mut(),
+                std::env::var("MCP_TEST_EXPERIMENTAL_CAPABILITIES"),
+            ) {
+                let supplied: serde_json::Value =
+                    serde_json::from_str(&raw).map_err(io::Error::other)?;
+                response["result"]["capabilities"]["experimental"] = supplied;
+            }
+        }
         if let Some(response) = response {
             write_frame(&mut writer, &response)?;
+            if method == "tools/call" {
+                append_event_from_env("MCP_TEST_TOOL_FINISH_COUNTER", "finished")?;
+            }
         }
     }
+}
+
+fn wait_for_gate(name: &str) -> io::Result<()> {
+    if let Some(path) = std::env::var_os(name) {
+        while !std::path::Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    Ok(())
 }
 
 fn append_event_from_env(name: &str, event: &str) -> io::Result<()> {

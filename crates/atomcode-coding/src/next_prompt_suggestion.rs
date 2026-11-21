@@ -19,6 +19,7 @@ const MAX_MESSAGE_CHARS: usize = MAX_CONTEXT_CHARS / 2;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 512;
 const MAX_TOOL_RESULT_CHARS: usize = 1_024;
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_SIDE_SAMPLE_BYTES: usize = 32_768;
 
 const INSTRUCTIONS: &str = r#"Predict the short message the user is most likely to type next.
 
@@ -83,7 +84,11 @@ pub(crate) async fn generate_next_prompt_suggestion(
     let prompt = format!("{INSTRUCTIONS}\n\nConversation records (JSON Lines):\n{transcript}");
     let sample =
         sample_side_call(provider, prompt, SAMPLE_TIMEOUT, "next prompt suggestion").await?;
-    let suggestion = sanitize_next_prompt_suggestion(&sample.raw);
+    let suggestion = if sample.cut_off {
+        None
+    } else {
+        sanitize_next_prompt_suggestion(&sample.raw)
+    };
     if suggestion.is_none() {
         report_nothing(
             why_nothing(&sample.raw, sample.cut_off),
@@ -127,16 +132,27 @@ pub(crate) async fn sample_side_call(
         let mut stream = match provider.chat_stream(&request, &[], &options).await {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::debug!(?error, what, "side call failed before sampling");
+                tracing::debug!(
+                    http_status = error.http_status,
+                    retryable = error.retryable,
+                    has_error_code = error.code.is_some(),
+                    what,
+                    "side call failed before sampling"
+                );
                 return None;
             }
         };
         let mut raw = String::new();
         let mut thinking_chars = 0usize;
-        let mut cut_off = false;
+        let mut terminal = None;
         while let Some(event) = stream.next().await {
             match event {
-                StreamEvent::TextDelta(text) => raw.push_str(&text),
+                StreamEvent::TextDelta(text) => {
+                    if text.len() > MAX_SIDE_SAMPLE_BYTES - raw.len() {
+                        return None;
+                    }
+                    raw.push_str(&text);
+                }
                 // Counted, never kept. How much a model spent thinking is the
                 // one number that tells a starved sample from a model with
                 // nothing to say; the thinking itself reaches no one.
@@ -144,19 +160,29 @@ pub(crate) async fn sample_side_call(
                     thinking_chars = thinking_chars.saturating_add(text.chars().count());
                 }
                 StreamEvent::Error(error) => {
-                    tracing::debug!(?error, what, "side call stream failed");
+                    tracing::debug!(
+                        http_status = error.http_status,
+                        retryable = error.retryable,
+                        has_error_code = error.code.is_some(),
+                        what,
+                        "side call stream failed"
+                    );
                     return None;
                 }
                 StreamEvent::Done { truncated } => {
-                    cut_off = truncated;
+                    terminal = Some(truncated);
                     break;
                 }
+                StreamEvent::Malformed
+                | StreamEvent::ToolCall(_)
+                | StreamEvent::ToolCallDelta { .. } => return None,
                 _ => {}
             }
+            tokio::task::yield_now().await;
         }
         Some(SideSample {
             raw,
-            cut_off,
+            cut_off: terminal?,
             thinking_chars,
         })
     };
@@ -177,9 +203,8 @@ pub(crate) async fn sample_side_call(
 /// being cut off rather than declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoSuggestion {
-    /// Cut by `finish_reason=length` with no visible text: the answer was never
-    /// reached. A standing condition rather than a hiccup — whatever ended this
-    /// one will end the next one too.
+    /// Cut by `finish_reason=length`, including when some visible text arrived.
+    /// Partial text is not a complete suggestion and is never handed to a user.
     CutOff,
     /// The model finished and sent nothing at all.
     NothingToSay,
@@ -193,32 +218,26 @@ pub(crate) enum NoSuggestion {
 ///
 /// A free function so the judgement can be checked without a provider.
 pub(crate) fn why_nothing(raw: &str, cut_off: bool) -> NoSuggestion {
+    if cut_off {
+        return NoSuggestion::CutOff;
+    }
     if raw.trim().is_empty() {
-        return match cut_off {
-            true => NoSuggestion::CutOff,
-            false => NoSuggestion::NothingToSay,
-        };
+        return NoSuggestion::NothingToSay;
     }
     NoSuggestion::Refused
 }
 
-/// Said once per process, so a standing condition is not also a silent one.
-///
-/// A model whose thinking outruns the answer does it on EVERY turn, so the
-/// choice is between one line and nothing: `debug!` is invisible at the default
-/// level (which is how this went unnoticed), and a line per turn would bury a
-/// log people read for real failures. The other two reasons stay at `debug!` —
-/// "the model had nothing to say" is the feature working.
+/// Report truncation once per process so repeated auxiliary samples do not
+/// flood the log. Ordinary empty/declined output remains a debug diagnostic.
 static CUT_OFF_REPORTED: AtomicBool = AtomicBool::new(false);
 
 fn report_nothing(why: NoSuggestion, output_chars: usize, thinking_chars: usize) {
     if why == NoSuggestion::CutOff {
         if !CUT_OFF_REPORTED.swap(true, Ordering::Relaxed) {
             tracing::info!(
+                output_chars,
                 thinking_chars,
-                "next prompt suggestion was cut off before it reached the answer \
-                 (the model or its gateway ended the response); no suggestion can \
-                 be offered while its thinking does not fit"
+                "next prompt suggestion was cut off before completion; no incomplete suggestion is offered"
             );
         }
         return;
@@ -574,6 +593,9 @@ fn truncate_tool_result(text: &str) -> String {
 /// Reject structured echoes, including incomplete records and quoted/fenced ones,
 /// rather than treating historical message fields as a new user intention.
 pub(crate) fn is_structured_side_output(raw: &str) -> bool {
+    if atomcode_capabilities::provider::contains_native_chat_template_token(raw) {
+        return true;
+    }
     let mut text = raw
         .trim()
         .trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”'))

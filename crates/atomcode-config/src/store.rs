@@ -64,7 +64,43 @@ impl ConfigStore {
         // read-only config mounted into a container) must not turn a readable
         // configuration into a startup failure.
         let _ = self.remove_legacy_pricing();
+        let _ = self.migrate_web_search_default();
         read_snapshot_tolerant(&self.path)
+    }
+
+    /// Upgrade the old Exa default once, preserving comments and unrelated data.
+    /// Parsing applies the same migration in memory if this best-effort write fails.
+    pub(crate) fn migrate_web_search_default(&self) -> Result<bool> {
+        self.with_lock(false, |disk| {
+            if disk.is_none() {
+                return Ok(false);
+            }
+            let source = std::fs::read_to_string(&self.path)?;
+            let mut document = source.parse::<DocumentMut>()?;
+            let Some(table) = document
+                .get_mut("web_search")
+                .and_then(toml_edit::Item::as_table_like_mut)
+            else {
+                return Ok(false);
+            };
+            if table
+                .get("auto_default_migrated")
+                .and_then(toml_edit::Item::as_bool)
+                == Some(true)
+            {
+                return Ok(false);
+            }
+            if table
+                .get("provider")
+                .and_then(toml_edit::Item::as_str)
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("exa"))
+            {
+                table.insert("provider", toml_edit::value("auto"));
+            }
+            table.insert("auto_default_migrated", toml_edit::value(true));
+            self.persist_document_locked(&document.to_string())?;
+            Ok(true)
+        })
     }
 
     /// Remove the retired provider/model `pricing` tables without disturbing
@@ -416,6 +452,66 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_exa_is_migrated_once_without_losing_keys_or_later_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep heading\n[web_search]\nprovider = 'Exa'\napi_key = 'fixture-key'\ncustom = 42\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.web_search.provider, "auto");
+        assert_eq!(config.web_search.api_key.as_deref(), Some("fixture-key"));
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("# keep heading"));
+        assert!(migrated.contains("custom = 42"));
+        assert!(migrated.contains("auto_default_migrated = true"));
+        let store = ConfigStore::new(&path);
+        assert_eq!(store.read().unwrap().config.web_search.provider, "auto");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
+        store
+            .update(|config| {
+                config.web_search.provider = "exa".into();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(Config::load(&path).unwrap().web_search.provider, "exa");
+        assert_eq!(store.read().unwrap().config.web_search.provider, "exa");
+    }
+
+    #[test]
+    fn search_migration_keeps_other_providers_and_works_without_a_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[web_search]\nprovider = 'tavily'\n").unwrap();
+        let store = ConfigStore::new(&path);
+        assert_eq!(store.read().unwrap().config.web_search.provider, "tavily");
+        assert!(
+            Config::load(&path)
+                .unwrap()
+                .web_search
+                .auto_default_migrated
+        );
+        // This pure parser is also the fallback when a read-only config cannot
+        // be rewritten. Environment overrides remain applied afterwards.
+        let legacy = "[web_search]\nprovider = 'exa'\napi_key = 'fixture-key'\n";
+        let config = Config::parse_disk_content(legacy, &path).unwrap();
+        assert_eq!(config.web_search.provider, "auto");
+        assert!(config.web_search.auto_default_migrated);
+        let (config, _) = Config::parse_disk_content_tolerant(legacy, &path).unwrap();
+        assert_eq!(config.web_search.provider, "auto");
+        assert_eq!(Config::load(&path).unwrap().web_search.provider, "tavily");
+        // Block the lock-file path to exercise the real best-effort failure
+        // boundary without relying on chmod (which does not constrain root).
+        let blocked = dir.path().join("blocked.toml");
+        std::fs::write(&blocked, legacy).unwrap();
+        std::fs::create_dir(sibling_lock_path(&blocked)).unwrap();
+        assert_eq!(Config::load(&blocked).unwrap().web_search.provider, "auto");
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), legacy);
+    }
 
     #[test]
     fn read_removes_only_legacy_pricing_tables() {

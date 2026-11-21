@@ -6,7 +6,7 @@
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>AtomCode · 在你的终端中运行的 AI 编程助手</title>
 <meta name="description" content="AtomCode — Claude Code 的开源平替。连接任意大模型，自主多步执行，30 秒上手。">
-<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="icon" type="image/png" href="https://cdn-news.gitcode.com/news/logo_1794046182088.png">
 <style>
   *,*::before,*::after{box-sizing:border-box}
   html,body{margin:0;padding:0;background:#0a0a0a;color:#fff;font-family:"PingFang SC","Microsoft YaHei",Inter,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden}
@@ -40,7 +40,7 @@
   .hdr{position:fixed;top:0;left:0;right:0;z-index:1000;height:60px;padding:0 30px;display:flex;align-items:center;justify-content:space-between;background:rgba(10,10,10,.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line);transition:background .25s}
   .hdr.scrolled{background:rgba(10,10,10,.92)}
   .hdr-logo{display:flex;align-items:center;gap:10px;font-family:Inter,sans-serif;font-weight:600;font-size:15px;letter-spacing:.5px}
-  .hdr-logo img{width:24px;height:24px;border-radius:6px;flex-shrink:0}
+  .hdr-logo img{width:24px;height:24px;object-fit:contain;flex-shrink:0}
   .ver{display:inline-flex;align-items:center;padding:2px 7px;margin-left:6px;font-family:var(--mono);font-size:10px;letter-spacing:.5px;color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;font-weight:500;background:rgba(232,160,80,.08);transition:all .25s}
   .ver:hover{background:var(--accent);color:#000;border-color:var(--accent)}
   .hdr-nav{display:flex;align-items:center;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
@@ -73,7 +73,11 @@
   .hero-wrap{width:min(1180px,100%);margin:0 auto;display:grid;grid-template-columns:1.1fr 1fr;gap:60px;align-items:center;position:relative}
   .hero-wrap > *{min-width:0}
   .hero-left .badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;letter-spacing:2.5px;color:var(--accent);text-transform:uppercase;padding:6px 12px;border:1px solid rgba(232,160,80,.35);border-radius:999px;margin-bottom:22px}
-  .hero-left .badge .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:dotPulse 2s ease-in-out infinite}
+  .hero-left .badge > span:last-child{display:flex;flex-wrap:wrap;gap:3px 8px;min-width:0}
+  .hero-left .badge .badge-item{white-space:nowrap}
+  .hero-left .badge .badge-item + .badge-item::before{content:'·';margin-right:8px}
+  html[lang="en"] .hero-left .badge{letter-spacing:.5px;font-size:10px}
+  .hero-left .badge .dot{flex-shrink:0;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:dotPulse 2s ease-in-out infinite}
   @keyframes dotPulse{0%,50%{opacity:1}25%{opacity:.3}}
   .hero h1{margin:0 0 18px;font-family:Inter,sans-serif;font-size:60px;font-weight:600;line-height:1.05;letter-spacing:-1.5px}
   .hero h1 .l1{display:block;background:linear-gradient(180deg,#fff,#9ba3b3);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
@@ -646,9 +650,9 @@
 <!-- header -->
 <header class="hdr" id="hdr">
   <a class="hdr-logo" href="#top">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <img src="https://cdn-news.gitcode.com/news/logo_1794046182088.png" alt="AtomCode">
     <span data-scramble>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v5.2.6</span>
+    <span class="ver" id="verBadge" title="当前版本">v5.2.8</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
@@ -821,7 +825,7 @@
     <article class="feat">
       <div class="icon">⎇</div>
       <h3 data-i18n="feat.atomgit.t">AtomGit 原生集成</h3>
-      <p data-i18n="feat.atomgit.d">内置工具直接创建仓库、提交 PR、创建 Issue,OAuth 一键登录 · 微信扫码领 CodingPlan 免费额度 —— 与开源生态无缝对接。</p>
+      <p data-i18n="feat.atomgit.d">内置工具直接创建仓库、提交 PR、创建 Issue；通过 /login 完成 OAuth 授权、申领 CodingPlan 免费额度并自动配置模型 —— 与开源生态无缝对接。</p>
       <div class="demo">
         <div class="gitcmd">
           <div class="l1" data-i18n="feat.atomgit.demo.q1">› 为 auth callback 404 创建 AtomGit Issue</div>
@@ -918,7 +922,7 @@
         <article class="plugin-feat">
           <div class="icon">★</div>
           <h3 data-i18n="plug.atomgit.t">AtomGit 集成</h3>
-          <p data-i18n="plug.atomgit.d">OAuth 一键登录，CodingPlan 免费额度，/login /codingplan 命令</p>
+          <p data-i18n="plug.atomgit.d">通过 /login 完成 OAuth 登录、申领 CodingPlan 免费额度并自动配置模型</p>
         </article>
 
       </div>
@@ -1109,7 +1113,7 @@
           <div class="wiz-body">
             <div class="wiz-step active" data-step="1">
               <div class="tt" data-i18n="wiz.s1.tt">第 1/3 步 · 欢迎</div>
-              <div class="qq" data-i18n="wiz.s1.qq">版本 v5.2.6 · 在终端里运行的 AI 编程代理</div>
+              <div class="qq" data-i18n="wiz.s1.qq">版本 v5.2.8 · 在终端里运行的 AI 编程代理</div>
               <ul class="intro-list">
                 <li data-i18n="wiz.s1.b1">多步骤 agent loop · 内置代码图工具</li>
                 <li data-i18n="wiz.s1.b2">兼容所有 OpenAI 风格 API</li>
@@ -1159,14 +1163,16 @@
 
 <script>
 /* ========== i18n ========== */
-var LANG='zh';
+// Explicit links override the saved preference, then the browser language.
+var LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
 try{
-  const s=localStorage.getItem('atomcode_lang');
-  if(s==='zh'||s==='en') LANG=s;
-  else LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
+  const saved=localStorage.getItem('atomcode_lang');
+  if(saved==='zh'||saved==='en') LANG=saved;
 }catch(e){}
+const requestedLang=new URLSearchParams(location.search).get('lang');
+if(requestedLang==='zh'||requestedLang==='en') LANG=requestedLang;
 
-const VERSION='v5.2.6';
+const VERSION='v5.2.8';
 
 const T={
   'nav.features':{zh:'功能',en:'Features'},
@@ -1233,8 +1239,8 @@ const T={
                    en:'Ctrl+V paste, Finder drag, iTerm2 path auto-detect — when the main model lacks vision, falls back to VL preprocessor (OCR + describe).'},
   'feat.images.demo':{zh:'📎 <b>Ctrl + V</b> 粘贴截图  ·  或拖入图片',en:'📎 <b>Ctrl + V</b> paste screenshot · or drop an image'},
   'feat.atomgit.t':{zh:'AtomGit 原生集成',en:'AtomGit Native Integration'},
-  'feat.atomgit.d':{zh:'内置工具直接创建仓库、提交 PR、创建 Issue,OAuth 一键登录 · 微信扫码领 CodingPlan 免费额度 —— 与开源生态无缝对接。',
-                    en:'Built-in tools create repos, open PRs and file Issues directly — plus OAuth login and WeChat QR sign-in for free CodingPlan credits, seamless with the open-source ecosystem.'},
+  'feat.atomgit.d':{zh:'内置工具直接创建仓库、提交 PR、创建 Issue；通过 /login 完成 OAuth 授权、申领 CodingPlan 免费额度并自动配置模型 —— 与开源生态无缝对接。',
+                    en:'Built-in tools create repos, open PRs and file Issues directly — use /login for OAuth authorization, free CodingPlan credit claims and automatic model setup, seamlessly connected to the open-source ecosystem.'},
   'feat.atomgit.demo.q1':{zh:'› 为 auth callback 404 创建 AtomGit Issue',en:'› Create an AtomGit Issue for the auth callback 404'},
   'feat.atomgit.demo.a1':{zh:'✓ atomgit.com/.../issues/124',en:'✓ atomgit.com/.../issues/124'},
   'feat.atomgit.demo.q2':{zh:'› 提交修复 PR 到 main',en:'› Open a fix PR to main'},
@@ -1261,7 +1267,7 @@ const T={
   'plug.session.t':{zh:'会话管理',en:'Session Management'},
   'plug.session.d':{zh:'按时间分组的历史会话，支持搜索、重命名、删除、恢复',en:'Time-grouped session history with search, rename, delete, and restore'},
   'plug.atomgit.t':{zh:'AtomGit 集成',en:'AtomGit Integration'},
-  'plug.atomgit.d':{zh:'OAuth 一键登录，CodingPlan 免费额度，/login /codingplan 命令',en:'OAuth one-click login, CodingPlan free tier, /login /codingplan commands'},
+  'plug.atomgit.d':{zh:'通过 /login 完成 OAuth 登录、申领 CodingPlan 免费额度并自动配置模型',en:'Use /login for OAuth login, free CodingPlan credit claims and automatic model setup'},
   'plug.install.head':{zh:'安装 AtomCode for VS Code',en:'Install AtomCode for VS Code'},
   'plug.install.mkt':{zh:'# 从 Marketplace 安装（推荐）',en:'# Install from Marketplace (recommended)'},
   'plug.install.cmd':{zh:'# 或通过命令行安装',en:'# Or install via command line'},
@@ -1362,8 +1368,14 @@ function applyI18n(){
   const tb=document.getElementById('themeBtn'); if(tb) tb.setAttribute('aria-label',t('aria.theme'));
   const lb=document.getElementById('langBtn'); if(lb) lb.setAttribute('aria-label',t('aria.lang'));
   document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n);});
+  const badge=document.querySelector('[data-i18n="hero.badge"]');
+  badge.replaceChildren(...t('hero.badge').split(' · ').map(text=>{
+    const item=document.createElement('span');
+    item.className='badge-item';item.textContent=text;return item;
+  }));
   document.querySelectorAll('[data-i18n-html]').forEach(el=>{el.innerHTML=t(el.dataset.i18nHtml);});
   document.querySelectorAll('[data-i18n-aria-label]').forEach(el=>{el.setAttribute('aria-label',t(el.dataset.i18nAriaLabel));});
+  document.querySelectorAll('a[href^="/docs/index.html"]').forEach(link=>{link.href='/docs/index.html?lang='+LANG;});
 }
 
 /* ========== data ========== */
@@ -1378,6 +1390,10 @@ const INVITE_PARAM=(()=>{
   return m?m[1]:'';
 })();
 const INVITE_CODE=/^[A-Za-z0-9]{8}$/.test(INVITE_PARAM)?INVITE_PARAM:'';
+function releaseDownloadUrl(file){
+  const url=`${RELEASE_BASE}/${file}`;
+  return INVITE_CODE?`${url}?invite=${encodeURIComponent(INVITE_CODE)}`:url;
+}
 function unixInstallCmd(){
   return `curl -fsSL ${SCRIPT_BASE}/install.sh | sh${INVITE_CODE?` -s -- --invite=${INVITE_CODE}`:''}`;
 }
@@ -1421,8 +1437,8 @@ const METHOD_CMDS={
         en:`# macOS / Linux only\n${brewInstallCmd()}`},
   source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
           en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
-  binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
-          en:`# Download from Releases page\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# Or curl for your platform\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`},
+  binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  "${releaseDownloadUrl(`atomcode-${VERSION}-darwin-arm64`)}"\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
+          en:`# Download from Releases page\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# Or curl for your platform\ncurl -L -o atomcode \\\n  "${releaseDownloadUrl(`atomcode-${VERSION}-darwin-arm64`)}"\nchmod +x atomcode && mv atomcode /usr/local/bin/`},
 };
 function methodHint(m){return t('method.'+m);}
 const DOWNLOADS=[
@@ -1838,7 +1854,7 @@ window.applyWizardNav=null;
 
   // downloads — actual release URLs
   document.getElementById('downloadRow').innerHTML=DOWNLOADS.map(d=>`
-    <a class="dl-btn" href="${RELEASE_BASE}/${d.file}" target="_blank" rel="noopener"><span>↓ ${d.os}</span><small>${d.arch}</small></a>`).join('');
+    <a class="dl-btn" href="${releaseDownloadUrl(d.file)}" target="_blank" rel="noopener"><span>↓ ${d.os}</span><small>${d.arch}</small></a>`).join('');
 
   // wizard
   const next=document.getElementById('wizNext'),prev=document.getElementById('wizPrev');
@@ -1974,6 +1990,9 @@ window.applyWizardNav=null;
   btn.addEventListener('click',()=>{
     LANG=LANG==='zh'?'en':'zh';
     try{localStorage.setItem('atomcode_lang',LANG)}catch(e){}
+    const url=new URL(location.href);
+    url.searchParams.set('lang',LANG);
+    history.replaceState(null,'',url);
     applyAll();
     toastEl.textContent=t('toast.lang.'+LANG);
     toastEl.classList.add('show');setTimeout(()=>toastEl.classList.remove('show'),1200);

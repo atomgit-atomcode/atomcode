@@ -1,0 +1,71 @@
+{
+  "platform": "macOS",
+  "base_commit": "7afd8b557",
+  "notes": "Working tree includes diagnostics and concurrent DNS changes. The production output queue is unchanged. HTTP probe is synthetic, not the full daemon.",
+  "records": [
+    {
+      "baseline_rss_kib": 8112,
+      "elapsed_ms": 833,
+      "longest_poll_ms": 689,
+      "max_probe_ms": 74,
+      "peak_rss_kib": 28400,
+      "poll_calls": 11,
+      "produced_bytes": 94371840,
+      "retained_rss_kib": 26624,
+      "ring_retained_bytes": 2359296,
+      "scenario": "production_background_start_poll_9",
+      "synthetic_health_failures": 0,
+      "synthetic_health_probes": 20
+    },
+    {
+      "baseline_rss_kib": 8192,
+      "elapsed_ms": 283,
+      "jobs": 1,
+      "max_probe_ms": 0,
+      "peak_rss_kib": 22928,
+      "produced_and_retained_bytes": 10485760,
+      "queued_rss_kib": 22928,
+      "scenario": "production_local_shell_paused_consumer",
+      "synthetic_health_failures": 0,
+      "synthetic_health_probes": 12
+    },
+    {
+      "baseline_rss_kib": 8160,
+      "elapsed_ms": 306,
+      "jobs": 4,
+      "max_probe_ms": 0,
+      "peak_rss_kib": 54336,
+      "produced_and_retained_bytes": 41943040,
+      "queued_rss_kib": 54208,
+      "scenario": "production_local_shell_paused_consumer",
+      "synthetic_health_failures": 0,
+      "synthetic_health_probes": 13
+    },
+    {
+      "baseline_rss_kib": 8352,
+      "elapsed_ms": 333,
+      "jobs": 9,
+      "max_probe_ms": 0,
+      "peak_rss_kib": 106032,
+      "produced_and_retained_bytes": 94371840,
+      "queued_rss_kib": 106032,
+      "scenario": "production_local_shell_paused_consumer",
+      "synthetic_health_failures": 0,
+      "synthetic_health_probes": 14
+    },
+    {
+      "baseline_rss_kib": 8448,
+      "elapsed_ms": 64766,
+      "longest_poll_ms": 60000,
+      "max_probe_ms": 13,
+      "peak_rss_kib": 27376,
+      "poll_calls": 18,
+      "produced_bytes": 94371840,
+      "retained_rss_kib": 23248,
+      "ring_retained_bytes": 2359296,
+      "scenario": "production_background_long_poll_9",
+      "synthetic_health_failures": 0,
+      "synthetic_health_probes": 2737
+    }
+  ]
+}

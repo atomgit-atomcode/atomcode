@@ -38,6 +38,8 @@ pub mod client;
 pub mod config;
 pub mod oauth;
 pub mod registry;
+mod requirements;
+mod result;
 pub mod tool;
 pub mod transport_http;
 pub mod transport_stdio;

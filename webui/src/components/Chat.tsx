@@ -1,18 +1,30 @@
+import { PromptHistory, promptHistoryDirection } from '../lib/promptHistory';
+import { HistoryLoading } from './HistoryLoading';
+import { TurnArtifactsCard } from './TurnArtifactsCard';
+import { MessageImages } from './MessageImages';
+import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
+import { preservedHistoryPrefix } from '../lib/historyPaging';
+import { GoalRecoveryStatus } from './GoalRecoveryStatus';
+import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
-import { importPatchFile, taskSpecs } from '../api';
+import { ApiCallError, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
-import type { ComponentChildren } from 'preact';
+import { Fragment, type ComponentChildren } from 'preact';
+import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
 import { SessionBrowse } from './SessionBrowse';
 import { LandingRuntimes } from './LandingRuntimes';
+import { BrowseActivityStatus } from './BrowseActivityStatus';
+import { browseActiveTurn } from '../lib/browseTurn';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
+import { groupedTimelinePage } from '../lib/groupedTimeline.ts';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
 import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/useTimelineMessages';
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { detectSlashMenuQuery } from '../lib/slashCommands';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
-import type { LiveGoalProgress } from '../api';
+import type { LiveGoalProgress, LiveLoopProgress, SessionActivity } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -44,7 +56,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -63,7 +75,7 @@ import { CompactionHistory } from './CompactionHistory';
 import { historyMessages } from '../lib/inlineHistory';
 import { TurnNavRail } from './TurnNavRail';
 import type { TranscriptTurn } from '../api';
-import { deriveTurnNavigation, createTurnNavigationIntent } from '../lib/turnNavigation';
+import { deriveTurnNavigation, createTurnNavigationIntent, turnAtReadingSpan } from '../lib/turnNavigation';
 import { ModelSelector } from './ModelSelector';
 import { mayFollowModelDefault, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { ModeSelector } from './ModeSelector';
@@ -87,7 +99,7 @@ import {
   ensureActiveDescendantVisible,
   splitAtToken,
 } from '../lib/atMention';
-import { settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { completedToolPatch, settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { backgroundPresentation, groupEmptyPolls, type PollGroups } from '../lib/backgroundTools';
 import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
 import {
@@ -141,12 +153,15 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, resolveArtifactPath, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  retryDiagnostics?: string[];
+  turnStop?: string;
   sourceSeq?: number;
   specPinned?: boolean;
   contextSummary?: boolean;
   archiveKey?: string;
   archiveBytes?: number;
   archiveArtifacts?: TurnArtifact[];
+  processSummary?: ReturnType<typeof processSummary>;
   retainedHistory?: boolean;
   role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
@@ -160,6 +175,8 @@ interface Message {
   ts?: number;
   /** Browser-local correlation for an optimistic /live submission. Never persisted. */
   pendingSteerId?: string;
+  /** Local viewport anchor; never part of session persistence. */
+  turnAnchorId?: string;
 }
 
 interface QueuedMessage {
@@ -195,13 +212,14 @@ function notificationDedupeKey(
 /** Zero-pad a local date/time component to 2 digits. */
 const pad2 = (n: number) => (n < 10 ? '0' + n : '' + n);
 
-/** Format a message timestamp as a stable, always-visible local wall clock. */
-function formatMsgTime(ts: number | undefined): string {
+/** Local wall clock: compact user metadata, full dates for tooltips and replies. */
+function formatMsgTime(ts: number | undefined, compact = false): string {
   // P3 修复: 用 ts == null 而非 !ts,避免把 ts=0 (epoch 1970) 误判为无效。
   // 实际消息时间戳不会是 0,但严格区分 "缺失" 与 "值为 0" 更正确。
   if (ts == null || !Number.isFinite(ts)) return '';
   const d = new Date(ts);
   if (isNaN(d.getTime())) return '';
+  if (compact) return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
@@ -253,13 +271,7 @@ function imageDataUrl(img: ImageData): string {
  * `\n\n[图片识别失败]`（原文为空时无前导换行）。仅影响显示；存储/喂给模型的文本不变。
  */
 function stripVisionAnnotation(text: string): string {
-  const markers = ['\n\n[图片内容（由', '[图片内容（由', '\n\n[图片识别失败]', '[图片识别失败]'];
-  let cut = -1;
-  for (const m of markers) {
-    const idx = text.indexOf(m);
-    if (idx >= 0 && (cut < 0 || idx < cut)) cut = idx;
-  }
-  return cut >= 0 ? text.slice(0, cut).trimEnd() : text;
+  return displayHistoryUser(text).text;
 }
 
 interface TokenUsage {
@@ -274,6 +286,7 @@ interface PermissionRequestEvent {
   tool_name: string;
   reason: string;
   call_id: string;
+  approval_id?: string;
   arguments: unknown;
   allow_all_bash?: boolean;
   project_rule?: { rule: string; file: string };
@@ -283,16 +296,22 @@ interface ChatProps {
   browseSession?: SessionMetaWithProject | null;
   onReturnToBound?: () => void;
   onContinueBrowse?: () => void;
+  /** Set while another runtime (a TUI in another terminal) holds the browsed session. */
+  browseActivity?: SessionActivity | null;
+  onForkBrowse?: () => void;
+  browseForking?: boolean;
+  browseForkError?: string | null;
   onExecutionState?: (active: boolean) => void;
   sessionId: string | null;
   onSessionId: (id: string) => void;
+  onForkSession?: () => Promise<void>;
   cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
   /** App-owned `/chat` approval projected into this component's composer seat. */
   pendingPermission?: PermissionRequestEvent | null;
   /** 审批已被解决时通知 App 清掉 /chat 的审批卡片：传 call_id 仅在匹配时清（工具已执行），
    *  传 null 则无条件清（回合 done/stopped/error 或用户中止——此时不可能再有待批准项）。 */
-  onPermissionResolved?: (callId: string | null) => void;
+  onPermissionResolved?: (callId: string | null, approvalId?: string) => void;
   /** Metadata of the currently-active session (for loading history) */
   activeSession?: SessionMetaWithProject | null;
   /** 刷新后正按 URL 短 id 还原会话；为 true 时抑制新建落地页，避免闪屏。 */
@@ -473,13 +492,24 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed, onOpenPackages }: ChatProps) {
+export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseActivity, onForkBrowse, browseForking, browseForkError, onExecutionState, sessionId, onSessionId, onForkSession, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed, onOpenPackages }: ChatProps) {
   const t = useT();
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
   const { messages, setMessages, read: readTimelineMessage, hold: holdTimelineMessages } = useTimelineMessages<Message>(limits.resident, (message, key) => ({
-    ...archivedMessage(message, key), archiveArtifacts: artifactsByAssistantIndex([message]).get(0),
+    ...archivedMessage(message, key), processSummary: processSummary(message), archiveArtifacts: artifactsByAssistantIndex([message]).get(0),
   }), limits.residentBytes);
+  type ServerHistory = { session: string; cursor?: DisplayHistoryCursor; baseline?: DisplayHistoryCursor };
+  const [serverHistory, setServerHistoryState] = useState<ServerHistory>({ session: '' });
+  const serverHistoryRef = useRef<ServerHistory>(serverHistory);
+  function setServerHistory(value: ServerHistory) {
+    serverHistoryRef.current = value;
+    setServerHistoryState(value);
+    setServerHistoryError(null);
+  }
+  const [serverHistoryLoading, setServerHistoryLoading] = useState(false);
+  const [serverHistoryError, setServerHistoryError] = useState<{ session: string; expired: boolean } | null>(null);
+  const serverHistoryRequest = useRef<AbortController | null>(null);
   const [timelineStart, setTimelineStart] = useState<number | null>(null);
   useEffect(() => {
     const media = window.matchMedia('(max-width: 767px)');
@@ -488,11 +518,21 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return () => media.removeEventListener('change', update);
   }, []);
   const [input, setInput] = useState('');
+  const promptHistoryRef = useRef(new PromptHistory<Message>());
+  const promptHistoryReading = useRef(false);
+  const promptHistoryRevision = useRef(0);
+  useEffect(() => {
+    promptHistoryRef.current.reset();
+    promptHistoryRevision.current++;
+  }, [sessionId]);
   // 组合期标记：仅用于 handleKeyDown 的守卫（菜单导航 / Enter 发送不得窃取
   // IME 候选窗的按键）。输入值本身始终受控同步，见 handleInput。
   const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
   const [goalProgress, setGoalProgress] = useState<LiveGoalProgress | null>(null);
+  const [goalSampledAt, setGoalSampledAt] = useState(0);
+  const [loopProgress, setLoopProgress] = useState<LiveLoopProgress | null>(null);
+  const [loopSampledAt, setLoopSampledAt] = useState(0);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
@@ -585,20 +625,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [compacting, setCompacting] = useState(false);
-  const [summaryCount, setSummaryCount] = useState<number | null>(null);
   const summaryCountRef = useRef<number | null>(null);
   function resetSummaryCount() {
     summaryCountRef.current = null;
-    setSummaryCount(null);
   }
   function updateSummaryCount(count?: number, record = false) {
     const next = nextContextSummary(summaryCountRef.current, count, record);
     summaryCountRef.current = next.count;
-    setSummaryCount(next.count);
     if (next.notice) pushCommandNotice(t('context.summaryRecorded', { count: next.count! }), true);
   }
 
-  const latestSummaryIndex = messages.map(message => message.contextSummary === true).lastIndexOf(true);
+  const [processExpanded, setProcessExpanded] = useState<Record<string, boolean>>({});
+  const processReadIntent = useRef(false);
   const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // Auxiliary persistence failures belong to application chrome, not the
@@ -674,7 +712,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // A live connection has no conversation verdict until its first snapshot.
   // Retain this across reconnects so an already rendered conversation stays put.
   const [liveSnapshotReady, setLiveSnapshotReady] = useState(false);
-  useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
+  useEffect(() => { if (!sync) { setGoalProgress(null); setLoopProgress(null); } }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
   useLayoutEffect(() => {
@@ -684,7 +722,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }, [sync]);
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
-  const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } } | null>(null);
+  const [livePending, setLivePending] = useState<{ approval_id: string; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } } | null>(null);
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
   const userInputVersionRef = useRef(0);
@@ -721,8 +759,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // ONLY while the user is at the bottom; scrolling up releases the follow so history
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
+  const turnAnchorRef = useRef<string | null>(null);
+  const positionedTurnRef = useRef<string | null>(null);
   const atBottomRef = useRef(true);
   const timelineScrollRef = useRef(0);
+  const timelineScrollbarDragRef = useRef(false);
   const timelineIgnoreScrollRef = useRef(0);
   const timelineTouchRef = useRef<number | null>(null);
   const timelineAnchorRef = useRef<{ index: number; top: number; start: number; before: boolean } | null>(null);
@@ -754,6 +795,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // An accepted first-turn `done` pre-binds activeIdRef to its new id, so that
     // normal null -> canonical-id prop update does not invalidate its own tail.
     if (activeIdRef.current !== sessionId) sessionGenerationRef.current += 1;
+    serverHistoryRequest.current?.abort();
     renderedSessionIdRef.current = sessionId;
   }
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
@@ -761,7 +803,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const loadedForRef = useRef<string | null>(null);
   const switchReadyRef = useRef<{ id: string; generation: number; ready: Promise<boolean> } | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
-  useEffect(() => () => { historyAbortRef.current?.abort(); }, []);
+  useEffect(() => () => { historyAbortRef.current?.abort(); serverHistoryRequest.current?.abort(); }, []);
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
   const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
   const messageCacheCountRef = useRef<Map<string, number>>(new Map());
@@ -769,6 +811,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // transcript state so history replacement cannot erase it.
   const noticeAfterSwitchRef = useRef<{ sessionId: string; text: string } | null>(null);
   const [sessionSwitchNotice, setSessionSwitchNotice] = useState<string | null>(null);
+  const [switchRetryTarget, setSwitchRetryTarget] = useState<string | null>(null);
+  const liveSessionObservationRef = useRef(0);
   // Mirror of messages state to read the latest value without dependency tracking.
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => {
@@ -871,11 +915,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     }
   }
 
-  function finishTodoTurn(cancelled: boolean) {
-    if (cancelled) {
-      resetTodoBatch(true);
-      return;
-    }
+  function finishTodoTurn() {
     const batch = todoBatchRef.current;
     if (batch.calls.length > 0) {
       replaceTodoItems(projectTodoCalls(batch.base, batch.calls).committed);
@@ -900,7 +940,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     let visibilityItems: TodoItem[] = [];
     for (const message of messages) {
       if (message.role === 'user') {
-        restoredVisible = reduceTodoPanelVisibility(restoredVisible, { type: 'user_input' });
+        restoredVisible = reduceTodoPanelVisibility(restoredVisible, {
+          type: 'user_input', hasOpenItems: visibilityItems.some((item) => item.status !== 'completed'),
+        });
       }
       for (const part of message.parts) {
         if (part.kind === 'tool' && part.tool.status === 'done' && isTodoTool(part.tool.name)) {
@@ -934,7 +976,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       const liveSwitch = liveSessionSwitchDisposition(
         liveLifecycleRef.current.running || busyRef.current,
       );
-      if (syncRef.current && !liveSwitch.allowed) {
+      // Existing sessions can move to the background; the runtime owner
+      // decides whether interactions or reconfiguration prevent handover.
+      if (syncRef.current && !sessionId && !liveSwitch.allowed) {
         if (prevId) onSessionId(prevId);
         setSessionSwitchNotice(t('browse.switchBusy'));
         return;
@@ -1014,6 +1058,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         ? noticeAfterSwitchRef.current.text : null;
       noticeAfterSwitchRef.current = null;
       setSessionSwitchNotice(carried);
+      if (carried !== t('browse.switchBusy')) setSwitchRetryTarget(null);
 
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
@@ -1033,6 +1078,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
         if (!carried) setSessionSwitchNotice(t('sync.switching'));
+        const observedBeforeSwitch = liveSessionObservationRef.current;
         const ready = postLiveSwitchSession(sessionId)
           .then((result) => {
             if (sessionGenerationRef.current !== switchGeneration) return false;
@@ -1048,7 +1094,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               if (!carried) setSessionSwitchNotice(null);
               return true;
             }
+            if (result.activeTurn && liveSessionObservationRef.current > observedBeforeSwitch
+                && liveSessionIdRef.current === sessionId) {
+              // The runtime already acknowledged this destination over SSE.
+              // A delayed Busy reply cannot roll that authoritative handover back.
+              setSessionSwitchNotice(null);
+              setSwitchRetryTarget(null);
+              return true;
+            }
             if (result.activeTurn && prevId) {
+              setSwitchRetryTarget(sessionId);
               noticeAfterSwitchRef.current = { sessionId: prevId, text: t('browse.switchBusy') };
               setSessionSwitchNotice(noticeAfterSwitchRef.current.text);
               onSessionId(prevId);
@@ -1115,57 +1170,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const pendingSwitch = switchReadyRef.current;
     const accepted = pendingSwitch?.id === loadId && pendingSwitch.generation === loadGeneration
       ? pendingSwitch.ready : undefined;
-    loadAfterSessionSwitch(accepted,
-      () => !historyController.signal.aborted && activeIdRef.current === loadId
-        && sessionGenerationRef.current === loadGeneration,
-      () => Promise.allSettled([getSession(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
-      .then((results) => {
-        if (!results || historyController.signal.aborted) return;
-        const [sessionResult, activeResult] = results;
-        // Generation also covers A -> B -> A; id equality alone is insufficient.
-        if (
-          activeIdRef.current !== loadId ||
-          sessionGenerationRef.current !== loadGeneration
-        ) return;
-
+    // Live snapshots replace history and abort its fetch. Detached-operation
+    // discovery must survive that replacement or the composer stays checking.
+    void loadAfterSessionSwitch(accepted,
+      () => activeIdRef.current === loadId && sessionGenerationRef.current === loadGeneration,
+      () => Promise.allSettled([getActiveChatSessions()]))
+      .then(results => {
+        if (!results || activeIdRef.current !== loadId || sessionGenerationRef.current !== loadGeneration) return;
+        const [activeResult] = results;
         let nextHint: string | null = null;
-        if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
-          updateSummaryCount(sessionResult.value.summary_count);
-          const currentCached = messageCacheRef.current.get(loadId);
-          const cachedTodos = todoCacheRef.current.get(loadId);
-          const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
-          // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
-          const loaded = sessionMessagesToDisplay(sessionResult.value.messages);
-
-          if (currentCached && currentCached.length > 0) {
-            // If the loaded messages from the backend are shorter than the cached messages,
-            // it means the backend task is still running or hasn't saved yet.
-            // Keep the cached messages and do not overwrite them with stale backend history.
-            if (loaded.length >= (messageCacheCountRef.current.get(loadId) ?? currentCached.length)) {
-              setMessages(loaded);
-              messageCacheRef.current.delete(loadId);
-              messageCacheCountRef.current.delete(loadId);
-            } else {
-              // `sessionMessagesToDisplay` also projects Todo state. If the
-              // persisted transcript loses to our longer local cache, restore
-              // the matching local Todo projection as well; otherwise the
-              // canvas and task card would represent different revisions.
-              restoreTodoTitles(currentCached);
-              if (cachedTodos) replaceTodoItems(cachedTodos);
-              if (cachedTodoVisibility !== undefined) {
-                setTodoPanelVisible(cachedTodoVisibility);
-              }
-            }
-          } else if (loaded.length > 0) {
-            // A newly loaded session starts at the bottom regardless of prior scroll state.
-            atBottomRef.current = true;
-            setMessages(loaded);
-          }
-        } else {
-          loadedForRef.current = null;
-          nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
-        }
-
         if (activeResult.status === 'fulfilled') {
           const active = activeResult.value.includes(loadId);
           transitionChatRecovery({ type: 'active_check_succeeded', active });
@@ -1192,6 +1205,62 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           loadedForRef.current = null;
         }
 
+        if (nextHint) setHistoryHint(nextHint);
+      });
+    loadAfterSessionSwitch(accepted,
+      () => !historyController.signal.aborted && activeIdRef.current === loadId
+        && sessionGenerationRef.current === loadGeneration,
+      () => Promise.allSettled([getSessionPage(projectHash, loadId, historyController.signal)]))
+      .then((results) => {
+        if (!results || historyController.signal.aborted) return;
+        const [sessionResult] = results;
+        // Generation also covers A -> B -> A; id equality alone is insufficient.
+        if (
+          activeIdRef.current !== loadId ||
+          sessionGenerationRef.current !== loadGeneration
+        ) return;
+
+        let nextHint: string | null = null;
+        if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
+          setServerHistory({ session: loadId, cursor: sessionResult.value.history_older, baseline: sessionResult.value.history_older });
+          updateSummaryCount(sessionResult.value.summary_count);
+          const currentCached = messageCacheRef.current.get(loadId);
+          const cachedTodos = todoCacheRef.current.get(loadId);
+          const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
+          // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
+          const loaded = sessionMessagesToDisplay(sessionResult.value.messages, !sessionResult.value.history_seed);
+          if (sessionResult.value.history_seed) sessionMessagesToDisplay(sessionResult.value.history_seed);
+
+          if (currentCached && currentCached.length > 0) {
+            // If the loaded messages from the backend are shorter than the cached messages,
+            // it means the backend task is still running or hasn't saved yet.
+            // Keep the cached messages and do not overwrite them with stale backend history.
+            if (sessionResult.value.history_seed || sessionResult.value.history_older || loaded.length >= (messageCacheCountRef.current.get(loadId) ?? currentCached.length)) {
+              setMessages(loaded);
+              messageCacheRef.current.delete(loadId);
+              messageCacheCountRef.current.delete(loadId);
+            } else {
+              // `sessionMessagesToDisplay` also projects Todo state. If the
+              // persisted transcript loses to our longer local cache, restore
+              // the matching local Todo projection as well; otherwise the
+              // canvas and task card would represent different revisions.
+              restoreTodoTitles(currentCached);
+              if (cachedTodos) replaceTodoItems(cachedTodos);
+              if (cachedTodoVisibility !== undefined) {
+                setTodoPanelVisible(cachedTodoVisibility);
+              }
+            }
+          } else if (loaded.length > 0) {
+            // A newly loaded session starts at the bottom regardless of prior scroll state.
+            atBottomRef.current = true;
+            setMessages(loaded);
+          }
+        } else {
+          loadedForRef.current = null;
+          nextHint = t('chat.continueSession', { id: loadId.slice(0, 8) });
+        }
+
+
         setHistoryHint(nextHint);
         setLoading(false);
       });
@@ -1216,7 +1285,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       ? scrollRestorationRef.current.onScroll()
       : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
     if (atBottom === null) return;
-    if (!atBottom && timelineStart === null) setTimelineStart(range.start);
+    if (!atBottom && timelineStart === null) setTimelineStart(timeline.windowStart);
     if (atBottom && timelineStart !== null && range.end >= messages.length) setTimelineStart(null);
     atBottomRef.current = atBottom;
     setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
@@ -1255,6 +1324,23 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   useEffect(() => {
     const restore = createScrollRestoration({
       viewport: () => scrollRef.current,
+      followingTop: bottom => {
+        const viewport = scrollRef.current;
+        if (!viewport || positionedTurnRef.current === turnAnchorRef.current) return bottom;
+        const anchor = Array.from(viewport.querySelectorAll<HTMLElement>('[data-turn-anchor]'))
+          .find(node => node.dataset.turnAnchor === turnAnchorRef.current);
+        if (!anchor) return bottom;
+        positionedTurnRef.current = turnAnchorRef.current;
+        const top = viewport.scrollTop + anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top
+          - parseFloat(getComputedStyle(viewport).paddingTop);
+        if (bottom > top + 2) {
+          // A long prompt opens at its beginning even when it fills the viewport.
+          atBottomRef.current = false;
+          setShowJumpBtn(true);
+          return Math.max(0, top);
+        }
+        return bottom;
+      },
       session: () => activeIdRef.current,
       following: () => atBottomRef.current,
       setFollowing: (following) => {
@@ -1286,6 +1372,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       window.removeEventListener('pageshow', pageshow);
       window.removeEventListener('resize', layout);
       window.visualViewport?.removeEventListener('resize', layout);
+    };
+  }, []);
+
+  useEffect(() => {
+    const release = () => { timelineScrollbarDragRef.current = false; };
+    window.addEventListener('pointerup', release);
+    window.addEventListener('pointercancel', release);
+    window.addEventListener('blur', release);
+    return () => {
+      window.removeEventListener('pointerup', release);
+      window.removeEventListener('pointercancel', release);
+      window.removeEventListener('blur', release);
     };
   }, []);
 
@@ -1579,7 +1677,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }, [sync]);
 
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
-  function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
+  function sessionMessagesToDisplay(msgs: SessionMessage[], projectState = true): Message[] {
     const loaded: Message[] = [];
     const todoTitles: TodoTitles = new Map();
     const pendingTodoCalls = new Map<string, { name: string; args: string }>();
@@ -1590,20 +1688,19 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     for (const msg of msgs) {
       if (msg.role === 'user') {
         if (isUserInterruptionMessage(msg)) {
-          orderedTodoCalls.length = 0;
-          pendingTodoCalls.clear();
-          todoCallEpochs.clear();
-          inputEpoch += 1;
+          const previous = [...loaded].reverse().find(message => message.role === 'assistant');
+          if (previous) previous.turnStop = 'cancelled';
           continue;
         }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
         inputEpoch += 1;
+        const displayUser = displayHistoryUser(msg.content ?? '', msg.images);
         loaded.push({
           role: 'user',
           sourceSeq: msg.source_seq,
           specPinned: msg.task_spec_pinned,
-          parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
-          images: msg.images && msg.images.length ? msg.images : undefined,
+          parts: [{ kind: 'text', text: displayUser.text }],
+          images: displayUser.images,
           ts: msg.created_at,
           retainedHistory: isRetainedHistoryUserMessage(msg),
         });
@@ -1638,8 +1735,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         const result = msg.tool_result;
         const tool = displayTools.get(result.call_id);
         if (tool) {
-          tool.output = result.summary;
-          tool.status = toolResultStatus(result.success, result.summary);
+          Object.assign(tool, completedToolPatch(result.success, result.summary, result.images));
           const pending = pendingTodoCalls.get(result.call_id);
           if (pending && isTodoTool(pending.name)) {
             const call = orderedTodoCalls.find(candidate => candidate.id === result.call_id);
@@ -1653,6 +1749,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       }
       // system messages: skip
     }
+    if (!projectState) return loaded;
     const restoredProjection = projectTodoCalls([], orderedTodoCalls);
     const restoredTodoItems = restoredProjection.committed;
     const priorTodoCalls = orderedTodoCalls.filter(
@@ -1662,10 +1759,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       (call) => todoCallEpochs.get(call.id) === inputEpoch,
     );
     const priorTodoItems = projectTodoCalls([], priorTodoCalls).committed;
-    const restoredTodoVisible = projectTodoCalls(
-      priorTodoItems,
-      currentTodoCalls,
-    ).hasApplicable;
+    const restoredTodoVisible = restoredTodoItems.some((item) => item.status !== 'completed')
+      || projectTodoCalls(priorTodoItems, currentTodoCalls).hasApplicable;
     todoTitlesRef.current = new Map(
       restoredTodoItems.map((item, index) => [index + 1, item.content]),
     );
@@ -1690,10 +1785,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments };
       case 'tool_output': return { type: 'tool_output', chunk: e.chunk };
       case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
-      case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
+      case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms, images: e.images };
       case 'context_summary': return e;
       case 'context_compacting': return e;
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
+      case 'provider_retry': return { type: 'provider_retry', message: e.message };
       case 'warning': return { type: 'warning', message: e.message };
       case 'persistence_warning': return { type: 'persistence_warning', message: e.message };
       case 'rate_limited': return { type: 'rate_limited', reset_at_display: e.reset_at_display, reset_label: e.reset_label, secs_until_reset: e.secs_until_reset, auto_resuming: e.auto_resuming, server_message: e.server_message ?? null };
@@ -1711,12 +1807,26 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
+    if (e.type === 'loop_changed') {
+      setLoopSampledAt(Date.now());
+      setLoopProgress(e.active ? e : null);
+      return;
+    }
     if (e.type === 'goal_changed') {
+      setGoalSampledAt(Date.now());
       setGoalProgress(e);
       return;
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      promptHistoryRef.current.reset();
+      promptHistoryRevision.current++;
+      liveSessionObservationRef.current++;
+      historyAbortRef.current?.abort();
+      serverHistoryRequest.current?.abort();
+      serverHistoryRequest.current = null;
+      setServerHistoryLoading(false);
+
       setCurrentTurnModel(null);
       currentTurnModelRef.current = null;
       if (activeIdRef.current !== e.session_id) resetSummaryCount();
@@ -1724,12 +1834,29 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       setCompacting(false);
       setLiveSnapshotReady(true);
       setLoading(false);
+      setGoalSampledAt(Date.now());
       setGoalProgress(e.goal ?? null);
+      setLoopSampledAt(Date.now());
+      setLoopProgress(e.loop_progress ?? null);
       liveSessionIdRef.current = e.session_id || null;
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
-      const loaded = segmentMessages(sessionMessagesToDisplay(e.messages));
+      let loaded = segmentMessages(sessionMessagesToDisplay(e.messages, !e.history_seed));
+      const previousHistory = serverHistoryRef.current;
+      const prefix = previousHistory.session === e.session_id
+        ? preservedHistoryPrefix(messagesRef.current, loaded, previousHistory.baseline, e.history_older) : [];
+      if (prefix.length > 0) {
+        loaded = [...prefix, ...loaded];
+        setServerHistory({ session: e.session_id, cursor: previousHistory.cursor, baseline: e.history_older });
+      } else {
+        setServerHistory({ session: e.session_id, cursor: e.history_older, baseline: e.history_older });
+        if (e.history_older || previousHistory.baseline) {
+          setTimelineStart(null);
+          timelineAnchorRef.current = null;
+        }
+      }
+      if (e.history_seed) sessionMessagesToDisplay(e.history_seed);
       // A new session starts at the bottom. Reconnection to the same session
       // must preserve whether the reader was following or inspecting history.
       if (e.session_id && activeIdRef.current !== e.session_id) {
@@ -1840,6 +1967,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
     // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
+      liveSessionObservationRef.current++;
+      if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) {
+        noticeAfterSwitchRef.current = null;
+      }
+      setSessionSwitchNotice(current =>
+        current === t('browse.switchBusy') || current === t('sync.switching') ? null : current);
+      setSwitchRetryTarget(null);
       liveSessionIdRef.current = e.session_id;
       // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
       // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
@@ -1892,7 +2026,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           setTurnStats(null);
           setTodoPanelVisible(reduceTodoPanelVisibility(
             todoPanelVisibleRef.current,
-            { type: 'user_input' },
+            { type: 'user_input', hasOpenItems: todoItemsRef.current.some((item) => item.status !== 'completed') },
           ));
         }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
@@ -1934,12 +2068,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         liveLifecycleRef.current = lifecycle.state;
         const terminal = lifecycle.terminal;
         setBusy(lifecycle.state.running);
-        if (!e.running) setCompacting(false);
+        if (!e.running) {
+          setCompacting(false);
+          // A replayed idle state need not close a locally observed turn.
+          // It still invalidates an earlier Busy rejection; clear its carried
+          // copy too, or the rollback effect could resurrect it later.
+          if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) noticeAfterSwitchRef.current = null;
+          setSessionSwitchNotice(current => current === t('browse.switchBusy') ? null : current);
+          setSwitchRetryTarget(null);
+        }
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
-          stampLastAssistantCompletion();
-          finishTodoTurn(e.stop_reason === 'cancelled');
+          stampLastAssistantCompletion(Date.now(), e.stop_reason);
+          finishTodoTurn();
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
             // buffer (agent.rs Cancel/Shutdown), so a leftover steer is NOT
@@ -2001,7 +2143,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         // Mark the tool row as waiting for approval (same as non-sync path)
         updateToolInLastAssistant(e.call_id, { status: 'waiting_approval' });
         // Show the PermissionCard for the live session (calls /live/permission via onDecide)
-        setLivePending({ tool_name: e.tool_name, reason: e.reason, call_id: e.call_id, arguments: e.arguments, allow_all_bash: e.allow_all_bash, project_rule: e.project_rule });
+        setLivePending({ approval_id: e.approval_id, tool_name: e.tool_name, reason: e.reason, call_id: e.call_id, arguments: e.arguments, allow_all_bash: e.allow_all_bash, project_rule: e.project_rule });
         break;
       }
       case 'user_input_request': {
@@ -2122,12 +2264,21 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   /** Stamp the assistant when the turn actually finishes. The optimistic
    *  placeholder intentionally has no clock, keeping reply completion distinct
    *  from the user's submission time. */
-  function stampLastAssistantCompletion(ts = Date.now()) {
+  function stampLastAssistantCompletion(ts = Date.now(), stopReason?: string, scope = activeIdRef.current) {
+    const viewport = scrollRef.current;
+    const readingProcess = processReadIntent.current && viewport
+      && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > BOTTOM_SLACK;
+    if (!atBottomRef.current || readingProcess) {
+      const groups = turnProcesses(messagesRef.current);
+      const group = groups.get(messagesRef.current.length - 1);
+      if (group) setProcessExpanded(prev => ({ ...prev, [`${scope}/${group.key}`]: true }));
+    }
+    processReadIntent.current = false;
     setMessages((prev) => {
       for (let index = prev.length - 1; index >= 0; index -= 1) {
         if (prev[index].role !== 'assistant') continue;
         const next = prev.slice();
-        next[index] = { ...next[index], ts, parts: settlePendingToolParts(next[index].parts) };
+        next[index] = { ...next[index], ts: next[index].ts ?? ts, turnStop: stopReason ?? next[index].turnStop, parts: settlePendingToolParts(next[index].parts) };
         return next;
       }
       return prev;
@@ -2173,10 +2324,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const projectHash = activeSession?.project_hash;
     if (!projectHash) return;
     try {
-      const detail = await getSession(projectHash, id);
+      const detail = await getSessionPage(projectHash, id);
       if (activeIdRef.current === id) {
+        setServerHistory({ session: id, cursor: detail.history_older, baseline: detail.history_older });
         updateSummaryCount(detail.summary_count);
-        setMessages(sessionMessagesToDisplay(detail.messages));
+        setMessages(sessionMessagesToDisplay(detail.messages, !detail.history_seed));
+        if (detail.history_seed) sessionMessagesToDisplay(detail.history_seed);
       }
     } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
   }
@@ -2272,7 +2425,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     setMessages(current=>current.map(message=>message.sourceSeq===seq?{...message,specPinned:pinned}:message));
   }
   async function chooseMessageSpec(message:Message) {
-    if(!sessionId||!message.sourceSeq||busyRef.current||specActionBusy)return;
+    if(!sessionId||busyRef.current||specActionBusy)return;
+    if(!message.sourceSeq){setSpecPicker('list');return;}
     if(!message.specPinned){setSpecPicker('show '+message.sourceSeq);return;}
     const generation=sessionGenerationRef.current;
     setSpecActionBusy(true);
@@ -2287,14 +2441,19 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   useEffect(()=>{
     if(!sync||busy||!sessionId||!activeSession?.project_hash)return;
     const controller=new AbortController();
-    void getSession(activeSession.project_hash,sessionId,controller.signal).then(detail=>{
+    void getSessionPage(activeSession.project_hash,sessionId,controller.signal).then(detail=>{
       if(controller.signal.aborted)return;
       const originals=detail.messages.filter(message=>message.role==='user'&&!message.synthetic&&!isInternalHistoryUserMessage(message.content??'',message.synthetic));
       setMessages(current=>{
         const users=current.filter(message=>message.role==='user');
-        if(users.length!==originals.length||users.some((message,index)=>message.sourceSeq!=null?message.sourceSeq!==originals[index].source_seq:messageText(message)!==stripVisionAnnotation(originals[index].content??'')))return current;
+        const offset=users.length-originals.length;
+        if(!originals.length||offset<0||users.slice(offset).some((message,index)=>message.sourceSeq!=null?message.sourceSeq!==originals[index].source_seq:messageText(message)!==stripVisionAnnotation(originals[index].content??'')))return current;
         let index=0;
-        return current.map(message=>message.role==='user'?{...message,sourceSeq:originals[index].source_seq,specPinned:originals[index++].task_spec_pinned}:message);
+        return current.map(message=>{
+          if(message.role!=='user')return message;
+          const original=originals[index++-offset];
+          return original?{...message,sourceSeq:original.source_seq,specPinned:original.task_spec_pinned}:message;
+        });
       });
     }).catch(()=>{});
     return ()=>controller.abort();
@@ -2368,6 +2527,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
+        if (command === 'fork') {
+          if (arg.trim()) { pushCommandNotice('Usage: /fork'); return; }
+          try { if (!onForkSession) throw new Error(t('cmd.fork.unavailable')); await onForkSession(); } catch (error) { pushCommandNotice(String(error)); }
+          return;
+        }
         if (command === 'followup') {
           if (!sessionId) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
           const generation = sessionGenerationRef.current;
@@ -2455,6 +2619,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             return;
           }
           if (res.kind === 'remember') { pushCommandNotice(res.text ?? t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'quality') { pushCommandNotice(res.text); return; }
           if (res.kind === 'memory_action') { pushCommandNotice(res.text); return; }
           if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
           if (res.kind === 'memory') {
@@ -2466,9 +2631,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           if (res.kind === 'compact') {
             if (res.applied) {
               if (sessionId) await reloadSessionTranscript(sessionId);
-              pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
+              pushCommandNotice(res.diagnostic ?? t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
             } else {
-              pushCommandNotice(t('cmd.compact.none'));
+              pushCommandNotice(res.diagnostic ?? t('cmd.compact.none'));
             }
             return;
           }
@@ -2508,7 +2673,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, slashOpen, sessionId, cwd, activeSession, provider, messages.length],
+    [t, modeState, sync, onCwdChanged, onForkSession, slashSkills, slashLoading, slashOpen, sessionId, cwd, activeSession, provider, messages.length],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -2590,6 +2755,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     switch (event.type) {
       case 'context_compacting':
         setCompacting(event.active);
+        if (event.diagnostic) pushCommandNotice(event.diagnostic);
         break;
       case 'context_summary':
         setCompacting(false);
@@ -2661,12 +2827,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           if (pending && event.success) setTodoSourceRevision(value => value + 1);
           pendingTodoCallsRef.current.delete(event.id);
         }
-        updateToolInLastAssistant(event.id, {
-          status: toolResultStatus(event.success, event.output),
-          duration_ms: event.duration_ms,
-          output: event.output,
-          progress: undefined,
-        });
+        updateToolInLastAssistant(event.id,
+          completedToolPatch(event.success, event.output, event.images, event.duration_ms));
         // 工具已执行完 → 其审批必已解决，清掉 /chat 残留的同 call_id 审批卡片。
         onPermissionResolved?.(event.id);
         break;
@@ -2701,10 +2863,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
       case 'done': {
         setCompacting(false);
-        // A normal terminal keeps only successful calls; a user cancellation
-        // retires the active plan at the same boundary as kernel/TUI.
-        stampLastAssistantCompletion();
-        finishTodoTurn(event.stop_reason === 'cancelled');
+        // Every terminal keeps successful todo changes and drops unresolved previews.
+        stampLastAssistantCompletion(Date.now(), event.stop_reason, event.session_id);
+        finishTodoTurn();
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
         activeIdRef.current = event.session_id;
@@ -2746,10 +2907,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
       case 'stopped':
         setCompacting(false);
-        // User cancellation is an authoritative interruption boundary: the
-        // previous plan remains historical but is no longer active.
-        stampLastAssistantCompletion();
-        resetTodoBatch(true);
+        // Stop execution without discarding the committed plan.
+        stampLastAssistantCompletion(Date.now(), 'cancelled');
+        finishTodoTurn();
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 用户中止：丢弃排队消息（对齐 VSCode 插件）
@@ -2763,7 +2923,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
       case 'error':
         setCompacting(false);
-        stampLastAssistantCompletion();
+        stampLastAssistantCompletion(Date.now(), 'error');
         resetTodoBatch(false);
         // A session another atomcode holds says so in words, with what to do —
         // not the session store's own line about leases.
@@ -2782,6 +2942,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           stopReason: 'error',
           sessionId: activeIdRef.current ?? undefined,
           message: event.message,
+        });
+        break;
+
+      case 'provider_retry':
+        // Presentation only: the server retains ownership of retries and termination.
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== 'assistant') return prev;
+          return [...prev.slice(0, -1), { ...last,
+            retryDiagnostics: [...(last.retryDiagnostics ?? []), event.message] }];
         });
         break;
 
@@ -2880,13 +3050,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
     setHistoryTarget(null); setHistoryReset(value => value + 1);
     setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    navScrollIntent.current.interact();
+    scrollRestorationRef.current?.interact();
     atBottomRef.current = true;
     setShowJumpBtn(false);
     const startsNewTurn = !busyRef.current;
+    const turnAnchorId = startsNewTurn ? randomId() : undefined;
+    if (turnAnchorId) {
+      turnAnchorRef.current = turnAnchorId;
+      setTimelineStart(null);
+    }
     if (startsNewTurn) {
       setTodoPanelVisible(reduceTodoPanelVisibility(
         todoPanelVisibleRef.current,
-        { type: 'user_input' },
+        { type: 'user_input', hasOpenItems: todoItemsRef.current.some((item) => item.status !== 'completed') },
       ));
     }
     // 本会话首条消息：用消息前 10 字做临时标题，立刻通知 App 乐观插入侧栏，
@@ -2927,6 +3104,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           images: images.length ? images : undefined,
           ts: now,
           pendingSteerId: pendingSteer.id,
+          turnAnchorId,
         },
         { role: 'assistant', parts: [], pendingSteerId: pendingSteer.id },
       ]);
@@ -3011,7 +3189,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const now = Date.now();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, turnAnchorId },
       { role: 'assistant', parts: [] },
     ]);
 
@@ -3088,6 +3266,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
 
   function sendMessage() {
+    promptHistoryRef.current.reset();
+    promptHistoryRevision.current++;
     const text = input.trim();
     const images = pendingImages;
     if (!text && images.length === 0) return;
@@ -3230,9 +3410,58 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       }
     }
 
+    const ta = textareaRef.current;
+    const direction = ta && promptHistoryDirection(e, ta.value, ta.selectionStart, ta.selectionEnd);
+    if (direction) {
+      if (promptHistoryReading.current) { e.preventDefault(); return; }
+      const candidates = messagesRef.current.filter(message => message.role === 'user' && !message.retainedHistory
+        && (message.archiveKey || displayImageMarkers(message.parts.filter(part => part.kind === 'text')
+          .map(part => part.text).join('\n'), message.images).trim()));
+      const scope = `${activeIdRef.current ?? ''}/${sessionGenerationRef.current}`;
+      const step = promptHistoryRef.current.move(scope, candidates, ta.value, direction);
+      if (step) {
+        e.preventDefault();
+        void recallPrompt(step, scope, ta.value, direction);
+        return;
+      }
+    }
+
     if (shouldSendComposerOnEnter(e, coarsePointer)) {
       e.preventDefault();
       sendMessage();
+    }
+  }
+
+  async function recallPrompt(step: { entry: Message } | { text: string }, scope: string, draft: string, direction: -1 | 1) {
+    const revision = promptHistoryRevision.current;
+    const release = 'entry' in step ? holdTimelineMessages([step.entry]) : () => {};
+    promptHistoryReading.current = true;
+    try {
+      const message = 'entry' in step ? await readTimelineMessage(step.entry) : null;
+      const text = message ? displayImageMarkers(message.parts.filter(part => part.kind === 'text')
+        .map(part => part.text).join('\n'), message.images) : ('text' in step ? step.text : '');
+      const ta = textareaRef.current;
+      if (!ta || composingRef.current || revision !== promptHistoryRevision.current || ta.value !== draft
+        || scope !== `${activeIdRef.current ?? ''}/${sessionGenerationRef.current}`) return;
+      if ('entry' in step) promptHistoryRef.current.accept(text);
+      setInput(text);
+      setSlashOpen(false);
+      setAtOpen(false);
+      requestAnimationFrame(() => {
+        if (ta.value !== text || revision !== promptHistoryRevision.current
+          || scope !== `${activeIdRef.current ?? ''}/${sessionGenerationRef.current}`) return;
+        // Stay at the appropriate boundary so repeated arrows can keep browsing.
+        const position = direction < 0 && text.includes('\n') ? 0 : text.length;
+        ta.setSelectionRange(position, position);
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+      });
+    } catch {
+      // Never recall an archive preview as if it were the person's full prompt.
+      promptHistoryRef.current.reset();
+    } finally {
+      release();
+      promptHistoryReading.current = false;
     }
   }
 
@@ -3358,6 +3587,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // input event (composition drafts included) so state always mirrors the DOM;
   // Preact's equal-value check then never writes the pre-edit buffer back.
   function commitComposerInput(ta: HTMLTextAreaElement) {
+    promptHistoryRef.current.reset();
+    promptHistoryRevision.current++;
     const val = ta.value;
     setInput(val);
     ta.style.height = 'auto';
@@ -3554,9 +3785,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const searchTrim = search.trim().toLowerCase();
   // 不过滤时间线，而是展示完整消息流
   const liveFrom = historyDisplay.active ? historyDisplay.liveStart : 0;
-  const range = boundedTimelineRange(messages, limits.mounted, timelineStart, limits.pageBytes);
-  const page = useTimelinePage(messages, historyDisplay.showLive ? Math.max(liveFrom, range.start) : 0,
-    historyDisplay.showLive ? range.end : 0, readTimelineMessage);
+  const processes = turnProcesses(messages, busy);
+  const timeline = groupedTimelinePage(messages, limits.mounted, timelineStart, limits.pageBytes, processes,
+    process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true);
+  const range = timeline.range;
+  const page = useTimelinePage(messages,
+    historyDisplay.showLive ? timeline.indexes.filter(index => index >= liveFrom) : [], readTimelineMessage,
+    `${sessionId}/${sessionGenerationRef.current}`);
   const visibleMessages = page.items.filter((item): item is { msg: Message; origIdx: number } => item.msg !== undefined);
   function showTimelinePage(start: number | null, preserve = false) {
     if (historyDisplay.active) {
@@ -3573,7 +3808,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           && item.node.getBoundingClientRect().top < line + viewport.clientHeight);
       const anchor = before ? candidates[0] : candidates[candidates.length - 1];
       if (anchor?.node) timelineAnchorRef.current = { index: anchor.index, top: anchor.node.getBoundingClientRect().top,
-        start: start ?? Math.max(0, messages.length - limits.mounted), before };
+        start: groupedTimelinePage(messages, limits.mounted, start, limits.pageBytes, processes,
+          process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true).range.start, before };
     } else timelineAnchorRef.current = null;
     timelineIgnoreScrollRef.current = performance.now() + 500;
     setTimelineStart(start);
@@ -3589,15 +3825,58 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     timelineScrollRef.current = viewport.scrollTop;
     timelineIgnoreScrollRef.current = performance.now() + 500;
     timelineAnchorRef.current = null;
-  }, [range.start, page.loading]);
+  }, [range.start, range.end, timelineStart, page.loading]);
+  async function loadServerHistory(retry = false) {
+    const id = activeIdRef.current;
+    const cursor = serverHistory.cursor;
+    const project = activeSession?.project_hash;
+    if (!id || id !== serverHistory.session || !cursor || !project || serverHistoryRequest.current
+      || (!retry && serverHistoryError?.session === id)) return;
+    setServerHistoryError(null);
+    const generation = sessionGenerationRef.current;
+    const controller = new AbortController();
+    serverHistoryRequest.current = controller;
+    setServerHistoryLoading(true);
+    try {
+      const detail = await getSessionPage(project, id, controller.signal, cursor);
+      if (controller.signal.aborted || generation !== sessionGenerationRef.current || activeIdRef.current !== id) return;
+      const older = segmentMessages(sessionMessagesToDisplay(detail.messages, false));
+      const viewport = scrollRef.current;
+      const node = matchRefs.current[range.start];
+      if (viewport && node?.isConnected) timelineAnchorRef.current = {
+        index: range.start + older.length, top: node.getBoundingClientRect().top,
+        start: older.length + range.start, before: true,
+      };
+      atBottomRef.current = false;
+      setTimelineStart(older.length + timeline.windowStart);
+      setMessages(current => [...older, ...current]);
+      setServerHistory({ session: id, cursor: detail.history_older, baseline: serverHistoryRef.current.baseline });
+    } catch (error) {
+      if (!controller.signal.aborted && generation === sessionGenerationRef.current && activeIdRef.current === id) {
+        setServerHistoryError({ session: id, expired: error instanceof ApiCallError && error.status === 409 });
+      }
+    } finally {
+      if (serverHistoryRequest.current === controller) {
+        serverHistoryRequest.current = null;
+        setServerHistoryLoading(false);
+      }
+    }
+  }
   function pageTimeline(direction: number) {
     if (page.loading || (historyDisplay.active && !historyDisplay.showLive) || performance.now() < timelineIgnoreScrollRef.current) return;
     const viewport = scrollRef.current;
     if (!viewport) return;
     if (direction < 0 && viewport.scrollTop <= 80 && range.start > liveFrom) {
       showTimelinePage(adjacentTimelineStart(messages, range, -1, limits.mounted, limits.pageBytes, liveFrom), true);
+    } else if (direction < 0 && viewport.scrollTop <= 80 && range.start === 0) {
+      void loadServerHistory();
     } else if (direction > 0 && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 80 && range.end < messages.length) {
-      showTimelinePage(adjacentTimelineStart(messages, range, 1, limits.mounted, limits.pageBytes), true);
+      let next = adjacentTimelineStart(messages, range, 1, limits.mounted, limits.pageBytes);
+      const candidate = groupedTimelinePage(messages, limits.mounted, next, limits.pageBytes, processes,
+        process => Boolean(searchTrim) || processExpanded[`${activeIdRef.current ?? sessionId}/${process.key}`] === true);
+      // An overlap inside the same collapsed group cannot advance the page.
+      if (candidate.range.end <= range.end && candidate.range.start <= range.start) next = range.end;
+      showTimelinePage(next, true);
     }
   }
   function onTimelineScroll() {
@@ -3605,7 +3884,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const direction = top - timelineScrollRef.current;
     timelineScrollRef.current = top;
     recomputeAtBottom(); updateActiveTurn();
-    if (direction) pageTimeline(direction);
+    // Native clamping, anchoring and restoration also emit scroll events.
+    // Only an active scrollbar drag may turn those events into pagination.
+    if (direction && timelineScrollbarDragRef.current) pageTimeline(direction);
   }
   async function copyAssistantTurn(index: number): Promise<string> {
     const snapshot = messagesRef.current;
@@ -3634,24 +3915,47 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     new Set(pendingSteers.filter(steer => steer.confirmed).map(steer => steer.id))), [messages, pendingSteers]);
   function updateActiveTurn() {
     const el = scrollRef.current;
-    if (!el || navTurns.length === 0) return;
+    if (!el || page.loading || navTurns.length === 0) return;
+    // At the end of the live timeline, short replies may leave several older
+    // turns above the latest one. The bottom means the latest turn, regardless
+    // of which older prompt happens to intersect the top reading line.
+    if ((!historyDisplay.active || historyDisplay.showLive) && range.end === messages.length
+      && el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK) {
+      setActiveNavIndex(navTurns.length - 1);
+      return;
+    }
     const readingLine = el.getBoundingClientRect().top + 48;
     // Offscreen user anchors are intentionally unmounted. Only measure the
     // bounded visible slice; Infinity placeholders are not a sorted DOM index.
-    let index = Math.max(0, navTurns.findIndex(turn => turn.endIndex >= range.start));
-    for (let i = index; i < navTurns.length && navTurns[i].messageIndex < range.end; i++) {
+    const spans: { index: number; bottom: number }[] = [];
+    const start = Math.max(0, navTurns.findIndex(turn => turn.endIndex >= range.start));
+    for (let i = start; i < navTurns.length && navTurns[i].messageIndex < range.end; i++) {
       const turn = navTurns[i];
-      let node: HTMLElement | null | undefined;
+      let bottom: number | undefined;
       for (let j = Math.max(range.start, turn.messageIndex); j <= Math.min(range.end - 1, turn.endIndex); j++) {
-        const candidate = matchRefs.current[j];
-        if (candidate?.isConnected) { node = candidate; break; }
+        const node = matchRefs.current[j];
+        if (node?.isConnected) bottom = Math.max(bottom ?? -Infinity, node.getBoundingClientRect().bottom);
       }
-      if (node && node.getBoundingClientRect().top <= readingLine) index = i;
+      if (bottom !== undefined) spans.push({ index: i, bottom });
     }
-    setActiveNavIndex(previous => previous === index ? previous : index);
+    const index = turnAtReadingSpan(spans, readingLine);
+    if (index !== null) setActiveNavIndex(previous => previous === index ? previous : index);
   }
   function interactWithTimeline(event: Event) {
-    if (timelineStart === null && !atBottomRef.current) setTimelineStart(range.start);
+    processReadIntent.current = true;
+    if (timelineStart === null && !atBottomRef.current) setTimelineStart(timeline.windowStart);
+    if (event.type === 'pointerdown') {
+      timelineScrollbarDragRef.current = event.target === scrollRef.current
+        && (event as PointerEvent).pointerType === 'mouse';
+    }
+    if (event.type === 'keydown') {
+      const key = event as KeyboardEvent;
+      const editing = (key.target as Element | null)?.closest('input, textarea, select, [contenteditable="true"]');
+      if (!editing && !key.ctrlKey && !key.metaKey && !key.altKey) {
+        if (['ArrowUp', 'PageUp', 'Home'].includes(key.key)) pageTimeline(-1);
+        if (['ArrowDown', 'PageDown', 'End'].includes(key.key)) pageTimeline(1);
+      }
+    }
     if (event.type === 'wheel') pageTimeline((event as WheelEvent).deltaY);
     if (event.type === 'touchstart') timelineTouchRef.current = (event as TouchEvent).touches[0]?.clientY ?? null;
     if (event.type === 'touchmove') {
@@ -3681,6 +3985,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   }
   function navigateTurn(messageIndex: number) {
+    // Resetting the live window can itself scroll before its anchor is mounted.
+    // Archive paging must ignore both this reflow and the subsequent smooth jump.
+    timelineIgnoreScrollRef.current = performance.now() + 800;
     const generation = sessionGenerationRef.current;
     setTimelineStart(targetTimelineStart(messages, messageIndex, limits.mounted, limits.pageBytes));
     setHistoryTarget(null); setHistoryReset(value => value + 1);
@@ -3706,9 +4013,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return () => { if (navFlashTimer.current) clearTimeout(navFlashTimer.current); };
   }, [navigationScope]);
   useEffect(() => {
+    // A page swap or process collapse can replace the visible turn without a
+    // scroll event (especially when it fits in the viewport). Wait for hydrated
+    // content and measure the new DOM instead of leaving the old rail marker.
+    if (page.loading) return;
     const frame = requestAnimationFrame(updateActiveTurn);
     return () => cancelAnimationFrame(frame);
-  }, [navTurns, navigationScope]);
+  }, [navTurns, navigationScope, range.start, range.end, page.loading, processExpanded, searchTrim]);
 
   useEffect(() => {
     if (navHighlight === null || page.loading) return;
@@ -3832,7 +4143,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
-  const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
+  const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) || Boolean(loopProgress?.recovery);
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError || currentTurnModel || (!sync && busy && provider !== runtimeModel?.provider) ? ' has-input-detail' : '')}>
       {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
@@ -3927,7 +4238,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               type="button"
               title={item.description || ''}
             >
-              <span class="slash-name">/{item.name}</span>
+              <span class="slash-name">{item.display_name ? `${item.display_name} · /${item.name}` : `/${item.name}`}</span>
               {item.description && <span class="slash-desc">{item.description}</span>}
             </button>
           ))}
@@ -3987,9 +4298,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               {(tokens.total / 1000).toFixed(1)}k tokens
             </span>
           )}
-          {summaryCount != null && summaryCount > 0 && (latestSummaryIndex >= 0
-            ? <button class="footer-tokens footer-summary-count" type="button" onClick={() => navigateTurn(latestSummaryIndex)}>{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</button>
-            : <span class="footer-tokens">{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</span>)}
         </div>
         <div class="input-footer-actions">
           {/* 只有在安卓宿主里才有识别器可借；桌面隐藏，而不是放个点了没反应的按钮。 */}
@@ -4093,6 +4401,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         ) : (
           <span class="input-cwd-path muted">{t('header.noCwd')}</span>
         )}
+        <GitBranch cwd={cwd || ''} />
         <span class="input-cwd-chevron">▾</span>
       </button>
       <span class="input-hint">
@@ -4130,10 +4439,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // Uses onDecide to call /live/permission instead of /chat/permission.
   const livePermissionCard = livePending && (
     <PermissionCard
-      key={`live:${livePending.call_id}`}
+      key={`live:${livePending.approval_id}`}
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments, allow_all_bash: livePending.allow_all_bash, project_rule: livePending.project_rule }}
-      onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id))}
-      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id); if (!result.accepted) throw new Error(t('perm.requestExpired')); }}
+      onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id, livePending.approval_id))}
+      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); if (!result.accepted) throw new Error(t('perm.requestExpired')); }}
     />
   );
 
@@ -4141,9 +4450,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // same composer seat as `/live` interactions.
   const chatPermissionCard = pendingPermission && (
     <PermissionCard
-      key={`chat:${pendingPermission.session_id}:${pendingPermission.call_id}`}
+      key={`chat:${pendingPermission.session_id}:${pendingPermission.approval_id ?? pendingPermission.call_id}`}
       req={pendingPermission}
-      onDone={() => onPermissionResolved?.(pendingPermission.call_id)}
+      onDone={() => onPermissionResolved?.(pendingPermission.call_id, pendingPermission.approval_id)}
     />
   );
 
@@ -4199,7 +4508,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     return <>
       {sessionSwitchNotice && <div class="session-browse-notice session-switch-notice" role="status">
         <span>{sessionSwitchNotice}</span>
-        <button onClick={() => setSessionSwitchNotice(null)} aria-label={t('attach.dismissError')}>×</button>
+        {switchRetryTarget && sessionSwitchNotice === t('browse.switchBusy') && <button
+          disabled={busy || blockingInteraction != null}
+          onClick={() => onSessionId(switchRetryTarget)}>{t('browse.retrySwitch')}</button>}
+        <button onClick={() => { setSessionSwitchNotice(null); setSwitchRetryTarget(null); }} aria-label={t('attach.dismissError')}>×</button>
       </div>}
       {view}{createPortal(blockingInteraction, interactionHost)}
     </>;
@@ -4241,19 +4553,36 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
   if (browseSession) {
     const target = activeSession?.name || sessionId || '';
+    const localBusy = busy || hasBlockingInteraction;
+    // Held by another runtime: only a copy can be continued here.
+    const held = browseActivity ?? null;
+    const description = held === 'running' ? t('browse.heldRunning')
+      : held === 'waiting' ? t('browse.heldWaiting')
+      : held === 'open' ? t('browse.heldOpen')
+      : t(localBusy ? 'browse.background' : 'browse.ready', { name: target });
     return withInteraction(<>
-      <div class="session-browse-notice" role="status">
-        <div class="session-browse-summary">
-          <span class="session-browse-label">{t('browse.label')}</span>
-          <strong class="session-browse-title" title={browseSession.name}>{browseSession.name}</strong>
-          <span class="session-browse-description">{t(busy || hasBlockingInteraction ? 'browse.background' : 'browse.ready', { name: target })}</span>
-        </div>
-        <div class="session-browse-actions">
-          <button class="session-browse-return" onClick={onReturnToBound}>{t(busy || hasBlockingInteraction ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
-          {!busy && !hasBlockingInteraction && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession}
+        live={held === 'running' || held === 'waiting'}
+        renderMessages={(raw, viewport, executing) => <BrowseMessagesView messages={sessionMessagesToDisplay(raw, false)}
+          sessionId={browseSession.id} cwd={browseSession.working_dir || cwd} viewport={viewport} executing={executing}
+          activity={held === 'waiting' ? 'waiting' : held === 'running' ? 'running' : 'syncing'} />} />
+      <div class="input-container session-browse-composer">
+        <div class="session-browse-notice session-browse-card" role="status">
+          <svg class="session-browse-lock" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <rect x="5" y="10" width="14" height="11" rx="3" /><path d="M8 10V7a4 4 0 0 1 8 0v3" />
+          </svg>
+          <div class="session-browse-summary">
+            <strong class="session-browse-label">{t('browse.label')}</strong>
+            <span class="session-browse-description">{description}</span>
+            {browseForkError && <span class="session-browse-description" role="alert">{browseForkError}</span>}
+          </div>
+          <div class="session-browse-actions">
+            <button class="session-browse-return" onClick={onReturnToBound}>{t(localBusy ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
+            {!localBusy && held && <button class="session-browse-continue" disabled={browseForking} onClick={onForkBrowse}>{t('browse.forkContinue')}</button>}
+            {!localBusy && !held && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+          </div>
         </div>
       </div>
-      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession} />
       {blockingInteraction && <div class="interaction-dock-seat" ref={interactionSeat} aria-label={target}></div>}
     </>);
   }
@@ -4309,12 +4638,21 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         onPointerDown={interactWithTimeline}
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
+        <HistoryLoading active={serverHistoryLoading} />
+        {serverHistoryError?.session === serverHistory.session && <div class="history-page-error" role="status">
+          <span>{t(serverHistoryError.expired ? 'chat.historyChanged' : 'chat.historyPageFailed')}</span>
+          <button onClick={() => serverHistoryError.expired ? window.location.reload() : void loadServerHistory(true)}>
+            {t(serverHistoryError.expired ? 'chat.historyRefresh' : 'chat.historyRetry')}
+          </button>
+        </div>}
+
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
           projectHash={activeSession.project_hash} sessionId={sessionId} messages={messages} reset={historyReset}
-          canLoadBefore={historyDisplay.active || range.start <= liveFrom} compact={compactTimeline}
+          canLoadBefore={!serverHistory.cursor && (historyDisplay.active || range.start <= liveFrom)} compact={compactTimeline}
           focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null}
           viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onNavigate={navigateNode}
+          isNavigating={() => performance.now() < timelineIgnoreScrollRef.current}
           onWindow={(active, showLive, liveStart) => {
             setHistoryDisplay({ active, showLive, liveStart });
             if (!active) setActiveHistoryTurn(null);
@@ -4323,10 +4661,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           renderTurn={(turn, onEdges) => <HistoricalTurnView turn={turn} compact={compactTimeline} sessionId={sessionId} cwd={cwd} search={search}
             viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onEdges={onEdges} />}
         />}
-        {historyDisplay.showLive && range.start > liveFrom && <div class="timeline-history-status">
-          <button onClick={() => showTimelinePage(Math.max(liveFrom, boundedTimelineRange(messages.slice(0, range.start), limits.mounted, null, limits.pageBytes).start))}>{t('chat.historyLoadPrevious')}</button>
-        </div>}
-        {page.loading && <div class="timeline-history-status" role="status">{t('chat.historyLoading')}</div>}
+
+        <HistoryLoading active={page.loading} />
         {(page.error || timelineSearch.error) && <div class="timeline-history-status" role="alert">{t('chat.historyFailed')}<button onClick={page.retry}>{t('chat.historyRetry')}</button></div>}
         {messages.length === 0 && !historyHint && awaitingConversation && (
           <div class="messages-empty">
@@ -4348,10 +4684,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         {(() => {
           const assistantTurnEnds = assistantTurnEndFlags(messages.map((message) => message.role));
           const turnArtifacts = artifactsByAssistantIndex(messages);
+          const firstVisible = new Map<string, number>();
+          const visibleIndexes = new Set(visibleMessages.map(item => item.origIdx));
+          for (const { origIdx } of visibleMessages) {
+            const process = processes.get(origIdx);
+            if (process && !firstVisible.has(process.key)) firstVisible.set(process.key, origIdx);
+          }
 
           return visibleMessages.map(({ msg, origIdx }) => {
             const isLast = origIdx === lastIdx;
-            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
+            const setMatchRef = (el: HTMLElement | null) => {
+              matchRefs.current[origIdx] = el;
+              if (el && msg.turnAnchorId) el.dataset.turnAnchor = msg.turnAnchorId;
+              else if (el) delete el.dataset.turnAnchor;
+            };
             const timeLabel = formatMsgTime(msg.ts);
             const isActiveSearchMatch = origIdx === navHighlight || (searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false);
 
@@ -4366,7 +4712,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                   isActiveSearchMatch={isActiveSearchMatch}
                   steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
                   onSpec={()=>void chooseMessageSpec(msg)}
-                  specDisabled={busy||specActionBusy||!msg.sourceSeq}
+                  specDisabled={busy||specActionBusy}
+                  onEdit={() => {
+                    setInput(current => [messageText(msg), current].filter(Boolean).join('\n'));
+                    if (msg.images?.length) setPendingImages(current => [...msg.images!, ...current]);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
                 />
               );
             }
@@ -4388,10 +4739,22 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             // copy/time controls and system notices remain transparent.
             const isLastInTurn = assistantTurnEnds[origIdx] === true;
 
+            const process = processes.get(origIdx);
+            const processKey = process ? `${activeIdRef.current ?? sessionId}/${process.key}` : '';
+            const canFold = process?.foldable && visibleIndexes.has(process.last) && !searchTrim;
+            const expanded = !canFold || processExpanded[processKey] === true;
+            const toggle = process && canFold && firstVisible.get(process.key) === origIdx
+              ? <TurnProcessToggle process={process} expanded={expanded}
+                  onToggle={() => setProcessExpanded(prev => ({ ...prev, [processKey]: !expanded }))} /> : null;
+            if (!expanded && process && origIdx !== process.last) {
+              return <Fragment key={origIdx}>{toggle}</Fragment>;
+            }
+            const finalOnly = process && (!expanded || (origIdx === process.last && !timeline.processIndexes.has(origIdx)));
+            const summary = finalOnly ? processSummary(msg) : undefined;
+            const displayMessage = summary ? { ...msg, parts: summary.hasAnswer ? msg.parts.slice(summary.finalStart) : [] } : msg;
             return (
-              <AssistantMessageView
-                key={origIdx}
-                msg={msg}
+              <Fragment key={origIdx}>{toggle}<AssistantMessageView
+                msg={displayMessage}
                 isLast={isLast}
                 busy={busy}
                 lastIdx={lastIdx}
@@ -4405,16 +4768,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
                 pollGroups={pollGroups}
-              />
+              /></Fragment>
             );
           });
         })()}
 
         {historyDisplay.showLive && compacting && <div class="msg-notice context-summary-note" role="status">{t('context.summarizing')}</div>}
-        {historyDisplay.showLive && range.end < messages.length && <div class="timeline-history-status">
-          <button onClick={() => showTimelinePage(range.end)}>{t('chat.historyLoadNext')}</button>
-          <button onClick={() => showTimelinePage(null)}>{t('chat.timelineLatest')}</button>
-        </div>}
+
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
         {historyDisplay.showLive && queued.map((q) => (
           <div
@@ -4424,13 +4784,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             aria-label={t('chat.queued')}
           >
             <div class="user-message-bubble">
-              {q.images && q.images.length > 0 && (
-                <div class="msg-images">
-                  {q.images.map((img, i) => (
-                    <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
-                  ))}
-                </div>
-              )}
+              <MessageImages images={q.images} />
               <div class="queued-head">
                 <span class="queued-tag">{t('chat.queued')}</span>
                 <button
@@ -4442,7 +4796,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                   ×
                 </button>
               </div>
-              {q.text}
+              {displayImageMarkers(q.text, q.images)}
             </div>
           </div>
         ))}
@@ -4455,7 +4809,6 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           </div>
         )}
 
-        <div />
         </div>
         {/* Zero-height sticky seat, following Harness: the control belongs to the
             conversation scroller and is centered on the same content lane. */}
@@ -4474,7 +4827,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       </div>
 
       <TurnNavRail key={`${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`}
-        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={activeHistoryTurn}
+        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={atBottomRef.current ? null : activeHistoryTurn}
         projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined}
         sessionId={sessionId ?? undefined} streaming={busy}
         onNavigate={navigateTurn} onHistory={navigateHistoricalTurn} />
@@ -4577,13 +4930,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       )}
       <div class="input-container">
         {goalProgress?.recovery && (
-          <div class="goal-recovery-status" role="status" aria-live="polite">
-            {t(goalProgress.recovery.retry_in_secs === 0 ? 'goal.recovery.running' : goalProgress.recovery.kind === 'evaluator' ? 'goal.recovery.evaluator' : 'goal.recovery.provider', {
-              attempt: goalProgress.recovery.attempt,
-              max: goalProgress.recovery.max_attempts,
-              secs: goalProgress.recovery.retry_in_secs,
-            })}
-          </div>
+          <GoalRecoveryStatus recovery={goalProgress.recovery} sampledAt={goalSampledAt} />
+        )}
+        {loopProgress?.recovery && (
+          <GoalRecoveryStatus recovery={loopProgress.recovery} sampledAt={loopSampledAt} kind="loop" />
         )}
         {goalProgress?.phase === 'paused_at_cap' && !goalProgress.recovery && (
           <div class="goal-recovery-status" role="status">{t('goal.recovery.paused')} {goalProgress.last_reason}</div>
@@ -4663,10 +5013,79 @@ function TodoProgressPanel({ items, projectHash, sessionId, sourceRevision }: { 
   );
 }
 
-/** Render an assistant message's ordered parts in chronological order: each
- *  text run becomes Markdown; runs of consecutive tool calls share one
- *  `.tool-list` container. This is what preserves the text→tool→text→tool
- *  interleaving (matching the TUI) instead of grouping all tools at the head. */
+/** Display history with the live message components, without projecting runtime state. */
+function BrowseMessagesView({ messages, sessionId, cwd, viewport, executing, activity }: {
+  messages: Message[]; sessionId: string; cwd: string; viewport: () => HTMLElement | null;
+  executing: boolean; activity: 'running' | 'waiting' | 'syncing';
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [active, setActive] = useState(0);
+  const refs = useRef<(HTMLElement | null)[]>([]);
+  const turns = deriveTurnNavigation(messages);
+  const processes = turnProcesses(messages, executing);
+  const current = browseActiveTurn(messages, executing);
+  const ends = assistantTurnEndFlags(messages.map(message => message.role));
+  const artifacts = artifactsByAssistantIndex(messages);
+  const polls = groupEmptyPolls(messages);
+  function updateActive() {
+    const el = viewport();
+    if (!el || !turns.length) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 2) {
+      setActive(turns.length - 1); return;
+    }
+    const line = el.getBoundingClientRect().top + 24;
+    const spans = turns.map((turn, index) => {
+      let bottom = 0;
+      for (let n = turn.messageIndex; n <= turn.endIndex; n++) {
+        const node = refs.current[n];
+        if (node?.isConnected) bottom = Math.max(bottom, node.getBoundingClientRect().bottom);
+      }
+      return { index, bottom };
+    });
+    setActive(turnAtReadingSpan(spans, line) ?? 0);
+  }
+  useLayoutEffect(() => {
+    const el = viewport(); if (!el) return;
+    const frame = requestAnimationFrame(updateActive);
+    el.addEventListener('scroll', updateActive, { passive: true });
+    const observer = new ResizeObserver(updateActive);
+    observer.observe(el); if (el.firstElementChild) observer.observe(el.firstElementChild);
+    return () => { cancelAnimationFrame(frame); el.removeEventListener('scroll', updateActive); observer.disconnect(); };
+  }, [messages, expanded]);
+  const host = viewport()?.parentElement;
+  return <>
+    {messages.map((msg, index) => {
+      const ref = (el: HTMLElement | null) => { refs.current[index] = el; };
+      // This reader only prepends older pages, so distance from the tail stays stable.
+      const key = messages.length - index;
+      if (msg.role === 'user') return <UserMessageView key={key} msg={msg} searchRef={ref}
+        timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} />;
+      const process = processes.get(index);
+      const processKey = process ? String(messages.length - process.last) : '';
+      const folded = process?.foldable && !expanded[processKey];
+      const toggle = process?.foldable && process.first === index
+        ? <TurnProcessToggle process={process} expanded={!folded}
+            onToggle={() => setExpanded(previous => ({ ...previous, [processKey]: !previous[processKey] }))} /> : null;
+      if (folded && process && index !== process.last) return <Fragment key={key}>{toggle}</Fragment>;
+      const display = folded && process ? { ...msg, parts: process.finalParts } : msg;
+      return <Fragment key={key}>{toggle}<AssistantMessageView msg={display}
+        isLast={index === messages.length - 1 || index === current.assistant} busy={executing} lastIdx={messages.length - 1}
+        isLastInTurn={ends[index]} copyText={() => {
+          const turn = turns.find(turn => index >= turn.messageIndex && index <= turn.endIndex);
+          return Promise.resolve(messages.slice(turn ? turn.messageIndex + 1 : index, index + 1)
+            .filter(message => message.role === 'assistant').map(messageFullText).join('\n\n'));
+        }} artifacts={artifacts.get(index) ?? []} sessionId={sessionId} cwd={cwd} searchRef={ref}
+        timeLabel={formatMsgTime(msg.ts)} search="" isActiveSearchMatch={false} pollGroups={polls} /></Fragment>;
+    })}
+    {executing && <BrowseActivityStatus state={activity} startedAt={current.startedAt} />}
+    {host && createPortal(<TurnNavRail items={turns} activeIndex={active} streaming={executing}
+      onNavigate={index => {
+        const el = viewport(); const node = refs.current[index];
+        if (el && node) el.scrollTo({ top: el.scrollTop + node.getBoundingClientRect().top - el.getBoundingClientRect().top - 20 });
+      }} onHistory={() => {}} />, host)}
+  </>;
+}
+
 /** A single archived user turn may itself contain thousands of tools. */
 function HistoricalTurnView({ turn, compact, sessionId, cwd, search, viewport, onBeforeRead, onEdges }: {
   turn: TranscriptTurn; compact: boolean; sessionId: string | null; cwd: string; search: string;
@@ -4676,12 +5095,16 @@ function HistoricalTurnView({ turn, compact, sessionId, cwd, search, viewport, o
   const t = useT();
   const messages = useMemo(() => segmentMessages(historyMessages(turn)), [turn]);
   const [start, setStart] = useState<number | null>(null);
+  const [processOpen, setProcessOpen] = useState(false);
+  const process = useMemo(() => turnProcesses(messages).get(messages.length - 1), [messages]);
+  const folded = Boolean(process?.foldable && !processOpen && !search.trim());
   const limits = timelineLimits(compact);
   const range = boundedTimelineRange(messages, limits.mounted, start, limits.pageBytes);
   const root = useRef<HTMLDivElement>(null);
   const ignoreUntil = useRef(0);
   const anchor = useRef<{ index: number; top: number; before: boolean } | null>(null);
   function move(direction: number, automatic = false) {
+    if (folded) return;
     if ((direction < 0 && range.start === 0) || (direction > 0 && range.end === messages.length)) return;
     if (automatic && performance.now() < ignoreUntil.current) return;
     const el = viewport(); const node = root.current;
@@ -4700,7 +5123,7 @@ function HistoricalTurnView({ turn, compact, sessionId, cwd, search, viewport, o
   }
   const moveRef = useRef(move); moveRef.current = move;
   useLayoutEffect(() => {
-    onEdges(range.start > 0, range.end < messages.length);
+    onEdges(!folded && range.start > 0, !folded && range.end < messages.length);
     const el = viewport(); const saved = anchor.current; const node = root.current;
     if (el && saved && node) {
       const keep = node.querySelector<HTMLElement>(`[data-history-segment="${saved.index}"]`);
@@ -4709,7 +5132,7 @@ function HistoricalTurnView({ turn, compact, sessionId, cwd, search, viewport, o
           : node.getBoundingClientRect().top - el.getBoundingClientRect().top);
       anchor.current = null;
     }
-  }, [range.start, range.end, messages.length]);
+  }, [range.start, range.end, messages.length, folded]);
   useEffect(() => {
     const el = viewport(); if (!el) return;
     let top = el.scrollTop; let touch: number | null = null;
@@ -4727,17 +5150,33 @@ function HistoricalTurnView({ turn, compact, sessionId, cwd, search, viewport, o
       el.removeEventListener('touchstart', touchStart); el.removeEventListener('touchmove', touchMove); onEdges(false, false); };
   }, []);
   return <div ref={root}>
-    {range.start > 0 && <div class="timeline-history-status"><button onClick={() => move(-1)}>{t('chat.historyLoadPrevious')}</button></div>}
-    {messages.slice(range.start, range.end).map((msg, offset) => <div key={range.start + offset} data-history-segment={range.start + offset}>
+    <UserMessageView msg={messages[0]} timeLabel={formatMsgTime(messages[0].ts)} search={search} isActiveSearchMatch={false} />
+    {process?.foldable && !search.trim() && <TurnProcessToggle process={process} expanded={!folded}
+      onToggle={() => setProcessOpen(value => !value)} />}
+    {folded && process ? <>
+      <AssistantMessageView msg={{ ...messages[process.last], parts: process.finalParts }} isLast={false} busy={false} lastIdx={-1}
+        isLastInTurn={true} copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
+        artifacts={[]} sessionId={sessionId} cwd={cwd} timeLabel={formatMsgTime(messages[process.last].ts)} search={search} isActiveSearchMatch={false} />
+    </> : messages.slice(range.start, range.end).map((msg, offset) => <div key={range.start + offset} data-history-segment={range.start + offset}>
       {msg.role === 'user'
-        ? <UserMessageView msg={msg} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />
+        ? null
         : <AssistantMessageView msg={msg} isLast={false} busy={false} lastIdx={-1}
             isLastInTurn={range.start + offset === messages.length - 1}
             copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
             artifacts={[]} sessionId={sessionId} cwd={cwd} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />}
     </div>)}
-    {range.end < messages.length && <div class="timeline-history-status"><button onClick={() => move(1)}>{t('chat.historyLoadNext')}</button></div>}
   </div>;
+}
+
+function TurnProcessToggle({ process, expanded, onToggle }: {
+  process: TurnProcess; expanded: boolean; onToggle: () => void;
+}) {
+  const t = useT();
+  return <button type="button" class="turn-process-toggle" aria-expanded={expanded} onClick={onToggle}>
+    <span class="turn-process-chevron" aria-hidden="true">{expanded ? '⌄' : '›'}</span>
+    <span>{t('chat.processSummary', { steps: process.steps, tools: process.tools })}</span>
+    {process.duration != null && <span class="turn-process-duration">{t('stats.duration', { duration: formatTurnDuration(process.duration) })}</span>}
+  </button>;
 }
 
 function AssistantMessageView({
@@ -4773,11 +5212,7 @@ function AssistantMessageView({
 }) {
   const t = useT();
   const text = messageText(msg);
-  const isError =
-    text.includes('[错误:') ||
-    text.includes('[连接错误:') ||
-    text.includes('[Error:') ||
-    text.includes('[Connection error:');
+  const isError = hasChatErrorNotice(text);
   const streaming = isLast && busy;
   // 三点 loading 覆盖整个回合：思考（无可见输出）和文本输出阶段都显示，
   // 直到回合结束（busy 变 false）才消失。不再使用闪烁光标。
@@ -4795,7 +5230,6 @@ function AssistantMessageView({
   // Copy button: only shown on the last assistant message in a turn.
   // Copies the entire turn's text (all assistant messages in this turn joined).
   const [copied, setCopied] = useState(false);
-  const [artifactError, setArtifactError] = useState('');
   const [copyError, setCopyError] = useState(false);
 
   function handleCopy() {
@@ -4837,7 +5271,7 @@ function AssistantMessageView({
   const groups = pollGroups ?? groupEmptyPolls(search.trim() ? [] : [msg]);
   const onlyHiddenPolls = msg.parts.every(part => part.kind === 'tool'
     ? groups.hidden.has(part.tool.id) : part.kind === 'text' && !part.text.trim());
-  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0) return null;
+  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length) return null;
 
   return (
     <div class={cls} ref={searchRef}>
@@ -4858,7 +5292,7 @@ function AssistantMessageView({
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts, search, groups)}
+          {renderAssistantParts(msg.parts, search, groups, sessionId)}
           {streaming && (
             <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
               <span class="waiting-dot" />
@@ -4869,42 +5303,14 @@ function AssistantMessageView({
         </>
       )}
       {isLastInTurn && !streaming && artifacts.length > 0 && (
-        <div class="turn-artifacts" aria-label={t('chat.artifacts')}>
-          <span class="turn-artifacts-label">{t('chat.artifacts')}</span>
-          <div class="turn-artifacts-list">
-            {artifacts.slice(0, 6).map((artifact) => (
-              <button
-                key={artifact.path}
-                type="button"
-                class="turn-artifact-chip"
-                title={artifact.path}
-                onClick={() => {
-                  setArtifactError('');
-                  // On the phone the viewer is the app shell's job: a sandboxed
-                  // daemon process cannot launch one, so `/fs/open` answers with
-                  // "open the path from the app UI" and nothing happens. Everywhere
-                  // else there is no bridge, so the workbench pane takes it and the
-                  // daemon opens the file itself if nothing else does.
-                  if (openWithHost(resolveArtifactPath(artifact.path, cwd))) return;
-                  if (sessionId) {
-                    window.dispatchEvent(new CustomEvent('workbench-open-file', { detail: { session: sessionId, path: artifact.path } }));
-                    return;
-                  }
-                  void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
-                    setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
-                  });
-                }}
-              >
-                {artifact.label}
-              </button>
-            ))}
-            {artifacts.length > 6 && (
-              <span class="turn-artifact-more">+{artifacts.length - 6}</span>
-            )}
-          </div>
-          {artifactError && <div class="turn-artifact-error" role="status">{artifactError}</div>}
-        </div>
+        <TurnArtifactsCard artifacts={artifacts} sessionId={sessionId} cwd={cwd} />
       )}
+      {!busy && msg.retryDiagnostics?.length ? (
+        <details class="provider-diagnostics">
+          <summary>{t('chat.requestDiagnostics')}</summary>
+          <pre>{msg.retryDiagnostics.join('\n')}</pre>
+        </details>
+      ) : null}
       {(copyBtn || showTimestamp) && (
         <div class="msg-actions msg-actions-left">
           {copyBtn}
@@ -4917,7 +5323,7 @@ function AssistantMessageView({
   );
 }
 
-function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups, sessionId: string | null): VNode[] {
   const out: VNode[] = [];
   let i = 0;
   while (i < parts.length) {
@@ -4956,7 +5362,7 @@ function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: Poll
       );
       i++;
     } else {
-      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} />);
+      if (p.text) out.push(<Markdown key={`tx-${i}`} content={p.text} search={search} sessionId={sessionId} />);
       i++;
     }
   }
@@ -5000,6 +5406,7 @@ function UserMessageView({
   steerPending,
   onSpec,
   specDisabled,
+  onEdit,
 }: {
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
@@ -5009,10 +5416,11 @@ function UserMessageView({
   steerPending?: boolean;
   onSpec?:()=>void;
   specDisabled?:boolean;
+  onEdit?:()=>void;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
-  const text = messageText(msg);
+  const text = displayImageMarkers(messageText(msg), msg.images);
   const skillTitle = detectSkillContent(text);
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -5024,13 +5432,7 @@ function UserMessageView({
     }).catch(() => {});
   }
 
-  const images = msg.images && msg.images.length > 0 && (
-    <div class="msg-images">
-      {msg.images.map((img, i) => (
-        <img key={i} class="msg-image" src={imageDataUrl(img)} alt="" />
-      ))}
-    </div>
-  );
+  const images = <MessageImages images={msg.images} />;
 
   const copyBtn = (
     <button
@@ -5052,8 +5454,12 @@ function UserMessageView({
     </button>
   );
 
-  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={!msg.sourceSeq?t('spec.awaitSaved'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
+  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={specDisabled?t('spec.running'):!msg.sourceSeq?t('spec.manage'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
     <svg width="14" height="14" viewBox="0 0 16 16" fill={msg.specPinned?'currentColor':'none'} aria-hidden="true"><path d="m5 2 6 0-1 4 3 3H9v4l-1 2-1-2V9H3l3-3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+  </button>;
+  const editBtn = onEdit && <button type="button" class="msg-copy-btn" onClick={onEdit}
+    title={t('chat.editMessageHint')} aria-label={t('chat.editMessage')}>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m10 2 4 4-8 8H2v-4Z M8 4l4 4" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
   </button>;
   const wrapperClass = 'user-message-wrapper'
     + (isActiveSearchMatch ? ' is-active-search-match' : '')
@@ -5081,8 +5487,8 @@ function UserMessageView({
         </button>
         {steerBadge}
         <div class="msg-actions">
-          {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-          {copyBtn}{specButton}
+          {timeLabel && <div class="msg-time msg-time-user" title={timeLabel}>{formatMsgTime(msg.ts, true) || timeLabel}</div>}
+          {copyBtn}{editBtn}{specButton}
         </div>
       </div>
     );
@@ -5103,8 +5509,8 @@ function UserMessageView({
         {skillTitle ? <Markdown content={text} search={search} /> : highlightText(text, search)}
       </div>
       <div class="msg-actions">
-        {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-        {copyBtn}{specButton}
+        {timeLabel && <div class="msg-time msg-time-user" title={timeLabel}>{formatMsgTime(msg.ts, true) || timeLabel}</div>}
+        {copyBtn}{editBtn}{specButton}
       </div>
       {steerBadge}
     </div>
@@ -5282,7 +5688,8 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
   }
 
   if (background) annotation = { cls: background.cls, label: t(background.label, background.params) };
-  const hasDetail = calls.some(call => Boolean(call.args || call.output));
+  const imageCount = calls.reduce((count, call) => count + (call.images?.length ?? 0), 0);
+  const hasDetail = calls.some(call => Boolean(call.args || call.output || call.images?.length));
 
   return (
     <div class="tool-body">
@@ -5291,6 +5698,7 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
         <span class="tool-name">{background?.title ? t(background.title) : displayToolName(tool.name)}</span>
         <span class="tool-name-secondary">{abbreviateArgs(background?.detail ?? tool.detail ?? formatToolDetail(tool.name, tool.args))}</span>
         {calls.length > 1 && <span class="tool-poll-count">{t('tool.pollCount', { n: calls.length })}</span>}
+        {imageCount > 0 && <span class="tool-poll-count">{t('tool.images', { n: imageCount })}</span>}
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>
             <ToolStatusIcon cls={annotation.cls} />
@@ -5318,6 +5726,12 @@ function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow
               <div key={`${call.id}-output`} class="tool-body-row">
                 <div class="tool-body-row-label">{t('tool.output')}</div>
                 <div class="tool-body-row-content">{call.output}</div>
+              </div>
+            ),
+            Boolean(call.images?.length) && (
+              <div key={`${call.id}-images`} class="tool-body-row">
+                <div class="tool-body-row-label">{t('tool.images', { n: call.images!.length })}</div>
+                <MessageImages images={call.images} />
               </div>
             ),
           ])}

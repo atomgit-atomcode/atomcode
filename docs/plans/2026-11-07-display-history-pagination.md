@@ -1,0 +1,18 @@
+# Display history pagination implementation plan
+
+**Goal:** TUI and WebUI initially obtain recent display history and fetch older history on demand, without changing runtime recovery, model context or persistent session format.
+**Architecture:** TUI uses a pure event-log page selector with whole-turn sequence ranges and snapshot cursors. WebUI windows its existing message display projection at human-input boundaries, with a content-validated prefix cursor. The native log stays authoritative. Display cursors bind session identity and a fixed high-water mark; historical mutations invalidate cursors, ordinary appends do not. Host-local reads serve TUI; authenticated project-scoped daemon reads serve WebUI. Subscriptions start after the initial page high-water mark so initial history and live facts have no gap or duplicate.
+**Tech Stack:** Rust native session events, existing host control, TUI transcript producer, Preact WebUI history windows, nextest and existing WebUI tests.
+
+Baseline: release/v5.2.7 7aa3885ea; clean main worktree at start. Develop in /tmp/atomcode-display-history-pagination. No commits or pushes without instruction.
+
+1. Implement and test shared neutral whole-turn paging, bounded requested sizes, consistent snapshot pagination, session/cursor validation, stale cursor rejection after rewind/undo/rewrite/compaction, append-safe continuation and oversized single-turn behavior.
+2. Add read-only display page host operation. TUI initial bootstrap must preserve display state (todos, cumulative stats, title, retention/undo markers and skill history) separately from old transcript bodies. Initial read then subscribe from high-water + 1. Fall back for hosts without paging; preserve explicit full-history setting.
+3. Add TUI asynchronous page state bound to view generation, one in-flight request, stale response rejection, retryable error, and older transcript prepend through an isolated producer without rebuilding live tools, pending input or current sidebar state. Keep scroll anchors and deduplicate sequences.
+4. Add opt-in paged session detail and history route in WebUI. Initial detail and live snapshot must both be bounded; omitted older payload remains fetchable. Reuse browser display windows and caches, preserve whole tool groups and bind loads to the session/generation.
+5. Test large histories, calls/results spanning model rounds, active appends during fetch, switch/cancel, stale mutations, replay controls, current todos/stats, live streaming continuity, image attachments, scroll anchors and no writes to the source log.
+6. Run relevant crate/UI tests, compile gate, format and lock checks. Measure payload/loaded-event reduction on a synthetic long session; do not claim backend full-read savings. Record any remaining single-turn and runtime replay costs.
+
+Ownership and failure semantics: CodingRuntime remains the sole runtime owner. Display reads may only inspect already committed native facts; cannot resume, mutate, freshen or compact a session. Cursor failures are explicit, never empty-success history. Kernel changes are limited to neutral in-memory page vocabulary/helpers, not coding lifecycle or storage. No disk indexes, sidecars or migrations are introduced.
+
+Implementation note: WebUI uses a projection cursor rather than the event cursor because its initial HTTP and live snapshots expose the current conversation projection (including legacy sessions). Its existing native transcript reader continues to supply compacted original history. Export and full-data API callers retain the unpaged contract. Development branch shortened to feat/history so a branch badge does not truncate the fixed-width readiness test fixture.

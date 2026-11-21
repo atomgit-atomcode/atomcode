@@ -79,8 +79,8 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
     ContentHash(h)
 }
 
-/// The part of the terminal's capabilities a block may see: **only the bits that
-/// decide shape or existence.**
+/// The terminal capabilities and display policy a block may see: **only the
+/// bits that decide shape or existence.**
 ///
 /// No `palette`. Colour is not a block's to decide — a block writes
 /// `Color::Role(Role)` and [`crate::ansi::encode_with`] resolves it on the way
@@ -95,6 +95,8 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
 /// yes, add it here (and to the caches, which key on this); no, leave it out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShapeCaps {
+    /// Display policy that changes diff row geometry, independent of hardware.
+    pub wrap_diff: bool,
     pub unicode: bool,
     /// See [`crate::caps::Caps::basic_glyphs`].
     pub basic_glyphs: bool,
@@ -115,11 +117,17 @@ impl ShapeCaps {
     pub fn of(caps: &crate::caps::Caps) -> Self {
         Self {
             unicode: caps.unicode,
+            wrap_diff: true,
             basic_glyphs: caps.basic_glyphs,
             colors: caps.colors,
             cell_background: caps.cell_background,
             graphics: caps.graphics,
         }
+    }
+
+    pub fn with_diff_wrap(mut self, enabled: bool) -> Self {
+        self.wrap_diff = enabled;
+        self
     }
 
     /// A decorative glyph as *this* terminal writes it.
@@ -226,6 +234,11 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// (where a `[Image #N]` marker can appear) overrides this.
     fn image_markers(&self) -> Vec<usize> {
         Vec::new()
+    }
+
+    /// A result picture opened by the reader; never a composer attachment.
+    fn result_image(&self) -> Option<&atomcode_kernel::message::ImageContent> {
+        None
     }
 
     /// One line standing in for the whole block when it is folded.
@@ -458,14 +471,17 @@ impl Slot {
     }
 }
 
-/// The append-only sequence a person reads.
+/// The sequence a person reads. Live blocks append; settled historical pages
+/// may be prepended without changing existing block identities.
 ///
-/// Positions are assigned on `open` and never move. Several slots may be `Live`
+/// Block identities are assigned on `open` and never change. Several slots may be `Live`
 /// at once (parallel tool calls) and they may settle in any order.
 #[derive(Debug, Default)]
 pub struct Stream {
     slots: Vec<Slot>,
     next_id: AtomicU64,
+    positions: Option<std::collections::HashMap<BlockId, usize>>,
+    opening: Option<BlockId>,
 }
 
 impl Stream {
@@ -473,7 +489,90 @@ impl Stream {
         Self::default()
     }
 
-    /// Everything, in emission order.
+    /// An isolated historical renderer allocates above existing IDs, so live
+    /// producers can keep amending their original blocks after a prepend.
+    pub(crate) fn history_buffer(&self) -> Self {
+        Self {
+            slots: Vec::new(),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::SeqCst)),
+            positions: Some(Default::default()),
+            opening: None,
+        }
+    }
+
+    pub(crate) fn has_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    /// One presentation-only opener per view, even if history arrived first.
+    pub(crate) fn prepend_opening(&mut self, opening: Self) {
+        assert!(self.opening.is_none());
+        assert_eq!(opening.slots.len(), 1);
+        let id = opening.slots[0].block().id;
+        self.prepend_history(opening);
+        self.opening = Some(id);
+    }
+
+    /// Replace the presentation-only opener. Its position and ID remain stable
+    /// while its settled row cache is replaced along with its contents.
+    pub(crate) fn replace_opening(&mut self, content: Arc<dyn Content>) -> bool {
+        let Some(index) = self.opening.and_then(|id| self.position_of(id)) else {
+            return false;
+        };
+        let previous = self.slots[index].block();
+        self.slots[index] = Slot::Settled(Settled::new(Arc::new(Block {
+            id: previous.id,
+            at: previous.at,
+            producer: previous.producer,
+            content,
+        })));
+        true
+    }
+
+    /// Insert read-only history below the opener, preserving live block IDs.
+    pub(crate) fn prepend_history(&mut self, mut older: Self) {
+        assert!(older.slots.iter().all(Slot::is_settled));
+        self.next_id
+            .fetch_max(older.next_id.load(Ordering::SeqCst), Ordering::SeqCst);
+        let prefix = self
+            .opening
+            .and_then(|id| self.position_of(id))
+            .map_or(0, |i| i + 1);
+        let mut tail = self.slots.split_off(prefix);
+        self.slots.append(&mut older.slots);
+        self.slots.append(&mut tail);
+        self.positions = Some(
+            self.slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.block().id, i))
+                .collect(),
+        );
+    }
+
+    pub(crate) fn discard_seed_blocks(&mut self) {
+        self.discard_after(0);
+    }
+
+    pub(crate) fn discard_after(&mut self, count: usize) {
+        if self
+            .opening
+            .and_then(|id| self.position_of(id))
+            .is_some_and(|i| i >= count)
+        {
+            self.opening = None;
+        }
+        self.slots.truncate(count);
+        self.positions = Some(
+            self.slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.block().id, i))
+                .collect(),
+        );
+    }
+
+    /// Everything, in display order (including any historical prefix).
     pub fn slots(&self) -> &[Slot] {
         &self.slots
     }
@@ -490,19 +589,24 @@ impl Stream {
     ///
     /// **The lookup is O(1), and that is the point.** Ids are handed out one
     /// per [`StreamWriter::open`] from a counter that starts at 1 and never
-    /// reuses a number, and nothing removes a slot — so a block's position *is*
+    /// reuses a number, and ordinary live appends keep every slot — so a block's position *is*
     /// its id minus one. Scanning for it instead turned every `settle` into a
     /// pass over the whole conversation, which is quadratic over a replay: the
     /// transcript settles a block per `emit`, so a session with a few thousand
     /// facts paid a few million slot visits. That was most of the cost of
     /// switching to another session (`plugin.rs::look_at` replays the log).
     ///
+    /// Historical prepends and discarded seed blocks use an ID-to-position
+    /// map instead, preserving O(1) lookup when display order changes.
     /// Kept as one checked accessor rather than `id.0 - 1` at each call site:
     /// a stream that ever gained a hole, a reused id or a second source of
     /// slots would answer `None` here rather than read the wrong block, and the
     /// position is what the counter and the vec have to agree about.
     fn position_of(&self, id: BlockId) -> Option<usize> {
-        let at = usize::try_from(id.0.checked_sub(1)?).ok()?;
+        let at = match &self.positions {
+            Some(positions) => *positions.get(&id)?,
+            None => usize::try_from(id.0.checked_sub(1)?).ok()?,
+        };
         self.slots
             .get(at)
             .is_some_and(|slot| slot.block().id == id)
@@ -542,6 +646,7 @@ impl Stream {
             stream: self,
             producer,
             dir: None,
+            members_working: 0,
         }
     }
 }
@@ -558,9 +663,20 @@ pub struct StreamWriter<'a> {
     /// The directory the session works in, as the host answered it — `None`
     /// until it has (see [`StreamWriter::dir`]).
     dir: Option<Arc<str>>,
+    members_working: usize,
 }
 
 impl StreamWriter<'_> {
+    /// Live member count supplied by the host; replay defaults to zero.
+    pub fn with_members_working(mut self, n: usize) -> Self {
+        self.members_working = n;
+        self
+    }
+
+    pub fn members_working(&self) -> usize {
+        self.members_working
+    }
+
     /// The same writer, for a session the host says works in `dir`.
     pub fn in_dir(mut self, dir: Option<Arc<str>>) -> Self {
         self.dir = dir;
@@ -579,6 +695,9 @@ impl StreamWriter<'_> {
     /// Append a new block, `Live`.
     pub fn open(&mut self, at: Coord, content: Arc<dyn Content>) -> BlockId {
         let id = BlockId(self.stream.next_id.fetch_add(1, Ordering::SeqCst) + 1);
+        if let Some(positions) = &mut self.stream.positions {
+            positions.insert(id, self.stream.slots.len());
+        }
         self.stream.slots.push(Slot::Live(
             Block {
                 id,
@@ -691,6 +810,30 @@ mod tests {
         Arc::new(Text(s))
     }
 
+    #[test]
+    fn history_prepend_keeps_live_ids_amendable_and_new_ids_unique() {
+        let mut stream = Stream::new();
+        let live = stream.writer("live").open(Coord::default(), text("live"));
+        let mut older = stream.history_buffer();
+        let old = older.writer("history").emit(Coord::default(), text("old"));
+        older.writer("history").settle_all();
+        stream.prepend_history(older);
+        assert_eq!(stream.slots()[0].block().id, old);
+        assert_eq!(stream.slots()[1].block().id, live);
+        stream.writer("live").amend(live, text("continued"));
+        stream.writer("live").settle(live);
+        let new = stream.writer("live").emit(Coord::default(), text("new"));
+        assert_ne!(new, old);
+        assert_ne!(new, live);
+        assert!(stream.get(old).unwrap().is_settled());
+        assert!(stream.get(live).unwrap().is_settled());
+        assert_eq!(
+            stream.get(live).unwrap().block().content.content_hash(),
+            text("continued").content_hash()
+        );
+        assert_eq!(stream.get(new).unwrap().block().id, new);
+    }
+
     /// A block that draws two rows on a terminal that does Unicode, one otherwise.
     ///
     /// Deliberately a *real* capability-dependent block rather than a mock: a
@@ -716,6 +859,7 @@ mod tests {
     fn shape(unicode: bool) -> ShapeCaps {
         ShapeCaps {
             unicode,
+            wrap_diff: true,
             basic_glyphs: false,
             colors: crate::caps::Colors::Ansi256,
             cell_background: true,

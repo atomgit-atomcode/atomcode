@@ -203,6 +203,7 @@ pub struct Opening {
     /// A dim line for the foot of the block — this launch's
     /// `OpeningNotices::welcome_note`, on the first welcome only.
     pub note: Option<String>,
+    pub model_setup: Option<crate::model_setup::SetupView>,
 }
 
 /// Hand-written because `words` is a trait object and the trait is deliberately

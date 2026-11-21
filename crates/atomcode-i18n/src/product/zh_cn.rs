@@ -3,6 +3,8 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::RecapTaskCounts { completed, active, pending } => format!("任务清单记录：已完成 {completed}，进行中 {active}，待办 {pending}。请与实际工作及测试结果核对。").into(),
+        Msg::RecapTasksUnavailable => "任务清单状态暂不可用，请核对后再判断完成情况。".into(),
         Msg::WelcomeBannerLine1 =>
             "欢迎使用 {brand}，请选择一项开始：".into(),
         Msg::WelcomeBannerLine2 =>
@@ -108,7 +110,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NetworkConnectHint =>
             "网络连接失败。若浏览器能打开，可能是代理/防火墙差异：用 /proxy 配置代理或设置 HTTPS_PROXY，或在浏览器打开上面的登录链接完成扫码。可按 Esc 跳过，稍后 /login 重试。".into(),
         Msg::NetworkConnectHintNoResolver =>
-            "网络连接失败，且本机 /etc/resolv.conf 不可读。Linux 产物静态链接 musl，拿不到该文件时解析器会把查询发往 127.0.0.1，Android / Termux 等环境因此解析不了域名。可把系统的解析配置挂进去，例如：proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode。".into(),
+            "网络连接失败，且本机 /etc/resolv.conf 不可读。Termux 环境会尝试使用 $PREFIX/etc/resolv.conf，请检查该文件中是否有可用的 nameserver，并检查网络与代理。也可临时挂载有效配置：proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode。".into(),
         Msg::CpSetupHeader =>
             "  {brand} CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
@@ -814,7 +816,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UpgradeOptForce => "重新安装最新版本".into(),
         Msg::UpgradeOptRollback => "回退到上一版本".into(),
 
-
         // ── /config ──
         Msg::ConfigProviderLabel { provider, path } =>
             format!("  Provider：{}\n  配置文件：{}\n\n", provider, path).into(),
@@ -1360,6 +1361,17 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CtxSystemPromptHeader => "=== 系统提示 ===".into(),
         Msg::CtxSystemPromptEmpty => "（为空 — 完成一轮对话后捕获）".into(),
         Msg::CtxTokensSuffix => "tokens".into(),
+        Msg::CompactSummaryFailed => "AI 摘要失败或未返回有效、完整的内容".into(),
+        Msg::CompactSummaryTimedOut => "AI 摘要等待首响应或后续内容超时".into(),
+        Msg::CompactSummaryContextExceeded => "AI 摘要输入无法容纳于模型窗口".into(),
+        Msg::CompactSummaryIncomplete => "AI 摘要为空、输出被截断或未完整结束".into(),
+        Msg::CompactSummaryAuthenticationFailed => "AI 摘要鉴权失败或无访问权限，请检查凭据和模型权限".into(),
+        Msg::CompactSummaryRequestRejected => "AI 摘要请求被服务端拒绝，请检查模型、参数、额度或服务限制".into(),
+        Msg::CompactSummaryRateLimited => "AI 摘要请求被限流，请等待后重试".into(),
+        Msg::CompactSummaryRequestFailed => "AI 摘要请求失败，有限重试后仍未恢复".into(),
+        Msg::CompactNotSmaller => "压缩方案未能缩小上下文".into(),
+        Msg::CompactDiagnosticRetained { reason, before, after } => format!("{reason}；历史保持不变（文本 {before} → {after} bytes）。请按上述原因处理后重试 /compact；具体诊断可查日志。").into(),
+        Msg::CompactDiagnosticReduced { reason, before, after } => format!("{reason}；仅折叠工具输出（文本 {before} → {after} bytes），对话历史已保留。").into(),
         Msg::CompactNothingShort => "（无需压缩 — 当前对话较短）\n".into(),
         Msg::CompactStarting => "（正在使用 LLM 摘要进行压缩...）\n".into(),
         Msg::CompactInterrupted => "（压缩已中断 — coding runtime 已变更或停止）\n".into(),
@@ -1447,9 +1459,17 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "让评审员看一遍现在的改动;只读,不改".into(),
         Msg::CmdCatalogSkills =>
             "装了哪些 skill;给名字就把它们一起用上".into(),
+        Msg::CmdSkillSpellingSuggestion { candidates } => format!("你是否想使用 {candidates}？未自动纠正或加载。").into(),
+        Msg::CmdSkillTaskSpelling { word, candidates } => format!("`{word}` 未识别为技能，仍作为任务正文；你是否想使用 {candidates}？未自动纠正或额外加载技能。").into(),
         Msg::CmdCatalogSkillsEmpty => "一个 skill 都没装".into(),
         Msg::CmdCatalogSkillDirs => "Skill 扫描目录".into(),
         Msg::CmdCatalogSkillDiagnostics => "Skill 加载诊断".into(),
+        Msg::CmdSkillsHistory => "本会话技能使用历史（不代表持续授权）".into(),
+        Msg::CmdSkillsListOption => "用法与使用历史；可用 $a $b 任务同时加载".into(),
+        Msg::CmdSkillsHelp => "查看用法与历史：/skills --list\n同时使用：/skills <名字> [名字2 ...] [任务]\nTUI 简写：$<名字> $<名字2> [任务]（也支持 ¥）。\n显式 $名字 必须全部存在；任务正文开始后的 $词 保持原文。\n可以再次调用以重新注入。历史使用不代表权限仍有效或内容仍保留在模型上下文中。".into(),
+        Msg::CmdSkillUsed { count, turn } => format!("本会话使用过：{count} 个回合，最近第 {turn} 回合").into(),
+        Msg::CmdSkillReload { name, turn } => format!("{name} 曾在第 {turn} 回合使用；本次将再次注入。").into(),
+        Msg::CmdSkillUnknownExplicit { name } => format!("没有可调用的 skill `{name}`；本次未提交任何技能。请用 /skills 查看可用名称。").into(),
         Msg::CmdCatalogSkillsUsage => "[名字… [给它们的话]]".into(),
         Msg::CmdCatalogSkillUsage => "[给它的话]".into(),
         Msg::CmdCatalogPromptCommandUsage => "[命令参数]".into(),
@@ -1477,6 +1497,30 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         }
         Msg::RelayClientStartFailed => "中继客户端启动失败".into(),
         Msg::RelayClientExited => "中继客户端已退出，请检查接入口令和客户端版本".into(),
+        Msg::MigrationSkillActive => "已经生效：直接读取，无需迁移。".into(),
+        Msg::MigrationSkillRejected { reason } => format!("技能加载器拒绝了它：{reason}").into(),
+        Msg::MigrationSkillOverridden { name } => {
+            format!("已被覆盖：另一个目录里同名的「{name}」优先生效。").into()
+        }
+        Msg::MigrationUnreadableFile { reason } => format!("文件读取失败：{reason}").into(),
+        Msg::MigrationSkillDepthLimit => "分组目录层级超出上限".into(),
+        Msg::MigrationSkillSymlinkCycle => "检测到符号链接环".into(),
+        Msg::MigrationSkillMdNotAFile => "这里的 SKILL.md 不是普通文件，该技能无法加载。".into(),
+        Msg::MigrationSkillCopyable { target } => {
+            format!("尚未生效。复制到 {target} 就能搬过来。").into()
+        }
+        Msg::MigrationSkillNotInEffect => "没有生效，技能加载器也没有给出原因。".into(),
+        Msg::MigrationForeignUnparseable => {
+            "这个文件本身无法解析，即使复制过去也加载不了。".into()
+        }
+        Msg::MigrationBrokenLink => "这是一个断链：目标已经不存在，任何东西都无法加载它。".into(),
+        Msg::MigrationNotARegularFile => "这不是普通文件，无法作为技能加载。".into(),
+        Msg::MigrationNotADirectory => "这不是目录，无法在其中扫描技能。".into(),
+        Msg::MigrationReportDepthLimit => "扫描在此停止：分组目录层级超出上限".into(),
+        Msg::MigrationReportSymlinkCycle => "扫描在此停止：检测到符号链接环".into(),
+        Msg::MigrationReportEntryUnusable { reason } => {
+            format!("这个条目无法作为技能使用：{reason}").into()
+        }
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
@@ -1568,7 +1612,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CliAboutTelemetry => "遥测控制".into(),
         Msg::CliAboutPlugin => "管理技能/命令插件".into(),
         Msg::CliAboutUninstall => "卸载 {brand}：移除二进制文件、PATH 编辑和数据".into(),
-        Msg::CliAboutSetup => "安装种子文件（技能/命令/钩子/MCP）到 {user_dir}/".into(),
+        Msg::CliAboutSetup => "检查项目能力，配置可选工具".into(),
         Msg::CliAboutHooks => "管理钩子（列表、测试、启用/禁用）".into(),
         Msg::CliAboutHooksList => "列出所有已加载钩子及其状态".into(),
         Msg::CliAboutHooksTest => "按名称测试指定钩子".into(),
@@ -1717,7 +1761,130 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         // ── resuming from the shell (`atomcode-cli`) ──
         Msg::ResumeHint { cmd } => format!("继续此会话，运行：{cmd}").into(),
         Msg::ResumeHintBackground { cmd } => format!("继续后台会话，运行：{cmd}").into(),
-    }
+
+        Msg::MigrationInstructionsActive => "直接读取本项目的这个文件 —— 已经生效".into(),
+        Msg::MigrationInstructionsCopyable { target } => {
+            format!("复制到 {target} 后对所有项目生效").into()
+        }
+        Msg::MigrationInstructionsShadowed { by } => {
+            format!("不会被读取：本项目中 {by} 的优先级更高").into()
+        }
+        Msg::MigrationInstructionsEmpty => "这个文件是空的，因此没有加载任何内容".into(),
+        Msg::MigrationPermissionsActive => "已并入本项目的权限规则 —— 已经生效".into(),
+        Msg::MigrationPermissionsCopyable { target } => {
+            format!("复制到 {target} 后即成为全局权限规则").into()
+        }
+        Msg::MigrationMcpCopyable { count, target } => {
+            format!("{count} 个 MCP 服务 —— 可复制到 {target}").into()
+        }
+        Msg::MigrationMcpActive { count } => {
+            format!("{count} 个 MCP 服务 —— 直接读取本项目的这个文件").into()
+        }
+        Msg::MigrationMcpAllDisabled { count } => {
+            format!("{count} 个 MCP 服务已配置但被禁用 —— 都没有在运行").into()
+        }
+        Msg::MigrationMcpRemoteNotCopyable => {
+            "远程 MCP 服务（只有 url）—— 无法复制为 stdio 命令".into()
+        }
+        Msg::MigrationRulesRejected => "我们的加载器会拒绝这个文件，因此其中规则都不生效".into(),
+        Msg::MigrationHooksCopyable { target } => {
+            format!("可复制到 {target}").into()
+        }
+        Msg::MigrationProviderCopyable { base_url, key } => {
+            format!("其中的 provider 设置可以导入（endpoint {base_url}，凭据 {key}）—— 写入前请先确认")
+                .into()
+        }
+        Msg::MigrationProviderNameUnusable { name } => {
+            format!("{name}：这个名字不能作为账号 id —— 未导入").into()
+        }
+        Msg::MigrationProviderProtocolUnsupported { protocol } => {
+            format!("这个端点说的是 {protocol}，我们不支持 —— 未导入").into()
+        }
+        Msg::MigrationProviderNothingToConnectTo => {
+            "这个 provider 没有写端点也没有写凭据 —— 没有可连接的对象".into()
+        }
+        Msg::MigrationCredentialHasDollar => {
+            "这个密钥里含有 `$`，配置会把它展开 —— 未导入".into()
+        }
+        Msg::MigrationOpencodePlaintextCredentials => {
+            "这个文件里是明文密钥 —— 只报告，不搬运".into()
+        }
+        Msg::MigrationAgentsBlocked => {
+            "我们的角色文件需要 permission 与 difficulty 前置元数据，Claude 的 subagent 文件没有 \
+             —— 未迁移"
+                .into()
+        }
+        Msg::MigrationPluginsBlocked => "插件清单格式是对方的 —— 未迁移".into(),
+        Msg::MigrationSessionsBlocked { count } => {
+            format!("{count} 个会话文件 —— 历史转换有损，本期未做").into()
+        }
+
+        Msg::MigrationUnreadableConfig => "这个配置文件无法解析，因此其中内容都没读到".into(),
+
+        Msg::MigrationReportEmpty => "没有发现其他 AI 编码 Agent 留下的资产。".into(),
+        Msg::MigrationSummary {
+            total,
+            active,
+            imported,
+            actionable,
+            blocked,
+        } => format!(
+            "\n共 {total} 项资产：{active} 项已经生效，{imported} 项已导入，\
+             {actionable} 项可以带走，{blocked} 项带不走。\n"
+        )
+        .into(),
+        Msg::MigrationStatusActive => "已经生效".into(),
+        Msg::MigrationStatusImported => "已导入".into(),
+        Msg::MigrationStatusActionable => "可以带走".into(),
+        Msg::MigrationStatusBlocked => "带不走".into(),
+        Msg::MigrationAlreadyImported => "已在你的配置里 —— 没有需要带过来的了".into(),
+
+        Msg::MigrationImportDone { imported } => format!("已导入：{imported}。").into(),
+        Msg::MigrationImportSkipped { skipped } => format!("未导入：{skipped}。").into(),
+        Msg::MigrationImportNone => "没有发现可导入的 provider 账号。".into(),
+        Msg::MigrationProvidersUnreadable { reasons } => {
+            format!("无法读取 provider 配置：{reasons}").into()
+        }
+        Msg::MigrationImportAlreadyThere { already } => {
+            format!("已经在配置里：{already}。").into()
+        }
+        Msg::MigrationImportConflict { id } => {
+            format!("{id}：已存在同名但不同的账号 —— 没有覆盖。").into()
+        }
+        Msg::MigrationCredentialReferenceUnsupported => "请手动配置此端点或凭据引用。".into(),
+        Msg::MigrationClaudeAuthAmbiguous => "Claude Code 同时配置了两种认证方式，请手动选择要使用的凭据。".into(),
+        Msg::MigrationProjectConfirmationRequired => "项目级账号需要交互式确认。".into(),
+        Msg::MigrationImportConfirm {
+            id,
+            protocol,
+            endpoint,
+            models,
+            credential,
+            destination,
+            source,
+        } => {
+            let models = if models.is_empty() {
+                String::new()
+            } else {
+                format!("，模型 {models}")
+            };
+            // **凭据的下场要说清楚。** 明文密钥要说明「会被**复制进**这个文件」，
+            // 并写出是哪个文件。
+            let credential = match credential.strip_prefix("plaintext") {
+                Some(_) => format!("，并把其中的**明文密钥**复制进 {destination}"),
+                None => match credential.strip_prefix("env:") {
+                    Some(name) => {
+                        format!("，并使用环境变量 {name}（密钥留在原地）")
+                    }
+                    None => String::new(),
+                },
+            };
+            format!(
+                "要从 {source} 导入账号 `{id}`（{protocol} -> {endpoint}）{models}{credential}吗？[y/N] "
+            )
+            .into()
+        }
+}
 }
 
 #[cfg(test)]

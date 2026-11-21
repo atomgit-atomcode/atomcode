@@ -260,6 +260,7 @@ impl Env {
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
+                mcp_paused: false,
                 extra_mcp_servers: Vec::new(),
                 mcp_user_config: None,
                 mcp_tokens: None,
@@ -732,6 +733,16 @@ async fn the_published_rows_are_what_the_product_mounts() {
         .map(|e| (e.id.clone(), e.config.clone()))
         .collect();
     for published in host::PUBLISHED_ROWS {
+        if *published == "architecture-topology" {
+            // An opt-in row is addressable by a host while dormant by default.
+            assert!(mounted
+                .app
+                .tree()
+                .entries
+                .iter()
+                .any(|e| e.id == *published && e.disabled));
+            continue;
+        }
         assert!(
             rows.iter().any(|(id, _)| id == published),
             "`{published}` is published and must be mounted: {:?}",

@@ -107,6 +107,39 @@ mod tests {
     }
 
     #[test]
+    fn compressed_assets_round_trip_to_the_original_build_output() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../webui/dist");
+        for name in WebuiAssets::iter() {
+            let original = std::fs::read(root.join(name.as_ref())).unwrap();
+            let embedded = WebuiAssets::get(&name).unwrap();
+            assert_eq!(embedded.data.as_ref(), original, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_assets_keep_decoded_bodies_and_original_mime_types() {
+        for (suffix, mime) in [
+            (".html", "text/html"),
+            (".css", "text/css"),
+            (".js", "text/javascript"),
+            (".woff2", "font/woff2"),
+        ] {
+            let Some(name) = WebuiAssets::iter().find(|name| name.ends_with(suffix)) else {
+                continue;
+            };
+            let expected = WebuiAssets::get(&name).unwrap();
+            let response = serve_webui(format!("/{name}").parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+            assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected.data.as_ref(), "{name}");
+        }
+    }
+
+    #[test]
     fn is_built_agrees_with_the_embedded_assets() {
         // Whether `webui/dist/` existed at compile time is a property of the
         // checkout, not of this code — `#[allow_missing]` above keeps that state

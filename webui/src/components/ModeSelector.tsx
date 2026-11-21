@@ -1,9 +1,8 @@
-import { useState } from 'preact/hooks';
-import { createPortal } from 'preact/compat';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { ApprovalMode } from '../api';
 import { useT } from '../settings';
+import { useComposerToolbarHold } from '../lib/composerFocus';
 import { MsgKey } from '../i18n';
-import { useDropdown } from '../lib/useDropdown';
 import { ModeModelsDialog } from './ModeModelsDialog';
 
 // Approval modes shown in the pill dropdown. Order = display order.
@@ -27,25 +26,27 @@ export function ModeSelector({
 }) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  // The menu is portaled to <body> and placed against the viewport: on a
-  // narrow phone the pill is far narrower than the menu, so anchoring the
-  // menu's right edge to the pill pushed it off the left edge of the screen.
-  const dropdown = useDropdown({
-    open,
-    onClose: () => setOpen(false),
-    prefer: 'above',
-    width: 240,
-  });
-  // The bindings dialog is the upstream feature; the menu placement stays the
-  // portaled one, because a phone's pill is far narrower than the menu.
   const [configuring, setConfiguring] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const toolbarHold = useComposerToolbarHold();
+  useEffect(() => {
+    if (!open) return;
+    const h = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [open]);
   const current = MODE_OPTIONS.find((o) => o.val === value) ?? MODE_OPTIONS[0];
   const isAuto = value === 'bypass';
   return (
-    <div class="model-selector model-selector-up mode-selector">
+    <div class="model-selector model-selector-up mode-selector" ref={ref}>
       <button
-        ref={dropdown.triggerRef}
         class={'model-selector-trigger mode-selector-trigger' + (isAuto ? ' mode-bypass' : '')}
+        // Keeps the mobile composer expanded while the trigger is pressed — see lib/composerFocus.
+        onPointerDown={toolbarHold.onPointerDown}
+        onPointerUp={toolbarHold.onPointerUp}
+        onPointerCancel={toolbarHold.onPointerCancel}
         onClick={() => {
           if (!disabled) setOpen((o) => !o);
         }}
@@ -58,12 +59,8 @@ export function ModeSelector({
         <span class="model-selector-chevron">▾</span>
       </button>
       {configuring && <ModeModelsDialog onClose={() => setConfiguring(false)} />}
-      {open && createPortal(
-        <div
-          ref={dropdown.menuRef}
-          class="model-dropdown mode-dropdown model-dropdown-viewport"
-          style={dropdown.style}
-        >
+      {open && (
+        <div class="model-dropdown mode-dropdown">
           {MODE_OPTIONS.map((o) => (
             <button
               key={o.val}
@@ -85,8 +82,7 @@ export function ModeSelector({
             </button>
           ))}
           <button class="model-item" type="button" onClick={() => { setOpen(false); setConfiguring(true); }}>{t('modeBindings.configure')}</button>
-        </div>,
-        document.body,
+        </div>
       )}
     </div>
   );

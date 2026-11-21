@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getModeModels, saveModeModels, type ModeModelsInfo, type ModeBindings } from '../api';
@@ -24,7 +25,7 @@ export function ModeModelsDialog({onClose}: {onClose: () => void}) {
       if(event.shiftKey&&document.activeElement===first){event.preventDefault();last?.focus();}
       else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first?.focus();}
     }
-    if(event.key==='Escape'&&!saving){event.preventDefault();event.stopPropagation();onClose();}};window.addEventListener('keydown',key);return()=>window.removeEventListener('keydown',key);},[saving]);
+};window.addEventListener('keydown',key);return()=>window.removeEventListener('keydown',key);},[saving]);
   async function save() {
     if(saving||!data)return;
     setSaving(true);setError('');
@@ -36,7 +37,7 @@ export function ModeModelsDialog({onClose}: {onClose: () => void}) {
     }catch(e){if(alive.current)setError(String(e));}
     finally{if(alive.current)setSaving(false);}
   }
-  return createPortal(<div class="modal-overlay" onClick={event=>{if(event.target===event.currentTarget&&!saving)onClose();}}>
+  return createPortal(<ModalOverlay>
     <section ref={dialog} class="modal-card mode-models-modal" role="dialog" aria-modal="true" aria-labelledby="mode-bindings-title">
       <header class="modal-header"><h3 id="mode-bindings-title">{t('modeBindings.title')}</h3><button class="ghost-btn modal-close" type="button" onClick={onClose} disabled={saving} aria-label={t('modeBindings.close')}>×</button></header>
       <div class="modal-body mode-bindings-body">
@@ -66,5 +67,5 @@ export function ModeModelsDialog({onClose}: {onClose: () => void}) {
       </div>
       <footer class="modal-footer"><button class="btn" onClick={onClose} disabled={saving}>{t('modeBindings.cancel')}</button><button class="btn btn-primary" onClick={save} disabled={!data||saving}>{saving?t('modeBindings.saving'):t('modeBindings.save')}</button></footer>
     </section>
-  </div>,document.body);
+  </ModalOverlay>,document.body);
 }

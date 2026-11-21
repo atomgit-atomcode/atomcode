@@ -18,6 +18,7 @@ use crate::i18n::{t, Msg};
 use atomcode_capabilities::tools::todo::{
     is_todo_call, reduce_todos, todo_counts, todo_glyph, TodoItem, TodoStatus,
 };
+#[cfg(test)]
 use atomcode_harness::seams::StopReason;
 use atomcode_harness::session::SessionEvent;
 
@@ -87,20 +88,6 @@ impl Plan {
                 }
                 None => false,
             },
-
-            // A cancel retires the plan: the list was for work that did not
-            // happen, and the person who stopped it did not ask for the rest.
-            // The calls stay in the log — only the *active* list is dropped, so
-            // a resumed session reads this the same way. A later continue is a
-            // fresh plan against the same history, which is exactly what
-            // `derive_current_todos` does with the interruption boundary.
-            SessionEvent::TurnEnd {
-                stop: StopReason::Cancelled,
-                ..
-            } => {
-                self.calls.clear();
-                true
-            }
 
             _ => false,
         }
@@ -813,7 +800,7 @@ mod tests {
 
     /// What `/todo` prints: the plan the panel folds, finished items kept —
     /// a finished plan is when the panel is gone and this is the only way to
-    /// read it — and a cancelled one gone, as it is from the panel.
+    /// read it. Interruption preserves the same plan.
     #[test]
     fn todo_prints_the_finished_plan_the_panel_retired() {
         let done = [plan(
@@ -833,7 +820,7 @@ mod tests {
                 error: None,
             },
         ];
-        assert_eq!(plan_text(&logged(&cancelled)), t(Msg::TodoNoPlan));
+        assert_eq!(plan_text(&logged(&cancelled)), text);
         assert_eq!(plan_text(&[]), t(Msg::TodoNoPlan));
     }
 
@@ -917,10 +904,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cancel_retires_the_plan_and_a_later_one_starts_fresh() {
+    fn an_interruption_preserves_the_plan_until_explicit_replacement() {
         let mut state = fold(&[plan(
             r#"{"todos":[{"content":"a","status":"in_progress"}]}"#,
         )]);
+        let before = drew(&state, 60, 10);
         Todo::absorb(
             &mut state,
             &SessionEvent::TurnEnd {
@@ -929,8 +917,7 @@ mod tests {
                 error: None,
             },
         );
-        assert_eq!(drew(&state, 60, 10), Vec::<String>::new());
-        assert_eq!(asks(&state), Height::Hug(0));
+        assert_eq!(drew(&state, 60, 10), before);
 
         // A turn that merely failed is not a person changing their mind.
         Todo::absorb(
@@ -943,8 +930,8 @@ mod tests {
         );
         assert_eq!(
             drew(&state, 60, 10),
-            Vec::<String>::new(),
-            "a stop that is not a cancel must not touch the list either way"
+            before,
+            "a stop must preserve the plan"
         );
 
         // And the list keeps being folded from the log, so a new plan lands.

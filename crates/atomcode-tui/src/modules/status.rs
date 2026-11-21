@@ -17,7 +17,6 @@ pub const ID: &str = "status";
 #[derive(Default)]
 pub struct State {
     pub turns: u64,
-    pub summaries: u64,
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -83,9 +82,6 @@ impl View for Status {
     }
 
     fn absorb(state: &mut State, fact: &SessionEvent) {
-        if atomcode_harness::session::is_context_summary(fact) {
-            state.summaries += 1;
-        }
         match fact {
             SessionEvent::TurnStart { turn } => {
                 state.turns = *turn;
@@ -205,6 +201,13 @@ impl View for Status {
             // gold that makes "it is still going" read at a glance.
             Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
             // The live line already says the turn is stopping.
+            Activity::Idle if vp.moment.working_members() > 0 => Some((
+                t(Msg::LiveWaitingForMember {
+                    n: vp.moment.working_members(),
+                })
+                .into_owned(),
+                theme::fg(Role::Warning),
+            )),
             Activity::Stopping | Activity::Idle => None,
         };
         if let Some((text, _)) = &activity {
@@ -244,13 +247,6 @@ impl View for Status {
         // state, not news, and it must never squeeze the model, the directory
         // or the context usage off the row. Placed after everything else, it
         // is drawn only in the room left over.
-        // Why no turn can be taken, when that is so: reserved like the badges,
-        // because it is the one thing on this row a person must act on before
-        // anything else here matters.
-        let unready = vp.moment.unready.clone();
-        if let Some(text) = &unready {
-            reserved += width::str_width(text) + sep_w;
-        }
         // `!` shell mode, said on the row while the line starts with `!` — the
         // same words tuix puts in its footer: what the bare `!` did, then what
         // Enter will do once there is a command after it. Reserved: it is about
@@ -309,11 +305,26 @@ impl View for Status {
         } else {
             "atomcode".to_string()
         };
+        // The gateway's display alias wins when the live model has one: the
+        // footer names the model the way the picker does, by the alias the
+        // server advertises, not the wire id. The prefix match below still
+        // asks about the wire name — aliases do not disambiguate accounts.
+        let wire_name = model_str.clone();
+        if let Some(alias) = vp
+            .moment
+            .providers
+            .models()
+            .iter()
+            .find(|m| m.model == model_str || m.id == model_str)
+            .and_then(|m| m.localized_alias().map(str::to_string))
+        {
+            model_str = alias;
+        }
         // Which account is answering, said only where the bare name cannot: the
         // name goes in front, so it reads as the qualified name the way the
         // model picker lists it. Asked of the name alone — the level is not
         // part of what any row carries, so it must not be in what is matched.
-        let prefix = provider_prefix(&vp.moment.providers, &model_str);
+        let prefix = provider_prefix(&vp.moment.providers, &wire_name);
         if !prefix.is_empty() {
             model_str.insert_str(0, &prefix);
         }
@@ -326,26 +337,20 @@ impl View for Status {
         // a real filesystem path), so the collapse happens here, not at the source.
         let cwd_full = crate::text::collapse_home(&vp.moment.cwd);
         let cwd_base = path_basename(&cwd_full).to_string();
+        let branch = crate::git_branch::current(&vp.moment.cwd);
+        let branch_suffix = branch.map(|name| format!(" [{name}]")).unwrap_or_default();
+        let cwd_full = format!("{cwd_full}{branch_suffix}");
+        let cwd_base = format!("{cwd_base}{branch_suffix}");
         // What the model is carrying now: the last request's prompt, or — when a
         // fold has shrunk the view since it was reported — what the fold left.
         let used = gauge_tokens(state, vp.moment);
         // Only what means something: a context usage segment appears once there
         // are tokens or a window to report, never as a bare zero.
-        let mut ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
+        let ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
             format_ctx_usage(used as usize, vp.moment.ctx_window as usize)
         } else {
             String::new()
         };
-        if state.summaries > 0 {
-            let count =
-                atomcode_i18n::product::t(atomcode_i18n::product::Msg::ContextSummaryCount {
-                    count: state.summaries,
-                });
-            if !ctx_str.is_empty() {
-                ctx_str.push_str(" · ");
-            }
-            ctx_str.push_str(&count);
-        }
         let cache_str =
             cache_indicator(state.session_cached, state.session_prompt).unwrap_or_default();
 
@@ -388,13 +393,16 @@ impl View for Status {
                     continue;
                 }
             }
+            if matches!(seg, StatusSeg::Cwd) && !branch_suffix.is_empty() {
+                if let Some(path) = text.strip_suffix(&branch_suffix) {
+                    row.push(El::styled(path.to_string(), dim));
+                    row.push(El::styled(branch_suffix.clone(), theme::fg(Role::Brand)));
+                    continue;
+                }
+            }
             row.push(El::styled(text.clone(), style_for(*seg)));
         }
 
-        if let Some(text) = unready {
-            row.push(El::styled(sep_text.clone(), dim));
-            row.push(El::styled(text, theme::fg(Role::Warning)));
-        }
         if let Some(text) = shell_hint {
             row.push(El::styled(sep_text.clone(), dim));
             row.push(El::styled(text, theme::fg(Role::Brand)));
@@ -854,7 +862,7 @@ mod tests {
     use crate::moment::Moment;
 
     #[test]
-    fn summary_count_shares_the_existing_token_segment_and_has_no_progress_label() {
+    fn summary_count_does_not_occupy_the_status_token_segment() {
         let _locale = crate::i18n::test_lock();
         let mut state = State::default();
         let moment = Moment {
@@ -874,7 +882,6 @@ mod tests {
                 texts: vec![],
             },
         );
-        assert_eq!(state.summaries, 0);
         Status::absorb(
             &mut state,
             &SessionEvent::Compacted {
@@ -885,7 +892,7 @@ mod tests {
             },
         );
         let line = draw::<Status>(&state, 160, &moment);
-        assert!(line.contains(label.as_ref()), "{line}");
+        assert!(!line.contains(label.as_ref()), "{line}");
         assert_eq!(line.matches("tok").count(), 1, "{line}");
         assert!(!line.contains("正在") && !line.contains("Summarizing"));
         for width in [20, 40, 80] {
@@ -893,7 +900,6 @@ mod tests {
                 crate::width::str_width(&draw::<Status>(&state, width, &moment)) <= width as usize
             );
         }
-        assert_eq!(State::default().summaries, 0);
     }
 
     crate::tui_conformance!(view Status as status_conformance);
@@ -907,11 +913,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Why no turn can be taken stands on the row, and the model slot says
-    /// "not configured" rather than a name that reads as a model — the page
-    /// above it opens as usual. Nothing of it shows once a turn can be taken.
+    /// The recovery tip has its own row above the composer.
     #[test]
-    fn why_no_turn_can_be_taken_stands_on_the_row() {
+    fn the_model_slot_reports_unconfigured_without_repeating_the_tip() {
         let why = "还没有可用的 provider——在 atomcode 终端里用 /login 登录,或用 /provider 添加一个";
         let unready = Moment {
             cwd: "~/work/project".into(),
@@ -919,7 +923,7 @@ mod tests {
             ..Moment::default()
         };
         let row = draw::<Status>(&State::default(), 160, &unready);
-        assert!(row.contains(why), "{row}");
+        assert!(!row.contains(why), "{row}");
         let not_configured =
             crate::i18n::product::t(crate::i18n::product::Msg::StatusModelNotConfigured)
                 .into_owned();
@@ -1363,6 +1367,7 @@ mod tests {
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,
@@ -1385,6 +1390,7 @@ mod tests {
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,
@@ -1821,12 +1827,18 @@ mod tests {
             account: account.into(),
             model: wire.into(),
             window: 128_000,
+            max_tokens: None,
             vision: None,
             effort: None,
             levels: Vec::new(),
             current,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         };
+
         let moment_of = |model: &str, providers: ProvidersView| Moment {
             model: model.into(),
             providers,

@@ -17,3 +17,10 @@ export function getVSCodeApi(): VSCodeApi {
 export function postMessage(message: unknown): void {
   getVSCodeApi().postMessage(message);
 }
+
+/** Session binding and panel preferences share VS Code's single state slot. */
+export function updateWebviewState(patch: Record<string, unknown>): void {
+  const api = getVSCodeApi();
+  const previous = api.getState();
+  api.setState({ ...(previous && typeof previous === 'object' ? previous : {}), ...patch });
+}

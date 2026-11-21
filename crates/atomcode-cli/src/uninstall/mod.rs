@@ -122,6 +122,12 @@ pub fn execute(
     // --- 2. Credentials ---
     if want(Group::Credentials) {
         for it in plan.items.iter().filter(|i| i.group == Group::Credentials) {
+            if it.path == plan.atomcode_dir.join("auth/ssh-keys.json") {
+                if let Err(error) = atomcode_auth::git_ssh::forget_all(&plan.atomcode_dir) {
+                    out.failed.push((it.path.clone(), error.to_string()));
+                    continue;
+                }
+            }
             match actions::remove_path(&it.path, it.needs_privilege) {
                 Ok(()) => out.removed.push(it.path.clone()),
                 Err(e) => out.failed.push((it.path.clone(), e.to_string())),

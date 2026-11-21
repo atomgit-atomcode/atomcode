@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 // Individual settings dialogs: theme, language, notifications, remote access.
 // Model settings live in ./ModelProviders.
 // Each is opened on its own from the sidebar settings menu.
@@ -34,12 +35,7 @@ function SettingsModal({
 }) {
   const { t } = useSettings();
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class={'modal-card' + (wide ? '' : ' modal-card-sm') + (cardClass ? ` ${cardClass}` : '')}>
         <div class="modal-header">
           <span>⚙</span>
@@ -57,7 +53,7 @@ function SettingsModal({
           </div>
         )}
       </div>
-    </div>
+    </ModalOverlay>
   );
 }
 

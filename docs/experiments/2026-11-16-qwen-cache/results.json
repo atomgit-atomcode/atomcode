@@ -1,0 +1,193 @@
+{
+  "model": "qwen3.8-27b",
+  "endpoint_host": "llm-api.atomgit.com",
+  "selection": "AtomGit-qwen3.8-27b",
+  "experiments": [
+    {
+      "method": "interleaved two arms, isolated synthetic prefixes; no tools; max output 96; adapter retries disabled; no real project data",
+      "model": "qwen3.8-27b",
+      "requests": [
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 4457,
+          "explicit_cache": false,
+          "first_content_ms": 3473,
+          "input_tokens": 19831,
+          "ok": true,
+          "output_tokens": 26,
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19831
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 5080,
+          "explicit_cache": true,
+          "first_content_ms": 3278,
+          "input_tokens": 19831,
+          "ok": true,
+          "output_tokens": 27,
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 27,
+              "input_tokens": 19831
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 5119,
+          "explicit_cache": false,
+          "first_content_ms": 4237,
+          "input_tokens": 19831,
+          "ok": true,
+          "output_tokens": 26,
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 26,
+              "input_tokens": 19831
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 4974,
+          "explicit_cache": true,
+          "first_content_ms": 3087,
+          "input_tokens": 19831,
+          "ok": true,
+          "output_tokens": 41,
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 41,
+              "input_tokens": 19831
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 5802,
+          "explicit_cache": false,
+          "first_content_ms": 3129,
+          "input_tokens": 19831,
+          "ok": true,
+          "output_tokens": 34,
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 34,
+              "input_tokens": 19831
+            }
+          ]
+        },
+        {
+          "cached_tokens": 16896,
+          "cold_prefix": false,
+          "elapsed_ms": 3066,
+          "explicit_cache": true,
+          "first_content_ms": 991,
+          "input_tokens": 19831,
+          "ok": true,
+          "output_tokens": 34,
+          "round": 2,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": true,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 16896,
+              "completion_tokens": 34,
+              "input_tokens": 19831
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "method": "two explicit-cache requests with synthetic tool history and ephemeral reminder; no real tools executed",
+      "model": "qwen3.8-27b",
+      "requests": [
+        {
+          "cached_tokens": 0,
+          "cold_prefix": true,
+          "elapsed_ms": 2932,
+          "explicit_cache": true,
+          "first_content_ms": 2586,
+          "input_tokens": 20160,
+          "ok": true,
+          "output_tokens": 33,
+          "round": 0,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 33,
+              "input_tokens": 20160
+            }
+          ]
+        },
+        {
+          "cached_tokens": 0,
+          "cold_prefix": false,
+          "elapsed_ms": 2865,
+          "explicit_cache": true,
+          "first_content_ms": 2526,
+          "input_tokens": 20160,
+          "ok": true,
+          "output_tokens": 33,
+          "round": 1,
+          "truncated": false,
+          "usage_diagnostics": [
+            {
+              "cache_read_reported": false,
+              "cache_write_tokens": null,
+              "cached_input_tokens": 0,
+              "completion_tokens": 33,
+              "input_tokens": 20160
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "An absent read counter is not evidence of a zero cache hit.",
+    "The gateway did not expose cache-write counts.",
+    "Eight requests do not establish a causal or stable cache-control benefit.",
+    "No Qwen4 or Qoder comparison was performed."
+  ]
+}

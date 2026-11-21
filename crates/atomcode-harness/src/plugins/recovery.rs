@@ -276,20 +276,24 @@ impl OverflowLadder {
         &self,
         req: &mut ModelRequest,
         attempt: &mut u32,
+        diagnostic: &mut Option<atomcode_kernel::message::CompactionDiagnostic>,
         what: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), String> {
         let (Some(session), Some(compaction)) = (
             crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
             self.ctx.service::<CompactionSvc>(),
         ) else {
-            return Err("no compaction provider is mounted, so this cannot recover");
+            return Err(format!(
+                "no compaction provider is mounted, so this cannot recover; {}",
+                self.request_sizes(req)
+            ));
         };
         let window = self
             .ctx
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
-        let used_tokens = super::loop_policy::last_prompt_tokens(&session);
+        let used_tokens = session.last_prompt_tokens();
         while *attempt < self.max_attempts {
             let ask = CompactionAsk {
                 trigger: CompactTrigger::Overflow {
@@ -306,18 +310,177 @@ impl OverflowLadder {
                     "summarizing the earlier conversation".into(),
                 );
             }
-            if let Some(decision) = compaction.compact(&session, &ask).await {
+            let result = compaction.compact_attempt(&session, &ask).await;
+            *diagnostic = result.diagnostic.or(*diagnostic);
+            if let Some(decision) = result.decision {
+                if decision.through != 0 {
+                    // A completed summary supersedes an earlier failed one;
+                    // tool-only savings do not prove the summarizer recovered.
+                    *diagnostic = result.diagnostic;
+                }
+                let action = if decision.through != 0 {
+                    "summary completed"
+                } else {
+                    "tool output reduced"
+                };
+                let before = self.projected(&req.messages);
                 crate::session::apply_compaction(&self.ctx, &session, decision);
                 super::loop_policy::reproject(req, &session);
                 notice(
                     &self.ctx,
                     NoticeKind::OverflowCompacted,
-                    format!("{what}; compacted ({}/{})", *attempt, self.max_attempts),
+                    format!(
+                        "{what}; {action} ({before} → {} estimated tokens; step {}/{})",
+                        self.projected(&req.messages),
+                        *attempt,
+                        self.max_attempts
+                    ),
                 );
                 return Ok(());
             }
         }
-        Err("nothing further can be compacted")
+        let why = match *diagnostic {
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed) => {
+                "AI summary failed or returned invalid/incomplete content; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut) => {
+                "AI summary first-response or idle timeout; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryContextExceeded) => {
+                "AI summary input cannot fit the model window; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryIncomplete) => {
+                "AI summary was empty, truncated, or incomplete; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRequestFailed) => {
+                "AI summary request failed after bounded retries; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryAuthenticationFailed) => {
+                "AI summary authentication or access denied; check credentials and model access; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRequestRejected) => {
+                "AI summary request rejected; check model, parameters and service restrictions; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryRateLimited) => {
+                "AI summary rate limited; wait before retrying; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::NotSmaller) => {
+                "compaction did not reduce context; conversation retained"
+            }
+            None => "no further safe reduction is available",
+        };
+        Err(format!("{why}; {}", self.request_sizes(req)))
+    }
+
+    fn request_sizes(&self, req: &ModelRequest) -> String {
+        let provider = self.ctx.service::<crate::seams::LlmSvc>();
+        let model = provider
+            .as_ref()
+            .map(|p| p.model_name())
+            .unwrap_or("unknown");
+        let window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
+        let limit = atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
+        let output = req
+            .options
+            .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "default".into());
+        format!("model={model}, context_window={window} tokens, usable_input={limit} tokens, max_output={output} tokens, estimated_messages={} tokens", self.projected(&req.messages))
+    }
+
+    /// What `messages` will cost as a request: the last request as the provider
+    /// measured it plus what was appended since, estimated ([`PromptAnchor`]),
+    /// or the whole estimate when there is no measurement to build on. A whole
+    /// estimate counts prior thinking only where the adapter sends it back.
+    ///
+    /// [`PromptAnchor`]: crate::session::PromptAnchor
+    fn projected(&self, messages: &[Message]) -> u64 {
+        match self.sized(messages) {
+            Sized::Measured(projection) => projection.size,
+            Sized::Estimated(size) => size,
+        }
+    }
+
+    fn sized(&self, messages: &[Message]) -> Sized {
+        let provider = self.ctx.service::<LlmSvc>();
+        let estimated = estimate(messages, provider.as_deref());
+        let Some(provider) = provider else {
+            return Sized::Estimated(estimated);
+        };
+        crate::agent::scoped(&self.ctx)
+            .service::<SessionSvc>()
+            .and_then(|session| session.prompt_anchor())
+            .and_then(|anchor| anchor.project(&provider, estimated))
+            .map_or(Sized::Estimated(estimated), Sized::Measured)
+    }
+
+    /// Whether `req` is past what the model can take beside its completion.
+    /// The estimate's margin covers what was estimated: all of a whole
+    /// estimate ([`effective_input_limit`]), only the part appended since a
+    /// measurement ([`measured_input_limit`]).
+    ///
+    /// [`effective_input_limit`]: atomcode_kernel::agent::effective_input_limit
+    /// [`measured_input_limit`]: atomcode_kernel::agent::measured_input_limit
+    fn would_not_fit(&self, req: &ModelRequest, window: u32) -> bool {
+        let max_tokens = req.options.max_tokens;
+        let (size, limit) = match self.sized(&req.messages) {
+            Sized::Measured(projection) => (
+                projection.size,
+                atomcode_kernel::agent::measured_input_limit(
+                    window,
+                    max_tokens,
+                    projection.unmeasured,
+                ),
+            ),
+            Sized::Estimated(size) => (
+                size,
+                atomcode_kernel::agent::effective_input_limit(window, max_tokens),
+            ),
+        };
+        size >= u64::from(limit)
+    }
+
+    /// The log position a request about to be sent was assembled at: what a
+    /// measurement of it holds for, until something is taken out after it.
+    fn position(&self) -> Option<crate::session::SeqNo> {
+        crate::agent::scoped(&self.ctx)
+            .service::<SessionSvc>()
+            .map(|session| session.last_seq())
+    }
+
+    /// Remember what the provider measured the request it just answered at. A
+    /// response without usage keeps the previous anchor: what was appended
+    /// since it is still only estimated, which is what the anchor is for.
+    fn anchor(
+        &self,
+        req: &ModelRequest,
+        through: Option<crate::session::SeqNo>,
+        response: &ModelResponse,
+    ) {
+        let Some(usage) = response.usage.as_ref().filter(|usage| usage.prompt > 0) else {
+            return;
+        };
+        let (Some(session), Some(provider), Some(through)) = (
+            crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
+            self.ctx.service::<LlmSvc>(),
+            through,
+        ) else {
+            return;
+        };
+        session.set_prompt_anchor(Some(crate::session::PromptAnchor {
+            provider: Arc::downgrade(&provider),
+            measured: u64::from(usage.prompt),
+            estimated: estimate(&req.messages, Some(provider.as_ref())),
+            through,
+        }));
+    }
+
+    /// The provider just said the request did not fit, so whatever the anchor
+    /// projected ran low: size the retries by the whole estimate.
+    fn forget_anchor(&self) {
+        if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
+            session.set_prompt_anchor(None);
+        }
     }
 }
 
@@ -341,21 +504,26 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             .messages
             .iter()
             .any(|m| m.role == atomcode_kernel::message::Role::Assistant);
+        let mut diagnostic = None;
         if window > 0 && answered {
-            let limit =
-                atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
             let mut attempt = 0;
-            while estimate(&req.messages) >= u64::from(limit) {
+            let before = self.projected(&req.messages);
+            while self.would_not_fit(req, window) {
                 if let Err(why) = self
-                    .shrink(req, &mut attempt, "the request would not fit")
+                    .shrink(
+                        req,
+                        &mut attempt,
+                        &mut diagnostic,
+                        "the request would not fit",
+                    )
                     .await
                 {
                     return Err(RequestError {
                         context_overflow: true,
                         code: Some("context_length_exceeded".into()),
                         ..RequestError::message(format!(
-                            "The request still exceeds the usable context window after safe compaction ({why}). \
-                             Conversation history was retained; restore the summary provider or use a model with a larger context window before retrying."
+                            "The request still exceeds the usable context window after safe compaction ({why}; estimated_messages_before={before} tokens). \
+                             Conversation history was retained. Check the compaction reason and model context/output settings before retrying."
                         ))
                     });
                 }
@@ -364,17 +532,28 @@ impl Waterfall<AgentRequest> for OverflowLadder {
 
         let mut attempt = 0;
         loop {
+            let through = self.position();
             match next.run(req).await {
-                Ok(response) => return Ok(response),
-                Err(error) if error.context_overflow && attempt < self.max_attempts => {
-                    if let Err(why) = reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
-                    {
-                        return Err(RequestError {
-                            message: format!("{} ({why})", error.message),
-                            ..error
-                        });
+                Ok(response) => {
+                    self.anchor(req, through, &response);
+                    return Ok(response);
+                }
+                Err(error) if error.context_overflow => {
+                    self.forget_anchor();
+                    if attempt < self.max_attempts {
+                        if let Err(why) =
+                            reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
+                        {
+                            return Err(RequestError {
+                                message: format!("{} ({why})", error.message),
+                                ..error
+                            });
+                        }
                     }
-                    if let Err(why) = self.shrink(req, &mut attempt, "context overflow").await {
+                    if let Err(why) = self
+                        .shrink(req, &mut attempt, &mut diagnostic, "context overflow")
+                        .await
+                    {
                         return Err(RequestError {
                             message: format!("{} ({why})", error.message),
                             ..error
@@ -387,10 +566,22 @@ impl Waterfall<AgentRequest> for OverflowLadder {
     }
 }
 
-fn estimate(messages: &[Message]) -> u64 {
+/// How a request was sized: from a measurement, or estimated whole.
+enum Sized {
+    Measured(crate::session::Projection),
+    Estimated(u64),
+}
+
+/// The byte estimate of `messages` as `provider` would send them: prior
+/// thinking counts only where the adapter puts it back on the wire.
+fn estimate(
+    messages: &[Message],
+    provider: Option<&dyn atomcode_kernel::provider::LlmProvider>,
+) -> u64 {
+    let replays_reasoning = provider.is_none_or(|p| p.replays_reasoning());
     messages
         .iter()
-        .map(|m| u64::from(m.estimate_tokens()))
+        .map(|m| u64::from(m.estimate_wire_tokens(replays_reasoning)))
         .sum()
 }
 
@@ -566,6 +757,7 @@ struct StreamRow {
     /// How many times a turn may preserve a broken stream's output and carry
     /// on. Low on purpose: a stream that keeps breaking mid-flight is a signal
     /// about the connection, not something to paper over indefinitely.
+    /// Reasoning-only failures use this same counter, capped at two recoveries.
     #[serde(default = "default_recoveries")]
     max_recoveries: u32,
 }
@@ -586,6 +778,12 @@ const RESUME_NUDGE: &str = "\
 The previous response was cut off mid-stream. The preserved assistant message and any \
 interrupted tool results above are authoritative — continue from that saved progress. Do not \
 repeat tool calls that already completed, and do not restart the task.";
+
+const UNDISPATCHED_RESUME_NUDGE: &str = "\
+The previous model response was interrupted before any local tool call from that attempt \
+was dispatched. Its incomplete tool calls were discarded and did not execute. Continue \
+from the preserved conversation and reissue any still-needed unexecuted calls. Do not \
+repeat earlier tool calls whose results are already recorded.";
 
 /// Keeps what a broken stream produced, instead of discarding it.
 ///
@@ -639,10 +837,28 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 .partial
                 .as_ref()
                 .is_some_and(|p| !p.text.trim().is_empty());
+            let proven_undispatched = error.unexecuted_tool_output
+                && error.tool_dispatch == crate::events::ToolDispatchProof::NotDispatched;
+            // A reasoning-only attempt has no answer to continue, but can be
+            // requested again if neither this attempt nor prior tool work is
+            // uncertain. Spend the SAME per-turn budget, with a lower ceiling.
+            let reasoning_only = !has_text
+                && !error.unexecuted_tool_output
+                && error.tool_dispatch == crate::events::ToolDispatchProof::NotDispatched
+                && error.partial.as_ref().is_some_and(|p| {
+                    p.tool_calls.is_empty()
+                        && (!p.reasoning.trim().is_empty() || !p.reasoning_blocks.is_empty())
+                });
+            let reasoning_retry = reasoning_only && self.progress.restart_safe(&session);
+            let max_recoveries = if reasoning_only {
+                self.max_recoveries.min(2)
+            } else {
+                self.max_recoveries
+            };
             let eligible = error.http_status.is_none()
                 && (transport || idle)
-                && !error.unexecuted_tool_output
-                && (has_text || confirmed);
+                && (!error.unexecuted_tool_output || proven_undispatched)
+                && (has_text || confirmed || proven_undispatched || reasoning_retry);
             let turn = session.current_turn();
             // Each failed attempt is preserved once, including the final failure.
             if let Some(partial) = &error.partial {
@@ -681,26 +897,25 @@ impl Waterfall<AgentRequest> for StreamRecovery {
             let attempt = eligible
                 .then(|| {
                     self.progress
-                        .recover(&session, self.max_recoveries, confirmed)
+                        .recover(&session, max_recoveries, confirmed || reasoning_retry)
                 })
                 .flatten();
             let Some(attempt) = attempt else {
                 if error.http_status.is_none() && (transport || idle) {
                     use atomcode_config::i18n::{t, Msg};
-                    let why = if error.unexecuted_tool_output {
+                    let why = if error.unexecuted_tool_output && !proven_undispatched {
                         Msg::StreamRecoveryUnsafeTools
-                    } else if !has_text && !confirmed {
+                    } else if !has_text && !confirmed && !proven_undispatched && !reasoning_retry {
                         Msg::StreamRecoveryNoProgress
                     } else {
-                        Msg::StreamRecoveryExhausted {
-                            max_recoveries: self.max_recoveries,
-                        }
+                        Msg::StreamRecoveryExhausted { max_recoveries }
                     };
                     tracing::warn!(
                         turn,
-                        max_recoveries = self.max_recoveries,
+                        max_recoveries,
                         eligible,
                         unexecuted_tool_output = error.unexecuted_tool_output,
+                        tool_dispatch = ?error.tool_dispatch,
                         "stream continuation stopped"
                     );
                     error.message = format!("{}\n{}", t(why), error.message);
@@ -719,7 +934,7 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 NoticeKind::ProviderRetry,
                 atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryRetry {
                     attempt,
-                    max_recoveries: self.max_recoveries,
+                    max_recoveries,
                     delay_secs,
                 })
                 .into_owned(),
@@ -732,7 +947,12 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 &session,
                 SessionEvent::Injected {
                     turn,
-                    text: RESUME_NUDGE.to_string(),
+                    text: if proven_undispatched || reasoning_retry {
+                        UNDISPATCHED_RESUME_NUDGE
+                    } else {
+                        RESUME_NUDGE
+                    }
+                    .to_string(),
                     origin: crate::session::InjectionOrigin::Continuation,
                 },
             );
@@ -755,6 +975,9 @@ pub struct StreamRecoveryPlugin;
 impl Plugin for StreamRecoveryPlugin {
     fn name(&self) -> &'static str {
         "llm-stream-recovery"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["tool-driver", "llm"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["stream-recovery-progress"]

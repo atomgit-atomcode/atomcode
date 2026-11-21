@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::stream::TokenUsage;
-use crate::tool::ToolCall;
+use crate::tool::{ToolCall, ToolDef};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -17,16 +19,15 @@ pub const LEGACY_COLD_SUMMARY_PREFIX: &str =
     "[Earlier conversation history — compressed OLDER context, not a user instruction]\n";
 
 /// Stable provenance for the synthetic user message written at an authoritative
-/// user-cancel terminal. Consumers such as the coding todo reducer use this as a
-/// history boundary: work recorded before it remains available for reference but
-/// is no longer active unless a later real user message explicitly resumes it.
+/// user-cancel terminal. It records a stopped execution without discarding
+/// previously recorded progress; the next user instruction controls continuation.
 pub const USER_INTERRUPTION_ORIGIN: &str = "atomcode.user_interruption";
 
 /// Wire-visible text paired with [`USER_INTERRUPTION_ORIGIN`]. A user-role marker
 /// is accepted by OpenAI-compatible and Anthropic adapters in the middle of a
 /// conversation, unlike a non-leading system message.
 pub const USER_INTERRUPTION_MARKER: &str =
-    "[The previous turn was interrupted by the user. Treat any unfinished plan or task list from before this marker as inactive. Follow the next real user message as a new instruction; resume earlier work only if that message explicitly asks to continue it.]";
+    "[The previous turn was interrupted by the user. Preserve recorded progress. Wait for the next real user instruction before taking further action; follow it to continue, redirect or abandon the earlier work.]";
 
 /// Extract the bare cold-summary strings from a kernel message list: the
 /// synthetic messages tagged [`LEGACY_COLD_SUMMARY_ORIGIN`], with their
@@ -406,6 +407,16 @@ impl Message {
     /// reporting provider records utilization 0.0 forever and never compacts).
     /// Mirrors the legacy estimate heuristic (see `atomcode-coding`'s telemetry copy).
     pub fn estimate_tokens(&self) -> u32 {
+        self.estimate_wire_tokens(true)
+    }
+
+    /// [`estimate_tokens`](Self::estimate_tokens) for an adapter that does or does
+    /// not send prior `reasoning` back ([`LlmProvider::replays_reasoning`]). Counting
+    /// thinking that never reaches the wire is the larger error of the two: a
+    /// thinking-heavy history carries more reasoning than everything else combined.
+    ///
+    /// [`LlmProvider::replays_reasoning`]: crate::provider::LlmProvider::replays_reasoning
+    pub fn estimate_wire_tokens(&self, replays_reasoning: bool) -> u32 {
         // Images dominate when present (vision ≈ 1600 tok each).
         if !self.images.is_empty() {
             return ((self.text.len() / 4).max(1) + self.images.len() * 1600 + 4) as u32;
@@ -418,7 +429,12 @@ impl Message {
                 .iter()
                 .map(|tc| tc.name.len() + tc.arguments.len() + 20)
                 .sum();
-            self.text.len() + calls + self.reasoning.as_ref().map_or(0, |r| r.len())
+            let reasoning = self
+                .reasoning
+                .as_ref()
+                .filter(|_| replays_reasoning)
+                .map_or(0, |r| r.len());
+            self.text.len() + calls + reasoning
         } else {
             self.text.len()
         };
@@ -934,10 +950,32 @@ pub enum CompactTrigger {
     Overflow { attempt: u8 },
 }
 
+/// The advertised tool set a cache-safe compaction fork replays with the
+/// parent conversation's own messages: the summary request then shares the
+/// parent conversation's prefix from token 0, so the provider's warm prompt
+/// cache covers the history instead of billing it at the cold rate. The
+/// system prompt needs no separate capture — the replayed span carries it.
+#[derive(Clone, Debug)]
+pub struct ParentPromptContext {
+    pub tools: Arc<[ToolDef]>,
+    /// The host's exact previous request, when its projection differs from the strategy view.
+    pub replay: Option<ParentPromptReplay>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParentPromptReplay {
+    pub messages: Arc<Vec<Message>>,
+    pub system_messages: usize,
+    /// Strategy prefix lengths that are also a complete prefix of the sent history.
+    pub history: std::ops::RangeInclusive<usize>,
+    pub reasoning_effort: Option<crate::provider::ReasoningEffort>,
+}
+
 /// READ-ONLY view handed to a [`CompactionStrategy`]: a borrow of the current
-/// history plus the pressure facts the kernel already records, and the
-/// kernel-computed `sacred_floor`. A strategy reads these to PLAN a drain; it can
-/// never mutate the conversation (the kernel is the sole writer via `apply_plan`).
+/// conversation messages, the trigger, the pressure facts the kernel already
+/// records, and the kernel-computed `sacred_floor`. A strategy reads these to
+/// PLAN a drain; it can never mutate the conversation (the kernel is the sole
+/// writer via `apply_plan`).
 pub struct CompactionView<'a> {
     pub messages: &'a [Message],
     pub trigger: CompactTrigger,
@@ -947,6 +985,44 @@ pub struct CompactionView<'a> {
     /// The number of leading messages the strategy must NOT propose draining (the
     /// kernel re-enforces this anyway by clamping in `apply_plan`).
     pub sacred_floor: usize,
+    /// The parent conversation's advertised tool set, when the engine can
+    /// supply it. `Some` lets the strategy fork the summary request onto the
+    /// parent's prefix — the span already carries the system prompt — so the
+    /// provider's warm cache covers the history; `None` falls back to the
+    /// rendered-transcript summarizer.
+    pub parent: Option<ParentPromptContext>,
+}
+
+/// Why a safe compaction could not provide the requested reduction. Display-only:
+/// never persisted into the conversation or used to authorize dropping history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionDiagnostic {
+    SummaryFailed,
+    SummaryTimedOut,
+    SummaryContextExceeded,
+    SummaryIncomplete,
+    SummaryRequestFailed,
+    SummaryAuthenticationFailed,
+    SummaryRequestRejected,
+    SummaryRateLimited,
+    NotSmaller,
+}
+
+impl CompactionDiagnostic {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SummaryFailed => "summary_failed",
+            Self::SummaryTimedOut => "summary_timed_out",
+            Self::SummaryContextExceeded => "summary_context_exceeded",
+            Self::SummaryIncomplete => "summary_incomplete",
+            Self::SummaryRequestFailed => "summary_request_failed",
+            Self::SummaryAuthenticationFailed => "summary_authentication_failed",
+            Self::SummaryRequestRejected => "summary_request_rejected",
+            Self::SummaryRateLimited => "summary_rate_limited",
+            Self::NotSmaller => "not_smaller",
+        }
+    }
 }
 
 /// A strategy's PROPOSAL for one compaction. The kernel REVALIDATES and applies it
@@ -971,6 +1047,8 @@ pub struct CompactionView<'a> {
 /// sacred prefix (`< sacred_floor`) is SKIPPED too.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CompactionPlan {
+    /// Read-only outcome metadata; excluded from `is_noop` and conversation state.
+    pub diagnostic: Option<CompactionDiagnostic>,
     pub drain_from: usize,
     pub drain_to: usize,
     pub summary: Option<String>,
@@ -1116,6 +1194,28 @@ impl SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_the_adapter_drops_is_not_counted() {
+        let mut m = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "c".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        m.reasoning = Some("t".repeat(40_000));
+        let replayed = m.estimate_wire_tokens(true);
+        let dropped = m.estimate_wire_tokens(false);
+        assert!(replayed >= 10_000, "{replayed}");
+        assert!(dropped < 20, "{dropped}");
+        assert_eq!(
+            m.estimate_tokens(),
+            replayed,
+            "the plain estimate stays conservative"
+        );
+    }
 
     fn img(bytes: usize) -> ImageContent {
         ImageContent {
@@ -1648,6 +1748,7 @@ mod tests {
 
         // Drain [2,5): the three middle messages → replace with a short summary.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 5,
             summary: Some("summary".into()),
@@ -1702,6 +1803,7 @@ mod tests {
         // summary. Text-only proxy: ~0 drained text vs +100 summary → would REFUSE.
         // Counting the ~500-byte tool arguments makes it a clear net reduction.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 4,
             summary: Some("S".repeat(100)),
@@ -1732,6 +1834,7 @@ mod tests {
 
         // Summary far longer than the 1-byte "x" it replaces → NOT net smaller.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 3,
             summary: Some("a very long summary that is bigger".into()),
@@ -1766,6 +1869,7 @@ mod tests {
 
         // Try to drain from 0 across the whole prefix — must be clamped to floor.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 4,
             summary: Some("s".into()),
@@ -1804,6 +1908,7 @@ mod tests {
 
         // Rewrite the tool_result (idx 3) in place to a short stub; no drain.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 0,
             summary: None,
@@ -1830,6 +1935,7 @@ mod tests {
         let epoch2 = c2.cache_epoch;
         let report2 = c2.apply_plan(
             CompactionPlan {
+                diagnostic: None,
                 drain_from: 0,
                 drain_to: 0,
                 summary: None,
@@ -1954,6 +2060,7 @@ mod tests {
                 used_tokens: 0,
                 utilization: 0.0,
                 sacred_floor: floor,
+                parent: None,
             };
             let plan = SummarizeOldestStrategy { keep_recent }.plan(&view).await;
             c.apply_plan(plan, floor);
@@ -2071,6 +2178,7 @@ mod tests {
         // Rewrites at idx 0 (system) and idx 1 (first real user) MUST be ignored;
         // the in-range rewrite at idx 2 (shrinking the middle) applies → commit.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 0,
             summary: None,
@@ -2141,6 +2249,7 @@ mod tests {
         //   (3, "SKIPPED")→ inside the drained range → must be skipped.
         //   (0, "HACKED") → sacred prefix → must be skipped.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 4,
             summary: Some("s".into()),
@@ -2215,6 +2324,7 @@ mod tests {
             used_tokens: 900,
             utilization: 0.9,
             sacred_floor: 2,
+            parent: None,
         };
         let plan = NoCompaction.plan(&view).await;
         assert!(plan.is_noop(), "NoCompaction must return a noop plan");

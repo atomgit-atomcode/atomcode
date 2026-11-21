@@ -399,10 +399,12 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     fun respondToPermission(
         sessionId: String,
         decision: String,
+        callId: String,
+        approvalId: String,
         toolName: String? = null,
     ): CompletableFuture<Boolean> {
         val client = getOrCreateClient()
-        return client.sendPermissionDecision(sessionId, decision, toolName).thenApply {
+        return client.sendPermissionDecision(sessionId, decision, callId, approvalId, toolName).thenApply {
             if (!it.success && !it.error.isNullOrBlank()) {
                 throw IllegalStateException(it.error)
             }

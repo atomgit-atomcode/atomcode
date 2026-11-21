@@ -43,6 +43,16 @@ pub struct Rendered {
 /// line-numbered under `indent`. `None` when `output` carries no change to show
 /// (no hunk, or context only), so a caller falls back to plain text.
 pub fn render_edit(output: &str, w: u16, indent: &str, max: usize) -> Option<Rendered> {
+    render_edit_with_wrap(output, w, indent, max, true)
+}
+
+pub fn render_edit_with_wrap(
+    output: &str,
+    w: u16,
+    indent: &str,
+    max: usize,
+    wrap: bool,
+) -> Option<Rendered> {
     let entries = parse_unified(output, max);
     if entries
         .iter()
@@ -50,11 +60,21 @@ pub fn render_edit(output: &str, w: u16, indent: &str, max: usize) -> Option<Ren
     {
         return None;
     }
-    Some(render(&entries, w, indent))
+    Some(render(&entries, w, indent, wrap))
 }
 
 /// Render a `write_file` result — every line of `content` as an addition.
 pub fn render_written(content: &str, w: u16, indent: &str, max: usize) -> Rendered {
+    render_written_with_wrap(content, w, indent, max, true)
+}
+
+pub fn render_written_with_wrap(
+    content: &str,
+    w: u16,
+    indent: &str,
+    max: usize,
+    wrap: bool,
+) -> Rendered {
     let entries: Vec<Entry> = content
         .lines()
         .take(max)
@@ -66,14 +86,17 @@ pub fn render_written(content: &str, w: u16, indent: &str, max: usize) -> Render
             text: text.to_string(),
         })
         .collect();
-    render(&entries, w, indent)
+    render(&entries, w, indent, wrap)
 }
 
-fn render(entries: &[Entry], w: u16, indent: &str) -> Rendered {
+fn render(entries: &[Entry], w: u16, indent: &str, wrap: bool) -> Rendered {
     let gutter = gutter_width(entries);
     let added = entries.iter().filter(|e| e.kind == Kind::Add).count();
     let removed = entries.iter().filter(|e| e.kind == Kind::Del).count();
-    let lines = entries.iter().map(|e| row(e, gutter, indent, w)).collect();
+    let lines = entries
+        .iter()
+        .flat_map(|e| row(e, gutter, indent, w, wrap))
+        .collect();
     Rendered {
         lines,
         added,
@@ -82,13 +105,13 @@ fn render(entries: &[Entry], w: u16, indent: &str) -> Rendered {
 }
 
 /// `{indent}{num:>gutter} {sign} {text}` — the number dim, the change coloured.
-fn row(e: &Entry, gutter: usize, indent: &str, w: u16) -> Line {
+fn row(e: &Entry, gutter: usize, indent: &str, w: u16, wrap: bool) -> Vec<Line> {
     if e.kind == Kind::Separator {
-        return Line::from_spans(vec![Span::styled(
+        return vec![Line::from_spans(vec![Span::styled(
             format!("{indent}{:>gutter$} \u{22ee}", ""),
             dim(),
         )])
-        .truncate(w as usize);
+        .truncate(w as usize)];
     }
     let num = match e.kind {
         Kind::Del => e.old_lineno,
@@ -105,11 +128,59 @@ fn row(e: &Entry, gutter: usize, indent: &str, w: u16) -> Line {
         Kind::Del => Style::new().fg(Color::role(Role::DiffRemove)),
         _ => dim(),
     };
-    Line::from_spans(vec![
-        Span::styled(format!("{indent}{numstr:>gutter$} "), dim()),
-        Span::styled(format!("{sign} {}", e.text), style),
-    ])
-    .truncate(w as usize)
+    display_row(
+        &e.text,
+        &format!("{indent}{numstr:>gutter$} {sign} "),
+        &format!("{indent}{:>gutter$} > ", ""),
+        w,
+        style,
+        wrap,
+    )
+}
+
+/// Shared by inline tool diffs and the /diff reader. Continuation prefixes
+/// belong to the display, never to the source or clipboard.
+pub(crate) fn display_row(
+    text: &str,
+    first: &str,
+    next: &str,
+    w: u16,
+    style: Style,
+    wrap: bool,
+) -> Vec<Line> {
+    if w == 0 {
+        return Vec::new();
+    }
+    let text = crate::text::for_screen(text);
+    if !wrap {
+        let prefix = Line::styled(first.to_owned(), dim());
+        let prefix = prefix.restyle(prefix.width().saturating_sub(2), prefix.width(), |_| style);
+        let mut spans = prefix.spans;
+        spans.push(Span::styled(text.into_owned(), style));
+        return vec![Line::from_spans(spans).truncate(w as usize)];
+    }
+    // Reserve body space even when a line-number gutter exceeds the terminal.
+    let prefix_room = (w as usize).saturating_sub(2);
+    let first = Line::raw(first).truncate(prefix_room);
+    let next = Line::raw(next).truncate(prefix_room);
+    let body = w
+        .saturating_sub(first.width().max(next.width()) as u16)
+        .max(1);
+    crate::markdown::wrap_spans(&[Span::styled(text.into_owned(), style)], body, "", style)
+        .into_iter()
+        .enumerate()
+        .map(|(at, row)| {
+            let mut line = if at == 0 { first.clone() } else { next.clone() };
+            for span in &mut line.spans {
+                span.style = dim();
+            }
+            if at == 0 {
+                line = line.restyle(line.width().saturating_sub(2), line.width(), |_| style);
+            }
+            line.spans.extend(row.spans);
+            line
+        })
+        .collect()
 }
 
 fn dim() -> Style {
@@ -228,6 +299,55 @@ fn parse_hunk_header(rest: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_lines_wrap_without_losing_text_or_changing_counts() {
+        let text = "https://example.com/a/very/long/path?query=abcdefghijk";
+        let shown = render_written(text, 18, "", 10);
+        assert_eq!(shown.added, 1);
+        assert_eq!(shown.removed, 0);
+        assert!(shown.lines.len() > 1);
+        assert!(shown.lines.iter().all(|line| line.width() <= 18));
+        assert!(shown
+            .lines
+            .iter()
+            .skip(1)
+            .all(|line| line.plain().starts_with("  > ")));
+        let restored: String = shown
+            .lines
+            .iter()
+            .map(|line| line.plain().chars().skip(4).collect::<String>())
+            .collect();
+        assert_eq!(restored, text);
+        let clipped = render_written_with_wrap(text, 18, "", 10, false);
+        assert_eq!(clipped.lines.len(), 1);
+        assert!(!clipped.lines[0].plain().contains("abcdefghijk"));
+    }
+
+    #[test]
+    fn narrow_unicode_diffs_keep_the_tail_and_their_colours() {
+        let source = "中文宽字符和e\u{301}组合字符到末尾";
+        for width in [2, 10, 24] {
+            let shown = render_written(source, width, "", 10);
+            assert!(shown
+                .lines
+                .iter()
+                .all(|line| line.width() <= width as usize));
+            let body: String = shown
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| span.style.fg == Some(Color::role(Role::DiffAdd)))
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(
+                body.strip_prefix("+ ").unwrap_or(&body),
+                source,
+                "width {width}"
+            );
+        }
+        assert!(render_written(source, 0, "", 10).lines.is_empty());
+    }
 
     /// The plain text of a rendered row (spans concatenated), trimmed.
     fn texts(r: &Rendered) -> Vec<String> {

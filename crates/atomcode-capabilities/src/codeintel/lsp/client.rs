@@ -602,7 +602,10 @@ impl LspClient {
         // Never return diagnostics published for an older document version. Servers
         // that omit the optional publishDiagnostics.version field are common, so clear
         // the cache before every sync and only surface messages published afterwards.
-        self.diagnostics.lock().unwrap().remove(path);
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .remove(&diagnostics_key(path));
         let previous_version = self.opened.lock().unwrap().get(path).copied();
         let version = previous_version
             .unwrap_or(0)
@@ -778,7 +781,7 @@ impl LspClient {
         self.diagnostics
             .lock()
             .unwrap()
-            .get(path)
+            .get(&diagnostics_key(path))
             .cloned()
             .unwrap_or_default()
     }
@@ -836,6 +839,25 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
+/// Use the filesystem's path identity for diagnostic cache operations. Windows paths are
+/// case-insensitive, but LSP servers may return a URI with a differently-cased drive letter
+/// (and percent-encoded colon) than the URI AtomCode sent in didOpen.
+fn diagnostics_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        windows_diagnostics_key(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_diagnostics_key(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().replace('/', "\\").to_lowercase())
+}
+
 /// LSP permits a single Location, an array of Location values, LocationLink values,
 /// or null for definition-like requests. Normalize the useful subset and ignore
 /// malformed entries rather than inventing positions.
@@ -887,7 +909,7 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
         .cloned()
         .unwrap_or_default();
     if items.is_empty() {
-        diagnostics.lock().unwrap().remove(&path);
+        diagnostics.lock().unwrap().remove(&diagnostics_key(&path));
         return;
     }
     let file = path.display().to_string();
@@ -938,15 +960,47 @@ fn handle_publish(params: &Value, diagnostics: &DiagMap) {
         })
         .collect();
     if parsed.is_empty() {
-        diagnostics.lock().unwrap().remove(&path);
+        diagnostics.lock().unwrap().remove(&diagnostics_key(&path));
     } else {
-        diagnostics.lock().unwrap().insert(path, parsed);
+        diagnostics
+            .lock()
+            .unwrap()
+            .insert(diagnostics_key(&path), parsed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_diagnostic_keys_ignore_drive_case_and_separator_style() {
+        assert_eq!(
+            windows_diagnostics_key(Path::new(r"D:/project/src/main.cj")),
+            windows_diagnostics_key(Path::new(r"d:\project\src\main.cj")),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encoded_lowercase_drive_uri_matches_opened_document_diagnostics_key() {
+        let opened = PathBuf::from(r"D:\1program\jian_lang_server\src\main.cj");
+        let published = uri_to_path("file:///d%3A/1program/jian_lang_server/src/main.cj").unwrap();
+        assert_eq!(diagnostics_key(&opened), diagnostics_key(&published));
+
+        let dm: DiagMap = Arc::new(Mutex::new(HashMap::new()));
+        handle_publish(
+            &json!({ "uri": "file:///d%3A/1program/jian_lang_server/src/main.cj", "diagnostics": [{ "range": {"start":{"line":0,"character":0}}, "message": "expected identifier" }] }),
+            &dm,
+        );
+        assert_eq!(
+            dm.lock()
+                .unwrap()
+                .get(&diagnostics_key(&opened))
+                .map(|items| items[0].message.as_str()),
+            Some("expected identifier"),
+        );
+    }
 
     /// A mock LSP server over a byte transport: answers `initialize`, then on the first
     /// `didOpen` emits one `publishDiagnostics` for that document's uri.

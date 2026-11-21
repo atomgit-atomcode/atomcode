@@ -14,6 +14,8 @@ interface AtomCodeApiClient {
     fun sendPermissionDecision(
         sessionId: String,
         decision: String,
+        callId: String,
+        approvalId: String,
         toolName: String? = null,
     ): CompletableFuture<PermissionDecisionResponse>
 }
@@ -45,7 +47,9 @@ class ExistingDaemonApiClient(
     override fun sendPermissionDecision(
         sessionId: String,
         decision: String,
+        callId: String,
+        approvalId: String,
         toolName: String?,
     ): CompletableFuture<PermissionDecisionResponse> =
-        delegate.sendPermissionDecision(sessionId, decision, toolName)
+        delegate.sendPermissionDecision(sessionId, decision, callId, approvalId, toolName)
 }

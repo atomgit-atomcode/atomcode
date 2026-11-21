@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.2.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.2.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -51,7 +51,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 ### Agent Loop
 
 - **Autonomous multi-step execution** — reads files, edits code, runs tests, fixes errors, all in a loop
-- **Verification loop** — automatically verifies edits via syntax checks before declaring success
+- **Verification guidance** — reminds the agent to check unverified code edits; opt-in quality gates provide configured command checks
 - **Dynamic step budget** — scales with the number of edited files, capped per turn to bound cost
 - **Loop detection** — detects and breaks out of repetitive tool-call patterns
 - **3-layer JSON repair** — recovers malformed tool-call arguments
@@ -60,6 +60,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 ### Modes & Autonomy
 
 - **Plan / Build modes** — `/plan` switches to read-only exploration (the agent investigates without touching files); `/build` switches back to full execution
+- **Quality policy** — `/quality on` runs explicitly configured checks before ordinary changed-task handoff, retaining logs and file fingerprints. Independent of approvals; failures preserve files. See [configuration and limits](site/docs/en/slash-commands.html#quality).
 - **Goal mode** — `/goal <text>` sets a completion condition and the agent loops autonomously, turn after turn, until the goal is met
 - **Recurring work** — `/loop 5m <task>` repeats work at the chosen interval; `/loop stop` ends the loop.
 - **Subagents and teams** — drivers with subagents enabled support delegating work through `task` / `team`.
@@ -84,6 +85,10 @@ Automation:
 
 - `auto_fix` — automatic lint/typecheck fix loop
 - `use_skill` — invoke a user-defined skill
+
+### Grape Remote Workflows
+
+The TUI `/grape` entry is temporarily disabled pending cloud authorization deployment. For services that already support authorization, connect with `atomcode grape connect --server <https-url>`, then use native Grape tools to query projects, retrieve repository knowledge, hand off existing Issues and inspect remote results. No copied API key or separate MCP server is required. Grape service-side support must be deployed first. See [authorization and usage](docs/grape.md).
 
 ### Multi-Provider Support
 
@@ -157,7 +162,7 @@ See [Permission Model](./docs/security/permission-model.md) for the full design 
 
 ### Privacy
 
-- 📊 Anonymous telemetry (opt-out) — see [docs/telemetry.md](docs/telemetry.md)
+- 📊 Anonymous telemetry (on by default, opt-out available) — see [docs/telemetry.md](docs/telemetry.md)
 
 ## Installation
 
@@ -345,17 +350,12 @@ By default credentials (`auth.toml`, `mcp.json`, `config.toml`, `ATOMCODE.md`) a
 atomcode
 ```
 
-On first run, a setup wizard will guide you through configuring your LLM provider:
+On first launch without a configured provider, choose how to connect a model:
 
-```
-Welcome to AtomCode! Let's set up your first provider.
+1. **Sign in with AtomGit** to claim free Coding Plan credits.
+2. **Connect your own model provider** to use a third-party or self-hosted model.
 
-Select provider:
-  [1] Claude (Anthropic)
-  [2] OpenAI
-  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
-  [4] Ollama (local)
-```
+Use the arrow keys and Enter to choose. Press Esc while waiting for AtomGit authorization to return to the choices. The chat input appears once a model is ready.
 
 ### 2. Configuration
 
@@ -440,7 +440,7 @@ Then just type what you want:
 | `Ctrl+J` | New line (when the terminal distinguishes the chord) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
 | `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
-| `Esc` | Clear input / Cancel stream |
+| `Esc` | Clear input / Stop streaming while preserving the Todo List |
 | `Esc` ×2 | Undo the previous turn |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept slash-command, skill, or file completion |
@@ -482,7 +482,7 @@ Then just type what you want:
 | `Ctrl+Up/Down`           | Jump to previous / next user message  |
 | Empty input + `Home/End` | Jump to top / bottom of conversation  |
 | `Ctrl+Shift+C`           | Copy selection                        |
-| `Ctrl+C`                 | Cancel operation (double-tap to exit) |
+| `Ctrl+C`                 | Stop execution; keep the Todo List (double-tap to exit) |
 
 ### New screen (`atomcode --tui`)
 
@@ -505,6 +505,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 
 | Command              | Action                                                                                     |
 | -------------------- | ------------------------------------------------------------------------------------------ |
+| `/fork`              | Copy the current conversation and switch to it; use `/compact` in the copy or `/resume <original-id>` to return (working files remain shared) |
 | `/resume`            | Resume or switch session                                                                   |
 | `/session`           | Start a new session                                                                        |
 | `/rename <name>`     | Rename the current session                                                                 |
@@ -522,6 +523,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | -------------- | --------------------------------------------------------------------------------- |
 | `/plan`        | Switch to Plan mode (read-only exploration)                                       |
 | `/build`       | Switch to Build mode (full execution)                                             |
+| `/quality` | Enable/disable configured checks, inspect status/evidence, or record a human waiver |
 | `/goal <text>` | Set a completion goal — the agent loops autonomously until it's met               |
 | `/review`      | Code review the current changes (`/review` · `/review staged` · `/review <base>`) |
 | `/think`       | Control extended thinking (on / off / budget N)                                   |
@@ -565,6 +567,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | Command   | Action                                                                |
 | --------- | --------------------------------------------------------------------- |
 | `/mcp`    | MCP server status (subcommands: `reload`, `tools`, `login`, `logout`) |
+| `/browser` | Configure an external browser once; ordinary webpage tasks automatically load browser guidance and use connected MCP tools under normal approvals |
 | `/plugin` | Plugin marketplace (`marketplace` / `install` / `uninstall` / `trust` / `untrust` / `list`) |
 | `/skills` | Browse loaded skills                                                  |
 
@@ -577,12 +580,18 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/reload` | Reload `~/.atomcode/config.toml` from disk |
 | `/upgrade` | Upgrade atomcode to latest (subcommand: `rollback`) |
 | `/setup` | First run: install the recommended skill and run it |
-| `/welcome` | Re-run the onboarding wizard |
 | `/language` | Switch display and default Git commit-message language |
 | `/guide <question>` | Ask atomcode-guide how to use AtomCode |
 | `/keys` | Show keyboard shortcuts |
 | `/help` | Show commands & shortcuts |
+| `/todo clear` | Explicitly clear the Todo List; interruption preserves its recorded progress. Send a follow-up instruction to continue or redirect work. |
 | `/quit`, `/exit` | Exit AtomCode (or Ctrl+C ×2) |
+
+With the default `keep_interrupted_context = true`, interruption keeps recorded task progress. Setting it to `false` still undoes the interrupted turn, including that turn's Todo changes.
+
+WebUI shows progress during execution, then collapses completed process details while keeping the final answer visible. Click “Process” to expand them. Search reveals the process; interrupted or failed turns stay expanded. Folding does not delete history or change Todo state.
+
+WebUI automatically pages history near the top or bottom and stops at the history boundary, without paging buttons. Completed history keeps each user prompt, collapsed process and final answer together; expanded long processes remain paged internally. Click an image thumbnail to enlarge it; Escape, the backdrop or the close button dismisses the preview. Redundant trailing image markers are hidden when thumbnails are available; missing-image markers remain visible.
 
 > **AtomGit Issues.** `/issue` has been removed. After `/login`, ask in natural
 > language—for example, “Create an AtomGit issue for this bug”—and AtomCode uses

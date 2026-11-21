@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { ModeModelsDialog } from './ModeModelsDialog';
 import { invalidateSkills } from '../skills';
 import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeaders";
@@ -12,6 +13,7 @@ import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeader
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   getConfig,
+  saveVisionPreprocessor,
   postConfigReload,
   ConfigInfo,
   ProviderInfo,
@@ -43,11 +45,13 @@ import {
   modelsBlocker,
   modelBody,
   adoptPicked,
+  updateModelDraft,
   parseTokens,
   providerHost,
   formatTokens,
   apiKeyProblem,
   validBaseUrl,
+  switchConnectionUrl,
   ReasoningDraft,
   reasoningFrom,
   toggleLevel,
@@ -228,12 +232,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <>
-      <div
-        class="modal-overlay"
-        onClick={(e) => {
-          if (e.target === e.currentTarget) onClose();
-        }}
-      >
+      <ModalOverlay>
         <div class="modal-card model-config-modal">
           <div class="modal-header">
             <span>⚙</span>
@@ -270,6 +269,13 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
               {!config && !loadError && <div class="modal-loading">{t('settings.loading')}</div>}
               {config && (
                 <>
+                  {config.vision_preprocessor_status !== undefined && (
+                    <VisionPreprocessor config={config} onSaved={(result) => setConfig((current) => current ? {
+                      ...current,
+                      vision_preprocessor_provider: result.vision_preprocessor_provider,
+                      vision_preprocessor_status: result.vision_preprocessor_status,
+                    } : result)} />
+                  )}
                   <div class="provider-list account-list">
                     {accounts.map((account) => (
                       <AccountCard
@@ -328,7 +334,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
             </div>
           </div>
         </div>
-      </div>
+      </ModalOverlay>
       {confirm && (
         <ConfirmDialog
           title={confirm.kind === 'account' ? t('providers.deleteAccountTitle') : t('settings.deleteTitle')}
@@ -597,6 +603,7 @@ function AddProviderCard({
   const [mode, setMode] = useState<'preset' | 'custom'>(presets.length > 0 ? 'preset' : 'custom');
   const [preset, setPreset] = useState<ProviderDraft>(() => blankDraft('preset', presets[0]?.id ?? ''));
   const [custom, setCustom] = useState<ProviderDraft>(() => blankDraft('custom', protocols[0]?.id ?? ''));
+  const [presetProtocol, setPresetProtocol] = useState('');
   const [setDefault, setSetDefault] = useState(!hasDefault);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -605,23 +612,27 @@ function AddProviderCard({
   const setDraft = mode === 'preset' ? setPreset : setCustom;
   const choices = mode === 'preset' ? presets : protocols;
   const chosen: ProviderPresetInfo | undefined = choices.find((p) => p.id === typed.provider);
+  const connections = mode === 'preset' ? chosen?.connections ?? [] : [];
+  const connection = connections.find((option) => option.type === presetProtocol) ?? connections[0];
+  const selectedType = connection?.type ?? chosen?.type;
+  const defaultEndpoint = connection?.base_urls[0] ?? chosen?.default_base_url;
   // A local Ollama takes no key: one typed before switching to it is hidden,
   // so it is neither judged nor sent.
-  const keyless = chosen?.type === 'ollama';
+  const keyless = selectedType === 'ollama';
   const draft = keyless ? { ...typed, apiKey: '' } : typed;
   const takenIds = (config.provider_accounts ?? []).map((a) => a.id);
   const blocker = firstBlocker(draft, {
     takenIds,
-    hasDefaultEndpoint: !!chosen?.default_base_url,
+    hasDefaultEndpoint: !!defaultEndpoint,
     requiresKey: mode === 'preset' && !!chosen?.requires_api_key && chosen?.type !== 'ollama' && Object.keys(headerBody(draft.headers ?? [])).length === 0,
   });
-  const endpoint = draft.baseUrl.trim() || chosen?.default_base_url || '';
+  const endpoint = draft.baseUrl.trim() || defaultEndpoint || '';
   const discoveryRequest = useMemo(() => ({
-    type: chosen?.type ?? 'openai',
+    type: selectedType ?? 'openai',
     base_url: endpoint,
     api_key: draft.apiKey.trim() || undefined,
     headers: headerBody(draft.headers ?? []),
-  }), [chosen?.type, endpoint, draft.apiKey, draft.headers]);
+  }), [selectedType, endpoint, draft.apiKey, draft.headers]);
 
   async function submit() {
     if (blocker || saving || headerProblem(draft.headers ?? [])) return;
@@ -631,14 +642,15 @@ function AddProviderCard({
       const res = await createAccount({
         id: mode === 'custom' ? draft.id.trim() : undefined,
         provider: draft.provider,
+        protocol: connection?.type,
         display_name: draft.displayName.trim() || undefined,
-        base_url: draft.baseUrl.trim() || undefined,
+        base_url: connection ? endpoint : draft.baseUrl.trim() || undefined,
         api_key: draft.apiKey.trim() || undefined,
         headers: headerBody(draft.headers ?? []),
         models: draft.models.map(modelBody),
         set_default: setDefault,
       });
-      await onCreated(res.account, res.models, chosen?.type === 'openai');
+      await onCreated(res.account, res.models, selectedType === 'openai');
     } catch (e) {
       setError(errorText(e, t));
     } finally {
@@ -675,9 +687,40 @@ function AddProviderCard({
             const host = providerHost(p.default_base_url);
             return { value: p.id, label: host ? `${p.display_name} · ${host}` : p.display_name };
           })}
-          onChange={(v) => setDraft({ ...typed, provider: v })}
+          onChange={(v) => {
+            const address = typed.baseUrl.trim().replace(/\/+$/, '');
+            const knownAddress = !address || address === chosen?.default_base_url
+              || connections.some((option) => option.base_urls.includes(address));
+            if (mode === 'preset') setPresetProtocol('');
+            setDraft({ ...typed, provider: v, baseUrl: knownAddress ? '' : typed.baseUrl, models: [emptyModelDraft()] });
+          }}
         />
       </div>
+
+      {connections.length > 1 && (
+        <div class="add-model-field">
+          <label class="add-model-label">{t('providers.protocol')}</label>
+          <Select
+            value={selectedType ?? ''}
+            options={connections.map((option) => ({ value: option.type, label: option.type === 'anthropic' ? 'Anthropic' : 'OpenAI' }))}
+            onChange={(type) => {
+              if (type === selectedType) return;
+              const next = connections.find((option) => option.type === type);
+              if (!next || !connection) return;
+              setPresetProtocol(type);
+              setDraft({ ...typed, baseUrl: switchConnectionUrl(endpoint, connection.base_urls, next.base_urls), models: [emptyModelDraft()] });
+            }}
+          />
+          <span class="field-hint">{t('providers.protocolEndpointHint')}</span>
+        </div>
+      )}
+
+      {mode === 'preset' && connections.length <= 1 && (
+        <div class="add-model-field">
+          <label class="add-model-label">{t('providers.protocol')}</label>
+          <span>{selectedType === 'openai' ? 'OpenAI' : selectedType === 'anthropic' ? 'Anthropic' : selectedType === 'responses' ? 'OpenAI Responses' : selectedType === 'ollama' ? 'Ollama' : selectedType === 'deepseek-messages' ? 'DeepSeek Messages' : selectedType}</span>
+        </div>
+      )}
 
       {mode === 'custom' && (
         <div class="add-model-field">
@@ -695,20 +738,18 @@ function AddProviderCard({
         </div>
       )}
 
-      {mode === 'custom' && (
-        <div class="add-model-field">
-          <label class="add-model-label">{t('providers.baseUrl')}</label>
-          <input
-            class="menu-input"
-            type="url"
-            spellcheck={false}
-            placeholder={chosen?.type === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1'}
-            aria-label={t('providers.baseUrl')}
-            value={draft.baseUrl}
-            onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
-          />
-        </div>
-      )}
+      <div class="add-model-field">
+        <label class="add-model-label">{t('providers.baseUrl')}</label>
+        <input
+          class="menu-input"
+          type="url"
+          spellcheck={false}
+          placeholder={defaultEndpoint ?? (selectedType === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1')}
+          aria-label={t('providers.baseUrl')}
+          value={mode === 'preset' ? endpoint : draft.baseUrl}
+          onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
+        />
+      </div>
 
       <div class="add-model-field">
         <label class="add-model-label">{t('providers.apiKey')}</label>
@@ -740,27 +781,10 @@ function AddProviderCard({
             onInput={(e) => setDraft({ ...typed, displayName: (e.target as HTMLInputElement).value })}
           />
         </div>
-        {mode === 'preset' && (
-          <div class="add-model-field">
-            <label class="add-model-label">{t('providers.baseUrl')}</label>
-            <input
-              class="menu-input"
-              type="url"
-              spellcheck={false}
-              placeholder={chosen?.default_base_url ?? ''}
-              aria-label={t('providers.baseUrl')}
-              value={draft.baseUrl}
-              onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
-            />
-            {chosen?.default_base_url && (
-              <span class="field-hint">{t('providers.baseUrlDefault', { url: chosen.default_base_url })}</span>
-            )}
-          </div>
-        )}
       </details>
 
       <ModelRowsEditor
-        key={mode}
+        key={`${mode}:${draft.provider}:${selectedType}`}
         rows={draft.models}
         levels={levelsOf(config)}
         setRows={(models) => setDraft({ ...typed, models })}
@@ -877,7 +901,7 @@ function ModelRowsEditor({
   }, [discoveryIdentity, autoDiscover]);
 
   const update = (i: number, patch: Partial<ModelDraft>) =>
-    setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    setRows(rows.map((r, j) => (j === i ? updateModelDraft(r, patch) : r)));
 
   return (
     <div class="add-model-field">
@@ -894,6 +918,7 @@ function ModelRowsEditor({
       {fetchError && <div class="modal-error" role="alert">{fetchError}</div>}
       <div class="model-draft-list">
         <ModelColumns removable />
+        <p class="field-hint">{t('providers.contextBudgetHint')}</p>
         {rows.map((row, i) => (
           <div key={i}>
           <div class="model-draft-row">
@@ -919,7 +944,7 @@ function ModelRowsEditor({
               type="text"
               placeholder={t('providers.contextWindowPlaceholder')}
               aria-label={t('providers.contextWindow')}
-              title={t('providers.contextWindow')}
+              title={t('providers.contextBudgetHint')}
               value={row.window}
               onInput={(e) => update(i, { window: (e.target as HTMLInputElement).value })}
             />
@@ -1102,12 +1127,7 @@ function ModelPicker({
   );
   const pickable = visible.filter((m) => !takenSet.has(m.id)).map((m) => m.id);
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onCancel();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card modal-card-sm model-picker-modal" role="dialog" aria-label={t('providers.pickTitle')}>
         <div class="modal-header">
           <h3>{t('providers.pickTitle')}</h3>
@@ -1117,6 +1137,9 @@ function ModelPicker({
         </div>
         <div class="modal-body">
           <div class="model-discovery-picker model-discovery-picker-multi">
+            {models.some((model) => model.catalog_only) && (
+              <p class="field-hint">{t('providers.catalogCandidates')}</p>
+            )}
             <input
               class="menu-input"
               type="search"
@@ -1159,6 +1182,7 @@ function ModelPicker({
                     {m.context_window ? <small>{formatTokens(m.context_window)}</small> : null}
                     {m.supports_vision === true && <small>{t('providers.visionOn')}</small>}
                     {!!m.reasoning_effort_levels?.length && <small>{m.reasoning_effort_levels.join(' / ')}</small>}
+                    {m.catalog_default_effort && <small>{t('providers.reasoningDefault')} {m.catalog_default_effort}</small>}
                     {exists && <small>{t('providers.pickAlready')}</small>}
                   </button>
                 );
@@ -1180,7 +1204,7 @@ function ModelPicker({
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }
 
@@ -1459,7 +1483,7 @@ function ModelEditor({
           type="text"
           placeholder={t('providers.contextWindowPlaceholder')}
           aria-label={t('providers.contextWindow')}
-          title={t('providers.contextWindow')}
+          title={t('providers.contextBudgetHint')}
           value={ctxWindow}
           onInput={(e) => setCtxWindow((e.target as HTMLInputElement).value)}
         />
@@ -1482,6 +1506,7 @@ function ModelEditor({
           onChange={(v) => setVision(v)}
         />
       </div>
+      <p class="field-hint">{t('providers.contextBudgetHint')}</p>
       <ReasoningFields value={reasoning} levels={levels} onChange={setReasoning} />
       <div class="reasoning-row">
         <span class="add-model-label">{t('providers.reasoningHistory')}</span>
@@ -1512,4 +1537,37 @@ function ModelEditor({
       </div>
     </div>
   );
+}
+
+function VisionPreprocessor({ config, onSaved }: { config: ConfigInfo; onSaved: (config: ConfigInfo) => void }) {
+  const { t } = useSettings();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const pending = useRef(false);
+  const current = config.vision_preprocessor_provider ?? '';
+  const models = config.providers.filter((model) => model.supports_vision);
+  const invalid = current !== '' && !models.some((model) => model.name === current);
+  const status = config.vision_preprocessor_status ?? 'unconfigured';
+  async function select(value: string) {
+    if (pending.current) return;
+    pending.current = true;
+    setSaving(true);
+    setError('');
+    try { onSaved(await saveVisionPreprocessor(value)); }
+    catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+    finally { pending.current = false; setSaving(false); }
+  }
+  return <section class="vision-preprocessor" aria-labelledby="vl-model-label" aria-busy={saving}>
+    <label id="vl-model-label" htmlFor="vl-model-select">{t('visionPreprocessor.title')}</label>
+    <p id="vl-model-hint">{t('visionPreprocessor.hint')}</p>
+    <select id="vl-model-select" value={current} disabled={saving} aria-describedby="vl-model-hint vl-model-status"
+      onChange={(event) => { void select(event.currentTarget.value); }}>
+      <option value="">{t('visionPreprocessor.off')}</option>
+      {invalid && <option value={current} disabled>{current}</option>}
+      {models.map((model) => <option key={model.name} value={model.name}>{model.display_name || model.model} · {model.name}</option>)}
+    </select>
+    <p id="vl-model-status" role="status">{saving ? t('visionPreprocessor.saving') : t(`visionPreprocessor.${status}`)}</p>
+    {models.length === 0 && <p>{t('visionPreprocessor.empty')}</p>}
+    {error && <p class="modal-error" role="alert">{error}</p>}
+  </section>;
 }

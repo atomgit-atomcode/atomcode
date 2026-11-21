@@ -1,0 +1,84 @@
+{
+  "wire_calls": [
+    {
+      "build": "reported-dd97065f",
+      "model": "gdtokenhub/deepseek-v4.1-flash-1017",
+      "effort": "high",
+      "tools": 46,
+      "max_tokens": 32768,
+      "session_bound": true
+    },
+    {
+      "build": "reported-dd97065f",
+      "model": "gdtokenhub/deepseek-v4.1-flash-1017",
+      "effort": "omitted",
+      "tools": 0,
+      "max_tokens": 32768,
+      "session_bound": true
+    },
+    {
+      "build": "reported-dd97065f",
+      "model": "gdtokenhub/deepseek-v4.1-flash-1017",
+      "effort": "high",
+      "tools": 46,
+      "max_tokens": 32768,
+      "session_bound": true
+    },
+    {
+      "build": "current-debug",
+      "model": "gdtokenhub/deepseek-v4.1-flash-1017",
+      "effort": "high",
+      "tools": 43,
+      "max_tokens": 32768,
+      "session_bound": true
+    },
+    {
+      "build": "current-debug",
+      "model": "gdtokenhub/deepseek-v4.1-flash-1017",
+      "effort": "high",
+      "tools": 0,
+      "max_tokens": 32768,
+      "session_bound": true
+    },
+    {
+      "build": "current-debug",
+      "model": "gdtokenhub/deepseek-v4.1-flash-1017",
+      "effort": "high",
+      "tools": 43,
+      "max_tokens": 32768,
+      "session_bound": true
+    }
+  ],
+  "request_diagnostics": [
+    {
+      "purpose": "main_reply",
+      "effort_source": "request_value",
+      "requested_effort": "high",
+      "model_default_effort": "high",
+      "resolved_effort": "high",
+      "reasoning_effort": "high",
+      "adapter_requested_effort": "high",
+      "reasoning_effort_disposition": "sent"
+    },
+    {
+      "purpose": "session_title",
+      "effort_source": "model_default",
+      "requested_effort": "omitted",
+      "model_default_effort": "high",
+      "resolved_effort": "high",
+      "reasoning_effort": "high",
+      "adapter_requested_effort": "high",
+      "reasoning_effort_disposition": "sent"
+    },
+    {
+      "purpose": "main_reply",
+      "effort_source": "request_value",
+      "requested_effort": "high",
+      "model_default_effort": "high",
+      "resolved_effort": "high",
+      "reasoning_effort": "high",
+      "adapter_requested_effort": "high",
+      "reasoning_effort_disposition": "sent"
+    }
+  ]
+}

@@ -1405,16 +1405,8 @@ class AtomCodeChatPanel(
     }
 
     private fun requestPermissionDecision(event: ChatEvent.PermissionRequest) {
-        // 非破坏性工具自动允许，避免模态对话框阻塞 EDT 导致 daemon 流中断
-        // 破坏性操作（bash、write、edit）在 UI 中异步确认
-        val isDestructive = event.toolName in setOf("bash", "execute_command", "write_to_file", "replace_in_file", "delete_files")
-        if (!isDestructive) {
-            addSystemMessage("[Permission] auto-allowed: ${event.toolName}")
-            service.respondToPermission(event.sessionId, "allow", event.toolName)
-            return
-        }
-
-        // 破坏性操作：在 UI 中展示确认信息，通过 daemon 异步响应
+        // The daemon already decided this call needs approval. Do not override
+        // its gate using a second, incomplete list of tool names in the IDE.
         addSystemMessage("[Permission required] ${event.toolName}: ${event.reason}")
         SwingUtilities.invokeLater {
             val args = event.arguments.take(1200)
@@ -1428,9 +1420,13 @@ class AtomCodeChatPanel(
                 this, message, "AtomCode Tool Permission",
                 arrayOf("Allow Once", "Deny", "Always Allow"), 0, Messages.getWarningIcon()
             )
-            val decision = when (choice) { 0 -> "allow"; 2 -> "allow_persist"; else -> "deny" }
+            val decision = when (choice) {
+                0 -> "allow"
+                2 -> if (event.toolName.startsWith("mcp__")) "allow_persist" else "always_allow"
+                else -> "deny"
+            }
             addSystemMessage("[Permission] $decision")
-            service.respondToPermission(event.sessionId, decision, event.toolName).whenComplete { ok, error ->
+            service.respondToPermission(event.sessionId, decision, event.callId, event.approvalId, event.toolName).whenComplete { ok, error ->
                 SwingUtilities.invokeLater {
                     if (error != null) addErrorMessage("Permission error: ${error.cause?.message ?: error.message ?: "failed"}")
                     else if (ok != true) addErrorMessage("no pending permission for this session")

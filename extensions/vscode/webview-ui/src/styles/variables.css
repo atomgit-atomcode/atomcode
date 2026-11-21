@@ -79,8 +79,8 @@ html {
 
   /* Font */
   --app-monospace-font-family: var(--vscode-editor-font-family, 'Menlo', 'Monaco', 'Courier New', monospace);
-  --app-monospace-font-size: var(--vscode-editor-font-size, 12px);
-  --app-monospace-font-size-small: calc(var(--vscode-editor-font-size, 12px) - 2px);
+  --app-monospace-font-size: calc(var(--app-font-size, 13px) * 12 / 13);
+  --app-monospace-font-size-small: calc(var(--app-font-size, 13px) * 10 / 13);
 }
 
 /* Light theme overrides */

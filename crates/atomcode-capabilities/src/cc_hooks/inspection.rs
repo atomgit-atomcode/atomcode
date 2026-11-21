@@ -18,6 +18,7 @@ fn row(
     command: &str,
     timeout_ms: u64,
     disabled: bool,
+    required_approval: bool,
     config: Option<HookConfig>,
 ) -> Candidate {
     let args = config
@@ -25,7 +26,7 @@ fn row(
         .map(|config| config.args.as_slice())
         .unwrap_or(&[]);
     let mut value = json!({"name":name,"event":event,"matcher":matcher,"command":command,"args":args,"timeout_ms":timeout_ms,
-        "source":source,"scope":scope,"disabled":disabled,"testable":config.is_some()});
+        "source":source,"scope":scope,"disabled":disabled,"required_approval":required_approval,"testable":config.is_some()});
     let fingerprint = format!("{}\n{}\n{:?}", cwd.display(), value, config);
     value["id"] = json!(format!("{:x}", Sha256::digest(fingerprint.as_bytes())));
     Candidate { value, config }
@@ -44,6 +45,8 @@ fn discover(cwd: &Path, dirs: &ProductDirs) -> (Value, Vec<Candidate>) {
             {
                 for (name, entry) in file.hooks {
                     let event = HookEvent::parse(&entry.event);
+                    let required_approval =
+                        entry.required_approval && event == Some(HookEvent::PreToolUse);
                     let config =
                         (!entry.disabled)
                             .then_some(event)
@@ -56,6 +59,7 @@ fn discover(cwd: &Path, dirs: &ProductDirs) -> (Value, Vec<Candidate>) {
                                 args: Vec::new(),
                                 plugin_root: None,
                                 plugin_content_hash: None,
+                                required_approval,
                             });
                     candidates.push(row(
                         cwd,
@@ -67,6 +71,7 @@ fn discover(cwd: &Path, dirs: &ProductDirs) -> (Value, Vec<Candidate>) {
                         &entry.command,
                         entry.timeout_ms,
                         entry.disabled,
+                        required_approval,
                         config,
                     ));
                 }
@@ -97,6 +102,7 @@ fn discover(cwd: &Path, dirs: &ProductDirs) -> (Value, Vec<Candidate>) {
             &hook.matcher,
             &hook.command,
             config.as_ref().map_or(10000, |c| c.timeout_ms),
+            false,
             false,
             config,
         ));
@@ -308,6 +314,20 @@ mod tests {
     }
 
     #[test]
+    fn required_approval_is_visible_for_pre_tool_use_hooks() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("hooks.json"),
+            r#"{"hooks":{"managed":{"event":"PreToolUse","command":"unused","required_approval":true}}}"#,
+        )
+        .unwrap();
+        let (catalogue, candidates) = discover(cwd.path(), &dirs(home.path()));
+        assert_eq!(catalogue["items"][0]["required_approval"], true);
+        assert!(candidates[0].config.as_ref().unwrap().required_approval);
+    }
+
+    #[test]
     fn explicit_arguments_are_visible_and_bound_to_the_selection() {
         let cwd = std::env::temp_dir();
         let make = |argument: &str| {
@@ -319,6 +339,7 @@ mod tests {
                 timeout_ms: 10000,
                 plugin_root: None,
                 plugin_content_hash: None,
+                required_approval: false,
             };
             row(
                 &cwd,
@@ -329,6 +350,7 @@ mod tests {
                 &None,
                 "python3",
                 10000,
+                false,
                 false,
                 Some(config),
             )

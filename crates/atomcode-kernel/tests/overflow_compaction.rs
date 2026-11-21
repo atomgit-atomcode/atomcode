@@ -58,6 +58,7 @@ impl CompactionStrategy for DrainOldOnOverflow {
             let last = view.messages.len().saturating_sub(1);
             if last > floor {
                 return CompactionPlan {
+                    diagnostic: None,
                     drain_from: floor,
                     drain_to: last,
                     summary: None,

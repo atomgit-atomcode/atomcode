@@ -23,7 +23,7 @@
   "atomcode.configuration.chat.fontFamily.description": "Font family for the chat's code blocks, tool output and input box. Leave empty to follow the editor font (editor.fontFamily). Accepts a CSS font-family list, e.g. 'Cascadia Code', 'JetBrains Mono', monospace.",
   "atomcode.configuration.autoSave.description": "Auto-save files before AI reads them",
   "atomcode.configuration.sendWithCtrlEnter.description": "Use Ctrl+Enter instead of Enter to send messages",
-  "atomcode.configuration.fontSize.description": "Font size in chat panel",
+  "atomcode.configuration.fontSize.description": "Default chat font size (9–40px), applied immediately to open panels",
   "atomcode.configuration.showInlineHints.description": "Show inline diff hints when AI edits files",
   "atomcode.commands.enableLanguageBridge.title": "AtomCode: Enable IDE Language Bridge (Copy Configuration)",
   "atomcode.commands.disableLanguageBridge.title": "AtomCode: Disable IDE Language Bridge",

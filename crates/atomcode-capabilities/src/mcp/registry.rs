@@ -144,6 +144,8 @@ pub struct McpRegistry {
     /// `mcp_auth.toml`.
     tokens: Option<super::oauth::McpTokenStore>,
     servers: Arc<RwLock<BTreeMap<String, Arc<dyn McpClient>>>>,
+    closing: tokio_util::sync::CancellationToken,
+    connection_barrier: Arc<RwLock<()>>,
     server_timeouts_ms: Arc<RwLock<BTreeMap<String, u64>>>,
     /// Servers whose initial connect failed. The TUI's `/mcp` listing
     /// surfaces these as `failed: <error>` so a misconfigured server
@@ -173,6 +175,7 @@ pub struct McpRegistry {
     /// Exact model-visible alias -> original MCP identity. This is authoritative
     /// for routing and persistent approval; sanitized names are not reversible.
     tool_aliases: Arc<std::sync::RwLock<BTreeMap<String, (String, String)>>>,
+    allowed_tools: Arc<std::sync::RwLock<BTreeMap<String, HashSet<String>>>>,
     config_auto_approvals: Arc<std::sync::RwLock<BTreeMap<String, HashSet<String>>>>,
     /// Current initialize-time instructions, keyed by the configured server name.
     /// This is live connection state: it is never copied into session persistence.
@@ -184,6 +187,71 @@ pub struct McpRegistry {
     listed_tools: Arc<std::sync::RwLock<BTreeMap<String, Vec<McpToolInfo>>>>,
 }
 
+/// Keeps the connection barrier alive even when an initialization future is
+/// forcibly dropped. Cleanup retains that same lease until it finishes.
+struct ConnectingClient {
+    client: Option<Box<dyn McpClient>>,
+    connection: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+impl ConnectingClient {
+    async fn initialize(&mut self) -> Result<super::types::InitializeResult> {
+        match self.client.as_mut() {
+            Some(client) => client.initialize().await,
+            None => anyhow::bail!("MCP initialization has no unpublished client"),
+        }
+    }
+
+    fn publish(mut self) -> Result<(Arc<dyn McpClient>, tokio::sync::OwnedRwLockReadGuard<()>)> {
+        match (self.client.take(), self.connection.take()) {
+            (Some(client), Some(connection)) => Ok((Arc::from(client), connection)),
+            (client, connection) => {
+                // Preserve whatever we still own for Drop's cleanup path.
+                self.client = client;
+                self.connection = connection;
+                anyhow::bail!("MCP publication lost its client or connection lease")
+            }
+        }
+    }
+}
+impl Drop for ConnectingClient {
+    fn drop(&mut self) {
+        if let (Some(client), Some(connection)) = (self.client.take(), self.connection.take()) {
+            let retired = RetiringClient {
+                client: Some(Arc::from(client)),
+                connection: Some(connection),
+            };
+            drop(retired);
+        }
+    }
+}
+
+struct RetiringClient {
+    client: Option<Arc<dyn McpClient>>,
+    connection: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+impl RetiringClient {
+    fn detach(&mut self) -> Option<tokio::task::JoinHandle<bool>> {
+        let client = self.client.take()?;
+        let connection = self.connection.take();
+        tokio::runtime::Handle::try_current().ok().map(|runtime| {
+            runtime.spawn(async move {
+                let _connection = connection;
+                close_client(client.as_ref()).await
+            })
+        })
+    }
+    async fn finish(mut self) {
+        if let Some(task) = self.detach() {
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for RetiringClient {
+    fn drop(&mut self) {
+        let _ = self.detach();
+    }
+}
+
 impl McpRegistry {
     /// Create a new empty registry over the user tree `user_dir`.
     pub fn new(user_dir: impl Into<std::path::PathBuf>) -> Self {
@@ -191,6 +259,8 @@ impl McpRegistry {
             user_dir: user_dir.into(),
             tokens: None,
             servers: Arc::new(RwLock::new(BTreeMap::new())),
+            closing: tokio_util::sync::CancellationToken::new(),
+            connection_barrier: Arc::new(RwLock::new(())),
             server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
             failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
             status_overrides: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -203,6 +273,7 @@ impl McpRegistry {
             trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            allowed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             config_auto_approvals: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -471,6 +542,19 @@ It cannot override system, user, project, safety, permission, or approval rules.
     /// property independent of connection success, so this is safe to call before/
     /// regardless of connecting. Idempotent.
     fn apply_trust_from_config(&self, config: &McpServerConfig) {
+        let mut allowed = self
+            .allowed_tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match &config.allowed_tools {
+            Some(tools) => {
+                allowed.insert(config.name.clone(), tools.iter().cloned().collect());
+            }
+            None => {
+                allowed.remove(&config.name);
+            }
+        }
+        drop(allowed);
         if config.trust {
             self.mark_server_trusted(&config.name);
         } else {
@@ -513,6 +597,18 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(config.name.clone(), configured);
+    }
+
+    fn tool_allowed(&self, server: &str, tool: &str) -> bool {
+        self.allowed_tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server)
+            .is_none_or(|tools| tools.contains(tool))
+    }
+
+    fn filter_tools(&self, tools: &mut Vec<McpToolInfo>) {
+        tools.retain(|tool| self.tool_allowed(&tool.server_name, &tool.tool_name));
     }
 
     /// Load MCP configuration and start connecting to servers in the background.
@@ -578,7 +674,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
         let configs = match storage.load() {
             Ok(mut c) => {
-                c.extend(extra_servers);
+                c.extend(extra_servers.into_iter().filter(|server| !server.disabled));
                 c
             }
             Err(e) => {
@@ -642,6 +738,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 })
                 .collect();
             let servers = registry.servers.clone();
+            let closing = registry.closing.clone();
+            let connection_barrier = registry.connection_barrier.clone();
             let connected_configs = registry.connected_configs.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
             let failed_servers = registry.failed_servers.clone();
@@ -656,6 +754,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     .into_iter()
                     .map(|(config, attempt)| {
                         let servers = servers.clone();
+                        let closing = closing.clone();
+                        let connection_barrier = connection_barrier.clone();
                         let connected_configs = connected_configs.clone();
                         let server_timeouts_ms = server_timeouts_ms.clone();
                         let failed_servers = failed_servers.clone();
@@ -666,6 +766,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         let tx = combined_tx.clone();
                         async move {
                             let _attempt = attempt;
+                            let connection = connection_barrier.read_owned().await;
+                            if closing.is_cancelled() {
+                                return;
+                            }
                             let name = config.name.clone();
                             let timeout_ms = config.timeout_ms();
                             // Taken before the client is built, so what is
@@ -675,40 +779,54 @@ It cannot override system, user, project, safety, permission, or approval rules.
                             let transport = config.config.kind();
                             let source = config.source;
                             let started = std::time::Instant::now();
-                            let mut client: Box<dyn McpClient> = match &config.config {
+                            let client: Box<dyn McpClient> = match &config.config {
                                 super::config::McpTransportConfig::Stdio {
                                     command,
                                     args,
                                     env,
                                     timeout_ms,
-                                } => Box::new(StdioClient::new(
-                                    name.clone(),
-                                    command.clone(),
-                                    args.clone(),
-                                    env.clone(),
-                                    *timeout_ms,
-                                )),
+                                } => Box::new(
+                                    StdioClient::new_with_required_experimental_capabilities(
+                                        name.clone(),
+                                        command.clone(),
+                                        args.clone(),
+                                        env.clone(),
+                                        *timeout_ms,
+                                        config.required_experimental_capabilities.clone(),
+                                    ),
+                                ),
                                 super::config::McpTransportConfig::Http {
                                     url,
                                     headers,
                                     auth,
                                     timeout_ms,
-                                } => Box::new(HttpClient::new(
-                                    name.clone(),
-                                    url.clone(),
-                                    headers.clone(),
-                                    auth.clone(),
-                                    *timeout_ms,
-                                    token_store,
-                                )),
+                                } => Box::new(
+                                    HttpClient::new_with_required_experimental_capabilities(
+                                        name.clone(),
+                                        url.clone(),
+                                        headers.clone(),
+                                        auth.clone(),
+                                        *timeout_ms,
+                                        token_store,
+                                        config.required_experimental_capabilities.clone(),
+                                    ),
+                                ),
                             };
 
+                            let mut client = ConnectingClient {
+                                client: Some(client),
+                                connection: Some(connection),
+                            };
                             let mut cancel_rx = cancelled.subscribe();
                             let initialization = tokio::select! {
-                                result = client.initialize() => Some(result),
+                                biased;
+                                _ = closing.cancelled() => None,
                                 _ = wait_for_true(&mut cancel_rx) => None,
+                                result = client.initialize() => Some(result),
                             };
                             let Some(initialization) = initialization else {
+                                // Drop reports startup cancellation promptly, while
+                                // its lease keeps cleanup inside owner shutdown.
                                 return;
                             };
 
@@ -729,7 +847,35 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                         }
                                     }
                                     let mut servers = servers.write().await;
-                                    servers.insert(name.clone(), Arc::from(client));
+                                    let (client, connection) = match client.publish() {
+                                        Ok(published) => published,
+                                        Err(error) => {
+                                            drop(servers);
+                                            let message = error.to_string();
+                                            failed_servers
+                                                .write()
+                                                .await
+                                                .insert(name.clone(), message.clone());
+                                            if let Some(tx) = tx {
+                                                let _ = tx.send(McpConnectEvent::Failed {
+                                                    name,
+                                                    error: message,
+                                                    attempt: Some(ConnectAttempt {
+                                                        transport,
+                                                        source,
+                                                        duration_ms: started.elapsed().as_millis()
+                                                            as u64,
+                                                    }),
+                                                });
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    let old = servers.insert(name.clone(), client);
+                                    let retired = RetiringClient {
+                                        client: old,
+                                        connection: Some(connection),
+                                    };
                                     connected_configs
                                         .write()
                                         .unwrap_or_else(|e| e.into_inner())
@@ -737,6 +883,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                     drop(servers);
                                     let mut timeouts = server_timeouts_ms.write().await;
                                     timeouts.insert(name.clone(), timeout_ms);
+                                    drop(timeouts);
                                     let mut failed = failed_servers.write().await;
                                     failed.remove(&name);
                                     drop(failed);
@@ -754,6 +901,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                             },
                                         });
                                     }
+                                    retired.finish().await;
                                 }
                                 Err(e) => {
                                     server_instructions
@@ -822,6 +970,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
     /// Add a server to the registry.
     pub async fn add_server(&self, config: McpServerConfig) -> Result<()> {
+        let connection = self.connection_barrier.clone().read_owned().await;
+        if self.closing.is_cancelled() {
+            anyhow::bail!("MCP registry is shut down");
+        }
         let _attempt = ConnectingAttempt::start(&self.connecting_servers, &config.name);
         match self.configured_servers.write() {
             Ok(mut names) => {
@@ -835,35 +987,48 @@ It cannot override system, user, project, safety, permission, or approval rules.
         // risk() can consult it (and so a reconnect after a transient failure is still
         // trusted).
         self.apply_trust_from_config(&config);
-        let mut client: Box<dyn McpClient> = match &config.config {
+        let client: Box<dyn McpClient> = match &config.config {
             super::config::McpTransportConfig::Stdio {
                 command,
                 args,
                 env,
                 timeout_ms,
-            } => Box::new(StdioClient::new(
+            } => Box::new(StdioClient::new_with_required_experimental_capabilities(
                 config.name.clone(),
                 command.clone(),
                 args.clone(),
                 env.clone(),
                 *timeout_ms,
+                config.required_experimental_capabilities.clone(),
             )),
             super::config::McpTransportConfig::Http {
                 url,
                 headers,
                 auth,
                 timeout_ms,
-            } => Box::new(HttpClient::new(
+            } => Box::new(HttpClient::new_with_required_experimental_capabilities(
                 config.name.clone(),
                 url.clone(),
                 headers.clone(),
                 auth.clone(),
                 *timeout_ms,
                 self.token_store(),
+                config.required_experimental_capabilities.clone(),
             )),
         };
 
-        let initialization = match client.initialize().await {
+        let mut client = ConnectingClient {
+            client: Some(client),
+            connection: Some(connection),
+        };
+        let initialization = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                anyhow::bail!("MCP registry is shut down");
+            }
+            result = client.initialize() => result,
+        };
+        let initialization = match initialization {
             Ok(result) => result,
             Err(e) => {
                 // Record the failure so `/mcp` still lists the server with a
@@ -878,7 +1043,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
         self.record_server_instructions(&config.name, initialization.instructions.as_deref());
 
         let mut servers = self.servers.write().await;
-        servers.insert(config.name.clone(), Arc::from(client));
+        let (client, connection) = client.publish()?;
+        let old = servers.insert(config.name.clone(), client);
+        let retired = RetiringClient {
+            client: old,
+            connection: Some(connection),
+        };
         self.connected_configs
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -892,6 +1062,9 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&config.name);
+        drop(failed);
+        drop(timeouts);
+        retired.finish().await;
 
         Ok(())
     }
@@ -901,8 +1074,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
     pub async fn reconnect_server(&self, config: McpServerConfig) -> Result<()> {
         let _attempt = ConnectingAttempt::start(&self.connecting_servers, &config.name);
         let name = config.name.clone();
-        let old = self.servers.write().await.remove(&name);
-        drop(old);
+        self.remove_and_close(&name).await;
         self.record_listed(&name, None);
         self.record_server_instructions(&name, None);
         self.status_overrides
@@ -914,7 +1086,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             Ok(result) => result,
             Err(_) => {
                 let error = format!("MCP server '{name}' initialize timed out");
-                self.servers.write().await.remove(&name);
+                self.remove_and_close(&name).await;
                 self.record_listed(&name, None);
                 self.record_server_instructions(&name, None);
                 self.failed_servers
@@ -926,10 +1098,21 @@ It cannot override system, user, project, safety, permission, or approval rules.
         }
     }
 
+    async fn remove_and_close(&self, name: &str) {
+        let connection = self.connection_barrier.clone().read_owned().await;
+        let client = self.servers.write().await.remove(name);
+        RetiringClient {
+            client,
+            connection: Some(connection),
+        }
+        .finish()
+        .await;
+    }
+
     /// Discard only the interrupted replacement; the owning runtime joins its
     /// aborted task before calling this, so late initialization cannot republish.
     pub async fn cancel_reconnect(&self, server: &str) {
-        self.servers.write().await.remove(server);
+        self.remove_and_close(server).await;
         self.record_listed(server, None);
         self.record_server_instructions(server, None);
         self.failed_servers
@@ -967,6 +1150,14 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
     /// Get all available tools from all connected servers.
     pub async fn list_all_tools(&self) -> Vec<McpToolInfo> {
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => Vec::new(),
+            result = self.list_all_tools_open() => result,
+        }
+    }
+
+    async fn list_all_tools_open(&self) -> Vec<McpToolInfo> {
         // Never hold the registry lock across an .await: list_tools can be slow and
         // status/reload should remain responsive.
         let server_snapshot: Vec<(String, Arc<dyn McpClient>)> = {
@@ -992,7 +1183,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&server_name);
-                    let tools = tool_infos(&server_name, result.tools);
+                    let mut tools = tool_infos(&server_name, result.tools);
+                    self.filter_tools(&mut tools);
                     self.record_listed(&server_name, Some(&tools));
                     all_tools.extend(tools);
                 }
@@ -1028,11 +1220,15 @@ It cannot override system, user, project, safety, permission, or approval rules.
     /// before its own live listing reconciles — otherwise the first request after
     /// a remount (an undo, a restored snapshot) can go out with no MCP tools.
     pub fn listed_tools(&self) -> Vec<McpToolInfo> {
+        if self.closing.is_cancelled() {
+            return Vec::new();
+        }
         let listed = self
             .listed_tools
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut tools: Vec<McpToolInfo> = listed.values().flatten().cloned().collect();
+        self.filter_tools(&mut tools);
         tools.sort_by(|left, right| {
             (&left.server_name, &left.tool_name).cmp(&(&right.server_name, &right.tool_name))
         });
@@ -1056,6 +1252,14 @@ It cannot override system, user, project, safety, permission, or approval rules.
     }
 
     pub async fn list_tools_for_server(&self, server_name: &str) -> Vec<McpToolInfo> {
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => Vec::new(),
+            result = self.list_tools_for_server_open(server_name) => result,
+        }
+    }
+
+    async fn list_tools_for_server_open(&self, server_name: &str) -> Vec<McpToolInfo> {
         let client = {
             let servers = self.servers.read().await;
             servers.get(server_name).map(Arc::clone)
@@ -1076,7 +1280,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(server_name);
-                let tools = tool_infos(server_name, result.tools);
+                let mut tools = tool_infos(server_name, result.tools);
+                self.filter_tools(&mut tools);
                 self.record_listed(server_name, Some(&tools));
                 tools
             }
@@ -1103,13 +1308,34 @@ It cannot override system, user, project, safety, permission, or approval rules.
         }
     }
 
-    /// Call a tool on a specific server.
+    /// Call a tool on a specific server, retaining its structured content.
+    /// Transport failures are errors; server-declared tool failures remain in
+    /// `CallToolResult::is_error` so their text and screenshots travel together.
     pub async fn call_tool(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String> {
+    ) -> Result<super::types::CallToolResult> {
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => anyhow::bail!("MCP registry is shut down"),
+            result = self.call_open_tool(server_name, tool_name, arguments) => result,
+        }
+    }
+
+    async fn call_open_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<super::types::CallToolResult> {
+        if !self.tool_allowed(server_name, tool_name) {
+            anyhow::bail!(
+                "MCP tool is blocked by allowedTools for server '{}'",
+                server_name
+            );
+        }
         // Take a stable client snapshot, then release the registry lock before the
         // potentially slow transport call. Reload/add-server writes must not wait
         // for an MCP tool execution to finish or time out.
@@ -1121,24 +1347,9 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", server_name))?
         };
 
-        let result = client.call_tool(tool_name, arguments).await?;
-
-        // Extract text from content blocks
-        let output = result
-            .content
-            .into_iter()
-            .filter_map(|c| match c {
-                super::types::ContentBlock::Text { text } => Some(text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if result.is_error {
-            anyhow::bail!("MCP tool error: {}", output);
-        }
-
-        Ok(output)
+        // Preserve all result blocks and the server error flag. The tool
+        // adapter owns conversion into the neutral model-facing ToolResult.
+        client.call_tool(tool_name, arguments).await
     }
 
     /// Get the status of all servers — connected ones from `servers`
@@ -1221,12 +1432,92 @@ It cannot override system, user, project, safety, permission, or approval rules.
         wait_for_true(&mut cancelled).await;
     }
 
+    /// Finish the turn on captured clients, in parallel: retire abandoned owned transports before the turn terminal.
+    /// Never grant permission or invoke model-visible business cleanup tools.
+    pub async fn finish_turn(&self) {
+        let clients: Vec<_> = self
+            .servers
+            .read()
+            .await
+            .iter()
+            .map(|(name, client)| (name.clone(), client.clone()))
+            .collect();
+        let mut pending: FuturesUnordered<_> = clients
+            .into_iter()
+            .map(|(name, client)| async move {
+                let result =
+                    tokio::time::timeout(Duration::from_secs(8), client.finish_turn()).await;
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(format!(
+                        "MCP turn cleanup failed: {error:#}; reconnect and re-observe"
+                    )),
+                    Err(_) => Some("MCP turn cleanup timed out; reconnect and re-observe".into()),
+                };
+                (name, client, error)
+            })
+            .collect();
+        while let Some((name, client, error)) = pending.next().await {
+            let Some(message) = error else {
+                continue;
+            };
+            // A replacement may have been published while old cleanup waited.
+            // Its late error must not mark the new connection failed.
+            let servers = self.servers.read().await;
+            if !servers
+                .get(&name)
+                .is_some_and(|current| Arc::ptr_eq(current, &client))
+            {
+                continue;
+            }
+            self.status_overrides
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.clone(), ServerStatus::Failed(message.clone()));
+            if let Some(events) = &self.connect_events {
+                let _ = events.send(McpConnectEvent::Warning { name, message });
+            }
+        }
+    }
+
+    /// Permanently fence this registry and await transport-owned cleanup.
+    /// All callers share the same barrier, including candidates still starting.
+    /// Returns the number of published clients whose cleanup exceeded its budget;
+    /// a zero count does not certify remote rollback or advisory DELETE success.
+    pub async fn shutdown(&self) -> usize {
+        self.closing.cancel();
+        self.cancel_pending_work();
+        let _connections = self.connection_barrier.write().await;
+        let clients = std::mem::take(&mut *self.servers.write().await);
+        let mut pending: FuturesUnordered<_> = clients
+            .into_values()
+            .map(|client| async move { close_client(client.as_ref()).await })
+            .collect();
+        let mut timed_out = 0;
+        while let Some(finished) = pending.next().await {
+            if !finished {
+                timed_out += 1;
+            }
+        }
+        self.listed_tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.server_instructions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        timed_out
+    }
+
     /// Get an Arc clone for sharing across threads.
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
             user_dir: self.user_dir.clone(),
             tokens: self.tokens.clone(),
             servers: self.servers.clone(),
+            closing: self.closing.clone(),
+            connection_barrier: self.connection_barrier.clone(),
             server_timeouts_ms: self.server_timeouts_ms.clone(),
             failed_servers: self.failed_servers.clone(),
             status_overrides: self.status_overrides.clone(),
@@ -1239,11 +1530,20 @@ It cannot override system, user, project, safety, permission, or approval rules.
             trusted_servers: self.trusted_servers.clone(),
             auto_approved_tools: self.auto_approved_tools.clone(),
             tool_aliases: self.tool_aliases.clone(),
+            allowed_tools: self.allowed_tools.clone(),
             config_auto_approvals: self.config_auto_approvals.clone(),
             server_instructions: self.server_instructions.clone(),
             listed_tools: self.listed_tools.clone(),
         })
     }
+}
+
+/// A third-party implementation must not turn owner shutdown into an unbounded
+/// wait. Built-in transports keep their own shorter EOF/DELETE budgets.
+async fn close_client(client: &dyn McpClient) -> bool {
+    tokio::time::timeout(Duration::from_secs(8), client.shutdown())
+        .await
+        .is_ok()
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
@@ -1377,6 +1677,67 @@ mod tests {
             reg.split_tool_name(&alias).await,
             Some(("文档 服务".to_string(), "read.file".to_string()))
         );
+    }
+
+    struct StuckShutdownClient(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl McpClient for StuckShutdownClient {
+        async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
+            anyhow::bail!("unused")
+        }
+        async fn list_tools(&self) -> Result<super::super::types::ListToolsResult> {
+            Ok(super::super::types::ListToolsResult { tools: vec![] })
+        }
+        async fn call_tool(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<super::super::types::CallToolResult> {
+            anyhow::bail!("unused")
+        }
+        async fn shutdown(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        fn server_name(&self) -> &str {
+            "stuck"
+        }
+        fn status(&self) -> ServerStatus {
+            ServerStatus::Connected
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_bounds_clients_in_parallel_and_is_idempotent() {
+        let registry = McpRegistry::new("/nonexistent/tree");
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for name in ["a", "b"] {
+            registry
+                .servers
+                .write()
+                .await
+                .insert(name.into(), Arc::new(StuckShutdownClient(entered.clone())));
+        }
+        let began = tokio::time::Instant::now();
+        assert_eq!(registry.shutdown().await, 2);
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_secs(8),
+            "one parallel budget, not per-server serial waits"
+        );
+        registry.shutdown().await;
+        assert_eq!(began.elapsed(), Duration::from_secs(8));
+        assert!(registry
+            .call_tool("a", "any", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shut down"));
+        assert!(registry.list_all_tools().await.is_empty());
+        assert!(!McpRegistry::new("/nonexistent/neighbor")
+            .closing
+            .is_cancelled());
     }
 
     #[test]
@@ -1666,6 +2027,69 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn adapter_honors_pre_cancel_and_interrupts_an_active_remote_call() {
+        use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext};
+        let registry = Arc::new(McpRegistry::new("/nonexistent/tree"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        registry.servers.write().await.insert(
+            "blocking".into(),
+            Arc::new(BlockingCallClient {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let adapter = Arc::new(
+            super::super::tool::McpToolAdapter::new(
+                registry,
+                McpToolInfo {
+                    server_name: "blocking".into(),
+                    tool_name: "wait".into(),
+                    description: "wait".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    read_only: false,
+                },
+            )
+            .unwrap(),
+        );
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let context = |cancel| ToolContext {
+            working_dir: "/tmp".into(),
+            cancel,
+            progress: ProgressSink::noop(),
+            requester: None,
+        };
+        let result = adapter.execute("{}", &context(cancelled)).await;
+        assert!(result.is_error && result.content.contains("before dispatch"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), entered.notified())
+                .await
+                .is_err()
+        );
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = {
+            let adapter = adapter.clone();
+            let ctx = context(cancel.clone());
+            tokio::spawn(async move { adapter.execute("{}", &ctx).await })
+        };
+        entered.notified().await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_error && result.content.contains("unverified"));
+        release.notify_one();
+        let result = adapter.execute("{}", &context(Default::default())).await;
+        assert!(
+            !result.is_error,
+            "a separate stateless client remains usable"
+        );
+    }
+
     #[async_trait::async_trait]
     impl McpClient for BarrierListClient {
         async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
@@ -1723,7 +2147,10 @@ mod tests {
         drop(write_guard);
 
         release.notify_one();
-        assert_eq!(call.await.unwrap().unwrap(), "done");
+        let result = call.await.unwrap().unwrap();
+        assert!(
+            matches!(&result.content[0], super::super::types::ContentBlock::Text { text } if text == "done")
+        );
     }
 
     /// SECURITY: an untrusted project's `.mcp.json` stdio server must never be
@@ -1791,6 +2218,8 @@ mod tests {
             source: super::super::config::McpConfigSource::Driver,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1845,6 +2274,8 @@ mod tests {
             },
             trust: false,
             auto_approve: vec!["query".to_string(), "mcp__docs__search".to_string()],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
         reg.apply_trust_from_config(&cfg);
         assert!(
@@ -1880,6 +2311,8 @@ mod tests {
             },
             trust: false,
             auto_approve: vec![format!("mcp__{server}__{tool}")],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
 
         reg.apply_trust_from_config(&cfg);
@@ -1949,6 +2382,8 @@ mod tests {
             },
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
 
         let result = registry.add_server(config).await;
@@ -1974,6 +2409,8 @@ mod tests {
             disabled: false,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
             config: super::super::config::McpTransportConfig::Stdio {
                 command: "server".into(),
                 args: vec![],
@@ -2000,6 +2437,14 @@ mod tests {
         assert!(
             registry.connection_matches(&granted),
             "a live Always grant already took effect"
+        );
+        let mut changed = original.clone();
+        changed
+            .required_experimental_capabilities
+            .insert("test/strict".into(), 1);
+        assert!(
+            !registry.connection_matches(&changed),
+            "stricter protocol requirements need a new connection"
         );
         let mut changed = original.clone();
         changed.trust = true;
@@ -2168,5 +2613,70 @@ mod tests {
                 .await,
             "cancelling a discarded runtime candidate must end its connection scope"
         );
+    }
+    struct TurnCleanupClient {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl McpClient for TurnCleanupClient {
+        async fn initialize(&mut self) -> Result<super::super::types::InitializeResult> {
+            anyhow::bail!("unused")
+        }
+        async fn list_tools(&self) -> Result<super::super::types::ListToolsResult> {
+            anyhow::bail!("unused")
+        }
+        async fn call_tool(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<super::super::types::CallToolResult> {
+            anyhow::bail!("unused")
+        }
+        fn server_name(&self) -> &str {
+            "cleanup"
+        }
+        fn status(&self) -> ServerStatus {
+            ServerStatus::Connected
+        }
+        async fn finish_turn(&self) -> Result<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            anyhow::bail!("old cleanup failed")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn old_turn_cleanup_cannot_poison_a_published_replacement() {
+        let registry = Arc::new(McpRegistry::new("/nonexistent/tree"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        registry.servers.write().await.insert(
+            "cleanup".into(),
+            Arc::new(TurnCleanupClient {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let finishing = {
+            let reg = registry.clone();
+            tokio::spawn(async move { reg.finish_turn().await })
+        };
+        entered.notified().await;
+        registry.servers.write().await.insert(
+            "cleanup".into(),
+            Arc::new(BlockingCallClient {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }),
+        );
+        release.notify_one();
+        finishing.await.unwrap();
+        assert!(registry.status_overrides.read().unwrap().is_empty());
+        assert!(matches!(
+            registry.server_statuses().await[0].1,
+            ServerStatus::Connected
+        ));
+        registry.shutdown().await;
     }
 }

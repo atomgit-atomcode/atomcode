@@ -201,6 +201,8 @@ impl Color {
 pub struct Span {
     pub text: String,
     pub style: Style,
+    /// Paint-only decoration occupies cells but is excluded from clipboard text.
+    pub copyable: bool,
     /// A URL this run points at, emitted as an OSC 8 terminal hyperlink so a
     /// supporting terminal makes it clickable (and ignored by one that does not,
     /// leaving the run merely styled). `None` for ordinary text — the common
@@ -215,6 +217,7 @@ impl Span {
         Self {
             text: text.into(),
             style: Style::new(),
+            copyable: true,
             link: None,
         }
     }
@@ -222,6 +225,7 @@ impl Span {
         Self {
             text: text.into(),
             style,
+            copyable: true,
             link: None,
         }
     }
@@ -231,16 +235,18 @@ impl Span {
         Self {
             text: text.into(),
             style,
+            copyable: true,
             link: Some(url.into()),
         }
     }
-    /// This span's style and link, with new text — for a wrapper that re-cuts a
+    /// This span's style, link and copy policy, with new text — for a wrapper that re-cuts a
     /// run into width-sized pieces without dropping its attributes (a link that
     /// wrapped across two rows stays a link on both).
     pub fn recut(&self, text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             style: self.style,
+            copyable: self.copyable,
             link: self.link.clone(),
         }
     }
@@ -248,6 +254,11 @@ impl Span {
     /// count — CJK and emoji occupy two.
     pub fn width(&self) -> usize {
         crate::width::str_width(&self.text)
+    }
+
+    pub fn decoration(mut self) -> Self {
+        self.copyable = false;
+        self
     }
 }
 
@@ -306,6 +317,32 @@ impl Line {
     /// The text with styling dropped. For assertions and for the exit dump.
     pub fn plain(&self) -> String {
         self.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Clipboard text for a cell range; decoration still counts toward offsets.
+    pub fn selected_text(&self, from: usize, to: usize) -> String {
+        // Snap once in the complete row, exactly as Frame selection does.
+        // Snapping each span independently can lose a CJK character when the
+        // selection begins in its second cell, or split a styled grapheme.
+        let plain = self.plain();
+        let head = crate::width::take_width(&plain, from);
+        #[allow(clippy::string_slice, reason = "head is a take_width prefix")]
+        let piece = crate::width::take_width(&plain[head.len()..], to.saturating_sub(from));
+        let (from, to) = (head.len(), head.len() + piece.len());
+        let mut x = 0;
+        let mut text = String::new();
+        for span in &self.spans {
+            let end = x + span.text.len();
+            if span.copyable && from < end && to > x {
+                #[allow(
+                    clippy::string_slice,
+                    reason = "selection is cut at grapheme boundaries and spans end at UTF-8 boundaries"
+                )]
+                text.push_str(&span.text[from.saturating_sub(x)..to.min(end) - x]);
+            }
+            x = end;
+        }
+        text
     }
 
     /// Cut to `w` cells, never mid-grapheme and never mid-wide-character.
@@ -382,8 +419,8 @@ impl Line {
                 (tail, span.style),
             ] {
                 if !text.is_empty() {
-                    let mut piece = Span::styled(text, style);
-                    piece.link = span.link.clone();
+                    let mut piece = span.recut(text);
+                    piece.style = style;
                     out.push(piece);
                 }
             }
@@ -585,13 +622,38 @@ impl Frame {
     ///
     /// Read back from the flattened frame rather than from the blocks behind
     /// it: what was selected is what was *on screen*, wrapped the way it was
-    /// wrapped. Trailing blanks go, because a terminal's own selection drops
+    /// wrapped, with paint-only decoration omitted. Trailing blanks go, because a terminal's own selection drops
     /// them and pasting a rectangle of spaces is never what was meant.
     pub fn selected_text(&self, sel: &crate::moment::Selection) -> String {
         if sel.is_empty() {
             return String::new();
         }
         let rows = self.rows();
+        // Match the painter's cell ownership: a later overlay replaces both
+        // the glyph and whether that glyph belongs on the clipboard.
+        let mut copyable = vec![vec![true; self.size.w as usize]; self.size.h as usize];
+        for part in &self.parts {
+            for (dy, line) in part.lines.iter().take(part.rect.h as usize).enumerate() {
+                let y = part.rect.y as usize + dy;
+                if y >= copyable.len() {
+                    break;
+                }
+                let mut x = part.rect.x as usize;
+                let edge = (x + part.rect.w as usize).min(self.size.w as usize);
+                if line.background.is_some() && x < edge {
+                    copyable[y][x..edge].fill(true);
+                }
+                for span in line.truncate(part.rect.w as usize).spans {
+                    for ch in span.text.chars() {
+                        let end = (x + crate::width::char_width(ch).max(1)).min(edge);
+                        if x < end {
+                            copyable[y][x..end].fill(span.copyable);
+                        }
+                        x = end;
+                    }
+                }
+            }
+        }
         let mut out: Vec<String> = Vec::new();
         for (y, row) in rows.iter().enumerate() {
             let Ok(y) = u16::try_from(y) else { continue };
@@ -605,7 +667,16 @@ impl Frame {
             )]
             let rest = &row[head.len()..];
             let piece = crate::width::take_width(rest, (b - a) as usize);
-            out.push(piece.trim_end().to_string());
+            let mut x = crate::width::str_width(&head);
+            let text: String = piece
+                .chars()
+                .filter(|ch| {
+                    let keep = copyable[y as usize].get(x).copied().unwrap_or(true);
+                    x += crate::width::char_width(*ch).max(1);
+                    keep
+                })
+                .collect();
+            out.push(text.trim_end().to_string());
         }
         out.join("\n")
     }
@@ -1105,5 +1176,58 @@ thr"
         f.place("a", Rect::new(0, 0, 6, 1), vec![Line::raw("abc")]);
         f.place("b", Rect::new(2, 1, 4, 1), vec![Line::raw("xy")]);
         assert_eq!(f.rows(), vec!["abc   ".to_string(), "  xy  ".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod clipboard_decoration_tests {
+    use super::*;
+    use crate::moment::Selection;
+
+    #[test]
+    fn cell_selection_matches_plain_rows_at_wide_and_styled_grapheme_boundaries() {
+        let line = Line::from_spans(vec![
+            Span::raw("中文"),
+            Span::raw("e"),
+            Span::raw("\u{301}"),
+            Span::raw("tail"),
+        ]);
+        let plain = line.plain();
+        for from in 0..line.width() + 2 {
+            for to in from..line.width() + 2 {
+                let head = crate::width::take_width(&plain, from);
+                #[allow(clippy::string_slice, reason = "head is a take_width prefix")]
+                let expected = crate::width::take_width(&plain[head.len()..], to - from);
+                assert_eq!(line.selected_text(from, to), expected, "{from}..{to}");
+            }
+        }
+        let decorated = Line::from_spans(vec![Span::raw("❯ ").decoration(), Span::raw("中文")]);
+        assert_eq!(decorated.selected_text(3, 6), "中");
+    }
+
+    #[test]
+    fn decoration_is_painted_but_not_copied_and_overlays_replace_its_policy() {
+        let line = Line::from_spans(vec![
+            Span::raw("❯ ").decoration(),
+            Span::raw("❯ literal 中文"),
+        ]);
+        assert_eq!(line.plain(), "❯ ❯ literal 中文");
+        assert_eq!(line.selected_text(0, 80), "❯ literal 中文");
+        assert_eq!(line.selected_text(0, 2), "");
+        assert_eq!(line.selected_text(4, 11), "literal");
+        let line = line.truncate(40).restyle(0, 40, |style| style.bold());
+        let mut frame = Frame::new(40, 1);
+        frame.place("user", Rect::sized(40, 1), vec![line]);
+        let sel = frame.line_at(0).unwrap();
+        assert_eq!(frame.selected_text(&sel), "❯ literal 中文");
+        assert_eq!(
+            frame.selected_text(&Selection {
+                anchor: (0, 0),
+                head: (1, 0)
+            }),
+            ""
+        );
+        frame.place("overlay", Rect::new(0, 0, 2, 1), vec![Line::raw("ok")]);
+        assert_eq!(frame.selected_text(&sel), "ok❯ literal 中文");
     }
 }

@@ -113,6 +113,8 @@ pub struct PrepareOptions {
     pub plugin_skill_dirs: Vec<atomcode_capabilities::skills::TemplateDirectory>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,
+    /// Ephemeral current-session overlay; never writes per-server disabled flags.
+    pub mcp_paused: bool,
     /// Driver-supplied MCP servers connected alongside config servers — e.g.
     /// ACP client-injected `mcpServers` from `session/new`. Entries must use
     /// `McpConfigSource::Driver`: they bypass the project trust gate because
@@ -267,6 +269,7 @@ impl Default for PrepareOptions {
             skill_dirs: None,
             plugin_skill_dirs: Vec::new(),
             mcp: true,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -465,6 +468,27 @@ pub struct SessionBinding {
     staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
+#[cfg(test)]
+impl SessionBinding {
+    /// A binding for tests that exercise one runtime step without assembling
+    /// the whole capability graph.
+    pub(crate) fn test_binding(
+        id: &str,
+        manager: Arc<SessionManager>,
+        lease: SessionLease,
+        pending_resume_prompt: Option<Message>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            manager,
+            lease,
+            resume: None,
+            pending_resume_prompt,
+            staged_fresh: None,
+        }
+    }
+}
+
 /// A live binding carries its storage owner across rebuilds. An importer only
 /// transfers a lease, which must still match the requested project's manager.
 pub(crate) enum SessionLeaseSource {
@@ -538,12 +562,40 @@ fn resolve_skill_dirs_at(
     if !opts.tools {
         return (Vec::new(), Vec::new(), Vec::new());
     }
-    if let Some(dirs) = &opts.skill_dirs {
-        return (dirs.clone(), dirs.clone(), Vec::new());
+    resolve_skill_dirs_from(
+        &cfg.extra_skill_dirs,
+        &cfg.working_dir,
+        &cfg.dirs,
+        home,
+        opts.skill_dirs.as_deref(),
+    )
+}
+
+/// The skill roots, from the inputs a HOST has.
+///
+/// **The same rule [`resolve_skill_dirs_at`] applies**, reading these five
+/// inputs instead of a config and a prepare-options struct. One body, two
+/// callers: the runtime resolves the roots it will load, and the migration
+/// report resolves the roots the runtime will load. If they were two
+/// bodies, they would drift — and the report would claim a skill is in
+/// effect that the runtime does not read (or the other way round).
+///
+/// `explicit` is the driver's own override (`PrepareOptions::skill_dirs`):
+/// given one, ONLY it is used — not even the standard directories. That is
+/// what an override means, and a host must honour it the same way.
+pub fn resolve_skill_dirs_from(
+    extra_dirs: &[String],
+    project: &std::path::Path,
+    product_dirs: &atomcode_capabilities::ProductDirs,
+    home: Option<&std::path::Path>,
+    explicit: Option<&[PathBuf]>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    if let Some(dirs) = explicit {
+        return (dirs.to_vec(), dirs.to_vec(), Vec::new());
     }
     let mut warnings = Vec::new();
     let mut extra = Vec::new();
-    for value in &cfg.extra_skill_dirs {
+    for value in extra_dirs {
         let path = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
             let Some(home) = home else {
                 warnings.push(
@@ -562,7 +614,7 @@ fn resolve_skill_dirs_at(
             if path.is_absolute() {
                 path
             } else {
-                cfg.working_dir.join(path)
+                project.join(path)
             }
         };
         extra.push(path.canonicalize().unwrap_or(path));
@@ -570,8 +622,8 @@ fn resolve_skill_dirs_at(
     let mut dirs = extra.clone();
     dirs.extend(standard_skill_dirs(SkillRoots {
         home: home.unwrap_or(std::path::Path::new(".")),
-        project: &cfg.working_dir,
-        dirs: &cfg.dirs,
+        project,
+        dirs: product_dirs,
     }));
     let mut seen = std::collections::BTreeSet::new();
     dirs.reverse();
@@ -595,6 +647,7 @@ fn resolve_skill_dirs_at(
 /// Everything `assemble` composes — and everything a respawn must REUSE so state
 /// survives (approval grants, hook state, session identity).
 pub struct CodingParts {
+    pub(crate) quality: Arc<crate::quality::QualityControl>,
     /// What preparing left out or changed that the person should be told —
     /// [`CodingAgentConfig::startup_warnings`] plus what `prepare` found (an
     /// external agent whose binary is missing, an in-flight prompt a resume
@@ -692,6 +745,10 @@ pub struct CodingParts {
     /// Current real-user turn's explicit execution restriction. The same instance is
     /// a lifecycle hook and a pre-approval Bash middleware.
     pub(crate) turn_execution_policy: Arc<TurnExecutionPolicy>,
+    /// Which background jobs a completion will wake the model for, written by
+    /// the runtime and read by `background-wait-hint`. Rebuilt with the parts:
+    /// a new assembly is a new generation, whose pending notifications start over.
+    pub(crate) background_waits: crate::background_jobs::BackgroundWaits,
     /// Session grant store for mutating MCP tools the user approved "always" while in
     /// PLAN mode. Owned here (not rebuilt in [`assemble`]) so a respawn / model-swap
     /// preserves the grants — the same reason the mode flags above are shared.
@@ -714,7 +771,7 @@ pub struct CodingParts {
     pub subagent_provider: Option<SharedReviewProvider>,
     /// The provider for model calls made outside a round — summaries — recorded
     /// and metered; filled with the others by [`wire_side_providers`].
-    side_provider: SharedReviewProvider,
+    side_provider: crate::on_harness::SharedCompactionProviders,
     /// Child-agent assembly prepared from the same live tier-provider cells and
     /// execution policy as `task`. The `team` tool is mounted in the next phase.
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
@@ -761,6 +818,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
+    let cc_hooks = if cfg.require_approval_hook {
+        CCExternalHooks::load_with_required_approval(
+            &cfg.working_dir,
+            cfg.dirs.user(),
+            plugin_cc_hooks,
+        )?
+    } else {
+        CCExternalHooks::load_with_extra(&cfg.working_dir, cfg.dirs.user(), plugin_cc_hooks)
+    };
     let bypass_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
@@ -808,6 +874,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string()),
         );
+        host_only_tools.push("git_status".into());
     }
     let request_user_input_enabled = opts.tools
         && opts.request_user_input
@@ -835,6 +902,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string()),
         );
+        if cfg.dap.enabled {
+            registry.register(Arc::new(
+                atomcode_capabilities::tools::debug::DebugTool::new(cfg.dap.clone()),
+            ));
+            names.push("debug".into());
+            host_only_tools.push("debug".into());
+        }
         if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
             names.push("lsp".into());
             host_only_tools.push("lsp".into());
@@ -876,6 +950,19 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         register_atomgit_capabilities(&mut registry, &mut names, &cfg.dirs)
             .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
         host_only_tools.extend(names[before..].iter().cloned());
+    }
+
+    #[cfg(feature = "grape")]
+    if opts.tools && !atomcode_config::config::offline::is_offline_active() {
+        atomcode_capabilities::tools::grape::register_grape_tools(&mut registry, cfg.dirs.user())
+            .map_err(|error| io::Error::other(format!("Grape tool setup failed: {error}")))?;
+        let grape_names = atomcode_capabilities::tools::grape::GRAPE_TOOLS
+            .iter()
+            .map(|name| (*name).to_string());
+        for name in grape_names {
+            host_only_tools.push(name.clone());
+            names.push(name);
+        }
     }
 
     if opts.tools && opts.web && !atomcode_config::config::offline::is_offline_active() {
@@ -1036,47 +1123,48 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // the session candidate path. `mount()` publishes each connected server's tools
     // atomically for the next turn, then publishes once more when the initial pass
     // reaches its bounded terminal state.
-    let (mcp_registry, mcp_connect_rx, mcp_telemetry_rx) = if opts.tools && opts.mcp {
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
-        // A second listener, only when something is metering. The registry
-        // publishes to one sender, so the fan-out is here rather than in
-        // `atomcode-capabilities` — one consumer is still the common case, and
-        // a telemetry-free embedder pays nothing for this.
-        //
-        // Chaining instead of teeing would make the meter load-bearing for the
-        // tool catalog: turn telemetry off and the tools stop being published.
-        let (event_rx, telemetry_rx) = match cfg.telemetry.is_some() {
-            false => (event_rx, None),
-            true => {
-                let (rows_tx, rows_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (meter_tx, meter_rx) = tokio::sync::mpsc::unbounded_channel();
-                let mut source = event_rx;
-                // Ends when the registry drops its sender, which happens when
-                // these parts do — no handle to abort, and nothing to leak.
-                tokio::spawn(async move {
-                    while let Some(event) = source.recv().await {
-                        let to_rows = rows_tx.send(event.clone()).is_ok();
-                        let to_meter = meter_tx.send(event).is_ok();
-                        if !to_rows && !to_meter {
-                            break;
+    let (mcp_registry, mcp_connect_rx, mcp_telemetry_rx) =
+        if opts.tools && opts.mcp && !opts.mcp_paused {
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+            // A second listener, only when something is metering. The registry
+            // publishes to one sender, so the fan-out is here rather than in
+            // `atomcode-capabilities` — one consumer is still the common case, and
+            // a telemetry-free embedder pays nothing for this.
+            //
+            // Chaining instead of teeing would make the meter load-bearing for the
+            // tool catalog: turn telemetry off and the tools stop being published.
+            let (event_rx, telemetry_rx) = match cfg.telemetry.is_some() {
+                false => (event_rx, None),
+                true => {
+                    let (rows_tx, rows_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (meter_tx, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let mut source = event_rx;
+                    // Ends when the registry drops its sender, which happens when
+                    // these parts do — no handle to abort, and nothing to leak.
+                    tokio::spawn(async move {
+                        while let Some(event) = source.recv().await {
+                            let to_rows = rows_tx.send(event.clone()).is_ok();
+                            let to_meter = meter_tx.send(event).is_ok();
+                            if !to_rows && !to_meter {
+                                break;
+                            }
                         }
-                    }
-                });
-                (rows_rx, Some(meter_rx))
-            }
+                    });
+                    (rows_rx, Some(meter_rx))
+                }
+            };
+            (
+                Some(Arc::new(McpRegistry::from_storage_background(
+                    &mcp_storage(cfg, &opts),
+                    Some(event_tx),
+                    opts.extra_mcp_servers.clone(),
+                ))),
+                Some(event_rx),
+                telemetry_rx,
+            )
+        } else {
+            (None, None, None)
         };
-        (
-            Some(Arc::new(McpRegistry::from_storage_background(
-                &mcp_storage(cfg, &opts),
-                Some(event_tx),
-                opts.extra_mcp_servers.clone(),
-            ))),
-            Some(event_rx),
-            telemetry_rx,
-        )
-    } else {
-        (None, None, None)
-    };
     let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
     // Session binding: the id's single owner.
@@ -1231,8 +1319,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // (`plugin_cc_hooks`, resolved by the host), mounted by the `cc-hooks-host` row on
     // both the lifecycle and the tool-middleware seam. Only when hooks actually exist.
     let cc_external = {
-        let mut cc =
-            CCExternalHooks::load_with_extra(&cfg.working_dir, cfg.dirs.user(), plugin_cc_hooks);
+        let mut cc = cc_hooks;
         // Stamp the persistent session id into every CC payload (CC `session_id`), so a
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
@@ -1292,6 +1379,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         bypass_mode,
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_execution_policy,
+        background_waits: Default::default(),
         mcp_plan_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
@@ -1307,6 +1395,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         credential_shell_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
+        quality: Arc::new(crate::quality::QualityControl::new(cfg.quality.clone())),
         registry,
         tool_names: names,
         todo_enabled,
@@ -1366,6 +1455,9 @@ impl LlmProvider for SlotProvider {
         self.current()
             .map(|p| p.effort_levels())
             .unwrap_or_default()
+    }
+    fn replays_reasoning(&self) -> bool {
+        self.current().is_none_or(|p| p.replays_reasoning())
     }
     async fn chat_stream(
         &self,
@@ -1541,7 +1633,7 @@ impl CodingParts {
 
     /// Where the provider for out-of-round model calls lives, refilled on every
     /// model change.
-    pub(crate) fn side_provider_slot(&self) -> SharedReviewProvider {
+    pub(crate) fn side_provider_slot(&self) -> crate::on_harness::SharedCompactionProviders {
         Arc::clone(&self.side_provider)
     }
 
@@ -1604,6 +1696,7 @@ impl CodingParts {
     /// Carry session-scoped runtime decisions across a capability-graph rebuild.
     /// Fresh/resume/project switches deliberately keep their newly prepared stores.
     pub(crate) fn inherit_runtime_continuity(&mut self, previous: &CodingParts) {
+        self.quality.inherit(&previous.quality);
         self.plan_mode = Arc::clone(&previous.plan_mode);
         self.bypass_mode = Arc::clone(&previous.bypass_mode);
         self.accept_edits = Arc::clone(&previous.accept_edits);
@@ -1708,6 +1801,7 @@ impl CodingParts {
             .as_ref()
         {
             prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+            prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
         }
     }
 
@@ -1928,6 +2022,10 @@ pub async fn mcp_row_facts_in(
 /// waits on a browser and writes only a token (`cli/tui_mcp.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpAction {
+    /// Pause all MCP connections for this session without changing configuration.
+    PauseAll,
+    /// Restore the configured servers for this session.
+    ResumeAll,
     /// Reconnect only this server, keeping the current session.
     Reconnect,
     /// Cancel the current reconnect of this server, without cancelling a turn.
@@ -2261,7 +2359,10 @@ pub(crate) fn wire_side_providers(
     }
 
     if let Ok(mut slot) = parts.side_provider.write() {
-        *slot = Some(metered_provider.clone());
+        *slot = Some(crate::on_harness::CompactionProviders {
+            primary: provider.clone(),
+            summary: metered_provider.clone(),
+        });
     }
     metered_provider
 }
@@ -2699,6 +2800,7 @@ mod tests {
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: true,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -3048,6 +3150,7 @@ mod tests {
             skill_dirs: Some(vec![]),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,

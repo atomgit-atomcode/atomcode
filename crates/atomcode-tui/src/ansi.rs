@@ -38,8 +38,8 @@ pub const ERASE_LINE: &str = "\x1b[K";
 ///
 /// Alternate scroll (DECSET 1007) is deliberately not part of this universal
 /// sequence. It is enabled separately only on HarmonyOS, whose terminal keeps
-/// the mouse but does not report wheel events. There the input pump separates a
-/// multi-arrow wheel burst from a lone Up/Down history key. Other platforms use
+/// the mouse but does not report wheel events. There both grouped and isolated
+/// wheel arrows scroll; Ctrl+P/Ctrl+N recall input history. Other platforms use
 /// reported mouse events (the default), or the terminal's native scrollback
 /// when the mouse is handed back.
 ///
@@ -52,10 +52,13 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// next prompt. With it the terminal wraps the text in markers and it arrives
 /// as one event, which is what `Input::Paste` was always written for.
 ///
+/// DECSCUSR selects a blinking bar for the composer. The terminal handles
+/// blinking between frames, and leaving the UI resets the cursor style.
+///
 /// The keyboard protocol is not in here: it is [`KEYS_ON`], asked for only
 /// where the input reader can read what it turns on
 /// (`crate::caps::wants_keyboard_protocol`).
-pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?25l";
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?25l\x1b[5 q";
 /// Ask the terminal to *disambiguate* keys (the keyboard protocol's flag 1).
 /// Without it a terminal sends the same byte — a carriage return — for enter,
 /// shift-enter and ctrl-enter, so "shift-enter inserts a newline" is not
@@ -81,7 +84,7 @@ pub const KEYS_ON: &str = "\x1b[>1u";
 /// sees every key in a form it does not expect. Popped whether or not they were
 /// pushed — a pop with nothing pushed changes nothing, and one that finds flags
 /// left behind clears them.
-pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
+pub const LEAVE: &str = "\x1b[0 q\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
 /// Off the alternate screen for `/raw`, with line wrap back on: what is
 /// printed next goes where the shell left off and into the terminal's own
 /// scrollback. Raw mode, bracketed paste and the keyboard flags stay, because a
@@ -91,14 +94,14 @@ pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?104
 /// terminal keeps one stack per screen, and [`TRANSCRIPT_BACK`]'s caller pushes
 /// them again, so the depth comes out the same however the terminal treats
 /// the two stacks.
-pub const TRANSCRIPT_OUT: &str = "\x1b[<u\x1b[?7h\x1b[?1049l";
+pub const TRANSCRIPT_OUT: &str = "\x1b[0 q\x1b[<u\x1b[?7h\x1b[?1049l";
 /// Leaving the alternate screen — the tail of [`LEAVE`], which a way out that
 /// is already on the ordinary screen leaves off.
 pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 /// Back onto the alternate screen after `/raw`, cleared, line wrap off again —
 /// the half of [`ENTER`] that [`TRANSCRIPT_OUT`] undid. The pointer mode is
 /// said by the surface, which knows which one is in force.
-pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[H\x1b[2J";
+pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[5 q\x1b[H\x1b[2J";
 /// Ask a terminal on the alternate screen to translate wheel motion into
 /// cursor keys. HarmonyOS HiShell does not report mouse events, so this is the
 /// only path by which its wheel can reach the application.
@@ -420,67 +423,78 @@ pub const SYNC_BEGIN: &str = "\x1b[?2026h";
 /// End a synchronized update. See [`SYNC_BEGIN`].
 pub const SYNC_END: &str = "\x1b[?2026l";
 
-fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
-    let mut parts: Vec<String> = Vec::new();
+fn write_sgr(out: &mut String, style: &Style, caps: crate::caps::Caps) -> bool {
+    let mut first = true;
+    let mut parameter = |value: std::fmt::Arguments<'_>| {
+        if first {
+            out.push_str("\x1b[");
+            first = false;
+        } else {
+            out.push(';');
+        }
+        out.write_fmt(value)
+            .expect("writing SGR into a String cannot fail");
+    };
     if style.bold {
-        parts.push("1".into());
+        parameter(format_args!("1"));
     }
     if style.italic {
-        parts.push("3".into());
+        parameter(format_args!("3"));
     }
     if style.underline {
-        parts.push("4".into());
+        parameter(format_args!("4"));
     }
     if style.reverse {
-        parts.push("7".into());
+        parameter(format_args!("7"));
     }
     match style.fg {
-        Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
-        Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+        Some(Color::Ansi(n)) => parameter(format_args!("38;5;{n}")),
+        Some(Color::Rgb(r, g, b)) => parameter(format_args!("38;2;{r};{g};{b}")),
         // A picture's own index: the same resolution the role path does, and the
         // only other place a colour becomes a sequence. Through the same door as
         // the resolver, so a terminal without the cube gets the nearest index it
         // really has instead of one it will map to anything.
         Some(Color::Picture(n)) => match crate::theme::indexed_colour(n, caps) {
-            Color::Ansi(n) => parts.push(format!("38;5;{n}")),
-            Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+            Color::Ansi(n) => parameter(format_args!("38;5;{n}")),
+            Color::Rgb(r, g, b) => parameter(format_args!("38;2;{r};{g};{b}")),
             _ => {}
         },
         // The one place a role becomes a colour, against the palette that was
         // actually measured. A role with no colour means "the terminal's own
         // foreground" — the absence of an SGR, not a colour that looks like it.
         Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
-            Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
-            Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+            Some(Color::Ansi(n)) => parameter(format_args!("38;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => parameter(format_args!("38;2;{r};{g};{b}")),
             _ => {}
         },
         Some(Color::Ground) => match crate::theme::exact_colour(caps.palette.background(), caps) {
-            Color::Ansi(n) => parts.push(format!("38;5;{n}")),
-            Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+            Color::Ansi(n) => parameter(format_args!("38;5;{n}")),
+            Color::Rgb(r, g, b) => parameter(format_args!("38;2;{r};{g};{b}")),
             _ => {}
         },
         None => {}
     }
     match style.bg {
-        Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
+        Some(Color::Ansi(n)) => parameter(format_args!("48;5;{n}")),
         Some(Color::Picture(n)) => match crate::theme::indexed_colour(n, caps) {
-            Color::Ansi(n) => parts.push(format!("48;5;{n}")),
-            Color::Rgb(r, g, b) => parts.push(format!("48;2;{r};{g};{b}")),
+            Color::Ansi(n) => parameter(format_args!("48;5;{n}")),
+            Color::Rgb(r, g, b) => parameter(format_args!("48;2;{r};{g};{b}")),
             _ => {}
         },
         Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
-            Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
-            Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
+            Some(Color::Ansi(n)) => parameter(format_args!("48;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => parameter(format_args!("48;2;{r};{g};{b}")),
             _ => {}
         },
-        Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
+        Some(Color::Rgb(r, g, b)) => parameter(format_args!("48;2;{r};{g};{b}")),
         // The cell's own background is what no SGR says.
         Some(Color::Ground) | None => {}
     }
-    if parts.is_empty() {
-        String::new()
+    if first {
+        false
     } else {
-        format!("\x1b[{}m", parts.join(";"))
+        out.push('m');
+        true
     }
 }
 
@@ -504,9 +518,9 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         // ECH paints erased cells without writing padding into copied source.
         // Unlike EL it is bounded by this part's width, including in overlays.
         if caps.colors != crate::caps::Colors::None {
-            out.push_str(&sgr(&surface, caps));
+            write_sgr(out, &surface, caps);
         }
-        out.push_str(&format!("\x1b[{width}X"));
+        write!(out, "\x1b[{width}X").expect("writing into a String cannot fail");
         if caps.colors != crate::caps::Colors::None {
             out.push_str("\x1b[0m");
         }
@@ -525,11 +539,6 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         // number of columns, so the clipping above stays correct.
         let text = caps.text(&clipped);
         let plain = caps.colors == crate::caps::Colors::None;
-        let codes = if plain {
-            String::new()
-        } else {
-            sgr(&span.style.under(surface), caps)
-        };
         // OSC 8 wraps the run this span actually drew (after clipping), so a
         // supporting terminal makes exactly the visible text clickable and one
         // that does not ignores the sequence, leaving it merely styled. Gated
@@ -552,11 +561,10 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
             out.push_str(url);
             out.push_str("\x1b\\");
         }
-        if codes.is_empty() {
-            out.push_str(&text);
-        } else {
-            out.push_str(&codes);
-            out.push_str(&text);
+        // Emit inside OSC 8, in exactly the same order as the string encoder.
+        let styled = !plain && write_sgr(out, &span.style.under(surface), caps);
+        out.push_str(&text);
+        if styled {
             out.push_str("\x1b[0m");
         }
         if hyperlink.is_some() {
@@ -838,6 +846,111 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn reference_sgr(style: &Style, caps: crate::caps::Caps) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if style.bold {
+            parts.push("1".into());
+        }
+        if style.italic {
+            parts.push("3".into());
+        }
+        if style.underline {
+            parts.push("4".into());
+        }
+        if style.reverse {
+            parts.push("7".into());
+        }
+        match style.fg {
+            Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+            // A picture's own index: the same resolution the role path does, and the
+            // only other place a colour becomes a sequence. Through the same door as
+            // the resolver, so a terminal without the cube gets the nearest index it
+            // really has instead of one it will map to anything.
+            Some(Color::Picture(n)) => match crate::theme::indexed_colour(n, caps) {
+                Color::Ansi(n) => parts.push(format!("38;5;{n}")),
+                Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+                _ => {}
+            },
+            // The one place a role becomes a colour, against the palette that was
+            // actually measured. A role with no colour means "the terminal's own
+            // foreground" — the absence of an SGR, not a colour that looks like it.
+            Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
+                Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
+                Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+                _ => {}
+            },
+            Some(Color::Ground) => {
+                match crate::theme::exact_colour(caps.palette.background(), caps) {
+                    Color::Ansi(n) => parts.push(format!("38;5;{n}")),
+                    Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+        match style.bg {
+            Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
+            Some(Color::Picture(n)) => match crate::theme::indexed_colour(n, caps) {
+                Color::Ansi(n) => parts.push(format!("48;5;{n}")),
+                Color::Rgb(r, g, b) => parts.push(format!("48;2;{r};{g};{b}")),
+                _ => {}
+            },
+            Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
+                Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
+                Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
+                _ => {}
+            },
+            Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
+            // The cell's own background is what no SGR says.
+            Some(Color::Ground) | None => {}
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("\x1b[{}m", parts.join(";"))
+        }
+    }
+
+    #[test]
+    fn direct_sgr_matches_reference_for_styles_and_capabilities() {
+        use crate::caps::Colors;
+        let colors = [
+            None,
+            Some(Color::Ansi(0)),
+            Some(Color::Ansi(255)),
+            Some(Color::Rgb(0, 128, 255)),
+            Some(Color::Picture(0)),
+            Some(Color::Picture(255)),
+            Some(Color::Role(crate::theme::Role::Muted)),
+            Some(Color::Role(crate::theme::Role::ToolName)),
+            Some(Color::Ground),
+        ];
+        for depth in [Colors::None, Colors::Ansi16, Colors::Ansi256, Colors::True] {
+            let mut caps = crate::caps::Caps::default();
+            caps.colors = depth;
+            for bits in 0..16 {
+                for fg in colors {
+                    for bg in colors {
+                        let style = Style {
+                            fg,
+                            bg,
+                            bold: bits & 1 != 0,
+                            italic: bits & 2 != 0,
+                            underline: bits & 4 != 0,
+                            reverse: bits & 8 != 0,
+                        };
+                        let expected = reference_sgr(&style, caps);
+                        let mut out = String::from("prefix");
+                        let styled = write_sgr(&mut out, &style, caps);
+                        assert_eq!(styled, !expected.is_empty());
+                        assert_eq!(out, format!("prefix{expected}"), "{style:?} {depth:?}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_row_surface_paints_without_printable_padding() {
         let row = Line::raw("abc").with_background(Color::role(crate::theme::Role::PanelBg));
@@ -1318,6 +1431,8 @@ mod tests {
         );
         assert!(TRANSCRIPT_OUT.contains("1049l") && TRANSCRIPT_OUT.contains("?7h"));
         assert!(TRANSCRIPT_BACK.contains("1049h") && TRANSCRIPT_BACK.contains("?7l"));
+        assert!(TRANSCRIPT_OUT.contains("\x1b[0 q"));
+        assert!(TRANSCRIPT_BACK.contains("\x1b[5 q"));
         let text = transcript(
             &[Line::from_spans(vec![crate::frame::Span::styled(
                 "hello".to_string(),
@@ -1337,6 +1452,7 @@ mod tests {
         // A UI that leaves a shell in the alternate screen is worse than no UI.
         assert!(ENTER.contains("1049h") && LEAVE.contains("1049l"));
         assert!(ENTER.contains("25l") && LEAVE.contains("25h"));
+        assert!(ENTER.contains("\x1b[5 q") && LEAVE.contains("\x1b[0 q"));
         // Auto-wrap: off while we own the screen, back on when we hand it
         // back. Leaving a shell with wrap off is as rude as leaving it in raw
         // mode — every long command line would overwrite its own last column.

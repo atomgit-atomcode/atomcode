@@ -125,3 +125,13 @@ test('previous pages meet the current page even with mixed large and small entri
     assert.ok(before.end >= range.start, `gap before message ${index}`);
   }
 });
+
+test('tool result image bytes count toward resident budget and leave with archive eviction', () => {
+  const plain: TimelineMessage = { role: 'assistant', parts: [tool(1)] };
+  const image = { media_type: 'image/png', data: 'a'.repeat(4096) };
+  const pictured: TimelineMessage = { role: 'assistant', parts: [{ kind: 'tool', tool: { ...tool(1).tool, images: [image] } }] };
+  assert.equal(timelineWeight(pictured) - timelineWeight(plain), 8192);
+  const archived = archivedMessage(pictured, 'image-turn');
+  assert.equal(archived.parts.length, 0);
+  assert.equal(pictured.parts[0].kind === 'tool' && pictured.parts[0].tool.images?.[0], image);
+});

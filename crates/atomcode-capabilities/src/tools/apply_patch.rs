@@ -55,8 +55,35 @@ impl ApplyPatchTool {
 fn store(provider: &ArtifactStoreProvider) -> Result<Arc<ArtifactStore>, String> {
     provider().ok_or_else(|| "input artifacts are unavailable for this session".into())
 }
+/// ENOTSUP (`os error 45` on macOS, `EOPNOTSUPP` on Linux) means the workspace volume
+/// cannot do what the patch needs. Say so, and say what to do instead — the bare errno
+/// told the reader nothing.
+fn with_mount_hint(msg: String) -> String {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("os error 45") || lower.contains("operation not supported") {
+        format!(
+            "{msg} (the workspace volume does not support the file operation this patch \
+needs — retry from a local volume, or edit the file with edit_file)"
+        )
+    } else {
+        msg
+    }
+}
+
+/// Name the stage and the path an error came from: a bare `os error 45` did not say
+/// which call failed.
+fn stage_err(stage: &str, rel: &str, e: impl std::fmt::Display) -> String {
+    with_mount_hint(format!("{rel}: {stage} failed: {e}"))
+}
+
 async fn root(world: &dyn FileSystem, cwd: &Path) -> Result<PathBuf, String> {
-    world.canonicalize(cwd).await.map_err(|e| e.to_string())
+    world.canonicalize(cwd).await.map_err(|e| {
+        stage_err(
+            "canonicalize working directory",
+            &cwd.display().to_string(),
+            e,
+        )
+    })
 }
 async fn target_path(
     world: &dyn FileSystem,
@@ -67,7 +94,7 @@ async fn target_path(
     let canonical = world
         .canonicalize(&path)
         .await
-        .map_err(|e| format!("{relative}: {e}"))?;
+        .map_err(|e| stage_err("canonicalize target", relative, e))?;
     if canonical != path || !canonical.starts_with(root) {
         return Err(format!("{relative}: symlink or path escape refused"));
     }
@@ -112,14 +139,21 @@ impl ImportPatchTool {
         let args: Args = serde_json::from_str(args).map_err(|e| e.to_string())?;
         cancelled(ctx)?;
         let path = resolve_path(&args.file_path, &ctx.working_dir);
-        if self.world.info(&path).await.map_err(|e| e.to_string())?.len > 8 * 1024 * 1024 {
+        if self
+            .world
+            .info(&path)
+            .await
+            .map_err(|e| stage_err("stat patch file", &args.file_path, e))?
+            .len
+            > 8 * 1024 * 1024
+        {
             return Err("patch exceeds 8 MiB import limit".into());
         }
         let bytes = self
             .world
             .read_bytes(&path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| stage_err("read patch file", &args.file_path, e))?;
         self.import_bytes(bytes, ctx).await
     }
 
@@ -158,7 +192,11 @@ impl ImportPatchTool {
             {
                 return Err(format!("{}: sensitive targets cannot be captured in patch artifacts; use explicitly approved per-file edits", file.path));
             }
-            let info = self.world.info(&path).await.map_err(|e| e.to_string())?;
+            let info = self
+                .world
+                .info(&path)
+                .await
+                .map_err(|e| stage_err("stat", &file.path, e))?;
             if info.len > 8 * 1024 * 1024 {
                 return Err(format!("{}: file exceeds 8 MiB limit", file.path));
             }
@@ -166,7 +204,7 @@ impl ImportPatchTool {
                 .world
                 .read_bytes(&path)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| stage_err("read", &file.path, e))?;
             if before.contains(&0) {
                 return Err(format!("{}: binary targets are unsupported", file.path));
             }
@@ -197,7 +235,9 @@ impl ImportPatchTool {
         if record.len() > 64 * 1024 * 1024 {
             return Err("encoded input record exceeds 64 MiB limit".into());
         }
-        let id = store.put_input(&record).map_err(|e| e.to_string())?;
+        let id = store
+            .put_input(&record)
+            .map_err(|e| stage_err("store input record", "artifact store", e))?;
         Ok(json!({"artifact_id":id,"patch_sha256":digest,"file_paths":manifest,"files":manifest.len(),"hunks":parsed.iter().map(|f| f.hunks.len()).sum::<usize>(),"status":"imported_and_preflighted","next":"apply_patch with this artifact_id and exact file_paths; never output the patch body"}).to_string())
     }
 }
@@ -238,7 +278,7 @@ impl ApplyPatchTool {
         let record: Record = serde_json::from_slice(
             &store
                 .get_input(&args.artifact_id)
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| stage_err("read input record", &args.artifact_id, e))?,
         )
         .map_err(|e| e.to_string())?;
         let root = root(&*self.world, &ctx.working_dir).await?;
@@ -419,6 +459,17 @@ mod tests {
     use super::*;
     use crate::world::LocalFs;
     use atomcode_kernel::tool::ProgressSink;
+    /// A workspace on an SMB/NFS mount fails `canonicalize`/`stat` with ENOTSUP and the
+    /// bare errno told the reader nothing. The hint must name the volume problem and a
+    /// way forward; unrelated errors must pass through untouched.
+    #[test]
+    fn mount_unsupported_error_gets_an_actionable_hint() {
+        let msg = with_mount_hint("Operation not supported (os error 45)".into());
+        assert!(msg.contains("local volume"), "{msg}");
+        assert!(msg.contains("edit_file"), "{msg}");
+        assert_eq!(with_mount_hint("No such file".into()), "No such file");
+    }
+
     fn context(dir: &Path) -> ToolContext {
         ToolContext {
             working_dir: dir.to_path_buf(),
@@ -540,6 +591,8 @@ mod failure_tests {
     struct Fails {
         inner: LocalFs,
         partial: bool,
+        /// When set, `info` fails the way an SMB/NFS mount does (ENOTSUP).
+        no_stat: bool,
     }
     #[async_trait]
     impl FileSystem for Fails {
@@ -568,6 +621,9 @@ mod failure_tests {
             self.inner.list(p).await
         }
         async fn info(&self, p: &Path) -> Result<FileInfo, FsError> {
+            if self.no_stat {
+                return Err(FsError::denied("Operation not supported (os error 45)"));
+            }
             self.inner.info(p).await
         }
         async fn canonicalize(&self, p: &Path) -> Result<PathBuf, FsError> {
@@ -584,6 +640,7 @@ mod failure_tests {
             let world = Arc::new(Fails {
                 inner: LocalFs::new(dir.path()),
                 partial,
+                no_stat: false,
             });
             for name in ["a", "b"] {
                 std::fs::write(dir.path().join(name), "old\n").unwrap();
@@ -659,6 +716,84 @@ mod failure_tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".env")).unwrap(),
             "secret\n"
+        );
+    }
+
+    /// The live ENOTSUP came from HERE, not from stat/read: writing the input record to
+    /// the artifact store. It was a bare `.to_string()`, so the reader saw only the errno.
+    #[tokio::test]
+    async fn import_names_the_stage_when_the_artifact_store_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "old\n").unwrap();
+        std::fs::write(
+            dir.path().join("p"),
+            "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        // A regular file where the store's directory must be → every write fails.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = Arc::new(ArtifactStore::new(blocked.join("inputs")));
+        let provider: ArtifactStoreProvider = Arc::new(move || Some(store.clone()));
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: Default::default(),
+            requester: None,
+        };
+        let tool = ImportPatchTool::new(
+            Arc::new(LocalFs::new(dir.path())),
+            provider,
+            super::super::sensitive_path::test_guard(),
+        );
+        let result = tool.execute(r#"{"file_path":"p"}"#, &ctx).await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("store input record"),
+            "must name the failing stage: {}",
+            result.content
+        );
+    }
+
+    /// The smoke run got a bare `import_patch: Operation not supported (os error 45)`:
+    /// no stage, no hint. Import must say which step failed and why the volume refuses.
+    #[tokio::test]
+    async fn import_names_the_failing_stage_and_hints_on_an_unsupported_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p"),
+            "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let store = Arc::new(ArtifactStore::new(storage.path()));
+        let provider: ArtifactStoreProvider = Arc::new(move || Some(store.clone()));
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: Default::default(),
+            progress: Default::default(),
+            requester: None,
+        };
+        let tool = ImportPatchTool::new(
+            Arc::new(Fails {
+                inner: LocalFs::new(dir.path()),
+                partial: false,
+                no_stat: true,
+            }),
+            provider,
+            super::super::sensitive_path::test_guard(),
+        );
+        let result = tool.execute(r#"{"file_path":"p"}"#, &ctx).await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("stat patch file"),
+            "must name the failing stage: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("local volume"),
+            "must hint at the unsupported volume: {}",
+            result.content
         );
     }
 }

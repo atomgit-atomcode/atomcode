@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getHooks, testHook, type HookCatalogue, type HookTestResult } from '../api';
@@ -37,7 +38,6 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
   }, []);
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!runningRef.current) onClose(); }
       if (event.key === 'Tab') {
         const nodes = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)') ?? []);
         if (nodes.length === 0) { event.preventDefault(); dialog.current?.focus(); return; }
@@ -57,7 +57,7 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
     catch (e) { if (alive.current) setError(String(e)); }
     finally { runningRef.current = false; if (alive.current) setRunning(false); }
   }
-  return createPortal(<div class="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !runningRef.current) onClose(); }}>
+  return createPortal(<ModalOverlay>
     <section ref={dialog} tabIndex={-1} class="modal-card hooks-modal" role="dialog" aria-modal="true" aria-labelledby="hooks-title">
       <header class="modal-header"><h3 id="hooks-title">{t('hooks.title')}</h3><button type="button" class="ghost-btn modal-close" disabled={running} onClick={() => { if (!runningRef.current) onClose(); }} aria-label={t('hooks.close')}>×</button></header>
       <div class="modal-body hooks-body">
@@ -75,11 +75,12 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
             <strong>{entry.event}</strong><span>{entry.name}</span><small>{entry.scope} · {entry.disabled ? t('hooks.disabled') : entry.testable ? t('hooks.configured') : t('hooks.invalid')}</small>
           </button>)}</nav>
           {item && <div class="hooks-detail"><h4>{item.name}</h4><p>{item.event} · {item.matcher ?? '*'} · {item.timeout_ms} ms</p><div class="hooks-path">{item.source}</div><pre>{item.command}</pre>{Boolean(item.args?.length) && <pre>args: {JSON.stringify(item.args)}</pre>}
+            {item.required_approval && <p>{t('hooks.requiredApproval')}</p>}
             <button type="button" class="btn" disabled={!item.testable || running || loading} onClick={run}>{running ? t('hooks.running') : t('hooks.test')}</button>
             {result && <div class="hooks-result" role="status"><p>{result.completed ? `${t('hooks.exit')} ${result.exit_code ?? '—'}` : t('hooks.incomplete')}</p><h5>stdout</h5><pre>{result.stdout || '—'}</pre><h5>stderr</h5><pre>{result.stderr || '—'}</pre></div>}
           </div>}</div>
         </>}
       </div>
     </section>
-  </div>, document.body);
+  </ModalOverlay>, document.body);
 }

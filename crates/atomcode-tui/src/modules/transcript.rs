@@ -16,7 +16,7 @@ use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
     ChoiceBlock, CommandSaid, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome,
-    SkillBlock, ToolCallBlock, TurnEndBlock, TurnStats, UserSaid,
+    SkillBlock, ToolCallBlock, ToolImage, TurnEndBlock, TurnStats, UserSaid,
 };
 use crate::module::Producer;
 
@@ -24,6 +24,8 @@ pub const ID: &str = "transcript";
 
 #[derive(Default)]
 struct Open {
+    retry_block: Option<BlockId>,
+    retry_details: String,
     /// The assistant text block currently accumulating chunks.
     text: Option<(BlockId, String)>,
     /// The reasoning block currently accumulating chunks.
@@ -62,6 +64,9 @@ struct Open {
     /// in the authoritative log. Hold them long enough to draw them under that
     /// invocation, where a tool result would appear.
     skills: Vec<(String, String)>,
+    /// A compact view index, rebuilt on replay. It never grants permissions.
+    skill_uses: Vec<(atomcode_harness::session::SeqNo, u64, String)>,
+    skill_notices: Vec<String>,
 }
 
 /// Turns session facts into what a person reads.
@@ -236,6 +241,29 @@ impl Producer for Transcript {
         let mut open = self.open.lock().expect("transcript poisoned");
         let at = Coord::new(fact.turn(), 0);
         open.plan.absorb(fact);
+        // Request headers can repeat across attempts. A successful response or
+        // new turn ends the group; timestamps come from the log for replay.
+        match fact {
+            SessionEvent::TurnStart { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::TurnEnd { .. }
+            | SessionEvent::Interrupted { .. } => {
+                if let Some(id) = open.retry_block.take() {
+                    // Settle this request's group, keeping its diagnostics
+                    // available through /errors after completion.
+                    out.amend(
+                        id,
+                        Arc::new(crate::provider_notice::RetryBlock {
+                            detail: open.retry_details.clone(),
+                        }),
+                    );
+                    out.settle(id);
+                }
+                open.retry_details.clear();
+            }
+            _ => {}
+        }
+
         // Read before this fact is folded in, so a `Rewound` is judged by the
         // turns before it.
         let silent_undo = match fact {
@@ -257,6 +285,12 @@ impl Producer for Transcript {
             .lock()
             .expect("transcript poisoned")
             .absorb(fact);
+        if let SessionEvent::Interrupted { turn, undone: true } = fact {
+            open.skill_uses
+                .retain(|(_, used_turn, _)| used_turn != turn);
+            open.skills.clear();
+            open.skill_notices.clear();
+        }
         match fact {
             // Where the turns start, so an undo can say which one it went back
             // to; and the undo itself, as a line in the stream that says so.
@@ -273,6 +307,11 @@ impl Producer for Transcript {
                 open.last_reply.clear();
             }
             SessionEvent::Rewound { to, scope, .. } => {
+                if scope.takes_back_conversation() {
+                    open.skill_uses.retain(|(seq, _, _)| seq < to);
+                    open.skills.clear();
+                    open.skill_notices.clear();
+                }
                 let to_turn = self
                     .turns
                     .lock()
@@ -343,7 +382,23 @@ impl Producer for Transcript {
                     out.emit(
                         at,
                         Arc::new(CommandSaid {
-                            text: t(Msg::TranscriptSkillsStarted { names: &names }).into_owned(),
+                            text: {
+                                // Upstream's notices (a skill that was reloaded
+                                // from an earlier turn) ride along with the
+                                // opening line. The line itself stays in the
+                                // word table: this branch's i18n gate counts
+                                // hard-coded CJK in the renderer, and upstream's
+                                // version spends three of them here.
+                                let base =
+                                    t(Msg::TranscriptSkillsStarted { names: &names }).into_owned();
+                                let notice =
+                                    open.skill_notices.drain(..).collect::<Vec<_>>().join("\n");
+                                if notice.is_empty() {
+                                    base
+                                } else {
+                                    format!("{base}\n{notice}")
+                                }
+                            },
                             refused: false,
                         }),
                     );
@@ -485,6 +540,7 @@ impl Producer for Transcript {
                 call_id,
                 content,
                 is_error,
+                images,
                 ..
             } => {
                 let named = open
@@ -509,6 +565,15 @@ impl Producer for Transcript {
                         out.emit(at, Arc::new(orphan.with(outcome)));
                     }
                 }
+                for (index, image) in images.iter().enumerate() {
+                    out.emit(
+                        at,
+                        Arc::new(ToolImage {
+                            image: image.clone(),
+                            ordinal: index + 1,
+                        }),
+                    );
+                }
             }
 
             SessionEvent::Notice {
@@ -517,6 +582,29 @@ impl Producer for Transcript {
                 retry,
                 ..
             } => {
+                if let (atomcode_harness::session::NoticeKind::ProviderRetry, Some(retry)) =
+                    (notice, retry)
+                {
+                    if !open.retry_details.is_empty() {
+                        open.retry_details.push('\n');
+                    }
+                    open.retry_details
+                        .push_str(&t(Msg::TranscriptProviderRetry {
+                            reason: detail,
+                            seconds: retry.backoff_secs,
+                            attempt: retry.attempt,
+                            max: retry.max_attempts,
+                        }));
+                    let block = Arc::new(crate::provider_notice::RetryBlock {
+                        detail: open.retry_details.clone(),
+                    });
+                    if let Some(id) = open.retry_block {
+                        out.amend(id, block);
+                    } else {
+                        open.retry_block = Some(out.open(at, block));
+                    }
+                    return;
+                }
                 // The runtime writes its rate-limit wait as an English sentence
                 // (`host_rows::RateLimitCoding`); said here in the person's
                 // language, as the classic screen says it. A provider retry
@@ -614,11 +702,36 @@ impl Producer for Transcript {
                 );
             }
 
-            SessionEvent::Injected { text, origin, .. } => {
+            SessionEvent::Injected { turn, text, origin } => {
                 // The log commits model context before the user message it
                 // accompanies. Keep that authority and only reorder its visual
                 // projection: `/name args`, then a folded, inspectable body.
                 if let InjectionOrigin::Skill { name } = origin {
+                    for skill in name
+                        .split(" · ")
+                        .filter(|name| !name.starts_with("[command] "))
+                    {
+                        if let Some((_, last_turn, _)) =
+                            open.skill_uses
+                                .iter()
+                                .rev()
+                                .find(|(_, used_turn, used_name)| {
+                                    used_name == skill && used_turn != turn
+                                })
+                        {
+                            let notice = crate::i18n::product::t(
+                                crate::i18n::product::Msg::CmdSkillReload {
+                                    name: skill,
+                                    turn: *last_turn,
+                                },
+                            )
+                            .into_owned();
+                            if !open.skill_notices.contains(&notice) {
+                                open.skill_notices.push(notice);
+                            }
+                        }
+                        open.skill_uses.push((logged.seq, *turn, skill.into()));
+                    }
                     open.skills.push((name.clone(), text.clone()));
                     return;
                 }
@@ -805,6 +918,7 @@ impl Producer for Transcript {
                     let idx = *seq;
                     if matches!(stop, atomcode_harness::seams::StopReason::Stopped)
                         && open_items == 0
+                        && out.members_working() == 0
                     {
                         *seq += 1;
                     }
@@ -824,6 +938,7 @@ impl Producer for Transcript {
                     stats,
                     done_index,
                     open_items,
+                    members_working: out.members_working(),
                     ended_at: crate::content::clock_of(logged.at),
                 };
                 if matches!(stop, atomcode_harness::seams::StopReason::ProviderError) {
@@ -1106,6 +1221,55 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_pictures_replay_in_order_even_when_failed_or_unpaired() {
+        let image = |data: &str| atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: data.into(),
+        };
+        let facts = [SessionEvent::ToolResultLogged {
+            turn: 2,
+            round: 3,
+            call_id: "missing".into(),
+            content: "failed with pictures".into(),
+            is_error: true,
+            images: vec![image("first-bytes"), image("second-bytes")],
+        }];
+        let first = fold(&facts);
+        let replay = fold(&facts);
+        let signature = |s: &Stream| {
+            s.slots()
+                .iter()
+                .map(|slot| {
+                    let b = slot.block();
+                    (
+                        b.kind(),
+                        b.content_hash(),
+                        b.content.reading_text(&crate::block::RenderCtx::bare(80)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&first), signature(&replay));
+        let kinds: Vec<_> = first.slots().iter().map(|s| s.block().kind()).collect();
+        assert_eq!(kinds, ["tool_call", "tool_image", "tool_image"]);
+        let images: Vec<_> = first
+            .slots()
+            .iter()
+            .filter_map(|s| s.block().content.result_image())
+            .collect();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.data.as_str())
+                .collect::<Vec<_>>(),
+            ["first-bytes", "second-bytes"]
+        );
+        assert!(!signature(&first)
+            .iter()
+            .any(|(_, _, text)| text.contains("first-bytes") || text.contains("second-bytes")));
+    }
+
+    #[test]
     fn incomplete_memory_is_visible_even_when_the_injection_is_folded() {
         let _locale = atomcode_i18n::test_lock();
         atomcode_i18n::set_locale(atomcode_i18n::Locale::En);
@@ -1216,18 +1380,151 @@ mod tests {
             },
         ]);
         let drawn = said(&s);
-        let said_once = t(Msg::TranscriptProviderRetry {
-            reason: &crate::provider_notice::reason("connection refused"),
-            seconds: 3,
-            attempt: 1,
-            max: 2,
-        })
-        .into_owned();
-        assert!(drawn.contains(&said_once), "{drawn}");
+        assert!(
+            drawn.contains("connection refused"),
+            "raw diagnostics remain available: {drawn}"
+        );
+        let folded = s
+            .slots()
+            .iter()
+            .flat_map(|slot| {
+                slot.block()
+                    .content
+                    .summary_lines(&crate::block::RenderCtx::bare(100))
+            })
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !folded.contains("connection refused"),
+            "routine structured retries are folded away: {folded}"
+        );
         assert!(
             drawn.contains("gateway reset; retrying in 6s (2/2)"),
             "{drawn}"
         );
+    }
+
+    #[test]
+    fn repeated_failures_keep_one_quiet_expandable_group() {
+        use atomcode_harness::session::{HeaderReason, NoticeKind, RetryAttempt};
+        let t = Transcript::default();
+        let mut s = Stream::new();
+        let mut events = vec![
+            (0, SessionEvent::TurnStart { turn: 1 }),
+            (
+                0,
+                SessionEvent::RequestHeader {
+                    turn: 1,
+                    round: 1,
+                    model: "model".into(),
+                    reason: HeaderReason::Append,
+                },
+            ),
+        ];
+        for (attempt, at) in [(1, 10_000), (2, 30_000), (3, 65_000), (4, 90_000)] {
+            events.push((
+                at,
+                SessionEvent::Notice {
+                    turn: 1,
+                    notice: NoticeKind::ProviderRetry,
+                    detail: format!("original-{attempt}"),
+                    retry: Some(RetryAttempt {
+                        attempt,
+                        max_attempts: 5,
+                        backoff_secs: 3,
+                    }),
+                },
+            ));
+        }
+        for (i, (at, event)) in events.iter().enumerate() {
+            let mut logged = conformance::logged(i, event);
+            logged.at = *at;
+            t.absorb(&logged, &mut s.writer(ID));
+            if i == 3 {
+                assert!(s.slots().iter().all(|slot| slot
+                    .block()
+                    .content
+                    .summary_lines(&crate::block::RenderCtx::bare(100))
+                    .is_empty()));
+            }
+        }
+        let groups: Vec<_> = s
+            .slots()
+            .iter()
+            .filter(|slot| slot.block().content.kind() == "provider_diagnostic")
+            .collect();
+        assert_eq!(groups.len(), 1);
+        let hint = groups[0]
+            .block()
+            .content
+            .summary_lines(&crate::block::RenderCtx::bare(100))
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(hint.is_empty(), "{hint}");
+        let details = said(&s);
+        for n in 1..=4 {
+            assert!(details.contains(&format!("original-{n}")));
+        }
+        let response = conformance::logged(
+            9,
+            &SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: "recovered".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+        );
+        t.absorb(&response, &mut s.writer(ID));
+        assert!(
+            s.slots()
+                .iter()
+                .filter(|slot| slot.block().content.kind() == "provider_diagnostic")
+                .all(|slot| slot
+                    .block()
+                    .content
+                    .summary_lines(&crate::block::RenderCtx::bare(100))
+                    .is_empty()),
+            "a completed request must not still claim it is retrying"
+        );
+        assert!(
+            said(&s).contains("original-4"),
+            "successful recovery keeps diagnostics"
+        );
+        // A new request after a completed response starts a fresh quiet group.
+        let next = conformance::logged(10, &SessionEvent::TurnStart { turn: 2 });
+        t.absorb(&next, &mut s.writer(ID));
+        let mut retry = conformance::logged(
+            11,
+            &SessionEvent::Notice {
+                turn: 2,
+                notice: NoticeKind::ProviderRetry,
+                detail: "new-request".into(),
+                retry: Some(RetryAttempt {
+                    attempt: 1,
+                    max_attempts: 5,
+                    backoff_secs: 3,
+                }),
+            },
+        );
+        retry.at = 200_000;
+        t.absorb(&retry, &mut s.writer(ID));
+        let groups: Vec<_> = s
+            .slots()
+            .iter()
+            .filter(|slot| slot.block().content.kind() == "provider_diagnostic")
+            .collect();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[1]
+            .block()
+            .content
+            .summary_lines(&crate::block::RenderCtx::bare(100))
+            .is_empty());
     }
 
     /// A pause is on screen with the time it ends, because the screen is
@@ -1316,6 +1613,73 @@ mod tests {
         assert!(folded.contains("⎿ Skill: review"), "{folded}");
         assert!(!folded.contains("SKILL.md body"), "{folded}");
         assert!(shown.contains("SKILL.md body"), "{shown}");
+    }
+
+    #[test]
+    fn repeated_skills_have_fact_derived_notices_and_rewind_removes_the_history() {
+        use atomcode_harness::session::RewindScope;
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let skill = |turn, name: &str| SessionEvent::Injected {
+            turn,
+            text: "body".into(),
+            origin: InjectionOrigin::Skill { name: name.into() },
+        };
+        let user = |turn| SessionEvent::UserMessage {
+            turn,
+            text: "/skills review task".into(),
+            images: Vec::new(),
+        };
+        let last_command = |facts: &[SessionEvent]| {
+            let stream = fold(facts);
+            stream
+                .slots()
+                .iter()
+                .rev()
+                .find(|slot| slot.block().kind() == "command")
+                .unwrap()
+                .block()
+                .content
+                .lines(&crate::block::RenderCtx::bare(200))
+                .iter()
+                .map(|line| line.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            skill(1, "review"),
+            user(1),
+            SessionEvent::TurnStart { turn: 2 },
+            skill(2, "review · plan"),
+            user(2),
+        ];
+        let notice = crate::i18n::product::t(crate::i18n::product::Msg::CmdSkillReload {
+            name: "review",
+            turn: 1,
+        });
+        assert!(last_command(&facts).contains(notice.as_ref()));
+        facts.push(SessionEvent::Rewound {
+            turn: 2,
+            to: 1,
+            scope: RewindScope::Conversation,
+        });
+        facts.extend([
+            SessionEvent::TurnStart { turn: 3 },
+            skill(3, "review"),
+            user(3),
+        ]);
+        assert!(!last_command(&facts).contains("inject it again"));
+        // A custom command with the same name never establishes skill history.
+        assert!(!last_command(&[
+            SessionEvent::TurnStart { turn: 1 },
+            skill(1, "[command] review"),
+            user(1),
+            SessionEvent::TurnStart { turn: 2 },
+            skill(2, "review"),
+            user(2)
+        ])
+        .contains("inject it again"));
     }
 
     #[test]

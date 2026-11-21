@@ -10,6 +10,8 @@ pub(crate) enum HeadlessEvent {
     #[serde(rename = "run.started")]
     RunStarted {
         schema_version: u32,
+        /// Native runtime identity; ephemeral runs have no resumable session.
+        session_id: Option<String>,
         provider: String,
         model: String,
     },
@@ -94,6 +96,21 @@ pub(crate) fn line(event: &HeadlessEvent) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_started_exposes_native_session_and_ephemeral_null() {
+        for session_id in [Some("session-123".to_owned()), None] {
+            let encoded = line(&HeadlessEvent::RunStarted {
+                schema_version: 1,
+                session_id: session_id.clone(),
+                provider: "test".into(),
+                model: "test".into(),
+            })
+            .unwrap();
+            let event: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(event["session_id"], serde_json::json!(session_id));
+        }
+    }
 
     #[test]
     fn event_is_one_valid_line_with_escaped_content() {

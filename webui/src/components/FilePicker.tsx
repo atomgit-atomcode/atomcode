@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 // Server-side file picker modal. The browser's native file input can't expose
 // an absolute path (security), so we browse the daemon's filesystem via
 // /fs/list (dirs + files) and return the chosen file's absolute path for
@@ -68,16 +69,12 @@ export function FilePicker({ current, onPick, onClose }: FilePickerProps) {
   const crumbs = parseBreadcrumb(browsePath);
 
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card">
         <div class="modal-header">
           <span>📄</span>
           <h3>{t('filepicker.title')}</h3>
+          <button type="button" class="ghost-btn modal-close" onClick={onClose} aria-label={t('settings.close')}>×</button>
         </div>
 
         <div class="modal-body">
@@ -126,6 +123,6 @@ export function FilePicker({ current, onPick, onClose }: FilePickerProps) {
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }

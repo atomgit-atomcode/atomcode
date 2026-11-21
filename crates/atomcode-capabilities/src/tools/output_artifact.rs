@@ -68,6 +68,13 @@ pub struct ArtifactStore {
 /// Resolve a host-owned optional store when a call/schema is built, not at mount.
 pub type ArtifactStoreProvider = Arc<dyn Fn() -> Option<Arc<ArtifactStore>> + Send + Sync>;
 
+/// Where a capture goes when the configured store cannot be written. Content-addressed
+/// and process-independent, so an id printed in one turn still resolves in the next —
+/// and `get` consults it on a miss.
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join("atomcode-artifacts")
+}
+
 impl ArtifactStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -96,11 +103,15 @@ impl ArtifactStore {
         if !is_valid_id(id) {
             return Ok(None);
         }
-        let path = self.dir.join(id);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match std::fs::read(self.dir.join(id)) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+            // A configured store that is unwritable (or not even a directory) spilled
+            // this capture to `fallback_dir`; an id we handed out must still resolve.
+            Err(primary) => match std::fs::read(fallback_dir().join(id)) {
+                Ok(b) => b,
+                Err(_) if primary.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(primary),
+            },
         };
         let start = offset.min(bytes.len());
         let end = start.saturating_add(limit).min(bytes.len());
@@ -173,8 +184,13 @@ impl ArtifactStore {
         }
         match std::fs::metadata(self.dir.join(id)) {
             Ok(m) => Ok(Some(m.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            // Mirror `get`: a capture that spilled to the temp store must report its real
+            // length, otherwise the fetch hint reads "showing bytes 0–0 of 0".
+            Err(primary) => match std::fs::metadata(fallback_dir().join(id)) {
+                Ok(m) => Ok(Some(m.len())),
+                Err(_) if primary.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(primary),
+            },
         }
     }
 }
@@ -286,6 +302,17 @@ any value from that range until you have read it.",
     )
 }
 
+/// The message for a capture that could not be saved anywhere. Both errors are
+/// named: the bare "(could not be saved.)" it replaces left the reader unable to
+/// tell a full disk from a permission problem, which is why the smoke run could
+/// not explain why `fetch_output` had no id to read.
+fn both_failed_message(primary: &std::io::Error, fallback: &std::io::Error) -> String {
+    format!(
+        "Full captured result unavailable — could not be saved: primary store error: {primary}; \
+fallback store error: {fallback}."
+    )
+}
+
 pub struct ArtifactMiddleware {
     store: Arc<ArtifactStore>,
     /// `[tools.output] threshold_bytes`, when the deployment set one.
@@ -293,6 +320,20 @@ pub struct ArtifactMiddleware {
 }
 
 impl ArtifactMiddleware {
+    /// Save a full capture, preferring the configured store and falling back to the
+    /// shared temp store. `Err` means neither could write and carries BOTH reasons:
+    /// the caller inlines the range away, but the reader learns why instead of seeing
+    /// a bare "(could not be saved)".
+    fn save_capture(&self, bytes: &[u8]) -> Result<(String, Option<std::io::Error>), String> {
+        match self.store.put(bytes) {
+            Ok(id) => Ok((id, None)),
+            Err(primary) => match ArtifactStore::new(fallback_dir()).put(bytes) {
+                Ok(id) => Ok((id, Some(primary))),
+                Err(fallback) => Err(both_failed_message(&primary, &fallback)),
+            },
+        }
+    }
+
     /// A caller-requested shell preview. Only presentation changes; the caller
     /// supplies the status from its process result, never from output text.
     pub(crate) fn shell_tail(
@@ -321,9 +362,12 @@ impl ArtifactMiddleware {
             let capture = if result.content.len() > MAX_ARTIFACT_BYTES {
                 format!("Full captured result unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).")
             } else {
-                match self.store.put(result.content.as_bytes()) {
-                    Ok(id) => format!("Full captured result saved as artifact {id}; read with fetch_output(artifact_id=\"{id}\", offset=0, limit={FETCH_MAX_LIMIT})."),
-                    Err(_) => "Full captured result unavailable (could not be saved).".into(),
+                match self.save_capture(result.content.as_bytes()) {
+                    Ok((id, None)) => format!("Full captured result saved as artifact {id}; read with fetch_output(artifact_id=\"{id}\", offset=0, limit={FETCH_MAX_LIMIT})."),
+                    Ok((id, Some(primary))) => format!(
+                        "Full captured result saved as a TEMPORARY artifact {id} (primary store failed: {primary}); read it with fetch_output(artifact_id=\"{id}\") in this session."
+                    ),
+                    Err(reason) => reason,
                 }
             };
             result.content = format!(
@@ -398,15 +442,18 @@ re-run the tool call with narrower output to see that range.]\n\n"
             return;
         }
 
-        let marker = match self.store.put(result.content.as_bytes()) {
-            Ok(id) => format!(
+        let marker = match self.save_capture(result.content.as_bytes()) {
+            Ok((id, None)) => format!(
                 "\n\n{missing} Full output saved as artifact {id}; the missing range is {} part(s) of up to \
 {FETCH_MAX_LIMIT} bytes. Read part 1: fetch_output(artifact_id=\"{id}\", offset={head_end}, limit={FETCH_MAX_LIMIT}).]\n\n",
                 (tail_begin - head_end).div_ceil(FETCH_MAX_LIMIT).max(1),
             ),
-            Err(_) => format!(
-                "\n\n{missing} Full output unavailable (could not be saved); re-run the tool call with narrower \
-output to see that range.]\n\n"
+            Ok((id, Some(primary))) => format!(
+                "\n\n{missing} Full output saved as a TEMPORARY artifact {id} (primary store failed: {primary}); \
+read part 1: fetch_output(artifact_id=\"{id}\", offset={head_end}, limit={FETCH_MAX_LIMIT}).]\n\n"
+            ),
+            Err(reason) => format!(
+                "\n\n{missing} {reason} Re-run the tool call with narrower output to see that range.]\n\n"
             ),
         };
         result.content = format!("{head}{marker}{tail}");
@@ -430,6 +477,165 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
 #[cfg(test)]
 mod tests {
+    /// The same defect lived in `spill`: a failed store write inlined the missing
+    /// range away with "(could not be saved)" — no id, no reason, no fallback.
+    #[tokio::test]
+    async fn spill_falls_back_to_a_readable_temp_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: format!("{}\nlast\n", "x".repeat(super::THRESHOLD_BYTES + 10_000)),
+            ..Default::default()
+        };
+        preview.spill(&mut result, false).await;
+        assert!(
+            result.content.contains("TEMPORARY artifact"),
+            "must fall back instead of dropping the range: {}",
+            &result.content[..400.min(result.content.len())]
+        );
+        let id = result
+            .content
+            .split("TEMPORARY artifact ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '(']).next())
+            .expect("the marker must carry an id")
+            .to_string();
+        assert!(
+            store.get(&id, 0, 16).unwrap().is_some(),
+            "an id we print must be readable"
+        );
+    }
+
+    /// The smoke run saw `(could not be saved.)` for three different sizes with no
+    /// id and no reason. A spill that cannot reach its configured directory must
+    /// still hand the model a readable artifact, and must name the failure.
+    #[test]
+    fn primary_store_failure_falls_back_to_a_temp_artifact() {
+        let d = tempfile::tempdir().unwrap();
+        // A regular FILE where the store's parent directory must be → create_dir_all fails.
+        let blocked = d.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store);
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: "first\nsecond\nthird\n[exit code 0]".into(),
+            ..Default::default()
+        };
+        preview.shell_tail(
+            &mut result,
+            1,
+            "[exit code 0]",
+            true,
+            "[atomcode: output truncated",
+        );
+        assert!(
+            result.content.contains("TEMPORARY artifact"),
+            "must fall back instead of giving up: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("primary store failed"),
+            "must name the primary failure: {}",
+            result.content
+        );
+    }
+
+    /// The fallback id was unusable in practice: `get` only read the configured
+    /// directory, so `fetch_output` answered "no longer available" for an id we had
+    /// just handed out. An id we print must be readable.
+    #[test]
+    fn a_fallback_artifact_is_readable_through_the_primary_store() {
+        let d = tempfile::tempdir().unwrap();
+        let blocked = d.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: "first\nsecond\nthird\n[exit code 0]".into(),
+            ..Default::default()
+        };
+        preview.shell_tail(
+            &mut result,
+            1,
+            "[exit code 0]",
+            true,
+            "[atomcode: output truncated",
+        );
+        assert!(
+            result.content.contains("TEMPORARY artifact"),
+            "{}",
+            result.content
+        );
+        let id = result
+            .content
+            .split("TEMPORARY artifact ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '(']).next())
+            .expect("the message must carry an id")
+            .to_string();
+        let got = store.get(&id, 0, usize::MAX).unwrap();
+        let got = got.unwrap_or_else(|| panic!("artifact {id} must be readable, got None"));
+        assert!(
+            String::from_utf8_lossy(&got).contains("second"),
+            "wrong bytes"
+        );
+    }
+
+    /// `get` falls back to the temp store, but `size` did not — so a temporary
+    /// artifact reported `[showing bytes 0–0 of 0]` while its bytes came back fine.
+    #[test]
+    fn a_fallback_artifact_reports_its_real_size() {
+        let d = tempfile::tempdir().unwrap();
+        let blocked = d.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(blocked.join("artifacts")));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let original = "first\nsecond\nthird\n[exit code 0]";
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: original.into(),
+            ..Default::default()
+        };
+        preview.shell_tail(
+            &mut result,
+            1,
+            "[exit code 0]",
+            true,
+            "[atomcode: output truncated",
+        );
+        let id = result
+            .content
+            .split("TEMPORARY artifact ")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '(']).next())
+            .expect("the message must carry an id")
+            .to_string();
+        assert!(
+            store.get(&id, 0, 1).unwrap().is_some(),
+            "get reads the temp store"
+        );
+        assert_eq!(
+            store.size(&id).unwrap(),
+            Some(original.len() as u64),
+            "size must agree with get for a temporary artifact"
+        );
+    }
+
+    #[test]
+    fn both_failed_message_names_both_errors() {
+        let primary = std::io::Error::other("primary denied");
+        let fallback = std::io::Error::other("fallback denied");
+        let msg = super::both_failed_message(&primary, &fallback);
+        assert!(msg.contains("primary denied"), "{msg}");
+        assert!(msg.contains("fallback denied"), "{msg}");
+        assert!(
+            !msg.contains("could not be saved.)"),
+            "no bare message: {msg}"
+        );
+    }
+
     #[test]
     fn requested_shell_tail_keeps_status_and_saves_utf8_capture() {
         let dir = tempfile::tempdir().unwrap();
@@ -458,7 +664,9 @@ mod tests {
         let blocker = dir.path().join("file");
         std::fs::write(&blocker, "not a directory").unwrap();
         for (path, full, reason) in [
-            (blocker, "first\nlast".to_string(), "could not be saved"),
+            // An unwritable primary store now falls back to a per-process temp store,
+            // so the honest message names the TEMPORARY artifact and the primary error.
+            (blocker, "first\nlast".to_string(), "TEMPORARY artifact"),
             (
                 dir.path().join("ceiling"),
                 format!("{}\nlast", "x".repeat(super::MAX_ARTIFACT_BYTES)),

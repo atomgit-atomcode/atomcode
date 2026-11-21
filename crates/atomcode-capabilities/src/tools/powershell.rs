@@ -64,6 +64,18 @@ impl PowerShell {
 #[cfg(any(windows, test))]
 #[async_trait]
 impl Shell for PowerShell {
+    fn dialect(&self) -> crate::world::ShellDialect {
+        crate::world::ShellDialect::PowerShell
+    }
+    async fn spawn_program(
+        &self,
+        program: &str,
+        arguments: &[String],
+        options: &SpawnOptions,
+    ) -> Result<Arc<dyn Process>, SpawnError> {
+        super::bash::spawn_local_program(program, arguments, options).await
+    }
+
     fn describe(&self) -> String {
         format!("PowerShell {} on this machine", self.version)
     }
@@ -180,7 +192,7 @@ impl PowerShellTool {
         let Some(shell) = world.powershell().await else {
             return Vec::new();
         };
-        let description = format!("Execute a PowerShell command directly in {} (not Bash or cmd.exe). Each call starts a fresh noninteractive process with no profile. Use native Windows paths, single-quote literal paths/registry keys, and -LiteralPath for file cmdlets. Backslash is not PowerShell's escape character; backtick is. No automatic path rewriting. If the version is 5.1, do not use &&, ||, ?? or other PowerShell 7-only syntax. Prefer dedicated file tools for reading/editing files. UTF-8 stdout is requested; for file writes explicitly select encoding. Preserve native exit codes; do not mask failures with output-filtering wrappers. PowerShell is unavailable under shell_guard_policy=strict. Commands require conservative approval; Bash grants do not authorize PowerShell. Use pwsh_start for long jobs, then bash_poll/bash_kill for their job IDs.", shell.describe());
+        let description = format!("Execute a PowerShell command directly in {} (not Bash or cmd.exe). Each call starts a fresh noninteractive process with no profile. Use native Windows paths, single-quote literal paths/registry keys, and -LiteralPath for file cmdlets. Backslash is not PowerShell's escape character; backtick is. No automatic path rewriting. If the version is 5.1, do not use &&, ||, ?? or other PowerShell 7-only syntax. Prefer dedicated file tools for reading/editing files. Commands are transported with UTF-16LE -EncodedCommand. For non-ASCII scripts, prefer executing the command directly with this tool. Windows PowerShell 5.1 -File reads BOM-less scripts as legacy ANSI: explicitly save .ps1 as UTF-8 with BOM, or use PowerShell 7 if available. OutputEncoding and chcp do not fix 5.1 script-file decoding. UTF-8 stdout is requested; for file writes explicitly select encoding. Preserve native exit codes; do not mask failures with output-filtering wrappers. PowerShell is unavailable under shell_guard_policy=strict. Commands require conservative approval; Bash grants do not authorize PowerShell. Use pwsh_start for long jobs, then bash_poll/bash_kill for their job IDs.", shell.describe());
         vec![
             Arc::new(Self { inner: Arc::new(BashTool::with_world(shell.clone(), sensitive.clone()).with_label("pwsh").with_output_preview_provider(preview.clone())), name: "pwsh", description: description.clone() }),
             Arc::new(Self { inner: Arc::new(BashStartTool::with_world(shell, sensitive).with_label("pwsh_start").with_output_preview_provider(preview)), name: "pwsh_start", description: format!("Start a background PowerShell job; use bash_poll/bash_kill for its job ID. {description}") }),
@@ -415,6 +427,98 @@ mod tests {
             assert_eq!(args[3], "-EncodedCommand");
             assert!(script.contains("'HKCU\\Software\\测试'"));
             assert!(script.contains("exit 7 # comment\n"));
+        }
+    }
+
+    #[test]
+    fn encoded_command_preserves_the_reported_workspace_path() {
+        let shell = PowerShell {
+            path: "powershell.exe".into(),
+            version: "5.1".into(),
+        };
+        let path = r"D:\2026增肌\工作区_wb06\_atomcode_archive";
+        let command = shell.command(&format!("[IO.Directory]::CreateDirectory('{path}')"));
+        use base64::Engine;
+        let encoded = command
+            .as_std()
+            .get_args()
+            .last()
+            .unwrap()
+            .to_string_lossy();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap();
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let decoded = String::from_utf16(&units).unwrap();
+        assert!(decoded.contains(path));
+        assert!(!decoded.contains("澧炶倢"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_powershell_versions_create_the_exact_chinese_archive_directory() {
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+        let programs = PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles"));
+        let mut shells = vec![(
+            system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+            "5.1",
+        )];
+        let seven = programs.join("PowerShell/7/pwsh.exe");
+        if seven.is_file() {
+            shells.push((seven, "7"));
+        }
+        for (path, version) in shells {
+            assert!(
+                path.is_file(),
+                "required Windows PowerShell is missing: {}",
+                path.display()
+            );
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().join("2026增肌").join("工作区 wb06");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let target = cwd.join("_atomcode_archive");
+            let escaped = target.to_string_lossy().replace('\'', "''");
+            let script = format!("$target = '{escaped}'; [IO.Directory]::CreateDirectory($target) | Out-Null; [IO.File]::WriteAllText([IO.Path]::Combine($target, 'probe.txt'), 'ok')");
+            let shell = PowerShell {
+                path,
+                version: version.into(),
+            };
+            let process = shell
+                .spawn(
+                    &script,
+                    &SpawnOptions {
+                        cwd: Some(cwd.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut output = Vec::new();
+            while let Some(chunk) = process.next_chunk().await {
+                output.extend_from_slice(chunk.bytes());
+            }
+            assert!(
+                process.wait().await.unwrap().success(),
+                "{}",
+                shell.decode(&output)
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.join("probe.txt")).unwrap(),
+                "ok"
+            );
+            let top: Vec<_> = std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(top, vec![std::ffi::OsString::from("2026增肌")]);
+            let dirs: Vec<_> = std::fs::read_dir(root.path().join("2026增肌"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(dirs, vec![std::ffi::OsString::from("工作区 wb06")]);
         }
     }
 }

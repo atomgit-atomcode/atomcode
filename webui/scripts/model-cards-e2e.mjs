@@ -82,7 +82,11 @@ try {
       await page.mouse.click(box.x + box.width - 2, box.y + 5);
       assert.ok(await dialog.isVisible(), 'clicking the dialog border must not dismiss it');
       await page.mouse.click(5, 5);
-    } else await page.keyboard.press('Escape');
+      assert.ok(await dialog.isVisible(), 'backdrop click must not dismiss model cards');
+    }
+    await page.keyboard.press('Escape');
+    assert.ok(await dialog.isVisible(), 'Escape must not dismiss model cards');
+    await dialog.locator('header button').click();
     await dialog.waitFor({ state: 'detached' });
     await page.locator('.model-selector-trigger').last().click();
     await page.locator('.model-card-info').nth(2).click();
@@ -90,7 +94,7 @@ try {
     await dialog.locator('.mc-pickers select').first().selectOption('minimax-m3-1-flash');
     await dialog.locator('.mc-headings').waitFor();
     assert.equal((await dialog.locator('.mc-table-scroll').last().locator('tbody tr').count()), 2);
-    await page.keyboard.press('Escape');
+    await dialog.locator('header button').click();
     // Confirmed absent catalogue entries are not repeatedly fetched or scored as zero.
     for (let attempt = 0; attempt < 2; attempt++) {
       await page.locator('.model-selector-trigger').last().click();
@@ -108,7 +112,7 @@ try {
         assert.ok(await dialog.locator('.mc-no-public').isVisible(), 'browsing another card keeps the configured model no-data state explicit');
         assert.ok((await dialog.locator('header').innerText()).includes('lumen-alpha'));
       }
-      await page.keyboard.press('Escape');
+      await dialog.locator('header button').click();
       await dialog.waitFor({ state: 'detached' });
     }
     if (!mobile) {
@@ -119,7 +123,7 @@ try {
       fail = false;
       await dialog.getByRole('alert').getByRole('button').click();
       await dialog.locator('.mc-headings').waitFor();
-      await page.keyboard.press('Escape');
+      await dialog.locator('header button').click();
     }
     assert.equal(writes, writesBefore, 'viewing, comparison and retries must never switch or reconfigure a model');
     await context.close();

@@ -51,7 +51,7 @@ impl View for SheetView {
         if let Page::Doc(doc) = &sheet.page {
             return doc_lines(sheet, doc, h, w, caps);
         }
-        layout(sheet, h)
+        layout(sheet, h, w)
             .into_iter()
             .map(|row| draw(sheet, row, w, caps, read_room(h)))
             .collect()
@@ -72,7 +72,11 @@ impl View for SheetView {
             let rows = doc_lines(sheet, doc, usize::MAX, width as usize, moment.caps).len();
             return Height::Hug(rows.min(u16::MAX as usize) as u16);
         }
-        Height::Hug(layout(sheet, usize::MAX).len().min(u16::MAX as usize) as u16)
+        Height::Hug(
+            layout(sheet, usize::MAX, width as usize)
+                .len()
+                .min(u16::MAX as usize) as u16,
+        )
     }
 }
 
@@ -105,7 +109,7 @@ enum Row {
     Legend,
 }
 
-fn layout(sheet: &Sheet, h: usize) -> Vec<Row> {
+fn layout(sheet: &Sheet, h: usize, w: usize) -> Vec<Row> {
     let mut rows = vec![Row::Rule, Row::Header];
     match &sheet.page {
         Page::List(list) => {
@@ -156,7 +160,7 @@ fn layout(sheet: &Sheet, h: usize) -> Vec<Row> {
             if read.lines.is_empty() {
                 rows.push(Row::Nothing);
             } else {
-                let (from, to) = read_window(read, read_room(h));
+                let (from, to) = read_window(read, read_room(h), w);
                 rows.extend((from..to).map(Row::Line));
             }
         }
@@ -188,8 +192,8 @@ fn window(len: usize, cursor: usize, room: usize) -> (usize, usize) {
 }
 
 /// 读的那页此刻画哪几行:从 `top` 起,但最后一屏总是满的。
-fn read_window(read: &Read, room: usize) -> (usize, usize) {
-    let len = read.lines.len();
+fn read_window(read: &Read, room: usize, width: usize) -> (usize, usize) {
+    let len = read.display_len(width);
     let from = read.top.min(len.saturating_sub(room));
     (from, (from + room).min(len))
 }
@@ -275,9 +279,9 @@ fn header(sheet: &Sheet, w: usize, room: usize) -> Line {
         Page::List(list) => spans.push(Span::styled(list.title.clone(), theme::fg(Role::Muted))),
         Page::Read(read) => {
             spans.extend(read.title.iter().map(piece_span));
-            let len = read.lines.len();
+            let len = read.display_len(w);
             if len > 0 {
-                let (from, to) = read_window(read, room);
+                let (from, to) = read_window(read, room, w);
                 spans.push(Span::styled(
                     format!("  {}-{}/{len}", from + 1, to),
                     theme::fg(Role::Muted),
@@ -463,6 +467,13 @@ fn item_line(list: &List, at: usize, index: usize, w: usize, caps: Caps) -> Line
 
 /// 读的那页一行:一栏灰色行号,diff 再多一栏 `+`/`-`,然后是字。
 fn read_line(read: &Read, at: usize, w: usize, caps: Caps) -> Line {
+    if read.wrap_diff {
+        return read
+            .display_rows_with_marker(w, caps.g(Glyph::Pending))
+            .get(at)
+            .cloned()
+            .unwrap_or_else(Line::empty);
+    }
     let Some(line) = read.lines.get(at) else {
         return Line::empty();
     };
@@ -528,7 +539,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
         return Geometry { rows: Vec::new() };
     };
     Geometry {
-        rows: layout(sheet, vp.rect.h as usize)
+        rows: layout(sheet, vp.rect.h as usize, vp.rect.w as usize)
             .into_iter()
             .map(|row| match row {
                 Row::Item { at, .. } => Some(at),
@@ -544,7 +555,7 @@ mod tests {
     use crate::sheet::{List, Row as Item};
 
     fn drawn(sheet: &Sheet, w: usize) -> Vec<String> {
-        layout(sheet, usize::MAX)
+        layout(sheet, usize::MAX, w)
             .into_iter()
             .map(|row| draw(sheet, row, w, Caps::default(), read_room(usize::MAX)).plain())
             .collect()
@@ -596,7 +607,7 @@ mod tests {
             "",
             vec![Item::new("/cd a", "a"), Item::new("/cd b", "b")],
         ));
-        let rows = layout(&plain, usize::MAX);
+        let rows = layout(&plain, usize::MAX, 80);
         assert!(!rows.iter().any(|row| matches!(row, Row::Preview(_))));
     }
 
@@ -796,7 +807,7 @@ mod tests {
         let sheet = Sheet::read(Read::file("view", Vec::new(), &text));
         let h = 20;
         let room = read_room(h);
-        let lines: Vec<String> = layout(&sheet, h)
+        let lines: Vec<String> = layout(&sheet, h, 60)
             .into_iter()
             .map(|row| draw(&sheet, row, 60, Caps::default(), room).plain())
             .collect();

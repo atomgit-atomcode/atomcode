@@ -41,6 +41,7 @@ pub use atomcode_plexus::{Context, Entry, Layer, Plugin};
 /// | `tools` | narrow the catalog: `config = { exclude = [..], include = [..] }`, patterns with `*`, `row:tool` to name one row's tool (`docs/tool-catalog-policy.md`). A host's patch is the whole policy unless `PrepareOptions.tools` is false: that explicit model-only contract closes the catalog after all layers. |
 /// | `codeintel` | disable: `list_symbols`, `read_symbol`, `find_references` and their prompt fragment |
 /// | `code-graph` | disable: `trace_callers`, `trace_callees`, `trace_chain`, `blast_radius`, `file_dependencies` and their prompt fragment |
+/// | `architecture-topology` | opt in to `repo_architecture`; disabled by default, no scan until called |
 /// | `tool-ast-grep` | disable: `ast_grep` and its prompt fragment |
 ///
 /// Disable rather than remove: the runtime patches some rows itself (the
@@ -50,6 +51,7 @@ pub const PUBLISHED_ROWS: &[&str] = &[
     "tools",
     "codeintel",
     "code-graph",
+    "architecture-topology",
     "tool-ast-grep",
 ];
 

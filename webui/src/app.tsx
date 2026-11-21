@@ -1,8 +1,8 @@
 // Two-column layout: sidebar + chat, header with cwd breadcrumb + config.
 // VSCode design system: timeline messages, violet brand, floating input.
 
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
-import { sessionSelectionDisposition } from './lib/sessionBrowse';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { createBrowseRefresh, sessionSelectionDisposition } from './lib/sessionBrowse';
 import { Chat } from './components/Chat';
 import { Workbench, hasUnsavedWorkbenchDrafts, persistWorkbenchState } from './components/Workbench';
 import { Sidebar } from './components/Sidebar';
@@ -14,10 +14,13 @@ import { CwdPicker } from './components/CwdPicker';
 import { SourceControl } from './components/SourceControl';
 import { PackageBrowser } from './components/PackageBrowser';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
-import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
+import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, getSessionActivity, postCommand, SessionMetaWithProject, type SessionActivity } from './api';
 import { useT, useSettings, SettingsSection } from './settings';
 import { applyConfigDefaults, initNotificationPermissionPrompt } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
+import { ArtifactWorkspaceProvider } from './components/TurnArtifactsCard';
+import { FileViewerContext, type FileViewerRoute, type FileViewerView } from './lib/fileViewer';
+import { workspaceRelativePath } from './lib/turnArtifacts';
 
 // 从 URL (?session=<id>) 读取要打开的会话 id（短 id），用于刷新后恢复。
 function readSessionIdFromUrl(): string | null {
@@ -33,8 +36,41 @@ function shortSessionId(id: string): string {
   return id.slice(0, 8);
 }
 
+// Persistent sidebar width (localStorage-backed).
+const SIDEBAR_WIDTH_KEY = 'atomcode-sidebar-width';
+const SIDEBAR_MIN = 180;
+const SIDEBAR_MAX = 500;
+const SIDEBAR_MAX_RATIO = 0.35;
+const SIDEBAR_COLLAPSE_AT = 140;
+
+function readSidebarWidth(): number | null {
+  try {
+    const v = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    if (v) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= SIDEBAR_MIN && n <= SIDEBAR_MAX) return n;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/** One counter for chat→Workbench git/file requests. Workbench keeps a
+ *  module-level watermark of the last seq it applied per session, so ids must
+ *  never repeat across request kinds or App/Workbench remounts. */
+let workbenchRequestSeq = 0;
+
+/** How often a browsed session's holder is asked what it is doing. */
+const BROWSE_ACTIVITY_POLL_MS = 3_000;
+
 export function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workbenchGitRequest, setWorkbenchGitRequest] = useState<{ sessionId: string; path: string; seq: number }>();
+  const [workbenchFileRequest, setWorkbenchFileRequest] = useState<{ sessionId: string; path: string; seq: number }>();
+  /** The browsed (historical) session whose read-only workspace is open. */
+  const [historyWorkbench, setHistoryWorkbench] = useState<string | null>(null);
+  const [historyRequest, setHistoryRequest] = useState<{ sessionId: string; path: string; seq: number; view: FileViewerView }>();
+  /** What had focus when a chat link opened the workspace; closing returns there. */
+  const viewerOpener = useRef<HTMLElement | null>(null);
   useEffect(()=>{
     const warn=(event:BeforeUnloadEvent)=>{persistWorkbenchState();if(hasUnsavedWorkbenchDrafts()){event.preventDefault();event.returnValue='';}};
     window.addEventListener('beforeunload',warn);
@@ -42,7 +78,16 @@ export function App() {
   },[]);
   const t = useT();
   const { lang } = useSettings();
-  const [browseSession, setBrowseSession] = useState<SessionMetaWithProject | null>(null);
+  const [browseSession, updateBrowseSession] = useState<SessionMetaWithProject | null>(null);
+  const browseNavigation = useRef(0);
+  function setBrowseSession(session: SessionMetaWithProject | null) {
+    browseNavigation.current++;
+    updateBrowseSession(session);
+  }
+  // What the runtime holding the browsed session (another terminal) is doing
+  // with it; re-read while browsing so the view follows it there.
+  const [browseActivity, setBrowseActivity] = useState<SessionActivity | null>(null);
+  const [browseForkError, setBrowseForkError] = useState<string | null>(null);
   const [executionActive, setExecutionActive] = useState(false);
   const executionActiveRef = useRef(false);
   const reportExecution = useCallback((active: boolean) => {
@@ -51,17 +96,11 @@ export function App() {
   }, []);
   // Bound runtime identity; history browsing never changes this value.
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [workbenchFile, setWorkbenchFile] = useState<{session:string;path:string;seq:number}|null>(null);
-  useEffect(() => {
-    const open = (event: Event) => {
-      const detail = (event as CustomEvent<{session:string;path:string}>).detail;
-      if (detail?.session !== sessionId || typeof detail.path !== 'string') return;
-      setWorkbenchFile({ ...detail, seq: Date.now() });
-      setWorkbenchOpen(true);
-    };
-    window.addEventListener('workbench-open-file', open);
-    return () => window.removeEventListener('workbench-open-file', open);
-  }, [sessionId]);
+  const sessionIdentityRef = useRef(sessionId);
+  sessionIdentityRef.current = sessionId;
+  const forkingRef = useRef(false);
+  const [forking, setForking] = useState(false);
+  const [forkNotice, setForkNotice] = useState<{id:string;text:string}|null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
   // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
@@ -127,6 +166,55 @@ export function App() {
   // 刷新时若 URL 带 session id，先进入「恢复中」态：在按短 id 还原出会话前，
   // 抑制 Chat 的新建落地页，避免「先闪一下新建页再跳到历史」的体验。
   const [restoring, setRestoring] = useState<boolean>(() => readSessionIdFromUrl() != null);
+
+  // Keep the responsive CSS width until a stored or dragged width exists.
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(readSidebarWidth);
+  const resizingRef = useRef<{
+    x: number; width: number; preferred: number | null; cursor: string; userSelect: string;
+  } | null>(null);
+  const widthRef = useRef(sidebarWidth);
+
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      const drag = resizingRef.current;
+      if (!drag) return;
+      const requested = drag.width + e.clientX - drag.x;
+      if (requested < SIDEBAR_COLLAPSE_AT) {
+        // A collapse gesture must not replace the last expanded preference
+        // with the temporary narrow widths crossed during the drag.
+        widthRef.current = drag.preferred;
+        setSidebarWidth(drag.preferred);
+        finishResize();
+        setSidebarCollapsed(true);
+        return;
+      }
+      const max = Math.min(SIDEBAR_MAX, window.innerWidth * SIDEBAR_MAX_RATIO);
+      const w = Math.min(max, Math.max(SIDEBAR_MIN, requested));
+      widthRef.current = w;
+      setSidebarWidth(w);
+    }
+    function finishResize() {
+      const drag = resizingRef.current;
+      if (!drag) return;
+      resizingRef.current = null;
+      document.body.style.cursor = drag.cursor;
+      document.body.style.userSelect = drag.userSelect;
+      if (widthRef.current !== null) {
+        try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(widthRef.current)); } catch { /* optional storage */ }
+      }
+    }
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', finishResize);
+    window.addEventListener('blur', finishResize);
+    window.addEventListener('resize', finishResize);
+    return () => {
+      finishResize();
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', finishResize);
+      window.removeEventListener('blur', finishResize);
+      window.removeEventListener('resize', finishResize);
+    };
+  }, [sidebarCollapsed]);
 
   // 关闭表头会话菜单：外部点击 / 滚动 / 缩放（fixed 菜单不跟随锚点，故一并关闭）。
   useEffect(() => {
@@ -339,7 +427,7 @@ export function App() {
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
-    const disposition = sessionSelectionDisposition(sessionId, session.id, executionActiveRef.current, browseSession !== null);
+    const disposition = sessionSelectionDisposition(sessionId, session.id, executionActiveRef.current, browseSession !== null, session.activity != null);
     if (disposition === 'return') { setBrowseSession(null); setSidebarOpen(false); return; }
     if (disposition === 'browse') {
       setBrowseSession(session); setSidebarOpen(false); return;
@@ -348,6 +436,7 @@ export function App() {
   }
 
   function activateSession(session: SessionMetaWithProject) {
+    sessionIdentityRef.current = session.id;
     setBrowseSession(null);
     setOptimisticSession(null);
     setSessionId(session.id);
@@ -423,6 +512,110 @@ export function App() {
     }
   }
 
+  useEffect(() => {
+    setBrowseActivity(browseSession?.activity ?? null);
+    setBrowseForkError(null);
+    const hash = browseSession?.project_hash;
+    const id = browseSession?.id;
+    if (!hash || !id) return;
+    const refresh = createBrowseRefresh({
+      needed: () => true,
+      ready: () => !document.hidden,
+      read: () => getSessionActivity(hash, id),
+      apply: setBrowseActivity,
+    });
+    const read = () => { void refresh.run(); };
+    read();
+    const timer = window.setInterval(read, BROWSE_ACTIVITY_POLL_MS);
+    document.addEventListener('visibilitychange', read);
+    return () => { refresh.stop(); window.clearInterval(timer); document.removeEventListener('visibilitychange', read); };
+  }, [browseSession?.id, browseSession?.project_hash]);
+
+  // A read-only workspace belongs to one browsed session: leaving it (another
+  // session, or back to the bound one) closes it instead of revealing it later.
+  useEffect(() => {
+    setHistoryWorkbench(open => open && open === browseSession?.id ? open : null);
+  }, [browseSession?.id]);
+
+  const displayedSessionId = browseSession?.id ?? sessionId;
+  const displayedCwd = browseSession?.working_dir || activeSession?.working_dir || cwd;
+  const browsing = browseSession !== null;
+  // Every local file link and artifact click lands here. Requests name the
+  // session whose message or document holds the link; one for a session that
+  // is no longer displayed is stale and dropped. The bound session opens its
+  // own Workbench; a browsed session gets a read-only one and is never activated.
+  const fileViewer = useMemo<FileViewerRoute>(() => ({
+    open({ sessionId: owner, path, view }) {
+      if (!owner || owner !== displayedSessionId) return;
+      const request = { sessionId: owner, path: workspaceRelativePath(path, displayedCwd) ?? path, seq: ++workbenchRequestSeq };
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && !focused.closest('.workbench')) viewerOpener.current = focused;
+      if (browsing) {
+        setHistoryRequest({ ...request, view });
+        setHistoryWorkbench(owner);
+        return;
+      }
+      if (view === 'diff') {
+        setWorkbenchFileRequest(undefined);
+        setWorkbenchGitRequest(request);
+      } else {
+        setWorkbenchGitRequest(undefined);
+        setWorkbenchFileRequest(request);
+      }
+      setWorkbenchOpen(true);
+    },
+  }), [displayedSessionId, displayedCwd, browsing]);
+  function restoreViewerFocus() {
+    const opener = viewerOpener.current;
+    viewerOpener.current = null;
+    // preventScroll: returning focus must not move the chat the person was reading.
+    if (opener) requestAnimationFrame(() => { if (opener.isConnected) opener.focus({ preventScroll: true }); });
+  }
+
+  // Continue a session another runtime holds as a copy of what it committed.
+  async function handleForkBrowse() {
+    const source = browseSession;
+    if (!source || executionActiveRef.current || forkingRef.current) return;
+    const navigation = browseNavigation.current;
+    const stillBrowsing = () => browseNavigation.current === navigation && !executionActiveRef.current;
+    forkingRef.current = true;
+    setForking(true);
+    setBrowseForkError(null);
+    try {
+      const result = await postCommand({command:'fork', arg:'', session_id:source.id, working_dir:source.working_dir, project_hash:source.project_hash});
+      if (result.kind === 'error') throw new Error(result.message);
+      if (result.kind !== 'fork') throw new Error(t('cmd.fork.failed'));
+      const record = await resolveSession(result.session_id).catch(() => null);
+      setSessionListVersion(value => value + 1);
+      if (!stillBrowsing()) return;
+      activateSession(record ?? {...source, id:result.session_id, name:`${source.name} (fork)`, activity:undefined});
+      setForkNotice({id:result.session_id, text:t('cmd.fork.done',{source:result.source_id}) + (result.warning ? ` ${result.warning}` : '')});
+    } catch (error) {
+      if (stillBrowsing()) setBrowseForkError(error instanceof Error ? error.message : String(error));
+    } finally { forkingRef.current = false; setForking(false); }
+  }
+
+  async function handleForkSession() {
+    if (!activeSession || !sessionId || browseSession || executionActiveRef.current || forkingRef.current) throw new Error(t('cmd.fork.unavailable'));
+    const source = activeSession;
+    forkingRef.current = true;
+    setForking(true);
+    setHeaderMenuOpen(false);
+    try {
+      const result = await postCommand({command:'fork', arg:'', session_id:source.id, working_dir:source.working_dir, project_hash:source.project_hash});
+      if (result.kind === 'error') throw new Error(result.message);
+      if (result.kind !== 'fork') throw new Error(t('cmd.fork.failed'));
+      // Creation/transition already committed. Metadata lookup failure must not
+      // turn this into a failed operation that the person retries.
+      const record = await resolveSession(result.session_id).catch(() => null);
+      if (sessionIdentityRef.current === source.id || sessionIdentityRef.current === result.session_id) {
+        activateSession(record ?? {...source,id:result.session_id,name:`${source.name} (fork)`});
+        setSessionListVersion(value => value + 1);
+        setForkNotice({id:result.session_id,text:t('cmd.fork.done',{source:result.source_id}) + (result.warning ? ` ${result.warning}` : '')});
+      }
+    } finally { forkingRef.current = false; setForking(false); }
+  }
+
   /** Export the active session's conversation as a Markdown file. */
   async function handleExportMarkdown() {
     if (!activeSession) return;
@@ -455,7 +648,7 @@ export function App() {
   }
 
   return (
-    <div class="app">
+    <div class="app" style={sidebarWidth === null ? undefined : { '--sidebar-width': `${sidebarWidth}px` }}>
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
       <Sidebar
         activeSessionId={browseSession?.id ?? sessionId}
@@ -481,6 +674,26 @@ export function App() {
         onOpenSourceControl={() => setShowSourceControl(true)}
         onOpenPackages={openPackages}
       />
+      {/* Resize handle: invisible drag strip on the sidebar's right edge.
+          Hidden on mobile (sidebar is a drawer) and when collapsed (icon rail). */}
+      {!sidebarCollapsed && (
+        <div
+          class="sidebar-resize-handle"
+          onMouseDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            resizingRef.current = {
+              x: e.clientX,
+              preferred: widthRef.current,
+              width: e.currentTarget.previousElementSibling?.getBoundingClientRect().width ?? 280,
+              cursor: document.body.style.cursor,
+              userSelect: document.body.style.userSelect,
+            };
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+          }}
+        />
+      )}
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
         onClick={() => setSidebarOpen(false)}
@@ -488,7 +701,11 @@ export function App() {
 
       {/* ===== Main column: sticky session-title header + chat (no top bar) ===== */}
       <div class="main-column">
-        {(!workbenchOpen || !sessionId) && <button class="workbench-toggle" disabled={restoring} onClick={() => { if (!sessionId) openNewSession(cwd || undefined); setWorkbenchOpen(true); }} aria-expanded={workbenchOpen && !!sessionId}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>}
+        {browseSession
+          // Browsing never activates the session: its workspace opens read-only.
+          ? historyWorkbench !== browseSession.id && <button class="workbench-toggle" aria-expanded={false}
+              onClick={() => setHistoryWorkbench(browseSession.id)}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>
+          : (!workbenchOpen || !sessionId) && <button class="workbench-toggle" disabled={restoring} onClick={() => { if (!sessionId) openNewSession(cwd || undefined); setWorkbenchOpen(true); }} aria-expanded={workbenchOpen && !!sessionId}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>}
         {/* Mobile-only floating menu button (the old top bar carried the ☰; the
             redesign has no top bar, so a fixed button gives mobile drawer access). */}
         <button
@@ -547,6 +764,10 @@ export function App() {
                 >
                   <span>{t('sidebar.rename')}</span>
                 </button>
+                <button class="item-menu-row" disabled={forking || executionActive || !!browseSession}
+                  onClick={() => void handleForkSession().catch(error => alert(String(error)))}>
+                  <span>{t(forking ? 'cmd.fork.pending' : 'cmd.fork.desc')}</span>
+                </button>
                 <button
                   class="item-menu-row"
                   onClick={handleExportMarkdown}
@@ -568,21 +789,34 @@ export function App() {
           </header>
         )}
 
+        {browseSession && <header class="session-header session-browse-header">
+          <span class="session-title-text session-browse-title" title={browseSession.name}>{browseSession.name}</span>
+        </header>}
         <div class="session-body app-sidebar">
+          <FileViewerContext.Provider value={fileViewer}>
           <div class="session-chat-column">
+          {forkNotice?.id === sessionId && <div class="session-fork-notice" role="status"><span>{forkNotice.text}</span></div>}
+          <ArtifactWorkspaceProvider version={`${sessionListVersion}:${executionActive}:${browseActivity}`} value={{
+            sessionId: displayedSessionId,
+            cwd: displayedCwd,
+          }}>
           <Chat
             browseSession={browseSession}
             onExecutionState={reportExecution}
             onReturnToBound={() => setBrowseSession(null)}
             onContinueBrowse={() => { if (!executionActiveRef.current && browseSession) activateSession(browseSession); }}
+            browseActivity={browseActivity}
+            onForkBrowse={() => void handleForkBrowse()}
+            browseForking={forking}
+            browseForkError={browseForkError}
             sessionId={sessionId}
             onSessionId={handleSessionAssigned}
             cwd={cwd}
             onPermission={setPending}
             pendingPermission={pending}
-            onPermissionResolved={(callId) =>
+            onPermissionResolved={(callId, approvalId) =>
               setPending((cur: any) =>
-                callId === null ? null : resolvePendingAfterDecision(cur, callId),
+                callId === null ? null : resolvePendingAfterDecision(cur, callId, approvalId),
               )}
             activeSession={activeSession}
             restoring={restoring}
@@ -593,11 +827,19 @@ export function App() {
             onLanding={setIsLanding}
             skillInsert={skillInsert}
             composerInsert={composerInsert}
+            onForkSession={handleForkSession}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
             onOpenPackages={openPackages}
           />
+          </ArtifactWorkspaceProvider>
           </div>
-          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} /></div>}
+          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} gitRequest={workbenchGitRequest} fileRequest={workbenchFileRequest} onClose={() => { setWorkbenchOpen(false); restoreViewerFocus(); }} /></div>}
+          {browseSession && historyWorkbench === browseSession.id && <Workbench key={`read-only:${browseSession.id}`} readOnly
+            session={browseSession.id} cwd={browseSession.working_dir || cwd} title={browseSession.name}
+            gitRequest={historyRequest?.view === 'diff' ? historyRequest : undefined}
+            fileRequest={historyRequest?.view === 'content' ? historyRequest : undefined}
+            onClose={() => { setHistoryWorkbench(null); restoreViewerFocus(); }} />}
+          </FileViewerContext.Provider>
         </div>
       </div>
 

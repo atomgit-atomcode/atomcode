@@ -44,6 +44,7 @@ async fn main() {
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
         mcp: false,
+        mcp_paused: false,
         ..Default::default()
     };
     let parts = match prepare(&cfg, opts.clone()).await {

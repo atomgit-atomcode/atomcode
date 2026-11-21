@@ -25,6 +25,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
 mod exit_diagnostic;
+#[cfg(any(windows, test))]
+mod windows_diagnostics;
+#[cfg(all(windows, test))]
+mod windows_encoding_tests;
 
 /// How long a process can be silent (no new stdout/stderr) AFTER having emitted
 /// something, before we kill it. Bumped from 30→90 to tolerate legitimate silent
@@ -63,6 +67,22 @@ fn non_interactive_env_vars() -> &'static [(&'static str, &'static str)] {
 fn apply_non_interactive_env(cmd: &mut tokio::process::Command) {
     for (key, value) in non_interactive_env_vars() {
         cmd.env(key, value);
+    }
+    #[cfg(unix)]
+    let interactive = crate::askpass::current_env().is_some();
+    #[cfg(not(unix))]
+    let interactive = false;
+    apply_auth_prompt_policy(cmd, interactive);
+}
+
+// Keep agent sockets and credential helpers intact. Without a human askpass
+// consumer, OpenSSH and GCM must not open a GUI to ask for missing credentials.
+// Custom helpers can implement their own UI; the existing process timeout remains
+// the bound for those. Do not override GIT_SSH_COMMAND or core.sshCommand.
+fn apply_auth_prompt_policy(cmd: &mut tokio::process::Command, interactive: bool) {
+    if !interactive {
+        cmd.env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GCM_INTERACTIVE", "never");
     }
 }
 
@@ -120,7 +140,24 @@ pub use background::{
 /// container, a remote sandbox. Everything this tool keeps is the part that is
 /// the same wherever it runs: what counts as destructive, how long to wait, and
 /// how to present the result.
+/// A completed foreground shell process, observed before textual rendering or truncation.
+/// Absence of this receipt (denial, timeout, cancellation, spawn failure) is not success.
+#[derive(Clone, Debug)]
+pub struct ShellExecutionReceipt {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Host-provided read-only execution observation; never authorizes an operation.
+pub trait ShellExecutionObserver: Send + Sync {
+    fn interested(&self, ctx: &ToolContext) -> bool;
+    fn completed(&self, ctx: &ToolContext, receipt: &ShellExecutionReceipt);
+}
+
 pub struct BashTool {
+    observer: Option<Arc<dyn ShellExecutionObserver>>,
     label: &'static str,
     world: Arc<dyn crate::world::Shell>,
     output_preview: Option<super::output_artifact::ArtifactStoreProvider>,
@@ -148,7 +185,13 @@ impl BashTool {
             label: "bash",
             sensitive,
             output_preview: None,
+            observer: None,
         }
+    }
+
+    pub fn with_execution_observer(mut self, observer: Arc<dyn ShellExecutionObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub(crate) fn with_label(mut self, label: &'static str) -> Self {
@@ -359,6 +402,13 @@ impl Tool for BashTool {
             // command had just started and call a finished command a timeout.
             res = process.collect_within(Some(dur)) => match res {
                 Ok(Some(collected)) => {
+                    if let Some(observer) = self.observer.as_ref().filter(|observer| observer.interested(ctx)) {
+                        observer.completed(ctx, &ShellExecutionReceipt {
+                            command: a.command.clone(), exit_code: collected.exit.code,
+                            stdout: self.world.decode(&collected.stdout),
+                            stderr: self.world.decode(&collected.stderr),
+                        });
+                    }
                     let mut result = format_output(
                         &self.world.decode(&collected.stdout),
                         &self.world.decode(&collected.stderr),
@@ -464,9 +514,10 @@ fn shell_tool_description(
              text, or rewrite the whole file with write_file — do not fall back to sed. \
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do. For long builds/tests use `bash_start`, then \
-             `bash_poll` with wait_ms (up to 60000); it collects output until exit, status change or timeout. \
-             Do not use shell sleep to wait or duplicate a running build.\n\
+             the dedicated tools can't do. For long builds/tests use `bash_start` and wait \
+             for it the way the host's background completion policy says; unless the host \
+             says it resumes you when a job finishes, wait with `bash_poll` until the job \
+             ends before answering. Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
              editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
@@ -478,6 +529,7 @@ fn shell_tool_description(
     macro_rules! cmd_suffix {
         () => {
             "\n\
+             Windows script encoding: avoid non-ASCII UTF-8 .cmd/.bat files under legacy code pages. Prefer the independent pwsh tool for commands containing literal Chinese paths. Windows PowerShell 5.1 -File requires UTF-8 with BOM for non-ASCII .ps1 scripts; console output encoding does not fix script decoding.\n\
              Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
              bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
              printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
@@ -496,6 +548,7 @@ fn shell_tool_description(
     macro_rules! bash_suffix {
         () => {
             "\n\
+             Windows script encoding: invoking powershell.exe -File or cmd.exe batch files still uses those interpreters decoding rules. For non-ASCII .ps1 scripts under Windows PowerShell 5.1, use UTF-8 with BOM or execute directly with the independent pwsh tool. Avoid non-ASCII UTF-8 .cmd/.bat files under legacy code pages.\n\
              Windows: a POSIX bash (Git Bash / MSYS2) is installed and this tool runs \
              commands via `bash -c` — use bash syntax, NOT cmd.exe. `$(...)`, `&&`, `|`, \
              quoting, heredocs and `printf` all work as on Linux.\n\
@@ -1202,11 +1255,16 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     // HEAD fix): std's `.arg()` applies `CommandLineToArgvW` quoting that cmd.exe does NOT
     // follow, mangling embedded quotes (`node -e "..."`), `%VAR%`, `^`. Mirrors
     // atomcode-core's process_utils::shell_command / tool/bash.rs.
+    Ok(build_cmd_command(command))
+}
+
+#[cfg(windows)]
+fn build_cmd_command(command: &str) -> tokio::process::Command {
     use std::os::windows::process::CommandExt;
     let mut cmd = tokio::process::Command::new("cmd.exe");
     cmd.arg("/C");
     cmd.as_std_mut().raw_arg(command);
-    Ok(cmd)
+    cmd
 }
 
 /// Decode subprocess output to text. UTF-8 is the fast path; if that fails we first
@@ -1602,10 +1660,22 @@ fn format_output(stdout: &str, stderr: &str, code: Option<i32>) -> ToolResult {
     ok(s)
 }
 
-/// Match Git's fatal HTTP credential diagnostics, not arbitrary programs'
+/// Match Git's fatal HTTP diagnostics or SSH failures paired with Git's remote error, not arbitrary programs'
 /// "Authentication failed" messages. This remains a diagnostic heuristic, not
 /// proof of why credentials are unavailable or a request to refresh AtomCode login.
 fn is_git_auth_failure(stderr: &str) -> bool {
+    let ssh_failure = stderr.lines().any(|line| {
+        line.contains("Permission denied (publickey")
+            || line.contains("Permission denied (password")
+            || line.contains("Host key verification failed.")
+    });
+    if ssh_failure
+        && stderr
+            .lines()
+            .any(|line| line.trim() == "fatal: Could not read from remote repository.")
+    {
+        return true;
+    }
     stderr.lines().any(|line| {
         let Some(message) = line.trim_start().strip_prefix("fatal: ") else {
             return false;
@@ -1634,7 +1704,7 @@ fn append_git_auth_hint(output: &mut String, code: Option<i32>, auth_failure: bo
     if !output.is_empty() && !output.ends_with('\n') {
         output.push('\n');
     }
-    output.push_str("[hint] Git reported a credential failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. Check or refresh this remote's Git credential helper/PAT in an external terminal before retrying.");
+    output.push_str("[hint] Git reported an authentication or host-key verification failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. For SSH, check the agent inherited by this process and unlock/load the intended key in an external terminal; verify the server host key there if needed. For HTTPS, check or refresh this remote's Git credential helper/PAT externally. `atomcode git-auth status` reports local agent/helper setup only, not remote access. Never provide passwords or tokens in chat; do not retry authentication failures blindly.");
 }
 
 /// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
@@ -1932,16 +2002,40 @@ pub fn shell_always_grant_scope(sensitive: &SensitivePaths, args: &str, command:
 }
 
 pub fn normalize_command_for_grant(command: &str) -> String {
-    strip_bash_comments(command)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let command = strip_bash_comments(command);
+    join_command_words(command.split_whitespace(), command.len())
+}
+
+fn join_command_words<'a>(words: impl Iterator<Item = &'a str>, capacity: usize) -> String {
+    let mut out = String::with_capacity(capacity);
+    for (index, word) in words.enumerate() {
+        if index != 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// Reconstruct the entire invocation before stripping comments, just as policy
+/// matching did with join. Empty arguments still contribute a separator.
+pub(super) fn normalize_invocation_for_grant(invocation: BashInvocation) -> String {
+    let mut command = invocation.command;
+    command.reserve(invocation.arguments.iter().map(|arg| arg.len() + 1).sum());
+    for argument in invocation.arguments {
+        command.push(' ');
+        command.push_str(&argument);
+    }
+    normalize_command_for_grant(&command)
 }
 
 /// Faithful, condensed port of the production `check_destructive_command`: it
 /// normalizes simple quoting, strips wrappers, and recurses into subshells / eval /
 /// compound parts / pipe-to-shell so a destructive command cannot hide one layer down.
 pub fn check_destructive_command(command: &str) -> Option<String> {
+    if super::git_index::risky(command) {
+        return Some("Git index mutation requires review of the staging/commit scope".into());
+    }
     // Strip comments first — the classifier is substring-based, so a `# rm -rf everything` note
     // would otherwise read as a destructive command.
     let command = strip_bash_comments(command);
@@ -2197,8 +2291,7 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
                         return Some(format!("destructive command piped to shell: {r}"));
                     }
                     if p.starts_with("echo ") || p.starts_with("printf ") {
-                        let payload: String =
-                            p.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                        let payload = join_command_words(p.split_whitespace().skip(1), p.len());
                         let inner = payload.trim_matches(|c| c == '"' || c == '\'');
                         if let Some(r) = check_destructive_command(inner) {
                             return Some(format!(
@@ -2468,7 +2561,7 @@ const READ_ONLY_BASH_ALLOWLIST: &[&str] = &[
 /// Parse `command` as bash with tree-sitter. `None` on parser-load failure or a
 /// completely unparseable input. The caller must still reject trees containing
 /// ERROR/MISSING nodes (a partial parse) — see `is_read_only_bash`.
-fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
+pub(crate) fn parse_bash(command: &str) -> Option<tree_sitter::Tree> {
     use std::cell::RefCell;
     thread_local! {
         static PARSER: RefCell<Option<tree_sitter::Parser>> = RefCell::new(None);
@@ -3127,6 +3220,23 @@ async fn pump<R>(
 
 #[async_trait]
 impl crate::world::Shell for LocalShell {
+    fn dialect(&self) -> crate::world::ShellDialect {
+        if cfg!(windows) && !windows_bash_active() {
+            crate::world::ShellDialect::Cmd
+        } else {
+            crate::world::ShellDialect::Bash
+        }
+    }
+
+    async fn spawn_program(
+        &self,
+        program: &str,
+        arguments: &[String],
+        options: &crate::world::SpawnOptions,
+    ) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+        spawn_local_program(program, arguments, options).await
+    }
+
     fn describe(&self) -> String {
         if cfg!(target_os = "windows") {
             format!(
@@ -3173,6 +3283,18 @@ impl crate::world::Shell for LocalShell {
             build_command(&effective_command).map_err(crate::world::SpawnError::Unsupported)?;
         spawn_local_command(cmd, options).await
     }
+}
+
+/// Direct native execution, sharing the shell's cwd/env/output/kill ownership.
+/// No shell discovery, quoting, script generation, or platform-specific fallback.
+pub(crate) async fn spawn_local_program(
+    program: &str,
+    arguments: &[String],
+    options: &crate::world::SpawnOptions,
+) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(arguments);
+    spawn_local_command(command, options).await
 }
 
 /// Shared process ownership, output pumps and tree cancellation for local shells.
@@ -3241,6 +3363,9 @@ pub(crate) async fn spawn_local_command(
             });
         }
     }
+
+    #[cfg(windows)]
+    windows_diagnostics::log_spawn(cmd.as_std());
 
     // `mut` is consumed on Windows, where the child is not rebound below.
     #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
@@ -3879,6 +4004,74 @@ mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
 
+    #[test]
+    fn grant_normalization_matches_join_with_comments_quotes_and_unicode() {
+        let pieces = [
+            "",
+            "echo",
+            "中文",
+            " ",
+            "\t\n",
+            "\u{a0}",
+            "\u{2003}",
+            "# comment\n",
+            "'quoted # value'",
+            "\"two words\"",
+            "a\\ b",
+            "$(echo x)",
+            "| bash",
+            "; rm -rf /",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let command = format!("{a}{b}{c}");
+                    let expected = strip_bash_comments(&command)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert_eq!(
+                        normalize_command_for_grant(&command),
+                        expected,
+                        "{command:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invocation_normalization_preserves_empty_arguments_and_comment_boundaries() {
+        let pieces = [
+            "",
+            "echo",
+            "# comment",
+            "\nnext",
+            "'# quoted'",
+            "中文",
+            "a b",
+        ];
+        for command in pieces {
+            for first in pieces {
+                for last in pieces {
+                    let invocation = BashInvocation {
+                        command: command.into(),
+                        arguments: vec![first.into(), String::new(), last.into()],
+                    };
+                    let reconstructed = std::iter::once(invocation.command.as_str())
+                        .chain(invocation.arguments.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert_eq!(
+                        normalize_invocation_for_grant(invocation),
+                        normalize_command_for_grant(&reconstructed),
+                        "{reconstructed:?}",
+                    );
+                }
+            }
+        }
+    }
+
     // `run_shell` — the streaming shell executor (owned here since bridge's `!cmd` handler
     // moved off `core::tool::bash`). Direct unit coverage of capture/exit/streaming/UTF-8.
     #[tokio::test]
@@ -4355,6 +4548,51 @@ mod tests {
     /// A git auth failure on a non-zero exit gets the explanatory hint, so the
     /// model can diagnose `could not read Username` instead of retrying blindly
     /// (issue #1645).
+    #[test]
+    fn unattended_auth_preserves_agent_and_helper_configuration() {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .env("SSH_AUTH_SOCK", "test-agent")
+            .env("GIT_ASKPASS", "existing-helper");
+        apply_auth_prompt_policy(&mut command, false);
+        let env: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(env["SSH_AUTH_SOCK"], "test-agent");
+        assert_eq!(env["GIT_ASKPASS"], "existing-helper");
+        assert_eq!(env["SSH_ASKPASS_REQUIRE"], "never");
+        assert_eq!(env["GCM_INTERACTIVE"], "never");
+        let mut interactive = tokio::process::Command::new("git");
+        apply_auth_prompt_policy(&mut interactive, true);
+        assert_eq!(interactive.as_std().get_envs().count(), 0);
+    }
+
+    #[test]
+    fn ssh_auth_hint_requires_the_git_remote_failure_and_preserves_exit_status() {
+        for message in [
+            "git@example.com: Permission denied (publickey).",
+            "Host key verification failed.",
+        ] {
+            assert!(!format_output("", message, Some(255))
+                .content
+                .contains("[hint]"));
+            let stderr = format!("{message}\nfatal: Could not read from remote repository.\n");
+            let result = format_output("", &stderr, Some(128));
+            assert!(result.content.contains("git-auth status"));
+            assert!(result.content.contains("[exit code 128]"));
+            assert!(!format_output("", &stderr, Some(0))
+                .content
+                .contains("[hint]"));
+        }
+    }
+
     #[test]
     fn format_output_appends_hint_on_git_auth_failure() {
         let stderr =
@@ -4905,6 +5143,14 @@ mod tests {
     }
 
     #[test]
+    fn staging_and_commits_require_scope_review() {
+        for command in ["git add -A", "git add .", "git commit -m wip"] {
+            assert_eq!(risk_of(command), RiskLevel::Risky, "{command}");
+        }
+        assert_eq!(risk_of("git add -- src/main.rs"), RiskLevel::Safe);
+    }
+
+    #[test]
     fn safe_commands_are_safe() {
         for c in [
             "ls -la",
@@ -4913,7 +5159,6 @@ mod tests {
             "grep -rn TODO .",
             "cargo build",
             "git status",
-            "git commit -m wip",
             "rm -rf node_modules",
             "rm -rf target dist",
             "cd if=/dev/foo", // dd false-positive must NOT fire (not a dd command)
@@ -5223,6 +5468,34 @@ mod tests {
     #[test]
     fn unparseable_args_are_conservatively_risky() {
         assert_eq!(BashTool::default().risk("not json"), RiskLevel::Risky);
+    }
+
+    #[test]
+    fn chinese_workspace_paths_survive_output_decoding_without_guessed_repairs() {
+        let path = r"D:\2026增肌\工作区_wb06\_atomcode_archive";
+        assert_eq!(decode_output(path.as_bytes()), path);
+        let (gbk, _, had_errors) = encoding_rs::GBK.encode(path);
+        assert!(!had_errors);
+        assert_eq!(decode_oem(&gbk, 936), path);
+        let utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_output(&utf16), path);
+        let mut pending = Vec::new();
+        let mut decoded = String::new();
+        for byte in path.as_bytes() {
+            if let Some(chunk) = decode_stream_chunk(&mut pending, &[*byte], false) {
+                decoded.push_str(&chunk);
+            }
+        }
+        if let Some(chunk) = decode_stream_chunk(&mut pending, &[], true) {
+            decoded.push_str(&chunk);
+        }
+        assert_eq!(decoded, path);
+        let (mojibake, _, errors) = encoding_rs::GBK.decode("增肌".as_bytes());
+        assert!(!errors);
+        assert_eq!(mojibake, "澧炶倢");
+        // This string is already valid Unicode. Output decoding cannot know
+        // that it came from a previous, incorrect decode or repair it safely.
+        assert_eq!(decode_output(mojibake.as_bytes()), mojibake);
     }
 
     #[test]

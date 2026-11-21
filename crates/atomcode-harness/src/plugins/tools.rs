@@ -232,7 +232,9 @@ impl Plugin for BashToolPlugin {
             )
             .await,
         )?;
-        let bash = BashTool::new(sensitive.clone()).with_output_preview_provider(provider.clone());
+        let bash = BashTool::new(sensitive.clone())
+            .with_output_preview_provider(provider.clone())
+            .with_execution_observer(shell_execution_observer(ctx));
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
                 provider.clone(),
@@ -259,8 +261,9 @@ impl Plugin for BashToolPlugin {
             "Use `bash` for builds, tests, and git. Quote paths that contain spaces. \
              Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
              `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. \
-             Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
-             (collects output until exit, status change or timeout), instead of shell sleep or duplicate builds. Do not \
+             Long builds/tests also use `bash_start`, waited for as the background \
+             completion policy says (unless the host says it resumes you, with `bash_poll` \
+             until the job ends), instead of shell sleep or duplicate builds. Do not \
              background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
              finishes. Preserve the original build/test exit status; output-filtering or \
              status-printing wrappers can hide failures.",
@@ -335,4 +338,28 @@ impl Plugin for SearchToolsPlugin {
         );
         Ok(())
     }
+}
+
+/// Read the live optional observer so host rows can mount after the tool row.
+pub(super) fn shell_execution_observer(
+    ctx: &Context,
+) -> Arc<dyn atomcode_capabilities::tools::bash::ShellExecutionObserver> {
+    struct Observer(Context);
+    impl atomcode_capabilities::tools::bash::ShellExecutionObserver for Observer {
+        fn interested(&self, ctx: &atomcode_kernel::tool::ToolContext) -> bool {
+            self.0
+                .service::<crate::seams::ShellExecutionSvc>()
+                .is_some_and(|observer| observer.interested(ctx))
+        }
+        fn completed(
+            &self,
+            ctx: &atomcode_kernel::tool::ToolContext,
+            receipt: &atomcode_capabilities::tools::bash::ShellExecutionReceipt,
+        ) {
+            if let Some(observer) = self.0.service::<crate::seams::ShellExecutionSvc>() {
+                observer.completed(ctx, receipt);
+            }
+        }
+    }
+    Arc::new(Observer(ctx.clone()))
 }

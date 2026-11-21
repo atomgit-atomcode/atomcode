@@ -1,6 +1,7 @@
 //! What models an endpoint offers, from its own listing — `GET {base}/models`
 //! (OpenAI-shaped and Responses), `{base}/v1/models` (Anthropic), `/api/tags`
 //! (Ollama) — so a person adding a model picks it rather than typing its id.
+//! Alibaba's Anthropic gateway uses its same-origin OpenAI model listing.
 //!
 //! One implementation for both front ends that offer it: the web UI's
 //! `POST /providers/discover-models` and the terminal's `/provider` panel.
@@ -12,6 +13,9 @@
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+#[path = "discovery_catalog.rs"]
+pub mod catalog;
 
 /// How long a listing may take.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +40,11 @@ pub struct DiscoveredModel {
     pub reasoning_effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Public catalog default shown as a hint, never saved as a request override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catalog_only: bool,
 }
 
 /// Everything in one call: the listing of the endpoint at `base_url`, spoken in
@@ -43,6 +52,32 @@ pub struct DiscoveredModel {
 /// lists nothing, the URL is unusable, the endpoint refused or did not answer,
 /// or the answer was not a listing.
 pub async fn discover(
+    base_url: &str,
+    provider_type: &str,
+    transport: &DiscoveryTransport,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let result = discover_endpoint(base_url, provider_type, transport).await;
+    if !use_public_catalog(&result) {
+        return result;
+    }
+    let ids: Vec<_> = result
+        .iter()
+        .flatten()
+        .filter(|m| catalog::needs_metadata(m))
+        .map(|m| m.id.as_str())
+        .collect();
+    let entries = catalog::models(base_url, provider_type, &ids).await;
+    catalog::merge_listing(result, entries)
+}
+
+fn use_public_catalog(result: &Result<Vec<DiscoveredModel>, DiscoveryError>) -> bool {
+    match result {
+        Ok(models) => models.iter().any(catalog::needs_metadata),
+        Err(error) => error.allows_catalog_candidates(),
+    }
+}
+
+async fn discover_endpoint(
     base_url: &str,
     provider_type: &str,
     transport: &DiscoveryTransport,
@@ -64,6 +99,16 @@ pub enum DiscoveryError {
     Request(DiscoveryRequestError),
     /// It answered, and not with a listing.
     NotAListing,
+}
+
+impl DiscoveryError {
+    fn allows_catalog_candidates(&self) -> bool {
+        // 只有协议缺少列表能力，或端点明确表示没有对应路由或方法，才提供候选。
+        matches!(
+            self,
+            Self::Unsupported | Self::Request(DiscoveryRequestError::UpstreamStatus(404 | 405))
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,12 +174,82 @@ pub fn discovery_url(base_url: &str, provider_type: &str) -> Result<reqwest::Url
     if !url.username().is_empty() || url.password().is_some() {
         return Err("model discovery URL must not contain credentials".into());
     }
+    // Alibaba's Anthropic-compatible gateway implements Messages but not the
+    // Models API. Its paired OpenAI listing uses the same origin and API key:
+    // https://help.aliyun.com/zh/model-studio/base-url
+    // Keep this vendor-specific; never guess a sibling endpoint on other hosts.
+    if suffix == "/v1/models"
+        && is_aliyun_model_host(&url)
+        && url.path().trim_end_matches('/') == "/apps/anthropic"
+    {
+        url.set_path("/compatible-mode/v1/models");
+        url.set_query(None);
+        url.set_fragment(None);
+        return Ok(url);
+    }
+    // These vendors document a single, same-origin model catalog shared by
+    // their chat protocols (LongCat APIDocs; Kimi API model-list reference).
+    let shared_catalog = matches!(
+        (
+            url.host_str().unwrap_or_default(),
+            url.path().trim_end_matches('/'),
+            discovery_protocol(provider_type)
+        ),
+        ("api.longcat.chat", "/anthropic", Some("anthropic"))
+            | ("api.longcat.chat", "/openai/v1", Some("openai"))
+            | ("api.moonshot.cn", "/anthropic", Some("anthropic"))
+            | ("tokenhub.tencentmaas.com", "", Some("anthropic"))
+    );
+    if shared_catalog {
+        url.set_path("/v1/models");
+        url.set_query(None);
+        url.set_fragment(None);
+        return Ok(url);
+    }
     let path = format!("{}{}", url.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
     // Anthropic pages its list (20 by default); one request for all of them.
     url.set_query((suffix == "/v1/models").then_some("limit=1000"));
     url.set_fragment(None);
     Ok(url)
+}
+
+fn is_aliyun_model_host(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.ends_with(".maas.aliyuncs.com")
+            || matches!(
+                host,
+                "dashscope.aliyuncs.com"
+                    | "dashscope-intl.aliyuncs.com"
+                    | "dashscope-us.aliyuncs.com"
+                    | "cn-hongkong.dashscope.aliyuncs.com"
+            )
+    })
+}
+
+fn discovery_auth(
+    request: reqwest::RequestBuilder,
+    url: &reqwest::Url,
+    protocol: &str,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    // TokenHub's shared Models API requires Bearer, while its ordinary
+    // Messages API uses x-api-key (unlike its subscription gateway).
+    // https://cloud.tencent.com/document/product/1823/130078
+    let openai_listing = (is_aliyun_model_host(url) && url.path() == "/compatible-mode/v1/models")
+        || (url.host_str() == Some("tokenhub.tencentmaas.com") && url.path() == "/v1/models");
+    if protocol == "anthropic" && !openai_listing {
+        let request = request.header("anthropic-version", "2023-06-01");
+        match key {
+            Some(key) => super::anthropic::authenticate(request, url.as_str(), key.trim()),
+            None => request,
+        }
+    } else {
+        match key {
+            Some(key) => request.bearer_auth(key.trim()),
+            None => request,
+        }
+    }
 }
 
 pub fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
@@ -212,6 +327,8 @@ pub fn parse_discovered_models(
                         .filter(|v| e.supported_levels.contains(v))
                 }),
                 reasoning_effort_levels: entry.effort.map(|e| e.supported_levels),
+                catalog_default_effort: None,
+                catalog_only: false,
             })
             .collect()
     };
@@ -224,10 +341,13 @@ enum DiscoveryReadError {
     Transport(reqwest::Error),
 }
 
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, DiscoveryReadError> {
+async fn read_bounded_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, DiscoveryReadError> {
     if response
         .content_length()
-        .is_some_and(|size| size > DISCOVERY_MAX_RESPONSE_BYTES as u64)
+        .is_some_and(|size| size > limit as u64)
     {
         return Err(DiscoveryReadError::ResponseTooLarge);
     }
@@ -235,7 +355,7 @@ async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, D
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(DiscoveryReadError::Transport)?;
-        if body.len().saturating_add(chunk.len()) > DISCOVERY_MAX_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(DiscoveryReadError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
@@ -425,18 +545,7 @@ pub async fn fetch_discovery_body(
     let client = discovery_client(transport, timeout, true, proxy.as_ref())
         .or_else(|_| discovery_client(transport, timeout, false, proxy.as_ref()))
         .map_err(|_| DiscoveryRequestError::Transport)?;
-    let mut request = client.get(url.clone()).header("accept", "application/json");
-    if protocol == "anthropic" {
-        // Anthropic authenticates the way its chat adapter does.
-        request = request.header("anthropic-version", "2023-06-01");
-        if let Some(key) = transport.api_key.as_deref() {
-            request = request.header("x-api-key", key.trim());
-        }
-    } else if let Some(key) = transport.api_key.as_deref() {
-        request = request.bearer_auth(key.trim());
-    }
-    request = super::apply_account_headers(request, &transport.headers)
-        .map_err(|_| DiscoveryRequestError::Transport)?;
+    let request = discovery_request(&client, &url, protocol, transport)?;
     let proxy_may_apply = protocol == "ollama" && discovery_proxy_may_apply(&url, proxy.as_ref());
     let response = request.send().await.map_err(|error| {
         ollama_connection_failure(&url, protocol, &error, proxy_may_apply).unwrap_or_else(|| {
@@ -452,7 +561,7 @@ pub async fn fetch_discovery_body(
             response.status().as_u16(),
         ));
     }
-    read_bounded_response(response)
+    read_bounded_response(response, DISCOVERY_MAX_RESPONSE_BYTES)
         .await
         .map_err(|error| match error {
             DiscoveryReadError::ResponseTooLarge => DiscoveryRequestError::ResponseTooLarge,
@@ -461,6 +570,28 @@ pub async fn fetch_discovery_body(
             }
             DiscoveryReadError::Transport(_) => DiscoveryRequestError::Transport,
         })
+}
+
+fn discovery_request(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    protocol: &str,
+    transport: &DiscoveryTransport,
+) -> Result<reqwest::RequestBuilder, DiscoveryRequestError> {
+    let key = transport.api_key.as_deref().map(str::trim);
+    let key = if protocol == "anthropic" {
+        super::anthropic::default_auth_key(key, &transport.headers)
+    } else {
+        key
+    };
+    let request = discovery_auth(
+        client.get(url.clone()).header("accept", "application/json"),
+        url,
+        protocol,
+        key,
+    );
+    super::apply_account_headers(request, &transport.headers)
+        .map_err(|_| DiscoveryRequestError::Transport)
 }
 
 pub fn normalize_discovered_models(mut models: Vec<DiscoveredModel>) -> Vec<DiscoveredModel> {
@@ -474,6 +605,234 @@ pub fn normalize_discovered_models(mut models: Vec<DiscoveredModel>) -> Vec<Disc
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn public_catalog_candidates_require_an_explicitly_unsupported_listing() {
+        let candidates = vec![DiscoveredModel {
+            id: "public-model".into(),
+            catalog_only: true,
+            ..Default::default()
+        }];
+        for status in [401, 403, 429, 500, 501, 503] {
+            let result = Err(DiscoveryError::Request(
+                DiscoveryRequestError::UpstreamStatus(status),
+            ));
+            assert!(!use_public_catalog(&result));
+            assert!(matches!(
+                catalog::merge_listing(result, candidates.clone()),
+                Err(DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(actual)))
+                    if actual == status
+            ));
+        }
+        let timeout = Err(DiscoveryError::Request(DiscoveryRequestError::Timeout));
+        assert!(!use_public_catalog(&timeout));
+        assert!(matches!(
+            catalog::merge_listing(timeout, candidates.clone()),
+            Err(DiscoveryError::Request(DiscoveryRequestError::Timeout))
+        ));
+        assert!(!use_public_catalog(&Err(DiscoveryError::NotAListing)));
+        assert!(!use_public_catalog(&Ok(vec![])));
+        for error in [
+            DiscoveryError::Unsupported,
+            DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(404)),
+            DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(405)),
+        ] {
+            let result = Err(error);
+            assert!(use_public_catalog(&result));
+            assert_eq!(
+                catalog::merge_listing(result, candidates.clone()).unwrap(),
+                candidates
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_discovery_does_not_add_bearer_to_an_explicit_api_key_header() {
+        let client = reqwest::Client::new();
+        for base in [
+            "https://api.longcat.chat/anthropic",
+            "https://tokenhub.tencentmaas.com",
+        ] {
+            let url = discovery_url(base, "anthropic").unwrap();
+            let mut transport = DiscoveryTransport {
+                api_key: Some("default-test-key".into()),
+                ..Default::default()
+            };
+            let default = discovery_request(&client, &url, "anthropic", &transport)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(
+                default.headers()["authorization"],
+                "Bearer default-test-key"
+            );
+            transport.headers =
+                serde_json::from_str(r#"{"X-API-Key":"explicit-test-key"}"#).unwrap();
+            let explicit = discovery_request(&client, &url, "anthropic", &transport)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(explicit.headers()["x-api-key"], "explicit-test-key");
+            assert!(!explicit.headers().contains_key("authorization"));
+        }
+    }
+
+    #[test]
+    fn aliyun_anthropic_lists_models_on_its_same_origin_openai_endpoint() {
+        let client = reqwest::Client::new();
+        for host in [
+            "token-plan.cn-beijing.maas.aliyuncs.com",
+            "workspace.ap-southeast-1.maas.aliyuncs.com",
+            "dashscope.aliyuncs.com",
+            "dashscope-intl.aliyuncs.com",
+            "dashscope-us.aliyuncs.com",
+            "cn-hongkong.dashscope.aliyuncs.com",
+        ] {
+            let base = format!("https://{host}:8443/apps/anthropic/?old=query#fragment");
+            let url = discovery_url(&base, "anthropic").unwrap();
+            assert_eq!(
+                url.as_str(),
+                format!("https://{host}:8443/compatible-mode/v1/models")
+            );
+            let request = discovery_auth(
+                client.get(url.clone()),
+                &url,
+                "anthropic",
+                Some(" test-key "),
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+            assert!(!request.headers().contains_key("x-api-key"));
+            assert!(!request.headers().contains_key("anthropic-version"));
+        }
+    }
+
+    #[test]
+    fn tokenhub_listing_uses_bearer_but_messages_keep_api_key_auth() {
+        let client = reqwest::Client::new();
+        for (base, protocol) in [
+            ("https://tokenhub.tencentmaas.com/", "anthropic"),
+            ("https://tokenhub.tencentmaas.com/v1", "openai"),
+        ] {
+            let url = discovery_url(base, protocol).unwrap();
+            assert_eq!(url.as_str(), "https://tokenhub.tencentmaas.com/v1/models");
+            let request =
+                discovery_auth(client.get(url.clone()), &url, protocol, Some(" test-key "))
+                    .build()
+                    .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+            assert!(!request.headers().contains_key("x-api-key"));
+            assert!(!request.headers().contains_key("anthropic-version"));
+        }
+        for url in [
+            "https://tokenhub.tencentmaas.com/v1/messages",
+            "https://tokenhub.tencentmaas.com.example.test/v1/models",
+            "https://tokenhub.tencentmaas.com/custom/v1/models",
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let request = discovery_auth(client.get(url), &parsed, "anthropic", Some("test-key"))
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["x-api-key"], "test-key");
+            assert!(!request.headers().contains_key("authorization"));
+        }
+    }
+
+    #[test]
+    fn compatible_vendors_use_their_documented_catalog_and_auth() {
+        let client = reqwest::Client::new();
+        for (base, path) in [
+            ("https://api.longcat.chat/anthropic", "/v1/models"),
+            ("https://api.moonshot.cn/anthropic", "/v1/models"),
+            ("https://api.siliconflow.cn", "/v1/models"),
+            ("https://openrouter.ai/api", "/api/v1/models"),
+            (
+                "https://api.lkeap.cloud.tencent.com/coding/anthropic",
+                "/coding/anthropic/v1/models",
+            ),
+            (
+                "https://tokenhub.tencentmaas.com/plan/anthropic",
+                "/plan/anthropic/v1/models",
+            ),
+            (
+                "https://ark.cn-beijing.volces.com/api/coding",
+                "/api/coding/v1/models",
+            ),
+        ] {
+            let url = discovery_url(base, "anthropic").unwrap();
+            assert_eq!(url.path(), path);
+            assert_eq!(
+                url.host_str(),
+                reqwest::Url::parse(base).unwrap().host_str()
+            );
+            let request =
+                discovery_auth(client.get(url.clone()), &url, "anthropic", Some("test-key"))
+                    .build()
+                    .unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+            assert!(!request.headers().contains_key("x-api-key"));
+            let message_url = format!("{base}/v1/messages");
+            let chat = super::super::anthropic::authenticate(
+                client.post(&message_url),
+                &message_url,
+                "test-key",
+            )
+            .build()
+            .unwrap();
+            assert_eq!(chat.headers()["authorization"], "Bearer test-key");
+            assert!(!chat.headers().contains_key("x-api-key"));
+        }
+        assert_eq!(
+            discovery_url("https://api.longcat.chat/openai/v1", "openai")
+                .unwrap()
+                .as_str(),
+            "https://api.longcat.chat/v1/models"
+        );
+        for url in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.longcat.chat.evil.test/anthropic/v1/messages",
+            "https://evil.test/api.siliconflow.cn/v1/messages",
+            "https://api.longcat.chat/custom/v1/messages",
+            "https://api.minimax.cn/anthropic/v1/messages",
+            "https://api.kimi.com/coding/v1/messages",
+            "https://api.lkeap.cloud.tencent.com.evil.test/coding/anthropic/v1/messages",
+            "https://tokenhub.tencentmaas.com/custom/plan/anthropic/v1/messages",
+        ] {
+            let request = super::super::anthropic::authenticate(client.post(url), url, "test-key")
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["x-api-key"], "test-key");
+            assert!(!request.headers().contains_key("authorization"));
+        }
+    }
+
+    #[test]
+    fn other_anthropic_endpoints_keep_their_path_and_authentication() {
+        let client = reqwest::Client::new();
+        for base in [
+            "https://api.anthropic.com",
+            "https://example.test/apps/anthropic",
+            "https://dashscope.aliyuncs.com.example.test/apps/anthropic",
+            "https://notmaas.aliyuncs.com/apps/anthropic",
+            "https://dashscope.aliyuncs.com/custom/apps/anthropic",
+        ] {
+            let url = discovery_url(base, "anthropic").unwrap();
+            assert_eq!(url.as_str(), format!("{base}/v1/models?limit=1000"));
+            let request =
+                discovery_auth(client.get(url.clone()), &url, "anthropic", Some("test-key"))
+                    .build()
+                    .unwrap();
+            assert_eq!(request.headers()["x-api-key"], "test-key");
+            assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+            assert!(!request.headers().contains_key("authorization"));
+        }
+        assert!(discovery_url(
+            "https://user:secret@dashscope.aliyuncs.com/apps/anthropic",
+            "anthropic"
+        )
+        .is_err());
+    }
 
     #[tokio::test]
     async fn a_refused_ollama_connection_offers_startup_guidance_only_for_ollama() {

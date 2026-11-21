@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { messages } from '../i18n.ts';
 import { parseSlashCommand } from './slashCommands.ts';
 
 test('parses a bare command', () => {
@@ -118,6 +119,30 @@ test('menu lists matching commands before skills', () => {
   assert.equal(items[0].kind, 'command');
   assert.equal(items[0].name, 'plan');
   assert.ok(items.some((i) => i.kind === 'skill' && i.name === 'plan-trip'));
+});
+
+test('menu searches localized descriptions and puts names and aliases first', () => {
+  const commands = [
+    { name: 'exit', descKey: 'exit', run: () => {} },
+    { name: 'session', aliases: ['new'], descKey: 'session', run: () => {} },
+  ];
+  const skills = [
+    { name: 'resume', description: '打开工作区的新会话' },
+    { name: 'workbench', display_name: 'New workbench' },
+  ];
+  const t = (key: string) => key === 'exit' ? 'Quit before starting a new session' : '新会话';
+  assert.deepEqual(buildSlashMenuItems(commands, skills, 'NEW', t).map(item => item.name),
+    ['session', 'workbench', 'exit']);
+  assert.deepEqual(buildSlashMenuItems(commands, skills, '新会话', t).map(item => item.name),
+    ['session', 'resume']);
+  assert.deepEqual(buildSlashMenuItems(commands, skills, '新会话', t, true).map(item => item.name),
+    ['resume']);
+});
+
+test('Chinese code review keyword completes to /review', () => {
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS, [], '代码审查',
+    key => messages.zh[key as keyof typeof messages.zh]);
+  assert.equal(items[0]?.name, 'review');
 });
 
 test('empty query returns all commands then all skills', () => {
@@ -239,6 +264,7 @@ test('plugin names beyond 30 characters remain completable, paths and arguments 
   const name = 'atomcode-smoke-test:atomcode-smoke-test';
   assert.equal(detectSlashMenuQuery(`/${name}`)?.query, name);
   assert.equal(detectSlashMenuQuery('/Users/theo/file'), null);
+  assert.equal(detectSlashMenuQuery('/file.txt'), null);
   assert.equal(detectSlashMenuQuery('/review staged'), null);
   assert.equal(detectSlashMenuQuery('/skills atom\nother'), null);
   assert.deepEqual(detectSlashMenuQuery('hello /atom'), { start: 6, query: 'atom', skillsOnly: false });
@@ -249,4 +275,49 @@ test('/skills dispatch preserves its search argument', async () => {
   const def = FRONTEND_COMMANDS.find(command => command.name === 'skills')!;
   await def.run('atom', { openSlashSkillsMenu: value => { query = value; } } as import('./slashCommands.ts').SlashHandlers);
   assert.equal(query, 'atom');
+});
+
+test('Chinese skill names parse, complete and dispatch without treating paths as commands', async () => {
+  const name = '玲珑打包技能';
+  const items = buildSlashMenuItems([], [{ name, description: '打包应用' }], '玲珑', (k) => k);
+  assert.deepEqual(items.map((item) => item.name), [name]);
+  assert.deepEqual(parseSlashCommand(`/${name} 应用`), { name, arg: '应用' });
+  assert.deepEqual(parseSlashCommand(`/插件:${name}`), { name: `插件:${name}`, arg: '' });
+  assert.equal(parseSlashCommand('/中文目录/文件'), null);
+  assert.equal(parseSlashCommand('/玲珑\u200b打包'), null);
+  const { h, calls } = fakeHandlers();
+  const map = buildCommandMap([{ name, descKey: 'skill', run: (arg, handlers) => handlers.execServerCommand(name, arg) }]);
+  assert.deepEqual(await dispatchSlashCommand(`/${name} 应用`, map, h), { handled: true });
+  assert.deepEqual(calls, [`exec:${name}:应用`]);
+});
+
+
+test('display titles filter skills while completion and dispatch keep canonical IDs', async () => {
+  const skills = [{ name: 'linyaps-packager', display_name: '玲珑打包技能', description: 'Build packages' }];
+  const items = buildSlashMenuItems([], skills, '玲珑', (k) => k);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].name, 'linyaps-packager');
+  assert.equal(items[0].display_name, '玲珑打包技能');
+  assert.equal(buildSlashMenuItems([], skills, 'linyaps', (k) => k).length, 1);
+  const { h, calls } = fakeHandlers();
+  const map = buildCommandMap([{ name: items[0].name, descKey: 'skill', run: (arg, handlers) => handlers.execServerCommand(items[0].name, arg) }]);
+  assert.deepEqual(await dispatchSlashCommand(`/${items[0].name} app`, map, h), { handled: true });
+  assert.deepEqual(calls, ['exec:linyaps-packager:app']);
+  assert.deepEqual(await dispatchSlashCommand('/玲珑打包技能', map, h), { handled: false, unknown: true });
+});
+
+test('/quality dispatches to the server without changing approval mode', async () => {
+  const { h, calls } = fakeHandlers();
+  const result = await dispatchSlashCommand('/quality status', buildCommandMap(FRONTEND_COMMANDS), h);
+  assert.deepEqual(result, { handled: true });
+  assert.deepEqual(calls, ['exec:quality:status']);
+});
+
+
+test('/fork is in help and routes to the explicit server operation', async () => {
+  const { h, calls } = fakeHandlers();
+  assert(FRONTEND_COMMANDS.some(command => command.name === 'fork'));
+  assert(buildHelpText(h.t).includes('/fork'));
+  await dispatchSlashCommand('/fork', buildCommandMap(FRONTEND_COMMANDS), h);
+  assert.deepEqual(calls, ['exec:fork:']);
 });

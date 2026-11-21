@@ -11,6 +11,9 @@
 //! that rig cannot see: everything the runtime does ACROSS turns (resume, undo,
 //! the durable store the catalog reads).
 
+#[path = "support/non_temp.rs"]
+mod non_temp;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -105,7 +108,33 @@ fn is_summary_request(request: &[Message]) -> bool {
     request.first().is_some_and(|m| {
         m.text
             .starts_with("You are an anchored context summarization assistant")
+    }) || request.last().is_some_and(|m| {
+        m.text
+            .starts_with("This is a maintenance task, not a conversational turn")
     })
+}
+
+fn assert_compaction_replays_sent_prefix(recorder: &Recorder, at: usize) {
+    let requests = recorder.requests.lock().unwrap();
+    let defs = recorder.defs.lock().unwrap();
+    let options = recorder.options.lock().unwrap();
+    let prior = requests[..at]
+        .iter()
+        .rposition(|request| !is_summary_request(request))
+        .unwrap();
+    let (instruction, prefix) = requests[at].split_last().unwrap();
+    assert!(instruction.text.starts_with("This is a maintenance task"));
+    assert!(prefix.len() > 1);
+    assert!(
+        requests[prior].starts_with(prefix),
+        "summary did not replay the exact sent prefix"
+    );
+    assert!(!defs[prior].is_empty());
+    assert_eq!(defs[at], defs[prior]);
+    assert_eq!(
+        options[at].reasoning_effort,
+        options[prior].reasoning_effort
+    );
 }
 
 /// Long enough that a second copy reads as a re-dump rather than a coincidence.
@@ -160,6 +189,23 @@ impl LlmProvider for RecordingProvider {
                 retry_after_secs: None,
             });
         }
+        // A provider that will not take the pictures in a request (DeepSeek's
+        // words for a picture it cannot read).
+        if messages
+            .iter()
+            .any(|m| m.role == Role::User && m.text == "refuse pictures")
+            && messages.iter().any(|m| !m.images.is_empty())
+        {
+            return Err(ProviderError {
+                retryable: false,
+                message:
+                    "HTTP 400: .messages[3].content[0]: You have uploaded an unsupported image."
+                        .into(),
+                http_status: Some(400),
+                code: None,
+                retry_after_secs: None,
+            });
+        }
         // A long task: plan, dig for a while without touching the list, stop.
         if let Some(steps) = dig_steps(messages) {
             let event = match steps {
@@ -187,7 +233,37 @@ impl LlmProvider for RecordingProvider {
                 StreamEvent::Done { truncated: false },
             ])));
         }
+        // A job left running in the background, polled once, then the answer.
+        let backgrounding = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.synthetic)
+            .is_some_and(|m| m.text.starts_with("background "));
         let first = match last {
+            Some(m) if backgrounding && m.role == Role::User => StreamEvent::ToolCall(ToolCall {
+                id: format!("call-{n}"),
+                name: "bash_start".into(),
+                arguments: serde_json::json!({ "command": &m.text[11..] }).to_string(),
+            }),
+            Some(m) if backgrounding && m.text.starts_with("Started background job ") => {
+                let job = m.text["Started background job ".len()..]
+                    .split_once(". ")
+                    .map(|(job, _)| job)
+                    .unwrap_or_default();
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "bash_poll".into(),
+                    arguments: serde_json::json!({ "job_id": job, "wait_ms": 0 }).to_string(),
+                })
+            }
+            Some(_) if backgrounding => StreamEvent::TextDelta("polled".into()),
+            Some(m) if m.role == Role::User && m.text == "launch debug fixture" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "debug".into(),
+                    arguments: serde_json::json!({"action":"launch","adapter":"fixture","program":"child.py"}).to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text.starts_with("retrieve referenced definition") => {
                 StreamEvent::ToolCall(ToolCall { id: format!("call-{n}"), name: "session_reference".into(),
                     arguments: serde_json::json!({"source": "0123456789abcdef/source", "query": "TubeSeq"}).to_string() })
@@ -217,6 +293,16 @@ impl LlmProvider for RecordingProvider {
                         serde_json::json!({ "file_path": &m.text[6..], "content": "written\n" })
                             .to_string(),
                 })
+            }
+            // A provider refusal that quotes the path the prompt named.
+            Some(m) if m.role == Role::User && m.text.starts_with("fail at ") => {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: format!("HTTP 400: {}", &m.text[8..]),
+                    http_status: Some(400),
+                    code: Some("invalid_request".into()),
+                    retry_after_secs: None,
+                });
             }
             // A provider-side failure the retry tier is meant to ride out.
             Some(m) if m.role == Role::User && m.text == "fail every time" => {
@@ -512,6 +598,7 @@ fn start(
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -569,15 +656,9 @@ async fn turn_answering(
     }
 }
 
-/// A directory that is neither the workspace nor a temp root, so a write there
-/// is one the write gate asks about. Under the build's `target/`, the same
-/// place `permission_grants.rs` uses.
+/// A directory outside both the workspace and temp-path approval exception.
 fn outside_dir() -> tempfile::TempDir {
-    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target");
-    std::fs::create_dir_all(&target).unwrap();
-    tempfile::tempdir_in(target).unwrap()
+    non_temp::tempdir()
 }
 
 fn user_texts(messages: &[Message]) -> Vec<String> {
@@ -1564,6 +1645,119 @@ fn system_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// Completions are delivered after a response ends, so only a driver that shows
+/// the turn a completion starts lets the model end its response to wait; a run
+/// that ends with the response (`-p`) is told to wait with `bash_poll` instead.
+async fn the_model_is_told_how_this_host_waits_for_background_work() {
+    for wakeups in [true, false] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.background_wakeups = wakeups;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, "hello").await;
+        let shown = system_text(&recorder.last_request());
+        assert_eq!(
+            shown.contains("This host resumes you when a background job finishes"),
+            wakeups,
+            "{shown}"
+        );
+        assert_eq!(
+            shown.contains("This host does not resume you when a background job finishes"),
+            !wakeups,
+            "{shown}"
+        );
+        let defs = recorder.defs.lock().unwrap().last().cloned().unwrap();
+        for name in ["bash", "bash_start"] {
+            assert!(
+                defs.iter().any(|def| def.name == name),
+                "the request must advertise {name}"
+            );
+        }
+        if wakeups {
+            // A model that needs the result next reads "end your response" as
+            // giving up the task, and copies any long poll it is shown instead —
+            // in the system prompt or in a tool definition sent beside it.
+            assert!(
+                shown.contains("Ending your response does not end the task"),
+                "{shown}"
+            );
+            assert!(!shown.contains("up to 60000"), "{shown}");
+            for def in &defs {
+                assert!(
+                    !def.description.contains("up to 60000"),
+                    "{}: {}",
+                    def.name,
+                    def.description
+                );
+            }
+        } else {
+            assert!(
+                shown.contains("wait with bash_poll using a long wait_ms"),
+                "{shown}"
+            );
+        }
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    }
+}
+
+/// A model whose poll found a job still running, where the host will wake it
+/// when the job finishes, is told on that request to end its response. The
+/// reminder rides the request only: the poll's result stays the tool's own for
+/// the front end that groups quiet polls and the loop guard that counts them,
+/// and a note after the status line does not hide the job's state from it.
+/// Under `-p` polling is how the model waits, so nothing is said.
+async fn a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request() {
+    for (command, wakeups, quiet) in [
+        ("sleep 20", true, true),
+        ("sleep 20 && cargo build | tail -n 5", true, false),
+        ("sleep 20", false, true),
+    ] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.background_wakeups = wakeups;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, &format!("background {command}")).await;
+        // The request that answered the poll, not a side call made after it.
+        let sent = recorder
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|request| request.iter().any(|m| m.role == Role::Tool))
+            .cloned()
+            .expect("a request answered the poll");
+        let poll = sent
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("the poll's result was sent");
+        if quiet {
+            assert_eq!(poll.text, "status: running", "{command}");
+        } else {
+            assert!(
+                poll.text.contains("status: running\n\n[execution note"),
+                "{command}: {}",
+                poll.text
+            );
+        }
+        let reminded = sent
+            .iter()
+            .skip_while(|m| m.role != Role::Tool || m.text != poll.text)
+            .any(|m| m.synthetic && m.text.contains("end your response instead of polling"));
+        let shape: Vec<String> = sent
+            .iter()
+            .map(|m| format!("{:?} synthetic={} {:.120}", m.role, m.synthetic, m.text))
+            .collect();
+        assert_eq!(reminded, wakeups, "{command}: {shape:#?}");
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    }
+}
+
 /// The model is told where it is working, and a resumed session keeps the git
 /// snapshot it started with — rewriting it would break the cached prefix of the
 /// whole resumed conversation.
@@ -1655,6 +1849,58 @@ async fn a_turn_is_transcribed_and_metered() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// The runtime assembly hands the session's working directory to the
+/// telemetry hook: a provider error quoting a path inside it is scrubbed to
+/// `<CWD>`. The hook's own unit test starts with a directory; this one proves
+/// the runtime actually passes the one the session runs in.
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn a_provider_error_is_scrubbed_with_the_session_working_dir() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    let path = env.project.path().join("src/main.rs");
+    turn(
+        &mut runtime,
+        &format!("fail at cannot open {}", path.display()),
+    )
+    .await;
+
+    let raw = env.project.path().display().to_string();
+    let mut reason = None;
+    for _ in 0..100 {
+        for record in captured.lock().await.iter() {
+            if let atomcode_telemetry::Event::LlmChat {
+                had_error: true,
+                error_data: Some(data),
+                ..
+            } = &record.event
+            {
+                reason = Some(data.clone());
+            }
+        }
+        if reason.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let reason = reason.expect("a failed LlmChat carries its reason");
+    let normalized = reason.replace('\\', "/");
+    assert!(
+        normalized.contains("<CWD>/src/main.rs"),
+        "the session path was not scrubbed relative to its working directory: {reason}"
+    );
+    assert!(
+        !reason.contains(&raw),
+        "the raw working directory leaked: {reason}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// The person's `hooks.json` runs, and so does a hook a plugin contributed.
 async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
     let env = env();
@@ -1685,6 +1931,7 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
             args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
+            required_approval: false,
         },
     ]));
     let mut runtime = CodingRuntime::start(start).await.unwrap();
@@ -1693,6 +1940,101 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
 
     assert!(from_file.exists(), "the hooks.json hook did not run");
     assert!(from_plugin.exists(), "the plugin's hook did not run");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Even in accept-edits mode, a required approval must authorize the write.
+#[cfg(unix)]
+async fn a_failed_required_approval_prevents_the_tool_from_writing() {
+    let env = env();
+    let project = env.project.path();
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "guard": {
+                    "event": "PreToolUse",
+                    "matcher": "write_file",
+                    "command": "exit 127",
+                    "required_approval": true,
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    turn(&mut runtime, "write denied.txt").await;
+    assert!(!project.join("denied.txt").exists());
+    assert!(recorder.last_request().iter().any(
+        |message| message.role == Role::Tool && message.text.contains("Required approval hook")
+    ));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+async fn managed_required_approval_is_checked_on_the_hooks_the_runtime_loads() {
+    let env = env();
+    let project = env.project.path();
+    let hooks = serde_json::json!({"hooks": {"guard": {
+        "event": "PreToolUse",
+        "matcher": "",
+        "command": "exit 127",
+        "required_approval": true
+    }}})
+    .to_string();
+    std::fs::write(project.join(".hooks.json"), &hooks).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let managed = || {
+        let mut input = start(project, &recorder, SessionMode::Fresh);
+        input.agent.require_approval_hook = true;
+        input
+    };
+    let user_hooks = env._home.path().join("hooks.json");
+    for content in [None, Some("{invalid")] {
+        if let Some(content) = content {
+            std::fs::write(&user_hooks, content).unwrap();
+        }
+        let Err(error) = CodingRuntime::start(managed()).await else {
+            panic!("managed startup must reject a missing or malformed user hook file");
+        };
+        assert!(
+            error.to_string().contains("--require-approval-hook"),
+            "{error}"
+        );
+    }
+
+    std::fs::remove_file(project.join(".hooks.json")).unwrap();
+    std::fs::write(&user_hooks, hooks).unwrap();
+    let mut runtime = CodingRuntime::start(managed()).await.unwrap();
+    let generation = runtime.handle.status().generation;
+    std::fs::remove_file(user_hooks).unwrap();
+    let mut reload = start(project, &recorder, SessionMode::Fresh).agent;
+    reload.todo.enabled = !reload.todo.enabled;
+    let error = runtime.handle.reprepare_config(reload).await.unwrap_err();
+    assert!(
+        error.to_string().contains("--require-approval-hook"),
+        "{error}"
+    );
+    assert_eq!(runtime.handle.status().generation, generation);
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    turn(&mut runtime, "write denied.txt").await;
+    assert!(!project.join("denied.txt").exists());
+    assert!(recorder.last_request().iter().any(
+        |message| message.role == Role::Tool && message.text.contains("Required approval hook")
+    ));
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -2811,8 +3153,62 @@ fn start_with_mcp_server(
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust,
         auto_approve: Vec::new(),
+        allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     start
+}
+
+/// An inline MCP screenshot must reach the next model request, through the
+/// same event-log projection as pictures produced by built-in tools.
+#[cfg(unix)]
+async fn an_mcp_screenshot_reaches_the_next_model_request() {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==";
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let script = write_mcp_server(env.project.path(), &env.project.path().join("spawns"));
+    let original = std::fs::read_to_string(&script).unwrap();
+    let content = serde_json::json!({"content":[
+        {"type":"text", "text":"captured the target window"},
+        {"type":"image", "mimeType":"image/png", "data":PNG}
+    ], "isError":false})
+    .to_string();
+    let replaced = original.replace(
+        "\"content\":[{\"type\":\"text\",\"text\":\"echo:from-server\"}]",
+        &content[1..content.len() - 1],
+    );
+    assert_ne!(replaced, original, "fixture result must be replaced");
+    std::fs::write(&script, replaced).unwrap();
+    let mut config = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    config.agent.supports_vision = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    turn(&mut runtime, "mcp echo").await;
+    let request = recorder.last_turn_request();
+    let tool = request
+        .iter()
+        .find(|m| m.role == Role::Tool && m.text.contains("captured the target window"))
+        .expect("the text result keeps its tool-call association");
+    assert!(
+        tool.images.is_empty(),
+        "provider tool messages remain text-only"
+    );
+    let pictures: Vec<_> = request
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.images.iter())
+        .collect();
+    assert_eq!(pictures.len(), 1);
+    assert_eq!(pictures[0].media_type, "image/png");
+    assert_eq!(
+        pictures[0].data, PNG,
+        "the next model request sees original screenshot bytes"
+    );
+    runtime.handle.shutdown().await.unwrap();
 }
 
 /// The tools the model was offered in its most recent request.
@@ -2853,6 +3249,10 @@ async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
 
     // 人要做的三件事,各有一个真的落点:信任项目与 OAuth 登录在 `/mcp` 那块
     // 面板上,改完文件重连是 `/reload`。
+    assert!(
+        said.contains("requiredExperimentalCapabilities"),
+        "the MCP owner must describe its supported connection contract:\n{said}"
+    );
     for real in ["/mcp", "/reload"] {
         assert!(said.contains(real), "`{real}` 得说出来:\n{said}");
     }
@@ -2869,6 +3269,134 @@ async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
             "`{gone}` 这条命令不存在,照着敲只会得到「不认识」:\n{said}"
         );
     }
+}
+
+// Uses real shell subprocess I/O; a paused Tokio clock would race MCP handshakes.
+#[cfg(unix)]
+async fn pausing_all_mcp_is_session_local_and_preserves_individual_switches() {
+    use atomcode_coding::parts::McpAction;
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let pid_file = scratch.path().join("pid");
+    let body = std::fs::read_to_string(&script).unwrap();
+    std::fs::write(
+        &script,
+        body.replacen(
+            "#!/bin/sh",
+            &format!("#!/bin/sh\necho $$ > '{}'", pid_file.display()),
+            1,
+        ),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut disabled = input.prepare.extra_mcp_servers[0].clone();
+    disabled.name = "off".into();
+    disabled.disabled = true;
+    input.prepare.extra_mcp_servers.push(disabled);
+    let config = env.project.path().join(".mcp.json");
+    let contents = r#"{"mcpServers":{"disabled":{"command":"do-not-start","disabled":true}}}"#;
+    std::fs::write(&config, contents).unwrap();
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let id = runtime.session.as_ref().unwrap().id.clone();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+    assert!(!runtime.handle.mcp_rows().await.unwrap().paused);
+    assert!(runtime
+        .handle
+        .set_mcp_paused("another-session".into(), true)
+        .await
+        .is_err());
+    runtime
+        .handle
+        .set_mcp_paused(id.clone(), true)
+        .await
+        .unwrap();
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    // Real subprocess teardown is asynchronous; wait for the observable OS process exit.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("paused MCP server process must be released");
+    assert!(runtime.handle.mcp_rows().await.unwrap().paused);
+    assert!(runtime
+        .handle
+        .mcp_status()
+        .await
+        .unwrap()
+        .servers
+        .is_empty());
+    assert!(runtime
+        .handle
+        .mcp_rows()
+        .await
+        .unwrap()
+        .rows
+        .iter()
+        .any(|r| r.name == "disabled" && r.disabled));
+    assert!(runtime
+        .handle
+        .mcp_act("t".into(), McpAction::Reconnect)
+        .await
+        .is_err());
+    assert!(runtime
+        .handle
+        .mcp_act("disabled".into(), McpAction::Enable)
+        .await
+        .is_err());
+    turn(&mut runtime, "plain task while MCP paused").await;
+    assert!(!last_offered(&recorder)
+        .iter()
+        .any(|n| n.starts_with("mcp__")));
+    runtime.handle.reload_capabilities().await.unwrap();
+    assert!(runtime.handle.mcp_rows().await.unwrap().paused);
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+    recorder.build_fails.store(true, Ordering::SeqCst);
+    assert!(runtime
+        .handle
+        .set_mcp_paused(id.clone(), false)
+        .await
+        .is_err());
+    assert!(runtime.handle.mcp_rows().await.unwrap().paused);
+    recorder.build_fails.store(false, Ordering::SeqCst);
+    runtime
+        .handle
+        .set_mcp_paused(id.clone(), false)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    turn(&mut runtime, "plain task after resume").await;
+    assert!(last_offered(&recorder).iter().any(|n| n == "mcp__t__echo"));
+    assert!(!last_offered(&recorder)
+        .iter()
+        .any(|n| n.starts_with("mcp__off__")));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), contents);
+    runtime.handle.set_mcp_paused(id, true).await.unwrap();
+    runtime.handle.fresh_session().await.unwrap();
+    assert!(!runtime.handle.mcp_rows().await.unwrap().paused);
+    runtime.handle.shutdown().await.unwrap();
 }
 
 async fn an_mcp_servers_tools_are_offered_and_run() {
@@ -2893,6 +3421,8 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
@@ -3492,6 +4022,8 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
@@ -3634,6 +4166,25 @@ async fn always_allowing_an_mcp_tool_holds_for_the_session_and_is_written() {
     let asked = turn_answering(&mut runtime, "mcp echo", Some(allow)).await;
     assert_eq!(asked, 1, "an untrusted MCP tool is asked about");
 
+    let wrong_generation = runtime.handle.status().generation + 1;
+    assert!(runtime
+        .handle
+        .respond_at_generation(
+            wrong_generation,
+            42,
+            serde_json::json!({"decision":"allow"})
+        )
+        .await
+        .is_err());
+    assert!(runtime
+        .handle
+        .approve_mcp_tool_at_generation(wrong_generation, "mcp__t__echo".into())
+        .await
+        .is_err());
+    assert!(
+        !env._home.path().join("mcp.json").exists(),
+        "a stale grant must not write configuration"
+    );
     let approval = runtime
         .handle
         .approve_mcp_tool("mcp__t__echo".into())
@@ -4298,6 +4849,91 @@ async fn an_exhausted_plan_window_pauses_until_its_reset() {
             } if reset_at_display == "15:30"
         )),
         "{notices:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// How many reminders the host added to a request, and how many say plan
+/// mode is on. A request sent again — a limit waited out, a picture refused —
+/// must carry each of them once, as the first did.
+fn reminders(request: &[Message]) -> (usize, usize) {
+    let tails = request
+        .iter()
+        .filter(|m| m.text.contains("<system-reminder>"))
+        .count();
+    let plan = request
+        .iter()
+        .filter(|m| m.text.contains("PLAN MODE is active"))
+        .count();
+    (tails, plan)
+}
+
+/// Every attempt at one turn carries the host's reminders once — the rows
+/// that add them are run again on the same request whenever it is resent.
+async fn a_request_sent_again_carries_each_reminder_once() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.supports_vision = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+
+    // A limit that clears in a moment: waited out, the request goes again.
+    let (reason, _) = turn_to_rate_limit(&mut runtime, "blip").await;
+    assert_eq!(reason, Some(atomcode_kernel::event::StopReason::Stopped));
+    let attempts: Vec<(usize, usize)> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| reminders(r))
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].1, 1, "plan mode said once: {attempts:?}");
+    assert_eq!(
+        attempts[1], attempts[0],
+        "resent after the limit: {attempts:?}"
+    );
+
+    // A picture the provider refuses: sent again without it.
+    recorder.requests.lock().unwrap().clear();
+    runtime
+        .handle
+        .submit(UserInput {
+            text: "refuse pictures".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let attempts: Vec<(usize, usize, usize)> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let (tails, plan) = reminders(r);
+            (r.iter().map(|m| m.images.len()).sum(), tails, plan)
+        })
+        .collect();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!((attempts[0].0, attempts[1].0), (1, 0), "{attempts:?}");
+    assert_eq!(attempts[0].2, 1, "plan mode said once: {attempts:?}");
+    assert_eq!(
+        (attempts[1].1, attempts[1].2),
+        (attempts[0].1, attempts[0].2),
+        "resent without the picture: {attempts:?}"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -5189,13 +5825,17 @@ async fn a_requested_compaction_is_summarized_by_the_model_about_the_focus() {
     };
     assert!(outcome.committed, "the compaction was refused");
 
-    let summary_call = recorder.requests.lock().unwrap()[asked_before..]
+    let summary_call = recorder
+        .requests
+        .lock()
+        .unwrap()
         .iter()
-        .any(|request| request.iter().any(|m| m.text.contains("the zebra parser")));
-    assert!(
-        summary_call,
-        "no model was asked to summarize with the focus"
-    );
+        .enumerate()
+        .skip(asked_before)
+        .find(|(_, request)| request.iter().any(|m| m.text.contains("the zebra parser")))
+        .map(|(index, _)| index)
+        .expect("the summary request must carry the focus");
+    assert_compaction_replays_sent_prefix(&recorder, summary_call);
     let meta = SessionManager::for_project(
         env.project.path(),
         &atomcode_coding::config::product_dirs_from_env(),
@@ -5273,18 +5913,20 @@ async fn the_prompt_teaches_each_product_tool_once() {
 async fn a_picture_read_reaches_a_model_that_can_see_it() {
     for vision in [true, false] {
         let env = env();
-        std::fs::write(
-            env.project.path().join("cover.jpg"),
-            [
-                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
-            ],
-        )
-        .unwrap();
+        // A real 2×1 PNG: a picture that does not decode is never attached.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x7B, 0x40, 0xE8, 0xDD, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0x00, 0x04, 0xFF, 0x01, 0x07, 0x00, 0x01, 0xFF, 0xE2, 0x23,
+            0x9E, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(env.project.path().join("cover.png"), PNG).unwrap();
         let recorder = Arc::new(Recorder::default());
         let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
         config.agent.supports_vision = vision;
         let mut runtime = CodingRuntime::start(config).await.unwrap();
-        turn(&mut runtime, "read cover.jpg").await;
+        turn(&mut runtime, "read cover.png").await;
         let shown = recorder.last_request().iter().any(|m| !m.images.is_empty());
         assert_eq!(shown, vision, "vision = {vision}");
         runtime.handle.shutdown().await.unwrap();
@@ -5512,6 +6154,8 @@ async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     turn(&mut runtime, "describe operations").await;
@@ -5810,10 +6454,13 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
     // A 128k window keeps about 32k tokens of recent turns; each prompt is ~10k.
     recorder.window.store(128_000, Ordering::SeqCst);
     recorder.prompt_tokens.store(104_000, Ordering::SeqCst);
-    let mut runtime =
-        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
-            .await
-            .unwrap();
+    // Every answer reports 104k however much was cut, so each next request
+    // measures 104k plus a ~10k prompt. A short completion keeps that inside the
+    // window; the default 16k would leave no room, and the pre-send guard —
+    // not the summary threshold under test — would act first.
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.chat_options.max_tokens = Some(1_024);
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
     let id = runtime.session.clone().unwrap().id;
 
     for n in 0..6 {
@@ -5826,6 +6473,17 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
 
     let summaries = recorder.summary_requests();
     assert_eq!(summaries.len(), 2, "one summary, then one update of it");
+    let summary_indices = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_summary_request(request).then_some(index))
+        .collect::<Vec<_>>();
+    for index in summary_indices {
+        assert_compaction_replays_sent_prefix(&recorder, index);
+    }
     assert!(
         summaries[1]
             .last()
@@ -6331,6 +6989,8 @@ async fn a_failed_mcp_connection_is_metered() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        allowed_tools: None,
+        required_experimental_capabilities: Default::default(),
     }];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     // The catalog settles whether or not the server came up; a failure to
@@ -6821,11 +7481,18 @@ mod criteria {
         an_undone_turn_is_not_offered_as_a_rewind_point,
         a_restored_snapshot_is_what_the_model_sees,
         plan_mode_refuses_a_write_and_says_so,
+        a_request_sent_again_carries_each_reminder_once,
         accept_edits_applies_a_write_without_asking,
         an_always_allow_survives_an_undo,
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
+        the_model_is_told_how_this_host_waits_for_background_work,
+        a_model_still_polling_a_job_the_host_wakes_for_is_reminded_on_the_request,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        #[cfg(unix)]
+        a_failed_required_approval_prevents_the_tool_from_writing,
+        #[cfg(unix)]
+        managed_required_approval_is_checked_on_the_hooks_the_runtime_loads,
         #[cfg(unix)]
         the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused,
         a_stop_hook_is_pointed_at_the_sessions_log,
@@ -6851,7 +7518,11 @@ mod criteria {
         a_round_budget_ends_the_turn,
         #[cfg(unix)]
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
+        #[cfg(unix)]
+        pausing_all_mcp_is_session_local_and_preserves_individual_switches,
         an_mcp_servers_tools_are_offered_and_run,
+        #[cfg(unix)]
+        an_mcp_screenshot_reaches_the_next_model_request,
         reconnecting_one_mcp_keeps_its_neighbor_and_session,
         a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries,
         a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel,
@@ -6916,6 +7587,7 @@ mod criteria {
 /// Sharing can initialize while the provider is still running; the strong
 /// snapshot API continues to wait for a complete turn.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn a_live_view_is_available_before_the_running_turn_finishes() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -7012,6 +7684,7 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn a_model_only_runtime_keeps_an_empty_catalog_across_rebuilds() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
@@ -7146,6 +7819,7 @@ async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_g
 // Real runtime + recorded provider input: neither a UI marker nor a successful
 // command acknowledgement is evidence that the model received a picture.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() {
     struct VisionFallback;
     #[async_trait::async_trait]
@@ -7193,7 +7867,8 @@ async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() 
                         text: task.into(),
                         images: vec![atomcode_kernel::message::ImageContent {
                             media_type: "image/png".into(),
-                            data: "cGljdHVyZQ==".into(),
+                            // A real 2×1 PNG: one that does not decode is left out.
+                            data: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg==".into(),
                         }],
                     },
                 )
@@ -7260,6 +7935,7 @@ async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() 
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
     struct WaitingVision(Arc<tokio::sync::Notify>);
     #[async_trait::async_trait]
@@ -7318,6 +7994,7 @@ async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
 async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() {
     #[derive(Debug)]
     struct Meter(Arc<AtomicUsize>);
@@ -7357,5 +8034,794 @@ async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() 
     runtime.handle.reassemble_provider(managed).await.unwrap();
     assert_eq!(runtime.handle.usage(false).await.unwrap().windows.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn recap_uses_the_compacted_task_list_without_a_model_call() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    plan_then_compact(&mut runtime).await;
+    let before = runtime.handle.snapshot().await.unwrap();
+    let calls = recorder.requests.lock().unwrap().len();
+    let text = runtime.handle.recap().await.unwrap().unwrap();
+    assert!(text.contains("#1: the first thing"), "{text}");
+    assert_eq!(
+        recorder.requests.lock().unwrap().len(),
+        calls,
+        "task counts must not be sampled from a model"
+    );
+    assert_eq!(
+        before.messages,
+        runtime.handle.snapshot().await.unwrap().messages,
+        "recap is read-only"
+    );
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let id = runtime.session.as_ref().unwrap().id.clone();
+    std::fs::write(manager.todo_sidecar_path(&id).unwrap(), "broken").unwrap();
+    let unavailable = runtime.handle.recap().await.unwrap().unwrap();
+    assert_eq!(
+        unavailable,
+        atomcode_config::i18n::t(atomcode_config::i18n::Msg::RecapTasksUnavailable)
+    );
+    assert_eq!(recorder.requests.lock().unwrap().len(), calls);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_session_without_a_task_list_keeps_model_generated_recap() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "hello").await;
+    let before = recorder.requests.lock().unwrap().len();
+    assert!(runtime.handle.recap().await.unwrap().is_some());
+    assert_eq!(recorder.requests.lock().unwrap().len(), before + 1);
+    assert!(recorder
+        .last_request()
+        .iter()
+        .any(|message| message.text.contains("Write a recap")));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn disabling_automatic_review_keeps_explicit_reviews_and_survives_reload() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let setup = production_start(env.project.path(), &recorder, |start| {
+        start.agent.auto_review = false;
+    });
+    let mut next = setup.agent.clone();
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    for stage in ["initial", "capability reload", "provider rebuild"] {
+        if stage == "capability reload" {
+            runtime.handle.reload_capabilities().await.unwrap();
+        } else if stage == "provider rebuild" {
+            runtime
+                .handle
+                .reassemble_provider(next.clone())
+                .await
+                .unwrap();
+        }
+        turn(&mut runtime, "hello").await;
+        let prompt = system_text(&recorder.last_request());
+        assert!(
+            prompt.contains("Automatic pre-handoff review is disabled"),
+            "{stage}: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use it before handing work back"),
+            "{stage}: {prompt}"
+        );
+        assert!(prompt.contains("When the user asks to review code"));
+        let definitions = recorder.defs.lock().unwrap();
+        let offered = definitions.last().unwrap();
+        assert!(
+            offered.iter().any(|tool| tool.name == "code_review"),
+            "{stage}"
+        );
+        assert!(
+            offered.iter().any(|tool| tool.name == "bash"),
+            "other tools remain available"
+        );
+    }
+    next.auto_review = true;
+    runtime.handle.reprepare_config(next).await.unwrap();
+    turn(&mut runtime, "hello again").await;
+    assert!(
+        !system_text(&recorder.last_request()).contains("Automatic pre-handoff review is disabled")
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn dap_debugging_is_default_on_and_obeys_disable_and_model_only_tool_closures() {
+    use atomcode_capabilities::tools::debug::{Adapter, Settings};
+    let configured = || Settings {
+        enabled: true,
+        adapters: [(
+            "fixture".into(),
+            Adapter {
+                command: "never-spawned-until-launch".into(),
+                args: vec![],
+            },
+        )]
+        .into(),
+    };
+    assert!(offered_tools(|_| {})
+        .await
+        .iter()
+        .any(|tool| tool.name == "debug"));
+    assert!(!offered_tools(|s| s.agent.dap.enabled = false)
+        .await
+        .iter()
+        .any(|tool| tool.name == "debug"));
+    assert!(offered_tools(|s| s.agent.dap = configured())
+        .await
+        .iter()
+        .any(|tool| tool.name == "debug"));
+    assert!(!offered_tools(|s| {
+        s.agent.dap = configured();
+        s.prepare.tools = false;
+    })
+    .await
+    .iter()
+    .any(|tool| tool.name == "debug"));
+}
+
+// This test needs real OS process I/O and process reaping; virtual-clock
+// auto-advance would race the fixture's Python startup and Tokio's reaper.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn dap_processes_follow_the_production_runtime_lifecycle() {
+    use atomcode_capabilities::tools::{debug::Adapter, PermissionRules};
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let fixture = env.project.path().join("adapter.py");
+    std::fs::write(
+        &fixture,
+        include_str!("../../atomcode-capabilities/src/tools/debug/fixture.py"),
+    )
+    .unwrap();
+    let setup = production_start(env.project.path(), &recorder, |start| {
+        start.agent.dap.adapters.insert(
+            "fixture".into(),
+            Adapter {
+                command: "python3".into(),
+                args: vec!["-u".into(), fixture.to_string_lossy().into_owned()],
+            },
+        );
+        start.agent.permission_rules = Arc::new(PermissionRules::parse(&["debug".into()], &[]).0);
+    });
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    async fn launched(runtime: &mut CodingRuntime, project: &std::path::Path) -> Vec<i32> {
+        // Remove the last launch's evidence so a refused tool cannot pass by
+        // reading a stale pid file.
+        let _ = std::fs::remove_file(project.join("pids"));
+        turn(runtime, "launch debug fixture").await;
+        std::fs::read_to_string(project.join("pids"))
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect()
+    }
+    fn alive(pid: i32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Unix kill utility is required")
+            .success()
+    }
+    async fn gone(pids: &[i32]) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if pids.iter().all(|pid| !alive(*pid)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debug process survived runtime teardown: {pids:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    let pids = launched(&mut runtime, env.project.path()).await;
+    let mut config = runtime.handle.configuration().await.unwrap();
+    runtime
+        .handle
+        .reassemble_provider(config.clone())
+        .await
+        .unwrap();
+    assert!(
+        pids.iter().all(|pid| alive(*pid)),
+        "provider-only patch must preserve debugging"
+    );
+    runtime.handle.reload_capabilities().await.unwrap();
+    assert!(
+        pids.iter().all(|pid| alive(*pid)),
+        "in-place skill reload keeps the same tool owner"
+    );
+    runtime
+        .handle
+        .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+        .await
+        .unwrap();
+    gone(&pids).await;
+
+    let pids = launched(&mut runtime, env.project.path()).await;
+    config.dap.enabled = false;
+    runtime
+        .handle
+        .reprepare_config(config.clone())
+        .await
+        .unwrap();
+    gone(&pids).await;
+    assert!(!runtime
+        .handle
+        .tool_catalog()
+        .await
+        .unwrap()
+        .iter()
+        .any(|tool| tool.name == "debug"));
+
+    config.dap.enabled = true;
+    runtime.handle.reprepare_config(config).await.unwrap();
+    let pids = launched(&mut runtime, env.project.path()).await;
+    runtime.handle.shutdown().await.unwrap();
+    gone(&pids).await;
+}
+
+/// The spend query is the heavy account-wide call: it runs past the light
+/// calls' 3 s page budget and still answers. The Stats tab used to read the
+/// shared budget's timeout ("deadline has elapsed") on every open.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_slow_spend_query_is_not_cut_off_by_the_page_budget() {
+    #[derive(Debug)]
+    struct SlowSpend;
+
+    #[async_trait::async_trait]
+    impl atomcode_coding::RateLimitWindowSource for SlowSpend {
+        fn applies_to(&self, _endpoint: &str) -> bool {
+            true
+        }
+        async fn fetch_windows(&self) -> Result<Vec<atomcode_coding::RateLimitWindow>, String> {
+            Ok(Vec::new())
+        }
+        async fn fetch_usage(&self) -> Result<Option<atomcode_coding::AccountUsage>, String> {
+            // Slower than the page budget, well inside the spend budget.
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            Ok(Some(atomcode_coding::AccountUsage::default()))
+        }
+    }
+
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.agent.base_url = "https://managed.invalid/v1".into();
+    input.prepare.rate_limit_source = Some(Arc::new(SlowSpend));
+    let runtime = CodingRuntime::start(input).await.unwrap();
+
+    let usage = runtime.handle.usage(false).await.unwrap();
+    assert!(
+        usage.spent.is_some(),
+        "the spend answers under its own budget: {:?}",
+        usage.spent_unavailable
+    );
+    assert_eq!(usage.spent_unavailable, None);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn vl_originals_are_saved_for_other_clients_without_reentering_model_context() {
+    struct Caption;
+    #[async_trait::async_trait]
+    impl atomcode_coding::ImagePreprocessor for Caption {
+        async fn preprocess(
+            &self,
+            text: String,
+            _: Vec<atomcode_kernel::message::ImageContent>,
+            _: bool,
+            _: Option<String>,
+        ) -> (UserInput, Option<atomcode_coding::VisionNotice>) {
+            (
+                UserInput {
+                    text: format!("{text}\n\n[图片内容（由 test-vl 识别）]\na picture"),
+                    images: vec![],
+                },
+                None,
+            )
+        }
+    }
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.image_preprocessor = Some(Arc::new(Caption));
+    config.agent.supports_vision = false;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    let id = runtime.session.as_ref().unwrap().id.clone();
+    let images = vec![atomcode_kernel::message::ImageContent {
+        media_type: "image/png".into(),
+        data: "eA==".into(),
+    }];
+    runtime
+        .handle
+        .submit(UserInput {
+            text: "look [Image #1]".into(),
+            images: images.clone(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !matches!(&event.event, CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Accepted { command, .. }) if command.starts_with("display-image-")),
+            "display receipts must not become product events"
+        );
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert!(
+        recorder.last_request().iter().all(|m| m.images.is_empty()),
+        "the text-only model must never receive original bytes"
+    );
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let events = manager.load_events(&id).unwrap();
+    let (seq, text) = events
+        .iter()
+        .find_map(|fact| match &fact.event {
+            atomcode_kernel::session::SessionEvent::UserMessage { text, images, .. } => {
+                assert!(images.is_empty());
+                Some((fact.seq, text))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let saved = manager
+        .read_display_images(&id, seq)
+        .unwrap()
+        .expect("original bytes should survive the TUI process for WebUI readers");
+    assert!(saved.matches(text));
+    assert_eq!(saved.images, images);
+    let (_, fork_lease) = manager.fork_native_session(&id, "display-fork", 1).unwrap();
+    assert_eq!(
+        manager
+            .read_display_images("display-fork", seq)
+            .unwrap()
+            .unwrap()
+            .images,
+        images
+    );
+    drop(fork_lease);
+    runtime.handle.shutdown().await.unwrap();
+    let fresh_reader = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    assert_eq!(
+        fresh_reader
+            .read_display_images(&id, seq)
+            .unwrap()
+            .unwrap()
+            .images,
+        images
+    );
+}
+
+/// Real runtime cancel reaches an executing MCP call; reconnect is explicit and
+/// preserves the coding session instead of rebuilding a second live agent.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn cancelling_a_dispatched_mcp_call_requires_reconnect_and_keeps_the_session() {
+    let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+    let external_io = tokio::task::spawn_blocking(move || {
+        let _ = release_clock.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns");
+    let calls = scratch.path().join("calls");
+    let gate = scratch.path().join("release");
+    let pid_file = scratch.path().join("pid");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let text = std::fs::read_to_string(&script).unwrap();
+    let text = text.replacen(
+        "#!/bin/sh",
+        "#!/bin/sh\nprintf '%s' $$ > \"$ATOMCODE_TEST_MCP_PID\"",
+        1,
+    );
+    let text = text.replace("*'\"method\":\"tools/call\"'*)", "*'\"method\":\"tools/call\"'*)\n      printf 'call\\n' >> \"$ATOMCODE_TEST_MCP_CALLS\"\n      while [ ! -f \"$ATOMCODE_TEST_MCP_GATE\" ]; do sleep 0.01; done");
+    std::fs::write(&script, text).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { env, .. } =
+        &mut input.prepare.extra_mcp_servers[0].config
+    {
+        env.insert(
+            "ATOMCODE_TEST_MCP_CALLS".into(),
+            calls.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "ATOMCODE_TEST_MCP_GATE".into(),
+            gate.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "ATOMCODE_TEST_MCP_PID".into(),
+            pid_file.to_string_lossy().into_owned(),
+        );
+    }
+    // This intentionally uncooperative server cannot read EOF while its tool
+    // is held. Keep real time for its bounded kill/reap; cancellation receipt
+    // remains prompt, but the turn terminal now awaits owned cleanup.
+    tokio::time::resume();
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let session = runtime.session.as_ref().unwrap().id.clone();
+    runtime
+        .handle
+        .submit(UserInput::from("mcp echo"))
+        .await
+        .unwrap();
+    let marker = calls.clone();
+    tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        while !marker.exists() && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(marker.exists(), "the external call actually started");
+    })
+    .await
+    .unwrap();
+    let cancelled_at = tokio::time::Instant::now();
+    runtime.handle.cancel().await.unwrap();
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(1),
+        "cancel receipt must not await backend cleanup"
+    );
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), runtime.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert!(
+        cancelled_at.elapsed() < std::time::Duration::from_secs(5),
+        "the terminal is bounded by owned teardown, not the ten-second RPC deadline"
+    );
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(
+        !std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "cancelled owned backend must be reaped before the native terminal"
+    );
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    let statuses = runtime.handle.mcp_status().await.unwrap();
+    assert!(statuses.servers.iter().any(|(name, status)| name == "t" && matches!(status, atomcode_capabilities::mcp::ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))));
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    std::fs::write(gate, "release old response").unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    tokio::time::pause();
+    turn(&mut runtime, "mcp echo").await;
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        2,
+        "only the explicitly requested next turn runs"
+    );
+    assert_eq!(std::fs::read_to_string(spawns).unwrap().lines().count(), 2);
+    runtime.handle.shutdown().await.unwrap();
+    drop(keep_clock);
+    let _ = external_io.await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn runtime_shutdown_awaits_mcp_eof_cleanup_before_its_terminal() {
+    let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+    let clock = tokio::task::spawn_blocking(move || {
+        let _ = release_clock.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let script = write_mcp_server(scratch.path(), &scratch.path().join("spawns"));
+    let marker = scratch.path().join("disposed");
+    let text = std::fs::read_to_string(&script).unwrap()
+        + "\nprintf disposed > \"$ATOMCODE_TEST_MCP_DISPOSED\"\n";
+    std::fs::write(&script, text).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { env, .. } =
+        &mut input.prepare.extra_mcp_servers[0].config
+    {
+        env.insert(
+            "ATOMCODE_TEST_MCP_DISPOSED".into(),
+            marker.to_string_lossy().into_owned(),
+        );
+    }
+    tokio::time::resume();
+    let runtime = CodingRuntime::start(input).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::pause();
+    runtime.handle.shutdown().await.unwrap();
+    assert!(
+        marker.exists(),
+        "runtime shutdown returns only after the owned MCP server observed EOF and disposed"
+    );
+    drop(keep_clock);
+    clock.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn an_explicit_fork_compacts_independently_and_keeps_the_original_resumable() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    for n in 0..6 {
+        turn(
+            &mut runtime,
+            &format!("original {n} {}", "context ".repeat(500)),
+        )
+        .await;
+    }
+    let source = runtime.session.as_ref().unwrap().id.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let original = manager.load_events(&source).unwrap();
+    let before = runtime.handle.snapshot().await.unwrap();
+    let cwd = runtime.handle.context_stats().await.unwrap().working_dir;
+    let branch = runtime
+        .handle
+        .fork_session(&source)
+        .await
+        .unwrap()
+        .session_id
+        .unwrap();
+    assert_ne!(branch, source);
+    assert!(
+        runtime.handle.fork_session(&source).await.is_err(),
+        "a late fork must not copy the replacement session"
+    );
+    assert_eq!(manager.list().len(), 2);
+    assert_eq!(
+        manager
+            .read_event_header(&branch)
+            .unwrap()
+            .parent
+            .as_deref(),
+        Some(source.as_str())
+    );
+    assert_eq!(
+        runtime.handle.snapshot().await.unwrap().messages,
+        before.messages
+    );
+    assert_eq!(
+        runtime.handle.context_stats().await.unwrap().working_dir,
+        cwd
+    );
+    assert_eq!(manager.load_events(&source).unwrap(), original);
+    assert!(
+        manager
+            .load_native_session(&branch)
+            .unwrap()
+            .meta
+            .fork_info
+            .is_none(),
+        "manual branches must not be collapsed or garbage collected as automatic forks"
+    );
+    assert!(
+        manager.acquire_lease(&branch).is_err(),
+        "replacement owns the branch lease"
+    );
+    assert!(
+        manager.acquire_lease(&source).is_ok(),
+        "the original is released"
+    );
+    compact_and_wait(&mut runtime).await;
+    turn(&mut runtime, "branch only").await;
+    assert_eq!(
+        manager.load_events(&source).unwrap(),
+        original,
+        "compaction and new turns must only append to the branch"
+    );
+    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+    let mut entries = scan.entries;
+    SessionManager::collapse_fork_lineages(&mut entries);
+    assert!(entries.iter().any(|entry| entry.id == source));
+    assert!(entries.iter().any(|entry| entry.id == branch));
+    runtime.handle.resume_session(&source).await.unwrap();
+    assert_eq!(
+        runtime.handle.snapshot().await.unwrap().messages,
+        before.messages
+    );
+    turn(&mut runtime, "back in original").await;
+    assert!(!user_texts(&recorder.last_request())
+        .iter()
+        .any(|text| text == "branch only"));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_failed_explicit_fork_removes_its_candidate_and_keeps_the_original() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "keep this").await;
+    let source = runtime.session.as_ref().unwrap().id.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let original = manager.load_events(&source).unwrap();
+    let mut ids = manager.list().into_iter().map(|m| m.id).collect::<Vec<_>>();
+    ids.sort();
+    recorder.build_fails.store(true, Ordering::SeqCst);
+    assert!(runtime.handle.fork_session(&source).await.is_err());
+    assert_eq!(runtime.session.as_ref().unwrap().id, source);
+    assert_eq!(manager.load_events(&source).unwrap(), original);
+    let mut after = manager.list().into_iter().map(|m| m.id).collect::<Vec<_>>();
+    after.sort();
+    assert_eq!(
+        after, ids,
+        "failed candidate must not remain in the catalog"
+    );
+    recorder.build_fails.store(false, Ordering::SeqCst);
+    turn(&mut runtime, "original still usable").await;
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn an_explicit_fork_refuses_running_turns_and_pending_questions_before_copying() {
+    for text in ["hang", "ask me"] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut runtime = CodingRuntime::start(start_attended(
+            env.project.path(),
+            &recorder,
+            SessionMode::Fresh,
+        ))
+        .await
+        .unwrap();
+        turn(&mut runtime, "seed").await;
+        let source = runtime.session.as_ref().unwrap().id.clone();
+        let manager = SessionManager::for_project(
+            env.project.path(),
+            &atomcode_coding::config::product_dirs_from_env(),
+        );
+        runtime.handle.submit(UserInput::from(text)).await.unwrap();
+        if text == "ask me" {
+            loop {
+                let envelope =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if matches!(envelope.event, CodingRuntimeEvent::Request(_)) {
+                    break;
+                }
+            }
+        }
+        assert!(matches!(
+            runtime.handle.fork_session(&source).await,
+            Err(atomcode_coding::RuntimeError::Busy)
+        ));
+        assert_eq!(runtime.session.as_ref().unwrap().id, source);
+        assert_eq!(
+            manager.list().len(),
+            1,
+            "busy refusal must not publish a candidate"
+        );
+        runtime.handle.cancel().await.unwrap();
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn an_explicit_fork_keeps_an_automatic_fork_as_a_durable_return_point() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "original context").await;
+    let root = runtime.session.as_ref().unwrap().id.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let (_, lease) = manager
+        .fork_native_session(&root, "automatic", atomcode_capabilities::session::now_ms())
+        .unwrap();
+    drop(lease);
+    runtime.handle.resume_session("automatic").await.unwrap();
+    let branch = runtime
+        .handle
+        .fork_session("automatic")
+        .await
+        .unwrap()
+        .session_id
+        .unwrap();
+    assert!(manager
+        .load_native_session("automatic")
+        .unwrap()
+        .meta
+        .fork_info
+        .is_none());
+    runtime.handle.resume_session(&root).await.unwrap();
+    let (_, lease) = manager
+        .fork_native_session(
+            &root,
+            "another-automatic",
+            atomcode_capabilities::session::now_ms(),
+        )
+        .unwrap();
+    let mut entries =
+        SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env()).entries;
+    SessionManager::collapse_fork_lineages(&mut entries);
+    assert!(entries.iter().any(|entry| entry.id == "automatic"));
+    assert!(entries.iter().any(|entry| entry.id == branch));
+    assert!(
+        manager.load_native_session("automatic").is_ok(),
+        "automatic GC must retain the explicit return point"
+    );
+    drop(lease);
     runtime.handle.shutdown().await.unwrap();
 }

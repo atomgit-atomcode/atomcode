@@ -181,6 +181,10 @@ echo "=== SHA256 ==="
 cd "$DIST"
 shasum -a 256 atomcode-* 2>/dev/null | tee checksums.txt
 
+# Compare before replacing latest.json, so the baseline is the previous release.
+python3 "$ROOT/scripts/report-package-size.py" --artifacts "$ROOT/$DIST" \
+    --baseline "$ROOT/latest.json" --output "$ROOT/$DIST/package-size.json"
+
 # --- latest.json (manifest for /upgrade self-update) ---
 #
 # Emits the manifest the TUI's `/upgrade` command reads from

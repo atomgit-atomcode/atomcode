@@ -49,6 +49,14 @@ pub struct Protocol {
     pub needs_key: bool,
 }
 
+/// Host-provided connection choices for one vendor offer. Corresponding URL
+/// indices preserve the same service/plan when switching the protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetConnection {
+    pub protocol: Protocol,
+    pub base_urls: Vec<String>,
+}
+
 /// One account: a place to send requests, and a credential to send them with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRow {
@@ -98,6 +106,8 @@ pub struct ModelRow {
     pub model: String,
     /// How much it can hold, in tokens.
     pub window: usize,
+    /// Saved per-model output budget; `None` uses the runtime default.
+    pub max_tokens: Option<usize>,
     /// `None` is "let it be decided"; the two `Some`s are a person's override.
     pub vision: Option<bool>,
     /// The reasoning effort this model runs at, when it takes one.
@@ -108,9 +118,41 @@ pub struct ModelRow {
     pub current: bool,
     /// Under a managed account: shown, never edited.
     pub managed: bool,
+    /// Display alias advertised by the CodingPlan gateway (`models-v3`).
+    /// Shown instead of the wire name when set; `None` keeps the raw name.
+    pub alias: Option<String>,
+    /// Human-readable description advertised by the CodingPlan gateway,
+    /// shown under the model's row in the picker. `None` adds no line.
+    pub desc: Option<String>,
+    /// English alias / description advertised by the CodingPlan gateway.
+    /// Shown when the interface language is English; `None` falls back to
+    /// [`Self::alias`].
+    pub alias_en: Option<String>,
+    pub desc_en: Option<String>,
 }
 
 impl ModelRow {
+    /// The alias to show for the interface language in force: the English one
+    /// the server advertised when the UI is in English, the Chinese one
+    /// otherwise. Neither has a fallback — when the language's own alias is
+    /// absent the raw model name stands, so an English UI never shows a
+    /// Chinese alias it was not given.
+    pub fn localized_alias(&self) -> Option<&str> {
+        match crate::i18n::current_locale() {
+            crate::i18n::Locale::En => self.alias_en.as_deref(),
+            _ => self.alias.as_deref(),
+        }
+    }
+
+    /// The description to show, selected the same way as
+    /// [`Self::localized_alias`].
+    pub fn localized_desc(&self) -> Option<&str> {
+        match crate::i18n::current_locale() {
+            crate::i18n::Locale::En => self.desc_en.as_deref(),
+            _ => self.desc.as_deref(),
+        }
+    }
+
     /// Only explicitly declared, known levels are offered when switching models.
     /// A stored default or a single configured value is not a level catalog.
     pub fn effort_pick(&self) -> Option<Vec<String>> {
@@ -167,6 +209,7 @@ pub struct ProvidersView {
     models: Arc<Vec<ModelRow>>,
     protocols: Arc<Vec<Protocol>>,
     efforts: Arc<Vec<String>>,
+    connections: Arc<Vec<(String, Vec<PresetConnection>)>>,
     /// The row [`Self::with_current`] resolved the session to, when it could.
     ///
     /// Not the same as the row marked `current`: a name no row or two rows
@@ -188,12 +231,26 @@ impl ProvidersView {
             models: Arc::new(models),
             protocols: Arc::new(protocols),
             efforts: Arc::new(efforts),
+            connections: Arc::new(Vec::new()),
             live: None,
         }
     }
 
     pub fn accounts(&self) -> &[AccountRow] {
         &self.accounts
+    }
+
+    pub fn with_connections(mut self, connections: Vec<(String, Vec<PresetConnection>)>) -> Self {
+        self.connections = Arc::new(connections);
+        self
+    }
+
+    pub fn connections(&self, preset: &str) -> &[PresetConnection] {
+        self.connections
+            .iter()
+            .find(|(id, _)| id == preset)
+            .map(|(_, options)| options.as_slice())
+            .unwrap_or_default()
     }
 
     /// The model one step on from the one in use, or one step back.
@@ -275,6 +332,7 @@ impl ProvidersView {
             models: Arc::new(models),
             protocols: self.protocols.clone(),
             efforts: self.efforts.clone(),
+            connections: self.connections.clone(),
             live: Some(at),
         }
     }
@@ -677,6 +735,9 @@ impl AccountForm {
             AccountField::Endpoint
         };
         form.caret = 0;
+        if view.connections(&row.id).len() > 1 {
+            form.focus = AccountField::Protocol;
+        }
         form
     }
 
@@ -688,6 +749,17 @@ impl AccountForm {
     pub fn fields(&self, view: &ProvidersView) -> Vec<AccountField> {
         let mut out = Vec::new();
         if !self.advanced {
+            if self
+                .preset
+                .as_deref()
+                .is_some_and(|id| view.connections(id).len() > 1)
+            {
+                let mut fields = vec![AccountField::Protocol, AccountField::Endpoint];
+                if self.needs_key(view) {
+                    fields.push(AccountField::Key);
+                }
+                return fields;
+            }
             return if self.needs_key(view) {
                 vec![AccountField::Key]
             } else {
@@ -768,6 +840,39 @@ impl AccountForm {
     /// protocol suggested: a person who typed their own endpoint and then
     /// cycled the protocol to see what else is on offer must not find it gone.
     fn cycle_protocol(&mut self, view: &ProvidersView, forward: bool) {
+        if let Some(id) = self.preset.as_deref() {
+            let options = view.connections(id);
+            if let Some(at) = options
+                .iter()
+                .position(|option| option.protocol.label == self.protocol_label(view))
+            {
+                let next = if forward {
+                    (at + 1) % options.len()
+                } else {
+                    (at + options.len() - 1) % options.len()
+                };
+                if let Some(protocol) = view
+                    .protocols()
+                    .iter()
+                    .position(|p| p.label == options[next].protocol.label)
+                {
+                    if self.endpoint.trim().is_empty() {
+                        self.endpoint = options[next].protocol.endpoint.clone().unwrap_or_default();
+                    } else if let Some(index) = options[at]
+                        .base_urls
+                        .iter()
+                        .position(|url| url == self.endpoint.trim().trim_end_matches('/'))
+                    {
+                        if let Some(url) = options[next].base_urls.get(index) {
+                            self.endpoint = url.clone();
+                        }
+                    }
+                    self.protocol = protocol;
+                    self.caret = self.caret.min(self.focused_len());
+                }
+                return;
+            }
+        }
         self.preset = None;
         let protocols = view.protocols();
         if protocols.is_empty() {
@@ -865,6 +970,30 @@ pub fn window_label(window: usize) -> String {
     }
 }
 
+/// Exact wire budgets: labels do not round 4096 into decimal "4K".
+pub const OUTPUT_PRESETS: &[usize] = &[4096, 8192, 16384, 32768, 65536, 131072];
+
+/// Positive integer tokens, optionally in decimal K/M. Match the runtime's u32 range.
+pub fn parse_output_tokens(text: &str) -> Option<usize> {
+    let text = text.trim().to_ascii_lowercase();
+    let (number, scale) = if let Some(number) = text.strip_suffix('k') {
+        (number, 1000u32)
+    } else if let Some(number) = text.strip_suffix('m') {
+        (number, 1_000_000u32)
+    } else {
+        (text.as_str(), 1u32)
+    };
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    number
+        .parse::<u32>()
+        .ok()?
+        .checked_mul(scale)
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
+}
+
 /// Which field of the model form has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelField {
@@ -875,6 +1004,7 @@ pub enum ModelField {
     Effort,
     Levels,
     Window,
+    Output,
     Default,
 }
 
@@ -900,6 +1030,8 @@ pub struct ModelForm {
     /// [`parse_window`] when the form is saved; [`ModelForm::window`] is not
     /// used while this is set.
     pub window_typed: Option<String>,
+    /// Custom output budget text. Empty/invalid text must not silently mean automatic.
+    pub max_tokens_typed: Option<String>,
     pub vision: Option<bool>,
     /// `None` is a model that takes no effort setting at all.
     pub effort: Option<String>,
@@ -934,10 +1066,12 @@ pub struct ModelForm {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Discovered {
     pub id: String,
+    pub catalog_only: bool,
     pub name: Option<String>,
     pub max_tokens: Option<usize>,
     pub vision: Option<bool>,
     pub effort: Option<String>,
+    pub catalog_default_effort: Option<String>,
     pub levels: Option<Vec<String>>,
     /// The context window the listing gave, when it gave one.
     pub window: Option<usize>,
@@ -990,6 +1124,7 @@ impl ModelForm {
             model: String::new(),
             window: None,
             window_typed: None,
+            max_tokens_typed: None,
             vision: None,
             effort: None,
             levels: vec![true; view.efforts().len()],
@@ -1047,6 +1182,7 @@ impl ModelForm {
             // A row the configuration gave no window stays automatic.
             window: (row.window > 0).then_some(row.window),
             window_typed: None,
+            max_tokens_typed: None,
             vision: row.vision,
             effort: row.effort.clone(),
             levels,
@@ -1065,7 +1201,7 @@ impl ModelForm {
             selected: Vec::new(),
             batch_cursor: 0,
             name: None,
-            max_tokens: None,
+            max_tokens: row.max_tokens,
         })
     }
 
@@ -1077,6 +1213,7 @@ impl ModelForm {
         self.discovered_model = Some(item.id.clone());
         self.name = item.name.clone();
         self.max_tokens = item.max_tokens;
+        self.max_tokens_typed = None;
         self.vision = item.vision;
         self.effort = item.effort.clone();
         self.known_levels = item.levels.clone();
@@ -1111,6 +1248,7 @@ impl ModelForm {
         }
         self.name = None;
         self.max_tokens = None;
+        self.max_tokens_typed = None;
         self.vision = None;
         self.effort = None;
         self.known_levels = None;
@@ -1163,6 +1301,7 @@ impl ModelForm {
             out.push(ModelField::Levels);
         }
         out.push(ModelField::Window);
+        out.push(ModelField::Output);
         if !self.connecting {
             out.push(ModelField::Default);
         }
@@ -1188,6 +1327,7 @@ impl ModelForm {
         match self.focus {
             ModelField::Model => self.model.len(),
             ModelField::Window => self.window_typed.as_ref().map_or(0, String::len),
+            ModelField::Output => self.max_tokens_typed.as_ref().map_or(0, String::len),
             _ => 0,
         }
     }
@@ -1291,6 +1431,57 @@ impl ModelForm {
         }
     }
 
+    /// Automatic is always available: unlike the context field it clears the stored override.
+    pub fn output_choices(&self) -> Vec<Option<usize>> {
+        let mut presets = OUTPUT_PRESETS.to_vec();
+        if let Some(value) = self.max_tokens.filter(|value| !presets.contains(value)) {
+            presets.push(value);
+            presets.sort_unstable();
+        }
+        std::iter::once(None)
+            .chain(presets.into_iter().map(Some))
+            .collect()
+    }
+
+    fn cycle_output(&mut self, forward: bool) {
+        let choices = self.output_choices();
+        let stops = choices.len() + 1;
+        let at = if self.max_tokens_typed.is_some() {
+            choices.len()
+        } else {
+            choices
+                .iter()
+                .position(|value| *value == self.max_tokens)
+                .unwrap_or(0)
+        };
+        let next = if forward {
+            (at + 1) % stops
+        } else {
+            (at + stops - 1) % stops
+        };
+        match choices.get(next) {
+            Some(value) => {
+                self.max_tokens = *value;
+                self.max_tokens_typed = None;
+            }
+            None => self.max_tokens_typed = Some(String::new()),
+        }
+        self.caret = self.focused_len();
+    }
+
+    fn type_output(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        if self.max_tokens_typed.is_none() {
+            self.max_tokens_typed = Some(String::new());
+            self.caret = 0;
+        }
+        if let Some((text, caret)) = self.text_and_caret() {
+            insert_at(text, caret, c);
+        }
+    }
+
     /// Off, then each level this build offers, then round.
     fn cycle_effort(&mut self, view: &ProvidersView, forward: bool) {
         let mut ring: Vec<Option<String>> = vec![None];
@@ -1318,6 +1509,7 @@ impl ModelForm {
         match self.focus {
             ModelField::Model => Some((&mut self.model, caret)),
             ModelField::Window => self.window_typed.as_mut().map(|typed| (typed, caret)),
+            ModelField::Output => self.max_tokens_typed.as_mut().map(|typed| (typed, caret)),
             _ => None,
         }
     }
@@ -1473,6 +1665,7 @@ pub struct ModelDraft {
     pub account: String,
     pub model: String,
     pub name: Option<String>,
+    /// `None` selects automatic and clears any saved output override on edit.
     pub max_tokens: Option<usize>,
     pub use_now: bool,
     /// `None` leaves it to whatever this protocol usually holds.
@@ -1916,7 +2109,12 @@ fn account_key(
         }
         _ => {}
     }
-    if form.protocol != previous_protocol {
+    if form.protocol != previous_protocol
+        && !form
+            .preset
+            .as_deref()
+            .is_some_and(|id| view.connections(id).len() > 1)
+    {
         secret.clear();
         form.key_len = 0;
     }
@@ -1975,7 +2173,17 @@ fn save_account(
         (form.needs_key(view) && !secret.trim().is_empty()).then(|| secret.trim().to_string());
     let draft = AccountDraft {
         name,
-        protocol: form.preset.clone().unwrap_or_else(|| protocol.id.clone()),
+        protocol: form
+            .preset
+            .as_deref()
+            .and_then(|id| {
+                view.connections(id)
+                    .iter()
+                    .find(|option| option.protocol.label == protocol.label)
+            })
+            .map(|option| option.protocol.id.clone())
+            .or_else(|| form.preset.clone())
+            .unwrap_or_else(|| protocol.id.clone()),
         endpoint,
         key,
     };
@@ -2069,6 +2277,7 @@ fn model_key(
                 ModelField::Vision => form.cycle_vision(forward),
                 ModelField::Effort => form.cycle_effort(view, forward),
                 ModelField::Window => form.cycle_window(forward),
+                ModelField::Output => form.cycle_output(forward),
                 ModelField::Levels => {
                     let len = form.levels.len().max(1);
                     form.level = match forward {
@@ -2107,6 +2316,7 @@ fn model_key(
             ModelField::Effort => form.cycle_effort(view, true),
             ModelField::Window if form.window_typed.is_none() => form.cycle_window(true),
             ModelField::Window => {}
+            ModelField::Output if form.max_tokens_typed.is_none() => form.cycle_output(true),
             _ => {
                 if let Some((text, caret)) = form.text_and_caret() {
                     insert_at(text, caret, ' ');
@@ -2135,6 +2345,8 @@ fn model_key(
                 form.key_len = secret.chars().count();
             } else if form.focus == ModelField::Window {
                 form.type_window(c);
+            } else if form.focus == ModelField::Output {
+                form.type_output(c);
             } else if let Some((text, caret)) = form.text_and_caret() {
                 insert_at(text, caret, c);
             }
@@ -2300,11 +2512,25 @@ fn save_model(
         },
         None => form.window,
     };
+    let max_tokens = match &form.max_tokens_typed {
+        Some(typed) => match parse_output_tokens(typed) {
+            Some(value) => Some(value),
+            None => {
+                let mut form = form.clone();
+                form.focus = ModelField::Output;
+                form.advanced = true;
+                form.caret = typed.len();
+                panel.form = Some(Form::Model(form));
+                return Step::Stay;
+            }
+        },
+        None => form.max_tokens,
+    };
     let draft = ModelDraft {
         account,
         model,
         name: form.name.clone(),
-        max_tokens: form.max_tokens,
+        max_tokens,
         use_now: form.connecting,
         window,
         vision: form.vision,
@@ -2411,6 +2637,13 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
                 }
                 return form.window_typed != before;
             }
+            if form.focus == ModelField::Output {
+                let before = form.max_tokens_typed.clone();
+                for c in line.trim().chars() {
+                    form.type_output(c);
+                }
+                return form.max_tokens_typed != before;
+            }
             let model_field = form.focus == ModelField::Model;
             let Some((field, caret)) = form.text_and_caret() else {
                 return false;
@@ -2469,6 +2702,11 @@ pub trait Providers: Send + Sync {
         Err("Batch model saving is unavailable".into())
     }
 
+    /// Resolve public catalog metadata before the synchronous config write.
+    fn enrich_models(&self, _drafts: &[ModelDraft]) -> Option<EnrichModelsFuture> {
+        None
+    }
+
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String>;
 
     fn delete_model(&self, id: &str) -> Result<(), String>;
@@ -2505,6 +2743,9 @@ pub trait Providers: Send + Sync {
 pub type DiscoverFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Vec<Discovered>, String>> + Send + 'static>,
 >;
+
+pub type EnrichModelsFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ModelDraft>> + Send + 'static>>;
 
 /// See [`Providers::probe`]: what to say, and whether all is well.
 pub type ProbeFuture =
@@ -2588,11 +2829,16 @@ mod tests {
             account: account.into(),
             model: id.into(),
             window: 128_000,
+            max_tokens: None,
             vision: None,
             effort: None,
             levels: Vec::new(),
             current: false,
             managed: false,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
         }
     }
 
@@ -2781,6 +3027,81 @@ mod tests {
 
     fn press(key: Key) -> KeyPress {
         KeyPress::plain(key)
+    }
+
+    #[test]
+    fn a_vendor_offer_exposes_protocol_and_preserves_plan_key_and_custom_address() {
+        let original = view();
+        let mut protocols = original.protocols().to_vec();
+        protocols.push(Protocol {
+            id: "anthropic-compatible".into(),
+            label: "Anthropic".into(),
+            endpoint: None,
+            needs_key: true,
+        });
+        let view = ProvidersView::new(original.accounts().to_vec(), vec![], protocols, vec![])
+            .with_connections(vec![(
+                "deepseek".into(),
+                vec![
+                    PresetConnection {
+                        protocol: Protocol {
+                            id: "deepseek".into(),
+                            label: "OpenAI".into(),
+                            endpoint: Some("https://vendor.test/v1".into()),
+                            needs_key: true,
+                        },
+                        base_urls: vec![
+                            "https://vendor.test/v1".into(),
+                            "https://vendor.test/plan/v1".into(),
+                        ],
+                    },
+                    PresetConnection {
+                        protocol: Protocol {
+                            id: "anthropic-compatible".into(),
+                            label: "Anthropic".into(),
+                            endpoint: Some("https://vendor.test".into()),
+                            needs_key: true,
+                        },
+                        base_urls: vec![
+                            "https://vendor.test".into(),
+                            "https://vendor.test/plan".into(),
+                        ],
+                    },
+                ],
+            )]);
+        for (input, expected) in [
+            ("https://vendor.test/plan/v1/", "https://vendor.test/plan"),
+            ("https://custom.test/route", "https://custom.test/route"),
+        ] {
+            let mut form = AccountForm::connect(&view, view.account("deepseek").unwrap());
+            form.endpoint = input.into();
+            form.key_len = 8;
+            assert!(!form.advanced);
+            assert_eq!(
+                form.fields(&view),
+                vec![
+                    AccountField::Protocol,
+                    AccountField::Endpoint,
+                    AccountField::Key
+                ]
+            );
+            let mut panel = Panel {
+                form: Some(Form::Account(form)),
+                ..Panel::new()
+            };
+            let mut secret = "test-key".to_string();
+            key(&view, &mut panel, &mut secret, press(Key::Right));
+            assert_eq!(secret, "test-key");
+            let Step::SaveAccount { draft, .. } =
+                key(&view, &mut panel, &mut secret, press(Key::Enter))
+            else {
+                panic!("save account")
+            };
+            assert_eq!(draft.name, "deepseek");
+            assert_eq!(draft.protocol, "anthropic-compatible");
+            assert_eq!(draft.endpoint, expected);
+            assert_eq!(draft.key.as_deref(), Some("test-key"));
+        }
     }
 
     fn ctrl(c: char) -> KeyPress {
@@ -3219,6 +3540,112 @@ mod tests {
     }
 
     #[test]
+    fn output_budget_presets_and_automatic_are_saved() {
+        let view = view();
+        let mut form = ModelForm::add(&view, None).unwrap();
+        form.advanced = false;
+        assert!(!form.fields(&view).contains(&ModelField::Output));
+        form.advanced = true;
+        assert!(form.fields(&view).contains(&ModelField::Output));
+        form.model = "vendor-x".into();
+        form.focus = ModelField::Output;
+        let mut panel = Panel::new();
+        let mut secret = String::new();
+        panel.form = Some(Form::Model(form));
+        run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Right), press(Key::Char(' '))],
+        );
+        let Step::SaveModel { draft, .. } =
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        else {
+            panic!("saves a preset");
+        };
+        assert_eq!(draft.max_tokens, Some(8192));
+
+        let mut row = model("vendor-x", "deepseek");
+        row.max_tokens = Some(4096);
+        let form = ModelForm::edit(&view, &row).unwrap();
+        assert_eq!(form.max_tokens, row.max_tokens);
+        panel.form = Some(Form::Model(form.clone()));
+        let Step::SaveModel { draft, .. } =
+            run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+        else {
+            panic!("saves the existing budget even with advanced settings hidden");
+        };
+        assert_eq!(draft.max_tokens, Some(4096));
+        let mut form = form;
+        form.focus = ModelField::Output;
+        panel.form = Some(Form::Model(form));
+        let Step::SaveModel { draft, .. } = run(
+            &view,
+            &mut panel,
+            &mut secret,
+            &[press(Key::Left), press(Key::Enter)],
+        ) else {
+            panic!("saves automatic");
+        };
+        assert_eq!(draft.max_tokens, None);
+    }
+
+    #[test]
+    fn custom_output_budget_rejects_invalid_input_without_losing_it() {
+        let view = view();
+        for (input, expected) in [
+            ("4096", Some(4096)),
+            ("32k", Some(32000)),
+            ("1M", Some(1_000_000)),
+            ("4294967295", Some(u32::MAX as usize)),
+            ("0", None),
+            ("-4096", None),
+            ("1.5", None),
+            ("4294967296", None),
+            ("4294968k", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            let mut form = ModelForm::add(&view, None).unwrap();
+            form.model = "vendor-x".into();
+            form.focus = ModelField::Output;
+            form.max_tokens = Some(393216);
+            let mut panel = Panel::new();
+            let mut secret = String::new();
+            panel.form = Some(Form::Model(form));
+            if input.is_empty() {
+                // Enter the custom stop after the saved non-preset value.
+                run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
+            } else {
+                assert!(paste(&mut panel, &mut secret, input));
+            }
+            let step = run(&view, &mut panel, &mut secret, &[press(Key::Enter)]);
+            if let Some(expected) = expected {
+                let Step::SaveModel { draft, .. } = step else {
+                    panic!("{input}: {step:?}")
+                };
+                assert_eq!(draft.max_tokens, Some(expected), "{input}");
+            } else {
+                assert_eq!(step, Step::Stay, "{input}");
+                let Some(Form::Model(form)) = &panel.form else {
+                    panic!("keeps the form")
+                };
+                assert_eq!(form.focus, ModelField::Output);
+                assert!(form.advanced);
+                assert_eq!(form.max_tokens_typed.as_deref(), Some(input));
+                // A deliberate choice of automatic recovers from invalid input.
+                run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
+                let Step::SaveModel { draft, .. } =
+                    run(&view, &mut panel, &mut secret, &[press(Key::Enter)])
+                else {
+                    panic!("automatic saves")
+                };
+                assert_eq!(draft.max_tokens, None);
+            }
+        }
+    }
+
+    #[test]
     fn a_model_saves_what_the_form_says() {
         let view = view();
         let mut panel = Panel::new();
@@ -3564,6 +3991,8 @@ mod tests {
         form.advanced = false;
         let item = Discovered {
             id: "flash".into(),
+            catalog_only: false,
+            catalog_default_effort: None,
             name: Some("Flash".into()),
             window: Some(1048576),
             max_tokens: Some(393216),
@@ -3746,6 +4175,44 @@ mod tests {
         assert!(form.selected.is_empty());
         assert!(discovered(&view, &mut panel, "deepseek", Ok(listed(&[("late", None)]))).is_none());
         assert!(picking(&panel).is_none());
+    }
+
+    #[test]
+    fn a_failed_listing_still_allows_typing_pasting_and_saving_a_model() {
+        let view = view();
+        for use_now in [true, false] {
+            let mut form = ModelForm::add(&view, Some("deepseek")).unwrap();
+            form.connecting = true;
+            form.advanced = false;
+            form.focus = ModelField::Model;
+            form.start_discovery();
+            let mut panel = Panel {
+                form: Some(Form::Model(form)),
+                ..Panel::new()
+            };
+            let mut secret = String::new();
+            discovered(&view, &mut panel, "deepseek", Err("HTTP 404".into()));
+            assert!(picking(&panel).is_none());
+            key(&view, &mut panel, &mut secret, press(Key::Char('q')));
+            assert!(paste(&mut panel, &mut secret, "wen-custom\n"));
+            let step = key(
+                &view,
+                &mut panel,
+                &mut secret,
+                if use_now {
+                    press(Key::Enter)
+                } else {
+                    ctrl('s')
+                },
+            );
+            let Step::SaveModel { id, draft } = step else {
+                panic!("manual model must be saved: {step:?}");
+            };
+            assert!(id.is_none());
+            assert_eq!(draft.account, "deepseek");
+            assert_eq!(draft.model, "qwen-custom");
+            assert_eq!(draft.use_now, use_now);
+        }
     }
 
     /// Ctrl+F on the model field of an add form asks for the account's listing;

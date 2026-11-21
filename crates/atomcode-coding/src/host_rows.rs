@@ -164,7 +164,11 @@ impl SessionNativePlugin {
                  and nothing else; `<id>.index` holds its name, working directory \
                  and per-turn statistics.\n\
                  Continuing a session is the person's to do, never yours, and never \
-                 by editing these files or any configuration: `/resume` in the \
+                 by editing these files or any configuration: `/fork` copies the current \
+                 conversation into an independent session and switches to it; it does not \
+                 copy working-tree files or compact automatically. `/compact` can then \
+                 compress the copy, while `/resume <original-id>` returns to the original. \
+                 `/resume` in the \
                  terminal UI, `atomcode --continue` (the latest) or `atomcode \
                  --resume <id-or-name>` when starting — `atomcode -p \"…\" --resume \
                  <id>` for a one-shot run — or picking it from the session list in \
@@ -556,9 +560,15 @@ impl Waterfall<AgentRequest> for Bridge {
         self.hook.pre_request(&mut proposed, &ctx).await;
         timing.returned();
         drop(timing);
-        if proposed.len() > before && proposed[..before] == handed[..] {
-            req.messages.extend(proposed.drain(before..));
-        }
+        // Taken off again once the request is answered (`with_tail`): a row
+        // nearer the front that sends it again must not find it already here.
+        let tail: Vec<Message> = if proposed.len() > before && proposed[..before] == handed[..] {
+            proposed.drain(before..).collect()
+        } else {
+            Vec::new()
+        };
+        let at = req.messages.len();
+        req.messages.extend(tail.iter().cloned());
         let mut timing =
             atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request_options");
         self.hook
@@ -578,7 +588,9 @@ impl Waterfall<AgentRequest> for Bridge {
         // `response_meta` measures for the session log — measured again here
         // because the meta that reaches a hook is built here, not there.
         let started = std::time::Instant::now();
-        match next.run(req).await {
+        let result = next.run(req).await;
+        atomcode_harness::tail::take_off(&mut req.messages, at, &tail);
+        match result {
             Ok(response) => {
                 let mut message =
                     Message::assistant(response.text.clone(), response.tool_calls.clone());
@@ -870,13 +882,13 @@ impl Waterfall<AgentRequest> for PlanModeLive {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
-        if self.active() {
-            req.messages
-                .push(atomcode_capabilities::reminder::synthetic_system_reminder(
-                    crate::plan_mode::PLAN_MODE_REMINDER_BODY,
-                ));
+        if !self.active() {
+            return next.run(req).await;
         }
-        next.run(req).await
+        let reminder = atomcode_capabilities::reminder::synthetic_system_reminder(
+            crate::plan_mode::PLAN_MODE_REMINDER_BODY,
+        );
+        atomcode_harness::tail::with_tail(req, vec![reminder], next).await
     }
 }
 
@@ -1024,7 +1036,7 @@ impl SkillsHostPlugin {
                     loaded.plugins.join(", ")
                 ));
             }
-            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one. The skills-host row can statically auto-load one eligible debugging workflow before a real user turn; auto-load: debugging opts a skill in, auto-load: off opts it out. Its auto_load:false row setting or a user [no-auto-skills] directive disables automatic loading. Automatic context never executes embedded commands or grants allowed-tools.");
+            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one. The skills-host row can statically auto-load one eligible workflow before a real user turn; auto-load: debugging opts into debugging tasks, auto-load: browser-use into explicit browser tasks, auto-load: off opts out. Its auto_load:false row setting or a user [no-auto-skills] directive disables automatic loading. Automatic context never executes embedded commands or grants allowed-tools.");
         }
         text
     }
@@ -1175,7 +1187,16 @@ impl Plugin for HostToolsPlugin {
     fn description(&self) -> &'static str {
         "tools the coding runtime built itself: its controllers' and its capability graph's"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        #[derive(serde::Deserialize, Default)]
+        struct Row {
+            auto_review: Option<bool>,
+        }
+        let row: Row = if config.is_null() {
+            Row::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
         atomcode_harness::plugins::tools::mount(ctx, self.0.clone())?;
         // The product disables the harness's `tool-code-review` row and mounts
         // its own reviewer here (the product's limits and provider slot), so
@@ -1183,7 +1204,10 @@ impl Plugin for HostToolsPlugin {
         // — or `/review` does not exist on the product at all, which is what it
         // was until 2026-09-22.
         if let Some(review) = self.0.iter().find(|tool| tool.name() == "code_review") {
-            atomcode_harness::plugins::capabilities::register_review_command(ctx, review.clone())?;
+            atomcode_harness::plugins::capabilities::register_review_command_inline(
+                ctx,
+                review.clone(),
+            )?;
         }
         let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {
@@ -1196,7 +1220,12 @@ impl Plugin for HostToolsPlugin {
                         "code-review" => 58,
                         _ => 57,
                     };
-                    atomcode_harness::plugins::tools::contribute_prompt(ctx, &id, rank, text);
+                    let guidance = if key == "code-review" && row.auto_review == Some(false) {
+                        format!("{text}\n{}", crate::review_rows::MANUAL_REVIEW_POLICY)
+                    } else {
+                        text.to_string()
+                    };
+                    atomcode_harness::plugins::tools::contribute_prompt(ctx, &id, rank, &guidance);
                 }
             }
         }
@@ -1427,7 +1456,8 @@ impl Plugin for CcHooksHostPlugin {
 atomcode_plexus::plexus_service!(LoadedContextSvc => atomcode_capabilities::session::SessionContextHook, "loaded-context", Core, "The instruction snapshot this runtime mounted");
 
 /// `session-context`: environment, project instructions and a git snapshot,
-/// contributed to the system prompt once per tree.
+/// contributed to the system prompt once per tree, plus bounded per-user-input
+/// workspace observations appended as logged reminders.
 ///
 /// The chain inserts this block as a leading system message at session start.
 /// A tree has no conversation to insert into — its system prompt is the prompt
@@ -1453,6 +1483,10 @@ impl Plugin for SessionContextPlugin {
     fn provides(&self) -> &'static [&'static str] {
         &["loaded-context"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // SessionSvc is agent-scoped and created by AgentsSvc, not a root row.
+        &["agents"]
+    }
     fn description(&self) -> &'static str {
         "environment, project instructions and a session-start git snapshot, in the system prompt"
     }
@@ -1461,9 +1495,46 @@ impl Plugin for SessionContextPlugin {
         let _ = ctx
             .provide::<LoadedContextSvc>(self.hook.clone())
             .map_err(|e| e.to_string())?;
+        let _ = ctx.on_waterfall::<PreStep>(
+            Arc::new(TaskWorktreeContext {
+                ctx: ctx.clone(),
+                hook: self.hook.clone(),
+            }),
+            false,
+        );
         // Withdrawn with the row, like every other fragment.
         atomcode_harness::plugins::tools::contribute_prompt(ctx, "project-instructions", 1, &block);
         Ok(())
+    }
+}
+
+/// Per-input observation appended through the existing logged injection seam,
+/// never a mutation of the cached system prefix or an authorization decision.
+struct TaskWorktreeContext {
+    ctx: Context,
+    hook: Arc<atomcode_capabilities::session::SessionContextHook>,
+}
+
+#[async_trait]
+impl Waterfall<PreStep> for TaskWorktreeContext {
+    async fn handle(&self, step: &mut StepDecision, next: Next<'_, PreStep>) -> StepDecision {
+        if step.step == 1
+            && matches!(step.origin, MessageOrigin::User)
+            && step.message.is_some()
+            && step.rejected.is_none()
+        {
+            let scoped = atomcode_harness::agent::scoped(&self.ctx);
+            let root = scoped
+                .service::<SessionSvc>()
+                .and_then(|session| self.ctx.service::<AgentsSvc>()?.by_session(session.id()))
+                .is_some_and(|agent| agent.parent().is_none());
+            if root {
+                if let Some(reminder) = self.hook.task_worktree_status().await.reminder(step.turn) {
+                    step.injections.push((reminder, InjectionOrigin::Reminder));
+                }
+            }
+        }
+        next.run(step).await
     }
 }
 
@@ -1816,6 +1887,10 @@ impl Plugin for McpHostPlugin {
                  and for HTTP `auth: {{ \"type\": \"oauth\" }}`. `${{VAR}}` is read from the \
                  environment, so a secret need not be written into the file. Comments are \
                  allowed; trailing commas are not.\n\
+                 `requiredExperimentalCapabilities` optionally maps a documented server \
+                 extension name to its exact positive integer version. Every MCP \
+                 initialize, including recovery, must satisfy it; this grants no \
+                 approval and is not proof of backend policy correctness.\n\
                  To add a server for the person: write the entry (for a stdio server, \
                  `atomcode mcp add <name> <command> [args…]` writes `.mcp.json`, and \
                  `--global` the user file). Two things only the person can do, and both \
@@ -1823,6 +1898,8 @@ impl Plugin for McpHostPlugin {
                  the project, without which its own `.mcp.json` servers never connect, \
                  and signing in to an OAuth server. The server's detail page also offers \
                  Reconnect, which replaces only that server while the session is idle. \
+                 The top of `/mcp` offers Pause all / Resume (Ctrl+S), for this session only. \
+                 Pause requires an idle session and leaves per-server configuration unchanged. \
                  After a file changes, `/reload` reads \
                  the servers again and reconnects. Each server's tools join the catalog \
                  as `mcp__<server>__<tool>` and go through the same approval as \
@@ -1844,12 +1921,35 @@ impl Plugin for McpHostPlugin {
             toolbox_slot,
             prompts_slot,
         } = publication;
+        atomcode_harness::plugins::capabilities::mount_mcp_turn_lifecycle(ctx, registry.clone());
         let _ = ctx
             .provide::<atomcode_harness::seams::McpSvc>(Arc::clone(&registry))
             .map_err(|e| e.to_string())?;
         let toolbox = ctx
             .require::<atomcode_harness::seams::ToolsSvc>()
             .map_err(|e| e.to_string())?;
+        // Session transitions stay nonblocking. Until the initial catalog is
+        // reconciled, tell the first request why configured schemas may be
+        // absent; no connection names, config values or server text enter here.
+        let startup_pending = !*catalog_ready.borrow();
+        if startup_pending
+            && publication_enabled.load(Ordering::Acquire)
+            && registry.server_statuses().await.iter().any(|(_, status)| {
+                matches!(
+                    status,
+                    atomcode_capabilities::mcp::ServerStatus::Connecting
+                        | atomcode_capabilities::mcp::ServerStatus::Connected
+                )
+            })
+        {
+            let (id, rank) = crate::mcp_instructions::STARTUP_FRAGMENT;
+            atomcode_harness::plugins::tools::contribute_prompt(
+                ctx,
+                id,
+                rank,
+                crate::mcp_instructions::STARTUP_GUIDANCE,
+            );
+        }
         // Withdrawal happens from the runtime, not from here, and it has to
         // reach this catalog or the model keeps being offered what was revoked.
         *toolbox_slot.write().unwrap_or_else(|e| e.into_inner()) = Some(toolbox.clone());
@@ -1910,12 +2010,16 @@ impl Plugin for McpHostPlugin {
                             }
                             if let Some(prompts) = &shared.prompts {
                                 prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+                                prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
                             }
                             break;
                         }
                         _ = &mut initial => {
                             let all = registry.list_all_tools().await;
                             publish_mcp(&toolbox, &registry, all, &shared, true).await;
+                            if let Some(prompts) = &shared.prompts {
+                                prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
+                            }
                             catalog_ready.send_replace(true);
                             break;
                         }
@@ -1953,6 +2057,7 @@ impl Plugin for McpHostPlugin {
             }
             if let Some(prompts) = &shared.prompts {
                 prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+                prompts.remove(crate::mcp_instructions::STARTUP_FRAGMENT.0);
             }
         });
         Ok(())
@@ -2273,12 +2378,14 @@ impl Listener<TurnFinishing> for WorkspaceCaptureBarrier {
 /// person asks for is that summary, steered by their focus. Every summary is
 /// billed to the session through the side provider, and every way it can fail
 /// falls back to something model-free.
-pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedReviewProvider);
+pub(crate) struct CompactionCodingPlugin(pub(crate) crate::on_harness::SharedCompactionProviders);
 
 #[derive(serde::Deserialize)]
 struct CompactionCodingRow {
     #[serde(default)]
     token_limit: Option<u32>,
+    #[serde(default)]
+    stub_recent_budget: Option<u32>,
     #[serde(default = "default_compaction_threshold")]
     threshold: f32,
 }
@@ -2289,21 +2396,33 @@ fn default_compaction_threshold() -> f32 {
 
 struct CodingCompaction {
     token_limit: Option<u32>,
-    provider: atomcode_review::SharedReviewProvider,
+    stub_recent_budget: Option<u32>,
+    provider: crate::on_harness::SharedCompactionProviders,
 }
 
 impl CodingCompaction {
     /// Resolved per call: `/model` and a logout swap the provider under it.
-    fn strategy(&self) -> (atomcode_capabilities::compaction::OverflowCompaction, bool) {
+    fn strategy(
+        &self,
+    ) -> (
+        atomcode_capabilities::compaction::OverflowCompaction,
+        Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>,
+    ) {
         let provider = self.provider.read().ok().and_then(|slot| slot.clone());
-        let writes = provider.is_some();
+        let stub = match self.stub_recent_budget {
+            Some(limit) => {
+                atomcode_capabilities::compaction::StubCompaction::new(limit as usize, true)
+            }
+            None => atomcode_capabilities::compaction::StubCompaction::default(),
+        };
+        let (primary, summary) = match provider {
+            Some(provider) => (Some(provider.primary), Some(provider.summary)),
+            None => (None, None),
+        };
         (
-            atomcode_capabilities::compaction::OverflowCompaction::new(
-                atomcode_capabilities::compaction::StubCompaction::default(),
-                provider,
-            )
-            .with_auto_token_limit(self.token_limit),
-            writes,
+            atomcode_capabilities::compaction::OverflowCompaction::new(stub, summary)
+                .with_auto_token_limit(self.token_limit),
+            primary,
         )
     }
 }
@@ -2315,7 +2434,15 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
             .token_limit
             .map(|limit| format!(" or {limit} prompt tokens"))
             .unwrap_or_default();
-        format!("fold old tool output under pressure; past 0.78 of the window{budget}, or on request, have the conversation's model summarize older turns; on an overflow, stub, truncate, then summarize")
+        let stub = self
+            .stub_recent_budget
+            .map(|limit| {
+                format!(
+                    "; a configured {limit}-token recent budget is clamped to the window-relative budget before stubbing"
+                )
+            })
+            .unwrap_or_default();
+        format!("fold old tool output under pressure{stub}; past 0.78 of the window{budget}, or on request, have the conversation's model summarize older turns; on an overflow, stub, truncate, then summarize")
     }
 
     fn calls_model(
@@ -2323,8 +2450,8 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> bool {
-        let (strategy, writes) = self.strategy();
-        writes
+        let (strategy, provider) = self.strategy();
+        provider.is_some()
             && atomcode_harness::plugins::compaction::strategy_would_summarize(&strategy, log, ask)
     }
 
@@ -2333,8 +2460,22 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         log: &atomcode_harness::session::SessionLog,
         ask: &atomcode_harness::seams::CompactionAsk,
     ) -> Option<atomcode_harness::seams::CompactionDecision> {
-        let (strategy, _) = self.strategy();
-        atomcode_harness::plugins::compaction::decide_with_strategy(&strategy, log, ask).await
+        self.compact_attempt(log, ask).await.decision
+    }
+
+    async fn compact_attempt(
+        &self,
+        log: &atomcode_harness::session::SessionLog,
+        ask: &atomcode_harness::seams::CompactionAsk,
+    ) -> atomcode_harness::seams::CompactionAttempt {
+        let (strategy, provider) = self.strategy();
+        atomcode_harness::plugins::compaction::attempt_with_sent_prompt(
+            &strategy,
+            log,
+            ask,
+            provider.as_ref(),
+        )
+        .await
     }
 }
 
@@ -2358,9 +2499,13 @@ impl Plugin for CompactionCodingPlugin {
         if row.token_limit == Some(0) {
             return Err("compaction token_limit must be positive or omitted".into());
         }
+        if row.stub_recent_budget == Some(0) {
+            return Err("compaction stub_recent_budget must be positive or omitted".into());
+        }
         let _ = ctx
             .provide::<atomcode_harness::seams::CompactionSvc>(Arc::new(CodingCompaction {
                 token_limit: row.token_limit,
+                stub_recent_budget: row.stub_recent_budget,
                 provider: self.0.clone(),
             }))
             .map_err(|e| e.to_string())?;
@@ -2386,6 +2531,9 @@ impl Plugin for CompactionCodingPlugin {
 pub(crate) struct CapabilityCommandsPlugin(
     pub(crate) Arc<dyn crate::runtime::RuntimeCommands>,
     pub(crate) std::path::PathBuf,
+    /// `Some` when the driver shows the turn a background completion starts
+    /// (`CodingAgentConfig::background_wakeups`): the jobs it will wake for.
+    pub(crate) Option<crate::background_jobs::BackgroundWaits>,
 );
 
 #[async_trait]
@@ -2402,29 +2550,76 @@ impl Plugin for CapabilityCommandsPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         // This policy belongs to the host that actually observes completions,
         // not to the portable shell tool or a second waiting state machine.
+        // Completions are delivered only after a response ends, so a model that
+        // keeps its turn open to poll only delays them; but only a driver that
+        // stays attached shows the turn a completion starts (`-p` exits at its
+        // first turn terminal), so only there may the model end its response.
+        let (policy, knowledge) = if let Some(waits) = &self.2 {
+            // The policy said once, at mount, reaches a model that has read
+            // many rounds since; the job it is polling right now is better
+            // evidence. Only on the request, so the tool result the front end
+            // groups and the loop guard counts stays the tool's own.
+            let _ = ctx.on_waterfall::<AgentRequest>(
+                Arc::new(crate::background_jobs::BackgroundWaitHint::new(
+                    waits.clone(),
+                )),
+                false,
+            );
+            (
+                "This host resumes you when a background job finishes. For bounded work \
+                 that may take a long time, including downloads, SDK installation, builds \
+                 and tests, use bash_start (notify_on_exit defaults to true). Keep the real \
+                 operation in that tracked job so its exit status and output are available. \
+                 While it runs, do independent work if useful; otherwise end your response. \
+                 Ending your response does not end the task, even when the next step needs \
+                 the job's result: the completion notification starts your next turn with \
+                 that result and you continue the remaining steps from there. The \
+                 notification is delivered only after your response ends, and every \
+                 bash_poll wait that times out with the job still running costs a whole \
+                 request; shell sleep, ls and pgrep wait without the job's status at all. \
+                 After the notification, \
+                 collect each finished job once with bash_poll and wait_ms 0, then check the \
+                 result. A file existing or a process disappearing does not prove success. \
+                 Leave completion notifications off for servers and watchers. If a job was \
+                 already started without notifications, use bash_poll to collect or wait for \
+                 that tracked job; do not restart the operation just to enable \
+                 notifications. Do not claim an untracked external process is being \
+                 observed by the host.",
+                "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement (switching model or session) retire pending notifications, so a person may need to resume the session then. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.",
+            )
+        } else {
+            (
+                "This host does not resume you when a background job finishes: the run ends \
+                 with your response. For bounded work that may take a long time, including \
+                 downloads, SDK installation, builds and tests, use bash_start and keep the \
+                 real operation in that tracked job so its exit status and output are \
+                 available. While it runs, do independent work if useful; when you are \
+                 blocked on it, wait with bash_poll using a long wait_ms, and repeat while it \
+                 reports running. Before your final answer, collect every job whose result \
+                 matters and bash_kill jobs that stopped mattering. Do not wait with shell \
+                 sleep, ls or pgrep. A file existing or a process disappearing does not prove \
+                 success. Do not claim an untracked external process is being observed by \
+                 the host.",
+                "This host does not resume the session when a background job finishes; the run ends with the model's response, so a bash_start job is waited for with bash_poll before answering.",
+            )
+        };
         atomcode_harness::plugins::tools::contribute_prompt(
             ctx,
             "background-completion-policy",
             52,
-            "This host supports background completion notifications. For bounded work that \
-             may take a long time, including downloads, SDK installation, builds and tests, \
-             use bash_start (notify_on_exit defaults to true). Keep the real operation in that \
-             tracked job so its exit status and output are available. While it runs, do \
-             independent work if useful; otherwise end your response and wait for the host \
-             notification, then collect output with bash_poll and check the result. Do not \
-             spend repeated model requests waiting with shell sleep, ls, pgrep, or empty \
-             polls. A file existing or a process disappearing does not prove success. \
-             Leave completion notifications off for servers and watchers. If a job was \
-             already started without notifications, use bash_poll to collect or wait for \
-             that tracked job; do not restart the operation just to enable notifications. \
-             Do not claim an untracked external process is being observed by the host.",
+            policy,
         );
-        atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
-            "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
+        atomcode_harness::plugins::self_knowledge::describes(
+            ctx,
+            "background-completion",
+            42,
+            knowledge,
+        );
         for command in [
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,
             Arc::new(LoopCommand(self.0.clone())),
+            Arc::new(QualityCommand(self.0.clone())),
             Arc::new(QueueCommand(self.0.clone())),
             Arc::new(PolicyCommand(self.0.clone())),
             Arc::new(WorktreeCommand(self.0.clone(), self.1.clone())),
@@ -3501,6 +3696,104 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_stub_budget_is_described_as_clamped() {
+        let row = super::CodingCompaction {
+            token_limit: None,
+            stub_recent_budget: Some(100_000),
+            provider: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        };
+        let described =
+            <super::CodingCompaction as atomcode_harness::seams::Compaction>::describe(&row);
+        assert!(described.contains("100000"));
+        assert!(described.contains("clamped"));
+    }
+
+    #[tokio::test]
+    async fn the_coding_row_uses_the_configured_stub_budget() {
+        use atomcode_kernel::message::{
+            CompactTrigger, CompactionStrategy, CompactionView, Conversation, Message,
+        };
+        use atomcode_kernel::tool::ToolCall;
+
+        fn big(text: &str) -> String {
+            format!("{text}\n{}", "x".repeat(600))
+        }
+        fn call(id: &str) -> Message {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+            )
+        }
+
+        // Three turns. The floor protects only the system line and the first
+        // user line; turn 1's tool result is old and is stubbed either way.
+        // Turn 2 is the one a smaller keep budget must be able to stub.
+        let mut conv = Conversation::new();
+        conv.messages = vec![
+            Message::system("persona"),
+            Message::user("first"),
+            call("b1"),
+            Message::tool_result("b1", big("first out"), false),
+            Message::user("second"),
+            call("b2"),
+            Message::tool_result("b2", big("second out"), false),
+            Message::user("third"),
+            call("b3"),
+            Message::tool_result("b3", big("third out"), false),
+        ];
+        let floor = conv.sacred_floor();
+        let view = CompactionView {
+            messages: &conv.messages,
+            trigger: CompactTrigger::Auto { utilization: 0.5 },
+            ctx_window: 1_000_000,
+            used_tokens: 500,
+            utilization: 0.5,
+            sacred_floor: floor,
+            parent: None,
+        };
+        let provider: crate::on_harness::SharedCompactionProviders =
+            std::sync::Arc::new(std::sync::RwLock::new(None));
+
+        let small = super::CodingCompaction {
+            token_limit: None,
+            stub_recent_budget: Some(1),
+            provider: provider.clone(),
+        }
+        .strategy()
+        .0;
+        let plan = small.plan(&view).await;
+        assert!(
+            plan.rewrites.iter().any(|(index, _)| *index == 6),
+            "the pinned small budget must stub the completed second turn"
+        );
+        assert!(
+            plan.rewrites.iter().any(|(index, _)| *index == 3),
+            "turn 1's tool result is old and stubbed under the small budget"
+        );
+
+        let default = super::CodingCompaction {
+            token_limit: None,
+            stub_recent_budget: None,
+            provider,
+        }
+        .strategy()
+        .0;
+        let plan = default.plan(&view).await;
+        assert!(
+            !plan.rewrites.iter().any(|(index, _)| *index == 6),
+            "without the pin, the window-relative budget keeps the second turn"
+        );
+        assert!(
+            plan.rewrites.iter().any(|(index, _)| *index == 3),
+            "turn 1's tool result is old and stubbed under the default budget"
+        );
+    }
+
     #[test]
     fn historical_framing_keeps_logged_stats_aligned_without_accepting_changed_text() {
         use atomcode_kernel::message::{
@@ -4583,6 +4876,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let error = ctx
                 .waterfall::<AgentRequest, _>(&mut request, |_| {
@@ -4629,6 +4923,7 @@ mod goal_rate_limit_classification_tests {
                 turn: 1,
                 round: 1,
                 answering_a_nudge: false,
+                images: Default::default(),
             };
             let seen = std::sync::atomic::AtomicU32::new(0);
             let began = tokio::time::Instant::now();
@@ -4667,15 +4962,45 @@ mod goal_rate_limit_classification_tests {
                 error.message.contains("request recovery budget exhausted"),
                 "{error}"
             );
-            assert_eq!(began.elapsed(), Duration::from_secs(expected_wait));
-            assert_eq!(
-                req.options
-                    .request_recovery
-                    .unwrap()
-                    .snapshot()
-                    .reserved_wait,
-                began.elapsed()
-            );
+            let ceiling = Duration::from_secs(expected_wait);
+            let floor = if statuses[0] == 503 {
+                ceiling.mul_f64(0.8)
+            } else {
+                ceiling
+            };
+            assert!((floor..=ceiling).contains(&began.elapsed()));
+            let reserved = req
+                .options
+                .request_recovery
+                .unwrap()
+                .snapshot()
+                .reserved_wait;
+            // One jittered sleep, rounded up to Tokio's millisecond resolution.
+            assert!((reserved..=reserved + Duration::from_millis(1)).contains(&began.elapsed()));
         }
+    }
+}
+
+struct QualityCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for QualityCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "quality",
+            Some("on|off|status|evidence|waive <reason>"),
+            "Configure quality checks and inspect verification evidence",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        self.0
+            .quality_for_session(agent.session_id().into(), args.into())
+            .await
     }
 }

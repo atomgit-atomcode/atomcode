@@ -65,12 +65,6 @@ fn native_runtime_mode(mode: ApprovalMode) -> atomcode_coding::RuntimeMode {
     }
 }
 
-/// 当前审批模式的线格字符串（"build" / "accept_edits" / "bypass" / "plan"），
-/// 供 Snapshot / 广播使用。
-fn live_current_mode_wire() -> String {
-    live_current_approval_mode().wire().to_string()
-}
-
 /// Coding Runtime 是工作目录的唯一运行时所有者；未绑定时使用 daemon 项目状态。
 fn live_current_working_dir(fallback: &Path) -> std::path::PathBuf {
     crate::native_live::binding()
@@ -296,9 +290,14 @@ pub(crate) fn chat_runtime_config(
     let (permission_rules, startup_warnings) =
         atomcode_coding::config::permission_rules_from_config(&config.permissions);
     atomcode_coding::CodingRuntimeConfig {
+        require_approval_hook: false,
         startup_warnings,
         extra_skill_dirs: config.skills.extra_dirs.clone(),
         compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
+        compact_stub_recent_budget: config
+            .compaction
+            .stub_recent_budget
+            .map(|limit| limit.get()),
         dirs: atomcode_coding::config::product_dirs_from_env(),
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -326,6 +325,7 @@ pub(crate) fn chat_runtime_config(
         mcp: true,
         telemetry: Some(telemetry),
         datalog: config.datalog.clone(),
+        quality: config.quality.clone(),
         reasoning_history: p.and_then(|p| p.reasoning_history.clone()),
         reasoning_effort: p.and_then(|p| p.reasoning_effort.clone()),
         reasoning_effort_levels: p.and_then(|p| p.reasoning_effort_levels.clone()),
@@ -356,6 +356,7 @@ pub(crate) fn chat_runtime_config(
         headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
+        response_header_timeout_secs: p.and_then(|p| p.response_header_timeout_secs),
         upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
         loop_max_rounds: atomcode_coding::resolve_loop_max_rounds(
             config.loop_config.max_rounds,
@@ -367,6 +368,11 @@ pub(crate) fn chat_runtime_config(
             config.coding.max_rounds,
             std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
         ),
+        architecture_topology: config.coding.architecture_topology,
+        auto_review: atomcode_coding::config::resolve_auto_review(
+            config.coding.auto_review,
+            std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref(),
+        ),
         repeat_stop_rounds: config.coding.repeat_stop_rounds,
         subagent_config: Some(Arc::new(config.clone())),
         // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
@@ -374,7 +380,10 @@ pub(crate) fn chat_runtime_config(
         // WebUI/daemon projection is intentionally deferred; avoid a hidden
         // auxiliary model request until that driver renders the suggestion.
         next_prompt_suggestions: false,
+        // `/chat` answers one request; only `/live` (below) shows later turns.
+        background_wakeups: false,
         lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
+        dap: atomcode_coding::config::dap_settings_from_config(&config.dap),
         web_search_provider: atomcode_coding::config::web_search_from_config(&config.web_search).0,
         web_search_api_key: atomcode_coding::config::web_search_from_config(&config.web_search).1,
     }
@@ -390,6 +399,9 @@ pub(crate) fn live_runtime_config(
 ) -> atomcode_coding::CodingRuntimeConfig {
     let mut runtime = chat_runtime_config(config, provider_name, working_dir, telemetry);
     runtime.interactive = true;
+    // The live hub shows turns it did not submit (`live_hub`: a turn started
+    // outside `submit`), so a background completion's turn reaches the page.
+    runtime.background_wakeups = true;
     runtime
 }
 
@@ -490,13 +502,8 @@ pub(crate) async fn run_chat_turn_v2(
         task,
         ..
     } = runtime;
-    // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
-    // （非视觉模型的 provider adapter 会因原图而报 400 错误）
-    let user_images = if text_carries_vl_caption(&user_text) {
-        Vec::new()
-    } else {
-        user_images
-    };
+    // Runtime preprocessing keeps these originals in its display-only sidecar
+    // while retaining the existing text-only input for a non-vision model.
     if let Err(error) = handle.set_mode(native_runtime_mode(approval_mode)).await {
         send_chat_runtime_error(&runtime_event_tx, format!("切换模式失败：{error}"));
         return;
@@ -543,17 +550,23 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
-                permission_routes.pending_call(&session_id, request.payload.get("call_id").and_then(serde_json::Value::as_str));
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
-                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
+                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload.clone())
                 else {
                     let _ = handle.respond(request.id, serde_json::Value::Null).await;
                     continue;
                 };
-                let answer = match &mut perm_rx {
+                permission_routes.pending_call(&session_id, Some(&approval.call_id));
+                // Capture identity before publishing: a fast HTTP client may consume
+                // the route as soon as it sees the projected permission event.
+                let expected_approval_id = permission_routes.approval_id(&session_id, &approval.call_id);
+                let interactive = perm_rx.is_some();
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                let mut answer = match &mut perm_rx {
                     None => fallback_approval_decision(approval_mode).into(),
                     Some(rx) => tokio::select! {
-                        _ = cancel.cancelled(), if !cancelled => {
+                        // A request can already be queued when the outer loop
+                        // observes cancellation. Its wait must still fail closed.
+                        _ = cancel.cancelled() => {
                             cancelled = true;
                             let _ = handle.cancel().await;
                             PermissionDecision::Deny.into()
@@ -561,6 +574,19 @@ pub(crate) async fn run_chat_turn_v2(
                         answer = rx.recv() => answer.unwrap_or(PermissionDecision::Deny.into()),
                     },
                 };
+                permission_routes.pending_call(&session_id, None);
+                // A cancellation or stale answer can never install a persistent grant.
+                // The HTTP route checks this too; the runtime remains authoritative.
+                if cancel.is_cancelled() {
+                    if !cancelled {
+                        cancelled = true;
+                        let _ = handle.cancel().await;
+                    }
+                    answer = PermissionDecision::Deny.into();
+                } else if interactive && (answer.call_id.as_deref() != Some(approval.call_id.as_str())
+                    || expected_approval_id.is_none() || answer.approval_id != expected_approval_id) {
+                    answer = PermissionDecision::Deny.into();
+                }
                 // "Always allow this MCP tool" is carried out by this runtime — the
                 // one the call belongs to — and names the tool the request is for,
                 // not whatever the client sent alongside its answer.
@@ -602,7 +628,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let answer = await_chat_user_input_response(rx, coding_cfg.request_timeout);
                 tokio::pin!(answer);
                 let value = tokio::select! {
-                    _ = cancel.cancelled(), if !cancelled => {
+                    _ = cancel.cancelled() => {
                         cancelled = true;
                         let _ = handle.cancel().await;
                         serde_json::Value::Null
@@ -702,11 +728,19 @@ use serde::Serialize;
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "context_compacting")]
-    ContextCompacting { active: bool },
+    ContextCompacting {
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
+    },
     #[serde(rename = "context_summary")]
     ContextSummary { count: u64, record: bool },
     #[serde(rename = "snapshot")]
     Snapshot {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        history_seed: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history_older: Option<crate::display_history::Cursor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary_count: Option<u64>,
         messages: Vec<crate::MessageInfo>,
@@ -727,6 +761,8 @@ pub(crate) enum LiveWireEvent {
         /// Goal controller state is not persisted in SessionSnapshot, so the
         /// initial wire snapshot carries it explicitly for late subscribers.
         goal: Option<LiveGoalSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loop_progress: Option<atomcode_coding::LoopProgress>,
     },
     #[serde(rename = "provider_selection_pending")]
     ProviderSelectionPending {
@@ -762,6 +798,11 @@ pub(crate) enum LiveWireEvent {
         last_reason: Option<String>,
         recovery: Option<atomcode_coding::GoalRecoveryProgress>,
     },
+    #[serde(rename = "loop_changed")]
+    LoopChanged {
+        #[serde(flatten)]
+        progress: atomcode_coding::LoopProgress,
+    },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
     #[serde(rename = "command_output")]
@@ -792,6 +833,8 @@ pub(crate) enum LiveWireEvent {
         output: String,
         success: bool,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::ImageData>,
     },
     #[serde(rename = "tokens")]
     Tokens {
@@ -815,12 +858,16 @@ pub(crate) enum LiveWireEvent {
     /// `Error` so a client can render it as a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Routine automatic retry diagnostics; clients keep these out of live status.
+    #[serde(rename = "provider_retry")]
+    ProviderRetry { message: String },
     /// Auxiliary session persistence failed. Kept distinct from conversational
     /// warnings so browser clients render it outside the message timeline.
     #[serde(rename = "persistence_warning")]
     PersistenceWarning { message: String },
     #[serde(rename = "permission_request")]
     PermissionRequest {
+        approval_id: String,
         tool_name: String,
         reason: String,
         call_id: String,
@@ -922,11 +969,20 @@ impl NativeLiveWireProjector {
         // events before drivers see them. Read its actual production seam.
         match &event {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionStarted { .. }) => {
-                return Some(LiveWireEvent::ContextCompacting { active: true })
+                return Some(LiveWireEvent::ContextCompacting {
+                    active: true,
+                    diagnostic: None,
+                })
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
             }) => {
+                if let Some(message) = outcome.diagnostic_message() {
+                    return Some(LiveWireEvent::ContextCompacting {
+                        active: false,
+                        diagnostic: Some(message),
+                    });
+                }
                 if outcome.committed {
                     if let Some(count) = self
                         .working_dir
@@ -940,11 +996,19 @@ impl NativeLiveWireProjector {
                         }
                     }
                 }
-                return Some(LiveWireEvent::ContextCompacting { active: false });
+                return Some(LiveWireEvent::ContextCompacting {
+                    active: false,
+                    diagnostic: None,
+                });
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Interrupted { .. },
-            }) => return Some(LiveWireEvent::ContextCompacting { active: false }),
+            }) => {
+                return Some(LiveWireEvent::ContextCompacting {
+                    active: false,
+                    diagnostic: None,
+                })
+            }
             _ => {}
         }
         Some(match event {
@@ -1017,6 +1081,11 @@ impl NativeLiveWireProjector {
                         id: result.call_id,
                         name,
                         output: result.content,
+                        images: result
+                            .images
+                            .into_iter()
+                            .map(crate::ImageData::from)
+                            .collect(),
                         success: !result.is_error,
                         duration_ms: started.elapsed().as_millis() as u64,
                     }
@@ -1038,7 +1107,7 @@ impl NativeLiveWireProjector {
                     max_attempts,
                     backoff_secs,
                     reason,
-                } => LiveWireEvent::Warning {
+                } => LiveWireEvent::ProviderRetry {
                     message: format!(
                         "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
                     ),
@@ -1059,10 +1128,13 @@ impl NativeLiveWireProjector {
                 Kernel::OutputTruncationRecovery {
                     attempt,
                     max_attempts,
+                    reason,
                 } => LiveWireEvent::Warning {
-                    message: format!(
+                    message: reason.unwrap_or_else(|| {
+                        format!(
                         "output limit reached; automatically continuing ({attempt}/{max_attempts})"
-                    ),
+                    )
+                    }),
                 },
                 Kernel::RateLimited {
                     reset_at_display,
@@ -1102,8 +1174,10 @@ impl NativeLiveWireProjector {
                         .get("project_rule")
                         .cloned()
                         .and_then(|v| serde_json::from_value(v).ok());
+                    let approval_id = request.payload.get("approval_id")?.as_str()?.to_owned();
                     let approval: ApprovalRequest = serde_json::from_value(request.payload).ok()?;
                     LiveWireEvent::PermissionRequest {
+                        approval_id,
                         tool_name: approval.tool,
                         reason: approval
                             .reason
@@ -1185,6 +1259,9 @@ impl NativeLiveWireProjector {
                 LiveWireEvent::Mode {
                     mode: mode.wire().into(),
                 }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::LoopChanged(progress)) => {
+                LiveWireEvent::LoopChanged { progress }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
                 use atomcode_coding::{GoalPhase, GoalTerminal};
@@ -1474,6 +1551,8 @@ pub(crate) async fn sync_live_provider_config(
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct LiveStreamQuery {
     #[serde(default)]
+    pub recent: bool,
+    #[serde(default)]
     pub session_id: Option<String>,
 }
 
@@ -1558,7 +1637,7 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &atomcode_coding::config::product_dirs_from_env(),
     );
-    let (session_name, session_meta, turn_timestamps) = {
+    let (session_name, catalog_session, turn_timestamps) = {
         match crate::legacy_convert::load_catalog_session_view_in_project(
             &project_hash,
             &join.binding.session_id,
@@ -1566,7 +1645,7 @@ pub(crate) async fn live_stream(
             Ok(Some(session)) => {
                 let timestamps =
                     crate::load_turn_timestamps(&project_hash, &join.binding.session_id).await;
-                (session.meta.name.clone(), Some(session.meta), timestamps)
+                (session.meta.name.clone(), Some(session), timestamps)
             }
             Ok(None) => (String::new(), None, crate::TurnTimestamps::new()),
             Err(error) => {
@@ -1583,41 +1662,101 @@ pub(crate) async fn live_stream(
     // projector can update its session after a SessionChanged event, so the id
     // must be captured at the exact point where each event is projected.
     let (tx, out_rx) = mpsc::unbounded_channel::<(String, LiveWireEvent)>();
-    let mut snapshot_messages: Vec<crate::MessageInfo> = join
-        .snapshot
-        .messages
-        .iter()
-        .map(crate::MessageInfo::from_kernel)
-        .collect();
-    let sources = crate::snapshot_spec_sources(
-        &join.snapshot,
-        std::path::Path::new(&join.binding.working_dir),
-        &join.binding.session_id,
-    );
-    for (info, (seq, pinned)) in snapshot_messages.iter_mut().zip(sources) {
-        info.source_seq = seq;
-        info.task_spec_pinned = pinned;
-    }
-    if let Some(meta) = session_meta.as_ref() {
-        crate::attach_snapshot_message_timestamps(
-            &mut snapshot_messages,
-            &join.snapshot,
-            meta,
-            &turn_timestamps,
-        );
-    }
-    // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
-    // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
-    // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
-    crate::attach_display_images(
-        &mut snapshot_messages,
+    let display_manager = crate::NativeSessionManager::for_project(
         &snapshot_wd,
-        &join.binding.session_id,
+        &atomcode_coding::config::product_dirs_from_env(),
     );
+    // Only issue HTTP paging cursors over the HTTP display projection. A live
+    // snapshot may contain request-only system context, or an uncommitted tail.
+    // In the latter case retain the complete live view with no paging cursor.
+    let canonical = catalog_session.as_ref().and_then(|session| {
+        crate::live_session_messages_for_display(
+            &join.snapshot,
+            session,
+            &turn_timestamps,
+            &display_manager,
+        )
+        .ok()
+        .flatten()
+    });
+    let (mut snapshot_messages, pageable) = if let Some(messages) = canonical {
+        (messages, true)
+    } else {
+        let mut snapshot_messages: Vec<crate::MessageInfo> = join
+            .snapshot
+            .messages
+            .iter()
+            .map(crate::MessageInfo::from_kernel)
+            .collect();
+        let sources = crate::snapshot_spec_sources(
+            &join.snapshot,
+            std::path::Path::new(&join.binding.working_dir),
+            &join.binding.session_id,
+        );
+        let tool_images = display_manager
+            .load_events(&join.binding.session_id)
+            .ok()
+            .map(|events| crate::tool_images::from_events(&join.snapshot, &events))
+            .unwrap_or_default();
+        for (index, ((info, (seq, pinned)), raw)) in snapshot_messages
+            .iter_mut()
+            .zip(sources)
+            .zip(&join.snapshot.messages)
+            .enumerate()
+        {
+            if let (Some(result), Some(images)) =
+                (info.tool_result.as_mut(), tool_images.get(index))
+            {
+                result.images = images.clone();
+            }
+            info.source_seq = seq;
+            info.task_spec_pinned = pinned;
+            crate::attach_native_display_images(
+                info,
+                &display_manager,
+                &join.binding.session_id,
+                &raw.text,
+            );
+        }
+        if let Some(meta) = catalog_session.as_ref().map(|session| &session.meta) {
+            crate::attach_snapshot_message_timestamps(
+                &mut snapshot_messages,
+                &join.snapshot,
+                meta,
+                &turn_timestamps,
+            );
+        }
+        // Re-attach display-only images (VL-preprocessed originals) so a refresh — which
+        // rebuilds from the kernel snapshot (image stripped) — shows the thumbnail, not the
+        // "missing image" placeholder. Same sidecar the HTTP session-load path reads.
+        crate::attach_display_images(
+            &mut snapshot_messages,
+            &snapshot_wd,
+            &join.binding.session_id,
+        );
+        (snapshot_messages, false)
+    };
     let summary_count = crate::context_summary_count(&snapshot_wd, &join.binding.session_id);
+    let history_seed = if q.recent {
+        crate::display_history::state_seed(&snapshot_messages)
+    } else {
+        Vec::new()
+    };
+    let history_older = if q.recent && pageable {
+        crate::display_history::window(
+            &format!("{project_hash}/{}", join.binding.session_id),
+            &mut snapshot_messages,
+            None,
+        )
+        .unwrap_or(None)
+    } else {
+        None
+    };
     let _ = tx.send((
         join.binding.session_id.clone(),
         LiveWireEvent::Snapshot {
+            history_seed,
+            history_older,
             summary_count,
             messages: snapshot_messages,
             session_id: join.binding.session_id.clone(),
@@ -1625,9 +1764,10 @@ pub(crate) async fn live_stream(
             project_hash,
             provider: join.binding.provider.clone(),
             model: join.model.clone(),
-            mode: live_current_mode_wire(),
+            mode: join.mode.wire().to_string(),
             working_dir: snapshot_wd.to_string_lossy().to_string(),
             goal: initial_goal.as_ref().map(goal_snapshot),
+            loop_progress: join.loop_progress.clone(),
         },
     ));
     if let Some(current) = join.pending_turn_model.clone() {
@@ -1984,6 +2124,7 @@ pub(crate) async fn live_message(
             return Json(serde_json::json!({ "accepted": false, "error": error }));
         }
     };
+    let mut submission_binding = join.binding.clone();
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
     let mut provider_change_applied = true;
@@ -2025,7 +2166,10 @@ pub(crate) async fn live_message(
             match crate::native_live::reload_provider(&join.binding, next, requested_fingerprint)
                 .await
             {
-                Ok(_) => {
+                Ok(generation) => {
+                    // Only our own successful reload may advance the captured
+                    // target. Never reacquire whichever session is current.
+                    submission_binding.generation = generation.0;
                     provider_name = requested_provider;
                 }
                 // A turn is active, so this /live/message is a STEER that folds into
@@ -2099,6 +2243,7 @@ pub(crate) async fn live_message(
     );
     let (runtime_input, echo_input) = split_live_inputs(req.message, original_images, runtime_text);
     match crate::native_live::submit_confirmed_with_echo(
+        &submission_binding,
         runtime_input,
         echo_input,
         req.client_input_id,
@@ -2364,7 +2509,7 @@ pub(crate) struct ApprovalModeResp {
 pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     Json(ApprovalModeResp {
         ok: true,
-        mode: live_current_approval_mode(),
+        mode: crate::native_live::current_mode().unwrap_or_else(live_current_approval_mode),
         error: None,
         selection: None,
     })
@@ -2625,12 +2770,15 @@ pub(crate) async fn live_reasoning_effort(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct LivePermissionReq {
+    #[serde(default)]
+    pub approval_id: Option<String>,
     pub decision: String, // "allow" | "deny" | "always_allow" | "allow_persist"
     /// Full MCP tool name (`mcp__{server}__{tool}`) the client believes it is
     /// answering. Informational only: `allow_persist` grants the tool named by
     /// the pending approval itself, never this field.
     #[serde(default)]
-    pub tool_name: Option<String>,
+    #[serde(rename = "tool_name")]
+    pub _tool_name: Option<String>,
     #[serde(default)]
     pub call_id: Option<String>,
 }
@@ -2652,7 +2800,10 @@ pub(crate) async fn persist_mcp_tool_approval(
     }
 }
 
-fn report_mcp_tool_approval(alias: &str, approval: Option<atomcode_coding::McpToolApproval>) {
+pub(crate) fn report_mcp_tool_approval(
+    alias: &str,
+    approval: Option<atomcode_coding::McpToolApproval>,
+) {
     match approval {
         None => tracing::warn!(
             target: "atomcode::mcp",
@@ -2683,7 +2834,7 @@ fn report_mcp_tool_approval(alias: &str, approval: Option<atomcode_coding::McpTo
 ///   anything else  → PermissionDecision::Deny
 pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl IntoResponse {
     use atomcode_capabilities::tools::{
-        parse_permission_decision, ApprovalRequest, PermissionDecision, APPROVAL_KIND,
+        parse_permission_decision, PermissionDecision, APPROVAL_KIND,
     };
     // Answer the approval the runtime is actually waiting on — nothing pending,
     // nothing to answer and nothing to grant. A stale tab replaying an answer
@@ -2699,35 +2850,6 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
         return Json(serde_json::json!({"accepted": false}));
     }
     let decision = if req.decision == "allow_persist" {
-        // "Always allow this MCP tool" names the tool the request is for, not
-        // whatever the client sent alongside its answer (same as /chat).
-        let asked = serde_json::from_value::<ApprovalRequest>(payload)
-            .ok()
-            .map(|approval| approval.tool)
-            .filter(|tool| tool.starts_with("mcp__"));
-        if let Some(full) = asked {
-            if req
-                .tool_name
-                .as_deref()
-                .is_some_and(|claimed| claimed != full)
-            {
-                tracing::warn!(
-                    target: "atomcode::mcp",
-                    tool = %full,
-                    claimed = ?req.tool_name,
-                    "\"always allow\" names a different tool than the pending approval; using the pending one"
-                );
-            }
-            match crate::native_live::approve_mcp_tool(full.clone()).await {
-                Ok(approval) => report_mcp_tool_approval(&full, approval),
-                Err(error) => tracing::warn!(
-                    target: "atomcode::mcp",
-                    tool = %full,
-                    error = ?error,
-                    "\"always allow\" not applied: no live runtime to apply it"
-                ),
-            }
-        }
         PermissionDecision::AllowOnce
     } else {
         parse_permission_decision(&req.decision)
@@ -2746,9 +2868,18 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
     if req.decision == "allow_project" {
         value = serde_json::json!({"decision":"allow", "save_project_rule":true});
     }
-    let ok = crate::native_live::respond_confirmed(id, value)
-        .await
-        .is_ok();
+    let (Some(token), Some(call_id)) = (req.approval_id.as_deref(), req.call_id.as_deref()) else {
+        return Json(serde_json::json!({"accepted": false}));
+    };
+    let ok = crate::native_live::respond_approval_confirmed(
+        id,
+        token,
+        call_id,
+        value,
+        req.decision == "allow_persist",
+    )
+    .await
+    .is_ok();
     Json(serde_json::json!({ "accepted": ok }))
 }
 
@@ -2923,6 +3054,37 @@ pub(crate) async fn live_compact(State(_state): State<AppState>) -> impl IntoRes
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct McpSessionQuery {
+    session: String,
+}
+#[derive(serde::Deserialize)]
+pub(crate) struct McpSessionChange {
+    session: String,
+    paused: bool,
+}
+
+pub(crate) async fn live_mcp_session_get(
+    axum::extract::Query(q): axum::extract::Query<McpSessionQuery>,
+) -> axum::response::Response {
+    mcp_session_reply(crate::native_live::mcp_session(q.session, None).await)
+}
+pub(crate) async fn live_mcp_session_post(
+    Json(q): Json<McpSessionChange>,
+) -> axum::response::Response {
+    mcp_session_reply(crate::native_live::mcp_session(q.session, Some(q.paused)).await)
+}
+fn mcp_session_reply(result: Result<bool, crate::live_hub::HubError>) -> axum::response::Response {
+    match result {
+        Ok(paused) => Json(serde_json::json!({"paused": paused})).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /live/mcp/trust — Trust the current project so its `.mcp.json` servers
 /// are allowed to connect on the next turn. Rebuilds the serving MCP registry
 /// so newly-allowed servers start connecting immediately.
@@ -2961,6 +3123,96 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_result_images_preserve_wire_order_mime_and_failed_status() {
+        let mut projector = NativeLiveWireProjector::default();
+        let event = atomcode_kernel::event::AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "picture-call".into(),
+                content: "captured".into(),
+                is_error: true,
+                images: vec![
+                    atomcode_kernel::message::ImageContent {
+                        data: "FIRST".into(),
+                        media_type: "image/png".into(),
+                    },
+                    atomcode_kernel::message::ImageContent {
+                        data: "SECOND".into(),
+                        media_type: "image/jpeg".into(),
+                    },
+                ],
+            },
+        };
+        let json = serde_json::to_value(
+            &projector
+                .project(crate::live_hub::LiveViewEvent::Runtime(
+                    atomcode_coding::CodingRuntimeEvent::Agent(event),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["images"][0]["data"], "FIRST");
+        assert_eq!(json["images"][1]["data"], "SECOND");
+        assert_eq!(json["images"][1]["media_type"], "image/jpeg");
+        assert_eq!(json["success"], false);
+        assert_eq!(json["output"], "captured");
+        assert_eq!(json["id"], "picture-call");
+    }
+
+    #[test]
+    fn loop_quota_progress_crosses_the_live_wire_as_a_loop() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::LoopChanged(atomcode_coding::LoopProgress {
+                    active: true,
+                    round: 2,
+                    elapsed_secs: 10,
+                    label: "check CI".into(),
+                    last_reason: None,
+                    recovery: Some(atomcode_coding::GoalRecoveryProgress {
+                        kind: atomcode_coding::GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                }),
+            ))
+            .unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "loop_changed");
+        assert_eq!(json["label"], "check CI");
+        assert_eq!(json["recovery"]["waiting_for_quota"], true);
+        assert_eq!(json["recovery"]["retry_in_secs"], 30);
+    }
+
+    #[test]
+    fn failed_summary_has_a_diagnostic_and_stops_the_live_compaction_indicator() {
+        let mut outcome = atomcode_coding::runtime::CompactionOutcome::from_kernel(
+            atomcode_kernel::message::CompactTrigger::Manual { focus: None },
+            0,
+            0,
+            2_000_000,
+            2_000_000,
+            false,
+            None,
+        );
+        outcome.diagnostic = Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed);
+        let expected = outcome.diagnostic_message().unwrap();
+        let wire = super::NativeLiveWireProjector::default()
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome),
+                },
+            ))
+            .unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "context_compacting");
+        assert_eq!(json["active"], false);
+        assert_eq!(json["diagnostic"], expected);
+    }
+
     #[test]
     fn normalized_runtime_compaction_progress_has_a_terminal_even_without_a_stored_count() {
         use atomcode_coding::{
@@ -3002,9 +3254,10 @@ mod tests {
         let mut projector = super::NativeLiveWireProjector::default();
         let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(atomcode_coding::CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
             id:42, kind:atomcode_capabilities::tools::APPROVAL_KIND.into(), snapshot:None,
-            payload:serde_json::json!({"call_id":"call-42","tool":"bash","args":"{}","reason":"specific safety reason","project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}}),
+            payload:serde_json::json!({"approval_id":"approval-42","call_id":"call-42","tool":"bash","args":"{}","reason":"specific safety reason","project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}}),
         }))).unwrap();
         let value = serde_json::to_value(wire).unwrap();
+        assert_eq!(value["approval_id"], "approval-42");
         assert_eq!(value["reason"], "specific safety reason");
         assert_eq!(value["project_rule"]["rule"], "Bash(rm -rf scratch)");
     }
@@ -3231,6 +3484,8 @@ mod tests {
             source: McpConfigSource::Project,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         };
         let part_before = partition_by_trust(vec![project_cfg.clone()], &proj, &tree);
         assert_eq!(
@@ -3555,6 +3810,8 @@ mod tests {
             "test".into(),
         );
         let mut config = atomcode_config::Config::default();
+        config.coding.auto_review = false;
+        config.coding.architecture_topology = true;
         config.permissions.default_mode = Some(atomcode_config::config::DefaultExecutionMode::Plan);
         let runtime = live_runtime_config(
             &config,
@@ -3563,6 +3820,18 @@ mod tests {
             telemetry,
         );
         assert!(runtime.interactive);
+        assert!(
+            runtime.agent_config().background_wakeups,
+            "the live page shows a turn a background completion starts"
+        );
+        assert!(runtime.agent_config().architecture_topology);
+        assert_eq!(
+            runtime.agent_config().auto_review,
+            atomcode_coding::config::resolve_auto_review(
+                false,
+                std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref()
+            )
+        );
         assert_eq!(
             runtime.agent_config().initial_mode,
             atomcode_coding::RuntimeMode::Plan
@@ -3867,6 +4136,25 @@ mod tests {
     }
 
     #[test]
+    fn automatic_retries_are_diagnostics_instead_of_warnings() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(
+            atomcode_coding::CodingRuntimeEvent::Agent(
+                atomcode_kernel::event::AgentEvent::ProviderRetry {
+                    attempt: 1,
+                    max_attempts: 5,
+                    backoff_secs: 3,
+                    reason: "timeout".into(),
+                },
+            ),
+        ));
+        let wire = wire.unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "provider_retry");
+        assert!(json["message"].as_str().unwrap().contains("timeout"));
+    }
+
+    #[test]
     fn native_live_projector_exposes_exact_steered_inputs() {
         let mut projector = NativeLiveWireProjector::default();
         let wire = projector
@@ -3924,6 +4212,7 @@ mod tests {
         kernel_message.synthetic = true;
         let event = CodingRuntimeEvent::CompactionFinished {
             completion: CompactionCompletion::Completed(CompactionOutcome {
+                diagnostic: None,
                 trigger: CompactTrigger::Manual { focus: None },
                 epoch: 1,
                 removed_messages: 2,

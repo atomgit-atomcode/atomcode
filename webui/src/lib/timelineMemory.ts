@@ -76,7 +76,7 @@ export function replaceArchived<T extends TimelineMessage>(current: T[], entries
 /** Approximate retained UTF-16 payload size; no stringify or text copies. */
 export function timelineWeight(message: TimelineMessage): number {
   return 256 + message.parts.reduce((bytes, part) => bytes + 96 + 2 * (part.kind === 'tool'
-    ? part.tool.args.length + (part.tool.output?.length ?? 0) + (part.tool.progress?.length ?? 0)
+    ? part.tool.args.length + (part.tool.output?.length ?? 0) + (part.tool.progress?.length ?? 0) + (part.tool.images?.reduce((size, image) => size + image.data.length, 0) ?? 0)
     : part.text.length), 0) + (message.images?.reduce((bytes, image) => bytes + image.data.length * 2, 0) ?? 0);
 }
 

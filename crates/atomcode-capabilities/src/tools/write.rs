@@ -80,13 +80,14 @@ impl Tool for WriteFileTool {
         };
         let path = resolve_path(&a.file_path, &ctx.working_dir);
 
-        // Capture pre-existing line count for an overwrite diff message.
+        // Display-only inspection must never read the entire old file.
+        let existed = self.world.info(&path).await.ok().map(|info| info.exists);
         let old_lines = self
             .world
-            .read_text(&path)
+            .count_lines_bounded(&path, 10 * 1024 * 1024)
             .await
             .ok()
-            .map(|s| s.lines().count());
+            .flatten();
 
         if let Some(parent) = path.parent() {
             if let Err(e) = self.world.create_dir_all(parent).await {
@@ -111,7 +112,7 @@ impl Tool for WriteFileTool {
             return err(format!("write_file: failed to write {disp}: {e}"));
         }
 
-        let msg = match old_lines {
+        let mut msg = match old_lines {
             Some(old) => {
                 let diff = new_lines as i64 - old as i64;
                 let sign = if diff >= 0 { "+" } else { "" };
@@ -127,14 +128,57 @@ impl Tool for WriteFileTool {
                 }
                 m
             }
-            None => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
+            None => match existed {
+                Some(false) => format!("Created {disp} ({bytes} bytes, {new_lines} lines)"),
+                Some(true) => format!("Overwrote {disp} ({bytes} bytes, {new_lines} lines; previous line count unavailable)"),
+                None => format!("Wrote {disp} ({bytes} bytes, {new_lines} lines; previous line count unavailable)"),
+            },
         };
+        if let Some(warning) = windows_script_encoding_warning(&path, &a.content) {
+            msg.push_str(warning);
+        }
         ok(msg)
+    }
+}
+
+// Inspect content, not the host OS: scripts may be authored for Windows remotely.
+fn windows_script_encoding_warning(path: &std::path::Path, content: &str) -> Option<&'static str> {
+    if content.is_ascii() {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("ps1") {
+        if content.starts_with('\u{feff}') {
+            return None;
+        }
+        Some("\nWARNING: This PowerShell script contains non-ASCII text without a BOM. Windows PowerShell 5.1 -File reads it using the legacy ANSI code page and may create wrongly named paths. Use the pwsh tool to execute the command directly, PowerShell 7 if available, or explicitly save this .ps1 as UTF-8 with BOM before running it in 5.1. Changing console output encoding does not fix script decoding.")
+    } else if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+        Some("\nWARNING: This batch script contains non-ASCII UTF-8 text. cmd.exe may read it using a different active code page and create wrongly named paths. Prefer the pwsh tool with literal paths instead of a batch file; do not assume adding a BOM makes cmd.exe read UTF-8 correctly.")
+    } else {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_script_encoding_warning_targets_unsafe_script_content() {
+        use std::path::Path;
+        for extension in ["ps1", "PS1", "cmd", "BAT"] {
+            let path = format!("script.{extension}");
+            assert!(
+                super::windows_script_encoding_warning(Path::new(&path), "mkdir '工作区'")
+                    .is_some()
+            );
+            assert!(super::windows_script_encoding_warning(Path::new(&path), "echo ok").is_none());
+        }
+        assert!(super::windows_script_encoding_warning(
+            Path::new("script.ps1"),
+            "\u{feff}mkdir '工作区'"
+        )
+        .is_none());
+        assert!(super::windows_script_encoding_warning(Path::new("notes.md"), "工作区").is_none());
+    }
     use super::*;
     use atomcode_kernel::tool::ToolContext;
     use tokio_util::sync::CancellationToken;
@@ -145,6 +189,35 @@ mod tests {
             cancel: CancellationToken::new(),
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn script_encoding_warning_reaches_the_model_without_changing_file_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        for (file, content, warning) in [
+            ("task.ps1", "New-Item '工作区'", true),
+            ("task.ps1", "\u{feff}New-Item '工作区'", false),
+            ("task.CMD", "mkdir 工作区", true),
+            ("task.bat", "\u{feff}mkdir 工作区", true),
+            ("notes.md", "工作区", false),
+        ] {
+            let result = WriteFileTool::default()
+                .execute(
+                    &serde_json::json!({"file_path": file, "content": content}).to_string(),
+                    &ctx(d.path()),
+                )
+                .await;
+            assert_eq!(
+                result.content.contains("WARNING:"),
+                warning,
+                "{}",
+                result.content
+            );
+            assert_eq!(
+                std::fs::read(d.path().join(file)).unwrap(),
+                content.as_bytes()
+            );
         }
     }
 
@@ -179,6 +252,30 @@ mod tests {
             "{}",
             r.content
         );
+    }
+
+    #[tokio::test]
+    async fn large_overwrite_skips_count_and_still_reports_overwrite() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("large.log");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(100 * 1024 * 1024)
+            .unwrap();
+        let result = WriteFileTool::default()
+            .execute(
+                r#"{"file_path":"large.log","content":"small\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.starts_with("Overwrote"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("previous line count unavailable"));
+        assert_eq!(std::fs::read(path).unwrap(), b"small\n");
     }
 
     #[tokio::test]

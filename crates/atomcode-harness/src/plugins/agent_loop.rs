@@ -186,7 +186,10 @@ impl PluginAgentLoop {
                 let provider = provider.clone();
                 let ctx = ctx.clone();
                 let session = session.clone();
-                let messages = req.messages.clone();
+                // Pictures are judged here, on exactly what is sent: a row may
+                // have rebuilt the request from the log since `image-budget` ran.
+                let mut messages = req.messages.clone();
+                super::image_budget::finalize(&mut messages, &mut req.images);
                 let tools = if text_only {
                     Vec::new()
                 } else {
@@ -207,20 +210,32 @@ impl PluginAgentLoop {
                     if retained_bytes > super::spec::allowance(provider.context_window()) {
                         return Err(RequestError::message("Task specifications exceed the current model's context allowance. Use /spec to unpin messages or choose a larger context model."));
                     }
-                    stream_once(
+                    let remember = options.tool_choice == ToolChoice::Auto
+                        && messages.iter().all(|message| message.images.is_empty());
+                    let effort = options.reasoning_effort;
+                    let result = stream_once(
                         &*provider,
                         &ctx,
                         &session,
                         turn,
                         round,
-                        messages,
-                        tools,
+                        &messages,
+                        &tools,
                         options,
                         idle,
                         first_content,
                         &loop_retried,
                     )
-                    .await
+                    .await;
+                    if remember && result.is_ok() {
+                        session.remember_sent_prompt(crate::session::SentPrompt {
+                            provider: Arc::downgrade(&provider),
+                            messages: Arc::new(messages),
+                            tools: tools.into(),
+                            reasoning_effort: effort,
+                        });
+                    }
+                    result
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
             })
             .await;
@@ -402,8 +417,8 @@ async fn stream_once(
     session: &SessionLog,
     turn: u64,
     round: u32,
-    messages: Vec<Message>,
-    tools: Vec<ToolDef>,
+    messages: &[Message],
+    tools: &[ToolDef],
     options: ChatOptions,
     idle: Option<std::time::Duration>,
     first_content: Option<std::time::Duration>,
@@ -417,8 +432,8 @@ async fn stream_once(
             session,
             turn,
             round,
-            &messages,
-            &tools,
+            messages,
+            tools,
             options.clone(),
             idle,
             first_content,
@@ -563,7 +578,10 @@ async fn stream_attempt(
                 return Err(RequestError {
                     retryable: !saw_tool_stream,
                     unexecuted_tool_output: saw_tool_stream,
-                    code: Some(STREAM_IDLE_CODE.to_string()),
+                    // ToolExec is downstream of a successful AgentRequest. No
+                    // call from this failed collection attempt was dispatched.
+                    tool_dispatch: crate::events::ToolDispatchProof::NotDispatched,
+                    code: Some(STREAM_IDLE_CODE.into()),
                     ..RequestError::message(format!(
                         "stream idle timeout ({}): no content for {}ms",
                         watchdog.phase(),
@@ -660,6 +678,7 @@ async fn stream_attempt(
             StreamEvent::Error(err) => {
                 let mut error = RequestError::from_provider(&err).with_partial(out);
                 error.unexecuted_tool_output |= saw_tool_stream;
+                error.tool_dispatch = crate::events::ToolDispatchProof::NotDispatched;
                 if saw_tool_stream {
                     error.retryable = false;
                 }
@@ -676,9 +695,16 @@ async fn stream_attempt(
     }
 
     // A response with neither text nor tool calls cannot advance the turn.
-    // Reported as a typed failure so a retry policy can decide, rather than
-    // silently producing an empty assistant message.
     if out.text.trim().is_empty() && out.tool_calls.is_empty() {
+        // Reasoning alone is an answer that stopped short, not a provider that
+        // failed: handed on as such, so truncation recovery can ask the model
+        // to act on it. Retrying it blind discards the reasoning and repeats it.
+        if !out.reasoning.trim().is_empty() || !out.reasoning_blocks.is_empty() {
+            out.ended_in_reasoning = true;
+            return Ok(out);
+        }
+        // Nothing at all: a typed failure so a retry policy can decide, rather
+        // than silently producing an empty assistant message.
         return Err(RequestError::empty().into());
     }
     Ok(out)
@@ -1008,6 +1034,7 @@ impl PluginAgentLoop {
                     turn,
                     round: step,
                     answering_a_nudge,
+                    images: Default::default(),
                 },
             );
             let cancel = agent.cancel_token();
@@ -1028,6 +1055,11 @@ impl PluginAgentLoop {
                     break;
                 }
                 Err(error) => {
+                    if error.policy_denied {
+                        outcome.stop = StopReason::PolicyDenied;
+                        outcome.error = Some(error.message);
+                        break;
+                    }
                     if let Some(pause) = error.rate_limit_pause.clone() {
                         outcome.provider_error = Some(error.clone());
                         // Not a failure: the turn stops cleanly and says when to
@@ -1036,7 +1068,14 @@ impl PluginAgentLoop {
                         outcome.stop = StopReason::RateLimited;
                         break;
                     }
-                    outcome.stop = if error.code.as_deref() == Some(STREAM_IDLE_CODE) {
+                    outcome.stop = if matches!(
+                        error.code.as_deref(),
+                        Some(
+                            STREAM_IDLE_CODE
+                                | atomcode_kernel::stream::OPEN_TIMEOUT_CODE
+                                | crate::events::HOST_DEADLINE_CODE
+                        )
+                    ) {
                         StopReason::Timeout
                     } else {
                         StopReason::ProviderError
@@ -1057,6 +1096,12 @@ impl PluginAgentLoop {
                         usage,
                     },
                 );
+            }
+            // Nothing to add to an internal note, but the provider's usage is
+            // still a paid receipt and must be kept before suppressing the reply.
+            if response.ended_in_reasoning && !response.truncated && answering_a_nudge {
+                outcome.stop = StopReason::Stopped;
+                break;
             }
             let meta = response_meta(
                 &session,
@@ -1302,7 +1347,7 @@ pub(super) fn response_meta(
         session_id: Some(session.id().to_string()),
         finish_reason: if !response.tool_calls.is_empty() {
             "tool_calls"
-        } else if response.truncated {
+        } else if response.truncated && !response.ended_in_reasoning {
             "length"
         } else {
             "stop"
@@ -1496,8 +1541,8 @@ mod content_deadline_tests {
             &log,
             1,
             0,
-            Vec::new(),
-            Vec::new(),
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
@@ -1524,8 +1569,8 @@ mod content_deadline_tests {
             &log,
             1,
             1,
-            vec![],
-            vec![],
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             None,
@@ -1648,6 +1693,10 @@ mod content_deadline_tests {
         .await
         .unwrap_err();
         assert!(error.unexecuted_tool_output);
+        assert_eq!(
+            error.tool_dispatch,
+            crate::events::ToolDispatchProof::NotDispatched
+        );
         assert!(!error.retryable);
         assert!(
             error.partial.is_none(),
@@ -1711,8 +1760,8 @@ mod content_deadline_tests {
             &log,
             1,
             0,
-            vec![],
-            vec![],
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
@@ -1765,8 +1814,8 @@ mod content_deadline_tests {
             &SessionLog::new("nonstreaming"),
             1,
             0,
-            vec![],
-            vec![],
+            &[],
+            &[],
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
@@ -1805,8 +1854,8 @@ mod content_deadline_tests {
             &SessionLog::new("progressing-recovery"),
             1,
             1,
-            vec![],
-            vec![],
+            &[],
+            &[],
             options,
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(600)),
@@ -1843,8 +1892,8 @@ mod content_deadline_tests {
             &log,
             1,
             1,
-            vec![],
-            vec![],
+            &[],
+            &[],
             options,
             None,
             None,

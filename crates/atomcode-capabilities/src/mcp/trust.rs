@@ -152,6 +152,8 @@ mod tests {
             source,
             trust: false,
             auto_approve: vec![],
+            allowed_tools: None,
+            required_experimental_capabilities: Default::default(),
         }
     }
 

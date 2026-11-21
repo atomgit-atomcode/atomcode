@@ -27,14 +27,14 @@ use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
 use atomcode_host_api::{
     BackgroundSession, BackgroundState, BackgroundStats, HostCommand, HostConnection, HostControl,
-    HostError, HostEvent, HostReply, LoggedFact,
+    HostError, HostEvent, HostReply, LoggedFact, ProviderUnavailableReason,
 };
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::session::{LoggedEvent, SessionEvent};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
-use crate::host::{HostConfig, RuntimeControl};
+use crate::host::{find_switchable_entry, HostConfig, RuntimeControl};
 
 /// 后台最多放这么多个会话。与 tuix 一致。
 pub const MOST: usize = 16;
@@ -94,11 +94,27 @@ struct ReviewElsewhere {
 
 #[async_trait]
 impl atomcode_review::ReviewDelegate for ReviewElsewhere {
+    fn report_only(&self) -> bool {
+        let Some(background) = self.home.0.lock().expect("review home poisoned").upgrade() else {
+            return false;
+        };
+        let Some(front_end) = self.front_end.upgrade() else {
+            return false;
+        };
+        let state = background.state.lock().expect("background poisoned");
+        state.slots.iter().any(|live| {
+            live.review_only
+                && Arc::ptr_eq(live.control.front_end(), &front_end)
+                && !matches!(*live.mark.lock().expect("mark poisoned"), Mark::TakenUp)
+        })
+    }
+
     async fn delegate(
         &self,
         working_dir: &std::path::Path,
         task: String,
         scope: Option<String>,
+        files: usize,
     ) -> Option<Result<atomcode_review::DelegatedReview, String>> {
         let background = self
             .home
@@ -114,6 +130,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
                 task,
                 scope,
                 Some("code-review".to_string()),
+                files,
             )
             .await
         {
@@ -130,6 +147,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
 /// 一个接上了的 runtime。
 struct Live {
     id: u64,
+    review_only: bool,
     control: Arc<RuntimeControl>,
     commands: mpsc::UnboundedSender<AgentCommand>,
     track: Arc<Mutex<Track>>,
@@ -201,8 +219,9 @@ struct Track {
 /// `None` = 这里问不出来(不在 git 仓库里、没有那个 base、或 git 不在):那就不说数,
 /// 而不是说一个谁都没量过的 0。`scope` 就是 `/review` 自己的词汇 —— 一行说"范围是
 /// 未提交的改动",另一行说"X 个文件",两处不能各算一半。
-fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
-    let mut git = std::process::Command::new("git");
+async fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
+    let mut git = tokio::process::Command::new("git");
+    git.kill_on_drop(true);
     git.current_dir(dir);
     match scope {
         "staged" => {
@@ -210,7 +229,7 @@ fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
         }
         "working_tree" => {
             // `status`,不是 `diff`:这次还没提交的包括还没被 git 看见的那些新文件。
-            git.args(["status", "--porcelain"]);
+            git.args(["status", "--porcelain", "-uall"]);
         }
         // `-` 开头的是 git 的选项,不是 ref:`/review --output=x` 会让 git 写一个
         // 文件。TUI 已经不把它当范围,这里再挡一次 —— 这条命令收的是任何宿主。
@@ -222,7 +241,10 @@ fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
             git.args(["diff", "--name-only", &range]);
         }
     }
-    let out = git.output().ok()?;
+    let out = tokio::time::timeout(std::time::Duration::from_secs(3), git.output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -266,10 +288,44 @@ fn last_turn_answer(log: &[LoggedEvent]) -> Option<String> {
         })
 }
 
+/// A terminal outcome must reach its parent even when the model produced no
+/// closing text. Never pass an earlier turn's answer off as this turn's result.
+fn completion_report(log: &[LoggedEvent], reason: &StopReason) -> String {
+    use atomcode_i18n::screen::{t, Msg};
+    if *reason == StopReason::Stopped {
+        return last_turn_answer(log)
+            .unwrap_or_else(|| t(Msg::BackgroundNoConclusion).into_owned());
+    }
+    let start = log
+        .iter()
+        .rposition(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
+        .unwrap_or(0);
+    let error = log[start..].iter().rev().find_map(|e| match &e.event {
+        SessionEvent::TurnEnd {
+            error: Some(error), ..
+        } => Some(error.as_str()),
+        _ => None,
+    });
+    let reason = error
+        .map(|e| format!("{reason:?}: {e}"))
+        .unwrap_or_else(|| format!("{reason:?}"));
+    let partial = last_turn_answer(log).unwrap_or_default();
+    t(Msg::BackgroundIncomplete {
+        reason: &reason,
+        partial: &partial,
+    })
+    .into_owned()
+}
+
 impl Track {
     /// 记下一件事。返回面板要不要重画。
     fn saw(&mut self, event: &AgentEvent) -> bool {
         match event {
+            AgentEvent::TurnStarted { .. } => {
+                self.error = None;
+                self.ended = None;
+                true
+            }
             AgentEvent::Request { .. } => {
                 self.pending = Some(event.clone());
                 true
@@ -459,6 +515,7 @@ fn attach(
     Ok((
         Live {
             id,
+            review_only: false,
             control,
             commands,
             track: track.clone(),
@@ -558,6 +615,17 @@ fn log_of_control(control: &RuntimeControl) -> Vec<LoggedEvent> {
         .unwrap_or_default()
 }
 
+fn review_task(request: Option<&str>, task: &str) -> String {
+    let context = request
+        .map(|request| format!("=== ORIGINATING REQUEST (CONTEXT ONLY) === {request}\n\n"))
+        .unwrap_or_default();
+    format!(
+        "{context}=== ASSIGNED READ-ONLY REVIEW ===\n{task}\n\n\
+         Review and report findings only. Do not edit files, commit, push, or create pull requests. \
+         The originating conversation owns all follow-up work, including work requested above."
+    )
+}
+
 fn current_request(log: &[LoggedEvent]) -> Option<String> {
     let turn = log.iter().rev().find_map(|logged| match logged.event {
         SessionEvent::TurnStart { turn } => Some(turn),
@@ -609,6 +677,17 @@ fn name_of(log: &[LoggedEvent]) -> String {
             })
         })
         .unwrap_or_default()
+}
+
+fn review_title(scope: Option<&str>) -> String {
+    use atomcode_i18n::screen::{t, Msg};
+    let scope = match scope {
+        None => return "code-review".into(),
+        Some("working_tree") => t(Msg::ReviewWhatUncommitted),
+        Some("staged") => t(Msg::ReviewWhatStaged),
+        Some(base) => t(Msg::ReviewWhatRange { base }),
+    };
+    format!("code-review · {scope}")
 }
 
 /// 一行里放得下的一句:第一行非空的,压掉首尾空白。
@@ -871,9 +950,22 @@ async fn stop(live: Live) {
     let handle = live.control.runtime().clone();
     if in_turn(&live) {
         // 取消失败不挡停:停本身也会把回合带走,取消只是让它以「被打断」落盘。
-        let _ = handle.cancel().await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.cancel()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "background cancel failed; proceeding to runtime shutdown")
+            }
+            Err(_) => tracing::warn!(
+                "background cancel exceeded five seconds; proceeding to runtime shutdown"
+            ),
+        }
     }
-    let _ = handle.shutdown().await;
+    // Keep awaiting the owner's terminal: it is published only after kernel,
+    // transport and session-lease cleanup. Dropping this wait on a timer would
+    // allow an editor to outlive its slot and a replacement to race its lease.
+    if let Err(error) = handle.shutdown().await {
+        tracing::warn!(%error, "background runtime shutdown unavailable");
+    }
 }
 
 impl Background {
@@ -892,9 +984,7 @@ impl Background {
         // 这是"结果回来了"在那段对话里的形状。**只投内容**:要不要接着逐条核实,是那段
         // 对话看了上下文自己决定的事,不由这里替它下令。
         if let AgentEvent::TurnComplete { reason, .. } = &event {
-            if ended_state(reason) == BackgroundState::Done {
-                self.deliver_home(id);
-            }
+            self.deliver_home(id, reason);
         }
         let front = {
             let state = self.state.lock().expect("background poisoned");
@@ -920,7 +1010,7 @@ impl Background {
     /// 投的是**内容**而不是一句通知。发起时说的是"结果回来后我会逐条核实",而那次
     /// 核实要真发生,就得让那段对话拿到结果 —— "去 /bg 读"是把这件事留给了一个人。
     /// 指令不跟着投:核实与否由那段对话自己定(`Msg::BackgroundResult`)。
-    fn deliver_home(&self, id: u64) {
+    fn deliver_home(&self, id: u64, reason: &StopReason) {
         use atomcode_i18n::screen::{t as tr, Msg as SMsg};
         let (origin, sender, frame, mark) = {
             let state = self.state.lock().expect("background poisoned");
@@ -931,9 +1021,7 @@ impl Background {
                 return;
             }
             let log = log_of(live);
-            let Some(answer) = last_turn_answer(&log) else {
-                return;
-            };
+            let answer = completion_report(&log, reason);
             let title = name_of(&log);
             let frame = tr(SMsg::BackgroundResult {
                 title: &title,
@@ -983,6 +1071,11 @@ impl Background {
                         for _ in 0..SETTLE_TRIES {
                             if holds_note_from(&home, &sender) {
                                 came_home_now(&mark, &sender);
+                                return;
+                            }
+                            // Never mark an unconfirmed delivery as received. A retired
+                            // home cannot add another fact; leave the result recoverable.
+                            if home.runtime().is_stopped() || home.front_end().app().is_none() {
                                 return;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1125,10 +1218,9 @@ impl Background {
                     if lead {
                         state.gate = true;
                     }
-                    let waiting = lead
-                        && state.front.control.runtime().status().phase
-                            == RuntimePhase::WaitingApproval;
-                    let pending = waiting
+                    // Request publication can precede the phase watch update.
+                    // Track is the authority for an unanswered live request.
+                    let pending = lead
                         .then(|| {
                             state
                                 .front
@@ -1191,6 +1283,7 @@ impl Background {
                 // Which session is in front, read **before** the stop goes out:
                 // after it the App is gone and its log with it.
                 self.record_exit_front();
+                self.settle_before_exit();
                 let front = self.front_commands();
                 let _ = front.send(command);
                 if let Some(me) = self.me.upgrade() {
@@ -1477,6 +1570,24 @@ impl Background {
             state.front.control.clone()
         };
         if self.in_background(&target) {
+            if project_navigation {
+                let control = self
+                    .state
+                    .lock()
+                    .expect("background poisoned")
+                    .slots
+                    .iter()
+                    .find(|slot| slot.control.session_id() == target)
+                    .map(|slot| slot.control.clone())
+                    .ok_or(HostError::NotFound)?;
+                // A retained runtime must satisfy the same project check as a
+                // newly prepared destination before publishing a shared switch.
+                if !control.working_dir_now().await.is_dir() {
+                    return Err(HostError::Failed {
+                        message: "The session's project directory is unavailable.".into(),
+                    });
+                }
+            }
             return self.foreground_locked(session, target).await;
         }
         if target == session
@@ -1497,11 +1608,7 @@ impl Background {
             use atomcode_capabilities::session::SessionManager;
             let dirs = atomcode_coding::config::product_dirs_from_env();
             let scan = SessionManager::scan_all(&dirs);
-            let entry = scan
-                .entries
-                .iter()
-                .find(|entry| entry.id == target && entry.message_count > 0)
-                .ok_or(HostError::NotFound)?;
+            let entry = find_switchable_entry(&scan.entries, &target)?;
             if entry.needs_newer_version {
                 return Err(HostError::Failed {
                     message: "Update AtomCode before opening this session.".into(),
@@ -1600,7 +1707,8 @@ impl Background {
         }
         .working_dir_now()
         .await;
-        self.start_locked(working_dir, text, scope, None).await
+        self.start_locked(working_dir, text, scope, None, None)
+            .await
     }
 
     /// [`Self::start`],替 `front_end` 那个 runtime —— 只在它**此刻**就是前台那个时。
@@ -1620,6 +1728,7 @@ impl Background {
         text: String,
         scope: Option<String>,
         name: Option<String>,
+        files: usize,
     ) -> Result<Option<HostReply>, HostError> {
         let Ok(_op) = self.op.try_lock() else {
             return Ok(None);
@@ -1638,15 +1747,10 @@ impl Background {
             let log = log_of(&state.front);
             current_request(&log)
         };
-        let text = match request {
-            Some(request) => format!(
-                "{request}\n\n{}",
-                text.split_once('\n')
-                    .map_or(text.as_str(), |(_, instructions)| instructions)
-            ),
-            None => text,
-        };
-        self.start_locked(working_dir, text, scope, name)
+        // The parent's request is context, not another assignment. In
+        // particular, its authorized edits/commit/PR remain the parent's job.
+        let text = review_task(request.as_deref(), &text);
+        self.start_locked(working_dir, text, scope, name, Some(files))
             .await
             .map(Some)
     }
@@ -1658,6 +1762,7 @@ impl Background {
         text: String,
         scope: Option<String>,
         name: Option<String>,
+        confirmed_files: Option<usize>,
     ) -> Result<HostReply, HostError> {
         let control = {
             let state = self.state.lock().expect("background poisoned");
@@ -1666,15 +1771,58 @@ impl Background {
             }
             state.front.control.clone()
         };
+        // Read the live owner's mode, not the launch-time configuration. Take
+        // one snapshot for this new task; later changes do not alter it.
+        let review_only = scope.is_some() || name.as_deref() == Some("code-review");
+        // ReviewHandoffRow confines an unopened review to its read-only reviewer;
+        // its approval mode still follows the conversation that assigned it.
+        let mode = control
+            .runtime()
+            .mode()
+            .await
+            .map_err(crate::host::refused)?;
         // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
-        let files = scope
-            .as_deref()
-            .and_then(|scope| changed_files(&working_dir, scope));
+        let files = match (confirmed_files, scope.as_deref()) {
+            (Some(files), _) => Some(files),
+            (None, Some(scope)) => changed_files(&working_dir, scope).await,
+            (None, None) => None,
+        };
         let mut live = self.spawn_at(working_dir.clone()).await?;
+        // Configure before publishing the slot or submitting any work. Failure
+        // retires the candidate and never runs it with a fallback permission.
+        if let Err(error) = live.control.runtime().set_mode(mode).await {
+            stop(live).await;
+            return Err(crate::host::refused(error));
+        }
+        if review_only {
+            // Name the assignment before its first prompt can launch the model
+            // titler. The same logged fact serves the panel and resumed sessions.
+            let session = live.control.session_id();
+            let agent = live
+                .control
+                .front_end()
+                .app()
+                .and_then(|app| Feed::find(&app, &session));
+            let Some(agent) = agent else {
+                stop(live).await;
+                return Err(HostError::Unavailable);
+            };
+            let log = agent.session();
+            atomcode_harness::session::commit(
+                agent.ctx(),
+                &log,
+                SessionEvent::Titled {
+                    turn: log.current_turn(),
+                    title: review_title(scope.as_deref()),
+                    user_set: false,
+                },
+            );
+        }
         // 它是替**前台那个**干的:干完把结果投回去,而不是留在这里等人来读。
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
+        live.review_only = review_only;
         live.name = name;
         live.task = one_line(&text);
         let session = live.control.session_id();
@@ -1876,7 +2024,68 @@ fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::Hub
     use atomcode_daemon::live_hub::HubError;
     match error {
         HostError::Busy { .. } => HubError::ActiveTurn,
-        error => HubError::RuntimeRejected(format!("{error:?}")),
+        // The host already wrote a person-readable reason: surface it,
+        // instead of re-wrapping it in the variant's Debug shape.
+        HostError::Failed { message } | HostError::InvalidWorkingDirectory { message } => {
+            HubError::RuntimeRejected(message)
+        }
+        // A bare variant name ("NotFound", ...) told a remote client nothing
+        // it could act on. Name the state instead, without asserting which
+        // session is gone — the variant reaches here from the target lookup
+        // AND from the source/front checks, where the session exists but the
+        // front moved on (issue #1740).
+        HostError::NotFound => HubError::RuntimeRejected(
+            "Session not found: one of the sessions involved in this switch is no longer available. Refresh the session list and try again."
+                .into(),
+        ),
+        HostError::SessionInUse { id } => HubError::RuntimeRejected(format!(
+            "Session {id} is already open in another AtomCode window; close it there before switching."
+        )),
+        // Typed, so /cd renders the shared RuntimeUnavailable wording (with
+        // the restart action) instead of a shorter second copy living here.
+        HostError::Unavailable => HubError::RuntimeUnavailable,
+        HostError::Cancelled => HubError::RuntimeRejected(
+            "The session switch was cancelled before it finished.".into(),
+        ),
+        HostError::ProviderUnavailable { reason } => {
+            let message = match reason {
+                ProviderUnavailableReason::NotConfigured => {
+                    "No model provider is configured. Configure one, then try the switch again."
+                }
+                ProviderUnavailableReason::AuthenticationRequired => {
+                    "The model provider needs authentication. Sign in or set its credentials, then try again."
+                }
+                ProviderUnavailableReason::UnsupportedBuild => {
+                    "The configured model provider is not supported on this build."
+                }
+                _ => "The model provider is unavailable. Check the provider setup and try again.",
+            };
+            HubError::RuntimeRejected(message.into())
+        }
+        HostError::UndoOutOfRange { requested, available } => {
+            let reason = format!(
+                "Undo history does not extend that far: {requested} requested, {available} available. Try again with a smaller step."
+            );
+            HubError::RuntimeRejected(reason)
+        }
+        // The session moved on since the switch was started. Typed, so /cd
+        // renders the shared StaleBinding wording instead of a second copy of
+        // the same "refresh and retry" sentence.
+        HostError::Stale { .. } => HubError::StaleBinding,
+        // A variant this mapper does not name: keep its shape out of the
+        // client message — that is the symptom this function exists to
+        // remove (issue #1740), and it must stay removed when
+        // #[non_exhaustive] grows the enum — and its diagnostic in the log.
+        error => {
+            // warn, not debug: the CLI file-log filter defaults to info, and
+            // this is the only place the unmapped variant and its payload are
+            // kept at all.
+            tracing::warn!(?error, "embedded navigation: unmapped host error");
+            HubError::RuntimeRejected(
+                "The switch was rejected for an unexpected reason. Try again; if it persists, open a new session."
+                    .into(),
+            )
+        }
     }
 }
 
@@ -1944,6 +2153,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delegated_review_keeps_context_without_assigning_follow_up_work() {
+        let text = review_task(Some("审查后修复、提交并创建 PR"), "Review staged changes");
+        assert!(text.contains("ORIGINATING REQUEST (CONTEXT ONLY)"));
+        assert!(text.contains("审查后修复、提交并创建 PR"));
+        assert!(text.contains("ASSIGNED READ-ONLY REVIEW ===\nReview staged changes"));
+        assert!(text.contains("Do not edit files, commit, push, or create pull requests"));
+        assert!(review_task(None, "review task").contains("review task"));
+    }
+
+    #[test]
     fn embedded_navigation_preserves_busy_refusals() {
         use atomcode_daemon::live_hub::HubError;
         assert_eq!(
@@ -1958,11 +2177,71 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn embedded_navigation_names_the_refusal_instead_of_the_variant() {
+        use atomcode_daemon::live_hub::HubError;
+        let reason = |error: HostError| match embedded_navigation_error(error) {
+            HubError::RuntimeRejected(reason) => reason,
+            other => panic!("expected RuntimeRejected, got {other:?}"),
+        };
+        let not_found = reason(HostError::NotFound);
+        assert_ne!(not_found, "NotFound");
+        assert!(not_found.contains("not found"), "{not_found}");
+        assert_eq!(
+            reason(HostError::Failed {
+                message: "hold on".into()
+            }),
+            "hold on"
+        );
+        let in_use = reason(HostError::SessionInUse { id: "abc".into() });
+        assert!(in_use.contains("abc"), "{in_use}");
+        assert_eq!(
+            embedded_navigation_error(HostError::Busy { reason: "x".into() }),
+            HubError::ActiveTurn
+        );
+    }
+
+    #[test]
+    fn embedded_navigation_never_leaks_the_variant_shape() {
+        use atomcode_daemon::live_hub::HubError;
+        let reason = |error: HostError| match embedded_navigation_error(error) {
+            HubError::RuntimeRejected(reason) => reason,
+            other => panic!("expected RuntimeRejected, got {other:?}"),
+        };
+        let provider = reason(HostError::ProviderUnavailable {
+            reason: ProviderUnavailableReason::NotConfigured,
+        });
+        assert!(provider.contains("No model"), "{provider}");
+        assert!(!provider.contains("ProviderUnavailable"), "{provider}");
+        let undo = reason(HostError::UndoOutOfRange {
+            requested: 5,
+            available: 2,
+        });
+        assert!(undo.contains("5"), "{undo}");
+        assert!(!undo.contains("UndoOutOfRange"), "{undo}");
+        // Unavailable/Stale stay typed: /cd renders their shared wording.
+        assert_eq!(
+            embedded_navigation_error(HostError::Unavailable),
+            HubError::RuntimeUnavailable
+        );
+        assert_eq!(
+            embedded_navigation_error(HostError::Stale { current: 7 }),
+            HubError::StaleBinding
+        );
+        // The fallback names nothing it does not know, and keeps even the
+        // payload out of the client message.
+        let fallback = reason(HostError::CodeRewindUnavailable {
+            message: "internal detail".into(),
+        });
+        assert!(!fallback.contains("CodeRewindUnavailable"), "{fallback}");
+        assert!(!fallback.contains("internal detail"), "{fallback}");
+    }
+
     /// 范围里有几个文件在变,是真的去问 git。
     ///
     /// 三种范围各过一遍:这个数是给人读的("这次有 2 个文件在变"),编不出来。
-    #[test]
-    fn a_scope_counts_the_files_it_touches() {
+    #[tokio::test]
+    async fn a_scope_counts_the_files_it_touches() {
         if std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -1987,28 +2266,32 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one").expect("write");
         std::fs::write(dir.join("b.txt"), "two").expect("write");
         assert_eq!(
-            changed_files(&dir, "working_tree"),
+            changed_files(&dir, "working_tree").await,
             Some(2),
             "两个还没提交的文件,包括 git 还没看见的那个"
         );
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/c.txt"), "three").unwrap();
+        std::fs::write(dir.join("nested/d.txt"), "four").unwrap();
+        assert_eq!(changed_files(&dir, "working_tree").await, Some(4));
         git(&["add", "a.txt"]);
-        assert_eq!(changed_files(&dir, "staged"), Some(1));
+        assert_eq!(changed_files(&dir, "staged").await, Some(1));
         git(&["add", "b.txt"]);
         git(&["commit", "-qm", "one"]);
         std::fs::write(dir.join("b.txt"), "two again").expect("write");
         git(&["add", "b.txt"]);
         git(&["commit", "-qm", "two"]);
         assert_eq!(
-            changed_files(&dir, "HEAD~1"),
+            changed_files(&dir, "HEAD~1").await,
             Some(1),
             "已提交的那一段:HEAD~1..HEAD 只动了 b.txt"
         );
         // 一个选项不是 ref:交给 git 就成了 `--output=…`,它会去写那个文件。
-        assert_eq!(changed_files(&dir, "--output=written"), None);
+        assert_eq!(changed_files(&dir, "--output=written").await, None);
         assert!(!dir.join("written..HEAD").exists(), "git 没把它当选项");
         // 问不出来的地方说"问不出来",而不是一个谁都没量过的零。
         assert_eq!(
-            changed_files(std::path::Path::new("/"), "working_tree"),
+            changed_files(std::path::Path::new("/"), "working_tree").await,
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2029,7 +2312,7 @@ mod tests {
         assert_eq!(track.ended, Some(BackgroundState::Failed));
         track.saw(&ended(StopReason::Stopped));
         assert_eq!(track.ended, Some(BackgroundState::Done));
-        // 被熔断、轮数用尽的不是一次结论 —— 不算干完,也就不会被投回去。
+        // 被熔断、轮数用尽的按失败回传，不冒充成功结论。
         for reason in [
             StopReason::RepeatLoop,
             StopReason::ToolLoopDetected,
@@ -2133,12 +2416,43 @@ mod tests {
         second.push(logged(SessionEvent::TurnStart { turn: 2 }));
         second.push(said(2, ""));
         assert_eq!(last_turn_answer(&second), None);
+        let failed = completion_report(&second, &StopReason::ProviderError);
+        assert!(failed.contains("ProviderError"));
+        assert!(!failed.contains("结论:两处要改"));
+        let cancelled = completion_report(&second, &StopReason::Cancelled);
+        assert!(cancelled.contains("Cancelled"));
 
         second.push(said(2, "补充:第三处也要改"));
         assert_eq!(
             last_turn_answer(&second).as_deref(),
             Some("补充:第三处也要改")
         );
+        second.push(logged(SessionEvent::TurnEnd {
+            turn: 2,
+            stop: StopReason::PolicyDenied,
+            error: Some("review budget exhausted; partial findings retained".into()),
+        }));
+        let failed = completion_report(&second, &StopReason::PolicyDenied);
+        assert!(failed.contains("review budget exhausted"));
+        assert!(failed.contains("补充:第三处也要改"));
+        assert!(failed.contains("不是成功结论") || failed.contains("not a successful conclusion"));
+    }
+
+    #[test]
+    fn a_new_turn_forgets_the_previous_error() {
+        let mut track = Track {
+            error: Some("previous failure".into()),
+            ended: Some(BackgroundState::Failed),
+            ..Track::default()
+        };
+        track.saw(&AgentEvent::TurnStarted { turn: Some(2) });
+        track.saw(&AgentEvent::TurnComplete {
+            turn: Some(2),
+            reason: StopReason::MaxRounds,
+            provider_failure: None,
+        });
+        assert!(track.error.is_none());
+        assert_eq!(track.ended, Some(BackgroundState::Failed));
     }
 
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。

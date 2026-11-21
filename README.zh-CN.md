@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.2.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.2.8-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -51,7 +51,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 ### Agent 循环
 
 - **自主多步执行** —— 读文件、改代码、跑测试、修错误，循环直到完成
-- **验证回路** —— 每次编辑后自动跑语法检查确认无误，才算任务完成
+- **验证提醒** —— 对未验证的代码改动提示 agent 补充检查；可选的质量策略执行明确配置的检查命令
 - **动态步数预算** —— 根据编辑文件数动态放宽步数上限，同时封顶以控成本
 - **循环检测** —— 识别并打破重复调用同一工具的死循环
 - **三层 JSON 修复** —— 修复畸形工具调用参数
@@ -60,6 +60,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 ### 模式与自主
 
 - **Plan / Build 模式** —— `/plan` 切换到只读探索模式（agent 只调研、不改文件），`/build` 切回完整执行
+- **质量策略** —— `/quality on` 在普通任务有改动时，于交付前执行明确配置的检查，保留日志和文件指纹；独立于审批模式，失败保留文件。见[配置与限制](site/docs/zh/slash-commands.html#quality)。
 - **目标模式** —— `/goal <目标>` 设定完成条件后，agent 会一轮接一轮自动循环执行，直到目标达成
 - **定时循环** —— `/loop 5m <任务>` 按指定间隔重复执行，`/loop stop` 停止循环。
 - **子 agent 与团队** —— 在启用子 agent 能力的入口中，可通过 `task` / `team` 委派工作。
@@ -327,17 +328,12 @@ irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/uninstall
 atomcode
 ```
 
-首次运行会有一个向导帮你配置模型：
+首次启动时，如果尚未配置模型，终端会请你选择模型接入方式：
 
-```
-Welcome to AtomCode! Let's set up your first provider.
+1. **使用 AtomGit 账号登录**，扫码授权并领取免费 Coding Plan 额度。
+2. **连接已有的模型服务**，使用第三方或自建服务，按需填写 API 地址和密钥。
 
-Select provider:
-  [1] Claude (Anthropic)
-  [2] OpenAI
-  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
-  [4] Ollama (local)
-```
+用方向键切换，按 Enter 确认。等待 AtomGit 授权时，按 Esc 可返回选择。模型可用后会显示聊天输入框。
 
 ### 2. 配置
 
@@ -410,7 +406,7 @@ atomcode --prompt-file task.md
 | `Ctrl+J` | 换行（终端能区分该组合键时） |
 | `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
 | `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
-| `Esc` | 清空输入 / 取消流式输出 |
+| `Esc` | 清空输入 / 停止流式输出，保留 Todo 清单 |
 | `Esc` ×2 | 撤销上一轮 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受斜杠命令、Skill 或文件补全 |
@@ -452,7 +448,7 @@ atomcode --prompt-file task.md
 | `Ctrl+Up/Down`      | 跳到上一条 / 下一条用户消息  |
 | 空输入时 `Home/End` | 跳到对话顶部 / 底部          |
 | `Ctrl+Shift+C`      | 复制选中内容                 |
-| `Ctrl+C`            | 取消当前操作（连按两次退出） |
+| `Ctrl+C`            | 停止执行，保留 Todo 清单（连按两次退出） |
 
 ### 新界面（`atomcode --tui`）
 
@@ -475,6 +471,7 @@ atomcode --prompt-file task.md
 
 | 命令                 | 动作                                                                          |
 | -------------------- | ----------------------------------------------------------------------------- |
+| `/fork`              | 复制当前对话并切换；可在副本 `/compact`，用 `/resume <原会话ID>` 返回（工作目录文件仍共用） |
 | `/resume`            | 恢复或切换会话                                                                |
 | `/session`           | 创建新会话                                                                    |
 | `/rename <名称>`     | 重命名当前会话                                                                |
@@ -492,6 +489,7 @@ atomcode --prompt-file task.md
 | -------------- | ------------------------------------------------------------------- |
 | `/plan`        | 切换到 Plan 模式（只读探索）                                        |
 | `/build`       | 切换到 Build 模式（完整执行）                                       |
+| `/quality` | 开关质量检查、查看状态与证据，或记录人工豁免 |
 | `/goal <目标>` | 设置完成目标——agent 自动循环执行直到条件满足                        |
 | `/review`      | 代码审查当前改动（`/review` · `/review staged` · `/review <base>`） |
 | `/think`       | 控制深度思考（on / off / budget N）                                 |
@@ -535,6 +533,7 @@ atomcode --prompt-file task.md
 | 命令      | 动作                                                         |
 | --------- | ------------------------------------------------------------ |
 | `/mcp`    | MCP 服务状态（子命令：`reload`、`tools`、`login`、`logout`） |
+| `/browser` | 一次配置外部浏览器后端；直接描述网页任务即可自动加载指引并使用已连接的 MCP 工具，沿用原有审批 |
 | `/plugin` | 插件市场（`marketplace` / `install` / `uninstall` / `trust` / `untrust` / `list`） |
 | `/skills` | 浏览已加载的 skills                                          |
 
@@ -547,12 +546,18 @@ atomcode --prompt-file task.md
 | `/reload` | 从磁盘重新加载 `~/.atomcode/config.toml` |
 | `/upgrade` | 升级 atomcode 到最新版（子命令：`rollback`） |
 | `/setup` | 首次运行：安装推荐 skill 并执行 |
-| `/welcome` | 重新运行引导向导 |
 | `/language` | 切换显示语言及默认 Git 提交消息语言 |
 | `/guide <问题>` | 向 atomcode-guide 询问使用方式 |
 | `/keys` | 查看键盘快捷键 |
 | `/help` | 查看命令与快捷键 |
+| `/todo clear` | 显式清空 Todo 清单；中断保留已记录的进度，发送后续指令可继续或调整任务。 |
 | `/quit`、`/exit` | 退出 AtomCode（或连按 Ctrl+C） |
+
+默认 `keep_interrupted_context = true` 时，中断保留已记录的任务进度；设为 `false` 仍会撤销被中断回合，包括该回合的 Todo 改动。
+
+WebUI 在执行时实时展示过程；回合完成且有最终正文后，会默认收起过程，点击“执行过程”可展开。搜索时自动展开，中断或失败时保持过程可见；折叠不删除历史，也不影响 Todo。
+
+WebUI 历史在滚动接近顶部或底部时自动补载，不再显示前后分页按钮；没有更多内容时停止加载。已完成的历史按完整对话组展示（用户消息、收起的过程、最终结果），展开超长过程后仍分段加载。消息图片可点击放大，按 Esc、点击遮罩或关闭按钮退出。已有缩略图时隐藏末尾重复的图片占位文字，缺失图片的提示仍保留。
 
 > **AtomGit Issue**：`/issue` 已移除。执行 `/login` 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”，AtomCode 会调用内置的 `atomgit_issue` 工具。读取 Issue 可直接执行；创建 Issue，以及新增、编辑或删除评论仍需权限确认。
 >

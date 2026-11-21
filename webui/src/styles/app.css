@@ -1214,6 +1214,7 @@ body {
 .footer-spacer { flex: 1; }
 .footer-tokens { opacity: 0.7; font-size: 0.75rem; white-space: nowrap; }
 
+
 .btn-send {
   width: 34px;
   height: 34px;
@@ -1274,9 +1275,9 @@ body {
 
 /* === Sidebar / session list === */
 .session-list {
-  /* Desktop ratio follows DeepSeek Harness: roughly 18% of the viewport,
-     bounded so ordinary laptops and ultrawide displays both stay balanced. */
-  width: clamp(280px, 18vw, 320px);
+  /* Keep the preferred width across viewport changes, while leaving at least
+     65% of the desktop for the conversation. Mobile drawer rules override it. */
+  width: clamp(180px, var(--sidebar-width, clamp(280px, 18vw, 320px)), min(500px, 35vw));
   /* 暖色二级背景（比主区略深），与主区形成柔和分层（对齐设计）。 */
   background: var(--app-secondary-background);
   border-right: 1px solid var(--app-primary-border-color);
@@ -1284,6 +1285,38 @@ body {
   flex-direction: column;
   overflow: hidden;
   flex-shrink: 0;
+}
+
+/* --- Sidebar resize handle (drag strip between sidebar and main column) --- */
+.sidebar-resize-handle {
+  width: 6px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+  /* Expand the hit area beyond the visible strip for easier grabbing. */
+  margin-left: -3px;
+  margin-right: -3px;
+}
+.sidebar-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 32px;
+  border-radius: 2px;
+  background: var(--app-secondary-foreground);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.sidebar-resize-handle:hover::after {
+  opacity: 0.4;
+}
+.sidebar-resize-handle:active::after {
+  opacity: 0.6;
+  height: 48px;
 }
 
 /* --- Brand row: diamond logo + "AtomCode" + collapse button --- */
@@ -2060,6 +2093,14 @@ body {
   white-space: nowrap;
 }
 /* Blocked-untrusted-project notice inside the MCP popover. */
+.mcp-session-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
 .mcp-blocked-notice {
   display: flex;
   flex-direction: column;
@@ -3674,6 +3715,8 @@ body {
   .session-list.collapsed { display: flex; width: 80vw; max-width: 300px; }
   .session-list.collapsed .sidebar-rail { display: none; }
   .sidebar-backdrop.show { display: block; }
+  /* Resize handle is desktop-only; sidebar is a drawer on mobile. */
+  .sidebar-resize-handle { display: none; }
 
   /* Reduce timeline / input insets */
   .messages-container {
@@ -3773,6 +3816,7 @@ body {
   }
   .input-footer-actions > .model-controls {
     width: 100%;
+    justify-content: flex-end;
     grid-column: 1 / -1;
     grid-row: 1;
     flex-wrap: wrap;
@@ -3795,6 +3839,7 @@ body {
   .input-footer-actions .model-controls > .model-selector:not(.effort-selector) .model-selector-trigger {
     width: 100%;
     max-width: none;
+    justify-content: flex-end;
   }
   .input-footer-actions .model-selector-trigger,
   .input-turn-controls > .btn-send,
@@ -4318,37 +4363,59 @@ body {
 }
 .jump-to-bottom:hover { opacity: 1; transform: translateY(-1px); }
 
-/* Turn deliverables: successful mutation tools only, deduped for the complete
-   user turn. Compact chips mirror DeepSeek Harness and remain keyboard usable. */
+/* Successful file mutations, deduped for a complete user turn. Paths wrap on
+   mobile; the card links to the existing workspace diff rather than duplicating it. */
 .turn-artifacts {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
+  /* .timeline-message aligns children to flex-start; stretch only this card to
+     the conversation column so short paths don't shrink it. */
+  align-self: stretch;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: 14px;
   margin-top: 14px;
   color: var(--app-secondary-foreground);
   font-size: 0.875rem;
 }
-.turn-artifacts-label { flex: 0 0 auto; }
-.turn-artifacts-list { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.turn-artifacts-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--app-border-subtle); }
+.turn-artifacts-header strong { flex: 1; min-width: 0; color: var(--app-primary-foreground); font-weight: 600; }
+.turn-artifacts-icon { flex: none; }
+.turn-artifacts-changes { flex: none; border: 1px solid var(--app-border-subtle); border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
+.turn-artifacts-list { list-style: none; margin: 0; padding: 6px 0; }
+.turn-artifacts-list li { display: flex; align-items: center; margin: 0; padding: 0; }
+.turn-artifact-diff { flex: none; margin-right: 12px; border: 1px solid var(--app-border-subtle); border-radius: 8px; padding: 4px 10px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
 .turn-artifact-chip {
-  max-width: min(320px, 60vw);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
   border: 0;
-  border-radius: 7px;
-  padding: 4px 9px;
-  background: var(--app-input-secondary-background);
-  color: var(--app-primary-foreground);
+  padding: 8px 16px;
+  background: transparent;
+  color: inherit;
   font: inherit;
   font-family: var(--app-monospace-font-family);
   cursor: pointer;
 }
-.turn-artifact-chip:hover { background: var(--app-hover-background); }
-.turn-artifact-chip:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
-.turn-artifact-more { align-self: center; color: var(--app-tertiary-foreground); }
-.turn-artifact-error { flex-basis: 100%; color: var(--app-error-fg, #b3261e); font-size: 0.8125rem; }
+.turn-artifact-path { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.turn-artifact-stats { display: flex; gap: 6px; flex: none; font-variant-numeric: tabular-nums; }
+.turn-artifact-added { color: var(--app-diff-addition-foreground, #168344); color: light-dark(#168344, #74c991); }
+.turn-artifact-removed { color: var(--app-diff-deletion-foreground, #c43131); color: light-dark(#c43131, #f14c4c); }
+.turn-artifact-chip:hover, .turn-artifacts-changes:hover, .turn-artifact-diff:hover, .turn-artifact-more:hover { background: var(--app-hover-background); }
+.turn-artifact-chip:focus-visible, .turn-artifacts-changes:focus-visible, .turn-artifact-diff:focus-visible, .turn-artifact-more:focus-visible { outline: 2px solid var(--app-brand); outline-offset: -2px; }
+.turn-artifact-more { display: flex; align-items: center; gap: 8px; border: 0; padding: 10px 16px 14px; background: transparent; color: var(--app-primary-foreground); font: inherit; cursor: pointer; }
+@media (max-width: 767px) {
+  .turn-artifacts-header { flex-wrap: wrap; padding: 12px; gap: 8px; }
+  .turn-artifacts-header strong { flex-basis: calc(100% - 32px); }
+  .turn-artifacts-changes { margin-left: 30px; min-height: 36px; }
+  .turn-artifact-chip { padding: 10px 12px; }
+  .turn-artifact-diff { margin-right: 8px; min-height: 36px; }
+  .turn-artifact-more { padding: 10px 12px 12px; }
+}
 
 /* === Old browser notice / unsigned build / opened without the link === */
 .notice-stack {
@@ -4464,6 +4531,50 @@ body {
  * glance at "which model, mode and effort will this turn use" cost a tap into
  * the input. The toolbar now stays visible at every width.
  */
+@media (max-width: 768px) {
+  /* Only populated conversations collapse; the empty landing keeps its full composer.
+     Focus or an open popup keeps the toolbar visible, including while a
+     saving/disabled effort button temporarily loses focus. Both the model and
+     the mode menu count: each sits in the toolbar the tap just revealed. */
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+  }
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .message-input {
+    grid-column: 1;
+    grid-row: 1;
+    height: 44px !important; /* overrides a previous multiline inline height */
+    min-height: 44px;
+    max-height: 44px;
+    padding: 10px 4px;
+    overflow: hidden;
+  }
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-footer,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-footer-actions {
+    display: contents;
+  }
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-footer-primary,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .mode-selector,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .model-controls,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .session-reference-chips,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-turn-controls > .btn-send {
+    display: none;
+  }
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) .input-turn-controls {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held):not(.is-running) .input-turn-controls {
+    display: none;
+  }
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) ~ .input-subbar,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(:has(.model-dropdown, .attach-popover)):not(.toolbar-held) ~ .turn-stats {
+    display: none;
+  }
+}
 
 /* Turn navigation floats over the outer gutter; it never resizes the reading lane. */
 .turn-nav-rail {
@@ -4521,8 +4632,9 @@ body {
 .timeline-history-status { padding: 12px 0; color: var(--app-secondary-foreground); font-size: .85rem; text-align: center; }
 .timeline-history-status button { cursor: pointer; color: inherit; text-decoration: underline; }
 
-.timeline-history-status.is-loading { position: sticky; top: 0; z-index: 4; height: 0; min-height: 0; flex: 0 0 0; padding: 0; pointer-events: none; }
-.timeline-history-status.is-loading > span { display: inline-block; padding: 4px 10px; border-radius: 8px; background: var(--app-primary-background); }
+.history-loading { display: flex; justify-content: center; align-items: center; min-height: 24px; padding: 4px 0; color: var(--app-secondary-foreground); }
+.history-loading-spinner { width: 14px; height: 14px; border: 2px solid var(--app-input-border); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .history-loading-spinner { animation: none; } }
 
 /* === Package page ===
    A full page rather than a modal: a scan produces a list worth scrolling, and
@@ -4694,6 +4806,66 @@ body {
   border-radius: var(--corner-radius-medium);
   background: var(--app-menu-background);
   padding: 0 12px;
+.session-browse-summary { flex: 1 1 280px; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.session-browse-label { flex: none; color: var(--app-brand); font-size: 12px; font-weight: 600; }
+.session-browse-title { min-width: 0; overflow-wrap: anywhere; color: var(--app-primary-foreground); }
+.session-browse-description { flex-basis: 100%; color: var(--app-secondary-foreground); overflow-wrap: anywhere; }
+.session-browse-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.session-browse-actions button { padding: 7px 12px; border: 1px solid var(--app-input-border); border-radius: 8px; cursor: pointer; color: var(--app-primary-foreground); background: var(--app-primary-background); font: inherit; }
+.session-browse-actions button:hover { background: var(--app-list-hover-background); }
+.session-browse-actions button:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
+.session-browse-actions .session-browse-continue { background: var(--app-button-background); border-color: var(--app-button-background); color: var(--app-button-foreground); }
+.session-browse-actions .session-browse-continue:hover { background: var(--app-button-hover-background); }
+@media (max-width: 768px) {
+  .session-browse-notice { padding: 60px 16px 16px; gap: 12px; }
+}
+/* Browse mode keeps the transcript unchanged; only the composer is replaced. */
+.session-browse-header { min-height: 48px; padding-right: 120px; font-size: 14px; font-weight: 600; }
+.session-browse-composer .session-browse-card {
+  width: 100%; max-width: var(--app-composer-max-width); margin: 0 auto;
+  display: grid; grid-template-columns: 22px minmax(0, 1fr) auto;
+  gap: 12px 16px; padding: 18px 20px;
+  border: 1px solid var(--app-input-border); border-radius: var(--corner-radius-large);
+  background: var(--app-primary-background); color: var(--app-primary-foreground);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .04);
+}
+.session-browse-card .session-browse-summary { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.session-browse-card .session-browse-label { color: var(--app-primary-foreground); font-size: 14px; }
+.session-browse-card .session-browse-description { flex-basis: auto; }
+.session-browse-card .session-browse-actions { border-left: 1px solid var(--app-border); padding-left: 16px; }
+.session-browse-card .session-browse-actions button { min-height: 40px; }
+@media (max-width: 768px) {
+  .session-browse-header { padding-left: 52px; }
+  .session-browse-composer .session-browse-card { grid-template-columns: 22px minmax(0, 1fr); padding: 14px 16px; }
+  .session-browse-card .session-browse-actions { grid-column: 2; border-left: 0; padding-left: 0; }
+  .session-browse-card .session-browse-actions button { min-height: 44px; }
+}
+.session-running-mark { flex-shrink: 0; padding: 1px 5px; border-radius: 4px; background: var(--app-secondary-background); color: var(--app-secondary-foreground); font-size: 11px; }
+.session-open-mark { background: transparent; color: var(--app-caption-foreground); }
+
+.task-specifications { width: min(760px, calc(100vw - 24px)); max-height: 85vh; overflow: auto; padding: 20px; border-radius: 12px; }
+.task-specifications header, .task-specifications footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-specifications pre { max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--app-border); }
+.task-spec-list { display: flex; flex-direction: column; gap: 8px; }
+.task-spec-list > button { display: flex; flex-direction: column; align-items: flex-start; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-specifications { display: block; font-size: 14px; line-height: 1.5; }
+.task-specifications p { margin: 10px 0; }
+.task-spec-list > button { height: auto; min-height: 64px; gap: 4px; padding: 10px; }
+.task-spec-list > button span:first-child { color: var(--app-secondary-foreground); font-size: 12px; }
+
+.msg-copy-btn.spec-pinned { color: var(--app-brand); opacity: 1; }
+/* Leave the floating turn-navigation gutter clear for message actions. */
+.user-message-wrapper > .msg-actions { padding-inline-end: 40px; }
+.msg-copy-btn:disabled { cursor: default; opacity: .4; }
+
+.session-switch-notice {
+  /* Keep actions out of the floating turn-navigation gutter without
+     raising this banner over the search controls. */
+  padding-inline-end: 56px;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  flex-shrink: 0;
+  background: var(--app-tool-background);
 }
 .pkg-manual > summary {
   padding: 11px 0;
@@ -4898,3 +5070,213 @@ body {
 }
 
 .plugin-card-details { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.model-controls.has-pending-model { flex-wrap: wrap; justify-content: flex-end; }
+.model-controls.has-pending-model .model-next-turn { flex-basis: 100%; text-align: right; }
+
+/* The branch is display metadata, sharing the directory picker's target. */
+.input-cwd-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 22ch;
+  color: var(--app-secondary-foreground);
+  flex-shrink: 1;
+}
+.input-cwd-branch svg { flex-shrink: 0; }
+.input-cwd-branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 480px) { .input-cwd-branch { max-width: 12ch; } }
+
+/* Workspace actions remain reachable by keyboard and on touch screens. */
+.sidebar-project-row:focus-within .sidebar-project-new { opacity: 1; visibility: visible; }
+.sidebar-project-pinned { flex: 0 0 auto; font-size: 0.7rem; }
+@media (hover: none) {
+  .sidebar-project-new { opacity: 1; visibility: visible; }
+}
+
+/* Full session identity: quiet card, shared light/dark menu tokens. */
+.session-hover-card {
+  position: fixed;
+  z-index: 1100;
+  box-sizing: border-box;
+  width: 360px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 12px 14px;
+  border: 1px solid var(--app-menu-border);
+  border-radius: 12px;
+  background: var(--app-menu-background);
+  color: var(--app-primary-foreground);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 12%);
+  user-select: text;
+}
+.session-hover-card-title {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+.session-hover-card-directory {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 8px;
+  color: var(--app-secondary-foreground);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.session-hover-card-directory svg { flex-shrink: 0; margin-top: 3px; }
+.session-hover-card-directory span { overflow-wrap: anywhere; min-width: 0; }
+
+
+/* A completed turn keeps its answer visible; its transcript stays expandable. */
+.turn-process-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  margin: 12px 0 8px;
+  padding: 8px 2px;
+  border: 0;
+  border-bottom: 1px solid var(--app-border-subtle);
+  border-radius: 0;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  font: inherit;
+  font-size: 0.8125rem;
+  text-align: left;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.turn-process-toggle:hover { color: var(--app-primary-foreground); }
+.turn-process-toggle:focus-visible { outline: 2px solid var(--app-primary-foreground); outline-offset: 3px; }
+.turn-process-chevron { width: 12px; flex-shrink: 0; }
+.turn-process-duration { color: var(--app-tertiary-foreground); }
+
+
+.msg-image-button { display: inline-flex; padding: 0; border: 0; border-radius: 6px; background: transparent; cursor: zoom-in; }
+.msg-image-button:focus-visible { outline: 2px solid var(--app-accent-color); outline-offset: 3px; }
+.message-image-preview[open] {
+  display: flex; align-items: center; justify-content: center;
+  width: 100vw; height: 100vh; height: 100dvh; max-width: none; max-height: none;
+  margin: 0; padding: 48px 24px 24px; border: 0; box-sizing: border-box;
+  background: rgba(0, 0, 0, .85); cursor: zoom-out;
+}
+.message-image-preview::backdrop { background: transparent; }
+.message-image-preview > img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: default; }
+.message-image-close {
+  position: absolute; right: 16px; top: 12px; width: 36px; height: 36px;
+  border: 1px solid rgba(255, 255, 255, .5); border-radius: 50%;
+  color: white; background: rgba(0, 0, 0, .4); font-size: 25px; cursor: pointer;
+}
+.message-image-close:focus-visible { outline: 2px solid white; outline-offset: 3px; }
+
+.history-page-error { display: flex; justify-content: center; align-items: center; gap: 8px; padding: 12px; color: var(--app-secondary-foreground); font-size: 13px; }
+
+
+.session-fork-notice {
+  flex-shrink: 0;
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.25));
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: var(--app-tool-background);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* Retry diagnostics are opt-in after the request, never a live status banner. */
+.provider-diagnostics {
+  margin-top: .5rem;
+  color: var(--app-secondary-foreground);
+  font-size: .85em;
+}
+.provider-diagnostics summary { cursor: pointer; }
+.provider-diagnostics pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 16rem;
+  overflow: auto;
+}
+
+/* One compact entry for model identity and its declared reasoning capability. */
+.model-effort-summary { flex-shrink: 0; color: var(--app-secondary-foreground); opacity: .75; }
+.unified-model-selector .model-effort-panel {
+  width: 280px; max-width: calc(100vw - 32px); padding: 12px;
+  border-radius: 14px; box-sizing: border-box; gap: 4px;
+  box-shadow: 0 12px 36px #00000018, 0 2px 6px #00000008;
+}
+.model-effort-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: var(--app-secondary-foreground); font-size: .8125rem; }
+.model-effort-heading strong { color: var(--app-primary-foreground); font-size: 1rem; font-weight: 600; }
+.model-effort-name { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; min-height: 32px; border: 0; border-radius: 8px; padding: 4px 0; background: transparent; color: var(--app-secondary-foreground); cursor: pointer; font: inherit; }
+.model-effort-name span:first-child { min-width: 0; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.model-effort-name:hover { background: var(--app-ghost-button-hover-background); }
+.model-effort-slider { position: relative; }
+.model-effort-slider input { width: calc(100% - 100% / var(--effort-count) + 16px); height: 24px; margin: 0 calc(50% / var(--effort-count) - 8px); cursor: pointer; accent-color: var(--app-primary-foreground); touch-action: pan-y; }
+.model-effort-slider input:disabled { cursor: default; opacity: .5; }
+.model-effort-stops { display: grid; grid-template-columns: repeat(var(--effort-count), minmax(0, 1fr)); }
+.model-effort-stops button { display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; min-height: 32px; padding: 2px 0; border: 0; border-radius: 5px; background: transparent; color: var(--app-secondary-foreground); font: inherit; font-size: .6875rem; white-space: nowrap; cursor: pointer; }
+.model-effort-stops button::before { content: ''; width: 5px; height: 5px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+.model-effort-stops button:hover { background: var(--app-ghost-button-hover-background); }
+.model-effort-stops button:disabled { opacity: .5; cursor: default; }
+.model-effort-stops .active { color: var(--app-brand); font-weight: 600; }
+.model-effort-hint { margin: 10px 0 0; font-size: .75rem; color: var(--app-secondary-foreground); }
+.model-choice-check { margin-left: auto; flex-shrink: 0; }
+.unified-model-selector .model-choice-list { width: 350px; box-sizing: border-box; border-radius: 14px; padding: 6px; }
+.unified-model-selector .model-card-row { min-height: 44px; }
+.unified-model-selector .model-item { min-height: 44px; border-radius: 12px; }
+@media (max-width: 600px) {
+  .unified-model-selector.model-selector-up .model-dropdown {
+    position: fixed; left: 12px; right: 12px; bottom: calc(116px + env(safe-area-inset-bottom, 0px));
+    width: auto; min-width: 0; max-width: none; max-height: min(50vh, 360px); max-height: min(50dvh, 360px);
+  }
+  .unified-model-selector .model-selector-trigger { gap: 6px; }
+  .model-effort-name { min-height: 40px; }
+  .model-effort-stops button { min-height: 40px; }
+  .unified-model-selector .model-card-info { min-width: 44px; min-height: 44px; }
+}
+
+/* A bounded, single-line trigger; the card retains the full model name. */
+.input-footer .model-controls > .unified-model-selector {
+  width: max-content;
+  max-width: min(220px, 100%);
+}
+.unified-model-selector .model-selector-trigger {
+  width: 100%;
+  max-width: 100%;
+  height: 28px;
+  box-sizing: border-box;
+}
+.unified-model-selector .model-selector-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 768px) {
+  .unified-model-selector .model-selector-trigger { height: 44px; }
+}
+
+/* The whole user-message toolbar stays quiet until hover or keyboard focus. */
+.user-message-wrapper > .msg-actions { opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+.user-message-wrapper:hover > .msg-actions,
+.user-message-wrapper:focus-within > .msg-actions { opacity: 1; pointer-events: auto; }
+
+.vision-preprocessor {
+  padding: 16px;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: var(--corner-radius-large);
+  min-width: 0;
+}
+.vision-preprocessor label { display: block; font-weight: 600; }
+.vision-preprocessor p { margin: 8px 0; font-size: 0.875rem; color: var(--app-secondary-foreground); overflow-wrap: anywhere; }
+.vision-preprocessor select {
+  width: 100%; min-width: 0; max-width: 100%; min-height: 44px;
+  padding: 8px 12px; border: 1px solid var(--app-border-subtle); border-radius: var(--corner-radius-small);
+  background: var(--app-input-background); color: var(--app-primary-foreground); font: inherit;
+}

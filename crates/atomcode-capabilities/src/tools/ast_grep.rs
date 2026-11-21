@@ -119,6 +119,13 @@ impl Tool for AstGrepTool {
             ));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(warning) = pattern_error_warning(&String::from_utf8_lossy(&out.stderr)) {
+            return err(format!(
+                "ast_grep: pattern does not parse as a valid AST node for the target \
+                 language ({warning}). Refine the pattern — each `$NAME`/`$$$` metavariable \
+                 must be a whole node."
+            ));
+        }
         let matches = parse_ast_grep_json(&stdout);
         if matches.is_empty() {
             return ok(format!("No matches for pattern: {}", a.pattern));
@@ -131,6 +138,20 @@ struct AstMatch {
     file: String,
     line: u32, // 1-based
     text: String,
+}
+
+/// ast-grep parses the pattern, and when it contains syntax errors it only WARNS on
+/// stderr while exiting 0 with `[]` on stdout. A successful exit therefore says
+/// nothing about the pattern being valid — this detector is the only signal that
+/// separates "invalid pattern" from "valid pattern, no match".
+fn pattern_error_warning(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .find(|line| {
+            line.to_ascii_lowercase()
+                .contains("pattern contains an error node")
+        })
+        .map(|line| line.trim().to_string())
 }
 
 /// Parse `ast-grep --json=compact` output (a JSON array of match objects) into
@@ -229,6 +250,57 @@ async fn run_ast_grep(argv: &[String], cwd: &Path) -> Result<std::process::Outpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn have_ast_grep() -> bool {
+        std::process::Command::new("ast-grep")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn ctx(dir: &std::path::Path) -> atomcode_kernel::tool::ToolContext {
+        atomcode_kernel::tool::ToolContext {
+            working_dir: dir.to_path_buf(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        }
+    }
+
+    #[test]
+    fn warning_detector_matches_ast_grep_message() {
+        assert!(pattern_error_warning(
+            "Warning: Pattern contains an ERROR node and may cause unexpected results."
+        )
+        .is_some());
+        assert!(pattern_error_warning("").is_none());
+        assert!(pattern_error_warning("[]").is_none());
+    }
+
+    /// `--lang python` plus the malformed pattern: ast-grep exits 0, prints `[]`, and
+    /// puts `Pattern contains an ERROR node` on stderr. Ignoring stderr turned a parse
+    /// failure into "No matches", which reads as "this shape is not in the repo".
+    #[tokio::test]
+    async fn unparseable_pattern_is_an_error_not_a_no_match() {
+        if !have_ast_grep() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("p.py");
+        std::fs::write(&file, "def main() -> None:\n    pass\n").unwrap();
+        let args = serde_json::json!({
+            "pattern": "def ((", "lang": "python", "paths": [file.to_string_lossy()]
+        })
+        .to_string();
+        let r = AstGrepTool.execute(&args, &ctx(d.path())).await;
+        assert!(
+            r.is_error,
+            "an unparseable pattern must be an error, got: {}",
+            r.content
+        );
+        assert!(r.content.contains("ERROR node"), "{}", r.content);
+    }
 
     #[test]
     fn parses_ast_grep_json_to_file_line_text() {

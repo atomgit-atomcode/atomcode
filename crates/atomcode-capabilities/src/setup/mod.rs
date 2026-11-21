@@ -6,6 +6,7 @@ pub mod error;
 pub mod fs_atomic;
 pub mod install;
 pub mod lock;
+pub mod recommendations;
 pub mod scan;
 pub mod seeds;
 pub mod state;

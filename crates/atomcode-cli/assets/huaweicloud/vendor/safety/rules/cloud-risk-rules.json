@@ -1,0 +1,227 @@
+{
+  "version": "0.1.0",
+  "rules": [
+    {
+      "id": "hwc-command-credential-file",
+      "title": "Credential file read",
+      "category": "credential",
+      "severity": "deny",
+      "stages": ["command"],
+      "match": {
+        "any": [
+          {
+            "field": "text",
+            "regex": "(^|\\s)(cat|type|Get-Content|gc|less|more)\\s+[^\\n]*(\\.hcloud|\\.huaweicloud)"
+          },
+          { "field": "text", "regex": "(hcloud|huaweicloud)[/\\\\](config|credentials)" }
+        ]
+      },
+      "message": "The command may read local Huawei Cloud credential or profile files into the agent context.",
+      "remediation": "Use huaweicloud_show_profile_redacted or user-side credential configuration instead of reading credential files."
+    },
+    {
+      "id": "hwc-command-env-dump",
+      "title": "Cloud credential environment dump",
+      "category": "credential",
+      "severity": "deny",
+      "stages": ["command"],
+      "match": {
+        "all": [
+          { "field": "text", "regex": "(^|\\s)(env|printenv|Get-ChildItem\\s+Env:|gci\\s+Env:|dir\\s+Env:)" },
+          { "field": "text", "regex": "(HUAWEICLOUD|HWC_|HCLOUD|OS_)" }
+        ]
+      },
+      "message": "The command may print cloud credential environment variables.",
+      "remediation": "Inspect only required non-secret settings and redact secret-like values before returning output."
+    },
+    {
+      "id": "hwc-command-secret-value-read",
+      "title": "Plaintext secret read",
+      "category": "secret",
+      "severity": "deny",
+      "stages": ["command"],
+      "match": {
+        "any": [
+          { "field": "text", "regex": "(ShowSecretVersion|DownloadSecret|GetSecretValue)" },
+          { "field": "text", "regex": "(secret_string|secret_binary|secretString|secretBinary)" }
+        ]
+      },
+      "message": "The command appears to retrieve plaintext secret values.",
+      "remediation": "Use runtime secret references, user-side inspection, or redacted metadata checks instead of returning secret values to the agent."
+    },
+    {
+      "id": "hwc-command-encoded-shell-exec",
+      "title": "Encoded payload piped to shell",
+      "category": "execution",
+      "severity": "deny",
+      "stages": ["command"],
+      "match": {
+        "all": [
+          {
+            "field": "text",
+            "regex": "(base64\\s+(-d|--decode)|xxd\\s+-r|certutil\\s+-decode|FromBase64String|hex\\s*decode)"
+          },
+          { "field": "text", "regex": "(\\||;|&&)" },
+          { "field": "text", "regex": "\\b(bash|sh|zsh|powershell|pwsh|cmd|python|node)\\b" }
+        ]
+      },
+      "message": "The command decodes an encoded payload and pipes it into an interpreter.",
+      "remediation": "Decode payloads into a reviewable file first, inspect the content, then execute only explicit reviewed commands."
+    },
+    {
+      "id": "hwc-network-public-admin-port",
+      "title": "Public admin port exposure",
+      "category": "public_exposure",
+      "severity": "deny",
+      "stages": ["command", "artifact", "deploy_plan"],
+      "match": {
+        "all": [
+          {
+            "field": "text",
+            "regex": "(0\\.0\\.0\\.0\\s*/\\s*0|::\\s*/\\s*0|remote_ip_prefix\\s*[=:]\\s*0\\.0\\.0\\.0\\s*/\\s*0|cidr\\s*[=:]\\s*0\\.0\\.0\\.0\\s*/\\s*0)"
+          },
+          {
+            "field": "text",
+            "regex": "(port_range_min|port_range_max|from_port|to_port|port|\\b22\\b|\\b3389\\b|\\b3306\\b|\\b5432\\b|\\b6379\\b|\\b9200\\b)"
+          }
+        ]
+      },
+      "message": "The change appears to expose an administrative or database port to the public internet.",
+      "remediation": "Restrict the source CIDR to a trusted range, use a bastion or VPN, and keep public preview endpoints behind authenticated HTTP services."
+    },
+    {
+      "id": "hwc-obs-anonymous-write",
+      "title": "OBS anonymous write",
+      "category": "public_exposure",
+      "severity": "deny",
+      "stages": ["command", "artifact", "deploy_plan"],
+      "match": {
+        "all": [{ "field": "text", "regex": "(OBS|obs://|bucket|object|Statement|Principal)" }],
+        "any": [
+          {
+            "field": "text",
+            "regex": "((Anonymous|Everyone|\\\"Principal\\\"\\s*:\\s*\\\"\\*\\\"|AllUsers).*(PutObject|DeleteObject|PutBucketPolicy|FULL_CONTROL|WRITE|obs:object:PutObject|obs:bucket:PutBucketPolicy)|(PutObject|DeleteObject|PutBucketPolicy|FULL_CONTROL|WRITE|obs:object:PutObject|obs:bucket:PutBucketPolicy).*(Anonymous|Everyone|\\\"Principal\\\"\\s*:\\s*\\\"\\*\\\"|AllUsers))"
+          },
+          {
+            "field": "text",
+            "regex": "(-acl\\s*=?\\s*public-read-write|acl\\s*[=:]\\s*[\\\"']?public-read-write|public-write)"
+          }
+        ]
+      },
+      "message": "The change may grant anonymous write or full-control access to OBS data.",
+      "remediation": "Use private buckets by default. Grant object read only when required, and avoid anonymous write permissions."
+    },
+    {
+      "id": "hwc-functiongraph-public-no-auth",
+      "title": "Public FunctionGraph trigger without auth",
+      "category": "public_exposure",
+      "severity": "warn",
+      "stages": ["command", "artifact", "deploy_plan"],
+      "match": {
+        "all": [
+          { "field": "text", "regex": "(FunctionGraph|APIG|CreateTrigger|CreateApi|DEDICATEDGATEWAY|API Gateway)" },
+          {
+            "field": "text",
+            "regex": "(public|PUBLIC|0\\.0\\.0\\.0\\s*/\\s*0|auth[\\\"']?\\s*[=:]\\s*[\\\"']?(NONE|none|false)|security_authentication[\\\"']?\\s*[=:]\\s*[\\\"']?(NONE|none))"
+          }
+        ]
+      },
+      "message": "The generated FunctionGraph or API Gateway path may be publicly reachable without authentication.",
+      "remediation": "Require IAM, app authentication, JWT, or another explicit auth layer before exposing generated application endpoints."
+    },
+    {
+      "id": "hwc-iam-admin-policy",
+      "title": "Broad IAM administrator grant",
+      "category": "iam",
+      "severity": "deny",
+      "stages": ["command", "artifact", "deploy_plan"],
+      "match": {
+        "all": [
+          { "field": "text", "regex": "(IAM|policy|role|agency|Statement|Action)" },
+          {
+            "field": "text",
+            "regex": "(\\\"Action\\\"\\s*:\\s*(\\\"(\\*|\\*:\\*)\\\"|\\[\\s*\\\"(\\*|\\*:\\*)\\\")|Action\\s*[=:]\\s*(\\*|\\*:\\*)|AdministratorAccess|FullAccess)"
+          },
+          { "field": "text", "regex": "(\\\"Effect\\\"\\s*:\\s*\\\"Allow\\\"|Effect\\s*[=:]\\s*Allow)" }
+        ]
+      },
+      "message": "The change appears to grant broad administrator permissions.",
+      "remediation": "Use least-privilege service actions, resource constraints, and short-lived credentials for generated application workflows."
+    },
+    {
+      "id": "hwc-destructive-delete-force",
+      "title": "Forced destructive operation",
+      "category": "destructive",
+      "severity": "deny",
+      "stages": ["command"],
+      "match": {
+        "all": [
+          { "field": "text", "regex": "(Delete|BatchDelete|Remove|\\brm\\b|delete)" },
+          { "field": "text", "regex": "(--force|-f|--recursive|-r|delete_publicip\\s*[=:]\\s*true)" }
+        ]
+      },
+      "message": "The command combines deletion with force, recursive, or cascading deletion behavior.",
+      "remediation": "Show the exact resources to be deleted, confirm backups or recovery path, and require explicit user approval for the exact command."
+    },
+    {
+      "id": "hwc-sandbox-missing-ttl",
+      "title": "Sandbox deployment missing cleanup metadata",
+      "category": "sandbox",
+      "severity": "warn",
+      "stages": ["artifact", "deploy_plan"],
+      "match": {
+        "all": [
+          {
+            "field": "text",
+            "regex": "(sandbox|preview|temporary|ephemeral|dev environment|FunctionGraph|ECS|CCE|APIG)"
+          },
+          { "field": "text", "regex": "(Create|Deploy|Provision|resource|stack|environment)" }
+        ],
+        "none": [
+          { "field": "text", "regex": "(ttl|expires_at|expire_at|cleanup|owner|cost_center|auto_delete|auto-delete)" }
+        ]
+      },
+      "message": "The preview or sandbox deployment does not show cleanup or ownership metadata.",
+      "remediation": "Add owner, purpose, expiration time, and cleanup command before creating preview cloud resources."
+    },
+    {
+      "id": "hwc-cost-unbounded-scale",
+      "title": "Unbounded scale or high-cost resource",
+      "category": "cost",
+      "severity": "warn",
+      "stages": ["command", "artifact", "deploy_plan"],
+      "match": {
+        "any": [
+          {
+            "field": "text",
+            "regex": "(max_instances|max_node_count|max_replica|desired\\s*[=:]\\s*[5-9][0-9]|replicas\\s*[=:]\\s*[5-9][0-9])"
+          },
+          { "field": "text", "regex": "(GPU|gpu|large|xlarge|charging_mode\\s*[=:]\\s*prePaid|period_type|period_num)" }
+        ]
+      },
+      "message": "The generated plan may create high-cost or unbounded capacity.",
+      "remediation": "Use small preview defaults, explicit quotas, budget labels, and user approval before creating high-cost resources."
+    },
+    {
+      "id": "hwc-sandbox-destructive-command",
+      "title": "Destructive command in sandbox terminal",
+      "category": "destructive",
+      "severity": "deny",
+      "stages": ["command"],
+      "match": {
+        "any": [
+          { "field": "text", "regex": "rm\\s+-rf\\s+/" },
+          { "field": "text", "regex": "mkfs" },
+          { "field": "text", "regex": "dd\\s+if=" },
+          { "field": "text", "regex": ":\\\\(\\\\)\\\\{[^}]*\\\\|[^}]*&[^}]*\\\\}[^;]*;:" },
+          { "field": "text", "regex": "\\bshutdown\\b" },
+          { "field": "text", "regex": "\\breboot\\b" },
+          { "field": "text", "regex": "\\binit\\s+[06]\\b" },
+          { "field": "text", "regex": "\\bfdisk\\b" }
+        ]
+      },
+      "message": "The sandbox terminal command is destructively dangerous and could destroy the workspace.",
+      "remediation": "Use targeted deletions instead of recursive root removal. Avoid disk format, fork bombs, and system shutdown commands in sandbox terminals."
+    }
+  ]
+}

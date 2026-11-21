@@ -1,3 +1,7 @@
+import { SessionHoverCard } from './SessionHoverCard';
+import { ModalOverlay } from './ModalOverlay';
+import { WorkspaceActionDialog } from './WorkspaceActions';
+import { visibleWorkspaces, applyWorkspacePreference } from '../lib/workspaceActions';
 import { ScheduleIcon } from './Automation';
 // Session sidebar (Claude-Code-inspired: brand + collapse at top, CC-style
 // new-conversation row, live-filtered session list, settings at the bottom;
@@ -6,13 +10,14 @@ import { ScheduleIcon } from './Automation';
 import { useSkills, refreshSkills } from '../skills';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getMcpStatus, postLiveMcpTrust, getSession, getProjects, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getMcpStatus, getMcpSession, setMcpSession, postLiveMcpTrust, getSession, getProjects, updateProject, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
 import { mergeOptimisticSession } from '../lib/sessionList';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
+import { pollSessionActivity, sessionActivityBadge } from '../lib/sessionActivity';
 import { sidebarRelativeTime } from '../lib/sidebarTime';
 import {
   loadSidebarViewMode,
@@ -347,6 +352,9 @@ function BellGlyph() {
   );
 }
 
+/** How often the open groups' session activity is re-read. */
+const SESSION_ACTIVITY_POLL_MS = 5_000;
+
 export function Sidebar({
   runningSessionId,
   activeSessionId,
@@ -388,6 +396,12 @@ export function Sidebar({
   const pendingCenterSessionIdRef = useRef<string | null>(activeSessionId);
   const previousActiveSessionIdRef = useRef<string | null>(activeSessionId);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [workspaceMenu, setWorkspaceMenu] = useState<{ project: ProjectInfo; top?: number; bottom?: number; right: number } | null>(null);
+  const workspaceMenuRef = useRef<HTMLDivElement | null>(null);
+  const [workspaceAction, setWorkspaceAction] = useState<{ project: ProjectInfo; action: 'remove' | 'clear' } | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [pinning, setPinning] = useState(false);
+  const [projectCatalogFailed, setProjectCatalogFailed] = useState(false);
   const [viewMode, setViewMode] = useState<SidebarViewMode>(() =>
     loadSidebarViewMode(sidebarStorage()),
   );
@@ -408,11 +422,55 @@ export function Sidebar({
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
   // MCP menu: server list fetched lazily; the count badge shows once loaded.
+  const [mcpSession, setMcpSessionState] = useState<{ session: string; paused: boolean } | null>(null);
+  const [mcpSwitchBusy, setMcpSwitchBusy] = useState(false);
+  const [mcpSwitchError, setMcpSwitchError] = useState('');
+  const mcpReadRevision = useRef(0);
+  const mcpSessionRef = useRef(activeSessionId);
+  mcpSessionRef.current = activeSessionId;
+  async function toggleMcpSession() {
+    const current = mcpSession;
+    if (!current || current.session !== activeSessionId || mcpSwitchBusy) return;
+    const revision = ++mcpReadRevision.current;
+    setMcpSwitchBusy(true);
+    setMcpSwitchError('');
+    try {
+      const { paused } = await setMcpSession(current.session, !current.paused);
+      if (mcpSessionRef.current === current.session && revision === mcpReadRevision.current) {
+        setMcpSessionState({ session: current.session, paused });
+        refreshMcpStatus();
+      }
+    } catch (error) {
+      if (mcpSessionRef.current === current.session && revision === mcpReadRevision.current) setMcpSwitchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMcpSwitchBusy(false);
+      // Reopening the menu may have read state before this mutation committed.
+      // Fetch again rather than applying its now-stale response to the current view.
+      if (mcpSessionRef.current === current.session && revision !== mcpReadRevision.current) {
+        const refresh = ++mcpReadRevision.current;
+        void getMcpSession(current.session).then(({ paused }) => {
+          if (mcpSessionRef.current === current.session && refresh === mcpReadRevision.current) {
+            setMcpSessionState({ session: current.session, paused });
+          }
+        }).catch(() => {});
+      }
+    }
+  }
   const [mcpStatus, setMcpStatus] = useState<McpStatusInfo | null>(null);
   const [mcpLoading, setMcpLoading] = useState(false);
   // Bounds the connecting-state poll loop (see the poll effect below).
   const mcpPollAttemptsRef = useRef(0);
   const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const revision = ++mcpReadRevision.current;
+    setMcpSessionState(null);
+    setMcpSwitchError('');
+    if (activeSessionId) getMcpSession(activeSessionId).then(({ paused }) => {
+      if (!cancelled && revision === mcpReadRevision.current) setMcpSessionState({ session: activeSessionId, paused });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeSessionId, mcpMenuOpen]);
   const [mcpMenuPos, setMcpMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const mcpMenuRef = useRef<HTMLDivElement | null>(null);
   const mcpBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -428,7 +486,7 @@ export function Sidebar({
     { top?: number; bottom?: number; right: number } | null
   >(null);
   // Session search: a centered modal dialog (same .modal-overlay/.modal-card
-  // family as the rename/delete dialogs), closes on backdrop click / Escape.
+  // family as the rename/delete dialogs), closed through its explicit button.
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   // Cross-project search results (the sidebar list itself is per-project, so the
@@ -552,6 +610,7 @@ export function Sidebar({
           }
           if (epoch !== loadEpochRef.current) return null;
           setProjects(nextProjects);
+          setProjectCatalogFailed(false);
           // 清理已不存在的项目 bucket，但不整表清空 —— 可见列表保持原样就地
           // 更新，避免重载/删除时整表刷新闪动。
           const hashes = new Set(nextProjects.map((project) => project.hash));
@@ -595,7 +654,9 @@ export function Sidebar({
         if (epoch !== loadEpochRef.current) return;
         setSessions([]);
         if (viewMode === 'workspace') {
-          setProjects([]);
+          // Catalog presentation facts outlive a failed refresh. In particular,
+          // do not resurrect a hidden current workspace via its fallback row.
+          setProjectCatalogFailed(true);
           setLoadedProjects(new Set());
         }
       })
@@ -633,11 +694,101 @@ export function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey, viewMode, projectHash]);
 
+  // A session another runtime holds — a TUI in another terminal — starts and
+  // ends turns without telling this page. Re-read the activity of the open
+  // groups' rows (only that field, so rows never jump or flash a spinner).
+  useEffect(() => {
+    if (viewMode !== 'workspace' || collapsed) return;
+    const hashes = [...expandedProjects].filter((hash) => loadedProjects.has(hash));
+    if (hashes.length === 0) return;
+    return pollSessionActivity({
+      hashes,
+      delay: SESSION_ACTIVITY_POLL_MS,
+      hidden: () => document.hidden,
+      load: listProjectSessions,
+      apply: (hash, list) => {
+        const activity = new Map(list.map((session) => [session.id, session.activity]));
+        setSessions((current) => {
+          let changed = false;
+          const next = current.map((session) => {
+            if (session.project_hash !== hash || !activity.has(session.id)) return session;
+            const now = activity.get(session.id);
+            if (now === session.activity) return session;
+            changed = true;
+            return { ...session, activity: now };
+          });
+          return changed ? next : current;
+        });
+      },
+      schedule: (task, delay) => {
+        const timer = window.setTimeout(task, delay);
+        return () => window.clearTimeout(timer);
+      },
+    });
+  }, [viewMode, collapsed, expandedProjects, loadedProjects]);
+
   // A real project switch makes the new working directory the sole expanded
   // group. Other projects remain visible as collapsed peer rows.
   useEffect(() => {
     setExpandedProjects(new Set(projectHash ? [projectHash] : []));
   }, [projectHash]);
+
+  useEffect(() => {
+    const reload = (event: Event) => {
+      const { hash, patch } = (event as CustomEvent<{ hash: string; patch: { pinned?: boolean; hidden?: boolean } }>).detail;
+      const fallback = hash === projectHash ? {
+        hash, name: dirName(cwd || ''), working_dir: cwd || '', session_count: 0, created_at: 0, last_updated: 0,
+      } : undefined;
+      setProjects(current => applyWorkspacePreference(current, hash, patch, fallback));
+      loadSessions();
+    };
+    window.addEventListener('atomcode:projects-changed', reload);
+    return () => window.removeEventListener('atomcode:projects-changed', reload);
+  }, [cwd, projectHash, viewMode, expandedProjects]);
+
+  useEffect(() => {
+    if (!workspaceMenu) return;
+    const close = () => setWorkspaceMenu(null);
+    const outside = (event: MouseEvent) => {
+      const el = event.target as HTMLElement;
+      if (!workspaceMenuRef.current?.contains(el) && !el.closest?.('.sidebar-project-more')) close();
+    };
+    const key = (event: KeyboardEvent) => { if (event.key === 'Escape') close(); };
+    document.addEventListener('mousedown', outside);
+    document.addEventListener('keydown', key);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      document.removeEventListener('mousedown', outside);
+      document.removeEventListener('keydown', key);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [workspaceMenu]);
+
+  function openWorkspaceMenu(event: MouseEvent, project: ProjectInfo) {
+    event.stopPropagation();
+    setMenuFor(null);
+    setWorkspaceError(null);
+    if (workspaceMenu?.project.hash === project.hash) { setWorkspaceMenu(null); return; }
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const right = Math.max(8, window.innerWidth - rect.right);
+    setWorkspaceMenu(window.innerHeight - rect.bottom < 160
+      ? { project, bottom: window.innerHeight - rect.top + 4, right }
+      : { project, top: rect.bottom + 4, right });
+  }
+
+  async function toggleWorkspacePin(project: ProjectInfo) {
+    if (pinning) return;
+    setPinning(true);
+    setWorkspaceError(null);
+    try {
+      await updateProject(project.hash, { pinned: !project.pinned });
+      setWorkspaceMenu(null);
+    } catch (error) {
+      setWorkspaceError(t('workspace.failed', { error: error instanceof Error ? error.message : String(error) }));
+    } finally { setPinning(false); }
+  }
 
   useEffect(() => {
     if (activeSessionId !== previousActiveSessionIdRef.current) {
@@ -671,8 +822,8 @@ export function Sidebar({
   useEffect(() => {
     if (viewMode === 'workspace') return;
     getProjects()
-      .then(setProjects)
-      .catch(() => setProjects([]));
+      .then(next => { setProjects(next); setProjectCatalogFailed(false); })
+      .catch(() => setProjectCatalogFailed(true));
   }, [reloadKey, viewMode]);
 
   useEffect(() => {
@@ -718,6 +869,7 @@ export function Sidebar({
   }, [menuFor]);
 
   function openItemMenu(e: MouseEvent, id: string) {
+    setWorkspaceMenu(null);
     e.preventDefault();
     e.stopPropagation();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -780,19 +932,6 @@ export function Sidebar({
       alert(t('sidebar.exportFailed'));
     }
   }
-
-  useEffect(() => {
-    if (!historyPreview) return;
-    const close = (event: KeyboardEvent) => {
-      if (event.isComposing || event.keyCode === 229) return;
-      if (event.key === 'Escape') {
-        ++previewGeneration.current;
-        setHistoryPreview(null);
-      }
-    };
-    document.addEventListener('keydown', close);
-    return () => document.removeEventListener('keydown', close);
-  }, [historyPreview !== null]);
 
   // Settings menu: fixed-anchored above its button; close on outside/scroll/resize.
   useEffect(() => {
@@ -982,17 +1121,6 @@ export function Sidebar({
     setMcpMenuOpen(true);
   }
 
-  // Close the search dialog on Escape (backdrop click is handled on the overlay).
-  useEffect(() => {
-    if (!searchOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape') setSearchOpen(false);
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [searchOpen]);
-
   // Focus the input on open; reset query/results on close so a reopen starts
   // fresh instead of flashing the previous search's stale results.
   useEffect(() => {
@@ -1152,7 +1280,7 @@ export function Sidebar({
             {!skillsLoading &&
               (skills ?? []).map((s) => (
                 <button key={s.name} class="skills-menu-row" onClick={() => chooseSkill(s.name)} title={s.description || ''}>
-                  <span class="skills-menu-name">/{s.name}</span>
+                  <span class="skills-menu-name">{s.display_name ? `${s.display_name} · /${s.name}` : `/${s.name}`}</span>
                   {s.description && <span class="skills-menu-desc">{s.description}</span>}
                 </button>
               ))}
@@ -1176,6 +1304,15 @@ export function Sidebar({
               minWidth: `${Math.max(mcpMenuPos.width, 220)}px`,
             }}
           >
+            {mcpSession?.session === activeSessionId && (
+              <div class="mcp-session-control">
+                <span>{t(mcpSession.paused ? 'mcp.sessionPaused' : 'mcp.sessionEnabled')}</span>
+                <button class="btn" disabled={mcpSwitchBusy} onClick={() => void toggleMcpSession()}>
+                  {mcpSwitchBusy ? '…' : t(mcpSession.paused ? 'mcp.resumeAll' : 'mcp.pauseAll')}
+                </button>
+              </div>
+            )}
+            {mcpSwitchError && <div role="alert" class="mcp-blocked-error">{mcpSwitchError}</div>}
             {mcpLoading && <div class="group-by-menu-title">{t('sidebar.mcpLoading')}</div>}
             {!mcpLoading && (mcpStatus?.servers?.length ?? 0) === 0 && !(mcpStatus?.blocked?.length) && (
               <div class="group-by-menu-title">{t('sidebar.mcpEmpty')}</div>
@@ -1236,6 +1373,7 @@ export function Sidebar({
       || (dir === cwdNorm ? projectHash || '' : '');
   };
 
+  // Selection only highlights a row; only a newly created optimistic row is prepended.
   const filtered = merged;
 
   const sessionsByProject = new Map<string, SessionMetaWithProject[]>();
@@ -1246,7 +1384,7 @@ export function Sidebar({
     bucket.push(session);
     sessionsByProject.set(hash, bucket);
   }
-  const workspaceProjects = projectHash && !projects.some((project) => project.hash === projectHash)
+  const availableProjects = projectHash && !projects.some((project) => project.hash === projectHash)
     ? [{
         hash: projectHash,
         name: dirName(cwd || ''),
@@ -1256,6 +1394,9 @@ export function Sidebar({
         last_updated: 0,
       } as ProjectInfo, ...projects]
     : projects;
+  const activeProjectHash = filtered.find(s => s.id === activeSessionId);
+  const selectedProjectHash = activeProjectHash ? sessionProjectHash(activeProjectHash) : projectHash;
+  const workspaceProjects = visibleWorkspaces(availableProjects, selectedProjectHash);
   const currentWorkspaceHash = projectHash || projects.find(
     (project) => normDir(project.working_dir) === cwdNorm,
   )?.hash || '';
@@ -1276,7 +1417,7 @@ export function Sidebar({
   const renderItem = (s: SessionMetaWithProject) => {
     const active = s.id === activeSessionId;
     const label = s.name || s.id.slice(0, 8);
-    const dir = shortDir(s.working_dir);
+    const activity = sessionActivityBadge(s.activity, s.id === runningSessionId, active);
     return (
       <div
         key={s.id}
@@ -1287,13 +1428,16 @@ export function Sidebar({
           (menuFor === s.id ? ' menu-open' : '')
         }
       >
-        <button class="session-item-main" onClick={() => onSelect(s)} title={runningSessionId && s.id !== runningSessionId ? `${dir} · ${t('browse.sidebarHint')}` : dir}>
+        <SessionHoverCard title={label} directory={s.working_dir} onSelect={() => onSelect(s)}>
           <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
-          {s.id === runningSessionId && <span class="session-running-mark">{t('browse.running')}</span>}
+          {activity === 'running' && <span class="session-running-mark">{t('browse.running')}</span>}
+          {activity === 'waiting' && <span class="session-running-mark">{t('browse.waiting')}</span>}
+          {/* This page holds its own session open; only another holder is news. */}
+          {activity === 'open' && <span class="session-running-mark session-open-mark" title={t('browse.openElsewhereHint')}>{t('browse.openElsewhere')}</span>}
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>
-        </button>
+        </SessionHoverCard>
         <button
           class="session-item-kebab"
           onClick={(e) => openItemMenu(e as unknown as MouseEvent, s.id)}
@@ -1514,8 +1658,6 @@ export function Sidebar({
         )}
       </div>
 
-      {runningSessionId && <p class="session-browse-sidebar-hint">{t('browse.sidebarHint')}</p>}
-
       <div
         class="session-list-body"
         ref={sessionListBodyRef}
@@ -1527,7 +1669,9 @@ export function Sidebar({
         {!loading && merged.length === 0 && (viewMode === 'flat' || workspaceProjects.length === 0) && (
           <div class="session-empty">{t(viewMode === 'flat' ? 'sidebar.empty' : 'sidebar.emptyInCwd')}</div>
         )}
+        {projectCatalogFailed && viewMode === 'workspace' && <button class="sidebar-project-retry" onClick={() => loadSessions()}>{t('sidebar.loadFailedRetry')}</button>}
         {viewMode === 'flat' && filtered.map(renderItem)}
+        {!loading && viewMode === 'workspace' && workspaceProjects.length === 0 && merged.length > 0 && <div class="session-empty">{t('workspace.noneVisible')}</div>}
         {viewMode === 'workspace' && workspaceProjects.map((project) => {
           const projectSessions = sessionsByProject.get(project.hash) ?? [];
           const expanded = expandedProjects.has(project.hash);
@@ -1557,6 +1701,15 @@ export function Sidebar({
                   <span class="sidebar-project-name">{project.name || dirName(project.working_dir)}</span>
                   <span class="sidebar-project-count">({project.session_count})</span>
                 </button>
+                {project.pinned && <span class="sidebar-project-pinned" title={t('workspace.pinned')} aria-label={t('workspace.pinned')}>📌</span>}
+                <button
+                  class="sidebar-project-new sidebar-project-more"
+                  onClick={(event) => openWorkspaceMenu(event, project)}
+                  title={t('workspace.actions')}
+                  aria-label={t('workspace.actions')}
+                  aria-haspopup="menu"
+                  aria-expanded={workspaceMenu?.project.hash === project.hash}
+                ><KebabIcon /></button>
                 <button
                   class="sidebar-project-new"
                   onClick={(e) => {
@@ -1683,7 +1836,7 @@ export function Sidebar({
 
       {/* Session search dialog (centered modal) */}
       {searchOpen && createPortal(
-        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
+        <ModalOverlay>
           <div class="modal-card search-modal-card">
             <div class="search-input-row">
               <SearchIcon />
@@ -1696,6 +1849,7 @@ export function Sidebar({
                 onInput={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
                 autofocus
               />
+              <button type="button" class="ghost-btn modal-close" onClick={() => setSearchOpen(false)} aria-label={t('settings.close')}>×</button>
             </div>
             <label style={{ display: 'block', padding: '8px 16px' }}>
               <input type="checkbox" checked={includeUnavailable} onChange={(e) => {
@@ -1765,20 +1919,41 @@ export function Sidebar({
               })()}
             </div>
           </div>
-        </div>,
+        </ModalOverlay>,
         document.body,
       )}
 
       {historyPreview && createPortal(
-        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) { ++previewGeneration.current; setHistoryPreview(null); } }}>
+        <ModalOverlay>
           <div class="modal-card" role="dialog" aria-modal="true" aria-label={historyPreview.title} style={{ width: 'min(900px, 90vw)' }}>
             <div class="modal-header"><h3>{historyPreview.title}</h3><button onClick={() => { ++previewGeneration.current; setHistoryPreview(null); }} aria-label={t('sidebar.closeHistory')}>×</button></div>
             <p style={{ padding: '0 16px' }}>{t('sidebar.unavailableWorkspace')}</p>
             <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflow: 'auto', maxHeight: '65vh', padding: '16px' }}>{historyPreview.text}</pre>
           </div>
-        </div>, document.body,
+        </ModalOverlay>, document.body,
       )}
 
+      {workspaceAction && createPortal(<WorkspaceActionDialog
+        key={`${workspaceAction.project.hash}:${workspaceAction.action}`}
+        project={workspaceAction.project} action={workspaceAction.action}
+        runningSessionId={runningSessionId} runningProjectHash={projectHash} onDeleted={handleDeleted}
+        onDone={() => { if (workspaceAction.action === 'clear') loadSessions(); }} onClose={() => setWorkspaceAction(null)}
+      />, document.body)}
+      {workspaceMenu && createPortal(
+        <div class="item-menu" ref={workspaceMenuRef} role="menu" aria-label={t('workspace.actions')}
+          style={{ top: workspaceMenu.top, bottom: workspaceMenu.bottom, right: workspaceMenu.right }}>
+          <button class="item-menu-row" role="menuitem" disabled={pinning} onClick={() => void toggleWorkspacePin(workspaceMenu.project)}>
+            {t(workspaceMenu.project.pinned ? 'workspace.unpin' : 'workspace.pin')}
+          </button>
+          <button class="item-menu-row danger" role="menuitem" disabled={pinning} onClick={() => {
+            setWorkspaceAction({ project: workspaceMenu.project, action: 'clear' }); setWorkspaceMenu(null);
+          }}>{t('workspace.clear')}</button>
+          <button class="item-menu-row danger" role="menuitem" disabled={pinning} onClick={() => {
+            setWorkspaceAction({ project: workspaceMenu.project, action: 'remove' }); setWorkspaceMenu(null);
+          }}>{t('workspace.remove')}</button>
+          {workspaceError && <div class="modal-error" role="alert">{workspaceError}</div>}
+        </div>, document.body,
+      )}
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the
           scroll container nor the mobile drawer's transform/overflow clips it. */}
       {menuSession && menuPos && createPortal(

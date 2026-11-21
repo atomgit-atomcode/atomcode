@@ -245,11 +245,17 @@ fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
-/// Wrap a tool result string as v2 tool-call content (plain text content block).
-fn tool_result_content(text: String) -> ToolCallContent {
-    ToolCallContent::Content(Box::new(Content::new(ContentBlock::Text(
-        TextContent::new(text),
-    ))))
+/// Preserve native tool output for both live delivery and historical replay.
+fn tool_result_contents(text: &str, images: &[ImageContent]) -> Vec<ToolCallContent> {
+    let mut content = vec![ToolCallContent::Content(Box::new(Content::new(
+        ContentBlock::Text(TextContent::new(text.to_owned())),
+    )))];
+    content.extend(images.iter().map(|image| {
+        ToolCallContent::Content(Box::new(Content::new(ContentBlock::Image(
+            V2ImageContent::new(image.data.clone(), MediaType::new(image.media_type.clone())),
+        ))))
+    }));
+    content
 }
 
 /// Translate one kernel event to an optional v2 session update.
@@ -284,7 +290,7 @@ pub fn event_to_update(ev: &AgentEvent, message_id: &str) -> Option<SessionUpdat
             Some(SessionUpdate::ToolCallUpdate(
                 ToolCallUpdate::new(ToolCallId::new(result.call_id.clone()))
                     .status(status)
-                    .content(vec![tool_result_content(result.content.clone())]),
+                    .content(tool_result_contents(&result.content, &result.images)),
             ))
         }
         AgentEvent::Usage(meta) => Some(SessionUpdate::UsageUpdate(UsageUpdate::new(
@@ -361,8 +367,8 @@ fn replay_entries_to_v2_updates(
                         .status(ToolCallStatus::InProgress)
                         .raw_input(crate::acp::replay::raw_input_from_arguments(arguments)),
                 ));
-                if let Some((content, is_error)) = result {
-                    let status = if *is_error {
+                if let Some(result) = result {
+                    let status = if result.is_error {
                         ToolCallStatus::Failed
                     } else {
                         ToolCallStatus::Completed
@@ -370,7 +376,7 @@ fn replay_entries_to_v2_updates(
                     updates.push(SessionUpdate::ToolCallUpdate(
                         ToolCallUpdate::new(ToolCallId::new(id.clone()))
                             .status(status)
-                            .content(vec![tool_result_content(content.clone())]),
+                            .content(tool_result_contents(&result.content, &result.images)),
                     ));
                 }
                 continue;
@@ -502,7 +508,8 @@ impl TurnWire for V2Wire {
                 ToolCallUpdate::new(ToolCallId::new(call_id.to_string()))
                     .title(tool.to_string())
                     .kind(tool_kind(tool))
-                    .status(ToolCallStatus::Pending),
+                    .status(ToolCallStatus::Pending)
+                    .raw_input(crate::acp::permission::approval_input(&payload)),
             ));
         }
         if auto_approve {
@@ -861,45 +868,48 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                         &scan,
                     )
                     .await?;
-                    // `replayFrom: start`: emit the persisted conversation as
-                    // full-content message updates BEFORE responding — the
-                    // protocol requires all requested replay entries before the
-                    // resume response.
-                    if let Some(agent_client_protocol::schema::v2::ReplayFrom::Start(_)) =
-                        req.replay_from.as_ref()
-                    {
-                        let native_id = crate::acp::sessions::native_id_from_wire(&v1_sid)
-                            .ok_or_else(|| {
-                                agent_client_protocol::util::internal_error(
-                                    "acp: resume replay: invalid session id",
-                                )
-                            })?;
-                        let updates = build_replay_updates(native_id, &cwd, &msg_ids)?;
-                        for update in updates {
-                            cx.send_notification(UpdateSessionNotification::new(
-                                req.session_id.clone(),
-                                update,
-                            ))?;
+                    crate::acp::sessions::finish_restore(&sessions, &v1_sid, async {
+                        // `replayFrom: start`: emit the persisted conversation as
+                        // full-content message updates BEFORE responding — the
+                        // protocol requires all requested replay entries before the
+                        // resume response.
+                        if let Some(agent_client_protocol::schema::v2::ReplayFrom::Start(_)) =
+                            req.replay_from.as_ref()
+                        {
+                            let native_id = crate::acp::sessions::native_id_from_wire(&v1_sid)
+                                .ok_or_else(|| {
+                                    agent_client_protocol::util::internal_error(
+                                        "acp: resume replay: invalid session id",
+                                    )
+                                })?;
+                            let updates = build_replay_updates(native_id, &cwd, &msg_ids)?;
+                            for update in updates {
+                                cx.send_notification(UpdateSessionNotification::new(
+                                    req.session_id.clone(),
+                                    update,
+                                ))?;
+                            }
                         }
-                    }
-                    // Advertise the initial config catalog (skipped on the wire
-                    // when empty), mirroring `session/new`.
-                    responder.respond(
-                        ResumeSessionResponse::new()
-                            .config_options(v1_to_v2_config_options(&config_options)),
-                    )?;
-                    // Advertise the slash-command surface right after resume
-                    // (best-effort, mirroring the v1 chain's reasoning).
-                    let catalog =
-                        crate::acp::commands::catalog_of(&sessions, req.session_id.0.as_ref())
-                            .await;
-                    let _ = cx.send_notification(UpdateSessionNotification::new(
-                        req.session_id.clone(),
-                        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands_v2(&catalog),
-                        )),
-                    ));
-                    Ok(())
+                        // Advertise the initial config catalog (skipped on the wire
+                        // when empty), mirroring `session/new`.
+                        responder.respond(
+                            ResumeSessionResponse::new()
+                                .config_options(v1_to_v2_config_options(&config_options)),
+                        )?;
+                        // Advertise the slash-command surface right after resume
+                        // (best-effort, mirroring the v1 chain's reasoning).
+                        let catalog =
+                            crate::acp::commands::catalog_of(&sessions, req.session_id.0.as_ref())
+                                .await;
+                        let _ = cx.send_notification(UpdateSessionNotification::new(
+                            req.session_id.clone(),
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                crate::acp::commands::available_acp_commands_v2(&catalog),
+                            )),
+                        ));
+                        Ok(())
+                    })
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1032,6 +1042,8 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    allowed_tools: None,
+                    required_experimental_capabilities: Default::default(),
                 });
             }
             McpServer::Http(h) => {
@@ -1057,6 +1069,8 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    allowed_tools: None,
+                    required_experimental_capabilities: Default::default(),
                 });
             }
             // `Acp` (MCP-over-ACP) is feature-gated upstream and this agent
@@ -1096,6 +1110,70 @@ mod tests {
         StorageOwner, TurnStat,
     };
     use atomcode_kernel::message::{Message, SessionSnapshot};
+
+    #[test]
+    fn replay_tool_images_match_live_wire_content() {
+        let images = vec![atomcode_kernel::message::ImageContent {
+            data: "IMAGE".into(),
+            media_type: "image/png".into(),
+        }];
+        let entries = vec![crate::acp::replay::ReplayEntry::ToolCall {
+            id: "image-call".into(),
+            name: "browser_take_screenshot".into(),
+            arguments: "{}".into(),
+            result: Some(crate::acp::replay::ReplayToolResult {
+                content: "captured".into(),
+                is_error: false,
+                images: images.clone(),
+            }),
+        }];
+        let updates = replay_entries_to_v2_updates(&entries, &AtomicU64::new(0));
+        let replay = serde_json::to_value(updates.last().unwrap()).unwrap();
+        let event = AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "image-call".into(),
+                content: "captured".into(),
+                is_error: false,
+                images,
+            },
+        };
+        let live = serde_json::to_value(event_to_update(&event, "m-image").unwrap()).unwrap();
+        assert_eq!(replay["content"], live["content"]);
+        assert_eq!(replay["content"].as_array().unwrap().len(), 2);
+        assert_eq!(replay["content"][1]["content"]["data"], "IMAGE");
+    }
+
+    #[test]
+    fn tool_result_images_preserve_order_bytes_mime_and_error_status() {
+        let event = AgentEvent::ToolResult {
+            result: atomcode_kernel::tool::ToolResult {
+                call_id: "image-call".into(),
+                content: "captured".into(),
+                is_error: true,
+                images: vec![
+                    atomcode_kernel::message::ImageContent {
+                        data: "FIRST".into(),
+                        media_type: "image/png".into(),
+                    },
+                    atomcode_kernel::message::ImageContent {
+                        data: "SECOND".into(),
+                        media_type: "image/jpeg".into(),
+                    },
+                ],
+            },
+        };
+        let value = serde_json::to_value(event_to_update(&event, "m-image").unwrap()).unwrap();
+        assert_eq!(value["toolCallId"], "image-call");
+        assert_eq!(value["status"], "failed");
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["content"]["text"], "captured");
+        assert_eq!(blocks[1]["content"]["type"], "image");
+        assert_eq!(blocks[1]["content"]["data"], "FIRST");
+        assert_eq!(blocks[1]["content"]["mimeType"], "image/png");
+        assert_eq!(blocks[2]["content"]["data"], "SECOND");
+        assert_eq!(blocks[2]["content"]["mimeType"], "image/jpeg");
+    }
 
     fn tag(u: &V2Update) -> &'static str {
         match u {
@@ -1208,6 +1286,9 @@ mod tests {
             },
         )
         .unwrap();
+        // Production replay follows runtime resume, which performs this conversion.
+        let lease = mgr.acquire_lease(id).unwrap();
+        mgr.open_as_events(&lease).unwrap();
     }
 
     fn turn_stat(turn_id: u64, after_message: usize) -> TurnStat {
@@ -1287,8 +1368,7 @@ mod tests {
     fn replay_builds_ordered_updates_from_snapshot_and_presentation() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let mut tool_result = Message::user("tool output");
-        tool_result.tool_call_id = Some("call-1".into());
+        let tool_result = Message::tool_result("call-1", "tool output", false);
         let mut assistant = Message::assistant("hi there", Vec::new());
         assistant.reasoning = Some("thinking...".into());
         persist_replay_session(
@@ -1409,8 +1489,7 @@ mod tests {
         };
         let mut assistant = Message::assistant("running", vec![call]);
         assistant.reasoning = Some("deciding...".into());
-        let mut tool_result = Message::user("file list");
-        tool_result.tool_call_id = Some("call-1".into());
+        let tool_result = Message::tool_result("call-1", "file list", false);
         persist_replay_session(
             &home,
             cwd.path(),
@@ -1467,10 +1546,8 @@ mod tests {
             arguments: r#"{"cmd":"b"}"#.into(),
         };
         let assistant = Message::assistant("running", vec![call_a, call_b]);
-        let mut result_a = Message::user("output-A");
-        result_a.tool_call_id = Some("dup".into());
-        let mut result_b = Message::user("output-B");
-        result_b.tool_call_id = Some("dup".into());
+        let result_a = Message::tool_result("dup", "output-A", false);
+        let result_b = Message::tool_result("dup", "output-B", false);
         persist_replay_session(
             &home,
             cwd.path(),
@@ -1485,7 +1562,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 ReplayEntry::ToolCall { result, .. } => {
-                    Some(result.as_ref().map(|(t, _)| t.clone()))
+                    Some(result.as_ref().map(|result| result.content.clone()))
                 }
                 _ => None,
             })

@@ -108,7 +108,7 @@ fn disk_floor_ok(available: Option<u64>, floor: u64) -> bool {
     matches!(available, Some(a) if a >= floor)
 }
 
-fn dir_size_bytes(path: &Path) -> u64 {
+pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -605,9 +605,13 @@ impl WorkspaceCheckpoint {
     ) -> Result<Option<String>, WorkspaceCheckpointError> {
         // Invariant A: physical disk floor. Unknown free space → skip.
         // This check is read-only and safe to perform outside the lock.
-        if !checkpoint_phase("disk_floor", || {
-            disk_floor_ok(available_disk_bytes(&self.git_dir), floor)
-        }) {
+        let available = checkpoint_phase("disk_floor", || available_disk_bytes(&self.git_dir));
+        if !disk_floor_ok(available, floor) {
+            tracing::warn!(
+                available_bytes = ?available,
+                required_bytes = floor,
+                "code rewind capture skipped: free disk space is below the floor or unknown"
+            );
             return Ok(None);
         }
         // Invariant B: store must not exceed budget. The size check AND any gc

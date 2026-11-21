@@ -48,7 +48,38 @@ pub struct ModelRequest {
     /// person sent. A recovery policy reads it to know that "no content" is an
     /// answer here — the model has nothing to add — and not a provider failing.
     pub answering_a_nudge: bool,
+    /// What may be done with this request's pictures — and, once it is sent,
+    /// what was. The loop applies it to the messages it actually sends, after
+    /// every row has had its say (a row may rebuild the request from the log),
+    /// so a picture is judged where it leaves this host.
+    pub images: ImageLimits,
 }
+
+/// The pictures a request may carry. `image-budget` sets the limits per
+/// attempt; the loop applies them to what it sends and fills in `sent`.
+#[derive(Clone, Debug, Default)]
+pub struct ImageLimits {
+    /// Encoded image bytes the request may carry; `None`: no limit.
+    pub max_bytes: Option<usize>,
+    /// Send no pictures at all: the provider refused this request's.
+    pub none: bool,
+    /// Pictures and encoded bytes the request was sent with.
+    pub sent: usize,
+    pub sent_bytes: usize,
+}
+
+/// Attempt-local evidence from the request/execution boundary, not inferred
+/// from error text or from the mere presence of a partial tool call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolDispatchProof {
+    #[default]
+    Unknown,
+    /// No local call collected in this failed attempt reached ToolExec.
+    NotDispatched,
+}
+
+/// A host-owned operation exhausted its total time budget.
+pub const HOST_DEADLINE_CODE: &str = "host_deadline";
 
 /// Why a model request failed, with the structure a recovery policy needs.
 ///
@@ -59,6 +90,8 @@ pub struct ModelRequest {
 /// 400 for a 429.
 #[derive(Clone, Debug)]
 pub struct RequestError {
+    /// A host policy refused completion; no provider failure occurred.
+    pub policy_denied: bool,
     pub message: String,
     /// The provider's own verdict on whether trying again could help.
     pub retryable: bool,
@@ -71,8 +104,10 @@ pub struct RequestError {
     /// The history no longer fits. Compacting and retrying is the only thing
     /// that helps, and retrying without compacting is guaranteed to fail again.
     pub context_overflow: bool,
-    /// The provider answered with no content and no tool calls. Distinct from
-    /// an error: nothing failed, the turn simply cannot proceed on it.
+    /// The provider answered with no content, no tool calls and no reasoning.
+    /// Distinct from an error: nothing failed, the turn simply cannot proceed
+    /// on it. A reasoning-only answer is not this; see
+    /// [`ModelResponse::ended_in_reasoning`].
     pub empty_response: bool,
     /// A rate-limit policy decided this 429 is a pause, not a failure: the turn
     /// ends cleanly as rate-limited and the person is told when it resets.
@@ -84,8 +119,10 @@ pub struct RequestError {
     /// already describe work worth keeping, and discarding them means the retry
     /// starts from nothing. Carried here so a recovery policy can preserve it.
     pub partial: Option<Box<ModelResponse>>,
-    /// Any tool call or argument fragment in the failed stream is unexecuted.
+    /// The failed stream contains tool calls or argument fragments. This flag
+    /// alone does not prove whether a custom request row dispatched them.
     pub unexecuted_tool_output: bool,
+    pub tool_dispatch: ToolDispatchProof,
 }
 
 impl RequestError {
@@ -101,6 +138,8 @@ impl RequestError {
             rate_limit_pause: None,
             partial: None,
             unexecuted_tool_output: false,
+            tool_dispatch: ToolDispatchProof::Unknown,
+            policy_denied: false,
         }
     }
 
@@ -117,6 +156,8 @@ impl RequestError {
             rate_limit_pause: None,
             partial: None,
             unexecuted_tool_output: false,
+            tool_dispatch: ToolDispatchProof::Unknown,
+            policy_denied: false,
         }
     }
 
@@ -173,6 +214,12 @@ pub struct ModelResponse {
     /// anything still streaming when it was cut — a tool call's arguments in
     /// particular — is incomplete and unsafe to act on.
     pub truncated: bool,
+    /// The provider ended the response normally after reasoning alone: no
+    /// text, no tool call. Not empty — the reasoning is real and was paid for —
+    /// but the turn cannot advance on it, and replaying the same request only
+    /// reasons the same way again. Seen when an upstream gateway closes a long
+    /// request at its own wall-clock limit and reports a plain `stop`.
+    pub ended_in_reasoning: bool,
 }
 
 /// A round's tool calls, on their way to being scheduled.
@@ -358,6 +405,20 @@ plexus_event!(ToolCallChunk, "assistant/tool-chunk", Emit, ToolChunk);
 plexus_event!(AssistantChunk, "assistant/chunk", Emit, Chunk);
 plexus_event!(AssistantMessage, "assistant/message", Emit, Message);
 plexus_event!(ToolResultEvent, "tool/result", Emit, ToolResult);
+
+/// Ephemeral signal from the delegated-write guard, not a persisted fact.
+/// Deliberately carries no paths, tool arguments or raw refusal text.
+#[derive(Clone, Debug)]
+pub struct DelegatedWriteRefusal {
+    pub session: String,
+    pub turn: u64,
+}
+plexus_event!(
+    DelegatedWriteRefused,
+    "delegation/write-refused",
+    Emit,
+    DelegatedWriteRefusal
+);
 
 plexus_event!(
     /// Around the model call. Delegating runs the provider; returning without

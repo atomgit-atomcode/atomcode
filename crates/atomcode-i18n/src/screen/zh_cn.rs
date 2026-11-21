@@ -94,6 +94,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── 当下 ──
+        Msg::MomentHistoryClear => "已填入历史消息 · Ctrl+C 清空输入 · Esc 停止任务".into(),
+        Msg::UpgradeProgressDownloading => "正在下载更新".into(),
+        Msg::UpgradeProgressEta { seconds } => format!("剩余约 {seconds} 秒").into(),
+        Msg::UpgradeProgressEtaUnknown => "剩余时间 —".into(),
         Msg::MomentQuitAgain => "再按 Ctrl+C 退出".into(),
         Msg::MomentEofAgain => "再按 Ctrl+D 退出".into(),
 
@@ -123,6 +127,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MentionEmpty => "  暂无匹配条目".into(),
         Msg::MentionLegend => "  Enter/Tab 插入 · Esc 关闭 · ↑/↓ 选择 · ←/→ 切换分类".into(),
         Msg::MentionSessions => "会话".into(),
+        Msg::MentionSessionsWorkspace => "会话 · 本工作区".into(),
         Msg::MentionSelected => "已选中".into(),
         Msg::MentionFilter => "切换类别 · Enter / Tab".into(),
         Msg::MenuFolder => "目录".into(),
@@ -169,7 +174,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 模型向人提问 ──
         Msg::AskStepLimitQuestion => "这一轮已经跑了很多步。继续吗?".into(),
         Msg::AskStepLimitTitle => "步数上限".into(),
-        Msg::AskTruncatedQuestion => "回答一直被截断,自动接续已经用尽。继续吗?".into(),
+        Msg::AskTruncatedQuestion => "输出连续被截断，自动恢复已停止。继续吗？".into(),
+        Msg::AskReasoningTruncatedQuestion => "模型连续思考达到输出上限，尚未生成正文。自动恢复已停止，继续尝试吗？".into(),
+        Msg::AskNoProgressTruncatedQuestion => "输出达到上限，仍无正文或完整工具调用。自动恢复已停止，继续尝试吗？".into(),
+        Msg::AskLowerEffortOnce => "以较低思考强度重试一次".into(),
         Msg::AskTruncatedTitle => "输出截断".into(),
         Msg::AskContinue => "继续".into(),
         Msg::AskStop => "停下".into(),
@@ -280,6 +288,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelCurrent => "（当前）".into(),
         Msg::RewindPanelNoCodeChanges => "没有代码改动".into(),
         Msg::RewindPanelFiles { files } => format!("{files} 个文件").into(),
+        Msg::RewindPanelTurnNoCheckpoint => "本轮未保留代码回退点。".into(),
         Msg::RewindPanelScopeAsk => "  回到那儿，把什么一起带回去？".into(),
         Msg::RewindCodeNotEnabled => "工作区回退已被 ATOMCODE_CODE_REWIND 关闭，去掉这个环境变量即可开启".into(),
         Msg::RewindCodeNoSession => "这次会话不落盘，工作区回不去".into(),
@@ -300,6 +309,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CdPinned { dir } => format!("{dir} 已标上——`/cd` 会先给它").into(),
         Msg::CdUnpinned { dir } => format!("{dir} 的标记取消了").into(),
         Msg::ResumeDeleteArmed => "再按一次就删掉它".into(),
+        Msg::ResumeHeldRunning => "● 运行中(别处)".into(),
+        Msg::ResumeHeldWaiting => "● 待回答(别处)".into(),
+        Msg::ResumeHeldOpen => "● 已在别处打开".into(),
         Msg::ResumePreviewWaiting => "正在读它最后聊了什么…".into(),
         Msg::ResumeDeleted { id } => format!("会话 {id} 已删除").into(),
         Msg::ResumeDeleteFailed { why } => format!("没删掉:{why}").into(),
@@ -355,6 +367,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "当前将使用".into(),
         Msg::ProviderSetUse => "设为使用模型".into(),
         Msg::ProviderBatchChoose => "设为使用模型".into(),
+        Msg::ProviderCatalogCandidates => "models.dev 目录候选 · 账号可用性未验证".into(),
         Msg::ProviderNotProvided => "未提供".into(),
         Msg::ProviderManualAdd => "手动添加".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::ProviderMenuEdit),
@@ -413,6 +426,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PatchReady => "请用 apply_patch 应用这份已导入的用户补丁，使用其 artifact_id 和完整 file_paths，不要复述补丁正文：".into(),
         Msg::CmdAboutPaste => "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它".into(),
         Msg::CmdAboutConfig => "拉出设置面板:搜索、改值;esc 关".into(),
+        Msg::CmdAboutTheme => "打开终端主题设置，重启后生效".into(),
         Msg::CmdAboutProviderPanel => "拉出 provider 面板:账号与模型,增改删;enter 换过去,esc 关".into(),
         Msg::CmdAboutCopy => "复制模型最后一条回复;/copy code 复制代码块(N 指定第几块,all 全要)".into(),
         Msg::CmdAboutSave => "把这段对话存成 markdown".into(),
@@ -424,6 +438,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutTranscript => "把对话按模型看到的样子列出来".into(),
         Msg::CmdAboutClear => "开一个新会话:这段对话放下,换一条干净的".into(),
         Msg::CmdAboutSession => "开一个新会话(等于 /clear)".into(),
+        Msg::ForkLeadOnly => "请先返回主会话后再使用 /fork。".into(),
+        Msg::CmdAboutFork => "复制当前对话并切换到独立会话".into(),
+        Msg::SessionForked { source, id } => format!("已分叉到 {id}。原会话：{source}。可在副本执行 /compact，或 /resume {source} 返回。工作目录文件仍共用。").into(),
         Msg::CmdAboutResume => "回到一个存下的会话;不带 id 则挑一个".into(),
         Msg::CmdAboutEffort => "改这个会话的思考强度(与模型无关)".into(),
         Msg::CmdAboutUndo => "撤回最后一句话(或某一回合)及其后的一切,那句话放回输入框".into(),
@@ -440,6 +457,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutStatus => "这次会话现在是什么状况:模型、模式、在哪、跑到第几回合".into(),
         Msg::CmdAboutCost => "这次会话用掉多少 token(等于 /context)".into(),
         Msg::CmdAboutUsage => "账号还剩多少额度,哪个窗口用完了、什么时候回来".into(),
+        Msg::CmdAboutBrowser => "管理外部隔离浏览器 MCP；/browser help 查看设置说明".into(),
+        Msg::CmdTakesBrowser => "[status|doctor|enable|disable|reload|help]".into(),
+        Msg::BrowserStatusAbout => "查看已保存的配置".into(),
+        Msg::BrowserDoctorAbout => "检查 Node 和后端版本，不启动浏览器".into(),
+        Msg::BrowserEnableAbout => "保存隔离浏览器配置".into(),
+        Msg::BrowserDisableAbout => "保存关闭配置；已发出的操作可能仍在执行".into(),
+        Msg::BrowserReloadAbout => "重载配置，使其在当前会话生效".into(),
+        Msg::BrowserHelpAbout => "查看设置与使用说明".into(),
+        Msg::BrowserHelp => "/browser [status|doctor|enable|disable|reload|help]\nstatus 读取配置；doctor 检查 Node/后端版本，不验证浏览器启动。首次设置：atomcode browser enable --server <cli.js 绝对路径>。请显式安装 @playwright/mcp@0.0.85 及浏览器。enable/disable 修改配置；reload 走现有重载流程。关闭不能中断或撤销已发出操作。配置后直接描述网页任务即可自动加载浏览器指引；也可显式使用 $browser-use。工具审批不等于站点授权。 来源范围：/browser enable --allow-origin https://example.test（可重复）；--deny-all-origins 拒绝全部；--unrestricted-origins 显式切回原版后端。普通 enable 保留范围。首次限制配置需要终端指定 --origin-backend 和 --backend-root；之后仍需显式 reload。 v2 权限：/browser enable --origin-policy-file /绝对路径/policy.json（执行主机上的文件；参数后全部作为路径，无需引号）。保存校验后的内容，保留已有工具限制。".into(),
         Msg::CmdAboutMcp => "MCP 服务器面板;reload 重连、tools 看工具、trust/untrust 信任、login/logout 登录、withdraw 撤下,/mcp help 看全部".into(),
         Msg::CmdAboutLanguage => "模型用哪种语言回答;不带参数则说现在是哪个,以及可选哪些".into(),
         Msg::CmdAboutReload => "重新读取 skills、MCP 与配置,会话不变".into(),
@@ -512,18 +538,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 到当前行首 / 行尾
     Ctrl+U / Ctrl+K                 删除到当前行首 / 行尾
     Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
-    Up / Down                       在输入里移动游标，到头则翻历史
-    Ctrl+P / Ctrl+N                 翻历史（鼠标交还终端时 ↑↓ 用来滚动对话）
+    Up / Down                       在输入里移动游标，到头翻历史（HiShell：到头滚动对话）
+    Ctrl+P / Ctrl+N                 上一条 / 下一条输入历史（HiShell 请使用这组快捷键）
     点击输入框                      定位游标
     Ctrl+R                          搜索这个项目里以前打过的东西；继续打字缩小范围，再按往更老翻，Enter 接受，Esc 还回草稿
 
   ── 回合进行中 ──
-    Esc / Ctrl+C                    停止当轮；排队的话退回输入框
+    Esc                             停止当轮；排队的话退回输入框
+    Ctrl+C                          有输入时只清空；输入为空时停止当轮
     Ctrl+X                          停止当轮；排队的话立刻发出
 
   ── 空闲时 ──
     Esc Esc                         清空输入；输入已空再连按两下打开回退
-    Ctrl+C                          清空输入；再按一次退出
+    Ctrl+C                          有输入时只清空；输入为空时双击退出
 
   ── 翻看与显示 ──
     PgUp / PgDn                     按屏翻页（保留一行重叠）
@@ -598,7 +625,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── background sessions ──
         Msg::CmdAboutBg => "后台会话:不带参数把这个会话放到后台接着跑,带任务就新开一个去做;也能看、换、丢".into(),
         Msg::CmdTakesBg => "[<任务> | list | <N> | drop <N>]".into(),
-        Msg::CmdAboutReview => "让另一个会话把这次改动审一遍——默认放后台跑,当前对话不停".into(),
+        Msg::CmdAboutReview => "在独立会话中进行代码审查，默认后台运行，当前对话可继续".into(),
         Msg::CmdTakesReview => "[deep | deep+verify] [staged | <base>] [关注点]".into(),
         Msg::ReviewWhatUncommitted => "审查未提交的改动".into(),
         Msg::ReviewWhatStaged => "审查已暂存的改动".into(),
@@ -647,6 +674,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // 只交内容,不交指令:那句"逐条核实一遍…"是替那段对话里的人做的决定,而且是以
         // 人的口吻说出来的。要不要接着核实,由那段对话自己看上下文决定。
+        Msg::BackgroundIncomplete { reason, partial } => format!("后台任务未完成（{reason}）。以下仅为中断前的部分输出，不是成功结论：\n\n{partial}").into(),
+        Msg::BackgroundNoConclusion => "后台任务已结束，但没有返回结论。".into(),
         Msg::BackgroundResult { title, answer } =>
             format!("后台「{title}」的结果回来了:\n\n{answer}").into(),
 
@@ -724,6 +753,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ShellTimedOut { secs } => format!("(跑了 {secs} 秒还没完,已停止)").into(),
         Msg::ShellFailed { code } => format!("(退出码 {code})").into(),
+        Msg::ShellContextHeading => "已执行的本地命令".into(),
+        Msg::ShellWorkingDir { dir } => format!("工作目录：{dir}").into(),
         Msg::ShellSaidNothing => "(命令已完成,没有输出)".into(),
         Msg::CompactionInterrupted => "压缩被打断了 —— 上下文还是原来那么长".into(),
         Msg::RuntimeStopped { how } => format!("运行时停了:{how}。这个会话不会再有新的东西。").into(),
@@ -783,7 +814,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "重新加载完成；已加载的指令来源可在 /status 查看。轻量 skill 重载不刷新指令正文".into(),
-        Msg::SignedOut => "已登出;/login 重新登录".into(),
+        Msg::SignedOutHint => "已退出 AtomGit。/model 切换模型 · /login 重新登录 · /provider 配置模型服务".into(),
+        Msg::SignedOut => "已退出登录。".into(),
         Msg::SignedIn => "已登录".into(),
 
         // ── MCP 面板 (`mcp.rs`、`modules/mcp.rs`) ──
@@ -816,6 +848,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpActionLogout => "登出".into(),
         Msg::McpActionReconnect => "重连".into(),
         Msg::McpActionEnable => "启用".into(),
+        Msg::McpPauseAll => "暂停全部".into(),
+        Msg::McpResumeAll => "恢复".into(),
+        Msg::McpSessionPaused => "本会话 MCP 已暂停".into(),
+        Msg::McpSessionEnabled => "本会话 MCP 已开启".into(),
         Msg::McpActionDisable => "停用".into(),
         Msg::McpRefreshTimeout => "MCP 状态刷新超时，按 Ctrl+R 重试".into(),
         Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭 · Ctrl+R 刷新".into(),
@@ -841,12 +877,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginAmbiguous { name, lines } => format!("有好几个叫 {name} 的,说清是哪个:\n{lines}").into(),
         Msg::NoPluginPort => "这个屏幕没有接插件:启动器没有提供 `tui-plugins`".into(),
         Msg::NoMcpPort => "这个屏幕没有接 MCP:启动器没有提供 `tui-mcp`".into(),
-        Msg::CmdTakesSetup => "[focus area,例如 hooks、mcp、skills、all]".into(),
-        Msg::CmdAboutSetup => "分析这个项目、装好种子 skill,然后给出该配哪些自动化的建议".into(),
+        Msg::CmdTakesSetup => "[check|install <id>|cancel|skip|automations|--force]".into(),
+        Msg::CmdAboutSetup => "检查项目能力，并查看可选工具的安装计划".into(),
         Msg::NoSetupPort => "这个屏幕没有接种子安装:启动器没有提供 `tui-setup`,所以它装不了种子".into(),
         Msg::SetupJobDidNotStart { error } => format!("装种子的活没能派出去:{error}").into(),
         Msg::SetupFailed { error } => format!("装种子失败:{error}").into(),
         Msg::SetupInstalling => "正在装种子文件…".into(),
+        Msg::SetupCapabilities => "项目能力检查".into(),
+        Msg::SetupAutomations => "让模型推荐自动化".into(),
+        Msg::SetupDismiss => "跳过这些推荐".into(),
+        Msg::SetupConfirm => "确认执行".into(),
+        Msg::SetupWorking => "正在执行已确认的安装计划… 可用 /setup cancel 停止。".into(),
+        Msg::SetupUsage => "使用 /setup [check|--force|cancel|skip|automations]，或 /setup install <ast-grep|context7>".into(),
         Msg::SetupRunningSkill => "种子已就位,正在让模型分析这个项目…".into(),
         Msg::PluginNothingInstalled => "还什么都没装".into(),
         Msg::PluginInstalledList { lines } => format!("装着这些:\n{lines}").into(),
@@ -995,6 +1037,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OpenLinkFailed { reason } => format!("打不开链接：{reason}").into(),
         Msg::ImagePreviewFailed { reason } => format!("打不开图片：{reason}").into(),
         Msg::NoOpener => "这个界面不能打开文件".into(),
+        Msg::ToolImage { ordinal } => format!("图片 {ordinal} · 点击打开").into(),
         Msg::ImageGone => "这张图已经找不到了".into(),
         Msg::ImageCorrupt => "图片数据损坏".into(),
         Msg::MouseTaken => "鼠标已收回 · ctrl+g 交还终端".into(),
@@ -1002,8 +1045,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ↑↓/ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · 保留原生鼠标 · 在 tmux 启用鼠标并重启后可用应用滚动".into(),
-        Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
-        Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
+        Msg::MouseUnreportedAtStart => "输入历史：Ctrl+P 上一条 · Ctrl+N 下一条 · Ctrl+R 搜索\n/keys 查看全部快捷键 · 终端保留鼠标，可直接拖选".into(),
+        Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮翻页 · Ctrl+P/N 翻输入历史".into(),
         Msg::MouseHandedBackAtStart => "鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into(),
         Msg::ReasoningNotReceived => "尚未收到思考内容；收到后会实时展示。".into(),
         Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开/隐藏 · 工具输出用 ctrl-t".into(),
@@ -1067,6 +1110,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── how the conversation reads (`content.rs`) ──
         Msg::ThoughtLines { gutter, n } => format!("{gutter} 思考 {n} 行").into(),
         Msg::ToolsRun { count } => format!("已执行了 {count} 个工具").into(),
+        Msg::BrowserActions { count } => format!("已执行 {count} 次浏览器操作").into(),
         Msg::ToolsFailed { failed } => format!(" · {failed} 失败").into(),
         Msg::VerbSkill => "技能".into(),
         Msg::VerbMemory => "记忆".into(),
@@ -1093,6 +1137,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "模型服务身份验证失败".into(),
         Msg::ProviderRateLimitError => "模型服务限流".into(),
         Msg::ProviderConnectionError => "无法连接模型服务".into(),
+        Msg::ProviderResponseTimeout => "模型服务未及时响应".into(),
         Msg::ProviderConnectionTimeout => "连接模型服务超时".into(),
         Msg::ProviderTlsInterrupted => "TLS 连接异常中断".into(),
         Msg::ProviderPartialReply => "响应中断，已保留部分回复".into(),
@@ -1104,6 +1149,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCheckRequest => "请查看错误详情，检查模型配置或联系服务提供方。".into(),
         Msg::ProviderCheckConnection => "请检查网络连接和模型服务地址，然后重试。".into(),
         Msg::ProviderNoFallback => "当前模型未找到可用的备用路由，无法自动切换。".into(),
+        Msg::ProviderRetryProlonged => "模型服务暂时不稳定，正在自动重试。可继续等待或取消。详情：/errors".into(),
         Msg::ProviderRetryDetailsHint => "详情：/errors".into(),
         Msg::ProviderErrorDetails => "原始错误详情 · 点击展开/收起，或 /errors show".into(),
         Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),
@@ -1130,6 +1176,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopAt { at } => format!("停下 {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
+        Msg::StopWithMembersRunning { n } => format!("本轮结束 · 仍有 {n} 个子 agent 工作").into(),
+        Msg::LiveWaitingForMember { n } => format!("等待 {n} 个子 agent 完成").into(),
         Msg::LiveStopping => "正在停止".into(),
         Msg::LiveRecognizingImage => "正在识别图片".into(),
         Msg::LiveCompacting => "正在压缩".into(),
@@ -1198,7 +1246,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FieldVision => "看图".into(),
         Msg::FieldEffort => "思考强度".into(),
         Msg::FieldLevels => "可选强度".into(),
-        Msg::FieldWindow => "上下文".into(),
+        Msg::FieldWindow => "上下文预算".into(),
+        Msg::ContextBudgetSource => "预算来源：当前模型配置或默认值，并非服务端实测容量。".into(),
+        Msg::AutoContextBudgetNote => "auto 路由的实际窗口未知，请设置保守预算；上次响应模型不保证下一次仍使用同一模型。".into(),
         Msg::FieldUseAfterSaving => "存完就用".into(),
         Msg::VisionYes => "能".into(),
         Msg::VisionNo => "不能".into(),
@@ -1210,7 +1260,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendChangeValue => "改".into(),
         Msg::LegendToggleLevel => "启用/停用这一档（✓ 为启用）".into(),
         Msg::LegendPickLevel => "选档位".into(),
-        Msg::WindowAutomatic => "自动（按协议默认）".into(),
+        Msg::WindowAutomatic => "未指定（协议默认值）".into(),
+        Msg::FieldOutputTokens => "最大输出 Tokens".into(),
+        Msg::OutputAutomatic => "自动（清除输出上限设置）".into(),
+        Msg::LegendTypeOutput => "输入正整数，如 4096、32k；单次输出上限，自动使用程序默认策略".into(),
+        Msg::OutputInvalid => "无效数值：请输入 1–4294967295 的整数，可用 k/m；方向键可选自动".into(),
         Msg::WindowCustom => "自定义".into(),
         Msg::LegendTypeWindow => "输入 token 数，如 200000、200k、1m".into(),
         Msg::LegendBackToPresets => "换回预设".into(),
@@ -1247,7 +1301,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "思考".into(),
         Msg::RuntimeAlreadyStopped => "这个会话的运行时已经停了".into(),
         Msg::NoProviderConfigured => "还没有可用的 provider——在 atomcode 终端里用 /login 登录,或用 /provider 添加一个".into(),
-        Msg::LoginExpired => "登录已经失效，需要重新登录".into(),
+        Msg::LoginExpired => "登录已失效。/login 重新登录 · /provider 选择模型服务".into(),
         Msg::ProviderUnsupportedByBuild => "当前构建不支持 AtomGit 官方网关。请安装官方版本，或用 /model 切换到其他模型、/provider 换一个 provider".into(),
         Msg::ScreenNotConnectedAgent => "屏幕还没接上 agent".into(),
         Msg::HostHasNoControl => "这个宿主没有控制面".into(),
@@ -1302,11 +1356,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── signing in, from the screen (`atomcode-cli`) ──
         Msg::CmdAboutTuiLogin => "登录并配好 provider；已登录则刷新 codingplan 配置".into(),
         Msg::SetupThreadDied => "codingplan setup 线程崩了".into(),
+        Msg::QuotaRefreshCheckingCurrentConfig => "套餐刷新已触发额度核验；当前任务沿用原配置，配置变更需在任务结束后重新加载。".into(),
+        Msg::GoalQuotaWaiting { secs } => format!("Goal 等待额度恢复 · {secs}s").into(),
+        Msg::GoalQuotaChecking => "Goal 正在核验额度".into(),
+        Msg::LoopQuotaWaiting { secs } => format!("Loop 等待额度恢复 · {secs}s").into(),
+        Msg::LoopQuotaChecking => "Loop 正在核验额度".into(),
+        Msg::LoopQuotaShort => "Loop 等待额度".into(),
+        Msg::GoalQuotaShort => "Goal 等待额度".into(),
+        Msg::QuotaAvailableContinueManually => "当前额度可用。若任务仍处于暂停状态，可发送“继续”继续当前对话；已结束的 loop 需要手动重新启动。".into(),
         Msg::ConfigWrittenReloadFailedCli { error } => format!("配置已写入，但重新加载失败：{error}").into(),
-        Msg::SignedInSettingUpProvider => "登录成了，正在配 provider…".into(),
+        Msg::SignedInSettingUpProvider => "登录成功，正在配置模型服务…".into(),
         Msg::AlreadySignedInRefreshing => "已登录，正在刷新 codingplan 配置…".into(),
         Msg::TokenRejectedSigningInAgain => "服务端不认这个 token 了，重新登录一次…".into(),
-        Msg::SignedInAgainRerunningSetup => "重新登录成了，重跑 setup…".into(),
+        Msg::SignedInAgainRerunningSetup => "重新登录成功，正在重新配置模型服务…".into(),
         Msg::ConfigNotWritten { error } => format!("配置没写成：{error}").into(),
         Msg::LoginCouldNotStart { error } => format!("登录起不来：{error}").into(),
         Msg::LoginAutoOpenFailed { reason } => {
@@ -1315,42 +1377,26 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LoginFailed { error } => format!("登录没成：{error}").into(),
         Msg::LoginNoAnswer => "登录没了回音".into(),
         Msg::TokenExchangeFailed { error } => format!("换 token 没成：{error}").into(),
-        Msg::SignedInCredentialsNotSaved { error } => format!("登录成了，但凭据没写成：{error}").into(),
+        Msg::SignedInCredentialsNotSaved { error } => format!("登录成功，但凭据保存失败：{error}").into(),
         Msg::ScanOrOpen => "用手机扫码，或在浏览器里打开：".into(),
         Msg::InternalError { error } => format!("internal error：{error}").into(),
 
-        // ── the first-run wizard (`atomcode-cli`) ──
-        Msg::OnboardIntroTitle => "先把这台机器配好".into(),
-        Msg::OnboardIntroLine1 => "还没有可用的 provider，所以现在还不能开始干活。".into(),
-        Msg::OnboardIntroLine2 => "选界面语言、定 provider 怎么来、看一眼配好了什么。".into(),
-        Msg::OnboardIntroLine3 => "任何一步都可以按 esc 退出，之后 /onboarding 再来。".into(),
-        Msg::OnboardLanguageTitle => "界面语言".into(),
-        Msg::OnboardLanguageChinese => "中文".into(),
-        Msg::OnboardLanguageFollowSystem => "跟随系统".into(),
-        Msg::OnboardLanguageFollowSystemAbout => "按环境变量判断".into(),
-        Msg::OnboardSetupTitle => "provider 怎么来".into(),
-        Msg::OnboardSetupCodingPlan => "登录 CodingPlan".into(),
-        Msg::OnboardSetupCodingPlanAbout => "扫一下码，免费额度跟着来".into(),
-        Msg::OnboardSetupManual => "自己配一个".into(),
-        Msg::OnboardSetupManualAbout => "手里有 API key，或者自己部署的模型".into(),
-        Msg::OnboardSetupSkip => "先不配".into(),
-        Msg::OnboardSetupSkipAbout => "这台机器仍然干不了活".into(),
-        Msg::OnboardSetupByHand => "接下来开 provider 面板：API key 、地址、模型都在那里填".into(),
-        Msg::OnboardWouldClearTitle => "这会清屏".into(),
-        Msg::OnboardWouldClearLine1 => "这里已经有在进行的对话。登录成功之后会开一个新会话，现在屏上的东西就不在了。".into(),
-        Msg::OnboardWouldClearLine2 => "回车继续，esc 算了。".into(),
-        Msg::OnboardLoginTitle => "登录".into(),
-        Msg::OnboardFetchingLoginUrl => "正在取登录地址…".into(),
-        Msg::OnboardConfirmTitle => "配好了".into(),
-        Msg::OnboardModalTitle => "开始之前".into(),
-        Msg::OnboardAlreadyFinished => "引导已经结束了".into(),
-        Msg::OnboardLanguageSet { language } => format!("界面语言：{language}").into(),
-        Msg::OnboardLanguageNotWritten { error } => format!("界面语言没写进去：{error}").into(),
-        Msg::OnboardLoginSkipped => "跳过了登录——还是没有 provider，/onboarding 可以再来".into(),
-        Msg::OnboardSkipHint => "不想现在弄的话，回车跳过。".into(),
-        Msg::OnboardSignedInConfigNotWritten { error } => format!("登录成了，但配置没写成：{error}").into(),
-        Msg::CmdAboutOnboarding => "把这台机器配到能干活：语言、登录、看一眼结果".into(),
-        Msg::CmdAboutOnboardingFinished => "引导走完了".into(),
+        Msg::RecoveryTitle => "登录已失效，请选择如何继续".into(),
+        Msg::RecoveryLogin => "重新登录 AtomGit".into(),
+        Msg::RecoveryProvider => "切换或连接其他模型服务".into(),
+        Msg::ModelSetupTitle => "选择模型接入方式".into(),
+        Msg::ModelSetupLogin => "使用 AtomGit 账号登录".into(),
+        Msg::ModelSetupLoginAbout => "扫码授权，领取免费 Coding Plan 额度。".into(),
+        Msg::ModelSetupProvider => "连接已有的模型服务".into(),
+        Msg::ModelSetupProviderAbout => "使用第三方或自建服务，按需填写 API 地址和密钥。".into(),
+        Msg::ModelSetupKeys => "↑/↓ 切换 · Enter 确认".into(),
+        Msg::ModelSetupWaiting => "等待 AtomGit 授权…".into(),
+        Msg::ModelSetupOpenLink => "请在浏览器中打开此链接。".into(),
+        Msg::ModelSetupCompleting => "正在应用登录结果…".into(),
+        Msg::LoginLinkKeys => "点击链接打开 · c 复制链接 · Esc 取消登录并返回".into(),
+        Msg::LoginCancelKey => "Esc 取消登录并返回".into(),
+        Msg::LoginCancelled => "已取消登录。".into(),
+        Msg::LoginAlreadyRunning => "登录已在进行中。".into(),
         Msg::RollbackConfirmSwitch => "会切换到上一版本,并在这个目录里重新启动 AtomCode。".into(),
         Msg::RollbackConfirmNoUpdates => {
             "之后不再自动升级;想回到新版本时运行 /upgrade(或命令行 `atomcode upgrade`)。".into()
@@ -1522,6 +1568,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "追加指令：未知".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerPlaceholder => "使用 AtomCode 开始工作".into(),
         Msg::WaitsForTheTurn { command } => {
             format!("正在回复,/{command} 要等这一轮结束再用;按 Esc 可以先停下这一轮").into()
         }
@@ -1566,7 +1613,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "{path} 有 {size}，粘不进来（上限 {cap}）。编辑区里的东西每一轮都要重发；             让模型自己去读这个文件，它只会读要用的那几行。"
         )
         .into(),
-    }
+
+        Msg::CmdAboutImport => "查看其他 AI 编码 Agent 留下的资产".into(),
+        Msg::NoMigrationPort => "迁移服务不可用".into(),
+        Msg::MigrationReportTitle => "其他 Agent 留下的资产".into(),
+        Msg::MigrationNoAssets => "这个来源没有资产".into(),
+        Msg::MigrationSourceUnavailable => "当前项目没有这个 Agent 的可报告资产。".into(),
+        Msg::MigrationPickSource => "要看哪个 Agent 的资产？".into(),
+        Msg::MigrationAssetsCount => "项资产".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}：{count} 项资产").into()
+        }
+}
 }
 
 /// `团队 · 2 名成员 · 1 个后台任务`, leaving out a count that is zero.

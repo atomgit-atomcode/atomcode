@@ -132,5 +132,21 @@ export function mergeTurnNavigation<T extends ArchivedNavigationTurn>(records: r
   items.forEach((item, live) => {
     if (!covered.has(live) && !(records.length && item.retained)) entries.push({ record: null, live });
   });
-  return entries;
+  // A live item absent from a stale/compacted archive can be older than the
+  // archive's last record. Appending it blindly puts an old prompt at the end
+  // and makes the bottom marker point at the penultimate rail entry.
+  const time = (entry: typeof entries[number]) =>
+    entry.record?.started_at ?? (entry.live >= 0 ? items[entry.live].ts : undefined);
+  // Keep unknown-time legacy entries in their existing slots, rather than
+  // inventing dates or using a non-transitive comparison with timed entries.
+  const timed = entries.filter(entry => time(entry) != null)
+    .sort((a, b) => time(a)! - time(b)!);
+  let cursor = 0;
+  return entries.map(entry => time(entry) == null ? entry : timed[cursor++]);
+}
+
+/** Read the first turn whose content has not ended above the reading line.
+ * A gap before the next prompt belongs to that upcoming turn, not the old one. */
+export function turnAtReadingSpan(spans: readonly { index: number; bottom: number }[], line: number): number | null {
+  return spans.find(span => span.bottom > line)?.index ?? spans[spans.length - 1]?.index ?? null;
 }

@@ -177,6 +177,12 @@ name = "skills"
 [[insert]]
 name = "skills-advert"
 
+# Experimental architecture evidence is absent until explicitly enabled.
+# Enabling only mounts a tool; it never starts a repository scan.
+[[insert]]
+name = "architecture-topology"
+disabled = true
+
 [[insert]]
 name = "codeintel"
 
@@ -527,6 +533,9 @@ pub fn headless_patch() -> atomcode_plexus::Layer {
 /// Public for the same reason [`CODING_DEFAULTS`] is: a host with its own front
 /// end stacks this list instead of restating it.
 pub const CODING_ROWS: &str = r#"
+[[insert]]
+name = "tool-git-index-review"
+
 # Approval gates that the chain mounted as kernel `ToolMiddleware`s.
 # Same judgements — each row calls the same L1 function the middleware does —
 # reached through the `approval` seam instead of a private `PermissionStore`.
@@ -829,6 +838,8 @@ struct CompactionTailPatch {
     threshold: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stub_recent_budget: Option<u32>,
     /// Carried because a patch replaces the whole config and base sets it. Only
     /// the model-free row reads it: `compaction-coding`, which the product swaps
     /// in, keeps recent turns by token budget.
@@ -878,6 +889,16 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
         .map_err(|e| e.to_string())?;
     let mut out = model_rows(cfg)?
         .patch(
+            "tool-code-review",
+            serde_json::json!({"auto_review": cfg.auto_review}),
+        )
+        .map_err(|e| e.to_string())?
+        .patch(
+            "host-tools",
+            serde_json::json!({"auto_review": cfg.auto_review}),
+        )
+        .map_err(|e| e.to_string())?
+        .patch(
             "builtin-tool-search",
             serde_json::json!({"enabled": cfg.atomgit_tool_search}),
         )
@@ -889,6 +910,9 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
             serde_json::json!({"tool_search": cfg.mcp_tool_search}),
         )
         .map_err(|e| e.to_string())?;
+    if cfg.architecture_topology {
+        out = out.enable("architecture-topology");
+    }
     // `[ui] ai_session_naming`(或 `ATOMCODE_AI_SESSION_NAMING`)选的是**哪一个
     // 命名器**填 `session-title` 这条缝:默认那个读第一句话、不问模型;开了之后
     // 换成问工具模型的那个。两者都把答案作为一条 `Titled` 事实提交,所以会话
@@ -918,6 +942,12 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     }
     // With the checkpoint, a front end that draws the question is asked before a
     // turn is cut off by its budget or ends with its answer cut off.
+    out = out
+        .patch(
+            "llm-stream-recovery",
+            serde_json::json!({"max_recoveries": 3}),
+        )
+        .map_err(|e| e.to_string())?;
     if cfg.round_cap_checkpoint {
         out = out
             .patch(
@@ -981,6 +1011,7 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
             CompactionTailPatch {
                 threshold: cfg.compact_threshold,
                 token_limit: cfg.compact_token_limit,
+                stub_recent_budget: cfg.compact_stub_recent_budget,
                 keep_turns: 2,
             },
         )
@@ -1526,6 +1557,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(crate::policy_rows::CredentialShellPlugin),
         Arc::new(crate::policy_rows::WriteApprovalPlugin),
         Arc::new(crate::policy_rows::BashWorkspacePlugin),
+        Arc::new(crate::git_index_policy::GitIndexPlugin),
         // Every tool call states its reason in one line, for the person reading
         // the transcript. This product's call, not the mechanism's: what a tool
         // call should say about itself is a presentation decision
@@ -1594,12 +1626,22 @@ pub async fn mount_swappable(
     .await
 }
 
+/// The primary adapter and its metered summary wrapper are updated together.
+#[derive(Clone)]
+pub struct CompactionProviders {
+    pub primary: Arc<dyn LlmProvider>,
+    pub summary: Arc<dyn LlmProvider>,
+}
+
+pub type SharedCompactionProviders = Arc<std::sync::RwLock<Option<CompactionProviders>>>;
+
 /// What the coding runtime hands a tree beyond its provider: the session it
 /// continues, and the lifecycle hooks it already built against that session.
 ///
 /// See [`crate::host_rows`] for how each becomes a row.
 #[derive(Default)]
 pub struct HostState {
+    pub(crate) quality: Option<Arc<crate::quality::QualityControl>>,
     pub session: crate::host_rows::SessionSeed,
     pub hooks: Option<Arc<crate::host_rows::HostHooks>>,
     /// The person's live switches, and the session grants plan mode keeps for
@@ -1634,6 +1676,11 @@ pub struct HostState {
     /// the policy intervention — offered as commands a person runs
     /// (`docs/adr/0021` §3, §10).
     pub(crate) runtime_commands: Option<Arc<dyn crate::runtime::RuntimeCommands>>,
+    /// `Some` when the driver shows the turn a background completion starts
+    /// ([`crate::CodingAgentConfig::background_wakeups`]): the jobs the runtime
+    /// will wake the model for. Decides what the `capability-commands` row
+    /// tells the model about waiting, and lets it remind a model still polling.
+    pub(crate) background_waits: Option<crate::background_jobs::BackgroundWaits>,
     /// Row edits the runtime's own options call for (a capability switched off,
     /// a directory to resolve against).
     pub rows: Layer,
@@ -1651,7 +1698,7 @@ pub struct HostState {
     /// for the same reason; this is the other half of it, at mount.
     pub model: Option<String>,
     /// The provider a requested compaction's summary is written with.
-    pub summary_provider: Option<atomcode_review::SharedReviewProvider>,
+    pub summary_provider: Option<SharedCompactionProviders>,
     /// The native snapshot writer a committed compaction is stored through.
     pub compaction_checkpoint: Option<Arc<atomcode_capabilities::session::SnapshotHook>>,
     /// Where CodingPlan usage windows come from, when this host has an account.
@@ -2047,9 +2094,9 @@ fn compose_hosted(
         .when(host.session_context.is_some(), |layer| {
             layer.swap("project-instructions", "session-context")
         })
-        .when(!host.tools.is_empty(), |layer| {
-            layer.insert(Entry::named("host-tools"))
-        })
+        // config_rows patches this row even for a model-only host. Mounting
+        // an empty list is valid; omitting the row made that assembly fail.
+        .insert(Entry::named("host-tools"))
         .when(host.skills.is_some(), |layer| {
             layer
                 .swap("skills", "skills-host")
@@ -2116,6 +2163,9 @@ fn compose_hosted(
     if let Some(middleware) = host.middleware.as_ref() {
         hosted = hosted.then(middleware.rows());
     }
+    if host.quality.is_some() {
+        hosted = hosted.insert(atomcode_plexus::Entry::named("quality-host"));
+    }
     layers.push(hosted.then(host.rows.clone()));
     for layer in extra_layers {
         layers.push(layer.clone());
@@ -2131,6 +2181,13 @@ fn compose_hosted(
     // What IS registered here is what this crate owns: the coding discipline.
     let mut registry = catalog();
     registry.register(Arc::new(InjectProvider(providers.clone())));
+    if let Some(control) = host.quality.clone() {
+        registry.register(Arc::new(crate::quality::QualityPlugin {
+            control,
+            cwd: working_dir.to_path_buf(),
+            evidence_root: dirs.user().join("quality-evidence"),
+        }));
+    }
     if let Some(stored) = host.session.stored.clone() {
         registry.register(Arc::new(crate::session_store::SessionStorePlugin(stored)));
     }
@@ -2205,6 +2262,7 @@ fn compose_hosted(
         registry.register(Arc::new(crate::host_rows::CapabilityCommandsPlugin(
             commands,
             working_dir.to_path_buf(),
+            host.background_waits,
         )));
     }
     if let Some(file) = host.config_file {
@@ -2218,9 +2276,7 @@ fn compose_hosted(
             atomcode_harness::plugins::capabilities::WebPlugin::with_api_key(key),
         ));
     }
-    if !host.tools.is_empty() {
-        registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));
-    }
+    registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));
     if let Some(engine) = host.cc_hooks {
         registry.register(Arc::new(crate::host_rows::CcHooksHostPlugin(engine)));
     }
@@ -2309,6 +2365,13 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Veri
     ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
     {
         let response = next.run(req).await?;
+        if self
+            .ctx
+            .service::<crate::quality::QualitySvc>()
+            .is_some_and(|quality| quality.enabled())
+        {
+            return Ok(response);
+        }
         // A round that asked for tools is not finished, and the loop will carry
         // on by itself. The cadence is about the round where the model says it
         // is done.
@@ -2656,12 +2719,12 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Skil
         // steering for one round, and a log full of nudges is a log nobody can
         // read. The loop's "model-visible content is logged" invariant is
         // checked on the assembled messages before the request is built, so a
-        // tail added here is outside it by construction.
-        req.messages
-            .push(atomcode_capabilities::reminder::synthetic_system_reminder(
-                crate::skill_first::SKILL_FIRST_BODY,
-            ));
-        next.run(req).await
+        // tail added here is outside it by construction. Taken off again after,
+        // so a request sent again carries it once.
+        let reminder = atomcode_capabilities::reminder::synthetic_system_reminder(
+            crate::skill_first::SKILL_FIRST_BODY,
+        );
+        atomcode_harness::tail::with_tail(req, vec![reminder], next).await
     }
 }
 

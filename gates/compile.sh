@@ -58,7 +58,8 @@ rm -f /tmp/atomcode-compile-gate.$$
 # 选择,哪天没人再开就又掉出去了;在这里显式开,比依赖别人碰巧开着稳。**别改成 run**
 # —— e2e 与 lsp-e2e 都要真实的外部服务。
 echo "→ feature 门控的测试也能编译"
-FEATURE_GATED='session,memory,setup,e2e,mcp,lsp-e2e'
+# Compile the opt-in bench target too; never run or threshold its timings here.
+FEATURE_GATED='session,memory,setup,e2e,mcp,lsp-e2e,bench,migration'
 if cargo check -p atomcode-capabilities --all-targets \
      --features "$FEATURE_GATED" \
      >/tmp/atomcode-feature-gate.$$ 2>&1; then
@@ -70,14 +71,23 @@ else
 fi
 rm -f /tmp/atomcode-feature-gate.$$
 
+# 诊断行里指向源文件的那一段由 rustc 决定分隔符:Windows 上是反斜杠,其它平台是正斜杠。
+# 两侧都归一成正斜杠再比对,否则在 Windows 上永远认不出阴性对照确实报了诊断,量具会
+# 把自己判成坏的。其它平台 `tr` 是空操作,不影响原有行为。
+diagnosed_at() { # $1 = 编译输出文件, $2 = 期望出现在诊断里的源文件
+  tr '\\' '/' < "$1" | grep -Fq -- "--> $2:"
+}
+
 # 量具自身要能判红。没有这一步,一个永远 `exit 0` 的脚本和这个脚本看起来一模一样。
 #
 # 办法是喂给它一个**一定编译不过**的测试文件,然后要求它说不。放在一个真 crate 的
 # `tests/` 下再删掉 —— 这样走的是 `--all-targets` 真正会去编的那条路,而不是另起一个
 # 只在这里存在的构造。
 echo "→ 闸门自身会判红"
-canary="crates/atomcode-host-api/tests/__gate_canary.rs"
-cleanup() { rm -f "$canary"; }
+# PID 用下划线分隔：Cargo 将文件名用作测试 crate 名，crate 名不能含点。
+canary="crates/atomcode-host-api/tests/__gate_canary_$$.rs"
+canary_out=$(mktemp) || exit 1
+cleanup() { rm -f "$canary" "$canary_out"; }
 trap cleanup EXIT
 cat > "$canary" <<'RS'
 // 阴性对照用,由 gates/compile.sh 写入并立刻删除。留在树里说明上一次跑被打断了。
@@ -86,8 +96,11 @@ fn this_must_not_compile() {
     let _: u32 = "gate canary";
 }
 RS
-if cargo check --workspace --all-targets >/dev/null 2>&1; then
+if cargo check --workspace --all-targets >"$canary_out" 2>&1; then
   printf '  \033[31mFAIL\033[0m 闸门判不出编译错误 —— 它现在什么也没在挡\n'
+  fail=1
+elif ! diagnosed_at "$canary_out" "$canary"; then
+  printf '  \033[31mFAIL\033[0m 闸门报红，但本次阴性对照没有产生诊断\n'
   fail=1
 else
   printf '  \033[32mok\033[0m   闸门自身会判红\n'
@@ -111,8 +124,9 @@ trap - EXIT
 # 时,新门的红不能算作「判得出」;旧门因别的原因本来就红时,也不能说成「新门没盖住
 # 新地方」。
 echo "→ feature 门控的闸门自身会判红（旧门对它应当无感）"
-feature_canary="crates/atomcode-capabilities/tests/__feature_gate_canary.rs"
-feature_out=$(mktemp)
+# 同样用下划线分隔 PID，并且只认本次阴性对照的源文件诊断。
+feature_canary="crates/atomcode-capabilities/tests/__feature_gate_canary_$$.rs"
+feature_out=$(mktemp) || exit 1
 feature_cleanup() { rm -f "$feature_canary" "$feature_out"; }
 trap feature_cleanup EXIT
 cat > "$feature_canary" <<'RS'
@@ -127,12 +141,12 @@ if cargo check -p atomcode-capabilities --all-targets \
      --features "$FEATURE_GATED" >"$feature_out" 2>&1; then
   printf '  \033[31mFAIL\033[0m feature 门控的闸门判不出编译错误\n'
   fail=1
-elif ! grep -q "__feature_gate_canary" "$feature_out"; then
+elif ! diagnosed_at "$feature_out" "$feature_canary"; then
   printf '  \033[31mFAIL\033[0m feature 门报红,但不是阴性对照引起的 —— feature 门后面的代码本来就坏着,这一条判不了\n'
   fail=1
 elif cargo check --workspace --all-targets >"$feature_out" 2>&1; then
   printf '  \033[32mok\033[0m   feature 门控的闸门自身会判红（旧门对它无感）\n'
-elif grep -q "__feature_gate_canary" "$feature_out"; then
+elif grep -Fq -- "--> $feature_canary:" "$feature_out"; then
   printf '  \033[31mFAIL\033[0m 旧门也看见了阴性对照 —— 这条新门没盖住新地方\n'
   fail=1
 else

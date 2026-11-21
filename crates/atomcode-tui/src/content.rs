@@ -10,7 +10,7 @@ use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
 use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
-use crate::theme::Role;
+use crate::theme::{self, Role};
 use crate::width;
 use atomcode_capabilities::tools::request_user_input::{
     parse_batch, read_result, ReadAnswer, REQUEST_USER_INPUT_KIND,
@@ -161,6 +161,7 @@ pub struct WelcomeBlock {
     /// A dim line under the working directory and the model
     /// (`OpeningNotices::welcome_note`).
     pub note: Option<String>,
+    pub model_setup: Option<crate::model_setup::SetupView>,
 }
 
 /// What the welcome block says, in the language in force.
@@ -341,7 +342,11 @@ impl Content for WelcomeBlock {
         // Shape is not in the hash — same class as width. `Content` promises the
         // hash covers what the block *says* and never the bytes it renders, and
         // "did the cat get drawn" is rendered bytes.
+        let branch = crate::git_branch::current(&self.cwd);
         let mut parts: Vec<&str> = vec!["welcome", self.version, &self.cwd, &self.heading];
+        if let Some(branch) = branch.as_deref() {
+            parts.push(branch);
+        }
         if let Some(model) = &self.model {
             parts.push(model);
         }
@@ -351,6 +356,28 @@ impl Content for WelcomeBlock {
         for (command, about) in &self.tips {
             parts.push(command);
             parts.push(about);
+        }
+        use crate::model_setup::SetupView;
+        match &self.model_setup {
+            Some(SetupView::Choose { second, expired }) => {
+                if *expired {
+                    parts.push("expired");
+                }
+                parts.push(if *second {
+                    "setup-provider"
+                } else {
+                    "setup-login"
+                });
+            }
+            Some(SetupView::Authorize { url, .. }) => {
+                parts.push("setup-authorize");
+                if let Some(url) = url {
+                    parts.push(url);
+                }
+            }
+            Some(SetupView::Completing) => parts.push("setup-completing"),
+            Some(SetupView::Provider) => parts.push("setup-provider-form"),
+            None => {}
         }
         hash_of(&parts)
     }
@@ -383,18 +410,44 @@ impl Content for WelcomeBlock {
         // `∙ proj` and `set a goal…` on one line.
         let mut below: Vec<Line> = Vec::new();
         let bullet = ctx.caps.g(Glyph::Bullet);
-        for text in std::iter::once(Some(self.cwd.as_str()))
+        for (index, text) in std::iter::once(Some(self.cwd.as_str()))
             .chain(std::iter::once(self.model.as_deref()))
             .flatten()
+            .enumerate()
         {
-            // The cwd and model read at full strength — they are the two facts a
-            // person most wants at a glance when a session opens, not chrome.
             below.extend(wrapped(
                 text,
                 content_w as u16,
                 Style::default(),
                 &format!("{bullet} "),
             ));
+            if index == 0 {
+                if let Some(branch) = crate::git_branch::current(&self.cwd) {
+                    let suffix = format!(" [{branch}]");
+                    let fits = below.last().is_some_and(|line| {
+                        let used: usize = line
+                            .spans
+                            .iter()
+                            .map(|span| width::str_width(&span.text))
+                            .sum();
+                        used + width::str_width(&suffix) <= content_w
+                    });
+                    if fits {
+                        below
+                            .last_mut()
+                            .unwrap()
+                            .spans
+                            .push(Span::styled(suffix, theme::fg(Role::Brand)));
+                    } else {
+                        below.extend(wrapped(
+                            &format!("[{branch}]"),
+                            content_w as u16,
+                            theme::fg(Role::Brand),
+                            "  ",
+                        ));
+                    }
+                }
+            }
         }
         // Under them, dim and without a bullet: an aside about the screen, not
         // a fact about the session.
@@ -537,7 +590,156 @@ impl Content for WelcomeBlock {
                 rows.push(line);
             }
         }
-        rows.extend(below);
+        rows.append(&mut below);
+
+        use crate::model_setup::SetupView;
+        if let Some(setup) = self.model_setup.as_ref() {
+            rows.push(Line::empty());
+            let heading = if matches!(setup, SetupView::Provider) {
+                Msg::ModelSetupProvider
+            } else if matches!(setup, SetupView::Authorize { .. } | SetupView::Completing) {
+                Msg::ModelSetupLogin
+            } else if matches!(setup, SetupView::Choose { expired: true, .. }) {
+                Msg::RecoveryTitle
+            } else {
+                Msg::ModelSetupTitle
+            };
+            rows.extend(wrapped(&t(heading), content_w as u16, muted(), &pad));
+            match setup {
+                SetupView::Choose {
+                    second: selected,
+                    expired,
+                } => {
+                    for (second, label, about) in [
+                        (
+                            false,
+                            if *expired {
+                                Msg::RecoveryLogin
+                            } else {
+                                Msg::ModelSetupLogin
+                            },
+                            Msg::ModelSetupLoginAbout,
+                        ),
+                        (
+                            true,
+                            if *expired {
+                                Msg::RecoveryProvider
+                            } else {
+                                Msg::ModelSetupProvider
+                            },
+                            Msg::ModelSetupProviderAbout,
+                        ),
+                    ] {
+                        rows.push(Line::empty());
+                        let active = second == *selected;
+                        let marker = if active {
+                            ctx.caps.g(Glyph::Prompt)
+                        } else {
+                            " "
+                        };
+                        let prefix = format!("{pad}{marker} {}. ", if second { 2 } else { 1 });
+                        let style = if active {
+                            theme::fg(Role::Accent).bold()
+                        } else {
+                            Style::default()
+                        };
+                        rows.extend(wrapped(&t(label), content_w as u16, style, &prefix));
+                        if *expired {
+                            continue;
+                        }
+                        rows.extend(wrapped(
+                            &t(about),
+                            content_w as u16,
+                            muted(),
+                            &format!("{pad}     "),
+                        ));
+                    }
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupKeys),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                SetupView::Authorize { .. } => {
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupWaiting),
+                        content_w as u16,
+                        Style::default(),
+                        &pad,
+                    ));
+                }
+                SetupView::Provider => {
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupProviderAbout),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                SetupView::Completing => {
+                    rows.push(Line::empty());
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupCompleting),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+            }
+        }
+        if let Some(SetupView::Authorize { url, screen_rows }) = &self.model_setup {
+            let cancel = wrapped(
+                &t(if url.is_some() {
+                    Msg::LoginLinkKeys
+                } else {
+                    Msg::LoginCancelKey
+                }),
+                content_w as u16,
+                muted(),
+                &pad,
+            );
+            if let Some(url) = url {
+                rows.push(Line::empty());
+                let url_rows = crate::markdown::wrap_spans(
+                    &[Span::linked(
+                        url,
+                        theme::fg(Role::Accent).underline(),
+                        url.as_str(),
+                    )],
+                    content_w as u16,
+                    &pad,
+                    muted(),
+                );
+                let qr_rows = crate::qr::CodeBlock::new(url).map_or_else(Vec::new, |qr| {
+                    qr.lines(&RenderCtx {
+                        width: content_w as u16,
+                        ..*ctx
+                    })
+                });
+                let scan = wrapped(&t(Msg::ScanOrOpen), content_w as u16, muted(), &pad);
+                // Include the gap before the cancel hint and the trailing blank.
+                let with_code =
+                    rows.len() + scan.len() + qr_rows.len() + url_rows.len() + cancel.len() + 2;
+                if !qr_rows.is_empty() && with_code <= usize::from(*screen_rows) {
+                    rows.extend(scan);
+                    rows.extend(qr_rows);
+                } else {
+                    rows.extend(wrapped(
+                        &t(Msg::ModelSetupOpenLink),
+                        content_w as u16,
+                        muted(),
+                        &pad,
+                    ));
+                }
+                rows.extend(url_rows);
+            }
+            rows.push(Line::empty());
+            rows.extend(cancel);
+        }
 
         // A trailing blank, so whatever arrives next (a connection notice, an
         // upgrade hint) does not butt against the last row. Tuix keeps one too.
@@ -712,7 +914,7 @@ impl Content for UserSaid {
         let prefix: String = chars.by_ref().take(512).collect();
         let omitted = chars.next().is_some();
         let clean = crate::text::for_buffer(&prefix);
-        let mut text = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut text = flatten(&clean);
         if text.is_empty() {
             return None;
         }
@@ -721,15 +923,7 @@ impl Content for UserSaid {
         }
         let room = (width as usize).saturating_sub(2);
         let text = clip(&text, room);
-        input_bar(
-            &text,
-            width,
-            &format!("{} ", Caps::default().g(Glyph::Prompt)),
-            None,
-            user(),
-        )
-        .into_iter()
-        .next()
+        user_bar(&text, width).into_iter().next()
     }
 
     fn content_hash(&self) -> ContentHash {
@@ -751,27 +945,19 @@ impl Content for UserSaid {
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        // The `!` commands that rode along are the model's reading, not what
-        // was typed: the person's words lead the bar, and each command follows
-        // as one muted `! command` row — said, so a resumed session still shows
-        // that the message carried it, but not as the tags the model reads.
         let (ran, said) = crate::shell::split_context(&self.0);
-        let mut rows = input_bar(
-            said,
-            ctx.width,
-            &format!("{} ", Caps::default().g(Glyph::Prompt)),
-            None,
-            user(),
-        );
-        let room = (ctx.width as usize).saturating_sub(4);
-        for command in ran {
-            rows.extend(input_bar(
-                &clip(&command, room),
+        let mut rows = user_bar(said, ctx.width);
+        if !ran.is_empty() && ctx.width > 0 {
+            rows.push(Line::default());
+            rows.extend(wrapped(
+                &t(Msg::ShellContextHeading),
                 ctx.width,
-                "  ! ",
-                None,
                 muted(),
+                "  ",
             ));
+            for command in ran {
+                rows.extend(wrapped(&command, ctx.width, muted(), "  ! "));
+            }
         }
         rows
     }
@@ -809,6 +995,25 @@ fn input_bar(text: &str, w: u16, mark: &str, mark_style: Option<Style>, style: S
             Line::from_spans(spans)
         })
         .collect()
+}
+
+fn user_bar(text: &str, width: u16) -> Vec<Line> {
+    let mut rows = input_bar(
+        text,
+        width,
+        &format!("{} ", Caps::default().g(Glyph::Prompt)),
+        None,
+        user(),
+    );
+    for row in &mut rows {
+        // The wrapper keeps its prompt/continuation indent in its own span.
+        // Only that span is decoration; literal chevrons and indentation in
+        // the person's message remain copyable.
+        if let Some(prefix) = row.spans.first_mut() {
+            *prefix = prefix.clone().decoration();
+        }
+    }
+    rows
 }
 
 /// A `!` command the person ran here, echoed as Claude Code echoes one: the
@@ -1099,6 +1304,43 @@ pub(crate) const GUTTER: usize = 2;
 /// row wraps, a lid that took every row of it would cost the run it stands for.
 const FOLDED_ROWS: usize = 2;
 
+/// One returned picture. Its bytes never become terminal text or attachment IDs.
+#[derive(Debug)]
+pub struct ToolImage {
+    pub image: atomcode_kernel::message::ImageContent,
+    pub ordinal: usize,
+}
+
+impl Content for ToolImage {
+    fn kind(&self) -> &'static str {
+        "tool_image"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "tool_image",
+            &self.ordinal.to_string(),
+            &self.image.media_type,
+            &self.image.data,
+        ])
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        vec![Line::styled(
+            t(Msg::ToolImage {
+                ordinal: self.ordinal,
+            })
+            .into_owned(),
+            tool(),
+        )
+        .truncate(ctx.width as usize)]
+    }
+    fn always_open(&self) -> bool {
+        true
+    }
+    fn result_image(&self) -> Option<&atomcode_kernel::message::ImageContent> {
+        Some(&self.image)
+    }
+}
+
 /// A tool call and, once it lands, its result. One block, two facts.
 #[derive(Debug)]
 pub struct ToolCallBlock {
@@ -1115,7 +1357,30 @@ pub struct ToolCallBlock {
     pub progress: Option<String>,
 }
 
+/// A display category, never a trust or approval decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolActivity {
+    Ordinary,
+    Browser,
+}
+
 impl ToolCallBlock {
+    pub(crate) fn activity(&self) -> ToolActivity {
+        if self
+            .name
+            .strip_prefix("mcp__browser-use__")
+            .is_some_and(|tool| !tool.is_empty())
+        {
+            ToolActivity::Browser
+        } else {
+            ToolActivity::Ordinary
+        }
+    }
+
+    pub(crate) fn is_interrupted(&self) -> bool {
+        matches!(self.outcome, Outcome::Interrupted)
+    }
+
     /// Only the exact no-output/running result emitted by bash_poll is noise.
     /// New output, terminal states, errors and pending calls remain independent.
     pub(crate) fn idle_poll_job(&self) -> Option<String> {
@@ -1472,7 +1737,7 @@ impl ToolCallBlock {
     /// diff, or `write_file`'s content as all-additions — when it succeeded and
     /// there is a change worth colouring. `None` for every other call and state,
     /// which then renders its result as text.
-    fn diff_view(&self, w: u16) -> Option<crate::diff::Rendered> {
+    fn diff_view(&self, w: u16, wrap: bool) -> Option<crate::diff::Rendered> {
         const MAX: usize = 400;
         // The indent the plain result body uses too, so folding one for the other
         // does not shift the column.
@@ -1481,7 +1746,7 @@ impl ToolCallBlock {
             return None;
         };
         match self.name.as_str() {
-            "edit_file" => crate::diff::render_edit(output, w, indent, MAX),
+            "edit_file" => crate::diff::render_edit_with_wrap(output, w, indent, MAX, wrap),
             "write_file" => {
                 let content = serde_json::from_str::<serde_json::Value>(&self.args)
                     .ok()?
@@ -1491,7 +1756,9 @@ impl ToolCallBlock {
                 if content.trim().is_empty() {
                     return None;
                 }
-                Some(crate::diff::render_written(&content, w, indent, MAX))
+                Some(crate::diff::render_written_with_wrap(
+                    &content, w, indent, MAX, wrap,
+                ))
             }
             _ => None,
         }
@@ -1596,7 +1863,14 @@ impl ToolCallBlock {
         let caps = Caps::default();
         let mut spans = vec![
             Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
-            Span::styled(t(Msg::ToolsRun { count }).into_owned(), muted()),
+            Span::styled(
+                t(match last.activity() {
+                    ToolActivity::Ordinary => Msg::ToolsRun { count },
+                    ToolActivity::Browser => Msg::BrowserActions { count },
+                })
+                .into_owned(),
+                muted(),
+            ),
         ];
         if failed > 0 {
             spans.push(Span::styled(
@@ -1960,7 +2234,17 @@ fn outcome_note(outcome: &Outcome) -> (String, Style) {
 /// the transcript is one row, and text that keeps them is written where the
 /// scroll is not counting.
 fn flatten(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut words = s.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push_str(first);
+    for word in words {
+        out.push(' ');
+        out.push_str(word);
+    }
+    out
 }
 
 /// `line` with a `…` at its end, cut to make room for it inside `w` cells. The
@@ -2085,7 +2369,7 @@ impl Content for ToolCallBlock {
         // row: the subject line when the model gave a reason, the head otherwise),
         // right after the file, and the line is re-clipped so the suffix cannot
         // push it past the width.
-        if let Some(diff) = self.diff_view(w) {
+        if let Some(diff) = self.diff_view(w, ctx.caps.wrap_diff) {
             if let Some(mut last) = out.pop() {
                 last.spans
                     .extend(self.diff_count_spans(diff.added, diff.removed));
@@ -3136,6 +3420,8 @@ pub struct TurnEndBlock {
     /// the task was done when it was not (reported against 5.1.0). Ignored for
     /// every other stop, which already says it was cut short.
     pub open_items: usize,
+    /// Members still working when this live turn ended; never inferred on replay.
+    pub members_working: usize,
     /// When the turn ended, as the person's own clock reads it (`21:42`) — see
     /// [`clock_of`]. `None` when the log recorded no time for it.
     pub ended_at: Option<String>,
@@ -3416,10 +3702,20 @@ pub fn byte_size(n: u64) -> String {
 /// vocabulary is the product's rather than new. What is added is the cause,
 /// where a person can do something about it: a turn that ran out of rounds says
 /// so, in words, instead of showing them a variant name or nothing at all.
-fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Glyph, String, Style) {
+fn turn_end_note(
+    stop: StopReason,
+    done_index: usize,
+    open_items: usize,
+    members_working: usize,
+) -> (Glyph, String, Style) {
     use StopReason::*;
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
+        Stopped if members_working > 0 => (
+            Glyph::Interrupted,
+            t(Msg::StopWithMembersRunning { n: members_working }).into_owned(),
+            warn,
+        ),
         // The model stopped on its own with the list still open: said as a stop,
         // with the count and what to do about it — never a celebratory verb.
         Stopped if open_items > 0 => (
@@ -3533,6 +3829,7 @@ impl Content for TurnEndBlock {
                 self.done_index,
             ),
             &self.open_items.to_string(),
+            &self.members_working.to_string(),
             self.ended_at.as_deref().unwrap_or(""),
         ])
     }
@@ -3558,8 +3855,15 @@ impl Content for TurnEndBlock {
         }
         let w = ctx.width;
         let caps = Caps::default();
-        let (mark, said, style) = turn_end_note(self.stop, self.done_index, self.open_items);
-        let clean = matches!(self.stop, StopReason::Stopped) && self.open_items == 0;
+        let (mark, said, style) = turn_end_note(
+            self.stop,
+            self.done_index,
+            self.open_items,
+            self.members_working,
+        );
+        let clean = matches!(self.stop, StopReason::Stopped)
+            && self.open_items == 0
+            && self.members_working == 0;
         // When it ended rides beside the word for a clean finish
         // (`✻ Nailed it 21:42 · 12.5s · …`). Every other outcome's words are a
         // sentence — a cause, what to do next — and a time glued to its end reads
@@ -3630,6 +3934,24 @@ impl Content for TurnEndBlock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flatten_matches_whitespace_join_for_empty_and_unicode_input() {
+        let pieces = [
+            "", "word", "中文", " ", "\t\r\n", "\u{a0}", "\u{2003}", "\u{200b}",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let input = format!("{a}{b}{c}");
+                    assert_eq!(
+                        flatten(&input),
+                        input.split_whitespace().collect::<Vec<_>>().join(" "),
+                        "{input:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// A `!` command is echoed `! cmd`, not `❯ !cmd`; what it printed hangs on
     /// the `⎿` gutter, the rows after the first set in under it; and a command
@@ -3872,6 +4194,7 @@ mod tests {
             },
             done_index: 1,
             open_items,
+            members_working: 0,
             ended_at: Some("21:42".into()),
         }
         .lines(&RenderCtx::bare(200))
@@ -4120,7 +4443,55 @@ mod tests {
             ],
             brand: std::sync::Arc::new(Brand::default()),
             note: None,
+            model_setup: None,
         }
+    }
+
+    #[test]
+    fn model_setup_choices_follow_the_welcome_tips_and_directory() {
+        let block = WelcomeBlock {
+            model_setup: Some(crate::model_setup::SetupView::Choose {
+                second: false,
+                expired: true,
+            }),
+            ..welcome()
+        };
+        for width in [32, 100] {
+            let rows = block.lines(&wctx(width, true));
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+            let find = |text: &str| {
+                rows.iter()
+                    .position(|row| row.plain().contains(text))
+                    .unwrap()
+            };
+            let directory = find("~/proj");
+            let setup = find(t(Msg::RecoveryTitle).as_ref());
+            assert!(find("上手提示") < find("/resume"));
+            assert!(find("/resume") < directory && directory < setup);
+            assert!(setup < find("1.") && find("1.") < find("2."));
+        }
+    }
+
+    #[test]
+    fn the_setup_authorization_falls_back_to_a_link_in_a_short_terminal() {
+        let url = "https://example.test/authorize";
+        let shows_qr = |screen_rows| {
+            let block = WelcomeBlock {
+                model_setup: Some(crate::model_setup::SetupView::Authorize {
+                    url: Some(url.into()),
+                    screen_rows,
+                }),
+                ..welcome()
+            };
+            let lines = lines_of(&block, 80, true);
+            assert!(lines.iter().any(|line| line.contains(url)));
+            assert!(lines.iter().any(|line| line.contains("Esc")));
+            lines
+                .iter()
+                .any(|line| line.chars().filter(|ch| *ch == '▀').count() > 9)
+        };
+        assert!(shows_qr(40));
+        assert!(!shows_qr(12));
     }
 
     #[test]
@@ -4158,6 +4529,7 @@ mod tests {
                 colors: crate::caps::Colors::Ansi256,
                 cell_background,
                 graphics: crate::caps::Graphics::None,
+                wrap_diff: true,
             },
         }
     }
@@ -4210,6 +4582,7 @@ mod tests {
             width: 100,
             caps: crate::block::ShapeCaps {
                 colors: crate::caps::colors_for(&env, false),
+                wrap_diff: true,
                 unicode: crate::caps::unicode_for(&env),
                 basic_glyphs: caps.basic_glyphs,
                 cell_background: crate::caps::cell_background_for(&env, false, false),
@@ -4231,6 +4604,34 @@ mod tests {
             .iter()
             .map(Line::plain)
             .collect()
+    }
+
+    #[test]
+    fn welcome_shows_a_brand_coloured_branch_and_fits_narrow_rows() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(
+            root.path().join(".git/HEAD"),
+            "ref: refs/heads/feature/demo\n",
+        )
+        .unwrap();
+        let mut block = welcome();
+        block.cwd = root.path().display().to_string();
+        let rows = block.lines(&wctx(120, false));
+        assert!(rows
+            .iter()
+            .any(|line| line.plain().contains("[feature/demo]")));
+        assert!(rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(
+                |span| span.text.contains("[feature/demo]") && span.style == theme::fg(Role::Brand)
+            ));
+        for width in [20, 40, 80] {
+            assert!(lines_of(&block, width, false)
+                .iter()
+                .all(|line| width::str_width(line) <= width as usize));
+        }
     }
 
     #[test]
@@ -4333,6 +4734,7 @@ mod tests {
         let block = WelcomeBlock {
             brand: std::sync::Arc::new(mine.clone()),
             note: None,
+            model_setup: None,
             ..welcome()
         };
         let all = lines_of(&block, 80, true).join("\n");
@@ -4715,6 +5117,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(100));
@@ -4745,6 +5148,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
@@ -4776,6 +5180,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }
             .lines(&crate::block::RenderCtx::bare(80))
@@ -4854,11 +5259,11 @@ mod tests {
 
         // Every reason is one of two outcomes, and the mark says which. The clean
         // end wears the `✻` sparkle; nothing cut short does.
-        let mark = |stop| turn_end_note(stop, 0, 0).0;
+        let mark = |stop| turn_end_note(stop, 0, 0, 0).0;
         assert_eq!(mark(StopReason::Stopped), Glyph::Sparkle);
         // A stop the model chose, with the task list still open, is not a finish.
         assert_ne!(
-            turn_end_note(StopReason::Stopped, 0, 2).0,
+            turn_end_note(StopReason::Stopped, 0, 2, 0).0,
             Glyph::Sparkle,
             "an open list does not wear the finish mark"
         );
@@ -4898,6 +5303,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let text = drawn(&block, 100);
@@ -4936,6 +5342,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let text = drawn(&block, 80);
@@ -4961,6 +5368,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
@@ -4990,6 +5398,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let outcome = format!("{} Done", Caps::default().g(Glyph::Ok));
@@ -5029,6 +5438,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         for w in 0..160u16 {
@@ -5099,6 +5509,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
             Box::new(TurnEndBlock {
@@ -5107,6 +5518,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
             // With figures, and with figures plus a cause: the caption is
@@ -5124,6 +5536,7 @@ mod tests {
                 },
                 done_index: 1,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
             Box::new(TurnEndBlock {
@@ -5139,6 +5552,7 @@ mod tests {
                 },
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
         ];
@@ -5198,6 +5612,39 @@ mod tests {
                 .any(|s| s.style.fg == red),
             "a removed row is red"
         );
+    }
+
+    #[test]
+    fn diff_wrap_remeasures_settled_tools_without_changing_source_or_copy() {
+        let text = "https://example.com/".repeat(10);
+        let block = ToolCallBlock {
+            call_id: "wrap".into(),
+            name: "edit_file".into(),
+            args: r#"{"file_path":"a.rs"}"#.into(),
+            outcome: Outcome::Ok(format!("@@ -0,0 +1 @@\n+{text}")),
+            dir: None,
+            progress: None,
+        };
+        let wrap = crate::block::RenderCtx::bare(30);
+        let clip = crate::block::RenderCtx {
+            caps: wrap.caps.with_diff_wrap(false),
+            ..wrap
+        };
+        assert_eq!(block.reading_text(&wrap), block.reading_text(&clip));
+        let mut stream = crate::block::Stream::new();
+        let mut writer = stream.writer("test");
+        let id = writer.emit(Default::default(), std::sync::Arc::new(block));
+        writer.settle_all();
+        let slot = stream.get(id).unwrap();
+        let hash = slot.block().content.content_hash();
+        let clipped = slot.rows_at(&clip).0;
+        let wrapped = slot.rows_at(&wrap).0;
+        assert!(wrapped > clipped);
+        assert!(
+            slot.rows_at(&clip).1.is_some(),
+            "changing wrapping invalidates row measurements"
+        );
+        assert_eq!(slot.block().content.content_hash(), hash);
     }
 
     #[test]
@@ -6018,9 +6465,7 @@ mod tests {
         assert!(rows[1].contains("⎿ $ make ·"), "{rows:?}");
     }
 
-    /// The `!` commands a message carried are not drawn as the tags the model
-    /// reads: the person's words lead the bar, each command follows as a muted
-    /// `! command` row.
+    /// A message's local command context is labelled below the user bar.
     #[test]
     fn a_message_that_carried_a_shell_command_shows_the_words_and_the_command() {
         let text = format!(
@@ -6034,8 +6479,10 @@ mod tests {
             .collect();
         assert!(!rows.iter().any(|r| r.contains("bash-")), "{rows:?}");
         assert!(rows[0].contains("分析下这个项目"), "{rows:?}");
+        assert!(rows[1].is_empty(), "{rows:?}");
+        assert_eq!(rows[2].trim(), t(Msg::ShellContextHeading));
         assert!(
-            rows[1].trim_end().ends_with("! rm -rf pelican-bike.html"),
+            rows[3].trim_end().ends_with("! rm -rf pelican-bike.html"),
             "{rows:?}"
         );
         assert!(rows.iter().all(|r| width::str_width(r) <= 60), "{rows:?}");
@@ -6530,5 +6977,37 @@ mod prompt_header_tests {
         assert!(!header.plain().contains('\x1b'));
         assert!(!header.plain().contains('\n'));
         assert_eq!(prompt.content_hash(), hash);
+    }
+}
+
+#[cfg(test)]
+mod user_clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn user_prompt_is_decoration_but_literal_chevrons_and_indents_are_text() {
+        let ctx = RenderCtx::bare(40);
+        for text in ["你好世界", "❯ literal", "  indented"] {
+            let user = UserSaid(text.into());
+            let lines = user.lines(&ctx);
+            assert_eq!(lines[0].selected_text(0, 40).trim_end(), text);
+            assert_eq!(user.reading_text(&ctx), text);
+            let mut frame = crate::frame::Frame::new(40, 2);
+            frame.place("user", crate::frame::Rect::sized(40, 2), lines);
+            assert_eq!(frame.selected_text(&frame.line_at(0).unwrap()), text);
+            if text == "你好世界" {
+                assert_eq!(frame.selected_text(&frame.word_at(3, 0).unwrap()), text);
+            }
+            let header = user.prompt_header(40).unwrap();
+            assert_eq!(header.selected_text(0, 40).trim_end(), text.trim_start());
+        }
+        let user = UserSaid("abcdefghij".into());
+        let lines = user.lines(&RenderCtx::bare(6));
+        assert!(lines.len() > 1);
+        let copied: String = lines
+            .iter()
+            .map(|line| line.selected_text(0, 6).trim_end().to_owned())
+            .collect();
+        assert_eq!(copied, "abcdefghij");
     }
 }

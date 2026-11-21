@@ -1,4 +1,4 @@
-import { apiFetch } from './lib/transport.ts';
+import { apiFetch, ApiStreamInterruptedError } from './lib/transport.ts';
 
 // Task 12 — API client for atomcode webui
 
@@ -71,7 +71,7 @@ export async function failure(r: Response): Promise<ApiCallError> {
 }
 
 export type SSEEvent =
-  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_compacting'; active: boolean; diagnostic?: string }
   | { type: 'context_summary'; count: number; record: boolean }
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
@@ -80,15 +80,16 @@ export type SSEEvent =
   | { type: 'tool_start'; id: string; name: string; arguments: unknown }
   | { type: 'tool_output'; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
-  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
+  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number; images?: ImageData[] }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
+  | { type: 'permission_request'; session_id: string; approval_id?: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'provider_retry'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | PolicyInterventionEvent
@@ -123,8 +124,7 @@ export interface ModelInfo {
 
 export async function getModels(): Promise<ModelInfo[]> {
   const r = await apiFetch('/models', { headers: authHeaders() });
-  if (!r.ok) throw new Error(`list models failed: ${r.status}`);
-  const body: unknown = await r.json();
+  const body: unknown = await readJson(r);
   if (!Array.isArray(body)) throw new Error('list models returned an invalid payload');
   return body as ModelInfo[];
 }
@@ -133,6 +133,7 @@ export async function getModels(): Promise<ModelInfo[]> {
 export interface ImageData {
   media_type: string;
   data: string;
+  missing?: boolean;
 }
 
 export interface StreamChatBody {
@@ -152,13 +153,12 @@ export async function stopChat(requestId: string): Promise<void> {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: requestId }),
   });
-  if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
+  if (!resp.ok) throw await failure(resp);
 }
 
 export async function getActiveChatSessions(): Promise<string[]> {
   const resp = await apiFetch('/chat/active', { headers: authHeaders() });
-  if (!resp.ok) throw new Error(`active chats failed: ${resp.status}`);
-  const body: unknown = await resp.json();
+  const body: unknown = await readJson(resp);
   if (!Array.isArray(body) || !body.every((entry) => typeof entry === 'string')) {
     throw new Error('active chats returned an invalid payload');
   }
@@ -181,6 +181,48 @@ export async function cancelDetachedChat(
   await stopChat(requestId);
 }
 
+/** Parse the daemon's single-data-line SSE blocks, keeping partial chunks. */
+async function readEventStream<T>(
+  response: Response,
+  onEvent: (event: T) => void,
+  options: { onActivity?: () => void; flushTrailing?: boolean; signal?: AbortSignal } = {},
+): Promise<void> {
+  if (!response.ok) throw await failure(response);
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const dispatch = (block: string) => {
+    const line = block.split('\n').find(line => line.startsWith('data:'));
+    const json = line?.slice('data:'.length).trim();
+    if (!json) return;
+    let event: T;
+    try { event = JSON.parse(json) as T; } catch { return; }
+    onEvent(event);
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        if (options.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw error;
+        }
+        throw new ApiStreamInterruptedError();
+      });
+      if (done) break;
+      options.onActivity?.();
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() ?? '';
+      for (const part of parts) dispatch(part);
+    }
+    // /chat accepts a final block without a separator. /live dispatches only
+    // complete blocks before reconnecting; keep that existing distinction.
+    if (options.flushTrailing && buffer.trim()) dispatch(buffer);
+  } finally {
+    try { await reader.cancel(); } catch { /* fetch already aborted */ }
+    reader.releaseLock();
+  }
+}
+
 export async function streamChat(
   body: StreamChatBody,
   onEvent: (event: SSEEvent) => void,
@@ -196,68 +238,22 @@ export async function streamChat(
     signal,
   });
 
-  if (!resp.ok) {
-    throw await failure(resp);
-  }
-
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let terminalSeen = false;
-
-  const emit = (event: SSEEvent) => {
-    if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
-      terminalSeen = true;
-    }
-    onEvent(event);
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-
-    // Split on double-newline (SSE event boundaries)
-    const parts = buffer.split('\n\n');
-    // The last part may be an incomplete event — keep it in buffer
-    buffer = parts.pop() ?? '';
-
-    for (const part of parts) {
-      // Find the data: line within the event block
-      const dataLine = part
-        .split('\n')
-        .find((line) => line.startsWith('data:'));
-      if (!dataLine) continue;
-
-      const jsonStr = dataLine.slice('data:'.length).trim();
-      if (!jsonStr) continue;
-
+  try {
+    await readEventStream<SSEEvent>(resp, event => {
+      // Preserve /chat's existing callback isolation; /live dispatch errors
+      // propagate so its caller can reconnect rather than appear healthy.
       try {
-        const parsed = JSON.parse(jsonStr) as SSEEvent;
-        emit(parsed);
-      } catch {
-        // Ignore malformed lines (keep-alive comments, etc.)
-      }
-    }
-  }
-
-  // Process any trailing content in the buffer
-  if (buffer.trim()) {
-    const dataLine = buffer
-      .split('\n')
-      .find((line) => line.startsWith('data:'));
-    if (dataLine) {
-      const jsonStr = dataLine.slice('data:'.length).trim();
-      if (jsonStr) {
-        try {
-          const parsed = JSON.parse(jsonStr) as SSEEvent;
-          emit(parsed);
-        } catch {
-          // Ignore
+        if (event.type === 'done' || event.type === 'stopped' || event.type === 'error') {
+          terminalSeen = true;
         }
-      }
-    }
+        onEvent(event);
+      } catch { /* legacy /chat dispatch isolation */ }
+    }, { flushTrailing: true, signal });
+  } catch (error) {
+    // An authoritative terminal has already settled the turn. A late
+    // transport failure cannot put the chat back into detached recovery.
+    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError)) throw error;
   }
 
   if (signal?.aborted) {
@@ -275,6 +271,7 @@ export async function respondPermission(
   decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
   callId?: string,
+  approvalId?: string,
 ): Promise<{ success: boolean }> {
   const resp = await apiFetch('/chat/permission', {
     method: 'POST',
@@ -282,7 +279,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName, call_id: callId }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName, call_id: callId, approval_id: approvalId }),
   });
   // A request that did not land throws: the card must stay up to be answered
   // again, or the person thinks it was approved while the turn waits on an
@@ -304,7 +301,12 @@ export interface SessionMeta {
   file_size?: number;
   working_directory_available?: boolean;
   scheduled?: boolean;
+  /** What a runtime holding the session (another terminal, this daemon) is
+   *  doing with it. Only the per-project listing reports it; absent = nobody. */
+  activity?: SessionActivity;
 }
+
+export type SessionActivity = 'open' | 'running' | 'waiting';
 
 export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
@@ -322,6 +324,7 @@ export interface ToolResultInfo {
   success: boolean;
   summary: string;
   line_count: number;
+  images?: ImageData[];
 }
 
 export interface SessionMessage {
@@ -336,8 +339,9 @@ export interface SessionMessage {
   tool_result?: ToolResultInfo;
   artifacts?: unknown;
   images?: ImageData[];
-  /** Epoch ms for the message's completed turn. Older sessions without a native
-   *  transcript omit it; the UI must not replace it with the current wall clock. */
+  /** Epoch ms: a user's real turn start, or an assistant/tool's real completion.
+   *  In-progress replies and older sessions may omit it; never replace it with
+   *  the browser's current wall clock. */
   created_at?: number;
 }
 
@@ -357,7 +361,11 @@ export async function getTodoSources(project: string, session: string, signal: A
   return readJson<TodoSourceView>(response);
 }
 
+export interface DisplayHistoryCursor { session: string; before: number; digest: string }
+
 export interface SessionDetail {
+  history_seed?: SessionMessage[];
+  history_older?: DisplayHistoryCursor;
   summary_count?: number;
   id: string;
   name: string;
@@ -390,12 +398,12 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
 // project of its own history when many other projects have newer sessions.
 // The endpoint returns bare SessionMeta; every row is in `projectHash`, so we
 // stamp it back on for the client's project-scoped dedup/filter.
-export async function listProjectSessions(projectHash: string): Promise<SessionMetaWithProject[]> {
+export async function listProjectSessions(projectHash: string, signal?: AbortSignal): Promise<SessionMetaWithProject[]> {
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions`, {
+    signal,
     headers: authHeaders(),
   });
-  if (!resp.ok) throw new Error(`list project sessions failed: ${resp.status}`);
-  const list: SessionMeta[] = await resp.json();
+  const list: SessionMeta[] = await readJson(resp);
   return list.map((m) => ({ ...m, project_hash: projectHash }));
 }
 
@@ -405,8 +413,7 @@ export async function searchSessions(q: string, includeUnavailable = false): Pro
   const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}${includeUnavailable ? "&include_unavailable=true" : ""}`, {
     headers: authHeaders(),
   });
-  if (!resp.ok) throw new Error(`search sessions failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 // Resolve a (short) session id to its full record across all projects, UNCAPPED.
@@ -417,8 +424,17 @@ export async function resolveSession(id: string): Promise<SessionMetaWithProject
     headers: authHeaders(),
   });
   if (resp.status === 404) return null;
-  if (!resp.ok) throw await failure(resp);
-  return resp.json();
+  return readJson(resp);
+}
+
+/** What a runtime holding one session is doing — `null` when nobody holds it. */
+export async function getSessionActivity(projectHash: string, sessionId: string): Promise<SessionActivity | null> {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/activity`, {
+    headers: authHeaders(),
+  });
+  const body = await readJson(resp) as { activity?: unknown };
+  const activity = body?.activity;
+  return activity === 'open' || activity === 'running' || activity === 'waiting' ? activity : null;
 }
 
 export interface CreateSessionResponse {
@@ -444,8 +460,7 @@ export async function createSession(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error(`create session failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 export async function renameSession(
@@ -461,7 +476,7 @@ export async function renameSession(
       body: JSON.stringify({ name }),
     },
   );
-  if (!resp.ok) throw new Error(`rename failed: ${resp.status}`);
+  if (!resp.ok) throw await failure(resp);
 }
 
 export class DeleteSessionError extends Error {
@@ -483,23 +498,8 @@ export async function deleteSession(
     { method: 'DELETE', headers: authHeaders() },
   );
   if (!resp.ok) {
-    const payload: unknown = await resp.json().catch(() => undefined);
-    const errorValue =
-      payload && typeof payload === 'object' && 'error' in payload
-        ? (payload as { error: unknown }).error
-        : undefined;
-    const codeValue =
-      payload && typeof payload === 'object' && 'code' in payload
-        ? (payload as { code: unknown }).code
-        : undefined;
-    const detail =
-      typeof payload === 'string'
-        ? payload
-        : typeof errorValue === 'string'
-          ? errorValue
-          : undefined;
-    const code = typeof codeValue === 'string' ? codeValue : undefined;
-    throw new DeleteSessionError(detail || `delete failed: ${resp.status}`, code);
+    const error = await failure(resp);
+    throw new DeleteSessionError(error.message, error.code);
   }
 }
 
@@ -567,10 +567,13 @@ export interface ProviderPresetInfo {
   model_source?: 'embedded' | 'discovery_api' | 'manual';
   /** Its models can be listed from the endpoint. */
   discoverable?: boolean;
+  connections?: { type: string; base_urls: string[] }[];
 }
 
 export interface DiscoveredModelInfo {
   id: string;
+  catalog_only?: boolean;
+  catalog_default_effort?: string;
   supports_vision?: boolean;
   reasoning_effort_levels?: string[];
   reasoning_effort?: string;
@@ -586,6 +589,8 @@ export interface NotificationConfigInfo {
 }
 
 export interface ConfigInfo {
+  vision_preprocessor_provider?: string | null;
+  vision_preprocessor_status?: 'unconfigured' | 'resolved' | 'unresolvable' | 'unsupported';
   path: string;
   default_provider: string;
   default_workdir?: string;
@@ -605,6 +610,12 @@ export interface ConfigInfo {
 export async function getConfig(): Promise<ConfigInfo> {
   const resp = await apiFetch('/config', { headers: authHeaders() });
   return readJson(resp);
+}
+
+export async function saveVisionPreprocessor(provider: string): Promise<ConfigInfo> {
+  return readJson(await apiFetch('/config/vision-preprocessor', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ provider }),
+  }));
 }
 
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
@@ -627,6 +638,8 @@ export async function postConfigReload(): Promise<ConfigReloadResult> {
 // --- Projects types ---
 
 export interface ProjectInfo {
+  pinned?: boolean;
+  hidden?: boolean;
   hash: string;
   name: string;
   working_dir: string;
@@ -638,8 +651,7 @@ export interface ProjectInfo {
 
 export async function getProjects(): Promise<ProjectInfo[]> {
   const resp = await apiFetch('/projects', { headers: authHeaders() });
-  if (!resp.ok) throw new Error(`list projects failed: ${resp.status}`);
-  const body: unknown = await resp.json();
+  const body: unknown = await readJson(resp);
   if (!Array.isArray(body)) throw new Error('list projects returned an invalid payload');
   return body as ProjectInfo[];
 }
@@ -663,6 +675,16 @@ export async function getProject(): Promise<ProjectState> {
 }
 
 
+export interface GitBranchState { working_dir: string; branch: string | null }
+
+export async function getGitBranch(dir: string, signal?: AbortSignal): Promise<GitBranchState> {
+  const response = await apiFetch(`/project/git-branch?dir=${encodeURIComponent(dir)}`, {
+    headers: authHeaders(), signal,
+  });
+  return readJson(response);
+}
+
+
 // --- MCP server status ---
 
 export interface McpServerInfo {
@@ -680,10 +702,20 @@ export interface McpStatusInfo {
   blocked?: string[];
 }
 
+/** Current-session pause overlay; does not change per-server configuration. */
+export async function getMcpSession(session: string): Promise<{ paused: boolean }> {
+  return readJson(await apiFetch(`/live/mcp/session?session=${encodeURIComponent(session)}`, { headers: authHeaders() }));
+}
+export async function setMcpSession(session: string, paused: boolean): Promise<{ paused: boolean }> {
+  return readJson(await apiFetch('/live/mcp/session', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session, paused }),
+  }));
+}
+
 export async function getMcpStatus(): Promise<McpStatusInfo> {
   const resp = await apiFetch('/mcp/status', { headers: authHeaders() });
-  if (!resp.ok) throw new Error(`mcp status failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 /** Trust the current project for MCP servers, then rebuild the MCP registry. */
@@ -692,20 +724,21 @@ export async function postLiveMcpTrust(): Promise<{ ok: boolean; error?: string 
     method: 'POST',
     headers: authHeaders(),
   });
-  return resp.json();
+  return readJson(resp);
 }
 
 // --- User-invocable skills (for the input "+" attach menu) ---
 
 export interface SkillInfo {
   name: string;
+  display_name?: string;
   description: string;
 }
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await apiFetch('/skills', { headers: authHeaders() });
   const value: unknown = await readJson(resp);
-  if (!Array.isArray(value) || value.some(item => !item || typeof item.name !== 'string' || typeof item.description !== 'string')) {
+  if (!Array.isArray(value) || value.some(item => !item || typeof item.name !== 'string' || typeof item.description !== 'string' || (item.display_name !== undefined && typeof item.display_name !== 'string'))) {
     throw new Error('Invalid skill list response / 技能列表响应格式异常');
   }
   return value as SkillInfo[];
@@ -735,8 +768,7 @@ export interface TunnelStatus {
 
 export async function getTunnelStatus(): Promise<TunnelStatus> {
   const resp = await apiFetch('/tunnel/status', { headers: authHeaders() });
-  if (!resp.ok) throw new Error(`tunnel status failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 /** Explicitly enable remote access through the current terminal host. */
@@ -745,10 +777,7 @@ export async function startTunnelRelay(signal?: AbortSignal): Promise<TunnelStat
     method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
     body: '{}', signal,
   });
-  if (!resp.ok) {
-    const body = await resp.json().catch(() => null);
-    throw new Error(body?.error ?? `relay start failed: ${resp.status}`);
-  }
+  if (!resp.ok) throw await failure(resp);
   return getTunnelStatus();
 }
 
@@ -766,11 +795,7 @@ export async function discoverProviderModels(body: {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
-  if (!r.ok) {
-    const e = await r.json().catch(() => ({}));
-    throw new Error((e as { error?: string }).error || `HTTP ${r.status}`);
-  }
-  const payload = await r.json() as { models?: unknown };
+  const payload = await readJson<{ models?: unknown }>(r);
   if (!Array.isArray(payload.models)) throw new Error('model discovery returned an invalid payload');
   return payload.models as DiscoveredModelInfo[];
 }
@@ -816,6 +841,7 @@ export interface CreateAccountBody {
   id?: string;
   /** A vendor preset id or a protocol id. */
   provider: string;
+  protocol?: string;
   display_name?: string;
   base_url?: string;
   api_key?: string;
@@ -955,8 +981,7 @@ export async function mkdir(path: string): Promise<{ path: string }> {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ path }),
   });
-  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
-  return r.json();
+  return readJson(r);
 }
 
 /** Open an existing file inside the active session's bound working directory. */
@@ -966,10 +991,7 @@ export async function openWorkspaceFile(path: string, sessionId?: string): Promi
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ path, session_id: sessionId }),
   });
-  if (!r.ok) {
-    const body = await r.json().catch(() => ({}));
-    throw new Error((body as { error?: string }).error || `HTTP ${r.status}`);
-  }
+  if (!r.ok) throw await failure(r);
 }
 
 // --- Change working directory ---
@@ -997,17 +1019,28 @@ export async function changeDir(path: string, setDefault = false): Promise<CdRes
   return readJson(resp);
 }
 
-/** Delete a historical project and its sessions catalog. */
+/** Hide a workspace group, preserving its directory and all sessions. */
 export async function deleteProject(hash: string): Promise<void> {
-  const resp = await apiFetch(`/projects/${hash}`, {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(hash)}`, {
     method: 'DELETE',
     headers: authHeaders(),
   });
-  if (!resp.ok) {
-    throw new Error(`deleteProject failed: ${resp.status}`);
-  }
+  if (!resp.ok) throw await failure(resp);
+  notifyProjectsChanged(hash, { hidden: true });
 }
 
+export function notifyProjectsChanged(hash: string, patch: { pinned?: boolean; hidden?: boolean }): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('atomcode:projects-changed', { detail: { hash, patch } }));
+}
+
+export async function updateProject(hash: string, patch: { pinned?: boolean; hidden?: boolean }): Promise<void> {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(hash)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  });
+  if (!resp.ok) throw await failure(resp);
+  notifyProjectsChanged(hash, patch);
+}
 
 // --- Session detail (messages endpoint exists) ---
 
@@ -1015,15 +1048,20 @@ export async function getSession(
   projectHash: string,
   sessionId: string,
   signal?: AbortSignal,
+  before?: DisplayHistoryCursor,
+  recent = false,
 ): Promise<SessionDetail> {
-  const resp = await apiFetch(`/projects/${projectHash}/sessions/${sessionId}`, {
+  const query = before ? `?before=${encodeURIComponent(JSON.stringify(before))}` : recent ? '?recent=true' : '';
+  const resp = await apiFetch(`/projects/${projectHash}/sessions/${sessionId}${query}`, {
     headers: authHeaders(),
     signal,
   });
-  if (!resp.ok) {
-    throw new Error(`getSession failed with status ${resp.status}`);
-  }
-  return resp.json();
+  return readJson(resp);
+}
+
+/** Bounded display read; export/search callers keep getSession's full contract. */
+export function getSessionPage(projectHash: string, sessionId: string, signal?: AbortSignal, before?: DisplayHistoryCursor) {
+  return getSession(projectHash, sessionId, signal, before, true);
 }
 
 export interface TranscriptStep {
@@ -1032,6 +1070,7 @@ export interface TranscriptStep {
   tools: { id: string; name: string; args: string; result: string | null; is_error: boolean | null }[];
 }
 export interface TranscriptTurn {
+  user_images?: ImageData[];
   user_truncated?: boolean;
   started_at?: number;
   ts?: number;
@@ -1053,8 +1092,7 @@ export async function getSessionTranscript(projectHash: string, sessionId: strin
   const params = query.toString();
   const suffix = params ? `?${params}` : '';
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript${suffix}`, { headers: authHeaders(), signal });
-  if (!resp.ok) throw new Error(`history request failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 // --- Live session (multi-tab real-time sync) ---
@@ -1092,6 +1130,7 @@ export interface PolicyInterventionEvent {
 }
 
 export interface GoalRecoveryProgress {
+  waiting_for_quota?: boolean;
   kind: 'provider' | 'evaluator';
   attempt: number;
   max_attempts: number;
@@ -1104,11 +1143,21 @@ export interface LiveGoalProgress {
   recovery?: GoalRecoveryProgress | null;
 }
 
+export interface LiveLoopProgress {
+  active: boolean;
+  label: string;
+  round: number;
+  elapsed_secs: number;
+  last_reason: string | null;
+  recovery?: GoalRecoveryProgress | null;
+}
+
 export type LiveWireEvent =
-  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_compacting'; active: boolean; diagnostic?: string }
   | { type: 'context_summary'; count: number; record: boolean }
-  | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | { type: 'snapshot'; history_seed?: SessionMessage[]; history_older?: DisplayHistoryCursor; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
+  | ({ type: 'loop_changed' } & LiveLoopProgress)
   | { type: 'provider'; provider: string; model?: string | null }
   | { type: 'provider_selection_pending'; current: {provider:string;model:string}|null }
   | { type: 'model'; model: string | null }
@@ -1120,14 +1169,15 @@ export type LiveWireEvent =
   | { type: 'tool_start'; id: string; name: string; arguments: string }
   | { type: 'tool_output'; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
-  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
+  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number; images?: ImageData[] }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string; stats?: TurnStats }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
+  | { type: 'provider_retry'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
+  | { type: 'permission_request'; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
   | PolicyInterventionEvent
@@ -1147,36 +1197,9 @@ export async function streamLive(
   // caller can run a staleness watchdog that reconnects a silently-dead stream.
   onActivity?: () => void,
 ): Promise<void> {
-  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+  const params = sessionId ? `?recent=true&session_id=${encodeURIComponent(sessionId)}` : '?recent=true';
   const resp = await apiFetch(`/live${params}`, { headers: authHeaders(), signal });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      onActivity?.();
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split('\n\n');
-      buffer = parts.pop() ?? '';
-      for (const part of parts) {
-        const line = part.split('\n').find((l) => l.startsWith('data:'));
-        if (!line) continue;
-        const json = line.slice('data:'.length).trim();
-        if (!json) continue;
-        let event: LiveWireEvent;
-        try { event = JSON.parse(json) as LiveWireEvent; } catch { continue; }
-        onEvent(event);
-      }
-    }
-  } finally {
-    // Release the response even when parsing/dispatch or an aborted read throws.
-    // A reconnect must not leave an old body locked in the mobile browser.
-    try { await reader.cancel(); } catch { /* fetch already aborted */ }
-    reader.releaseLock();
-  }
+  await readEventStream(resp, onEvent, { onActivity, signal });
 }
 
 export async function postLiveMessage(
@@ -1203,8 +1226,7 @@ export async function postLiveMessage(
       ...(clientInputId ? { client_input_id: clientInputId } : {}),
     }),
   });
-  if (!resp.ok) throw new Error(`send live message failed: ${resp.status}`);
-  const body = await resp.json() as {
+  const body = await readJson(resp) as {
     accepted?: boolean;
     disposition?: 'started' | 'steered';
     generation?: number;
@@ -1243,8 +1265,7 @@ export async function postLiveStop(): Promise<void> {
     method: 'POST',
     headers: authHeaders(),
   });
-  if (!resp.ok) throw new Error(`stop live chat failed: ${resp.status}`);
-  const body = await resp.json() as { accepted?: boolean };
+  const body = await readJson(resp) as { accepted?: boolean };
   if (!body.accepted) throw new Error('live runtime rejected the stop request');
 }
 
@@ -1255,8 +1276,7 @@ export async function postLiveCompact(): Promise<{ accepted: boolean }> {
     method: 'POST',
     headers: authHeaders(),
   });
-  if (!resp.ok) throw new Error(`live compact failed: ${resp.status}`);
-  const body = await resp.json() as { accepted?: boolean };
+  const body = await readJson(resp) as { accepted?: boolean };
   return { accepted: body.accepted === true };
 }
 
@@ -1277,8 +1297,7 @@ export async function postLiveSwitchSession(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
-  if (!resp.ok) throw await failure(resp);
-  const body = await resp.json() as {
+  const body = await readJson(resp) as {
     ok?: boolean;
     active_turn?: boolean;
     error?: string;
@@ -1306,23 +1325,24 @@ export async function postLiveProvider(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ provider, ...(sessionId ? { session_id: sessionId } : {}) }),
   });
-  if (!resp.ok) throw new Error(`switch live provider failed: ${resp.status}`);
   // A business rejection (e.g. active_turn) is NOT thrown — the caller reverts its
   // optimistic selection and shows a notice. Only transport failures throw.
-  const body = await resp.json() as { ok?: boolean; active_turn?: boolean; error?: string };
+  const body = await readJson(resp) as { ok?: boolean; active_turn?: boolean; error?: string };
   return { ok: body.ok === true, activeTurn: body.active_turn === true, error: body.error };
 }
 
 // --- /command endpoint ---
 
 export type CommandResult =
+  | { kind: 'fork'; session_id: string; source_id: string; warning?: string | null }
+  | { kind: 'quality'; text: string }
   | { kind: 'undo'; undone: number }
   | { kind: 'remember'; scope: 'global' | 'project' | 'local'; text?: string }
   | { kind: 'memory_action'; text: string }
   | { kind: 'forget'; removed: string[] }
   | { kind: 'memory'; global: string[]; project: string[]; local?: string[]; text?: string }
   | { kind: 'context'; used_tokens: number; total_messages: number; ctx_window: number; utilization: number; ctx_name: string }
-  | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
+  | { kind: 'compact'; diagnostic?: string; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
   | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string; text: string }
   | { kind: 'config'; path: string; provider: string }
@@ -1344,8 +1364,7 @@ export async function postCommand(body: {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error(`command failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 /** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
@@ -1357,7 +1376,6 @@ export async function postModeSelection(mode: ApprovalMode, context: {
   independent?: boolean; current_model?: ModeSelection; return_model?: ModeSelection; previous_mode?: ApprovalMode; running?: boolean;
 } = {}): Promise<ModeSelectionResult> {
   const resp = await apiFetch('/approval_mode', {method:'POST', headers:{'Content-Type':'application/json',...authHeaders()}, body:JSON.stringify({mode,...context})});
-  if(!resp.ok) throw await failure(resp);
   const body = await readJson<ModeSelectionResult>(resp);
   if(!body.ok) throw new Error(body.error || 'live runtime rejected the mode switch');
   return body;
@@ -1368,15 +1386,14 @@ export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
 
 export async function getApprovalMode(): Promise<ApprovalMode> {
   const resp = await apiFetch('/approval_mode', { headers: authHeaders() });
-  if (!resp.ok) throw new Error(`get mode failed: ${resp.status}`);
-  const body = (await resp.json()) as ApprovalModeResponse;
+  const body = await readJson<ApprovalModeResponse>(resp);
   return body.mode;
 }
 
-export class ReasoningEffortError extends Error {
+export class ReasoningEffortError extends ApiCallError {
   readonly activeTurn: boolean;
-  constructor(message: string, activeTurn = false) {
-    super(message);
+  constructor(message: string, activeTurn = false, status = 200, code?: string) {
+    super(message, status, code);
     this.activeTurn = activeTurn;
   }
 }
@@ -1396,8 +1413,20 @@ export async function postLiveReasoningEffort(
       ...(provider ? { provider } : {}),
     }),
   });
-  const body = await resp.json().catch(() => ({})) as { ok?: boolean; error?: string; active_turn?: boolean };
-  if (!resp.ok || !body.ok) {
+  if (!resp.ok) {
+    // Keep the domain-specific busy hint while sharing HTTP error decoding.
+    const details: unknown = await resp.clone().json().catch(() => undefined);
+    const activeTurn = !!details && typeof details === 'object'
+      && 'active_turn' in details && details.active_turn === true;
+    const error = await failure(resp);
+    throw new ReasoningEffortError(error.message, activeTurn, error.status, error.code);
+  }
+  type EffortResponse = { ok?: boolean; error?: string; active_turn?: boolean };
+  const body = await readJson<EffortResponse>(resp).catch((error: unknown): EffortResponse => {
+    if (error instanceof ApiCallError) throw error;
+    return {};
+  });
+  if (!body.ok) {
     throw new ReasoningEffortError(body.error ?? `set live reasoning effort failed: ${resp.status}`, body.active_turn === true);
   }
 }
@@ -1406,14 +1435,14 @@ export async function postLivePermission(
   decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
   callId?: string,
+  approvalId?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await apiFetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision, tool_name: toolName, call_id: callId }),
+    body: JSON.stringify({ decision, tool_name: toolName, call_id: callId, approval_id: approvalId }),
   });
-  if (!resp.ok) throw new Error(`answer live permission failed: ${resp.status}`);
-  return resp.json();
+  return readJson(resp);
 }
 
 export interface UserInputQuestion {
@@ -1470,8 +1499,7 @@ export async function postLiveUserInput(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error(`answer live user input failed: ${resp.status}`);
-  const result = await resp.json() as { accepted: boolean; error?: string };
+  const result = await readJson(resp) as { accepted: boolean; error?: string };
   if (!result.accepted) {
     throw new Error(result.error ?? 'live runtime did not accept the user input answer');
   }
@@ -1487,8 +1515,7 @@ export async function postLivePolicyInterventionResolution(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ intervention_id: interventionId, action }),
   });
-  if (!resp.ok) throw new Error(`resolve live policy intervention failed: ${resp.status}`);
-  const result = await resp.json() as { accepted: boolean; error?: string };
+  const result = await readJson(resp) as { accepted: boolean; error?: string };
   if (!result.accepted) {
     throw new Error(result.error ?? 'live runtime did not accept the policy intervention resolution');
   }
@@ -1504,8 +1531,7 @@ export async function postChatUserInput(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId, ...body }),
   });
-  if (!resp.ok) throw new Error(`answer chat user input failed: ${resp.status}`);
-  const result = await resp.json() as { accepted: boolean; error?: string };
+  const result = await readJson(resp) as { accepted: boolean; error?: string };
   if (!result.accepted) {
     throw new Error(result.error ?? 'chat runtime did not accept the user input answer');
   }
@@ -2101,8 +2127,8 @@ export async function workbenchRequest<T>(path: string, body?: unknown, method?:
   if (response.status === 204) return undefined as T;
   return readJson<T>(response);
 }
-export async function workbenchPreview(session: string, path: string): Promise<Blob> {
-  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders() });
+export async function workbenchPreview(session: string, path: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders(), signal });
   if (!response.ok) throw await failure(response);
   return response.blob();
 }
@@ -2113,8 +2139,7 @@ export async function importPatchFile(session: string, file: File, signal?: Abor
   const response = await apiFetch('/live/patch?' + new URLSearchParams({ session_id: session }), {
     method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/octet-stream'}, body: file, signal,
   });
-  if (!response.ok) throw await failure(response);
-  const value = await response.json();
+  const value = await readJson<{ reference?: unknown }>(response);
   if (typeof value.reference !== 'string') throw new Error('Invalid patch reference');
   return value.reference;
 }
@@ -2129,8 +2154,7 @@ export async function taskSpecs(sessionId:string,args:string,signal?:AbortSignal
 
 export async function getModelCards(): Promise<import('./lib/modelCards').ModelCards> {
   const response = await apiFetch('/model-cards', { headers: authHeaders() });
-  if (!response.ok) throw new Error(`model cards failed: ${response.status}`);
-  return response.json();
+  return readJson(response);
 }
 
 export interface PersonaInfo { source: string; appended: boolean | null; text: string }
@@ -2165,6 +2189,7 @@ export async function saveModeModels(bindings: ModeBindings): Promise<ModeModels
 export interface HookEntry {
   id: string; name: string; event: string; matcher: string | null; command: string;
   timeout_ms: number; source: string; scope: string; disabled: boolean; testable: boolean; args?: string[];
+  required_approval?: boolean;
 }
 export interface HookCatalogue {
   cwd: string;

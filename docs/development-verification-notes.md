@@ -106,6 +106,11 @@ grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # �
 - nextest 不跑 doctest。全仓 24 个 doc 代码块，带 `text`/`json`/`toml` 语言标记和 `ignore` 的都不跑——数 ``` 的个数会高估可跑数量，`atomcode-tui` 的 2 个块实测就是 0 passed / 2 ignored。真要确认某个 crate 丢没丢覆盖，跑 `cargo test --doc -p <crate>` 看 `test result` 那行，别靠 grep 估。
 - 新增 async 测试，只要被测路径上有超时、退避或重试（provider retry、rate limit、stream timeout、conformance check timeout），一律写 `#[tokio::test(flavor = "current_thread", start_paused = true)]`，让 `tokio::time::sleep` 走虚拟时钟。裸 `#[tokio::test]` 会真等墙钟时间——sleep 往往不在测试里而在被测的生产代码里（如 `agent.rs` 的重试退避），grep 测试文件是看不出来的。kernel 曾有 11 个这样的测试，最慢单个 27s，合计占整套 305 个测试时间的 97%。范式见 `crates/atomcode-kernel/tests/tool_batch.rs`。
 - 虚拟时钟不会让测试变空过：断言打在可观测结果上（重试是否耗尽、approval 问了几次），逻辑没跑到就会红。但 `start_paused` 要求 current_thread，改之前确认该测试不依赖真并行（无 `std::thread`、`spawn_blocking`、`block_on`）。
+- **改写进程级 `ATOMCODE_HOME` 的测试要共享一把命名锁，并且用完还原**（2026-11-12 清 `#1621` 残留时确认）：
+  - 同一个 test binary 内的读写者必须互斥。锁键用 `serial_test::serial(atomcode_home)`（仓里主流，160 处）；`atomcode-daemon` 用的是自定义 `atomcode_home_test_lock()`，别在同一 crate 里再起第二个名字——两把不同名的锁互不相通，等于没锁。
+  - **只锁写者不够**：读者经 `product_dirs_from_env()` 一样会落进写者窗口内的临时目录，写者随后 drop 掉 `TempDir`，读者拿到的是死路径。`#1621` 报的就是这个形态，而它的提报者当年就否掉了"只给失败用例加锁"这条路——锁只能约束自己。
+  - 改了不还原同样会漏：`isolate_home()` 走 `call_once` 只设一次，其后裸 `set_var` 的测试全部继承那个已删除的临时目录。用 RAII guard 还原（`ScopedChatHome` / `ScopedAtomcodeHome`），别用裸 `set_var`。
+  - 库侧已根治：`28e73ca7a` 让库只收 `ProductDirs`、不再读 `ATOMCODE_HOME`（解析环境只在宿主）。所以测试侧读 env 是合法的，但要按上面三条隔离。
 - **转之前先看该测试怎么断言时间，这里有两个陷阱**（2026-09-13 在 `harness/tests/recovery.rs` 踩到）：
   - 上界断言 `started.elapsed() < Duration::from_secs(20)`（"必须有界"）：若 `Instant` 来自 `std::time`，虚拟钟下真实时间几乎不走，断言变成恒真，判据当场作废。修法是把 `Instant` 换成 `tokio::time::Instant` —— 未暂停时等价 std，暂停时跟随虚拟钟，于是"超时被误写成 30s"这类退化仍然抓得住。
   - 下界断言 `run.elapsed >= Duration::from_millis(900)`（"必须真等过"）：**这种测试不要转**，虚拟钟会让它失去意义甚至判红。`recovery.rs` 的 `a_real_retry_after_is_honoured_over_any_guess` 和 `concurrency.rs` 就是这一类，它们至今仍真等墙钟时间，是刻意的。

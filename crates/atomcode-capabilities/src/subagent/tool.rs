@@ -5,11 +5,14 @@
 //!
 //! Phase 1 / T1.5 of the external-agent subagent-driver spec.
 
+use std::path::{Component, Path, PathBuf};
+
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolRegistry, ToolResult};
 
 use super::claude_code::ClaudeCodeBackend;
 use super::codex::CodexBackend;
+use super::read_only_cli::ReadOnlyCliBackend;
 use super::{
     ExternalSubagentProfile, PermissionMode, SubagentBackend, SubagentError, SubagentEvent,
     SubagentKind, SubagentRun, SubagentStopReason,
@@ -29,6 +32,9 @@ pub fn tool_name_for(profile_name: &str) -> String {
 pub fn build_backend(profile: &ExternalSubagentProfile) -> Box<dyn SubagentBackend> {
     let timeout = profile.timeout;
     match profile.kind {
+        SubagentKind::Grok | SubagentKind::OpenCode => {
+            Box::new(ReadOnlyCliBackend(profile.clone()))
+        }
         SubagentKind::Codex => {
             let mut b = CodexBackend::new(&profile.name, profile.permission)
                 .allow_dangerous(profile.allow_dangerous);
@@ -106,13 +112,16 @@ impl ExternalSubagentTool {
         let agent = match backend.kind() {
             SubagentKind::Codex => "Codex",
             SubagentKind::ClaudeCode => "Claude Code",
+            SubagentKind::Grok => "Grok Build",
+            SubagentKind::OpenCode => "OpenCode",
         };
         let description = format!(
             "Delegate a self-contained coding task to the {agent} agent \
              (instance `{name}`, {perm} mode). Provide ONE detailed, standalone \
              prompt in `prompt`: the agent runs in a separate process with no \
-             access to this conversation, so include all needed context. Returns \
-             the agent's final answer.",
+             access to this conversation, so include all needed context. List essential \
+             workspace-relative files in `required_files` for a launch-time read check. \
+             Returns the agent's final answer.",
             perm = permission
         );
         Self {
@@ -124,23 +133,25 @@ impl ExternalSubagentTool {
     }
 }
 
-/// Parse the `prompt` argument. Accepts the standard `{"prompt": "..."}` object;
-/// falls back to treating a bare non-JSON string as the prompt (weak-model
-/// tolerance).
-fn parse_prompt(args: &str) -> Option<String> {
+/// Accept the standard object or a bare non-JSON prompt.
+fn parse_request(args: &str) -> Result<(String, Vec<PathBuf>), &'static str> {
+    const MISSING_PROMPT: &str = "missing required `prompt` (a self-contained task string).";
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err(MISSING_PROMPT);
     }
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(v) => v
-            .get("prompt")
-            .and_then(|p| p.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.trim().is_empty()),
-        // Not JSON → treat the raw args as the prompt.
-        Err(_) => Some(trimmed.to_string()),
-    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Ok((trimmed.to_owned(), Vec::new()));
+    };
+    let prompt = value["prompt"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(MISSING_PROMPT)?;
+    let files = value
+        .get("required_files")
+        .map(required_files)
+        .transpose()?;
+    Ok((prompt.to_owned(), files.unwrap_or_default()))
 }
 
 fn err(content: impl Into<String>) -> ToolResult {
@@ -150,6 +161,82 @@ fn err(content: impl Into<String>) -> ToolResult {
         is_error: true,
         images: Vec::new(),
     }
+}
+
+fn required_files(files: &serde_json::Value) -> Result<Vec<PathBuf>, &'static str> {
+    files
+        .as_array()
+        .filter(|files| files.len() <= 16)
+        .ok_or("`required_files` must be an array of at most 16 workspace-relative file paths")?
+        .iter()
+        .map(|file| {
+            let path = Path::new(file.as_str().unwrap_or_default());
+            if path.components().any(|part| matches!(part, Component::Normal(_)))
+                && path.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+            {
+                Ok(path.to_owned())
+            } else {
+                Err("`required_files` paths must be relative to the workspace without parent traversal")
+            }
+        })
+        .collect()
+}
+
+/// Checks the launcher's ambient access. A backend can apply further sandbox
+/// restrictions after startup, so passing this check is not a permission grant.
+async fn check_workspace(cwd: &Path, files: &[PathBuf]) -> Result<(), SubagentError> {
+    use tokio::io::AsyncReadExt;
+
+    let unavailable = |path: &Path, e: std::io::Error| {
+        let diagnostic = format!("cannot read {}: {e}", path.display());
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            SubagentError::PermissionDenied(diagnostic)
+        } else {
+            SubagentError::WorkspaceUnavailable(diagnostic)
+        }
+    };
+    let mut entries = tokio::fs::read_dir(cwd)
+        .await
+        .map_err(|e| unavailable(cwd, e))?;
+    entries
+        .next_entry()
+        .await
+        .map_err(|e| unavailable(cwd, e))?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    let root = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|e| unavailable(cwd, e))?;
+    for file in files {
+        let path = root.join(file);
+        let canonical = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|e| unavailable(&path, e))?;
+        if !canonical.starts_with(&root) {
+            return Err(SubagentError::WorkspaceUnavailable(format!(
+                "required file {} resolves outside the workspace",
+                file.display()
+            )));
+        }
+        let metadata = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(|e| unavailable(&path, e))?;
+        if !metadata.is_file() {
+            return Err(SubagentError::WorkspaceUnavailable(format!(
+                "required file {} is not a regular file",
+                file.display()
+            )));
+        }
+        let mut handle = tokio::fs::File::open(&canonical)
+            .await
+            .map_err(|e| unavailable(&path, e))?;
+        handle
+            .read(&mut [0])
+            .await
+            .map_err(|e| unavailable(&path, e))?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -169,6 +256,12 @@ impl Tool for ExternalSubagentTool {
                 "prompt": {
                     "type": "string",
                     "description": "The full, self-contained task for the external agent."
+                },
+                "required_files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": 16,
+                    "description": "Optional existing files relative to the workspace that must be readable before launch."
                 }
             },
             "required": ["prompt"]
@@ -196,12 +289,21 @@ impl Tool for ExternalSubagentTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let Some(prompt) = parse_prompt(args) else {
-            return err(format!(
-                "{}: missing required `prompt` (a self-contained task string).",
-                self.tool_name
-            ));
+        let (prompt, files) = match parse_request(args) {
+            Ok(request) => request,
+            Err(e) => return err(format!("{}: {e}", self.tool_name)),
         };
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return err(format!("{}: cancelled before completion.", self.tool_name));
+            }
+            check = check_workspace(&ctx.working_dir, &files) => {
+                if let Err(e) = check {
+                    return err(format!("{}: launch preflight: {e}", self.tool_name));
+                }
+            }
+        }
 
         // Forward the agent's activity stream to the driver progress channel.
         let progress = ctx.progress.clone();
@@ -242,6 +344,14 @@ impl Tool for ExternalSubagentTool {
                 "{}: bypass permission mode is not allowed in this context.",
                 self.tool_name
             )),
+            Err(e @ SubagentError::PermissionDenied(_)) => err(format!(
+                "{}: {e}. Verify access using this agent's execution environment before retrying.",
+                self.tool_name
+            )),
+            Err(e @ SubagentError::RateLimited { .. }) => err(format!(
+                "{}: {e}. Wait for the provider quota to reset before retrying.",
+                self.tool_name
+            )),
             Err(e) => err(format!("{}: {e}", self.tool_name)),
         }
     }
@@ -268,6 +378,15 @@ fn register_external_subagent_tools_with(
     let mut skipped = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for profile in profiles {
+        if matches!(profile.kind, SubagentKind::Grok | SubagentKind::OpenCode)
+            && profile.permission != PermissionMode::ReadOnly
+        {
+            skipped.push(format!(
+                "subagent: `{}` ({}) currently supports only read-only delegation; skipped",
+                profile.name, profile.kind
+            ));
+            continue;
+        }
         if !binary_available(profile.kind.binary()) {
             tracing::info!(
                 profile = %profile.name,
@@ -385,15 +504,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_prompt_accepts_object_and_bare_string() {
+    fn parse_request_accepts_object_and_bare_string() {
         assert_eq!(
-            parse_prompt(r#"{"prompt":"do it"}"#).as_deref(),
-            Some("do it")
+            parse_request(r#"{"prompt":"do it"}"#).unwrap(),
+            ("do it".into(), Vec::new())
         );
-        assert_eq!(parse_prompt("bare prompt").as_deref(), Some("bare prompt"));
-        assert_eq!(parse_prompt(r#"{"prompt":"  "}"#), None);
-        assert_eq!(parse_prompt(""), None);
-        assert_eq!(parse_prompt(r#"{"other":1}"#), None);
+        assert_eq!(parse_request("bare prompt").unwrap().0, "bare prompt");
+        assert!(parse_request(r#"{"prompt":"  "}"#).is_err());
+        assert!(parse_request("").is_err());
+        assert!(parse_request(r#"{"other":1}"#).is_err());
+        assert!(parse_request(r#"{"prompt":"review","required_files":["../handoff"]}"#).is_err());
     }
 
     #[tokio::test]
@@ -412,12 +532,53 @@ mod tests {
         assert!(res.content.contains("missing required `prompt`"));
     }
 
+    #[tokio::test]
+    async fn execute_checks_required_workspace_files_before_delegating() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx();
+        ctx.working_dir = dir.path().to_path_buf();
+        let tool = stub_tool("backend ran");
+        let args = r#"{"prompt":"review","required_files":["handoff.md"]}"#;
+        let missing = tool.execute(args, &ctx).await;
+        assert!(missing.is_error);
+        assert!(missing
+            .content
+            .contains("launch preflight: workspace unavailable"));
+        assert!(missing.content.contains("handoff.md"));
+
+        std::fs::write(dir.path().join("handoff.md"), "review instructions").unwrap();
+        let available = tool.execute(args, &ctx).await;
+        assert!(!available.is_error);
+        assert_eq!(available.content, "backend ran");
+    }
+
     #[test]
     fn build_backend_maps_kind() {
         let p = ExternalSubagentProfile::new("c", SubagentKind::Codex);
         assert_eq!(build_backend(&p).kind(), SubagentKind::Codex);
         let p = ExternalSubagentProfile::new("cc", SubagentKind::ClaudeCode);
         assert_eq!(build_backend(&p).kind(), SubagentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn new_read_only_agents_mount_and_write_profiles_are_skipped() {
+        let mut registry = ToolRegistry::new();
+        let mut writer = ExternalSubagentProfile::new("writer", SubagentKind::OpenCode);
+        writer.permission = PermissionMode::AcceptEdits;
+        let profiles = [
+            ExternalSubagentProfile::new("grok", SubagentKind::Grok),
+            ExternalSubagentProfile::new("opencode", SubagentKind::OpenCode),
+            writer,
+        ];
+        let (registered, warnings) =
+            register_external_subagent_tools_with(&mut registry, &profiles, |_| true);
+        assert_eq!(registered, ["subagent_grok", "subagent_opencode"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("only read-only"));
+        let tools = registry.mount(&["subagent_grok", "subagent_opencode", "subagent_writer"]);
+        assert!(tools.get("subagent_grok").is_some());
+        assert!(tools.get("subagent_opencode").is_some());
+        assert!(tools.get("subagent_writer").is_none());
     }
 
     #[test]

@@ -20,6 +20,14 @@ impl StreamWatchdog {
             last_content: None,
         }
     }
+    fn content_deadline(&self) -> Option<Instant> {
+        let budget = if self.last_content.is_some() {
+            self.idle
+        } else {
+            self.first
+        };
+        budget.map(|d| self.last_content.unwrap_or(self.started) + d)
+    }
     pub fn budget(&self) -> Option<Duration> {
         if self.last_content.is_some() {
             self.idle
@@ -35,8 +43,7 @@ impl StreamWatchdog {
         }
     }
     pub fn deadline(&self) -> Option<Instant> {
-        self.budget()
-            .map(|budget| self.last_content.unwrap_or(self.started) + budget)
+        self.content_deadline()
     }
     pub fn silent_for(&self) -> Duration {
         self.last_content.unwrap_or(self.started).elapsed()

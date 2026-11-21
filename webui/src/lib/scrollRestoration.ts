@@ -2,6 +2,8 @@
 export interface ChatViewport { scrollTop: number; scrollHeight: number; clientHeight: number }
 export function createScrollRestoration(options: {
   viewport: () => ChatViewport | null;
+  /** Allow a new oversized prompt to open at its beginning once. */
+  followingTop?: (bottom: number) => number;
   session: () => string | null;
   following: () => boolean;
   setFollowing: (following: boolean) => void;
@@ -22,7 +24,8 @@ export function createScrollRestoration(options: {
   function apply(position: Position): boolean {
     const el = options.viewport();
     if (!el || el.clientHeight <= 0) return false;
-    el.scrollTop = position.following ? Math.max(0, el.scrollHeight - el.clientHeight)
+    const bottom = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = position.following ? (options.followingTop?.(bottom) ?? bottom)
       : Math.min(position.top, Math.max(0, el.scrollHeight - el.clientHeight));
     lastTop = el.scrollTop;
     return true;

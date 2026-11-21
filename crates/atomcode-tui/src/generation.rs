@@ -1,33 +1,118 @@
-//! Ephemeral current-request generation throughput. The host supplies time; replay invents none.
+//! Ephemeral turn generation throughput. The host supplies time; replay invents none.
+//!
+//! Speed is decode speed: each request is timed from its first streamed output
+//! to its last, so neither the wait for that first output (prefill, queueing)
+//! nor a silence before the end frame is divided into it. Only output that
+//! arrived after the first is counted against that window: whatever came with
+//! the first output was generated before the window opened. Tokens are a local
+//! estimate of what streamed: billed output is one total per request and
+//! cannot say how much of it fell inside the window, so it only screens out
+//! requests that streamed far less than they billed. The turn's requests are
+//! aggregated (tokens summed, then divided by summed time).
 use crate::moment::Timestamp;
 use atomcode_harness::session::SessionEvent;
+
+/// Shortest window over which one request contributes. A reply buffered and
+/// delivered in one burst spans no time; one that arrives in a few frames
+/// moments apart would read as thousands of tokens per second.
+const MIN_REQUEST_MS: u64 = 1_000;
+/// Evidence the turn must accumulate before any speed is shown, so a short
+/// first reply cannot set a figure on its own.
+const MIN_EVIDENCE_TOKENS: u64 = 200;
+const MIN_EVIDENCE_MS: u64 = 2_000;
+/// Billed output this many times the visible estimate means most of it was
+/// never streamed (hidden reasoning). Where that generation fell relative to
+/// the window is unknown, so the request contributes nothing rather than a
+/// reading the estimate cannot vouch for.
+const HIDDEN_RATIO: u64 = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Request {
     id: (u64, u32),
-    started: Option<Timestamp>,
+    first: Option<Timestamp>,
+    last: Option<Timestamp>,
     ended: Option<Timestamp>,
-    chars: u64,
+    /// Characters that tokenize roughly one apiece (CJK and full-width).
+    wide: u64,
+    /// Everything else, roughly four characters per token.
+    narrow: u64,
+    /// Estimated tokens that arrived with the first output.
+    lead: u64,
+    /// The provider's whole-request output count; screens, never counts.
+    billed: Option<u64>,
+    /// The attempt was discarded; its billing, if reported, is not this one's.
+    discarded: bool,
 }
 
 impl Request {
-    fn reading(&self, now: Timestamp) -> Option<(u64, u64)> {
-        let started = self.started?;
-        let ms = self
-            .ended
-            .unwrap_or(now)
-            .as_millis()
-            .saturating_sub(started.as_millis());
-        let tokens = self.chars / 4;
-        (ms > 0).then_some((tokens, ms))
+    fn open(id: (u64, u32)) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
     }
+
+    fn push(&mut self, text: &str, now: Timestamp) {
+        if text.is_empty() {
+            return;
+        }
+        let first = *self.first.get_or_insert(now);
+        self.last = Some(now);
+        for ch in text.chars() {
+            if is_wide(ch) {
+                self.wide += 1;
+            } else {
+                self.narrow += 1;
+            }
+        }
+        if first == now {
+            self.lead = self.estimate();
+        }
+    }
+
+    fn estimate(&self) -> u64 {
+        self.wide + self.narrow / 4
+    }
+
+    /// `(tokens, ms)` this request contributes: the output after its first
+    /// over the time from first to last output.
+    fn reading(&self) -> Option<(u64, u64)> {
+        let ms = self
+            .last?
+            .as_millis()
+            .saturating_sub(self.first?.as_millis());
+        if ms < MIN_REQUEST_MS {
+            return None;
+        }
+        let estimate = self.estimate();
+        if self
+            .billed
+            .is_some_and(|billed| billed > estimate.max(1) * HIDDEN_RATIO)
+        {
+            return None;
+        }
+        let tokens = estimate.saturating_sub(self.lead);
+        (tokens > 0).then_some((tokens, ms))
+    }
+}
+
+fn is_wide(ch: char) -> bool {
+    matches!(ch as u32,
+        0x1100..=0x11FF
+        | 0x2E80..=0x9FFF
+        | 0xAC00..=0xD7AF
+        | 0xF900..=0xFAFF
+        | 0xFF00..=0xFFEF
+        | 0x20000..=0x2FA1F)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Generation {
     turn: Option<u64>,
     request: Option<Request>,
-    last_rate: Option<u64>,
+    /// Summed readings of the turn's earlier requests.
+    done_tokens: u64,
+    done_ms: u64,
 }
 
 impl Generation {
@@ -53,31 +138,32 @@ impl Generation {
                 {
                     return;
                 }
-                self.last_rate = self.rate(now);
+                if let Some((tokens, ms)) = self.request.as_ref().and_then(Request::reading) {
+                    self.done_tokens += tokens;
+                    self.done_ms += ms;
+                }
                 self.turn = Some(*turn);
-                self.request = Some(Request {
-                    id,
-                    started: Some(now),
-                    ..Request::default()
-                });
+                self.request = Some(Request::open(id));
             }
             SessionEvent::AssistantChunk {
                 turn, round, delta, ..
             } => {
-                if let Some(request) = self.request.as_mut().filter(|request| {
-                    request.id == (*turn, *round) && request.ended.is_none() && !delta.is_empty()
-                }) {
-                    request.started.get_or_insert(now);
-                    request.chars = request.chars.saturating_add(delta.chars().count() as u64);
+                if let Some(request) = self.current(*turn, *round) {
+                    request.push(delta, now);
                 }
             }
-            SessionEvent::Usage { turn, round, .. } => {
+            SessionEvent::Usage { turn, round, usage } => {
                 if let Some(request) = self
                     .request
                     .as_mut()
                     .filter(|request| request.id == (*turn, *round))
                 {
+                    if request.discarded && request.first.is_none() {
+                        request.discarded = false;
+                        return;
+                    }
                     request.ended.get_or_insert(now);
+                    request.billed = Some(u64::from(usage.completion));
                 }
             }
             SessionEvent::AssistantMessage { turn, round, .. } => {
@@ -89,62 +175,73 @@ impl Generation {
                     request.ended.get_or_insert(now);
                 }
             }
+            SessionEvent::ReasoningDiscarded { turn, round } => {
+                if let Some(request) = self
+                    .request
+                    .as_mut()
+                    .filter(|request| request.id == (*turn, *round))
+                {
+                    *request = Request {
+                        discarded: true,
+                        ..Request::open(request.id)
+                    };
+                }
+            }
             SessionEvent::Notice {
                 turn,
                 notice: atomcode_harness::session::NoticeKind::ProviderRetry,
                 ..
             } if self.turn == Some(*turn) => {
-                if let Some(request) = self
-                    .request
-                    .as_mut()
-                    .filter(|request| request.ended.is_none())
-                {
-                    // Discard the failed attempt before measuring the retry.
-                    *request = Request {
-                        id: request.id,
-                        started: Some(now),
-                        ..Request::default()
-                    };
+                // The retry re-runs the current round. A failed attempt's
+                // partial reply may already have ended it; discard that
+                // attempt either way before measuring the retry.
+                if let Some(request) = self.request.as_mut() {
+                    *request = Request::open(request.id);
                 }
             }
             _ => {}
         }
     }
 
+    fn current(&mut self, turn: u64, round: u32) -> Option<&mut Request> {
+        self.request
+            .as_mut()
+            .filter(|request| request.id == (turn, round) && request.ended.is_none())
+    }
+
     /// The handle's live tool name/argument fragments share generation time
     /// with prose and reasoning. Metadata-only frames contribute no output.
     pub fn tool_stream(&mut self, name: Option<&str>, arguments: &str, now: Timestamp) -> bool {
-        let chars = name.map_or(0, |name| name.chars().count()) + arguments.chars().count();
-        if chars == 0 {
+        if name.is_none_or(str::is_empty) && arguments.is_empty() {
             return false;
         }
-        if let Some(request) = self.request.as_mut().filter(|r| r.ended.is_none()) {
-            request.started.get_or_insert(now);
-            request.chars = request.chars.saturating_add(chars as u64);
-            return true;
-        }
-        false
+        let Some(request) = self.request.as_mut().filter(|r| r.ended.is_none()) else {
+            return false;
+        };
+        request.push(name.unwrap_or_default(), now);
+        request.push(arguments, now);
+        true
     }
 
     /// Streaming token estimate for the current request.
     pub fn tokens(&self) -> u64 {
-        self.request.as_ref().map_or(0, |request| request.chars / 4)
+        self.request.as_ref().map_or(0, Request::estimate)
     }
 
-    /// Live generation, then the last finished measurement through tools and
-    /// first-token waits. Like tuix, estimate tokens as phase characters / 4
-    /// over the model phase (including first-token wait), never tool time.
-    /// Usage totals can include invisible reasoning and do not replace this estimate.
-    /// Finished durations are frozen. A new turn or session clears this projection.
-    pub fn rate(&self, now: Timestamp) -> Option<u64> {
-        let measured = self.request.as_ref().and_then(|request| {
-            let (tokens, ms) = request.reading(now)?;
-            if tokens == 0 || ms < 1_000 {
-                return None;
-            }
-            Some((tokens as f64 * 1_000.0 / ms as f64).round() as u64)
-        });
-        measured.or(self.last_rate)
+    /// Decode speed over the turn's qualifying requests, including the one
+    /// streaming now once it qualifies. It moves only with output: through
+    /// tools, the next first-output wait or a silence before the end frame the
+    /// earlier readings stand. A new turn or session clears this projection.
+    pub fn rate(&self) -> Option<u64> {
+        let (live_tokens, live_ms) = self
+            .request
+            .as_ref()
+            .and_then(Request::reading)
+            .unwrap_or_default();
+        let tokens = self.done_tokens + live_tokens;
+        let ms = self.done_ms + live_ms;
+        (tokens >= MIN_EVIDENCE_TOKENS && ms >= MIN_EVIDENCE_MS)
+            .then(|| (tokens as f64 * 1_000.0 / ms as f64).round() as u64)
     }
 }
 
@@ -152,18 +249,6 @@ impl Generation {
 mod tests {
     use super::*;
     use atomcode_kernel::stream::TokenUsage;
-
-    #[test]
-    fn buffered_output_and_hidden_usage_share_no_shortened_denominator() {
-        let mut g = Generation::default();
-        at(&mut g, header(1), 0);
-        at(&mut g, chunk(1, false, &"a".repeat(4_000)), 59_900);
-        at(&mut g, usage(1, 100_000), 60_000);
-        // tuix formula: 4000 chars / 4 / 60s, not billing tokens / 0.1s.
-        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(17));
-        at(&mut g, header(2), 120_000);
-        assert_eq!(g.rate(Timestamp::millis(180_000)), Some(17));
-    }
 
     fn header(round: u32) -> SessionEvent {
         SessionEvent::RequestHeader {
@@ -203,141 +288,203 @@ mod tests {
             meta: None,
         }
     }
+    fn retry() -> SessionEvent {
+        SessionEvent::Notice {
+            turn: 1,
+            notice: atomcode_harness::session::NoticeKind::ProviderRetry,
+            detail: String::new(),
+            retry: None,
+        }
+    }
     fn at(g: &mut Generation, event: SessionEvent, ms: u64) {
         g.absorb(&event, Timestamp::millis(ms));
     }
-    #[test]
-    fn measures_each_request_and_retains_finished_speed_during_tools_and_waits() {
-        let mut g = Generation::default();
-        at(&mut g, header(1), 0);
-        assert_eq!(g.rate(Timestamp::millis(60_000)), None);
-        at(&mut g, chunk(1, true, &"a".repeat(400)), 60_000);
-        assert_eq!(g.rate(Timestamp::millis(60_249)), Some(2));
-        assert_eq!(g.rate(Timestamp::millis(60_250)), Some(2));
-        at(&mut g, chunk(1, false, &"a".repeat(400)), 61_000);
-        assert_eq!(g.rate(Timestamp::millis(62_000)), Some(3));
-        at(&mut g, usage(1, 300), 62_000);
-        at(&mut g, message(1), 62_000);
-        assert_eq!(g.rate(Timestamp::millis(90_000)), Some(3));
-        at(&mut g, header(2), 90_000);
-        assert_eq!(g.rate(Timestamp::millis(150_000)), Some(3));
-        at(&mut g, chunk(1, true, "late chunk"), 150_000);
-        at(&mut g, usage(1, 999), 150_000);
-        at(&mut g, chunk(2, false, &"a".repeat(400)), 150_000);
-        assert_eq!(g.rate(Timestamp::millis(152_000)), Some(2));
-        at(&mut g, usage(2, 100), 154_000);
-        assert_eq!(
-            g.rate(Timestamp::millis(200_000)),
-            Some(2),
-            "finished speed excludes the subsequent tool and idle time"
-        );
-    }
-    #[test]
-    fn retry_discards_partial_attempt() {
-        let mut g = Generation::default();
-        at(&mut g, header(1), 0);
-        at(&mut g, chunk(1, false, "你好世界"), 100);
-        assert_eq!(g.tokens(), 1, "characters, not UTF-8 bytes");
-        at(&mut g, usage(1, 100), 2_100);
-        at(&mut g, header(2), 3_000);
-        at(&mut g, chunk(2, true, &"a".repeat(400)), 4_000);
-        at(
-            &mut g,
-            SessionEvent::Notice {
-                turn: 1,
-                notice: atomcode_harness::session::NoticeKind::ProviderRetry,
-                detail: String::new(),
-                retry: None,
-            },
-            5_000,
-        );
-        assert_eq!(g.tokens(), 0);
-        assert_eq!(g.rate(Timestamp::millis(100_000)), Some(0));
-        at(&mut g, chunk(2, false, &"a".repeat(400)), 100_000);
-        at(&mut g, message(2), 102_000);
-        // Late billing usage must not replace the visible-output estimate.
-        at(&mut g, usage(2, 300), 110_000);
-        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(1));
-        at(&mut g, SessionEvent::TurnStart { turn: 2 }, 130_000);
-        at(&mut g, usage(2, 999), 131_000);
-        assert_eq!(g.rate(Timestamp::millis(140_000)), None);
-    }
-    #[test]
-    fn replay_and_zero_duration_do_not_invent_speed() {
-        let mut g = Generation::default();
-        at(&mut g, header(1), 0);
-        at(&mut g, usage(1, 100), 0);
-        at(&mut g, message(1), 0);
-        assert_eq!(g.rate(Timestamp::millis(100_000)), None);
-        at(&mut g, header(2), 100_000);
-        at(&mut g, chunk(2, false, "abcd"), 100_999);
-        at(&mut g, usage(2, 1), 100_999);
-        assert_eq!(g.rate(Timestamp::millis(200_000)), None);
-    }
-    #[test]
-    fn pure_tool_output_retains_its_finished_speed() {
-        let mut g = Generation::default();
-        at(&mut g, header(1), 0);
-        assert!(!g.tool_stream(None, "", Timestamp::millis(50_000)));
-        assert_eq!(g.rate(Timestamp::millis(59_000)), None);
-        assert!(g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000)));
-        g.tool_stream(None, &"a".repeat(400), Timestamp::millis(61_000));
-        at(&mut g, usage(1, 94), 62_000);
-        assert_eq!(g.rate(Timestamp::millis(63_000)), Some(2));
-        assert!(!g.tool_stream(Some("late"), "late", Timestamp::millis(64_000)));
-        at(&mut g, header(2), 70_000);
-        assert_eq!(g.rate(Timestamp::millis(130_000)), Some(2));
+    /// `n` narrow characters: `n / 4` estimated tokens.
+    fn text(n: usize) -> String {
+        "a".repeat(n)
     }
 
     #[test]
-    fn tool_fragments_and_text_share_one_duration_and_final_only_stays_unknown() {
+    fn the_wait_for_first_output_is_not_divided_into_the_speed() {
         let mut g = Generation::default();
         at(&mut g, header(1), 0);
-        at(&mut g, chunk(1, true, &"a".repeat(400)), 10_000);
-        g.tool_stream(Some("f"), &"b".repeat(399), Timestamp::millis(11_000));
-        assert_eq!(g.rate(Timestamp::millis(12_000)), Some(17));
-        at(&mut g, usage(1, 400), 12_000);
-        assert_eq!(g.rate(Timestamp::millis(99_000)), Some(17));
-        at(&mut g, SessionEvent::TurnStart { turn: 2 }, 100_000);
-        at(
-            &mut g,
-            SessionEvent::RequestHeader {
-                turn: 2,
-                round: 1,
-                model: "m".into(),
-                reason: atomcode_harness::session::HeaderReason::Append,
-            },
-            100_000,
-        );
-        g.tool_stream(Some("f"), "{}", Timestamp::millis(120_000));
-        at(
-            &mut g,
-            SessionEvent::Usage {
-                turn: 2,
-                round: 1,
-                usage: TokenUsage {
-                    prompt: 1,
-                    completion: 94,
-                    cached: 0,
-                },
-            },
-            120_000,
-        );
-        assert_eq!(g.rate(Timestamp::millis(180_000)), None);
-    }
-    #[test]
-    fn short_response_cannot_turn_billing_usage_into_a_speed_spike() {
-        let mut g = Generation::default();
-        at(&mut g, header(1), 0);
-        g.tool_stream(Some("read_file"), "{", Timestamp::millis(100));
+        assert_eq!(g.rate(), None, "a minute of prefill is no reading");
+        at(&mut g, chunk(1, true, &text(4)), 60_000);
+        at(&mut g, chunk(1, false, &text(1_600)), 62_000);
+        // 400 tokens after the first output over the 2s since it, not 62s.
+        assert_eq!(g.rate(), Some(200));
+        at(&mut g, usage(1, 520), 64_000);
+        at(&mut g, message(1), 64_000);
         assert_eq!(
-            g.rate(Timestamp::millis(249)),
-            None,
-            "streaming estimates still need a stable interval"
+            g.rate(),
+            Some(200),
+            "the end frame does not move the reading"
         );
-        at(&mut g, usage(1, 94), 500);
-        assert_eq!(g.rate(Timestamp::millis(61_000)), None);
+        at(&mut g, header(2), 90_000);
+        assert_eq!(
+            g.rate(),
+            Some(200),
+            "tools and the next wait are not counted"
+        );
+    }
+
+    #[test]
+    fn output_that_came_with_the_first_frame_is_not_counted_in_the_window() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        // 900 tokens generated before the window opened, 200 inside it.
+        at(&mut g, chunk(1, false, &text(3_600)), 10_000);
+        at(&mut g, chunk(1, false, &text(800)), 12_000);
+        assert_eq!(g.rate(), Some(100), "not (900 + 200) / 2s");
+        // Billing is one total: its excess may be hidden reasoning from before
+        // the window, so none of it is attributed to the window.
+        at(&mut g, usage(1, 3_000), 12_000);
+        assert_eq!(g.rate(), Some(100));
+    }
+
+    #[test]
+    fn a_reply_delivered_in_one_burst_yields_no_reading() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4_000)), 60_000);
+        at(&mut g, usage(1, 1_000), 60_050);
+        assert_eq!(g.rate(), None);
         at(&mut g, header(2), 70_000);
-        assert_eq!(g.rate(Timestamp::millis(120_000)), None);
+        at(&mut g, chunk(2, false, &text(4_000)), 80_000);
+        at(&mut g, chunk(2, false, &text(4_000)), 80_400);
+        at(&mut g, usage(2, 2_000), 80_400);
+        assert_eq!(g.rate(), None, "frames moments apart are a burst too");
+    }
+
+    #[test]
+    fn a_burst_followed_by_a_late_end_frame_yields_no_reading() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4_000)), 60_000);
+        assert_eq!(g.rate(), None);
+        // Nothing streamed in the 2.5s before the end frame.
+        at(&mut g, usage(1, 1_000), 62_500);
+        at(&mut g, message(1), 62_500);
+        assert_eq!(g.rate(), None);
+    }
+
+    #[test]
+    fn billing_far_above_what_streamed_yields_no_reading() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4)), 10_000);
+        at(&mut g, chunk(1, false, &text(800)), 12_000);
+        assert_eq!(g.rate(), Some(100));
+        // Most of the output was never streamed: the window started late.
+        at(&mut g, usage(1, 1_000), 13_000);
+        assert_eq!(g.rate(), None);
+    }
+
+    #[test]
+    fn wide_characters_count_one_token_each() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, "你好，世界abcd"), 100);
+        assert_eq!(g.tokens(), 6, "five wide characters plus four narrow ones");
+    }
+
+    #[test]
+    fn short_replies_count_once_the_turn_has_enough_evidence() {
+        let mut g = Generation::default();
+        at(&mut g, SessionEvent::TurnStart { turn: 1 }, 0);
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4)), 10_000);
+        at(&mut g, chunk(1, false, &text(600)), 11_500);
+        at(&mut g, usage(1, 151), 11_500);
+        assert_eq!(g.rate(), None, "150 tokens over 1.5s is not enough alone");
+        at(&mut g, header(2), 20_000);
+        at(&mut g, chunk(2, false, &text(4)), 30_000);
+        at(&mut g, chunk(2, false, &text(600)), 31_500);
+        assert_eq!(g.rate(), Some(100), "300 tokens over 3s");
+    }
+
+    #[test]
+    fn the_turn_aggregates_requests_by_duration() {
+        let mut g = Generation::default();
+        at(&mut g, SessionEvent::TurnStart { turn: 1 }, 0);
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4)), 10_000);
+        at(&mut g, chunk(1, false, &text(1_600)), 14_000);
+        at(&mut g, usage(1, 401), 14_000);
+        at(&mut g, header(2), 20_000);
+        at(&mut g, chunk(2, false, &text(4_000)), 50_000);
+        at(&mut g, usage(2, 1_000), 50_010);
+        at(&mut g, header(3), 60_000);
+        at(&mut g, chunk(3, false, &text(4)), 70_000);
+        at(&mut g, chunk(3, false, &text(2_400)), 72_000);
+        at(&mut g, usage(3, 601), 72_000);
+        // (400 + 600) tokens over (4s + 2s); the burst contributes nothing.
+        assert_eq!(g.rate(), Some(167));
+        at(&mut g, SessionEvent::TurnStart { turn: 2 }, 90_000);
+        assert_eq!(g.rate(), None, "a new turn clears the reading");
+    }
+
+    #[test]
+    fn a_retry_after_a_committed_partial_reply_is_measured_afresh() {
+        // Stream recovery commits the failed attempt's partial reply for the
+        // same round, then announces the retry, which reuses that round.
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4_000)), 10_000);
+        at(&mut g, chunk(1, false, &text(4_000)), 11_000);
+        at(&mut g, message(1), 12_000);
+        at(&mut g, retry(), 12_000);
+        assert_eq!(g.tokens(), 0);
+        assert_eq!(g.rate(), None);
+        at(&mut g, chunk(1, false, &text(4)), 20_000);
+        at(&mut g, chunk(1, false, &text(3_200)), 24_000);
+        at(&mut g, usage(1, 801), 24_100);
+        at(&mut g, message(1), 24_100);
+        assert_eq!(g.rate(), Some(200), "the retry's own window and billing");
+    }
+
+    #[test]
+    fn a_discarded_attempt_restarts_the_measurement() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, true, &text(4_000)), 1_000);
+        at(&mut g, chunk(1, true, &text(4_000)), 4_000);
+        at(
+            &mut g,
+            SessionEvent::ReasoningDiscarded { turn: 1, round: 1 },
+            5_000,
+        );
+        // The discarded attempt's billing must not end the retry.
+        at(&mut g, usage(1, 5_000), 5_000);
+        assert_eq!(g.rate(), None);
+        at(&mut g, chunk(1, false, &text(4)), 20_000);
+        at(&mut g, chunk(1, false, &text(1_600)), 24_000);
+        at(&mut g, usage(1, 401), 24_000);
+        assert_eq!(g.rate(), Some(100));
+    }
+
+    #[test]
+    fn replay_without_streamed_output_invents_no_speed() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, usage(1, 1_000), 0);
+        at(&mut g, message(1), 0);
+        assert_eq!(g.rate(), None);
+        at(&mut g, chunk(1, false, &text(4_000)), 100_000);
+        at(&mut g, chunk(1, false, &text(4_000)), 200_000);
+        assert_eq!(g.rate(), None, "late chunks after the end are ignored");
+    }
+
+    #[test]
+    fn tool_fragments_and_text_share_one_window() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        assert!(!g.tool_stream(None, "", Timestamp::millis(50_000)));
+        at(&mut g, chunk(1, true, &text(4)), 60_000);
+        assert!(g.tool_stream(Some("f"), &text(799), Timestamp::millis(62_000)));
+        assert_eq!(g.rate(), Some(100));
+        at(&mut g, usage(1, 201), 62_000);
+        assert_eq!(g.rate(), Some(100));
+        assert!(!g.tool_stream(Some("late"), "late", Timestamp::millis(99_000)));
     }
 }

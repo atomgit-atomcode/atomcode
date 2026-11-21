@@ -106,6 +106,9 @@ impl Plugin for UpgradeRow {
         let ui = ctx.require::<UiSvc>().map_err(|e| e.to_string())?;
         commands.add(Arc::new(Upgrade {
             ui,
+            progress: ctx
+                .require::<atomcode_tui::update::ProgressDisplaySvc>()
+                .ok(),
             running: Arc::new(AtomicBool::new(false)),
         }))?;
         Ok(())
@@ -272,6 +275,7 @@ fn failed(message: &str) -> String {
 
 struct Upgrade {
     ui: Arc<dyn UserInterface>,
+    progress: Option<Arc<dyn atomcode_tui::update::ProgressDisplay>>,
     /// One upgrade at a time: two would race to replace the same file.
     running: Arc<AtomicBool>,
 }
@@ -312,6 +316,7 @@ impl CommandSet for Upgrade {
             return Outcome::Quiet;
         }
         let ui = self.ui.clone();
+        let progress = self.progress.clone();
         let running = self.running.clone();
         match asked {
             Asked::Rollback { .. } => {
@@ -350,6 +355,15 @@ impl CommandSet for Upgrade {
                 Outcome::Quiet
             }
             Asked::Upgrade { force } => {
+                if let Some(display) = &progress {
+                    display.draw(
+                        atomcode_tui::update::ProgressFrame {
+                            title: t(Msg::CmdCheckingUpdate).into_owned(),
+                            ..Default::default()
+                        },
+                        false,
+                    );
+                }
                 tokio::spawn(async move {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
                     let failures = tx.clone();
@@ -360,16 +374,74 @@ impl CommandSet for Upgrade {
                     });
                     let mut last_pct = -1;
                     let mut restart = None;
-                    while let Some(event) = rx.recv().await {
+                    let mut meter = crate::upgrade_progress::DownloadMeter::default();
+                    let mut started = None;
+                    let mut ticks = tokio::time::interval(crate::upgrade_progress::REFRESH);
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        let next = tokio::select! {
+                            event = rx.recv() => event,
+                            _ = ticks.tick(), if started.is_some() && progress.is_some() => {
+                                if let (Some(start), Some(display)) = (started, &progress) {
+                                    display.draw(meter.frame(tokio::time::Instant::now() - start), false);
+                                }
+                                continue;
+                            }
+                        };
+                        let Some(event) = next else {
+                            break;
+                        };
+                        if let UpgradeEvent::Downloading { bytes, total } = &event {
+                            if progress.is_some() {
+                                started.get_or_insert_with(tokio::time::Instant::now);
+                                meter.update(*bytes, *total);
+                                continue;
+                            }
+                        }
+                        started = None;
+                        let finished = matches!(
+                            &event,
+                            UpgradeEvent::Done { .. }
+                                | UpgradeEvent::Failed(_)
+                                | UpgradeEvent::RolledBack { .. }
+                        );
                         let (said, then) = said_for(event, &mut last_pct);
                         if let Some(said) = said {
-                            ui.say(&said);
+                            if let Some(display) = &progress {
+                                display.draw(
+                                    atomcode_tui::update::ProgressFrame {
+                                        title: said,
+                                        ..Default::default()
+                                    },
+                                    finished,
+                                );
+                            } else {
+                                ui.say(&said);
+                            }
                         }
                         if then.is_some() {
                             restart = then;
                         }
                     }
-                    let _ = driver.await;
+                    if let Err(error) = driver.await {
+                        let said = failed(&error.to_string());
+                        if let Some(display) = &progress {
+                            display.draw(
+                                atomcode_tui::update::ProgressFrame {
+                                    title: said,
+                                    ..Default::default()
+                                },
+                                true,
+                            );
+                        } else {
+                            ui.say(&said);
+                        }
+                    }
+                    // Already-current and driver failures also close the live slot.
+                    if let Some(display) = &progress {
+                        // A terminal event already settled the card; no extra message is appended.
+                        display.finish();
+                    }
                     running.store(false, Ordering::SeqCst);
                     finish(
                         ui.as_ref(),
@@ -380,7 +452,11 @@ impl CommandSet for Upgrade {
                         }),
                     );
                 });
-                Outcome::Said(t(Msg::CmdCheckingUpdate).into_owned())
+                if self.progress.is_some() {
+                    Outcome::Quiet
+                } else {
+                    Outcome::Said(t(Msg::CmdCheckingUpdate).into_owned())
+                }
             }
         }
     }

@@ -114,6 +114,7 @@ export interface ArtifactData {
 
 export interface PermissionRequestData {
   id: string;
+  approvalId?: string;
   sessionId: string;
   toolName: string;
   reason: string;
@@ -268,9 +269,9 @@ export type ChatAction =
   | { type: 'CLOSE_IMAGE_PREVIEW' }
   | { type: 'IMAGE_PREVIEW_NEXT' }
   | { type: 'IMAGE_PREVIEW_PREV' }
-  | { type: 'PERMISSION_REQUEST'; id: string; sessionId: string; toolName: string; reason: string; args: string; isDestructive: boolean }
-  | { type: 'PERMISSION_RESPOND'; id: string; decision: PermissionDecision }
-  | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; success: boolean; message?: string }
+  | { type: 'PERMISSION_REQUEST'; id: string; approvalId?: string; sessionId: string; toolName: string; reason: string; args: string; isDestructive: boolean }
+  | { type: 'PERMISSION_RESPOND'; id: string; approvalId?: string; decision: PermissionDecision }
+  | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; approvalId?: string; success: boolean; message?: string }
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'SEARCH_NEXT' }
@@ -313,6 +314,7 @@ export type ExtensionMessage =
   | { type: 'models'; models: ModelInfo[] }
   | { type: 'approvalMode'; mode: ApprovalMode; pending?: boolean }
   | { type: 'providers'; providers: ProviderInfo[]; defaultProvider?: string }
+  | { type: 'runtimeInfo'; provider: string; model: string }
   | { type: 'authStatus'; auth: AuthStatus }
   | { type: 'setupState'; auth?: AuthStatus; providers: ProviderInfo[]; defaultProvider?: string; currentModel?: string; setupRequired: boolean }
   | { type: 'loginStarted'; loginId: string; url: string }
@@ -324,8 +326,9 @@ export type ExtensionMessage =
   | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string; startLine?: number; endLine?: number }
   | { type: 'insertText'; text: string }
   | { type: 'skills'; skills: SkillInfo[] }
-  | { type: 'permissionRequest'; sessionId: string; id: string; toolName: string; reason: string; args: string; isDestructive: boolean }
-  | { type: 'permissionResponseResult'; id: string; success: boolean; message?: string }
+  | { type: 'permissionRequest'; sessionId: string; id: string; approvalId?: string; toolName: string; reason: string; args: string; isDestructive: boolean }
+  | { type: 'permissionResponseResult'; id: string; approvalId?: string; success: boolean; message?: string }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string }
-  | { type: 'chromeFont'; value: string | null };
+  | { type: 'chromeFont'; value: string | null }
+  | { type: 'chromeFontSize'; value: number };

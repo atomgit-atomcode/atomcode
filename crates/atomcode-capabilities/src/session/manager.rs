@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ProductDirs;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
+use atomcode_kernel::session::{LoggedEvent, RewindScope, SeqNo, SessionEvent};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use super::presentation::{
@@ -35,19 +36,26 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
-/// Bounded size for the todo-list sidecar: a todo list is small (a few dozen
-/// items), so a generous-but-bounded cap prevents a corrupt file from ballooning
-/// memory on read.
+/// Size budget for one todo state, preserving the pre-baseline limit.
 pub const MAX_TODO_SIDECAR_BYTES: usize = 256 * 1024;
+/// The cache can hold both the current state and a recovery baseline. Each
+/// state is bounded separately; reads must allow both without unbounded input.
+const MAX_TODO_SIDECAR_FILE_BYTES: usize = 2 * MAX_TODO_SIDECAR_BYTES + 64;
 const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
 const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
+/// How often [`SessionManager::acquire_lease`] retries contention before
+/// calling the session in use. A [`SessionManager::lease_is_held`] probe holds
+/// the lock for microseconds; a runtime holding the session holds it for
+/// minutes, so the retries only ever outlast the former.
+const LEASE_PROBE_RETRIES: u32 = 3;
+const LEASE_PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Serializable todo-list sidecar. Independent of the transcript so a compaction
 /// that drains old turns (including the early todowrite plan call) does not erase
 /// the todo state the model (`TodoHook` pre-request anchor) and the vscode panel
-/// rely on (issue #1503). `message_count` is a stale marker: readers discard the
-/// sidecar when the CURRENT conversation message count is smaller (a rollback /
-/// undo truncated history).
+/// rely on (issue #1503). Rewinds rebuild this cache from standing log facts and
+/// its recovery baseline; message count alone cannot detect staleness because
+/// compaction also reduces the conversation size.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TodoSidecar {
     /// Batch source pointers only; raw guidance remains in the event log.
@@ -55,7 +63,7 @@ pub struct TodoSidecar {
     pub source_seqs: Vec<u64>,
     #[serde(default)]
     pub todos: Vec<TodoSidecarItem>,
-    /// Conversation message count at write time (stale-detection marker).
+    /// Conversation message count at write time (informational, not a validity check).
     #[serde(default)]
     pub message_count: usize,
     /// Where the last todo call `todos` already reflects was made. A transcript
@@ -64,6 +72,23 @@ pub struct TodoSidecar {
     /// replayed `add` would append its task again). `None` in a sidecar written
     /// before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through: Option<TodoCallPosition>,
+    /// The list as it stood before the calls `todos` reflects since it: what an
+    /// undo falls back to when the plan itself is no longer in the log (a
+    /// converted or compacted session). An undo takes a suffix of turns, so
+    /// recovering this one state and re-applying the standing calls is enough.
+    /// `None` in a sidecar written before this existed, or one with no earlier
+    /// state to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<TodoSidecarBaseline>,
+}
+
+/// A recoverable pre-increment state of a [`TodoSidecar`].
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TodoSidecarBaseline {
+    #[serde(default)]
+    pub todos: Vec<TodoSidecarItem>,
+    #[serde(default)]
     pub through: Option<TodoCallPosition>,
 }
 
@@ -99,6 +124,7 @@ pub const MAX_SNAPSHOT_MESSAGES: usize = 100_000;
 pub const MAX_META_TURN_STATS: usize = 100_000;
 pub const MAX_STORED_STRING_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_IMAGE_BASE64_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESUME_REPLAY_BYTES: usize = 4096;
 
 pub type SessionResult<T> = Result<T, SessionStoreError>;
 
@@ -686,6 +712,146 @@ pub(crate) struct InflightSnapshot {
     version: u32,
     replay_safe: bool,
     pub(super) snapshot: SessionSnapshot,
+}
+
+/// A resume retracted an accepted-but-unanswered prompt and handed it to the
+/// runtime; this marker says the replayed turn may not have landed yet.
+///
+/// The prompt itself stays in the event log (a rewind is a projection fact, not
+/// a deletion). The marker only makes the *retraction* retryable: without it a
+/// second death before the replay started would leave the prompt hidden from
+/// the projection with nothing left to hand back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResumeReplay {
+    /// The `TurnStart` the resume rewind took back.
+    pub to: SeqNo,
+    /// The turn whose accepted prompt is waiting to be replayed.
+    pub turn: u64,
+    /// The exact `Rewound` this resume committed, once it has. Without it a
+    /// user's own undo with the same `to` would be mistaken for ours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewound: Option<SeqNo>,
+}
+
+/// What [`SessionManager::prepare_resume_replay`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareResumeReplay {
+    /// The marker/rewind is in place, or there was nothing to retract; the
+    /// runtime may send the prompt.
+    Prepared,
+    /// The conversation moved on (the prompt was already replayed, or the
+    /// marked turn is no longer unanswered); do not send it.
+    Obsolete,
+}
+
+/// What a [`ResumeReplay`] marker means against the log that holds it.
+enum PendingReplay {
+    /// The rewind is in the log, no later turn exists, and the prompt is still
+    /// there to hand back.
+    StillWaiting(Box<Message>),
+    /// A turn after the rewind exists: the replay was accepted (or the person
+    /// moved on), so the marker has done its job.
+    Started,
+    /// The marker no longer matches the log (its rewind was rolled back, or the
+    /// prompt is gone); the normal resume path decides what to do.
+    Stale,
+}
+
+/// Whether a prompt found in the log is the one the runtime holds. The two are
+/// built from the same `UserMessage` fact, so text and images decide it.
+fn same_accepted_prompt(pending: &Message, logged: &Message) -> bool {
+    pending.text == logged.text && pending.images == logged.images
+}
+
+fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> PendingReplay {
+    // The marker names positions in the log, and the log projects in file order;
+    // a sequence number only names one. Walk that order here for the same reason
+    // `unanswered_at` does, so the two cannot disagree about where the retracted
+    // turn starts and ends when records are not numbered in file order.
+    let Some(rewound_at) = events.iter().position(|logged| {
+        replay.rewound == Some(logged.seq)
+            && matches!(
+                &logged.event,
+                SessionEvent::Rewound { to, scope, .. }
+                    if *to == replay.to && scope.takes_back_conversation()
+            )
+    }) else {
+        return PendingReplay::Stale;
+    };
+    let after = &events[rewound_at + 1..];
+    let Some((start, turn)) = super::events::turn_start_at(events, replay.to) else {
+        return PendingReplay::Stale;
+    };
+    if turn != replay.turn || start >= rewound_at {
+        return PendingReplay::Stale;
+    }
+    // A later user rewind that reaches this turn retires the prompt, even though
+    // our own rewind is still in the log. The turn it reaches is the `TurnStart`
+    // at its position in the log, not the smallest sequence: a later record may
+    // carry a smaller number, and comparing numbers would call that rewind an
+    // earlier one. A rewind whose turn is not in the log cannot be shown to spare
+    // the prompt, so it retires it too.
+    let later_rewinds: BTreeSet<SeqNo> = after
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::Rewound { to, scope, .. } if scope.takes_back_conversation() => Some(*to),
+            _ => None,
+        })
+        .collect();
+    if !later_rewinds.is_empty() {
+        // `turn_start_at` resolves a sequence to the first record that carries
+        // it; looking each later rewind up from the front of the log would make
+        // this quadratic on a log with many rewinds. Resolve them all in one
+        // pass. A sequence whose first record is not a `TurnStart` still
+        // resolves to none, exactly as `turn_start_at` does.
+        let mut first_position: HashMap<SeqNo, usize> = HashMap::new();
+        for (position, logged) in events.iter().enumerate() {
+            if later_rewinds.contains(&logged.seq) {
+                first_position.entry(logged.seq).or_insert(position);
+            }
+        }
+        let turn_start = |seq: SeqNo| {
+            first_position.get(&seq).and_then(|&position| {
+                matches!(events[position].event, SessionEvent::TurnStart { .. }).then_some(position)
+            })
+        };
+        if later_rewinds
+            .iter()
+            .any(|to| turn_start(*to).is_none_or(|position| position <= start))
+        {
+            return PendingReplay::Stale;
+        }
+    }
+    // Wider than `unanswered_prompt` on purpose: the question here is not
+    // whether the prompt still waits for an answer, but whether anything
+    // happened after the retraction. Any later turn means the replay was
+    // accepted or the person moved on, and the marker has done its job.
+    if after
+        .iter()
+        .any(|logged| matches!(logged.event, SessionEvent::TurnStart { .. }))
+    {
+        return PendingReplay::Started;
+    }
+    let mut prompt = None;
+    for logged in &events[start + 1..rewound_at] {
+        let SessionEvent::UserMessage { turn, text, images } = &logged.event else {
+            continue;
+        };
+        if *turn != replay.turn {
+            continue;
+        }
+        if prompt.is_some() {
+            return PendingReplay::Stale;
+        }
+        prompt = Some(if images.is_empty() {
+            Message::user(text)
+        } else {
+            Message::user_with_images(text, images.clone())
+        });
+    }
+    prompt.map_or(PendingReplay::Stale, |prompt| {
+        PendingReplay::StillWaiting(Box::new(prompt))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1325,6 +1491,69 @@ impl SessionManager {
         deserialize(&bytes, "controller checkpoint").map(Some)
     }
 
+    /// UI-only originals, one bounded file per committed user-event sequence.
+    /// The active session lease is the sole writer. Never read during resume.
+    pub fn read_display_images(
+        &self,
+        id: &str,
+        seq: u64,
+    ) -> SessionResult<Option<super::presentation::DisplayImages>> {
+        let dir = self.path_for(id, "display-images")?;
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_at(&dir, e)),
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "display images",
+                    message: "attachment directory is not a regular directory".into(),
+                })
+            }
+            Ok(_) => {}
+        }
+        let path = dir.join(format!("{seq}.image"));
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_at(&path, e)),
+            Ok(_) => {}
+        }
+        let bytes = read_regular_file_bounded(&path, "display images", MAX_SNAPSHOT_BYTES)?;
+        deserialize(&bytes, "display images").map(Some)
+    }
+
+    pub fn write_display_images(
+        &self,
+        lease: &SessionLease,
+        seq: u64,
+        text: &str,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        let dir = self.path_for(lease.id(), "display-images")?;
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "display images",
+                    message: "attachment directory is not a regular directory".into(),
+                })
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && images.is_empty() => return Ok(()),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&dir, e)),
+            _ => {}
+        }
+        let path = dir.join(format!("{seq}.image"));
+        if images.is_empty() {
+            return match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io_at(&path, e)),
+            };
+        }
+        fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
+        let value = super::presentation::DisplayImages::new(text, images);
+        let bytes = serialize_bounded(&value, "display images", MAX_SNAPSHOT_BYTES)?;
+        atomic_write(&path, &bytes)
+    }
+
     /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot),
     /// `<id>.todos` for an event session.
     pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -1359,19 +1588,60 @@ impl SessionManager {
         through: Option<TodoCallPosition>,
         source_seqs: &[u64],
     ) -> SessionResult<()> {
-        if source_seqs.len() > 4 || source_seqs.iter().any(|seq| *seq == 0) {
+        // Keep the state before this write's calls so an undo that takes one
+        // back can rebuild the list even when the plan itself is no longer in
+        // the log. An older baseline is already the furthest recoverable point.
+        // A smaller message_count is not evidence that the conversation was
+        // taken back: compaction shrinks the projection too, and the list it
+        // shrank around is still the state before this write. When an undo
+        // does shrink it, the rebuild has already rewritten this sidecar (and
+        // cleared any baseline whose plan the undo took back) before the next
+        // hook write, so what this read sees is the standing list either way.
+        let baseline = match self.read_todo_sidecar(id) {
+            Ok(Some(previous)) => previous.baseline.or(Some(TodoSidecarBaseline {
+                todos: previous.todos,
+                through: previous.through,
+            })),
+            _ => None,
+        };
+        self.write_todo_sidecar_full(id, todos, message_count, through, source_seqs, baseline)
+    }
+
+    /// The writer with the baseline chosen by the caller: an undo rebuild keeps
+    /// the state it recovered from (so a later undo can reach it again) and
+    /// clears it only when the plan it described was taken back.
+    pub(super) fn write_todo_sidecar_full(
+        &self,
+        id: &str,
+        todos: &[TodoSidecarItem],
+        message_count: usize,
+        through: Option<TodoCallPosition>,
+        source_seqs: &[u64],
+        baseline: Option<TodoSidecarBaseline>,
+    ) -> SessionResult<()> {
+        if source_seqs.len() > 4 || source_seqs.contains(&0) {
             return Err(SessionStoreError::Corrupt {
                 kind: "todo sidecar",
                 message: "invalid source references".into(),
             });
         }
-        let sidecar = TodoSidecar {
+        // Adding recovery data must not halve the accepted size of a current
+        // plan, nor allow either state to grow beyond its original budget.
+        let mut sidecar = TodoSidecar {
             source_seqs: source_seqs.to_vec(),
             todos: todos.to_vec(),
             message_count,
             through,
+            baseline: None,
         };
-        let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        let current = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        let bytes = if let Some(baseline) = baseline {
+            serialize_bounded(&baseline, "todo baseline", MAX_TODO_SIDECAR_BYTES)?;
+            sidecar.baseline = Some(baseline);
+            serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_FILE_BYTES)?
+        } else {
+            current
+        };
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)
     }
     /// Read the todo-list sidecar. The sidecar is written at `turn_complete` and,
@@ -1386,9 +1656,102 @@ impl SessionManager {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = read_regular_file_bounded(&path, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        let bytes = read_regular_file_bounded(&path, "todo sidecar", MAX_TODO_SIDECAR_FILE_BYTES)?;
         let sidecar: TodoSidecar = deserialize(&bytes, "todo sidecar")?;
         Ok(Some(sidecar))
+    }
+
+    fn resume_replay_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "replay")
+    }
+
+    pub(crate) fn write_resume_replay(&self, id: &str, replay: &ResumeReplay) -> SessionResult<()> {
+        let bytes = serialize_bounded(replay, "resume replay", MAX_RESUME_REPLAY_BYTES)?;
+        atomic_write(&self.resume_replay_path(id)?, &bytes)
+    }
+
+    pub(crate) fn read_resume_replay(&self, id: &str) -> SessionResult<Option<ResumeReplay>> {
+        let path = self.resume_replay_path(id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_regular_file_bounded(&path, "resume replay", MAX_RESUME_REPLAY_BYTES)?;
+        deserialize(&bytes, "resume replay").map(Some)
+    }
+
+    pub(crate) fn clear_resume_replay(&self, id: &str) -> SessionResult<()> {
+        let path = self.resume_replay_path(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_at(&path, error)),
+        }
+    }
+
+    /// Carry a source session's todo sidecar into a fork.
+    ///
+    /// The sidecar may be the only copy of a plan compaction took out of the
+    /// transcript. Its `through` is a position in the **source** log; when it
+    /// points past the fork's last turn the sidecar was written after the
+    /// aggregate this fork copied, so the items travel without a position rather
+    /// than anchoring the panel to a call the fork does not have.
+    #[cfg(feature = "tools")]
+    pub(super) fn carry_todo_sidecar(&self, source_id: &str, destination_id: &str, last_turn: u64) {
+        let sidecar = match self.read_todo_sidecar(source_id) {
+            Ok(Some(sidecar)) => sidecar,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    source = source_id,
+                    "could not read the source todo sidecar for a fork"
+                );
+                return;
+            }
+        };
+        let through = match sidecar.through {
+            Some(through) if through.turn > last_turn => {
+                tracing::warn!(
+                    source = source_id,
+                    through = through.turn,
+                    last_turn,
+                    "source todo sidecar points past the fork's turns; carrying its items without a position"
+                );
+                None
+            }
+            other => other,
+        };
+        // The plan's original-guidance pointers travel with the items; a fork is
+        // a copy of the same conversation, so they still name its user messages.
+        // The recoverable baseline travels too, with the same position rule as
+        // `through`: past the fork's last turn it keeps its items, not its anchor.
+        let sources: &[u64] =
+            if sidecar.source_seqs.len() <= 4 && sidecar.source_seqs.iter().all(|seq| *seq > 0) {
+                &sidecar.source_seqs
+            } else {
+                &[]
+            };
+        let baseline = sidecar.baseline.map(|mut baseline| {
+            if baseline.through.is_some_and(|at| at.turn > last_turn) {
+                baseline.through = None;
+            }
+            baseline
+        });
+        if let Err(error) = self.write_todo_sidecar_full(
+            destination_id,
+            &sidecar.todos,
+            sidecar.message_count,
+            through,
+            sources,
+            baseline,
+        ) {
+            tracing::warn!(
+                %error,
+                source = source_id,
+                destination = destination_id,
+                "could not carry the todo sidecar into the fork"
+            );
+        }
     }
     fn meta_lock_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta.lock")
@@ -1659,11 +2022,10 @@ impl SessionManager {
         notes: &mut Vec<String>,
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         self.validate_active_lease(lease)?;
-        let mut loaded = self.load_native_session(lease.id())?;
-        // An event session's accepted prompt is already a fact in its log.
         if self.is_event_session(lease.id()) {
-            return Ok((loaded, None));
+            return self.resume_event_session(lease, notes);
         }
+        let mut loaded = self.load_native_session(lease.id())?;
         let inflight = match self.load_inflight_snapshot(lease.id()) {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => return Ok((loaded, None)),
@@ -1680,12 +2042,11 @@ impl SessionManager {
         let canonical_len = loaded.snapshot.messages.len();
         let recoverable = inflight.snapshot.messages.len() == canonical_len.saturating_add(1)
             && inflight.snapshot.messages[..canonical_len] == loaded.snapshot.messages
-            && inflight.snapshot.messages.last().is_some_and(|message| {
-                message.role == atomcode_kernel::message::Role::User
-                    && !message.synthetic
-                    && message.internal_origin.is_none()
-                    && message.tool_calls.is_empty()
-            });
+            && inflight
+                .snapshot
+                .messages
+                .last()
+                .is_some_and(super::events::is_resumable_prompt);
         if recoverable {
             if inflight.replay_safe {
                 Ok((loaded, inflight.snapshot.messages.last().cloned()))
@@ -1697,7 +2058,296 @@ impl SessionManager {
             // A stale or unsafe auxiliary checkpoint must not shadow committed
             // state on future resumes.
             self.clear_inflight_snapshot(lease.id());
+            // This can also be a stale checkpoint from a completed turn;
+            // its presence cannot prove a crash or loss of committed history.
+            notes.push(format!(
+                "a stale or unsafe checkpoint for session {} was not replayed; \
+                 the committed conversation was retained",
+                lease.id()
+            ));
             Ok((loaded, None))
+        }
+    }
+
+    /// Resume an event session: continue a replay a previous resume retracted but
+    /// did not finish, otherwise retract a newly found accepted-but-unanswered
+    /// prompt and hand it back.
+    ///
+    /// The prompt is never deleted: the rewind only changes the projection, and
+    /// the marker written before it makes that retraction retryable. A death
+    /// between the marker and the rewind leaves the prompt visible; a death
+    /// between the rewind and the replay hands the same prompt back on the next
+    /// resume.
+    fn resume_event_session(
+        &self,
+        lease: &SessionLease,
+        notes: &mut Vec<String>,
+    ) -> SessionResult<(LoadedSession, Option<Message>)> {
+        let id = lease.id();
+        let (mut loaded, events) = self.load_event_session_with_events(id)?;
+        let inherited = self.read_event_header(id)?.inherited;
+        let own_events = &events[inherited.min(events.len())..];
+
+        match self.read_resume_replay(id) {
+            Ok(Some(replay)) => match pending_replay_prompt(own_events, &replay) {
+                PendingReplay::StillWaiting(prompt) => return Ok((loaded, Some(*prompt))),
+                PendingReplay::Started | PendingReplay::Stale => {
+                    let _ = self.clear_resume_replay(id);
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                // The log cannot say whose rewind this is. A resume's own
+                // retraction and the person's undo write the same `Rewound`,
+                // and an unreadable marker names neither; handing a prompt back
+                // on the strength of a rewind alone would replay what the person
+                // withdrew. So nothing is replayed from it, and the log below
+                // decides instead.
+                //
+                // The marker stays. It may be unreadable only for this read (a
+                // sharing violation, a partial write that later completes), and
+                // the retraction it names may already be committed: removing it
+                // would throw away the only record that could hand that prompt
+                // back. `prepare_resume_replay` treats an unreadable marker the
+                // same way — it decides from the log and replaces the marker with
+                // one it can use when it retracts — so leaving it here is what
+                // keeps that replacement possible. Naming the rewind's author
+                // would take a new fact or a field on `Rewound` — a log format
+                // change of its own.
+                notes.push(format!(
+                    "the pending replay of session {id} could not be read; its retraction, \
+                     if any, will not be replayed: {error}"
+                ));
+            }
+        }
+
+        // A retired marker does not end the resume: what the log holds now is
+        // the authority. A prompt the person withdrew is followed there by its
+        // own `Rewound`, and `unanswered_prompt` hands back only a turn no
+        // rewind follows, so this finds a later prompt still waiting — never
+        // the withdrawn one.
+        // A stopped prompt is handed back below. When no prompt is waiting,
+        // the run may still have died mid-turn: the last `TurnStart` never
+        // followed by its `TurnEnd` is a process that stopped with rounds of
+        // activity unfinished. Say so on resume — silence reads the locked
+        // sending state as a provider outage.
+        let Some((to, turn, prompt)) = super::events::unanswered_prompt(own_events) else {
+            if let Some(turn) = super::events::unterminated_turn(own_events) {
+                notes.push(format!(
+                    "the previous run of session {id} stopped mid-turn: turn {turn} never \
+                     recorded its end, so the conversation resumes with that turn left \
+                     unfinished"
+                ));
+            }
+            return Ok((loaded, None));
+        };
+        // Loading does not retract: the prompt stays visible until the runtime is
+        // actually about to send it (`prepare_resume_replay`). Record the exact
+        // target so prepare retracts what was handed back, not whatever the log
+        // says later.
+        let replay = ResumeReplay {
+            to,
+            turn,
+            rewound: None,
+        };
+        if let Err(error) = self.write_resume_replay(id, &replay) {
+            notes.push(format!(
+                "the prompt session {id} accepted before its turn was answered \
+                 could not be marked for replay: {error}"
+            ));
+        }
+        // The returned snapshot is the pending view, not the log: the prompt is
+        // handed back separately and will start a new turn. Leaving it in the
+        // seeded conversation too would show the model the same prompt twice.
+        let next = events
+            .iter()
+            .map(|logged| logged.seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut pending_view = events;
+        pending_view.push(LoggedEvent {
+            seq: next,
+            at: 0,
+            event: SessionEvent::Rewound {
+                turn,
+                to,
+                scope: RewindScope::Conversation,
+            },
+        });
+        loaded.snapshot = super::events::snapshot_of(&pending_view);
+        Ok((loaded, Some(prompt)))
+    }
+
+    /// The runtime is about to replay the prompt `resume_event_session` handed back:
+    /// write the retry marker, then retract the unanswered turn.
+    ///
+    /// `pending` is the prompt the runtime holds. When the marker cannot name a
+    /// retraction (never written, or unreadable), the log decides — but only a
+    /// still-visible copy of `pending` may be retracted, so a conversation that
+    /// moved on is never rewound on the replay's behalf.
+    ///
+    /// Idempotent while the marker's rewind is in the log, so a failed send can be
+    /// retried. A transient failure is reported and leaves the retryable state in
+    /// place — the prompt visible before a rewind, the marker after one. [`PrepareResumeReplay::Obsolete`]
+    /// means the conversation moved on and the runtime must not send it.
+    pub fn prepare_resume_replay(
+        &self,
+        lease: &SessionLease,
+        pending: &Message,
+    ) -> SessionResult<PrepareResumeReplay> {
+        self.validate_active_lease(lease)?;
+        let id = lease.id();
+        if !self.is_event_session(id) {
+            // A snapshot session has no log to retract. Its prompt came from
+            // the in-flight checkpoint and simply starts a new turn.
+            return Ok(PrepareResumeReplay::Prepared);
+        }
+        let events = self.load_events(id)?;
+        let inherited = self.read_event_header(id)?.inherited;
+        let own_events = &events[inherited.min(events.len())..];
+        let replay = match self.read_resume_replay(id) {
+            Ok(Some(replay)) => Some(replay),
+            Ok(None) => None,
+            Err(error) => {
+                // A retry aid that cannot be read must not strand the prompt:
+                // this attempt decides from the log, and any marker it writes
+                // replaces the unreadable one with a marker this build can use.
+                tracing::warn!(
+                    session = id,
+                    %error,
+                    "resume replay marker could not be read; deciding from the log"
+                );
+                None
+            }
+        };
+        let target = if let Some(replay) = replay {
+            match pending_replay_prompt(own_events, &replay) {
+                PendingReplay::StillWaiting(logged) if same_accepted_prompt(pending, &logged) => {
+                    return Ok(PrepareResumeReplay::Prepared);
+                }
+                PendingReplay::Started => {
+                    // The rewind is in the log and a later turn exists: the
+                    // replay started, or the person moved on. Retracting anything
+                    // else here would undo work that is still theirs.
+                    let _ = self.clear_resume_replay(id);
+                    return Ok(PrepareResumeReplay::Obsolete);
+                }
+                PendingReplay::StillWaiting(_) => {
+                    // The marker's rewind is committed for a prompt this
+                    // runtime does not hold. Keep the marker — it is the only
+                    // record of that retracted prompt — and do not send this
+                    // copy beside it; the next resume hands the log's prompt
+                    // back and replays that.
+                    return Ok(PrepareResumeReplay::Obsolete);
+                }
+                // The marker has no retraction this prompt can use yet. Retract
+                // its exact target, not a freshly chosen last turn, and only
+                // while that target still holds the prompt being replayed.
+                PendingReplay::Stale => {
+                    // The marker names a `TurnStart` at `to`. A truncated and
+                    // rewritten log can reuse that sequence for another turn;
+                    // retracting it there would take back the new turn instead.
+                    if super::events::turn_started_at(own_events, replay.to) != Some(replay.turn) {
+                        let _ = self.clear_resume_replay(id);
+                        return Ok(PrepareResumeReplay::Obsolete);
+                    }
+                    let Some(visible) =
+                        super::events::unanswered_at(own_events, replay.to, replay.turn)
+                    else {
+                        let _ = self.clear_resume_replay(id);
+                        return Ok(PrepareResumeReplay::Obsolete);
+                    };
+                    if !same_accepted_prompt(pending, &visible) {
+                        let _ = self.clear_resume_replay(id);
+                        return Ok(PrepareResumeReplay::Obsolete);
+                    }
+                    replay
+                }
+            }
+        } else {
+            // No usable marker (its write failed at load, or it could not be
+            // read): fall back to the last unanswered turn, which must still be
+            // this prompt. With no such turn the replay was answered or the
+            // conversation moved on; sending it would show the prompt again
+            // without retracting anything.
+            let Some((to, turn, visible)) = super::events::unanswered_prompt(own_events) else {
+                return Ok(PrepareResumeReplay::Obsolete);
+            };
+            if !same_accepted_prompt(pending, &visible) {
+                return Ok(PrepareResumeReplay::Obsolete);
+            }
+            ResumeReplay {
+                to,
+                turn,
+                rewound: None,
+            }
+        };
+        // The marker must name the exact `Rewound` this prepare is about to
+        // append, so the sequence is allocated under the log's write lock. A
+        // user undo with the same `to` takes a different sequence and must not
+        // be mistaken for it. The log read above is the floor: an allocation is
+        // never a sequence this prepare has already seen in the log.
+        let floor = events.iter().map(|logged| logged.seq).max().unwrap_or(0);
+        let mut marked = false;
+        let appended = self.append_event_allocating(
+            lease,
+            floor,
+            |seq| {
+                Ok(LoggedEvent {
+                    seq,
+                    at: u64::try_from(super::now_ms()).unwrap_or(0),
+                    event: SessionEvent::Rewound {
+                        turn: target.turn,
+                        to: target.to,
+                        scope: RewindScope::Conversation,
+                    },
+                })
+            },
+            |seq| {
+                self.write_resume_replay(
+                    id,
+                    &ResumeReplay {
+                        to: target.to,
+                        turn: target.turn,
+                        rewound: Some(seq),
+                    },
+                )?;
+                marked = true;
+                Ok(())
+            },
+        );
+        match appended {
+            Ok(()) => Ok(PrepareResumeReplay::Prepared),
+            Err(error) => {
+                // A failed append is not proof the rewind is absent: a write
+                // that failed after the bytes reached the file has already
+                // retracted the turn, and clearing the marker then would lose
+                // the prompt for good — no marker hands it back, and the rewind
+                // hides it from `unanswered_prompt`. Clear only a marker the
+                // log provably does not need; one naming an absent rewind is
+                // `Stale` on the next resume and is dealt with there.
+                if marked && self.resume_retraction_is_absent(id, target.to, target.turn) {
+                    let _ = self.clear_resume_replay(id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether the log can be read and does not hold the retraction a failed
+    /// append was asked to write. A read that fails proves nothing and answers
+    /// `false`, so the marker survives an uncertain commit.
+    fn resume_retraction_is_absent(&self, id: &str, to: SeqNo, turn: u64) -> bool {
+        match self.load_events(id) {
+            Ok(events) => !events.iter().any(|logged| {
+                matches!(
+                    &logged.event,
+                    SessionEvent::Rewound { to: found, turn: found_turn, scope }
+                        if *found == to && *found_turn == turn && scope.takes_back_conversation()
+                )
+            }),
+            Err(_) => false,
         }
     }
 
@@ -1717,26 +2367,45 @@ impl SessionManager {
     }
 
     /// Try to become the sole active runtime for `id`. Contention is reported
-    /// immediately as [`SessionStoreError::SessionInUse`]; this never waits.
+    /// as [`SessionStoreError::SessionInUse`] without waiting for the holder;
+    /// only a [`lease_is_held`](Self::lease_is_held) probe, which holds the
+    /// lock for an instant, is waited out.
     pub fn acquire_lease(&self, id: &str) -> SessionResult<SessionLease> {
         validate_session_id(id)?;
         fs::create_dir_all(&self.root).map_err(|error| io_at(&self.root, error))?;
         let path = self.lease_path(id)?;
         reject_existing_non_regular(&path)?;
         let file = open_session_lock_file(id, &path)?;
-        let lock = match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => LeaseLock::Flock(file),
-            Err(error) if is_file_lock_contention(&error) => {
-                return Err(SessionStoreError::SessionInUse {
-                    id: id.to_string(),
-                    path,
-                })
+        // Both halves matter here. The probe loop is upstream's: a lease held
+        // for an instant (a reader probing it) must not read as "in use".
+        // The directory fallback is this branch's: Android's shared storage
+        // (FUSE) refuses advisory locks altogether and answers ENOSYS, which
+        // used to fail every session creation outright.
+        let mut probes_waited_out = 0;
+        let lock = loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break LeaseLock::Flock(file),
+                Err(error)
+                    if is_file_lock_contention(&error)
+                        && probes_waited_out < LEASE_PROBE_RETRIES =>
+                {
+                    probes_waited_out += 1;
+                    std::thread::sleep(LEASE_PROBE_RETRY_DELAY);
+                }
+                Err(error) if is_file_lock_contention(&error) => {
+                    return Err(SessionStoreError::SessionInUse {
+                        id: id.to_string(),
+                        path,
+                    })
+                }
+                // A filesystem that refuses advisory locks altogether (Android
+                // FUSE answers ENOSYS): use the atomic directory instead of
+                // failing the session outright.
+                Err(error) if lock_unsupported(&error) => {
+                    break LeaseLock::Dir(take_lock_dir(id, &path)?)
+                }
+                Err(error) => return Err(io_at(&path, error)),
             }
-            // A filesystem that refuses advisory locks altogether (Android FUSE
-            // answers ENOSYS): use the atomic directory instead of failing the
-            // session outright.
-            Err(error) if lock_unsupported(&error) => LeaseLock::Dir(take_lock_dir(id, &path)?),
-            Err(error) => return Err(io_at(&path, error)),
         };
         Ok(SessionLease {
             inner: Arc::new(SessionLeaseInner {
@@ -1745,6 +2414,30 @@ impl SessionManager {
                 lock,
             }),
         })
+    }
+
+    /// Whether some runtime — in this process or another — holds `id`'s lease
+    /// right now, i.e. has the session open.
+    ///
+    /// Read-only: a session never leased has no lease file and none is created.
+    /// The probe takes a shared lock and drops it at once; an
+    /// [`acquire_lease`](Self::acquire_lease) racing it retries past that
+    /// instant instead of reporting the session in use.
+    pub fn lease_is_held(&self, id: &str) -> SessionResult<bool> {
+        let path = self.lease_path(id)?;
+        let file = match open_read_file(&path) {
+            Ok(file) => file,
+            Err(SessionStoreError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                Ok(false)
+            }
+            Err(error) if is_file_lock_contention(&error) => Ok(true),
+            Err(error) => Err(io_at(&path, error)),
+        }
     }
 
     /// Persist the working-set snapshot (atomic). Overwrites every turn.
@@ -2234,6 +2927,24 @@ impl SessionManager {
         id: &str,
         limit: usize,
     ) -> SessionResult<LoadedSession> {
+        let meta = self.read_native_meta(id)?;
+        let snapshot = self.load_snapshot_bounded(id, limit)?;
+        let presentation = match self.read_presentation_bounded(id, limit) {
+            // An event session has display-only entries only if something added
+            // them.
+            Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
+                PresentationFile::default()
+            }
+            other => other?,
+        };
+        Ok(LoadedSession {
+            meta,
+            snapshot,
+            presentation,
+        })
+    }
+
+    fn read_native_meta(&self, id: &str) -> SessionResult<SessionMeta> {
         let meta = self.read_meta(id)?;
         if meta.needs_newer_version() {
             return Err(SessionStoreError::FutureSchema {
@@ -2249,19 +2960,39 @@ impl SessionManager {
                 operation: "load native session",
             });
         }
-        let snapshot = self.load_snapshot_bounded(id, limit)?;
-        let presentation = match self.read_presentation_bounded(id, limit) {
-            // An event session has display-only entries only if something added
-            // them.
-            Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
-                PresentationFile::default()
-            }
-            other => other?,
-        };
-        Ok(LoadedSession {
-            meta,
-            snapshot,
-            presentation,
+        Ok(meta)
+    }
+
+    /// An event session's strict aggregate and the facts its projection was made
+    /// from, in one log read. Resume both decides whether a prompt is pending and
+    /// returns the projected conversation; reading the same log twice is not free.
+    fn load_event_session_with_events(
+        &self,
+        id: &str,
+    ) -> SessionResult<(LoadedSession, Vec<LoggedEvent>)> {
+        self.with_meta_lock(id, || {
+            let meta = self.read_native_meta(id)?;
+            let (_, events) = self.read_event_log_bounded(id, false, usize::MAX)?;
+            let snapshot = super::events::snapshot_of(&events);
+            let presentation = match self.read_presentation_bounded(id, usize::MAX) {
+                // An event session has display-only entries only if something
+                // added them. Any other session needs the file, the same way
+                // the strict aggregate does.
+                Err(error)
+                    if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    PresentationFile::default()
+                }
+                other => other?,
+            };
+            Ok((
+                LoadedSession {
+                    meta,
+                    snapshot,
+                    presentation,
+                },
+                events,
+            ))
         })
     }
 
@@ -2329,8 +3060,52 @@ impl SessionManager {
         destination_id: &str,
         now_ms: i64,
     ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.copy_native_session(source_id, destination_id, now_ms, false)
+    }
+
+    /// Explicitly branch the committed state of a session held elsewhere.
+    /// Unlike `branch_native_session`, this never modifies the source: its
+    /// runtime retains ownership. The destination is independent of automatic
+    /// busy-fork collapse and garbage collection.
+    pub fn branch_committed_session(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.copy_native_session(source_id, destination_id, now_ms, true)
+    }
+
+    /// Explicit user branch: retain provenance in the event header, but keep an
+    /// independent catalog identity instead of automatic busy-fork collapse/GC.
+    pub fn branch_native_session(
+        &self,
+        source: &SessionLease,
+        destination_id: &str,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        self.validate_lease(source)?;
+        let copied = self.copy_native_session(source.id(), destination_id, now_ms, true)?;
+        // An intentional branch also keeps its chosen return point. Otherwise
+        // an unused automatic busy-session fork could still be collapsed/reaped.
+        if let Err(error) = self.update_meta(source.id(), |meta| meta.fork_info = None) {
+            self.delete(&copied.1)?;
+            return Err(error);
+        }
+        Ok(copied)
+    }
+
+    fn copy_native_session(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        now_ms: i64,
+        explicit: bool,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
         let source = self.load_native_session(source_id)?;
-        self.reap_abandoned_forks(&source);
+        if !explicit {
+            self.reap_abandoned_forks(&source);
+        }
         let destination_lease = self.acquire_lease(destination_id)?;
         let source_name_was_placeholder =
             SessionMeta::name_needs_fallback(&source.meta.name, source_id);
@@ -2358,6 +3133,11 @@ impl SessionManager {
             base_message_count: source.meta.message_count,
             base_turn_count: source.meta.turn_count,
         });
+        if explicit {
+            meta.fork_info = None;
+            meta.origin = SessionOrigin::Manual;
+            meta.name = format!("{} (fork)", source.meta.name);
+        }
         if self.is_event_session(source_id) {
             self.fork_event_session(
                 source_id,
@@ -2366,7 +3146,13 @@ impl SessionManager {
                 &source.presentation,
                 now_ms,
             )?;
-            let forked = self.load_native_session(destination_id)?;
+            let forked = match self.load_native_session(destination_id) {
+                Ok(forked) => forked,
+                Err(error) => {
+                    self.delete(&destination_lease)?;
+                    return Err(error);
+                }
+            };
             return Ok((forked, destination_lease));
         }
         let forked = LoadedSession {
@@ -2380,6 +3166,28 @@ impl SessionManager {
             Some(&forked.presentation),
             &forked.meta,
         )?;
+        #[cfg(feature = "tools")]
+        {
+            // `through.turn` is a turn id, and `meta.turn_count` counts finished
+            // turns: an undone or stat-less turn leaves a gap between the two. The
+            // snapshot's high-water mark, or the highest id its messages carry, is
+            // the id the fork reaches; a snapshot from before either field is
+            // bounded by its finished-turn count, as it always was.
+            let last_turn = forked
+                .snapshot
+                .turn_counter
+                .max(
+                    forked
+                        .snapshot
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.meta.as_ref().map(|meta| meta.turn_id))
+                        .max()
+                        .unwrap_or(0),
+                )
+                .max(u64::from(forked.meta.turn_count));
+            self.carry_todo_sidecar(source_id, destination_id, last_turn);
+        }
         Ok((forked, destination_lease))
     }
 
@@ -3418,6 +4226,7 @@ impl SessionManager {
             self.path_for(id, "rewind")?,
             self.path_for(id, "rewind.txn")?,
             self.path_for(id, "todos")?,
+            self.path_for(id, "replay")?,
             self.path_for(id, "controller")?,
             self.path_for(id, "index")?,
         ];
@@ -3431,8 +4240,21 @@ impl SessionManager {
                 Err(e) => return Err(io_at(&p, e)),
             }
         }
+        let images = self.path_for(id, "display-images")?;
+        match fs::remove_dir_all(&images) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_at(&images, e)),
+        }
         if let Ok(dir) = self.artifacts_dir(id) {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
+        }
+        // Its Code Rewind store only served `/rewind` for this session; nothing
+        // else reads it. Best-effort, like the artifacts: the session is gone.
+        // Named by the leased id, never by what a file says its id is; a
+        // delegated session (`<lead>~<name>`) has no store of its own.
+        if let Some(rewind) = super::rewind_retention::rewind_root_for(&self.root) {
+            super::rewind_retention::remove_session_stores(&rewind, id);
         }
         Ok(())
     }
@@ -3483,7 +4305,7 @@ impl SessionManager {
                 record.turn_id,
                 TurnTimestamp {
                     started_at: record.started_at,
-                    completed_at: record.ts,
+                    completed_at: Some(record.ts),
                 },
             );
             Ok(())
@@ -3737,7 +4559,8 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             .or_else(|| name.strip_suffix(".rewind.txn"))
             .or_else(|| name.strip_suffix(".rewind"))
             .or_else(|| name.strip_suffix(".ui"))
-            .or_else(|| name.strip_suffix(".todos"));
+            .or_else(|| name.strip_suffix(".todos"))
+            .or_else(|| name.strip_suffix(".replay"));
         if let Some(id) = direct_sidecar_id {
             match file_entry.file_type() {
                 Ok(file_type) if file_type.is_file() => {}
@@ -4531,7 +5354,10 @@ pub(super) fn serialize_pretty_bounded<T: Serialize>(
     Ok(bytes)
 }
 
-fn deserialize<T: for<'de> Deserialize<'de>>(bytes: &[u8], kind: &'static str) -> SessionResult<T> {
+pub(super) fn deserialize<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    kind: &'static str,
+) -> SessionResult<T> {
     serde_json::from_slice(bytes).map_err(|e| SessionStoreError::Corrupt {
         kind,
         message: e.to_string(),
@@ -4577,7 +5403,7 @@ fn reject_existing_non_regular(path: &Path) -> SessionResult<()> {
     }
 }
 
-fn open_read_file(path: &Path) -> SessionResult<File> {
+pub(super) fn open_read_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     no_follow(&mut options);
@@ -4595,6 +5421,15 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
     // semantics are unchanged.
     options.create(true).append(true).read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `append(true)` alone grants only FILE_APPEND_DATA, which can write at
+        // the end of the file but cannot truncate it; cutting off a torn tail
+        // (`set_len`) needs write access as well. FILE_APPEND_DATA is still set
+        // by the append flag, so writes keep landing at the end of the file.
+        options.access_mode(0x8000_0000 | 0x4000_0000); // GENERIC_READ | GENERIC_WRITE
+    }
     set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
@@ -5589,9 +6424,9 @@ mod tests {
         let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
         assert_eq!(timestamps.len(), 2);
         assert_eq!(timestamps[&7].started_at, Some(1_700_000_000_000));
-        assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
+        assert_eq!(timestamps[&7].completed_at, Some(1_700_000_000_123));
         assert_eq!(timestamps[&8].started_at, None);
-        assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
+        assert_eq!(timestamps[&8].completed_at, Some(1_700_000_001_123));
     }
 
     #[test]
@@ -5635,6 +6470,12 @@ mod tests {
         assert_eq!(records[0].user, "question 1");
         assert_eq!(records[0].assistant, "answer 1");
         assert_eq!(records[2].user, "question 3");
+
+        mgr.write_meta(&SessionMeta::new("s1", "/work", 1)).unwrap();
+        assert_eq!(
+            mgr.first_prompt_preview("s1").unwrap().as_deref(),
+            Some("question 1")
+        );
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {
@@ -6147,6 +6988,23 @@ mod tests {
             &source_meta,
         )
         .unwrap();
+        #[cfg(feature = "tools")]
+        let todo_through = TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        };
+        #[cfg(feature = "tools")]
+        mgr.write_todo_sidecar(
+            "source",
+            &[TodoSidecarItem {
+                content: "a".into(),
+                status: "in_progress".into(),
+            }],
+            2,
+            Some(todo_through),
+        )
+        .unwrap();
 
         let (forked, fork_lease) = mgr
             .fork_native_session("source", "destination", 20)
@@ -6173,6 +7031,17 @@ mod tests {
                 base_turn_count: 2,
             })
         );
+        #[cfg(feature = "tools")]
+        {
+            let sidecar = mgr
+                .read_todo_sidecar("destination")
+                .unwrap()
+                .expect("the fork carries the plan");
+            assert_eq!(sidecar.todos.len(), 1);
+            assert_eq!(sidecar.todos[0].content, "a");
+            assert_eq!(sidecar.todos[0].status, "in_progress");
+            assert_eq!(sidecar.through, Some(todo_through));
+        }
         assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
         assert!(matches!(
             mgr.acquire_lease("source"),
@@ -6182,6 +7051,133 @@ mod tests {
             mgr.acquire_lease("destination"),
             Err(SessionStoreError::SessionInUse { .. })
         ));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_fork_bounds_the_sidecar_by_the_highest_turn_id_not_the_turn_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("source").unwrap();
+        let mut snapshot = snap(&["first"]);
+        // Turn ids are minted even by a turn that leaves no statistic behind: the
+        // finished count is 1 while the id high-water mark is 5.
+        snapshot.turn_counter = 5;
+        let mut meta = SessionMeta::new("source", "/project", 10);
+        meta.owner = StorageOwner::Native;
+        meta.turn_count = 1;
+        meta.message_count = 1;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let through = TodoCallPosition {
+            turn: 3,
+            round: 1,
+            index: 0,
+        };
+        mgr.write_todo_sidecar(
+            "source",
+            &[TodoSidecarItem {
+                content: "a".into(),
+                status: "in_progress".into(),
+            }],
+            1,
+            Some(through),
+        )
+        .unwrap();
+
+        let _ = mgr
+            .fork_native_session("source", "destination", 20)
+            .unwrap();
+
+        let sidecar = mgr
+            .read_todo_sidecar("destination")
+            .unwrap()
+            .expect("the fork carries the plan");
+        assert_eq!(
+            sidecar.through,
+            Some(through),
+            "a through inside the fork's turn ids is kept, not clamped by the count"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_projection_keeps_the_older_baseline_over_the_stale_list() {
+        let item = |status: &str| TodoSidecarItem {
+            content: "task".into(),
+            status: status.into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        // A normal next write keeps the previous list as the recoverable state.
+        manager
+            .write_todo_sidecar("s", &[item("pending")], 4, None)
+            .unwrap();
+        manager
+            .write_todo_sidecar("s", &[item("completed")], 6, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the state before this write is recoverable"
+        );
+
+        // The projection shrank since the last write (as a compaction or an
+        // undo would shrink it). The older baseline is still the furthest
+        // recoverable point; the stale completed list does not displace it.
+        // The new list is deliberately distinct from the older baseline, so a
+        // baseline taken from this write cannot pass.
+        manager
+            .write_todo_sidecar("s", &[item("in_progress")], 4, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(sidecar.todos[0].status, "in_progress");
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the stale completed list is not kept, the older baseline is"
+        );
+    }
+
+    #[test]
+    fn a_shrunk_conversation_without_a_baseline_keeps_the_state_before_the_write() {
+        let item = |status: &str| TodoSidecarItem {
+            content: "task".into(),
+            status: status.into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        // The first write has no older baseline. A compaction then shrinks the
+        // projection before the next write; that shrink is not evidence the
+        // list was taken back, so the state before the write is still the only
+        // state an undo can fall back to and must be kept.
+        manager
+            .write_todo_sidecar("s", &[item("pending")], 8, None)
+            .unwrap();
+        manager
+            .write_todo_sidecar("s", &[item("completed")], 3, None)
+            .unwrap();
+        let sidecar = manager.read_todo_sidecar("s").unwrap().unwrap();
+        assert_eq!(sidecar.todos[0].status, "completed");
+        assert_eq!(
+            sidecar
+                .baseline
+                .as_ref()
+                .map(|b| b.todos[0].status.as_str()),
+            Some("pending"),
+            "the state before the shrunk write is the recoverable floor"
+        );
     }
 
     #[test]
@@ -7312,15 +8308,336 @@ mod tests {
         let bucket = root.path().join("0123456789abcdef");
         let mgr = SessionManager::with_root(&bucket);
         mgr.save_snapshot("orphan", &snap(&["x"])).unwrap();
+        // A resume marker is a native sidecar like any other: without its index
+        // it is an orphan, not an unknown file.
+        std::fs::write(bucket.join("orphan-replay.replay"), b"{}").unwrap();
         let lock_only = mgr.acquire_lease("deleted").unwrap();
         drop(lock_only);
 
         let scan = SessionManager::scan_catalog(root.path());
 
         assert!(scan.entries.is_empty());
-        assert_eq!(scan.diagnostics.len(), 1);
-        assert!(scan.diagnostics[0].path.ends_with("orphan.snapshot"));
-        assert_eq!(scan.diagnostics[0].kind, CatalogDiagnosticKind::Corrupt);
+        assert_eq!(scan.diagnostics.len(), 2);
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("orphan.snapshot")));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("orphan-replay.replay")));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind == CatalogDiagnosticKind::Corrupt));
+    }
+
+    #[test]
+    fn an_uncertain_retraction_keeps_the_replay_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        mgr.append_events(
+            &lease,
+            &[
+                logged(1, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(mgr.resume_retraction_is_absent("replay", 1, 1));
+
+        mgr.append_events(
+            &lease,
+            &[logged(
+                3,
+                SessionEvent::Rewound {
+                    turn: 1,
+                    to: 1,
+                    scope: RewindScope::Conversation,
+                },
+            )],
+        )
+        .unwrap();
+        assert!(!mgr.resume_retraction_is_absent("replay", 1, 1));
+        assert!(mgr.resume_retraction_is_absent("replay", 1, 2));
+
+        // A log that cannot be read proves nothing about the retraction, so the
+        // marker has to survive instead of being cleared on the failed append.
+        std::fs::write(mgr.events_path("replay").unwrap(), b"not a record\n").unwrap();
+        assert!(!mgr.resume_retraction_is_absent("replay", 1, 1));
+    }
+
+    #[test]
+    fn a_marker_and_a_retraction_meet_in_file_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // The retraction was appended with a sequence below the turn it retracts,
+        // as an allocation from that log's own tail can be. File order still puts
+        // it after the prompt, and that is what the marker decides against.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(5, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    6,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    2,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        let marker = ResumeReplay {
+            to: 5,
+            turn: 1,
+            rewound: Some(2),
+        };
+        match pending_replay_prompt(&mgr.load_events("replay").unwrap(), &marker) {
+            PendingReplay::StillWaiting(prompt) => assert_eq!(prompt.text, "hello"),
+            _ => panic!("the retraction written after the prompt still leaves it waiting"),
+        }
+    }
+
+    #[test]
+    fn a_later_rewind_is_read_by_position_not_by_its_number() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // The later rewind names turn 2, whose `TurnStart` sits after the
+        // prompt's and only carries a smaller number. It does not reach the
+        // retracted prompt, whatever the numbers say.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(100, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    101,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(50, SessionEvent::TurnStart { turn: 2 }),
+                logged(
+                    102,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 100,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+                logged(
+                    103,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 50,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        let marker = ResumeReplay {
+            to: 100,
+            turn: 1,
+            rewound: Some(102),
+        };
+        match pending_replay_prompt(&mgr.load_events("replay").unwrap(), &marker) {
+            PendingReplay::StillWaiting(prompt) => assert_eq!(prompt.text, "hello"),
+            _ => panic!("a rewind to a later turn does not retire the prompt"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_marker_does_not_replay_the_rewind_it_cannot_own() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // A committed rewind hides one unanswered prompt, but the log cannot say
+        // whether the resume wrote it or the person undid the turn themselves.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(1, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    3,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            mgr.resume_replay_path("replay").unwrap(),
+            b"\xffnot a marker",
+        )
+        .unwrap();
+
+        let mut notes = Vec::new();
+        let (_loaded, pending) = mgr
+            .load_native_session_for_resume_noting(&lease, &mut notes)
+            .unwrap();
+        assert!(pending.is_none(), "an unwritten prompt is not handed back");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("will not be replayed")),
+            "{notes:?}"
+        );
+        // The marker may name a retraction that is already committed, and it can
+        // be unreadable for one resume only. Removing it would throw away the
+        // only record that could hand that prompt back.
+        assert_eq!(
+            std::fs::read(mgr.resume_replay_path("replay").unwrap()).unwrap(),
+            b"\xffnot a marker"
+        );
+        assert!(
+            mgr.read_resume_replay("replay").is_err(),
+            "still unreadable, and still kept"
+        );
+        assert!(matches!(
+            mgr.prepare_resume_replay(&lease, &Message::user("hello")),
+            Ok(PrepareResumeReplay::Obsolete)
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_marker_does_not_resurrect_an_answered_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // The rewind hides a turn the model answered; its prompt was not left
+        // waiting, so nothing may hand it back.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(1, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    3,
+                    SessionEvent::TurnEnd {
+                        turn: 1,
+                        stop: atomcode_kernel::event::StopReason::Stopped,
+                        error: None,
+                    },
+                ),
+                logged(
+                    4,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            mgr.resume_replay_path("replay").unwrap(),
+            b"\xffnot a marker",
+        )
+        .unwrap();
+
+        let mut notes = Vec::new();
+        let (_loaded, pending) = mgr
+            .load_native_session_for_resume_noting(&lease, &mut notes)
+            .unwrap();
+        assert!(pending.is_none());
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("will not be replayed")),
+            "{notes:?}"
+        );
+        assert_eq!(
+            std::fs::read(mgr.resume_replay_path("replay").unwrap()).unwrap(),
+            b"\xffnot a marker"
+        );
     }
 
     #[test]
@@ -7380,6 +8697,40 @@ mod tests {
         ));
         assert!(mgr.snapshot_path("s1").unwrap().exists());
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn display_images_are_leased_bounded_sidecars_and_deleted_with_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(root.path());
+        let lease = manager.acquire_lease("pictures").unwrap();
+        let images = vec![atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "eA==".into(),
+        }];
+        manager
+            .write_display_images(&lease, 7, "caption", images.clone())
+            .unwrap();
+        let saved = manager.read_display_images("pictures", 7).unwrap().unwrap();
+        assert!(saved.matches("caption"));
+        assert!(!saved.matches("other caption"));
+        assert_eq!(saved.images, images);
+        assert!(manager
+            .read_display_images("pictures", 8)
+            .unwrap()
+            .is_none());
+        manager
+            .write_display_images(&lease, 7, "new fact reusing sequence", vec![])
+            .unwrap();
+        assert!(manager
+            .read_display_images("pictures", 7)
+            .unwrap()
+            .is_none());
+        manager
+            .write_display_images(&lease, 9, "caption", images)
+            .unwrap();
+        manager.delete(&lease).unwrap();
+        assert!(!root.path().join("pictures.display-images").exists());
     }
 
     #[test]
@@ -8282,6 +9633,28 @@ mod tests {
         assert!(!art.exists(), "artifacts dir removed with the session");
     }
 
+    #[test]
+    fn delete_removes_the_sessions_rewind_store_in_any_bucket() {
+        let user = tempfile::tempdir().unwrap();
+        let dirs = ProductDirs::new(user.path().to_path_buf(), ".atomcode");
+        let mgr = SessionManager::with_root(SessionManager::sessions_root(&dirs).join("cwd"));
+        mgr.save_snapshot("s1", &snap(&["keep"])).unwrap();
+        // A session started in a subdirectory keeps its store under the
+        // worktree root's bucket, not its own.
+        let store = |id: &str| {
+            let dir = user.path().join("rewind").join("worktree-root").join(id);
+            std::fs::create_dir_all(dir.join("objects")).unwrap();
+            std::fs::write(dir.join("atomcode-rewind-version"), "atomcode-rewind-v1").unwrap();
+            dir
+        };
+        let own = store("s1");
+        let other = store("s2");
+        let lease = mgr.acquire_lease("s1").unwrap();
+        mgr.delete(&lease).unwrap();
+        assert!(!own.exists(), "the deleted session's store goes with it");
+        assert!(other.exists(), "another session's store stays");
+    }
+
     #[cfg(unix)]
     #[test]
     fn active_lease_rejects_a_symlink_lock_file() {
@@ -8600,6 +9973,50 @@ mod tests {
             !mgr.has_inflight_snapshot(id),
             "unsafe checkpoints are cleared so they cannot shadow later resumes"
         );
+    }
+
+    #[test]
+    fn stale_or_unsafe_checkpoints_do_not_claim_a_mid_turn_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("checkpoint-note").unwrap();
+        let canonical = snap(&["committed"]);
+        let mut meta = SessionMeta::new(lease.id(), "/project", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.commit_native_import(
+            &lease,
+            Some(&canonical),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        for checkpoint in [
+            canonical.clone(),
+            SessionSnapshot::new(vec![
+                Message::user("committed"),
+                Message::assistant("uncommitted work", vec![]),
+            ]),
+        ] {
+            mgr.save_inflight_snapshot(lease.id(), &checkpoint, true)
+                .unwrap();
+            let mut notes = Vec::new();
+            let (loaded, pending) = mgr
+                .load_native_session_for_resume_noting(&lease, &mut notes)
+                .unwrap();
+            assert_eq!(loaded.snapshot, canonical);
+            assert!(pending.is_none());
+            assert!(!mgr.has_inflight_snapshot(lease.id()));
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].contains("was not replayed"));
+            assert!(!notes[0].contains("stopped mid-turn"));
+            let mut again = Vec::new();
+            mgr.load_native_session_for_resume_noting(&lease, &mut again)
+                .unwrap();
+            assert!(
+                again.is_empty(),
+                "do not repeat a cleared checkpoint notice"
+            );
+        }
     }
 
     #[test]

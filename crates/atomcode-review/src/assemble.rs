@@ -3,6 +3,7 @@
 
 use crate::config::ReviewAgentConfig;
 use crate::persona::review_persona;
+use crate::timing::ReviewTiming;
 use atomcode_capabilities::codeintel::lang::Lang;
 use atomcode_capabilities::codeintel::{codeintel_tool_names, register_codeintel_tools};
 use std::path::Path;
@@ -121,6 +122,16 @@ pub fn build_review_agent_with_cancel(
     provider: Arc<dyn LlmProvider>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> (Agent, ReportFindingTool) {
+    build_review_agent_inner(cfg, provider, cancel_token, None, None)
+}
+
+pub(crate) fn build_review_agent_inner(
+    cfg: &ReviewAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    timing: Option<&ReviewTiming>,
+    patch: Option<Arc<crate::review_batches::ReviewPatch>>,
+) -> (Agent, ReportFindingTool) {
     // One shared findings sink: the registered tool and the returned handle share state.
     let report = ReportFindingTool::new();
     // Auto-degrade the code-graph on huge repos when the caller set a bound. Default
@@ -137,7 +148,19 @@ pub fn build_review_agent_with_cancel(
         }
         mount
     };
-    let tools = mount_review_tools(&cfg.dirs, &report, cfg.no_web, mount_graph, &cfg.skill_dirs);
+    let tools = mount_review_tools(
+        &cfg.dirs,
+        &report,
+        cfg.no_web,
+        mount_graph,
+        &cfg.skill_dirs,
+        timing,
+        patch,
+    );
+    let provider = match timing {
+        Some(timing) => timing.provider(provider),
+        None => provider,
+    };
     let persona = compose_persona(cfg);
     let mut builder = Agent::builder()
         .provider(provider)
@@ -158,13 +181,16 @@ pub fn build_review_agent_with_cancel(
     if let Some(policy) = cfg.tool_loop_policy {
         builder = builder.tool_loop_policy(policy);
     }
-    // Round fuse is opt-in: only bound rounds when the caller asked for it (keeps a bare
-    // CLI run unbounded; engineering callers pass `--max-rounds`). When bounded, also mount
-    // the round-budget pressure hook so the reviewer LANDS findings before the fuse trips
-    // instead of dying empty in a read-exploration loop (see `round_budget`).
+    // Keep a bare CLI run unbounded. A bounded caller gets landing pressure for
+    // time as well as rounds: slow requests may exhaust time long before rounds.
+    // The existing cancellation seam still enforces the deadline.
     if let Some(n) = cfg.max_rounds {
-        builder = builder.max_rounds(n).hook(Arc::new(
+        builder = builder.max_rounds(n);
+    }
+    if cfg.max_rounds.is_some() || cfg.max_turn_duration.is_some() {
+        builder = builder.hook(Arc::new(
             crate::round_budget::RoundBudgetHook::new()
+                .with_duration(cfg.max_turn_duration)
                 .tracing_to_stderr(cfg.trace_budget_to_stderr),
         ));
     }
@@ -225,6 +251,8 @@ fn mount_review_tools(
     no_web: bool,
     mount_graph: bool,
     skill_dirs: &[PathBuf],
+    timing: Option<&ReviewTiming>,
+    patch: Option<Arc<crate::review_batches::ReviewPatch>>,
 ) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg, &dirs); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
@@ -242,7 +270,20 @@ fn mount_review_tools(
         atomcode_capabilities::skills::register_skill_tools(&mut reg, skills);
         names.extend_from_slice(atomcode_capabilities::skills::skill_tool_names());
     }
-    reg.mount(&names)
+    if let Some(patch) = patch {
+        reg.register(patch);
+        names.push("read_review_patch");
+    }
+    let mounted = reg.mount(&names);
+    if let Some(timing) = timing {
+        for name in &names {
+            if let Some(tool) = mounted.get(name) {
+                reg.register(timing.tool(tool));
+            }
+        }
+        return reg.mount(&names);
+    }
+    mounted
 }
 
 /// Final system prompt: full override wins (else the built-in reviewer persona), then the

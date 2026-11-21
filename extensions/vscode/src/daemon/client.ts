@@ -325,10 +325,14 @@ export class DaemonClient {
     sessionId: string,
     decision: PermissionDecision,
     toolName?: string,
+    callId?: string,
+    approvalId?: string,
   ): Promise<PermissionDecisionResponse> {
     return this.post<PermissionDecisionResponse>('/chat/permission', {
       session_id: sessionId,
       decision,
+      call_id: callId,
+      approval_id: approvalId,
       ...(toolName ? { tool_name: toolName } : {}),
     });
   }
@@ -642,6 +646,7 @@ export class DaemonClient {
           toolName: event.tool_name,
           reason: event.reason,
           callId: event.call_id,
+          ...(event.approval_id ? { approvalId: event.approval_id } : {}),
           args: event.arguments,
         });
         break;

@@ -1,0 +1,89 @@
+{
+  "baseline_commit": "c042a8226432b29ec44b7e11eec4c7b4acc3cae9",
+  "candidate": "phase-one compressed assets and WOFF2-only fonts",
+  "target": "aarch64-apple-darwin",
+  "profile": "release, default unsigned full CLI",
+  "binary_bytes": 40883856,
+  "method": "Apple ld -map; sum live symbols attributed to tree-sitter grammar C archive members, excluding dead-stripped symbols. Excludes alignment, shared pools and Rust wrappers; this is not a removal A/B saving.",
+  "grammar_live_symbol_bytes": 22970268,
+  "grammars": [
+    {
+      "language": "kotlin_sg",
+      "live_symbol_bytes": 5781516,
+      "parse_table_bytes": 5462726
+    },
+    {
+      "language": "c_sharp",
+      "live_symbol_bytes": 5327905,
+      "parse_table_bytes": 5041994
+    },
+    {
+      "language": "cpp",
+      "live_symbol_bytes": 3433499,
+      "parse_table_bytes": 3095794
+    },
+    {
+      "language": "typescript",
+      "live_symbol_bytes": 2827846,
+      "parse_table_bytes": 2519636
+    },
+    {
+      "language": "bash",
+      "live_symbol_bytes": 1359268,
+      "parse_table_bytes": 951222
+    },
+    {
+      "language": "rust",
+      "live_symbol_bytes": 1101049,
+      "parse_table_bytes": 962096
+    },
+    {
+      "language": "php",
+      "live_symbol_bytes": 1037387,
+      "parse_table_bytes": 916230
+    },
+    {
+      "language": "c",
+      "live_symbol_bytes": 623082,
+      "parse_table_bytes": 466252
+    },
+    {
+      "language": "python",
+      "live_symbol_bytes": 449008,
+      "parse_table_bytes": 346818
+    },
+    {
+      "language": "java",
+      "live_symbol_bytes": 404930,
+      "parse_table_bytes": 327158
+    },
+    {
+      "language": "javascript",
+      "live_symbol_bytes": 398282,
+      "parse_table_bytes": 324048
+    },
+    {
+      "language": "go",
+      "live_symbol_bytes": 210523,
+      "parse_table_bytes": 142952
+    },
+    {
+      "language": "html",
+      "live_symbol_bytes": 15973,
+      "parse_table_bytes": 3062
+    }
+  ],
+  "kotlin_regeneration": {
+    "generator": "tree-sitter 0.26.7",
+    "generator_asset_sha256": "24162119aca35a160a2752a4457b17f3c47f7b2895ab63002c66b8dfd1bb41d1",
+    "abi": 14,
+    "grammar": "tree-sitter-kotlin-sg 0.4.1 original grammar.json",
+    "before_states": 10180,
+    "after_states": 10180,
+    "before_large_states": 6938,
+    "after_large_states": 6938,
+    "before_parser_source_bytes": 33716905,
+    "after_parser_source_bytes": 33776249,
+    "retained": false
+  }
+}

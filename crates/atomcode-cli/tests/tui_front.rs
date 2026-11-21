@@ -125,6 +125,7 @@ fn start(
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
+                mcp_paused: false,
                 extra_mcp_servers: Vec::new(),
                 mcp_user_config: None,
                 mcp_tokens: None,
@@ -148,6 +149,7 @@ fn start(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
 async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -183,7 +185,14 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
         SessionMode::Resume(id),
         Some(front_end.clone()),
     );
-    let second = CodingRuntime::start(second).await.expect("resumes");
+    let second = CodingRuntime::start_with_bootstrap(
+        second,
+        atomcode_coding::ProviderBootstrap::Unavailable(
+            atomcode_coding::ProviderUnavailableReason::NotConfigured,
+        ),
+    )
+    .await
+    .expect("resumes without a provider");
     let screen = Screen {
         headless: Some((100, 30)),
         ..Screen::default()
@@ -207,9 +216,7 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
     .await
     .expect("the screen mounts");
 
-    // A machine with no provider is told where to go (`/login`, `/provider`)
-    // and nothing is opened for it: the first-run wizard is not started on its
-    // own. It is still mounted, and `/onboarding` still runs it.
+    // The spoken fallback also reaches hosts without a setup screen.
     {
         let commands = mounted
             .app
@@ -234,10 +241,8 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
             }
             other => panic!("a machine with no provider: {other:?}"),
         }
-        assert!(
-            commands.find(atomcode::tui_onboarding::COMMAND).is_some(),
-            "the walkthrough is still there to type"
-        );
+        assert!(commands.find("onboarding").is_none());
+        assert!(commands.find("welcome").is_none());
     }
     // **`/login` is the launcher's, not the screen's shipped one.**
     //
@@ -321,6 +326,27 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
         "the history the product wrote is on the screen:\n{screen_text}"
     );
 
+    // Recovery still uses the normal composer when an existing session
+    // opens without a provider.
+    term.type_line("/provider");
+    let mut panel_open = false;
+    for _ in 0..200 {
+        panel_open = term
+            .last()
+            .is_some_and(|frame| frame.part(atomcode_tui::modules::providers::ID).is_some());
+        if panel_open {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        panel_open,
+        "the restored session can open /provider:\n{}",
+        term.text()
+    );
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Esc,
+    ));
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
@@ -342,6 +368,7 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
 /// with `/language en` written to the configuration, the heading on screen is
 /// the English one.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_welcome_block_reads_the_language_the_launcher_knows() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -439,6 +466,7 @@ async fn the_welcome_block_reads_the_language_the_launcher_knows() {
 /// but that is an invariant two files apart, and getting it wrong trades a
 /// silent notice for a silent welcome.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -530,6 +558,7 @@ async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
 
 /// Invalid upgrade arguments are handled locally, without model or network work.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn invalid_upgrade_arguments_are_reported_on_the_screen() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -597,16 +626,14 @@ async fn invalid_upgrade_arguments_are_reported_on_the_screen() {
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
 
-/// `/welcome` — the classic screen's name for re-running the first-run
-/// walkthrough — opens this screen's walkthrough rather than meeting "no such
-/// command" after the default moved.
 #[tokio::test]
-async fn the_classic_name_for_the_walkthrough_still_opens_it() {
+#[serial_test::serial(atomcode_home)]
+async fn model_setup_returns_from_cancel_then_opens_provider_and_yields_when_ready() {
+    use atomcode_tui::surface::{Key, KeyPress};
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
     let project = tempfile::tempdir().unwrap();
     let count = Arc::new(Count::default());
-    let config_path = home.path().join("config.toml");
     let _locale = atomcode_config::i18n::test_lock();
     atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
 
@@ -618,91 +645,151 @@ async fn the_classic_name_for_the_walkthrough_still_opens_it() {
         Some(front_end.clone()),
     );
     let runtime = CodingRuntime::start(start).await.expect("starts");
+    let handle = runtime.handle.clone();
+    handle
+        .deactivate_provider(atomcode_coding::ProviderUnavailableReason::NotConfigured)
+        .await
+        .expect("unconfigured at startup");
     let screen = Screen {
-        headless: Some((120, 40)),
+        headless: Some((100, 60)),
         ..Screen::default()
     };
     let mounted = tui_front::mount(
         runtime,
         front_end,
-        config,
+        config.clone(),
         None,
         &screen,
-        config_path,
+        home.path().join("config.toml"),
         None,
         None,
     )
     .await
     .expect("the screen mounts");
-    let term = mounted
-        .app
-        .context()
+
+    let ctx = mounted.app.context();
+    let term = ctx
         .service::<atomcode_tui::plugin::SurfaceSvc>()
         .and_then(|surface| surface.as_any_headless())
         .expect("a headless surface");
+    let model_setup = ctx
+        .service::<atomcode_tui::plugin::ModelSetupSvc>()
+        .expect("the setup service");
+    let login = model_setup
+        .start_login()
+        .expect("simulate authorization wait");
+    assert!(login
+        .attempt
+        .display_in_setup("https://example.test/authorize"));
     let ui = mounted.ui.clone();
-    let ctx = mounted.app.context();
     let running = tokio::spawn(async move {
         let _ = ui.run(&ctx, None).await;
     });
 
-    term.type_line("/welcome");
-    let mut screen_text = String::new();
-    for _ in 0..200 {
-        screen_text = term.text();
-        if screen_text.contains("先把这台机器配好") {
-            break;
+    let wait_for = |expected: &'static str| {
+        let term = term.clone();
+        async move {
+            for _ in 0..200 {
+                let frame = term.text();
+                if frame.contains(expected) {
+                    return frame;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("missing {expected:?}:\n{}", term.text());
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        screen_text.contains("先把这台机器配好"),
-        "`/welcome` opened the walkthrough:\n{screen_text}"
-    );
-    assert_eq!(count.0.load(Ordering::SeqCst), 0, "not sent as a prompt");
-    // On a screen nobody has said anything on, the walkthrough opens straight
-    // into the intro: a question whose only sensible answer is yes is one
-    // people learn to press through without reading.
-    assert!(
-        !screen_text.contains("这会清屏"),
-        "nothing to lose, so nothing to ask:\n{screen_text}"
-    );
+    };
+    let waiting = wait_for("取消登录并返回").await;
+    assert!(waiting.contains("AtomCode"));
+    assert!(!waiting.contains("使用 AtomCode 开始工作"));
+    assert!(waiting.contains("https://example.test/authorize"));
+    let frame = term.frames().pop().unwrap();
+    assert!((0..frame.size.h).any(|y| (0..frame.size.w)
+        .any(|x| frame.link_at(x, y).as_deref() == Some("https://example.test/authorize"))));
+    term.press(KeyPress::plain(Key::Char('c')));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while term.clipboard_text().as_deref() != Some("https://example.test/authorize") {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("c copies the full authorization link");
+    term.press(KeyPress::plain(Key::Esc));
+    let choice = wait_for("连接已有的模型服务").await;
+    assert!(choice.contains("使用 AtomGit 账号登录"));
+    assert!(choice.find("上手提示").unwrap() < choice.find("选择模型接入方式").unwrap());
+    assert!(!choice.contains("https://example.test/authorize"));
+    assert!(login.attempt.cancelled());
+    assert!(!login.attempt.begin_completion());
+    drop(login);
 
-    // Now say something, so there is a conversation to lose, and ask again.
-    //
-    // **The wiring is the half worth pinning.** Whether the warning step is
-    // built is a flag, and the flag is worked out in `run()` from the session
-    // on screen — a build that always passed `false` would keep every unit
-    // criterion about the step green and still never show it to anybody.
-    term.press(atomcode_tui::surface::KeyPress::plain(
-        atomcode_tui::surface::Key::Esc,
-    ));
+    term.press(KeyPress::plain(Key::Down));
+    term.press(KeyPress::plain(Key::Enter));
+    let providers = wait_for("手动添加").await;
+    assert!(!providers.contains("添加 provider"));
+    assert!(!providers.contains("使用 AtomCode 开始工作"));
+    assert!(
+        !providers.contains("Enter 确认"),
+        "the provider picker owns the keyboard"
+    );
+    let picker_line = providers
+        .lines()
+        .position(|line| line.contains("账号"))
+        .unwrap();
+    assert!(
+        picker_line < 18,
+        "the first-run picker follows the header on a tall terminal:\n{providers}"
+    );
+    term.press(KeyPress::plain(Key::Esc));
+    let returned = wait_for("选择模型接入方式").await;
+    assert!(returned.contains("2. 连接已有的模型服务"));
+    assert!(!returned.contains("添加 provider"));
+
+    handle
+        .reassemble_provider(config)
+        .await
+        .expect("activate provider");
+    wait_for("使用 AtomCode 开始工作").await;
+    assert!(!model_setup.required());
     term.type_line("hello");
-    for _ in 0..200 {
-        if count.0.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    wait_for("answer 1").await;
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+
+    // Cancelling a later /login attempt keeps the ready conversation on screen.
+    let login = model_setup.start_login().expect("simulate a later sign-in");
+    term.press(KeyPress::plain(Key::Esc));
+    let after_cancel = wait_for("已取消登录").await;
+    assert!(login.attempt.cancelled());
+    assert!(after_cancel.contains("answer 1"));
+    assert!(!after_cancel.contains("选择模型接入方式"));
+    drop(login);
+
+    handle
+        .deactivate_provider(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
+        .await
+        .expect("simulate expired credentials");
+    let expired = wait_for("/login 重新登录").await;
+    assert!(expired.contains("answer 1"));
+    assert!(expired.contains("/provider 选择"));
+    assert!(!expired.contains("选择模型接入方式"));
     assert!(
-        count.0.load(Ordering::SeqCst) > 0,
-        "the turn was taken, so the log has something a person said"
+        model_setup.start_login().is_some(),
+        "expiry did not automatically sign in"
     );
 
-    term.type_line("/welcome");
-    for _ in 0..200 {
-        screen_text = term.text();
-        if screen_text.contains("这会清屏") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    for c in "draft".chars() {
+        term.press(KeyPress::plain(Key::Char(c)));
     }
-    assert!(
-        screen_text.contains("这会清屏"),
-        "asked before the walkthrough, not after the sign-in that clears:\n{screen_text}"
-    );
+    wait_for("draft").await;
+    term.press(KeyPress::new(
+        Key::Char('2'),
+        atomcode_tui::surface::Mods::ALT,
+    ));
+    wait_for("账号").await;
+    term.press(KeyPress::plain(Key::Esc));
+    assert!(wait_for("draft").await.contains("answer 1"));
 
-    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
 
@@ -710,6 +797,7 @@ async fn the_classic_name_for_the_walkthrough_still_opens_it() {
 /// written to the config file (so the next launch keeps it), and a bare `/proxy`
 /// offers the three modes with the current one marked.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -808,6 +896,7 @@ async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
 /// `/schedule` opens the shared task manager without starting a model turn.
 /// Creation can be inspected and cancelled entirely from the keyboard.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn scheduled_tasks_are_listed_here() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -911,6 +1000,7 @@ async fn until_text(
 /// harness writes a `todowrite` call and its result into the log between turns,
 /// and the panel folds the list from there — nothing is sent as a prompt.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn a_person_edits_the_plan_with_todo_add_and_clear() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1032,6 +1122,7 @@ async fn a_person_edits_the_plan_with_todo_add_and_clear() {
 /// criterion for all of them, because the way any of these rows breaks is the
 /// same: the row stops being mounted and nothing says so.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_launchers_own_commands_are_in_the_menu() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1075,14 +1166,7 @@ async fn the_launchers_own_commands_are_in_the_menu() {
         .into_iter()
         .map(|c| c.name.into_owned())
         .collect();
-    for name in [
-        "proxy",
-        "schedule",
-        "openrouter",
-        "onboarding",
-        "config",
-        "changelog",
-    ] {
+    for name in ["proxy", "schedule", "openrouter", "config", "changelog"] {
         assert!(
             offered.contains(&name.to_string()),
             "`/{name}` is mounted: {offered:?}"
@@ -1093,6 +1177,7 @@ async fn the_launchers_own_commands_are_in_the_menu() {
 /// The retired screen's command table is a frozen input, not a second catalog.
 /// Run the event loop: runtime-owned commands arrive through Described events.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
 async fn every_retired_command_has_a_live_replacement() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1131,6 +1216,9 @@ async fn every_retired_command_has_a_live_replacement() {
     let running = tokio::spawn(async move { ui.run(&ctx, None).await });
     let mut retired: Vec<String> =
         serde_json::from_str(include_str!("fixtures/retired-tuix-commands.json")).unwrap();
+    // First-run setup is now an automatic entry point, replacing the command
+    // and its alias. The original catalog fixture remains historical.
+    retired.retain(|name| name != "welcome");
     retired.extend(["new".into(), "exit".into()]);
     let mut missing = Vec::new();
     for _ in 0..200 {
@@ -1170,6 +1258,7 @@ async fn every_retired_command_has_a_live_replacement() {
 /// middle of the run, and the part a build could get wrong while both ends look
 /// right.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
 async fn the_menu_is_described_in_the_language_language_is_set_to() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1309,6 +1398,7 @@ fn has_cjk(text: &str) -> bool {
 /// the same panel, drawn as markdown — and Esc comes back to the list, with the
 /// cursor where it was, so reading one release leads to the next.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_changelog_is_picked_from_a_list_read_in_the_panel_and_left_back_to_it() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -1440,6 +1530,7 @@ async fn until_shown(term: &atomcode_tui::surface::Headless, what: &str) -> Stri
 /// waits for the turn and that Esc stops it — not the runtime's "busy" — and
 /// `/compact` says it comes after the turn. Neither stops the turn.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn commands_typed_mid_turn_say_what_they_wait_for() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());

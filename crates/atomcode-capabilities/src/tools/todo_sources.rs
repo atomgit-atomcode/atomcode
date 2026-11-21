@@ -124,13 +124,6 @@ pub fn source_plan(events: &[LoggedEvent]) -> SourcePlan {
     let mut results = BTreeMap::new();
     for entry in retained_events(events) {
         match &entry.event {
-            // A person's interruption retires the active plan, as active_todo_calls
-            // does in the message projection. Original kept inputs remain readable.
-            SessionEvent::Interrupted { .. } => {
-                calls.clear();
-                multiplicity.clear();
-                results.clear();
-            }
             SessionEvent::AssistantMessage {
                 turn,
                 round,
@@ -516,16 +509,16 @@ mod tests {
     }
 
     #[test]
-    fn interruption_retires_the_batch_and_undone_inputs_cannot_be_revived() {
+    fn interruption_preserves_the_batch_but_undone_inputs_cannot_be_revived() {
         for undone in [false, true] {
             let mut session = fixture();
             session
                 .events
                 .push(event(4, SessionEvent::Interrupted { turn: 1, undone }));
             let plan = source_plan(&session.events);
-            assert!(plan.source_seqs.is_empty());
-            assert!(plan.todos.is_empty());
-            assert!(active_source_anchor(&session.events).is_none());
+            assert_eq!(plan.source_seqs, if undone { vec![] } else { vec![1] });
+            assert_eq!(plan.todos.is_empty(), undone);
+            assert_eq!(active_source_anchor(&session.events).is_none(), undone);
             assert_eq!(read_source(&session, 1, 0, 100).is_err(), undone);
             assert_eq!(list_sources(&session.events, u64::MAX).is_empty(), undone);
             session.events.extend([

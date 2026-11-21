@@ -1,0 +1,533 @@
+{
+  "binary": "/Users/theo/Documents/workspace/atomcode/target/release/atomcode",
+  "version": "5.2.7 (eab22d60d+dirty)",
+  "selection": "alitoken/qwen4-max-preview",
+  "endpoint_host": "token-plan.cn-beijing.maas.aliyuncs.com",
+  "batches": {
+    "no_tools": [
+      {
+        "arm": "off",
+        "round": 0,
+        "exit_code": 0,
+        "elapsed_ms": 4416,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 17920,
+            "completion_tokens": 30,
+            "cached_tokens": 0,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 4135,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 17950,
+            "prompt_tokens": 17920,
+            "completion_tokens": 30,
+            "cached_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "ttft_ms": 3468,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "on",
+        "round": 0,
+        "exit_code": 0,
+        "elapsed_ms": 5050,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 17920,
+            "completion_tokens": 39,
+            "cached_tokens": 0,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 4791,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 17959,
+            "prompt_tokens": 17920,
+            "completion_tokens": 39,
+            "cached_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "ttft_ms": 3861,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "on",
+        "round": 1,
+        "exit_code": 0,
+        "elapsed_ms": 6970,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 17920,
+            "completion_tokens": 77,
+            "cached_tokens": 16980,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 6681,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 17997,
+            "prompt_tokens": 17920,
+            "completion_tokens": 77,
+            "cached_tokens": 16980,
+            "cache_hit_rate": 0.9475446428571429,
+            "ttft_ms": 4512,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "off",
+        "round": 1,
+        "exit_code": 0,
+        "elapsed_ms": 5312,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 17920,
+            "completion_tokens": 65,
+            "cached_tokens": 17664,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 5059,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 17985,
+            "prompt_tokens": 17920,
+            "completion_tokens": 65,
+            "cached_tokens": 17664,
+            "cache_hit_rate": 0.9857142857142858,
+            "ttft_ms": 3820,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "off",
+        "round": 2,
+        "exit_code": 0,
+        "elapsed_ms": 4011,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 17920,
+            "completion_tokens": 42,
+            "cached_tokens": 17664,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 3737,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 17962,
+            "prompt_tokens": 17920,
+            "completion_tokens": 42,
+            "cached_tokens": 17664,
+            "cache_hit_rate": 0.9857142857142858,
+            "ttft_ms": 2784,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "on",
+        "round": 2,
+        "exit_code": 0,
+        "elapsed_ms": 4682,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 17920,
+            "completion_tokens": 38,
+            "cached_tokens": 16980,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 4363,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 17958,
+            "prompt_tokens": 17920,
+            "completion_tokens": 38,
+            "cached_tokens": 16980,
+            "cache_hit_rate": 0.9475446428571429,
+            "ttft_ms": 3406,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      }
+    ],
+    "tool_schemas": [
+      {
+        "arm": "off",
+        "round": 0,
+        "exit_code": 0,
+        "elapsed_ms": 8463,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 36622,
+            "completion_tokens": 77,
+            "cached_tokens": 0,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 7386,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 36699,
+            "prompt_tokens": 36622,
+            "completion_tokens": 77,
+            "cached_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "ttft_ms": 5222,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "on",
+        "round": 0,
+        "exit_code": 0,
+        "elapsed_ms": 14683,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 36622,
+            "completion_tokens": 96,
+            "cached_tokens": 0,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          },
+          {
+            "type": "usage",
+            "round": 2,
+            "turn_id": 1,
+            "request_id": 2,
+            "prompt_tokens": 36671,
+            "completion_tokens": 57,
+            "cached_tokens": 36484,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 13911,
+            "rounds": 2,
+            "tool_calls": 0,
+            "total_tokens": 73446,
+            "prompt_tokens": 73293,
+            "completion_tokens": 153,
+            "cached_tokens": 36484,
+            "cache_hit_rate": 0.49778287148840955,
+            "ttft_ms": 6778,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "on",
+        "round": 1,
+        "exit_code": 0,
+        "elapsed_ms": 6655,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 36622,
+            "completion_tokens": 35,
+            "cached_tokens": 35578,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 5907,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 36657,
+            "prompt_tokens": 36622,
+            "completion_tokens": 35,
+            "cached_tokens": 35578,
+            "cache_hit_rate": 0.9714925454644749,
+            "ttft_ms": 3279,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "off",
+        "round": 1,
+        "exit_code": 0,
+        "elapsed_ms": 6274,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 36622,
+            "completion_tokens": 33,
+            "cached_tokens": 36352,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 5462,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 36655,
+            "prompt_tokens": 36622,
+            "completion_tokens": 33,
+            "cached_tokens": 36352,
+            "cache_hit_rate": 0.992627382447709,
+            "ttft_ms": 4869,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "off",
+        "round": 2,
+        "exit_code": 0,
+        "elapsed_ms": 14204,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 36622,
+            "completion_tokens": 96,
+            "cached_tokens": 36352,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          },
+          {
+            "type": "usage",
+            "round": 2,
+            "turn_id": 1,
+            "request_id": 2,
+            "prompt_tokens": 36701,
+            "completion_tokens": 96,
+            "cached_tokens": 36352,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          },
+          {
+            "type": "usage",
+            "round": 3,
+            "turn_id": 1,
+            "request_id": 3,
+            "prompt_tokens": 36848,
+            "completion_tokens": 96,
+            "cached_tokens": 36608,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 13374,
+            "rounds": 3,
+            "tool_calls": 0,
+            "total_tokens": 110459,
+            "prompt_tokens": 110171,
+            "completion_tokens": 288,
+            "cached_tokens": 109312,
+            "cache_hit_rate": 0.9922030298354376,
+            "ttft_ms": 4684,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      },
+      {
+        "arm": "on",
+        "round": 2,
+        "exit_code": 0,
+        "elapsed_ms": 5367,
+        "usage": [
+          {
+            "type": "usage",
+            "round": 1,
+            "turn_id": 1,
+            "request_id": 1,
+            "prompt_tokens": 36622,
+            "completion_tokens": 68,
+            "cached_tokens": 35578,
+            "elapsed_ms": 0,
+            "reasoning_elapsed_ms": 0
+          }
+        ],
+        "terminal": [
+          {
+            "type": "turn.completed",
+            "stop_reason": "Stopped",
+            "exit_code": 0,
+            "duration_ms": 4389,
+            "rounds": 1,
+            "tool_calls": 0,
+            "total_tokens": 36690,
+            "prompt_tokens": 36622,
+            "completion_tokens": 68,
+            "cached_tokens": 35578,
+            "cache_hit_rate": 0.9714925454644749,
+            "ttft_ms": 2857,
+            "snapshot_error": null
+          }
+        ],
+        "diagnostics": [],
+        "errors": []
+      }
+    ]
+  },
+  "metadata_logs": [
+    "2026-11-16T08:35:22.241903Z  INFO provider_request{request_id=1 process_id=85162}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=59489 messages=4 tools=0",
+    "2026-11-16T08:35:26.194048Z  INFO provider_request{request_id=1 process_id=85162}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=17920 cached_input_tokens=0 completion_tokens=30 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:35:26.611451Z  INFO provider_request{request_id=1 process_id=85322}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=59612 messages=4 tools=0",
+    "2026-11-16T08:35:31.245138Z  INFO provider_request{request_id=1 process_id=85322}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=17920 cached_input_tokens=0 completion_tokens=39 cache_read_reported=true cache_write_tokens=Some(17880)",
+    "2026-11-16T08:35:31.728676Z  INFO provider_request{request_id=1 process_id=85434}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=59612 messages=4 tools=0",
+    "2026-11-16T08:35:38.217358Z  INFO provider_request{request_id=1 process_id=85434}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=17920 cached_input_tokens=16980 completion_tokens=77 cache_read_reported=true cache_write_tokens=Some(900)",
+    "2026-11-16T08:35:38.622931Z  INFO provider_request{request_id=1 process_id=85577}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=59489 messages=4 tools=0",
+    "2026-11-16T08:35:43.530965Z  INFO provider_request{request_id=1 process_id=85577}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=17920 cached_input_tokens=17664 completion_tokens=65 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:35:43.978904Z  INFO provider_request{request_id=1 process_id=85703}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=59489 messages=4 tools=0",
+    "2026-11-16T08:35:47.542812Z  INFO provider_request{request_id=1 process_id=85703}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=17920 cached_input_tokens=17664 completion_tokens=42 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:35:48.071265Z  INFO provider_request{request_id=1 process_id=85829}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=59612 messages=4 tools=0",
+    "2026-11-16T08:35:52.226006Z  INFO provider_request{request_id=1 process_id=85829}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=17920 cached_input_tokens=16980 completion_tokens=38 cache_read_reported=true cache_write_tokens=Some(900)",
+    "2026-11-16T08:36:16.230856Z  INFO provider_request{request_id=1 process_id=86196}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=135157 messages=5 tools=41",
+    "2026-11-16T08:36:23.446571Z  INFO provider_request{request_id=1 process_id=86196}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36622 cached_input_tokens=0 completion_tokens=77 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:36:24.378096Z  INFO provider_request{request_id=1 process_id=86417}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=135280 messages=5 tools=41",
+    "2026-11-16T08:36:32.800875Z  INFO provider_request{request_id=1 process_id=86417}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36622 cached_input_tokens=0 completion_tokens=96 cache_read_reported=true cache_write_tokens=Some(36484)",
+    "2026-11-16T08:36:32.803879Z  INFO provider_request{request_id=2 process_id=86417}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=2 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=135600 messages=6 tools=41",
+    "2026-11-16T08:36:38.130817Z  INFO provider_request{request_id=2 process_id=86417}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36671 cached_input_tokens=36484 completion_tokens=57 cache_read_reported=true cache_write_tokens=Some(0)",
+    "2026-11-16T08:36:39.041279Z  INFO provider_request{request_id=1 process_id=86753}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=135280 messages=5 tools=41",
+    "2026-11-16T08:36:44.789651Z  INFO provider_request{request_id=1 process_id=86753}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36622 cached_input_tokens=35578 completion_tokens=35 cache_read_reported=true cache_write_tokens=Some(906)",
+    "2026-11-16T08:36:45.763583Z  INFO provider_request{request_id=1 process_id=86917}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=135157 messages=5 tools=41",
+    "2026-11-16T08:36:51.063681Z  INFO provider_request{request_id=1 process_id=86917}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36622 cached_input_tokens=36352 completion_tokens=33 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:36:52.052188Z  INFO provider_request{request_id=1 process_id=87098}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=135157 messages=5 tools=41",
+    "2026-11-16T08:36:58.594501Z  INFO provider_request{request_id=1 process_id=87098}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36622 cached_input_tokens=36352 completion_tokens=96 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:36:58.597330Z  INFO provider_request{request_id=2 process_id=87098}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=2 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=135554 messages=6 tools=41",
+    "2026-11-16T08:37:01.686760Z  INFO provider_request{request_id=2 process_id=87098}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36701 cached_input_tokens=36352 completion_tokens=96 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:37:01.689624Z  INFO provider_request{request_id=3 process_id=87098}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=3 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=false request_bytes=136303 messages=8 tools=41",
+    "2026-11-16T08:37:05.269027Z  INFO provider_request{request_id=3 process_id=87098}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36848 cached_input_tokens=36608 completion_tokens=96 cache_read_reported=true cache_write_tokens=None",
+    "2026-11-16T08:37:06.405840Z  INFO provider_request{request_id=1 process_id=87299}: atomcode_capabilities::provider::openai_compat: provider request parameters request_id=1 model=qwen4-max-preview reasoning_effort=\"omitted\" thinking_type=\"omitted\" enable_thinking=None max_tokens=Some(96) max_completion_tokens=None qwen_prompt_cache=true request_bytes=135280 messages=5 tools=41",
+    "2026-11-16T08:37:10.636692Z  INFO provider_request{request_id=1 process_id=87299}: atomcode_capabilities::provider::openai_compat: provider cache usage (final upstream-reported tokens) input_tokens=36622 cached_input_tokens=35578 completion_tokens=68 cache_read_reported=true cache_write_tokens=Some(906)"
+  ]
+}

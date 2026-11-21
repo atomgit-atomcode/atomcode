@@ -39,6 +39,14 @@ pub(crate) struct CommandReq {
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum CommandResult {
+    Fork {
+        session_id: String,
+        source_id: String,
+        warning: Option<String>,
+    },
+    Quality {
+        text: String,
+    },
     Undo {
         undone: usize,
     },
@@ -66,6 +74,8 @@ pub(crate) enum CommandResult {
         ctx_name: String,
     },
     Compact {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
         applied: bool,
         removed_messages: usize,
         before_tokens: usize,
@@ -322,6 +332,9 @@ async fn exec_native_compact(
     let coding_cfg = crate::kernel_runtime::coding_config_from_runtime(
         &crate::live_api::chat_runtime_config(&config, &resolved, working_dir, telemetry),
     );
+    let stub_recent_budget = coding_cfg
+        .compact_stub_recent_budget
+        .map(|limit| limit as usize);
     let factory = crate::runtime_host::coding_provider_factory();
     let provider = tokio::task::spawn_blocking(move || factory.build(&coding_cfg, None))
         .await
@@ -332,17 +345,125 @@ async fn exec_native_compact(
         session.loaded.snapshot.messages.clone(),
         provider,
         (!arg.trim().is_empty()).then(|| arg.trim().to_string()),
+        stub_recent_budget,
     )
     .await;
     if compacted.outcome.committed {
         commit_native_compaction(session, compacted.messages, compacted.mutation)?;
     }
     Ok(CommandResult::Compact {
+        diagnostic: compacted.outcome.diagnostic_message(),
         applied: compacted.outcome.committed,
         removed_messages: compacted.outcome.removed_messages,
         before_tokens: compacted.outcome.estimated_tokens_before,
         after_tokens: compacted.outcome.estimated_tokens_after,
     })
+}
+
+async fn exec_fork(
+    working_dir: &Path,
+    project_hash: Option<&str>,
+    session_id: Option<&str>,
+    arg: &str,
+) -> anyhow::Result<CommandResult> {
+    anyhow::ensure!(arg.trim().is_empty(), "Usage: /fork");
+    let source = session_id.ok_or_else(|| anyhow::anyhow!("session_id required for fork"))?;
+    if let Ok(binding) = crate::native_live::binding() {
+        if binding.session_id == source {
+            let result = crate::native_live::fork_session(&binding)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = ?e, "session fork refused");
+                    use crate::live_hub::HubError;
+                    let message = match e {
+                        HubError::ActiveTurn => {
+                            "Finish the current task and pending interactions before forking."
+                                .to_owned()
+                        }
+                        HubError::StaleBinding
+                        | HubError::StaleEvent
+                        | HubError::RuntimeGenerationChanged { .. } => {
+                            "The current session changed. Retry /fork in the selected conversation."
+                                .to_owned()
+                        }
+                        HubError::RuntimeRejected(reason) => {
+                            format!("Could not fork the conversation: {reason}")
+                        }
+                        _ => "Cannot fork this conversation now. Reopen it and retry.".to_owned(),
+                    };
+                    anyhow::anyhow!(message)
+                })?;
+            return Ok(CommandResult::Fork {
+                session_id: result
+                    .changed
+                    .session_id
+                    .ok_or_else(|| anyhow::anyhow!("fork committed without a session identity"))?,
+                source_id: source.into(),
+                warning: result
+                    .projection_error
+                    .map(|e| { tracing::warn!(error = ?e, "fork committed but live projection failed"); "The copy was created, but the live view needs reconnecting. Reopen this conversation.".to_owned() }),
+            });
+        }
+    }
+    // A standalone stored conversation has no live owner. Acquire its source
+    // lease before copying. When another runtime holds it, explicitly branch
+    // its committed state without modifying the source or acquiring its lease.
+    let native = match load_native_command_session(working_dir, project_hash, source) {
+        Ok(native) => native,
+        Err(busy) if is_session_in_use(&busy) => {
+            return fork_held_session(working_dir, project_hash, source, busy)
+        }
+        Err(error) => return Err(error),
+    }
+    .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let (_, _lease) = native.manager.branch_native_session(
+        &native.lease,
+        &id,
+        atomcode_capabilities::session::now_ms(),
+    )?;
+    Ok(CommandResult::Fork {
+        session_id: id,
+        source_id: source.into(),
+        warning: None,
+    })
+}
+
+fn is_session_in_use(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<atomcode_capabilities::session::SessionStoreError>(),
+        Some(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+    )
+}
+
+/// Fork a session another runtime holds without taking its lease.
+///
+/// Caught mid legacy convergence (or just deleted) the copy cannot be read;
+/// that stays the familiar "in use" refusal rather than an internal error.
+fn fork_held_session(
+    working_dir: &Path,
+    project_hash: Option<&str>,
+    source: &str,
+    busy: anyhow::Error,
+) -> anyhow::Result<CommandResult> {
+    use atomcode_capabilities::session::SessionStoreError;
+    let bucket = command_project_bucket(working_dir, project_hash)?;
+    let manager = NativeSessionManager::with_root(
+        NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env())
+            .join(bucket),
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    match manager.branch_committed_session(source, &id, atomcode_capabilities::session::now_ms()) {
+        Ok(_) => Ok(CommandResult::Fork {
+            session_id: id,
+            source_id: source.into(),
+            warning: None,
+        }),
+        Err(SessionStoreError::OwnershipConflict { .. } | SessionStoreError::NotFound { .. }) => {
+            Err(busy)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn exec_undo(
@@ -856,6 +977,24 @@ pub(crate) async fn run_command(
         }
     };
     let result = match req.command.as_str() {
+        "fork" => {
+            exec_fork(
+                &working_dir,
+                req.project_hash.as_deref(),
+                req.session_id.as_deref(),
+                &req.arg,
+            )
+            .await
+        }
+        "quality" => match req.session_id {
+            Some(session) => crate::native_live::quality(session, req.arg)
+                .await
+                .map(|text| CommandResult::Quality { text })
+                .map_err(|error| {
+                    anyhow::anyhow!("Quality command requires the current live session: {error:?}")
+                }),
+            None => Err(anyhow::anyhow!("session_id required for quality")),
+        },
         "undo" => exec_undo(
             &working_dir,
             req.session_id.as_deref(),
@@ -921,6 +1060,94 @@ mod tests {
     use atomcode_capabilities::memory::MemoryStore;
     use atomcode_capabilities::session::PresentationFile;
     use atomcode_capabilities::session::{StorageOwner, TurnStat};
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn standalone_fork_keeps_the_source_even_while_another_runtime_holds_it() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("ATOMCODE_HOME", value),
+                    None => std::env::remove_var("ATOMCODE_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = NativeSessionManager::for_project(
+            project.path(),
+            &atomcode_coding::config::product_dirs_from_env(),
+        );
+        let lease = manager.acquire_lease("source").unwrap();
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("original context"),
+        ]);
+        let mut meta = NativeSessionMeta::new("source", project.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        meta.message_count = 1;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        manager.open_as_events(&lease).unwrap();
+        let original = manager.load_events("source").unwrap();
+        // Held by another runtime (a TUI in another terminal): copied from what
+        // it committed, without taking the lease from it.
+        let held = exec_fork(project.path(), None, Some("source"), "")
+            .await
+            .unwrap();
+        let CommandResult::Fork {
+            session_id: held_copy,
+            ..
+        } = held
+        else {
+            panic!("expected fork");
+        };
+        assert_eq!(manager.load_events(&held_copy).unwrap(), original);
+        let copied_meta = manager.load_native_session(&held_copy).unwrap().meta;
+        assert!(copied_meta.fork_info.is_none());
+        assert!(copied_meta.name.ends_with(" (fork)"));
+        // A later automatic fork must not collect the explicit copy, even
+        // before the browser sends its first message or acquires a lease.
+        let (_, _automatic) = manager
+            .fork_native_session("source", "automatic", 50)
+            .unwrap();
+        assert_eq!(manager.load_events(&held_copy).unwrap(), original);
+        assert!(
+            manager.lease_is_held("source").unwrap(),
+            "the holder keeps its session"
+        );
+        assert_eq!(manager.load_events("source").unwrap(), original);
+        drop(lease);
+        let result = exec_fork(project.path(), None, Some("source"), "")
+            .await
+            .unwrap();
+        let CommandResult::Fork {
+            session_id,
+            source_id,
+            ..
+        } = result
+        else {
+            panic!("expected fork");
+        };
+        assert_eq!(source_id, "source");
+        assert_ne!(session_id, source_id);
+        assert_eq!(manager.load_events("source").unwrap(), original);
+        assert_eq!(manager.load_events(&session_id).unwrap(), original);
+        assert_eq!(manager.list().len(), 4);
+        assert!(
+            manager.acquire_lease(&session_id).is_ok(),
+            "standalone copies have no live owner until opened"
+        );
+    }
 
     #[test]
     fn context_file_status_shows_instruction_and_memory_paths() {

@@ -8,6 +8,9 @@
 # ---- 默认 provider（必须匹配下方某个 [providers.*] 的键名）----
 default_provider = "deepseek"
 
+# 大+小模型协作配置见文件末尾及 docs/mixed-models.md。
+# default_model = "big"  # 可选：使用末尾示例时，以大模型为主会话
+
 # ---- 自动更新（顶层键，必须在任何 [表] 之前）----
 # auto_update: 每小时轮询新版本并预暂存，下次启动时应用（/upgrade 仍可手动）
 auto_update = true
@@ -54,6 +57,9 @@ type = "openai"
 api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
+# Local budget, not measured server capacity. For auto routes choose a conservative
+# value for eligible models; discovery suggestions do not pin the next route.
+# See docs/context-window-budget.md. Zero is not an auto-discovery sentinel.
 context_window = 64000
 # Total attempts including the first request. Default: 3; set 1 to disable retries.
 # retry_max_attempts = 5
@@ -220,6 +226,7 @@ mode = "follow_system"
 #   {"action":"modify","args":{...}}, or Claude Code's
 #   {"hookSpecificOutput":{"permissionDecision":"allow|deny|ask"}}; exit code 2 with a
 #   reason also blocks.
+#   With "required_approval": true, only exit 0 and explicit allow authorize a tool.
 # UserPromptSubmit can block via {"decision":"block","reason":"..."} or add context via
 #   {"hookSpecificOutput":{"additionalContext":"..."}}.
 #
@@ -253,6 +260,7 @@ mode = "follow_system"
 # 内嵌 code_review 在父回合等待期间有自己的默认保险（200 轮/900 秒），均可覆盖，0 为关闭：
 #   ATOMCODE_REVIEW_MAX_ROUNDS=200
 #   ATOMCODE_REVIEW_MAX_DURATION_SECS=900
+# 约 5 分钟开始软提醒收尾，不会因此终止；deep 与 verify 共用同一时间预算。
 # 工具返回的截断阈值见下方 [tools.output]；环境变量优先于配置文件：
 #   ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES=204800
 # open_file（打开产物/文件）在桌面端用哪个程序打开。不设置时按平台默认：
@@ -262,7 +270,16 @@ mode = "follow_system"
 #   ATOMCODE_OPEN_COMMAND=code -r
 #   ATOMCODE_OPEN_COMMAND="C:\Program Files\Viewer\view.exe" --new
 [coding]
+# true 保留默认评审指导；false 明确要求仅在用户提出评审请求时调用 code_review。
+# /config 中的“任务完成前自动评审”可修改此项；显式 /review 和其他工具不受影响。
+# ATOMCODE_AUTO_REVIEW=0/false/off 关闭，1/true/on 开启；--no-review 优先级最高。
+# 这是模型行为指导，并非禁止模型调用工具的执行权限开关。
+auto_review = true
 max_rounds = 0
+# ATI 只读架构证据工具，默认关闭；启用后仅在调用时扫描，不自动修改代码或写记忆。
+# /config 搜索 ATI/架构 可切换并重载；手改文件后需重载或重启 runtime。
+# 使用与限制见 docs/architectural-topology.md。
+architecture_topology = false
 
 # ---- Plan / Build 模式模型绑定（可选）----
 # 让 /plan 与 /build 各自使用不同的模型与思考强度；整段留空表示不绑定，行为与以前一致。
@@ -353,9 +370,31 @@ eager = "auto"
 # 是否挂载由前端决定；环境变量 `ATOMCODE_SUBAGENT=0` 可以关掉。没有配置键控制开关。
 # max_rounds 可由 ATOMCODE_SUBAGENT_MAX_ROUNDS 覆盖。
 # （旧文件里的 enabled / initial_turns / max_turns / timeout_secs 从来没有生效过，已移除；留着也照常解析。）
+# capable_model 写在 [models.<id>]（或旧 [providers.<id>]）中，不写在 [subagent]。
+# task 不传 model 继承主会话；排名影响可委派列表，不自动判断子任务复杂度。
+# team 的 simple 角色未指定 model 时可使用同账号的最低排名辅助模型。
+# 跨账号需用户目录 agents/ 角色显式指定 model；项目角色仍受账号边界约束。
+# 详见 docs/mixed-models.md。
 [subagent]
 max_concurrent = 3      # 并发子 agent 上限（下限 1）
 max_rounds = 200        # 单个子任务模型轮次高水位（0=不设上限）
+
+# 可选的只读外部子代理。使用各 CLI 自己已配置的登录和模型。
+# Grok Build 的只读沙箱支持 macOS / Linux。
+# [[subagent.external]]
+# name = "grok"
+# kind = "grok"
+# permission = "read-only"
+# timeout_secs = 600
+#
+# [[subagent.external]]
+# name = "opencode"
+# kind = "opencode"
+# permission = "read-only"
+# model = "provider/model"  # 可省略
+# timeout_secs = 600
+#
+# Grok Build 的单次任务文本经命令行参数传递，避免在委派文本中放入凭据。
 
 [team]
 max_members = 6         # 每个 lead 最多保留的成员数；空闲成员也占名额，stop 后释放
@@ -385,9 +424,10 @@ auto_update_marketplaces = true
 # =============================================================================
 [ui]
 theme = "auto"
-# 恢复会话时首次布局的历史行预算，更早历史随向上滚动加载。
-# 省略时按终端自动选择；0 表示完整布局，单个块可能超过预算。
-# 仅影响界面布局，不截断运行时会话。
+# 恢复会话先取近期显示历史，向上滚动补载旧页（见 docs/display-history.md）。
+# 这里是首次布局的历史行预算，不是分页回合数；省略时按终端自动选择。
+# 0 表示完整历史订阅和布局，单个块可能超过预算。
+# 仅影响界面，不截断运行时会话；truncate_resumed_history = false 也禁用分页。
 # history_replay_max_rows = 5000
 
 # Custom gateway authentication (optional account-level HTTP headers):
@@ -402,6 +442,9 @@ theme = "auto"
 # blank to preserve it, or delete its row to remove the header.
 
 # Autonomous goals: bounded recovery while this runtime remains alive.
+# /loop quota waits share these provider-recovery limits (not the evaluator tier).
+# Known quota resets are verified before resuming the interrupted iteration;
+# refreshing the plan can bring that verification forward without resetting limits.
 # Existing goal round/time caps still apply. 0 attempts disables that retry tier.
 # Recovery does not bypass permissions, quota limits, or uncertain persistence.
 # The time budget controls scheduling; an already running model request may finish.
@@ -413,7 +456,7 @@ theme = "auto"
 # evaluator_max_attempts = 3
 # evaluator_timeout_secs = 600
 
-# Optional low-frequency goal recovery after the short retry budget is exhausted.
+# Optional low-frequency goal recovery / long loop quota waits after short recovery.
 # Omit this table to keep the default 30-minute recovery window.
 # This may incur further model costs. Goal round/time caps still apply.
 # [goal.recovery.long_wait]
@@ -436,3 +479,57 @@ theme = "auto"
 [tools.atomgit]
 # enabled = true
 # tool_search = true
+
+# ---- DAP 调试（默认开启，按需发现本地 Python/debugpy 或 LLDB）----
+# 无需填写本节即可使用已安装的适配器；缺依赖时提示安装，不会自动下载。
+# 完整说明见 docs/dap-debugging.md。所有 debug 操作沿用执行审批。
+# 设置 enabled = false 可关闭；下方适配器配置用于覆盖自动发现。
+# [dap]
+# enabled = true
+# [dap.adapters.python]
+# command = "/path/to/venv/bin/python"
+# args = ["-m", "debugpy.adapter"]
+
+# =============================================================================
+# 可选：大+小模型协作（取消下面注释前，先替换连接信息和真实模型名）
+# 顶层 default_model = "big" 放在文件开头；勿与已有同名表重复。
+# 同账号显式委派和用户角色跨账号示例见 docs/mixed-models.md。
+# =============================================================================
+# [provider_accounts.mixed]
+# provider = "openai"
+# base_url = "https://your-gateway.example/v1"
+# api_key = "${MY_GATEWAY_API_KEY}"
+# [models.big]
+# account = "mixed"
+# model = "your-capable-model"
+# context_window = 128000
+# capable_model = 5
+# [models.small]
+# account = "mixed"
+# model = "your-fast-model"
+# context_window = 64000
+# capable_model = 0
+
+# =============================================================================
+# Context compaction (optional)
+# =============================================================================
+# [compaction]
+# token_limit = 200000       # Optional positive prompt-token threshold for earlier summarization.
+# stub_recent_budget = 100000 # Optional positive recent-history keep budget for tool-output stubs.
+# Both are omitted by default and apply after the agent is rebuilt.
+# stub_recent_budget only adjusts the retained span when compaction is triggered;
+# it does not trigger compaction earlier or cap total prompt tokens. The gentle
+# stub policy keeps the active user turn and exempts read_file results.
+# With a known window it cannot raise the window-relative keep budget; when
+# the window is unknown, a configured value is capped at 256000 tokens. Summary/overflow policies remain unchanged.
+# Rewriting old output may invalidate provider prompt-cache entries; savings
+# depend on the model, cache behavior, and workload.
+
+# 网页搜索：auto 为默认，限流/认证/网络/服务或协议故障时有界切换。
+# 显式选择会固定后端，不再自动切换；/config 也可修改此选项。
+[web_search]
+provider = "auto" # auto | exa | parallel | tavily | firecrawl | tinyfish | duckduckgo
+auto_default_migrated = true # 保留此标记：旧配置的 exa 仅自动迁移一次，之后尊重用户选择。
+# api_key = "..." # 仅 Exa；优先使用 EXA_API_KEY，勿将真实 Key 提交到仓库。
+# 其他后端可选环境变量：PARALLEL_API_KEY、TAVILY_API_KEY、FIRECRAWL_API_KEY、TINYFISH_API_KEY。
+# 未提供 Key 时使用上游 keyless 接口，仍受上游匿名额度/速率限制。

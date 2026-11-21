@@ -44,9 +44,14 @@ pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;
 pub mod credential_bash_gate;
+pub mod debug;
 pub mod edit;
 pub mod encoding;
+pub mod git_index;
+mod git_status;
 pub mod glob;
+#[cfg(feature = "grape")]
+pub mod grape;
 pub mod grep;
 pub mod list;
 /// Model-facing memory tool (remember / forget / list). Opt-in `memory` feature.
@@ -168,6 +173,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
             "list_directory",
             "open_file",
             "bash",
+            "git_status",
             "grep",
             "glob",
             "search_replace",
@@ -187,6 +193,7 @@ pub fn coding_tool_names() -> &'static [&'static str] {
             "list_directory",
             "open_file",
             "bash",
+            "git_status",
             "grep",
             "glob",
             "search_replace",
@@ -223,6 +230,7 @@ pub fn register_coding_tools_with_vision(
     reg.register(Arc::new(EditFileTool::default()));
     reg.register(Arc::new(ListDirTool::new(dirs.clone())));
     reg.register(Arc::new(OpenFileTool::default()));
+    reg.register(Arc::new(git_status::GitStatusTool));
     let sensitive = sensitive_path::SensitivePaths::of(dirs);
     reg.register(Arc::new(BashTool::new(sensitive.clone())));
     // Background job path for long-running commands (start/poll/kill) — the reference-
@@ -746,6 +754,7 @@ mod tests {
         "list_directory",
         "open_file",
         "bash",
+        "git_status",
         "grep",
         "glob",
         "search_replace",
@@ -885,8 +894,15 @@ mod tests {
     async fn re_registering_read_file_overwrites_its_vision_flag() {
         use atomcode_kernel::tool::{ProgressSink, ToolContext};
         let d = tempfile::tempdir().unwrap();
-        // JPEG-ish blob with a NUL so `looks_binary` flags it.
-        std::fs::write(d.path().join("c.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00]).unwrap();
+        // A real (tiny) JPEG: one that does not decode is never attached.
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        std::fs::write(d.path().join("c.jpg"), jpeg).unwrap();
         let ctx = ToolContext {
             working_dir: d.path().to_path_buf(),
             cancel: Default::default(),

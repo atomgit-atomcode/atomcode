@@ -103,6 +103,10 @@ pub struct McpServerConfig {
     /// Per-tool auto-approve allowlist (the `autoApprove` array): bare tool names
     /// (e.g. `["query", "search"]`) whose calls skip the approval prompt.
     pub auto_approve: Vec<String>,
+    /// Exact raw MCP tool names permitted for discovery and execution. None permits all; empty denies all.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Exact positive versions required in every initialize response, including reconnect.
+    pub required_experimental_capabilities: BTreeMap<String, u64>,
 }
 
 /// Configuration source for a server.
@@ -165,6 +169,14 @@ struct McpServerEntry {
     /// `autoApprove: ["query", ...]` ⇒ per-tool auto-approve allowlist.
     #[serde(default, rename = "autoApprove", alias = "auto_approve")]
     auto_approve: Vec<String>,
+    #[serde(default, rename = "allowedTools", alias = "allowed_tools")]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "requiredExperimentalCapabilities",
+        alias = "required_experimental_capabilities"
+    )]
+    required_experimental_capabilities: BTreeMap<String, u64>,
 }
 
 use serde::Deserialize;
@@ -624,6 +636,7 @@ fn servers_in(
 }
 
 fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServerConfig> {
+    super::requirements::validate(&entry.required_experimental_capabilities)?;
     let trust = entry.trust;
     let disabled = entry.disabled;
     let transport = if let Some(command) = entry.command {
@@ -674,6 +687,8 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         source: McpConfigSource::Project, // default; overwritten by load_config_file
         trust,
         auto_approve: entry.auto_approve,
+        allowed_tools: entry.allowed_tools,
+        required_experimental_capabilities: entry.required_experimental_capabilities,
     })
 }
 
@@ -728,6 +743,42 @@ fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Valu
         }
     }
     out
+}
+
+/// Add an optional HTTP server without enabling it, replacing an existing entry,
+/// adding credentials, or changing any approval grants. Used by onboarding hosts.
+pub fn add_disabled_http_server_into_text(
+    existing: Option<&str>,
+    name: &str,
+    url: &str,
+) -> Result<String> {
+    if name.is_empty() || url::Url::parse(url)?.scheme() != "https" {
+        bail!("a server name and an HTTPS URL are required");
+    }
+    let mut root = match existing {
+        Some(text) => json_for_rewrite(text, &GIVEN_TEXT)?,
+        None => json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP config root must be a JSON object"))?;
+    for key in ["servers", "mcpServers"] {
+        if obj.get(key).is_some_and(|v| !v.is_object()) {
+            bail!("{key} must be a JSON object");
+        }
+    }
+    let mut servers = collect_merged_mcp_server_maps(obj);
+    if servers.contains_key(name) {
+        bail!("MCP server '{name}' already exists; its configuration was preserved");
+    }
+    servers.insert(name.to_string(), json!({"url":url,"disabled":true}));
+    obj.insert("mcpServers".into(), Value::Object(servers));
+    obj.remove("servers");
+    let text = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    // Validate all preserved entries through the production reader, after
+    // normalizing legacy/current maps the same way existing editors do.
+    parse_mcp_servers(&text, McpConfigSource::Project)?;
+    Ok(text)
 }
 
 /// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `$ATOMCODE_HOME/mcp.json`).
@@ -912,48 +963,36 @@ fn with_http_oauth_server(
 /// Supports `${VAR}` and `${VAR:-default}` syntax.
 fn expand_env_vars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
+    let mut rest = s;
 
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            i += 2; // skip ${
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_brace = &rest[start + 2..];
+        let Some(end) = after_brace.find('}') else {
+            // No closing brace: keep the literal text and stop scanning.
+            result.push_str("${");
+            rest = after_brace;
+            break;
+        };
 
-            let mut var_name = String::new();
-            let mut default = String::new();
-            let mut has_default = false;
-
-            while i < bytes.len() && bytes[i] != b'}' {
-                if bytes[i] == b':' && !has_default && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    i += 2; // skip :-
-                    has_default = true;
-                    continue;
+        let inner = &after_brace[..end];
+        let (var_name, default) = match inner.find(":-") {
+            Some(sep) => (&inner[..sep], Some(&inner[sep + 2..])),
+            None => (inner, None),
+        };
+        match std::env::var(var_name) {
+            Ok(value) => result.push_str(&value),
+            // 未命中：默认值直接 push 切片，不再为它 clone 一次 String。
+            Err(_) => {
+                if let Some(d) = default {
+                    result.push_str(d);
                 }
-                if has_default {
-                    default.push(bytes[i] as char);
-                } else {
-                    var_name.push(bytes[i] as char);
-                }
-                i += 1;
             }
-            if i < bytes.len() {
-                i += 1; // skip }
-            }
-
-            let value = std::env::var(&var_name).unwrap_or_else(|_| {
-                if has_default {
-                    default
-                } else {
-                    String::new()
-                }
-            });
-            result.push_str(&value);
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
         }
+        rest = &after_brace[end + 1..];
     }
 
+    result.push_str(rest);
     result
 }
 
@@ -1174,6 +1213,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_simple() {
         std::env::set_var("TEST_VAR", "test_value");
         let result = expand_env_vars("${TEST_VAR}");
@@ -1181,6 +1221,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_with_default() {
         std::env::remove_var("NONEXISTENT_VAR");
         let result = expand_env_vars("${NONEXISTENT_VAR:-default_value}");
@@ -1188,6 +1229,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_existing_with_default() {
         std::env::set_var("EXISTING_VAR", "actual");
         let result = expand_env_vars("${EXISTING_VAR:-unused}");
@@ -1195,6 +1237,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_no_var() {
         std::env::remove_var("MISSING_VAR");
         let result = expand_env_vars("${MISSING_VAR}");
@@ -1202,11 +1245,65 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_mixed() {
         std::env::set_var("VAR1", "a");
         std::env::set_var("VAR2", "b");
         let result = expand_env_vars("prefix_${VAR1}_middle_${VAR2}_suffix");
         assert_eq!(result, "prefix_a_middle_b_suffix");
+    }
+
+    #[test]
+    fn test_expand_env_vars_unclosed_brace_is_kept_verbatim() {
+        // 无 `}` 的 `${` 不得把后面的文本当变量名展开成空串，必须按字面保留。
+        assert_eq!(expand_env_vars("${UNCLOSED"), "${UNCLOSED");
+    }
+
+    #[test]
+    fn test_expand_env_vars_preserves_utf8_outside_braces() {
+        // 旧实现逐字节 `bytes[i] as char`，把非 ASCII 路径改写成 Latin-1 乱码。
+        // 这条断言钉住「${} 之外的内容逐字节原样保留」。
+        let cjk_path = "/tmp/中文 目录/with space/server.py";
+        assert_eq!(expand_env_vars(cjk_path), cjk_path);
+    }
+
+    #[test]
+    #[serial_test::serial(expand_test_var)]
+    fn test_expand_env_vars_default_value_keeps_utf8() {
+        // `${VAR:-default}` 会先查 VAR：用专用变量并先删除，保证无论外部
+        // 环境如何都走默认值；默认值本身含非 ASCII 时必须逐字节保留。
+        struct RemoveEnvOnDrop;
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var("EXPAND_UTF8_MISSING_VAR");
+            }
+        }
+        std::env::remove_var("EXPAND_UTF8_MISSING_VAR");
+        let _env_guard = RemoveEnvOnDrop;
+        assert_eq!(
+            expand_env_vars("${EXPAND_UTF8_MISSING_VAR:-/tmp/中文 目录/server.py}"),
+            "/tmp/中文 目录/server.py"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(expand_test_var)]
+    fn test_expand_env_vars_expansion_before_unclosed_brace() {
+        // 使用专用变量名，并与其他环境变量展开测试共享串行组；
+        // Drop 清理保证断言失败后也不遗留本测试设置的值。
+        struct RemoveEnvOnDrop;
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var("EXPAND_UNCLOSED_VAR");
+            }
+        }
+        std::env::set_var("EXPAND_UNCLOSED_VAR", "test_value");
+        let _env_guard = RemoveEnvOnDrop;
+        // 前段正常展开，后段未闭合的 `${` 按 break 路径由兜底拼接保留。
+        assert_eq!(
+            expand_env_vars("${EXPAND_UNCLOSED_VAR}tail${D"),
+            "test_valuetail${D"
+        );
     }
 
     #[test]
@@ -2025,5 +2122,93 @@ mod hosted_tests {
         assert!(tokens.load_token("s0").is_err());
         assert!(tokens.save_token("s0", token("x")).is_err());
         assert_eq!(unreadable.raw().as_deref(), Some("sealed with another key"));
+    }
+}
+
+#[cfg(test)]
+mod recommendation_tests {
+    use super::*;
+
+    #[test]
+    fn optional_http_add_preserves_both_maps_and_never_grants_execution() {
+        let original = r#"{"servers":{"legacy":{"command":"a","trust":true}},"mcpServers":{"modern":{"url":"https://example.com","headers":{"X-Key":"kept"}}},"other":7}"#;
+        let text = add_disabled_http_server_into_text(
+            Some(original),
+            "docs",
+            "https://mcp.context7.com/mcp",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["other"], 7);
+        assert_eq!(value["mcpServers"]["legacy"]["trust"], true);
+        assert_eq!(value["mcpServers"]["modern"]["headers"]["X-Key"], "kept");
+        let parsed = parse_mcp_servers(&text, McpConfigSource::Project).unwrap();
+        let added = parsed.iter().find(|s| s.name == "docs").unwrap();
+        assert!(added.disabled);
+        assert!(!added.trust);
+        assert!(added.auto_approve.is_empty());
+        assert!(
+            matches!(&added.config, McpTransportConfig::Http { headers, auth: None, .. } if headers.is_empty())
+        );
+        assert!(
+            add_disabled_http_server_into_text(Some(&text), "docs", "https://other.com").is_err()
+        );
+    }
+
+    #[test]
+    fn optional_http_add_refuses_invalid_input_instead_of_replacing_it() {
+        for invalid in [
+            "bad json",
+            "[]",
+            r#"{"mcpServers":null}"#,
+            r#"{"servers":[]}"#,
+            r#"{"servers":{"broken":{"args":[]}}}"#,
+        ] {
+            assert!(
+                add_disabled_http_server_into_text(Some(invalid), "docs", "https://example.com")
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(add_disabled_http_server_into_text(None, "docs", "http://example.com").is_err());
+    }
+}
+
+#[cfg(test)]
+mod required_capabilities_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn requirements_survive_configuration_edits_and_reject_malformed_versions() {
+        let source = json!({"mcpServers":{"strict":{"command":"test-server",
+            "requiredExperimentalCapabilities":{"test/strict":1}}}})
+        .to_string();
+        let edited = set_mcp_server_disabled_in_text(&source, "strict", true).unwrap();
+        let config = parse_mcp_servers(&edited, McpConfigSource::User)
+            .unwrap()
+            .remove(0);
+        assert!(config.disabled);
+        assert_eq!(
+            config.required_experimental_capabilities,
+            BTreeMap::from([("test/strict".into(), 1)])
+        );
+        let legacy = parse_mcp_servers(
+            r#"{"mcpServers":{"legacy":{"command":"test"}}}"#,
+            McpConfigSource::User,
+        )
+        .unwrap();
+        assert!(legacy[0].required_experimental_capabilities.is_empty());
+        for bad in [
+            json!(null),
+            json!([]),
+            json!({"test/strict":true}),
+            json!({"test/strict":"1"}),
+            json!({"test/strict":1.0}),
+            json!({"test/strict":0}),
+        ] {
+            let value = json!({"mcpServers":{"strict":{"command":"test", "requiredExperimentalCapabilities":bad}}});
+            assert!(parse_mcp_servers(&value.to_string(), McpConfigSource::User).is_err());
+        }
     }
 }

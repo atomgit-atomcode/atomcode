@@ -655,6 +655,9 @@ mod tests {
                         json!({"capabilities":{"documentSymbolProvider":true}})
                     }
                     Some("textDocument/didOpen") => {
+                        // The real Cangjie server returns null for outlines if this
+                        // is "cj" or "cangjie", even though hover still works.
+                        assert_eq!(message["params"]["textDocument"]["languageId"], "Cangjie");
                         opened += 1;
                         continue;
                     }

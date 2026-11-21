@@ -826,13 +826,7 @@ fn current_todos(
                     status: parse_todo_status(&item.status),
                 })
                 .collect();
-            let sources = if messages.iter().any(Message::is_user_interruption) {
-                // A source belongs to a plan, not to cached tasks revived after
-                // the person cancelled it. A later full plan may explicitly relink.
-                Vec::new()
-            } else {
-                sidecar.source_seqs
-            };
+            let sources = sidecar.source_seqs;
             (
                 items,
                 sidecar.through,
@@ -860,6 +854,30 @@ fn current_todos(
         items,
         through: last.max(through),
     })
+}
+
+/// Read-only recap projection. Preserve unknown/unavailable instead of inventing
+/// an empty list; a retained full plan does not need the sidecar at all.
+pub(crate) fn recap_todos(
+    messages: &[Message],
+    session: Option<(&SessionManager, &str)>,
+) -> crate::recap::TaskState {
+    let mut unavailable = false;
+    let current = current_todos(messages, || {
+        let (manager, id) = session?;
+        match manager.read_todo_sidecar(id) {
+            Ok(sidecar) => sidecar,
+            Err(_) => {
+                unavailable = true;
+                None
+            }
+        }
+    });
+    if unavailable {
+        Err(())
+    } else {
+        Ok(current.map(|current| current.items))
+    }
 }
 
 /// Informational resume display, using the same fold as the live task list.
@@ -972,6 +990,55 @@ mod tests {
                 arguments: args.into(),
             }],
         )
+    }
+
+    #[tokio::test]
+    async fn adaptive_receipts_preserve_the_full_plan_reminder_and_task_identity() {
+        use atomcode_capabilities::tools::{
+            todo::{parse_todos, render_todos_numbered},
+            TodoTool,
+        };
+        use atomcode_kernel::tool::{Tool, ToolContext};
+        for count in [1, 20] {
+            let tasks: Vec<_> = (1..=count)
+                .map(|id| {
+                    serde_json::json!({
+                        "content":format!("verify parser behavior {id}"), "status":"pending"
+                    })
+                })
+                .collect();
+            let args = serde_json::json!({"todos":tasks}).to_string();
+            let tool_ctx = ToolContext {
+                working_dir: "/fixture".into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: Default::default(),
+                requester: None,
+            };
+            let result = TodoTool::new().execute(&args, &tool_ctx).await;
+            assert!(!result.is_error);
+            assert_eq!(result.content.starts_with("Plan updated:"), count == 20);
+            let legacy = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+            let mut reminders = Vec::new();
+            for receipt in [legacy, result.content] {
+                let mut messages = vec![
+                    Message::user("implement the complete plan"),
+                    todowrite_msg(&args),
+                    Message::tool_result("1", receipt, false),
+                ];
+                TodoHook::default()
+                    .pre_request(&mut messages, &TurnCtx::default())
+                    .await;
+                let reminder = messages.last().unwrap().text.clone();
+                for id in 1..=count {
+                    assert!(reminder.contains(&format!("{id}. verify parser behavior {id}")));
+                }
+                reminders.push(reminder);
+            }
+            assert_eq!(
+                reminders[0], reminders[1],
+                "the request's authoritative plan must not depend on receipt wording"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1322,10 +1389,8 @@ mod tests {
         cancelled_cache.source_seqs = vec![7, 12];
         let cancelled =
             current_todos(&[Message::user_interruption()], || Some(cancelled_cache)).unwrap();
-        assert!(
-            cancelled.source_seqs.is_empty(),
-            "a cancelled batch cannot be revived from its cache"
-        );
+        assert_eq!(cancelled.source_seqs, vec![7, 12]);
+        assert_eq!(cancelled.items[0].status, TodoStatus::InProgress);
         let replaced = current_todos(
             &[todowrite_msg(
                 r#"{"todos":[{"content":"new work","status":"pending"}]}"#,
@@ -1964,6 +2029,7 @@ mod tests {
                 .collect(),
             message_count: 40,
             through,
+            baseline: None,
         }
     }
 

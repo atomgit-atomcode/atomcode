@@ -84,6 +84,7 @@ enum Row<'a> {
     Rule,
     /// 面板自己的表头:列表层是标题与数量,详情层是这一台的名字。
     Header,
+    SessionSwitch,
     /// 列表层:一个来源的分组标题——它不是一行可以做点什么的东西,是一条分界。
     Group(String),
     /// 列表层:过滤后的第 `at` 个服务器。
@@ -147,6 +148,7 @@ fn layout<'a>(view: &'a McpView, panel: &'a Panel, h: usize, w: usize) -> Vec<Ro
     }
     match panel.level {
         Level::List => {
+            rows.push(Row::SessionSwitch);
             rows.push(Row::BoxTop);
             rows.push(Row::Search);
             rows.push(Row::BoxBottom);
@@ -252,6 +254,29 @@ fn draw(view: &McpView, panel: &Panel, row: Row<'_>, w: usize, caps: Caps) -> Li
         Row::Group(label) => Line::styled(
             width::take_width(&format!("  {label}"), w),
             theme::fg(Role::Muted).bold(),
+        ),
+        Row::SessionSwitch => Line::styled(
+            width::take_width(
+                &format!(
+                    "  {}  [Ctrl+S {}]",
+                    t(if view.paused {
+                        Msg::McpSessionPaused
+                    } else {
+                        Msg::McpSessionEnabled
+                    }),
+                    t(if view.paused {
+                        Msg::McpResumeAll
+                    } else {
+                        Msg::McpPauseAll
+                    })
+                ),
+                w,
+            ),
+            theme::fg(if view.paused {
+                Role::Warning
+            } else {
+                Role::Muted
+            }),
         ),
         Row::Server(at, server) => server_line(server, at == panel.cursor, w, caps),
         Row::BoxTop => box_edge(w, caps, true),
@@ -456,11 +481,16 @@ fn address_of(transport: &Transport) -> String {
 pub struct Geometry {
     rows: Vec<Option<usize>>,
     header: Option<usize>,
+    session_switch: Option<usize>,
 }
 
 impl Geometry {
     pub fn row_at(&self, row: usize) -> Option<usize> {
         self.rows.get(row).copied().flatten()
+    }
+
+    pub fn is_session_switch(&self, row: usize) -> bool {
+        self.session_switch == Some(row)
     }
 
     pub fn is_header(&self, row: usize) -> bool {
@@ -473,11 +503,15 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
         return Geometry {
             rows: Vec::new(),
             header: None,
+            session_switch: None,
         };
     };
     let rows = layout(&moment.mcp, panel, vp.rect.h as usize, vp.rect.w as usize);
     Geometry {
         header: rows.iter().position(|row| matches!(row, Row::Header)),
+        session_switch: rows
+            .iter()
+            .position(|row| matches!(row, Row::SessionSwitch)),
         rows: rows
             .into_iter()
             .map(|row| match row {
@@ -550,6 +584,33 @@ mod tests {
     /// 一屏画出来的东西,一行一句。断言对着它看。
     fn text_of(lines: &[Line]) -> Vec<String> {
         lines.iter().map(line_text).collect()
+    }
+
+    #[test]
+    fn session_switch_is_visible_and_uses_its_own_mouse_target() {
+        for paused in [false, true] {
+            let view = McpView::new(vec![row("server", "global", McpState::Connected, 1)])
+                .with_paused(paused);
+            let panel = Panel::new();
+            let moment = Moment {
+                mcp: view.clone(),
+                mcp_panel: Some(panel.clone()),
+                ..Moment::default()
+            };
+            let vp = Viewport::new(Rect::sized(100, 24), &moment);
+            let lines = Mcp::render(&State_, &vp);
+            let at = lines
+                .iter()
+                .position(|line| line.plain().contains("Ctrl+S"))
+                .unwrap();
+            assert!(geometry(&moment, &vp).is_session_switch(at));
+            assert_eq!(geometry(&moment, &vp).row_at(at), None);
+            assert!(lines[at].plain().contains(&*t(if paused {
+                Msg::McpResumeAll
+            } else {
+                Msg::McpPauseAll
+            })));
+        }
     }
 
     /// A note longer than the panel is wrapped, not clipped.

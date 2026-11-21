@@ -183,6 +183,7 @@ impl Plugin for BashWorldToolPlugin {
             .await,
         )?;
         let bash = BashTool::with_world(shell.clone(), sensitive.clone())
+            .with_execution_observer(super::tools::shell_execution_observer(ctx))
             .with_output_preview_provider(provider.clone());
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
@@ -212,8 +213,9 @@ impl Plugin for BashWorldToolPlugin {
                 "Shell commands run through: {}. Quote paths that contain spaces. \
                  Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
                  `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. \
-                 Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
-                 (collects output until exit, status change or timeout), instead of shell sleep or duplicate builds. Do not \
+                 Long builds/tests also use `bash_start`, waited for as the background \
+                 completion policy says (unless the host says it resumes you, with `bash_poll` \
+                 until the job ends), instead of shell sleep or duplicate builds. Do not \
                  background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
                  finishes. Preserve the original build/test exit status; output-filtering or \
                  status-printing wrappers can hide failures.",

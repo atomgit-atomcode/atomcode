@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::plugins::capabilities::register_review_command;
+use atomcode_harness::plugins::capabilities::register_review_command_inline;
 use atomcode_harness::plugins::tools::{contribute_prompt, mount};
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
@@ -29,6 +29,9 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 
 #[derive(Debug, Deserialize, Default)]
 struct ReviewRow {
+    /// None keeps the historical automatic pre-handoff guidance.
+    #[serde(default)]
+    auto_review: Option<bool>,
     /// What the child reviewer is told it is running.
     ///
     /// Config rather than "just read the seam", and that is the whole design of
@@ -106,26 +109,31 @@ impl Plugin for ReviewToolPlugin {
         // "review what I changed" is a thing a person asks for directly, and
         // asking the model to call a tool on their behalf spends a turn to
         // reach the same reviewer.
-        register_review_command(ctx, tool)?;
+        register_review_command_inline(ctx, tool)?;
         // This row's guidance for this row's tool. It lived in the coding persona as
         // `## CODE REVIEW`, which described the tool on BOTH assemblies — and stayed describing
         // it after this row was patched out of the tree.
-        contribute_prompt(
-            ctx,
-            "tool-code-review",
-            58,
+        let policy = if row.auto_review == Some(false) {
+            MANUAL_REVIEW_POLICY
+        } else {
+            "Use it before handing work back — not instead of running the tests."
+        };
+        let guidance = format!(
             "`code_review` runs a reviewer over the current changes and reports what it \
-             finds. It reads; it never edits. Use it before handing work back — not \
-             instead of running the tests. When the person asks to review code, a diff, staged \
+             finds. It reads; it never edits. {policy} When the person asks to review code, a diff, staged \
              changes, a commit, or a branch range, call it before writing the review and pass \
              the requested scope and path filters straight to it rather than pre-reading the \
              diff with ordinary read/search tools, which is what the scoped reviewer is for. It \
              may report findings you did not find; weigh them. Do not claim it fixed files or \
-             posted comments — it does neither.",
+             posted comments — it does neither."
         );
+        contribute_prompt(ctx, "tool-code-review", 58, &guidance);
         Ok(())
     }
 }
+
+/// Shared policy for the standalone and production host-tool mount paths.
+pub(crate) const MANUAL_REVIEW_POLICY: &str = "Automatic pre-handoff review is disabled. Call code_review only when the person explicitly asks for a review; do not call it just because a task is finished. Keep running the applicable tests.";
 
 /// The reviewer prompt, taken from the shipped review specialization rather
 /// than restated here. Two copies of a hard-won prompt drift, and the one that
@@ -174,6 +182,156 @@ impl Plugin for ReviewPersonaPlugin {
             0,
             &atomcode_review::review_persona(&model),
         );
+        Ok(())
+    }
+}
+
+/// A background review is a single tool assignment, not a second development
+/// conversation. The host decides whether a person has taken this session over.
+/// Completion comes from the session's actual tool result, never a model claim.
+pub(crate) struct ReviewHandoffPlugin(pub Arc<dyn atomcode_review::ReviewDelegate>);
+
+struct ReviewHandoffRow {
+    delegate: Arc<dyn atomcode_review::ReviewDelegate>,
+    ctx: Context,
+}
+
+impl ReviewHandoffRow {
+    fn events(&self) -> Option<Vec<atomcode_kernel::session::LoggedEvent>> {
+        if !self.delegate.report_only()
+            || atomcode_harness::agent::current_member_name(&self.ctx).is_some()
+        {
+            return None;
+        }
+        let log = atomcode_harness::agent::scoped(&self.ctx)
+            .service::<atomcode_harness::seams::SessionSvc>()?;
+        if log.header().member.is_some() {
+            return None;
+        }
+        Some(log.events())
+    }
+}
+
+fn completed_review(
+    events: &[atomcode_kernel::session::LoggedEvent],
+    turn: u64,
+) -> Option<(String, bool)> {
+    use atomcode_kernel::session::SessionEvent;
+    let call = first_review_call(events, turn)?;
+    events.iter().find_map(|e| match &e.event {
+        SessionEvent::ToolResultLogged {
+            turn: t,
+            call_id,
+            content,
+            is_error,
+            ..
+        } if *t == turn && call_id == call => Some((content.clone(), *is_error)),
+        _ => None,
+    })
+}
+
+fn first_review_call(events: &[atomcode_kernel::session::LoggedEvent], turn: u64) -> Option<&str> {
+    use atomcode_kernel::session::SessionEvent;
+    events.iter().find_map(|e| match &e.event {
+        SessionEvent::AssistantMessage {
+            turn: t,
+            tool_calls,
+            ..
+        } if *t == turn => tool_calls
+            .iter()
+            .find(|call| call.name == "code_review")
+            .map(|call| call.id.as_str()),
+        _ => None,
+    })
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for ReviewHandoffRow {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        use atomcode_harness::events::{ModelResponse, RequestError};
+        if let Some(events) = self.events() {
+            req.tools.retain(|tool| tool.name == "code_review");
+            if let Some(result) = completed_review(&events, req.turn) {
+                return if result.1 {
+                    if let Some(detail) = atomcode_review::review_deadline_detail(&result.0) {
+                        Err(RequestError {
+                            code: Some(atomcode_harness::events::HOST_DEADLINE_CODE.into()),
+                            ..RequestError::message(detail)
+                        })
+                    } else if let Some(detail) =
+                        atomcode_review::review_open_timeout_detail(&result.0)
+                    {
+                        Err(RequestError::from_provider(
+                            &atomcode_kernel::stream::ProviderError {
+                                code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.into()),
+                                message: detail.to_owned(),
+                                ..Default::default()
+                            },
+                        ))
+                    } else {
+                        Err(RequestError::message(result.0))
+                    }
+                } else {
+                    Ok(ModelResponse {
+                        text: result.0,
+                        ..Default::default()
+                    })
+                };
+            }
+        }
+        next.run(req).await
+    }
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecute> for ReviewHandoffRow {
+    async fn handle(
+        &self,
+        exec: &mut atomcode_harness::events::ToolExec,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::ToolsExecute>,
+    ) -> atomcode_kernel::tool::ToolResult {
+        use atomcode_kernel::session::SessionEvent;
+        if let Some(events) = self.events() {
+            // The requested batch is committed before parallel execution. Using
+            // that fact, rather than racing ToolStarted events, admits exactly
+            // its first review even if the model asks twice in one response.
+            let turn = events.iter().rev().find_map(|e| match &e.event {
+                SessionEvent::TurnStart { turn } => Some(*turn),
+                _ => None,
+            });
+            let prior = turn
+                .and_then(|turn| first_review_call(&events, turn))
+                .is_some_and(|first| first != exec.call.id);
+            if exec.call.name != "code_review" || prior {
+                return atomcode_kernel::tool::ToolResult {
+                    call_id: exec.call.id.clone(),
+                    content: "This host-owned background assignment runs code_review once and returns its result. Follow-up work belongs to the originating conversation.".into(),
+                    is_error: true,
+                    images: vec![],
+                };
+            }
+        }
+        next.run(exec).await
+    }
+}
+
+#[async_trait]
+impl Plugin for ReviewHandoffPlugin {
+    fn name(&self) -> &'static str {
+        "review-handoff"
+    }
+    async fn apply(&self, ctx: &Context, _: &Value) -> Result<(), String> {
+        let row = Arc::new(ReviewHandoffRow {
+            delegate: self.0.clone(),
+            ctx: ctx.clone(),
+        });
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(row.clone(), true);
+        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(row, true);
         Ok(())
     }
 }

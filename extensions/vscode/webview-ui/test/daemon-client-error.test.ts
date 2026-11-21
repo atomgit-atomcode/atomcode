@@ -77,6 +77,7 @@ function testPermissionRequestSseIsForwardedToCallback() {
       tool_name: 'write_file',
       reason: 'Modify workspace file',
       call_id: 'call-1',
+      approval_id: 'approval-1',
       arguments: '{"path":"README.md"}',
     }), callbacks);
 
@@ -85,6 +86,7 @@ function testPermissionRequestSseIsForwardedToCallback() {
     toolName: 'write_file',
     reason: 'Modify workspace file',
     callId: 'call-1',
+    approvalId: 'approval-1',
     args: '{"path":"README.md"}',
   });
 }
@@ -335,7 +337,25 @@ testPermissionRequestSseIsForwardedToCallback();
 testWarningSseIsForwardedToCallback();
 testRateLimitedSseIsForwardedToCallback();
 testDoneSseForwardsAuthoritativeStopReason();
+async function testPermissionAnswerEchoesBothIdentitiesOverHttp() {
+  let body = '';
+  const server = http.createServer((req, res) => {
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => { res.setHeader('Content-Type', 'application/json'); res.end('{"success":true}'); });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = (server.address() as { port: number }).port;
+    const result = await new DaemonClient(port).sendPermissionDecision('session', 'allow', 'mcp__browser-use__browser_click', 'call', 'approval');
+    assert.equal(result.success, true);
+    assert.deepEqual(JSON.parse(body), {session_id:'session',decision:'allow',tool_name:'mcp__browser-use__browser_click',call_id:'call',approval_id:'approval'});
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+}
+
 void Promise.resolve()
+  .then(testPermissionAnswerEchoesBothIdentitiesOverHttp)
   .then(testCleanEofWithoutTerminalFailsTheStream)
   .then(testCleanEofAfterDoneDoesNotEmitASecondTerminal)
   .then(testEventsAfterTerminalAreIgnored)

@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use super::client::McpClient;
+use super::client::{McpClient, ToolRequestGuard, CANCELLED_TOOL_REQUEST};
 use super::config::McpHttpAuthConfig;
 use super::oauth::{refresh_mcp_oauth_token, token_is_expired, McpTokenStore};
 use super::types::{
@@ -40,12 +40,16 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 /// HTTP-based MCP client.
 pub struct HttpClient {
     server_name: String,
+    required_experimental_capabilities: BTreeMap<String, u64>,
     url: String,
     headers: BTreeMap<String, String>,
     auth: Option<McpHttpAuthConfig>,
     timeout_ms: u64,
     status: Arc<Mutex<ServerStatus>>,
     next_id: AtomicU64,
+    abandoned_request: Arc<AtomicU64>,
+    closing: tokio_util::sync::CancellationToken,
+    shutdown_lock: Mutex<()>,
     client: reqwest::Client,
     /// Streamable-HTTP session id. Stateful servers (e.g. Figma Dev Mode) return
     /// `Mcp-Session-Id` on the `initialize` response and REJECT later requests that
@@ -60,6 +64,22 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    /// Requirements belong to this connection's lifetime and cannot be changed
+    /// after construction. They grant no approval or tool authority.
+    pub fn new_with_required_experimental_capabilities(
+        server_name: String,
+        url: String,
+        headers: BTreeMap<String, String>,
+        auth: Option<McpHttpAuthConfig>,
+        timeout_ms: Option<u64>,
+        token_store: McpTokenStore,
+        requirements: BTreeMap<String, u64>,
+    ) -> Self {
+        let mut client = Self::new(server_name, url, headers, auth, timeout_ms, token_store);
+        client.required_experimental_capabilities = requirements;
+        client
+    }
+
     /// Create a new HTTP client.
     pub fn new(
         server_name: String,
@@ -78,12 +98,16 @@ impl HttpClient {
 
         Self {
             server_name,
+            required_experimental_capabilities: BTreeMap::new(),
             url,
             headers,
             auth,
             timeout_ms: timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
             status: Arc::new(Mutex::new(ServerStatus::Disconnected)),
             next_id: AtomicU64::new(1),
+            abandoned_request: Arc::new(AtomicU64::new(0)),
+            closing: tokio_util::sync::CancellationToken::new(),
+            shutdown_lock: Mutex::new(()),
             client,
             session_id: Arc::new(Mutex::new(None)),
             negotiated_version: Arc::new(Mutex::new(None)),
@@ -111,14 +135,44 @@ impl HttpClient {
         negotiated.filter(|v| !v.is_empty())
     }
 
-    /// Capture the `Mcp-Session-Id` response header (case-insensitive) so it can be
-    /// echoed on later requests. A missing or empty value leaves the prior id intact.
-    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) {
-        if let Some(value) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-            if !value.is_empty() {
-                *self.session_id.lock().await = Some(value.to_string());
-            }
+    /// Required declarations must be validated for this logical MCP session.
+    async fn require_validated_session(&self, method: &str) -> Result<()> {
+        if method != "initialize"
+            && !self.required_experimental_capabilities.is_empty()
+            && !matches!(*self.status.lock().await, ServerStatus::Connected)
+        {
+            bail!("MCP required capabilities have not been validated for this session");
         }
+        Ok(())
+    }
+
+    /// Preserve session identity after a required-capability handshake.
+    async fn capture_session_id(&self, headers: &reqwest::header::HeaderMap) -> Result<()> {
+        if let Some(value) = headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
+            let negotiating = matches!(*self.status.lock().await, ServerStatus::Connecting);
+            let mut session = self.session_id.lock().await;
+            let expected = self
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("mcp-session-id"))
+                .map(|(_, value)| value.as_str())
+                .or(session.as_deref());
+            if !self.required_experimental_capabilities.is_empty()
+                && !negotiating
+                && expected != Some(value)
+            {
+                drop(session);
+                let message = "MCP session identity changed; reinitialize to validate required capabilities; a dispatched request outcome may be unknown";
+                *self.status.lock().await = ServerStatus::Failed(message.into());
+                bail!(message);
+            }
+            *session = Some(value.to_owned());
+        }
+        Ok(())
     }
 
     /// Send a request and wait for response.
@@ -127,6 +181,22 @@ impl HttpClient {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => bail!("MCP transport is shut down"),
+            result = self.send_open_request(method, params) => result,
+        }
+    }
+
+    async fn send_open_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.require_validated_session(method).await?;
+        if self.abandoned_request.load(Ordering::SeqCst) != 0 {
+            bail!(CANCELLED_TOOL_REQUEST);
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // IMPORTANT: omit `params` when it's None.
@@ -189,83 +259,102 @@ impl HttpClient {
             req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
         }
 
-        let timeout_duration = Duration::from_millis(self.timeout_ms);
-        let response = timeout(timeout_duration, req.send())
-            .await
-            .with_context(|| {
-                format!(
-                    "HTTP request to MCP server {} timed out after {}ms",
-                    self.server_name, self.timeout_ms
-                )
-            })?
-            .with_context(|| format!("HTTP request to MCP server {} failed", self.server_name))?;
+        if self.abandoned_request.load(Ordering::SeqCst) != 0 {
+            bail!(CANCELLED_TOOL_REQUEST);
+        }
+        let guard =
+            (method == "tools/call").then(|| ToolRequestGuard::new(self.abandoned_request.clone()));
+        let result = async {
+            self.require_validated_session(method).await?;
+            if let Some(guard) = &guard {
+                guard.dispatched(id);
+            }
+            let timeout_duration = Duration::from_millis(self.timeout_ms);
+            let response = timeout(timeout_duration, req.send())
+                .await
+                .with_context(|| {
+                    format!(
+                        "HTTP request to MCP server {} timed out after {}ms",
+                        self.server_name, self.timeout_ms
+                    )
+                })?
+                .with_context(|| {
+                    format!("HTTP request to MCP server {} failed", self.server_name)
+                })?;
 
-        // Capture the session id the server may have handed out (e.g. on initialize).
-        self.capture_session_id(response.headers()).await;
+            // Capture the session id the server may have handed out (e.g. on initialize).
+            self.capture_session_id(response.headers()).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            if (status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN)
-                && self.auth.is_some()
-            {
-                bail!(
+            if !response.status().is_success() {
+                let status = response.status();
+                if (status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN)
+                    && self.auth.is_some()
+                {
+                    bail!(
                     "MCP server {} requires OAuth; run `atomcode mcp login {}` or `/mcp login {}`",
                     self.server_name,
                     self.server_name,
                     self.server_name
                 );
+                }
+                let body = read_limited_response_text(response, &self.server_name).await?;
+                bail!(
+                    "MCP server {} returned HTTP {}: {}",
+                    self.server_name,
+                    status,
+                    body
+                );
             }
+
+            // MCP "Streamable HTTP" servers (deepwiki, context7, etc.) may
+            // return responses as `text/event-stream` SSE frames rather than
+            // a single JSON body — the spec lets the server pick whichever
+            // content type it sent in its response. We negotiated both via
+            // the `Accept` header above, so handle both on the receive side.
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+
             let body = read_limited_response_text(response, &self.server_name).await?;
-            bail!(
-                "MCP server {} returned HTTP {}: {}",
-                self.server_name,
-                status,
-                body
-            );
-        }
 
-        // MCP "Streamable HTTP" servers (deepwiki, context7, etc.) may
-        // return responses as `text/event-stream` SSE frames rather than
-        // a single JSON body — the spec lets the server pick whichever
-        // content type it sent in its response. We negotiated both via
-        // the `Accept` header above, so handle both on the receive side.
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-
-        let body = read_limited_response_text(response, &self.server_name).await?;
-
-        let result: super::types::JsonRpcResponse = if content_type.contains("text/event-stream") {
-            parse_sse_jsonrpc(&body, id).with_context(|| {
-                format!(
-                    "Failed to parse MCP SSE response from {} (first 200 bytes: {:?})",
-                    self.server_name,
-                    body.chars().take(200).collect::<String>()
-                )
-            })?
-        } else {
-            serde_json::from_str(&body).with_context(|| {
-                format!(
-                    "Failed to parse MCP HTTP response from {} (content-type={:?}, \
+            let result: super::types::JsonRpcResponse =
+                if content_type.contains("text/event-stream") {
+                    parse_sse_jsonrpc(&body, id).with_context(|| {
+                        format!(
+                            "Failed to parse MCP SSE response from {} (first 200 bytes: {:?})",
+                            self.server_name,
+                            body.chars().take(200).collect::<String>()
+                        )
+                    })?
+                } else {
+                    serde_json::from_str(&body).with_context(|| {
+                        format!(
+                            "Failed to parse MCP HTTP response from {} (content-type={:?}, \
                      first 200 bytes: {:?})",
-                    self.server_name,
-                    content_type,
-                    body.chars().take(200).collect::<String>()
-                )
-            })?
-        };
+                            self.server_name,
+                            content_type,
+                            body.chars().take(200).collect::<String>()
+                        )
+                    })?
+                };
 
-        if let Some(error) = result.error {
-            bail!("MCP error {} (code {}): {}", error.message, error.code, "");
+            if let Some(error) = result.error {
+                bail!("MCP error {} (code {}): {}", error.message, error.code, "");
+            }
+
+            result
+                .result
+                .ok_or_else(|| anyhow::anyhow!("MCP response missing result"))
         }
-
+        .await;
+        if let Some(guard) = &guard {
+            guard.disarm();
+        }
         result
-            .result
-            .ok_or_else(|| anyhow::anyhow!("MCP response missing result"))
     }
 
     fn load_oauth_token(&self) -> Result<Option<String>> {
@@ -430,9 +519,9 @@ impl Drop for HttpClient {
 }
 
 /// Send the MCP session-termination `DELETE`. Mirrors `send_request`'s header handling:
-/// user-supplied headers (incl. a pinned `Mcp-Session-Id` or auth) are applied, and the
-/// captured session id is added only when the user didn't already provide one. Best-effort
-/// — errors are intentionally ignored.
+/// A user-pinned session is an attached resource, not this client's lease to
+/// destroy. Only a server-issued session is eligible for best-effort cleanup.
+/// Errors do not imply rollback or confirmed remote cleanup.
 async fn delete_http_session(
     client: reqwest::Client,
     url: String,
@@ -443,6 +532,9 @@ async fn delete_http_session(
     let user_has_session = headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case("mcp-session-id"));
+    if user_has_session {
+        return;
+    }
     let user_has_version = headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case(MCP_PROTOCOL_VERSION_HEADER));
@@ -458,12 +550,15 @@ async fn delete_http_session(
             req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
         }
     }
-    let _ = req.send().await;
+    // Teardown has its own short budget; a long ordinary RPC timeout must not
+    // leave shutdown cleanup running indefinitely. No business tool is called.
+    let _ = timeout(Duration::from_secs(2), req.send()).await;
 }
 
 #[async_trait]
 impl McpClient for HttpClient {
     async fn initialize(&mut self) -> Result<InitializeResult> {
+        super::requirements::validate(&self.required_experimental_capabilities)?;
         let mut status = self.status.lock().await;
         *status = ServerStatus::Connecting;
         drop(status);
@@ -474,6 +569,14 @@ impl McpClient for HttpClient {
 
         let init_result: InitializeResult =
             serde_json::from_value(result).context("Failed to parse initialize result")?;
+
+        if let Err(error) = super::requirements::check(
+            &self.required_experimental_capabilities,
+            &init_result.capabilities,
+        ) {
+            *self.status.lock().await = ServerStatus::Failed(error.to_string());
+            return Err(error);
+        }
 
         // Record what the server actually agreed to speak. Every request from here on
         // must label itself with THIS value (not what we asked for) — an older server
@@ -510,11 +613,35 @@ impl McpClient for HttpClient {
         serde_json::from_value(result).context("Failed to parse tools/call result")
     }
 
+    async fn shutdown(&self) {
+        self.closing.cancel();
+        let _shutdown = self.shutdown_lock.lock().await;
+        let session = self.session_id.lock().await.take();
+        if let Some(session) = session {
+            let version = self.negotiated_version.lock().await.clone();
+            delete_http_session(
+                self.client.clone(),
+                self.url.clone(),
+                self.headers.clone(),
+                session,
+                version,
+            )
+            .await;
+        }
+        *self.status.lock().await = ServerStatus::Disconnected;
+    }
+
     fn server_name(&self) -> &str {
         &self.server_name
     }
 
     fn status(&self) -> ServerStatus {
+        if self.closing.is_cancelled() {
+            return ServerStatus::Disconnected;
+        }
+        if self.abandoned_request.load(Ordering::SeqCst) != 0 {
+            return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
+        }
         self.status
             .try_lock()
             .map(|s| s.clone())
@@ -762,6 +889,146 @@ mod session_tests {
     use crate::mcp::types::MCP_PROTOCOL_VERSION;
     use reqwest::header::HeaderMap;
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cleanup_preserves_attached_sessions_and_bounds_owned_session_delete() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || {
+            let _ = release_clock.recv_timeout(Duration::from_secs(10));
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/mcp");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let began = tokio::time::Instant::now();
+        delete_http_session(
+            client.clone(),
+            url.clone(),
+            BTreeMap::from([("mCp-SeSsIoN-iD".into(), "attached-not-owned".into())]),
+            "server-offered".into(),
+            None,
+        )
+        .await;
+        assert_eq!(began.elapsed(), Duration::ZERO);
+        // No request was dispatched: the first actual connection below must
+        // carry the owned ID, never the attached ID or the ignored offer.
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let seen = observed.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.starts_with("DELETE "));
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: owned"));
+            assert!(!headers.contains("attached-not-owned"));
+            seen.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let deletion = tokio::spawn(delete_http_session(
+            client,
+            url,
+            BTreeMap::new(),
+            "owned".into(),
+            None,
+        ));
+        observed.notified().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        deletion.await.unwrap();
+        assert_eq!(began.elapsed(), Duration::from_secs(2));
+        server.abort();
+        drop(keep_clock);
+        let _ = clock.await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_awaits_one_owned_session_delete_and_rejects_stale_calls() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || {
+            let _ = release_clock.recv_timeout(Duration::from_secs(10));
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server = {
+            let observed = observed.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("DELETE "));
+                loop {
+                    line.clear();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                observed.notify_one();
+                release.notified().await;
+                stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            })
+        };
+        let client = Arc::new(HttpClient::new(
+            "owned".into(),
+            url,
+            BTreeMap::new(),
+            None,
+            None,
+            McpTokenStore::new("/nonexistent/mcp_auth.toml".into()),
+        ));
+        *client.session_id.lock().await = Some("owned-session".into());
+        let first = {
+            let client = client.clone();
+            tokio::spawn(async move { client.shutdown().await })
+        };
+        observed.notified().await;
+        let second = {
+            let client = client.clone();
+            tokio::spawn(async move { client.shutdown().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        assert!(client
+            .call_tool("any", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("shut down"));
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        server.await.unwrap();
+        assert!(
+            client.session_id().await.is_none(),
+            "Drop must not delete the same session again"
+        );
+        assert!(matches!(client.status(), ServerStatus::Disconnected));
+        drop(keep_clock);
+        clock.await.unwrap();
+    }
+
     fn client() -> HttpClient {
         HttpClient::new(
             "t".into(),
@@ -782,7 +1049,7 @@ mod session_tests {
         );
         let mut h = HeaderMap::new();
         h.insert("mcp-session-id", "abc-123".parse().unwrap());
-        c.capture_session_id(&h).await;
+        c.capture_session_id(&h).await.unwrap();
         assert_eq!(
             c.session_id().await.as_deref(),
             Some("abc-123"),
@@ -845,11 +1112,11 @@ mod session_tests {
     #[tokio::test]
     async fn ignores_missing_or_empty_session_id() {
         let c = client();
-        c.capture_session_id(&HeaderMap::new()).await; // header absent
+        c.capture_session_id(&HeaderMap::new()).await.unwrap(); // header absent
         assert!(c.session_id().await.is_none());
         let mut h = HeaderMap::new();
         h.insert("mcp-session-id", "".parse().unwrap());
-        c.capture_session_id(&h).await; // header present but empty
+        c.capture_session_id(&h).await.unwrap(); // header present but empty
         assert!(
             c.session_id().await.is_none(),
             "empty value must not overwrite"

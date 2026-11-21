@@ -13,16 +13,36 @@
 //! attachment could reach the model without anyone having asked for it.
 
 use atomcode_kernel::message::ImageContent;
+use std::sync::Arc;
 
 /// One image waiting, and the number it is labelled with.
 ///
 /// Private: what the composer holds is nobody's business but this module's.
 /// The outside world only ever sees a marker in the text and, at send time,
-/// the images that text still refers to.
+/// the images that text still refers to. The bytes are shared: the composer
+/// and the session gallery hold the same picture, and a frame's snapshot of
+/// the moment shares both instead of copying the base64 twice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Pending {
     marker: usize,
-    image: ImageContent,
+    image: Arc<ImageContent>,
+}
+
+/// The vectors behind [`Attachments`]. Shared through one `Arc` so cloning an
+/// [`Attachments`] (every frame's `Moment` snapshot) is a refcount bump, not a
+/// copy of every image the session ever attached; `Arc::make_mut` pays the
+/// copy only on the rare mutation, when a snapshot is still alive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Inner {
+    images: Vec<Pending>,
+    /// Every image added this session, by marker number — **kept after send**,
+    /// where [`Inner::images`] is drained. This is what lets a person open
+    /// a picture again from the history: the marker `[Image #N]` in a sent line
+    /// still resolves to its bytes here. Append-only for the session (numbers are
+    /// never reused), and untouched by [`Attachments::clear`] — a previously sent
+    /// image's bytes must survive the composer being emptied.
+    gallery: Vec<Pending>,
+    next: usize,
 }
 
 /// The `[Image #N]` marker for one number.
@@ -119,15 +139,7 @@ pub fn snap_caret_out_of_marker(text: &str, caret: usize) -> usize {
 /// What the composer is holding between submits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachments {
-    images: Vec<Pending>,
-    /// Every image added this session, by marker number — **kept after send**,
-    /// where [`images`](Self::images) is drained. This is what lets a person open
-    /// a picture again from the history: the marker `[Image #N]` in a sent line
-    /// still resolves to its bytes here. Append-only for the session (numbers are
-    /// never reused), and untouched by [`clear`](Self::clear) — a previously sent
-    /// image's bytes must survive the composer being emptied.
-    gallery: Vec<Pending>,
-    next: usize,
+    inner: Arc<Inner>,
 }
 
 /// Hand-written rather than derived, because the derived one would start the
@@ -144,14 +156,16 @@ impl Default for Attachments {
 impl Attachments {
     /// Whether there are no pending images in the composer.
     pub fn is_empty(&self) -> bool {
-        self.images.is_empty()
+        self.inner.images.is_empty()
     }
 
     pub fn new() -> Self {
         Self {
-            images: Vec::new(),
-            gallery: Vec::new(),
-            next: 1,
+            inner: Arc::new(Inner {
+                images: Vec::new(),
+                gallery: Vec::new(),
+                next: 1,
+            }),
         }
     }
 
@@ -160,23 +174,41 @@ impl Attachments {
     /// Nothing dedups: the same picture pasted twice is two attachments,
     /// because the person pasted twice and the second one is in there.
     pub fn add(&mut self, image: ImageContent) -> String {
-        let n = self.next;
-        self.next += 1;
+        self.add_shared(Arc::new(image))
+    }
+
+    /// The same attach with the bytes already shared with the gallery, so a
+    /// recalled picture is renumbered without copying its base64.
+    fn add_shared(&mut self, image: Arc<ImageContent>) -> String {
+        let inner = Arc::make_mut(&mut self.inner);
+        let n = inner.next;
+        inner.next += 1;
         let pending = Pending { marker: n, image };
-        // The send queue is drained at submit; the gallery keeps a copy so the
+        // The send queue is drained at submit; the gallery keeps a handle so the
         // picture can be reopened from the history long after it was sent.
-        self.gallery.push(pending.clone());
-        self.images.push(pending);
+        inner.gallery.push(pending.clone());
+        inner.images.push(pending);
         marker(n)
     }
 
     /// The bytes of image `n`, for reopening it — from the composer or from a
     /// sent line in the history. `None` if no such number was ever added.
     pub fn image_at(&self, n: usize) -> Option<&ImageContent> {
-        self.gallery
+        self.inner
+            .gallery
             .iter()
             .find(|p| p.marker == n)
-            .map(|p| &p.image)
+            .map(|p| p.image.as_ref())
+    }
+
+    /// The shared handle behind [`image_at`], so re-attaching a recalled picture
+    /// can reuse the bytes instead of cloning them.
+    fn image_shared(&self, n: usize) -> Option<Arc<ImageContent>> {
+        self.inner
+            .gallery
+            .iter()
+            .find(|p| p.marker == n)
+            .map(|p| Arc::clone(&p.image))
     }
 
     /// Re-attach the images a recalled line refers to, under FRESH marker
@@ -199,16 +231,16 @@ impl Attachments {
         use std::collections::HashSet;
         // Markers already going this submit are fresh attachments, not recalls —
         // re-adding them would send (and cache) the same picture twice.
-        let queued: HashSet<usize> = self.images.iter().map(|p| p.marker).collect();
+        let queued: HashSet<usize> = self.inner.images.iter().map(|p| p.marker).collect();
         let mut handled: HashSet<usize> = HashSet::new();
         let mut missing = Vec::new();
         for old in markers_in(line) {
             if queued.contains(&old) || !handled.insert(old) {
                 continue;
             }
-            match self.image_at(old).cloned() {
+            match self.image_shared(old) {
                 Some(image) => {
-                    let fresh = self.add(image);
+                    let fresh = self.add_shared(image);
                     *line = line.replace(&marker(old), &fresh);
                 }
                 None => missing.push(old),
@@ -226,11 +258,12 @@ impl Attachments {
     /// log's business, and the ones that did not are not anybody's.
     pub fn take_shown(&mut self, text: &str) -> Vec<ImageContent> {
         let shown: Vec<usize> = markers_in(text);
-        let taken = self
+        let inner = Arc::make_mut(&mut self.inner);
+        let taken = inner
             .images
             .drain(..)
             .filter(|p| shown.contains(&p.marker))
-            .map(|p| p.image)
+            .map(|p| (*p.image).clone())
             .collect();
         taken
     }
@@ -243,7 +276,7 @@ impl Attachments {
     /// have to re-derive that they are gone; dropping them here keeps the state
     /// and the screen telling the same story at every moment.
     pub fn clear(&mut self) {
-        self.images.clear();
+        Arc::make_mut(&mut self.inner).images.clear();
     }
 }
 
@@ -602,6 +635,53 @@ mod tests {
             "clearing the composer keeps it"
         );
         assert_eq!(a.image_at(9), None, "a number never added has no image");
+    }
+
+    // A frame renders from a cloned Moment; with the bytes shared behind one
+    // Arc, every mutation must copy-on-write so a snapshot in flight keeps the
+    // state it was taken with. The compiler cannot enforce that, so pin it.
+    #[test]
+    fn a_frame_snapshot_is_not_written_back_when_the_live_composer_changes() {
+        let mut live = Attachments::new();
+        live.add(img("one"));
+        let snapshot = live.clone();
+
+        live.add(img("two"));
+        let _ = live.take_shown("[Image #2]");
+        live.clear();
+
+        assert!(!snapshot.is_empty(), "the snapshot keeps its pending image");
+        assert_eq!(
+            snapshot.image_at(1),
+            Some(&img("one")),
+            "the snapshot keeps its own bytes"
+        );
+        assert_eq!(
+            snapshot.image_at(2),
+            None,
+            "an image added after the snapshot stays out of it"
+        );
+        assert!(live.is_empty());
+    }
+
+    // Recalling a sent line that names a picture re-attaches the gallery's own
+    // bytes under a fresh number: the marker changes, the base64 does not move.
+    #[test]
+    fn a_recalled_picture_shares_the_bytes_it_was_recalled_from() {
+        let mut a = Attachments::new();
+        let sent = a.add(img("one"));
+        // Send it: the queue drains, the gallery keeps the bytes — which is
+        // exactly the state a recalled history line resolves against.
+        let _ = a.take_shown(&format!("sent {sent}"));
+        let before = a.image_shared(1).expect("the gallery has it");
+        let mut line = "sent [Image #1]".to_string();
+        assert!(a.rehydrate_recalled(&mut line).is_empty());
+        let after = a.image_shared(2).expect("the recall renumbered it");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the recalled image reuses the gallery's bytes"
+        );
+        assert!(line.contains("[Image #2]"), "{line}");
     }
 
     // A click position (a byte offset) inside an `[Image #N]` span opens that

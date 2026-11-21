@@ -89,6 +89,40 @@ pub fn format_compaction_noop(
     }
 }
 
+/// Safe display-only compaction diagnostics, shared by native and web drivers.
+pub fn format_compaction_diagnostic(
+    code: &str,
+    before: usize,
+    after: usize,
+    committed: bool,
+) -> String {
+    let reason = t(match code {
+        "summary_timed_out" => Msg::CompactSummaryTimedOut,
+        "summary_context_exceeded" => Msg::CompactSummaryContextExceeded,
+        "summary_incomplete" => Msg::CompactSummaryIncomplete,
+        "summary_request_failed" => Msg::CompactSummaryRequestFailed,
+        "summary_authentication_failed" => Msg::CompactSummaryAuthenticationFailed,
+        "summary_request_rejected" => Msg::CompactSummaryRequestRejected,
+        "summary_rate_limited" => Msg::CompactSummaryRateLimited,
+        "not_smaller" => Msg::CompactNotSmaller,
+        _ => Msg::CompactSummaryFailed,
+    });
+    t(if committed {
+        Msg::CompactDiagnosticReduced {
+            reason: &reason,
+            before,
+            after,
+        }
+    } else {
+        Msg::CompactDiagnosticRetained {
+            reason: &reason,
+            before,
+            after,
+        }
+    })
+    .into_owned()
+}
+
 /// Format the localized acknowledgement for an accepted compaction that was
 /// interrupted by runtime replacement or shutdown.
 pub fn format_compaction_interrupted() -> String {
@@ -106,6 +140,36 @@ fn fmt_compaction_tokens(tokens: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_summary_text_is_distinct_from_a_noop_and_from_tool_output_savings() {
+        let _guard = crate::screen::test_lock();
+        for locale in [Locale::En, Locale::ZhCn] {
+            crate::screen::set_locale(locale);
+            let failed = format_compaction_diagnostic("summary_failed", 100, 100, false);
+            let timeout = format_compaction_diagnostic("summary_timed_out", 100, 100, false);
+            let refused = format_compaction_diagnostic("not_smaller", 100, 100, false);
+            let reduced = format_compaction_diagnostic("summary_failed", 100, 50, true);
+            for code in [
+                "summary_context_exceeded",
+                "summary_incomplete",
+                "summary_request_failed",
+                "summary_authentication_failed",
+                "summary_request_rejected",
+                "summary_rate_limited",
+            ] {
+                let specific = format_compaction_diagnostic(code, 100, 100, false);
+                assert_ne!(specific, failed);
+                assert_ne!(specific, timeout);
+            }
+            assert_ne!(failed, timeout);
+            assert_ne!(failed, refused);
+            assert_ne!(failed, reduced);
+            assert_ne!(failed, format_compaction_noop(25, 25, false));
+            assert!(failed.contains("100 → 100"));
+            assert!(reduced.contains("100 → 50"));
+        }
+    }
 
     #[test]
     fn t_with_returns_english_for_en() {

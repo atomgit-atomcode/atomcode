@@ -121,6 +121,30 @@ impl SensitivePaths {
             .is_some_and(|value| self.decoded_json_references(&value))
     }
 
+    /// [`Self::references`] for a decoded path the caller already holds.
+    ///
+    /// A walker calls this once per file. Passing the path to `references`
+    /// instead would JSON-encode it and parse it back for every file, only to
+    /// apply the same filename and marker rules to the decoded string. This
+    /// applies those rules directly and keeps the same answers.
+    pub(crate) fn references_path(&self, path: &Path) -> bool {
+        // Lowercase once; avoid a separator copy when no backslash is present.
+        // Literal backslashes are valid Unix filename bytes too, but the old
+        // decoded JSON check normalized them on every platform.
+        let mut normalized = path.to_string_lossy().to_ascii_lowercase();
+        if normalized.as_bytes().contains(&b'\\') {
+            normalized = normalized.replace('\\', "/");
+        }
+        // A path argument in JSON ends with `.env"`. The decoded path ends with
+        // the same bytes without the quote.
+        normalized.ends_with(".env")
+            // Preserve the raw-argument check even when the apostrophe is a
+            // literal filename byte rather than shell quoting.
+            || normalized.contains(".env'")
+            || env_dot_reference_is_sensitive(&normalized)
+            || self.matches_a_marker(&normalized)
+    }
+
     /// Check file targets in the same world and directory the tool uses. `file_path` /
     /// `path` arguments and shell command operands are resolved; search patterns, URLs
     /// and query text are not treated as paths.
@@ -986,6 +1010,62 @@ mod tests {
 
     fn references_sensitive_path(args: &str) -> bool {
         guard().references(args)
+    }
+
+    /// The per-file walker checks a decoded path, not a JSON argument. The two
+    /// entry points must agree, or a walk would read (or stop reading) a file
+    /// the gate answered differently for the same bytes.
+    #[test]
+    fn a_decoded_path_gets_the_same_answer_as_a_json_argument() {
+        let guard = guard();
+        assert!(guard.references_path(Path::new("/proj/.env")));
+        assert!(!guard.references_path(Path::new("/proj/.env.example")));
+        assert!(guard.references_path(Path::new("/home/u/.ssh/id_rsa")));
+        assert!(!guard.references_path(Path::new("/proj/src/main.rs")));
+
+        for raw in [
+            "/home/u/.ssh/id_rsa",
+            "/home/u/.ssh",
+            "/home/u/.aws/credentials",
+            "/home/u/.gnupg/private.key",
+            "/home/u/.kube/config",
+            "/home/u/.netrc",
+            "/home/u/.docker/config.json",
+            "/proj/.env",
+            "/proj/.env'backup",
+            "/proj/.env'/config",
+            "/proj/.ENV'backup",
+            r"C:\proj\.env'backup",
+            "/proj/.env.local",
+            "/proj/.env.production",
+            "/proj/.env.example",
+            "/proj/.env.sample",
+            "/proj/.env.dist",
+            "/proj/foo.env",
+            "/home/u/.atomcode/auth.toml",
+            "/home/u/.atomcode/auth/session.json",
+            "/home/u/.atomcode/config.toml.bak",
+            "/home/u/.atomcode/mcp_auth.toml",
+            "/home/u/.atomcode/memory.md",
+            "/home/u/.atomcode/plugins/x/config.toml",
+            "/proj/.cargo/config.toml",
+            "/proj/server.pem",
+            "/proj/secrets/token.txt",
+            "/proj/src/main.rs",
+            "/proj/README.md",
+            "/HOME/U/.SSH/ID_RSA",
+            r"C:\Users\u\.ssh\id_rsa",
+            r"C:\Users\u\.atomcode\config.toml",
+            r"C:\proj\.env.local",
+            r"C:\proj\.env.example",
+        ] {
+            let path = Path::new(raw);
+            assert_eq!(
+                guard.references_path(path),
+                guard.references(&serde_json::json!({ "path": path }).to_string()),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

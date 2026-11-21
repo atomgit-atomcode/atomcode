@@ -547,6 +547,11 @@ pub(crate) async fn codingplan_setup(
             }
         }
 
+        if report.should_persist_config() {
+            // A successful refresh is independent of whether a live goal is waiting.
+            let _ = crate::native_live::refresh_quota_wait().await;
+        }
+
         // Emit TakeCodingplan exactly once on the success path
         state.telemetry.track(Event::TakeCodingplan {
             type_: result_type,

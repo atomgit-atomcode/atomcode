@@ -59,6 +59,7 @@ fn screen_catalogue() -> Vec<Command> {
         Command::said("team", t(Msg::CmdAboutTeam)),
         Command::said_taking("paste", t(Msg::CmdTakesPath), t(Msg::CmdAboutPaste)),
         Command::said("config", t(Msg::CmdAboutConfig)),
+        Command::said("theme", t(Msg::CmdAboutTheme)),
         Command::said("provider", t(Msg::CmdAboutProviderPanel)),
     ]
 }
@@ -176,6 +177,7 @@ impl CommandSet for ScreenCommands {
                 }
             },
             "config" => Outcome::Do(Action::ToggleSettings),
+            "theme" => Outcome::Do(Action::OpenSetting("ui.theme")),
             "provider" => Outcome::Do(Action::ToggleProviders),
             "keys" => {
                 let names = ctx
@@ -953,6 +955,7 @@ fn session_catalogue() -> Vec<Command> {
         Command::said("clear", t(Msg::CmdAboutClear)),
         // `/session` is the same fresh start, named the way the reference does,
         // with `/new` as its memorable alias — one row, not two.
+        Command::said("fork", t(Msg::CmdAboutFork)),
         Command::said("session", t(Msg::CmdAboutSession)).with_aliases(&["new"]),
         Command::said_taking("resume", t(Msg::CmdTakesSessionId), t(Msg::CmdAboutResume)),
         // One command for everything about background sessions: bare, it moves
@@ -993,6 +996,20 @@ fn session_catalogue() -> Vec<Command> {
         Command::said("cost", t(Msg::CmdAboutCost)),
         Command::said("usage", t(Msg::CmdAboutUsage)),
         Command::said_taking("mcp", t(Msg::CmdTakesMcp), t(Msg::CmdAboutMcp)),
+        Command::said_taking("browser", t(Msg::CmdTakesBrowser), t(Msg::CmdAboutBrowser))
+            .selecting(
+                [
+                    ("status", Msg::BrowserStatusAbout),
+                    ("doctor", Msg::BrowserDoctorAbout),
+                    ("enable", Msg::BrowserEnableAbout),
+                    ("disable", Msg::BrowserDisableAbout),
+                    ("reload", Msg::BrowserReloadAbout),
+                    ("help", Msg::BrowserHelpAbout),
+                ]
+                .into_iter()
+                .map(|(value, about)| CommandOption::new(value, t(about)))
+                .collect(),
+            ),
         Command::said("language", t(Msg::CmdAboutLanguage)).selecting(language_options()),
         Command::said("reload", t(Msg::CmdAboutReload)),
         Command::said("logout", t(Msg::CmdAboutLogout)),
@@ -1771,6 +1788,30 @@ impl CommandSet for SessionCommands {
                     crate::sheet::List::new("agents", t(Msg::AgentsPickerHint), rows),
                 )))
             }
+            "fork" => {
+                if !args.trim().is_empty() {
+                    return Outcome::Refused("Usage: /fork".into());
+                }
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::ForkLeadOnly).into_owned());
+                }
+                if let Some(refused) = waits_for_the_turn(name) {
+                    return refused;
+                }
+                let Some(control) = control else {
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
+                };
+                match control
+                    .call(HostCommand::ForkSession {
+                        session: root.clone(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
+                    Ok(_) => Outcome::Quiet,
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "resume" => {
                 let Some(control) = control else {
                     return Outcome::Refused(t(Msg::NoHost).into_owned());
@@ -1809,6 +1850,17 @@ impl CommandSet for SessionCommands {
                                     turns: stored.turns,
                                     needs_newer_version: stored.needs_newer_version,
                                     scheduled: stored.scheduled,
+                                    held: stored.held.map(|held| match held {
+                                        atomcode_host_api::HeldActivity::Open => {
+                                            crate::resume::Held::Open
+                                        }
+                                        atomcode_host_api::HeldActivity::Running => {
+                                            crate::resume::Held::Running
+                                        }
+                                        atomcode_host_api::HeldActivity::Waiting => {
+                                            crate::resume::Held::Waiting
+                                        }
+                                    }),
                                 })
                                 .collect();
                             if sessions.is_empty() {
@@ -2075,6 +2127,18 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
+                // 换成了说哪个:网关给模型起了显示别名,提示就用别名 ——
+                // 和选择器、状态栏同一口径;没别名的仍是原来的名字。
+                let display = ctx
+                    .service::<crate::plugin::ProvidersSvc>()
+                    .and_then(|port| {
+                        let rows = port.rows();
+                        let row = rows
+                            .model(wanted)
+                            .or_else(|| rows.models().iter().find(|m| m.model == wanted));
+                        row.and_then(|row| row.localized_alias().map(str::to_string))
+                    })
+                    .unwrap_or_else(|| wanted.to_string());
                 let (model_line, note) = match control
                     .call(HostCommand::SwitchModel {
                         session: root,
@@ -2085,35 +2149,28 @@ impl CommandSet for SessionCommands {
                     // 宿主说换成了,但有话要说 —— 两句都要说:换确实成了,
                     // 而没存下来是重启之后才看得到的那一半。
                     Ok(HostReply::DoneWithNote { note }) => (
-                        format!("{}\n{note}", t(Msg::ModelSet { wanted })),
+                        format!("{}\n{note}", t(Msg::ModelSet { wanted: &display })),
                         Some(note),
                     ),
-                    Ok(_) => (t(Msg::ModelSet { wanted }).into_owned(), None),
+                    Ok(_) => (t(Msg::ModelSet { wanted: &display }).into_owned(), None),
                     Err(error) => return Outcome::Refused(refusal(error)),
                 };
-                // 换成了,把**选择 id** 记下来:描述报的是 wire 名,而两个账号跑
-                // 同一个模型时,只有选择 id 认得出是哪一行(`ProvidersView`
-                // 先按 id 匹配)。状态行要靠它在同名时说清是哪个 provider。
-                //
-                // 只在**恰好一行**对得上时才认它的 id。打的是 id 就永远对得上;
-                // 打的是 wire 名或别名、而那个名字被几个账号共用时,这里认不出
-                // 宿主换过去的那一行——那就干脆不认(`None`)。认一个猜的行比不认
-                // 更糟:状态行会指着错的 provider 说,而 `marked_row` 本来就拒绝
-                // 在这种时候猜,让它继续用 wire 名、退回不标才是诚实的答案。
-                // 宿主其实知道换到了哪一行(`HostReply` 目前不带回来,正解是
-                // 在 reply 上加),所以这是权宜:宁可这一帧没有前缀。
+                // Keep the accepted exact choice available immediately for
+                // `/model <id> <effort>`. Resolve aliases and shared wire names
+                // from the runtime as well, rather than keeping a guessed row.
                 let selection = ctx
                     .service::<crate::plugin::ProvidersSvc>()
                     .and_then(|port| {
                         let rows = port.rows();
-                        let mut hit = rows
-                            .models()
-                            .iter()
-                            .filter(|m| m.id == wanted || m.model == wanted);
+                        if let Some(row) = rows.model(wanted) {
+                            return Some(row.id.clone());
+                        }
+                        let mut hit = rows.models().iter().filter(|row| row.model == wanted);
                         let first = hit.next()?;
                         hit.next().is_none().then(|| first.id.clone())
                     });
                 client.chose_model(selection);
+                client.refresh_model_selection(&client.root());
                 // 带了档位:走 `/effort` 那一套设过去(只有一份实现),于是
                 // 这一趟不再问第二次。模型此时已经换过去了,所以强度那一步
                 // 不管成不成,「换成了」这句都得留在屏上 —— 只报强度的拒绝,
@@ -2807,6 +2864,76 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
+            "browser" => {
+                use atomcode_host_api::BrowserAction;
+                let action = match args.trim().to_ascii_lowercase().as_str() {
+                    "help" | "--help" | "-h" => {
+                        return Outcome::Said(t(Msg::BrowserHelp).into_owned())
+                    }
+                    "reload" => {
+                        if let Some(why) = waits_for_the_turn("browser reload") {
+                            return why;
+                        }
+                        let control = match host(control) {
+                            Ok(c) => c,
+                            Err(e) => return e,
+                        };
+                        return mcp(control, root, "reload", "").await;
+                    }
+                    "" | "status" => BrowserAction::Status,
+                    "doctor" => BrowserAction::Doctor,
+                    "enable" => BrowserAction::Enable,
+                    "disable" => BrowserAction::Disable,
+                    raw if raw.starts_with("enable --origin-policy-file ") => {
+                        let path = raw["enable --origin-policy-file ".len()..].trim();
+                        if path.is_empty() || path.chars().any(char::is_control) {
+                            return Outcome::Refused(t(Msg::BrowserHelp).into_owned());
+                        }
+                        BrowserAction::EnablePolicyFile { path: path.into() }
+                    }
+                    _ => {
+                        let words: Vec<_> = args.split_whitespace().collect();
+                        match words.as_slice() {
+                            ["enable", "--deny-all-origins"] => BrowserAction::EnableScoped {
+                                origins: Vec::new(),
+                            },
+                            ["enable", "--unrestricted-origins"] => {
+                                BrowserAction::EnableUnrestricted
+                            }
+                            ["enable", rest @ ..]
+                                if !rest.is_empty()
+                                    && rest.len() % 2 == 0
+                                    && rest.chunks_exact(2).all(|pair| {
+                                        pair[0] == "--allow-origin" && !pair[1].starts_with('-')
+                                    }) =>
+                            {
+                                BrowserAction::EnableScoped {
+                                    origins: rest
+                                        .chunks_exact(2)
+                                        .map(|pair| pair[1].to_string())
+                                        .collect(),
+                                }
+                            }
+                            _ => return Outcome::Refused(t(Msg::BrowserHelp).into_owned()),
+                        }
+                    }
+                };
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                match control
+                    .call(HostCommand::Browser {
+                        session: root,
+                        action,
+                    })
+                    .await
+                {
+                    Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
+                    Ok(other) => Outcome::Refused(format!("unexpected host reply: {other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "mcp" => {
                 // 无参要的是那块面板,不是一列文本(设计 §5.1):它读的端口是面板自己的,
                 // 而命令这一层连不上宿主——所以举起动作,由插件那一侧升起它(`/toolbox`
@@ -2984,7 +3111,7 @@ async fn unknown_server(
     server: &str,
 ) -> Option<Outcome> {
     let rows = match control.call(HostCommand::McpManage { session: root }).await {
-        Ok(HostReply::McpRows { rows }) => rows,
+        Ok(HostReply::McpRows { rows, .. }) => rows,
         _ => return None,
     };
     if rows.iter().any(|row| row.name == server) {
@@ -3281,30 +3408,8 @@ impl CommandSet for HelpCommands {
         Outcome::Said(out)
     }
 }
-
-/// `/setup`: put the seed skills on disk if this machine never has, then hand
-/// the name to the agent — which owns what running it means.
-///
-/// **Why the screen owns this at all.** `/setup` is a skill
-/// (`assets/setup-seeds/skills/atomcode-automation-recommender/SKILL.md` —
-/// `name: setup`, `user_invocable: true`), and the `skills` row registers one
-/// command per user-invocable skill, so on a machine where the seeds *are*
-/// installed the agent's catalog already offers `/setup` and there is nothing to
-/// add here. On a machine where they are not, that command does not exist yet —
-/// and typing `/setup` is answered with "no such command" by the very command
-/// that would have installed what it needs. Unpacking the seeds is the one step
-/// the agent cannot take, because it has to have the skill before it can be
-/// asked for one.
-///
-/// **Why it declares `overrides`.** Both machines have to end in the same place,
-/// so this set claims the name unconditionally rather than only when the agent
-/// lacks it. Who would notice the difference is the person, at the moment one of
-/// the two worked and the other did not.
-///
-/// What is left of tuix's `/setup` (`event_loop/commands.rs:3947`) is exactly
-/// this: install → reload → forward. The reload is not optional — writing the
-/// files is not making them so, and the command about to be handed over is one
-/// of the things that arrives by that rebuild.
+/// Local capability inspection and reviewed setup actions. The automation option
+/// retains seed bootstrap → reload → invoke, including seed-only embedders.
 pub struct SetupCommands;
 
 fn setup_catalogue() -> Vec<Command> {
@@ -3333,6 +3438,99 @@ impl CommandSet for SetupCommands {
         let Some(port) = ctx.service::<crate::plugin::SetupSvc>() else {
             return Outcome::Refused(t(Msg::NoSetupPort).into_owned());
         };
+        let args = args.trim();
+        let words: Vec<_> = args.split_whitespace().collect();
+        if port.capability_setup()
+            && !matches!(
+                words.first(),
+                Some(&"automations" | &"hooks" | &"mcp" | &"skills" | &"all")
+            )
+        {
+            if words.as_slice() == ["cancel"] {
+                return match port.cancel().await {
+                    Ok(text) => Outcome::Said(text),
+                    Err(error) => Outcome::Refused(error),
+                };
+            }
+            let root = match working_dir(client.control(), client.root()).await {
+                Ok(root) => std::path::PathBuf::from(root),
+                Err(error) => return Outcome::Refused(error),
+            };
+            return match words.as_slice() {
+                [] | ["check"] | ["--force"] => match port.check(&root, args == "--force").await {
+                    Ok(Some(report)) => {
+                        let mut rows: Vec<_> = report
+                            .entries
+                            .into_iter()
+                            .map(|entry| {
+                                let verb = if entry.installable { "install" } else { "info" };
+                                crate::sheet::Row::new(
+                                    format!("/setup {verb} {}", entry.id),
+                                    entry.name,
+                                )
+                                .about(entry.status)
+                                .preview(crate::width::wrap(&entry.detail, 56))
+                            })
+                            .collect();
+                        rows.push(crate::sheet::Row::new(
+                            "/setup automations",
+                            t(Msg::SetupAutomations),
+                        ));
+                        rows.push(crate::sheet::Row::new("/setup skip", t(Msg::SetupDismiss)));
+                        Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
+                            crate::sheet::List::new("setup", t(Msg::SetupCapabilities), rows),
+                        )))
+                    }
+                    Ok(None) => Outcome::Refused(t(Msg::NoSetupPort).into_owned()),
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["info", id] => match port.check(&root, false).await {
+                    Ok(Some(report)) => match report.entries.into_iter().find(|e| e.id == *id) {
+                        Some(e) => Outcome::Said(format!("{}: {}\n{}", e.name, e.status, e.detail)),
+                        None => Outcome::Refused(t(Msg::SetupUsage).into_owned()),
+                    },
+                    Ok(None) => Outcome::Refused(t(Msg::NoSetupPort).into_owned()),
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["skip"] => match port.dismiss(&root).await {
+                    Ok(text) => Outcome::Said(text),
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["install", id] => match port.plan(&root, id).await {
+                    Ok(plan) => {
+                        let text = crate::width::wrap(&plan.detail, 56).join("\n");
+                        let mut read = crate::sheet::Read::file(
+                            "setup",
+                            vec![crate::sheet::Piece::new(
+                                t(Msg::SetupConfirm),
+                                crate::sheet::Tone::Plain,
+                            )],
+                            &text,
+                        );
+                        read.action = Some((
+                            t(Msg::SetupConfirm).into_owned(),
+                            format!("/setup install {} --confirm {}", plan.id, plan.token),
+                        ));
+                        Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::read(read)))
+                    }
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["install", id, "--confirm", token] => {
+                    if let Some(ui) = ctx.service::<atomcode_harness::seams::UiSvc>() {
+                        ui.say(&t(Msg::SetupWorking));
+                    }
+                    match port.apply(&root, id, token).await {
+                        Ok(text) => Outcome::Said(text),
+                        Err(error) => Outcome::Refused(error),
+                    }
+                }
+                _ => Outcome::Refused(t(Msg::SetupUsage).into_owned()),
+            };
+        }
+        let args = args
+            .strip_prefix("automations")
+            .map(str::trim_start)
+            .unwrap_or(args);
         // The common case, and the whole reason this is a question rather than
         // an attempt: on a machine that has run `/setup` once, unfolding the
         // seeds, taking the file lock and rebuilding the graph are all work with
@@ -3416,6 +3614,53 @@ pub(crate) fn described_command_is_skill(
         })
 }
 
+pub(crate) fn skill_spelling_notice(
+    commands: &[atomcode_kernel::agent::CommandDescription],
+    line: &str,
+) -> Option<String> {
+    let (command, args) = line.trim_start().split_once(char::is_whitespace)?;
+    if !command.eq_ignore_ascii_case("/skills") {
+        return None;
+    }
+    let names: Vec<_> = commands
+        .iter()
+        .filter(|command| described_command_is_skill(command))
+        .map(|command| command.name.as_str())
+        .collect();
+    // Match registry resolution, rather than the menu's case-insensitive search.
+    let boundary = atomcode_capabilities::skills::spelling::invocation_boundary(args, |name| {
+        names.contains(&name)
+            || name
+                .strip_prefix("skills:")
+                .is_some_and(|bare| names.contains(&bare))
+            || (!name.contains(':')
+                && names
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.ends_with(&format!(":{}", name.to_ascii_lowercase()))
+                    })
+                    .count()
+                    == 1)
+    })?;
+    let suggestions =
+        atomcode_capabilities::skills::spelling::task_candidates(&boundary, names.iter().copied());
+    if suggestions.is_empty() {
+        return None;
+    }
+    let candidates = suggestions
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(
+        crate::i18n::product::t(crate::i18n::product::Msg::CmdSkillTaskSpelling {
+            word: boundary.word,
+            candidates: &candidates,
+        })
+        .into_owned(),
+    )
+}
+
 pub(crate) fn catalog_command_starts_turn(
     commands: &[atomcode_kernel::agent::CommandDescription],
     name: &str,
@@ -3486,11 +3731,18 @@ impl CommandSet for AgentCatalogCommands {
             .described()
             .map(|d| d.commands)
             .unwrap_or_default();
-        let skill_options: Vec<crate::command::CommandOption> = described
+        let mut skill_options: Vec<crate::command::CommandOption> = described
             .iter()
             .filter(|c| described_command_is_skill(c))
             .map(|c| crate::command::CommandOption::new(c.name.clone(), c.summary.clone()))
             .collect();
+        if !skill_options.is_empty() {
+            skill_options.push(crate::command::CommandOption::new(
+                "--list",
+                crate::i18n::product::t(crate::i18n::product::Msg::CmdSkillsListOption)
+                    .into_owned(),
+            ));
+        }
         described
             .into_iter()
             .filter(|c| !described_command_is_skill(c))
@@ -3783,8 +4035,243 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
 // be a second answer to "what commands does a screen have", and the second
 // answer is the one that goes stale. See `crate::rows::SCREEN`.
 
+/// The `/import` command set: another agent's assets, and where each stands.
+pub struct ImportCommands;
+
+fn import_catalogue() -> Vec<Command> {
+    vec![Command::said("import", t(Msg::CmdAboutImport))]
+}
+
+/// `CommandSet` is an `#[async_trait]` trait (`command.rs:296`), so the impl
+/// needs the attribute too — without it the `async fn` in the trait does not
+/// match the desugared signature. `async_trait` is already imported in this
+/// file (`commands.rs:14`), so nothing else is needed.
+#[async_trait]
+impl CommandSet for ImportCommands {
+    fn id(&self) -> &'static str {
+        "cmd-import"
+    }
+    fn commands(&self) -> Vec<Command> {
+        import_catalogue()
+    }
+    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
+        let Some(port) = ctx.service::<crate::plugin::MigrationSvc>() else {
+            return Outcome::Refused(t(Msg::NoMigrationPort).into_owned());
+        };
+        let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+            return Outcome::Refused(t(Msg::NoHost).into_owned());
+        };
+        let project = match working_dir(client.control(), client.root()).await {
+            Ok(project) => project,
+            Err(reason) => return Outcome::Refused(reason),
+        };
+        let report = match port.report(std::path::Path::new(&project)).await {
+            Ok(report) => report,
+            Err(error) => return Outcome::Refused(error),
+        };
+
+        // **多源才问**（Codex 的做法，`codex-rs/tui/src/external_agent_config_
+        // migration/flow.rs:300`）：先检测**全部**来源，只把**检测到东西的**
+        // 来源放进选择屏；只有一个来源时**不打扰**用户，直接进面板。
+        //
+        // 问「你要导入 Claude Code 还是 Codex」而用户只装了一个，是白问一遍
+        // —— Codex 的 `detected_sources.len() == 1` 分支正是为此。
+        let found: Vec<_> = report
+            .sources
+            .iter()
+            .filter(|source| !source.assets.is_empty())
+            .collect();
+        let requested = args.trim();
+        if !requested.is_empty() {
+            return match found.iter().find(|source| source.source_id == requested) {
+                Some(source) => Outcome::Do(crate::keymap::Action::OpenSheet(
+                    crate::sheet::Sheet::list(import_list(source)),
+                )),
+                None => Outcome::Refused(t(Msg::MigrationSourceUnavailable).into_owned()),
+            };
+        }
+        if found.is_empty() {
+            // The **product** table: the CLI says the same sentence, and one
+            // thing must not be said two ways.
+            use crate::i18n::product::{t as pt, Msg as PMsg};
+            return Outcome::Said(pt(PMsg::MigrationReportEmpty).into_owned());
+        }
+        if found.len() > 1 {
+            let rows: Vec<crate::sheet::Row> = found
+                .iter()
+                .map(|source| {
+                    crate::sheet::Row::new(
+                        format!("/import {}", source.source_id),
+                        source.display_name.clone(),
+                    )
+                    .about(format!(
+                        "{} {}",
+                        source.assets.len(),
+                        t(Msg::MigrationAssetsCount)
+                    ))
+                })
+                .collect();
+            return Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+                crate::sheet::List::new("import-source", t(Msg::MigrationPickSource), rows),
+            )));
+        }
+
+        // One source: its assets are the list.
+        Outcome::Do(crate::keymap::Action::OpenSheet(crate::sheet::Sheet::list(
+            import_list(&found[0]),
+        )))
+    }
+}
+
+/// The assets of one source, as a list the person can walk.
+///
+/// **This is a bottom sheet (`crate::sheet`), not an overlay.** `overlay.rs`'s
+/// own module note says it: a modal is "a flow rather than a list", and a
+/// list to pick from is the bottom sheet, which rises from the foot of the
+/// screen like every other working panel instead of covering the
+/// conversation.
+///
+/// The sheet gives us, for free: a cursor (↑/↓/PgUp/PgDn/Home/End), a filter
+/// box, and — the reason we want a sheet rather than a text dump —
+/// **`Row::preview`**: the lines shown under the list when the cursor rests on
+/// a row (`sheet.rs:127`). So "expand one item to read what it says" is the
+/// existing shape, not something to invent.
+fn import_list(source: &crate::migration::MigrationSourceView) -> crate::sheet::List {
+    let mut rows: Vec<crate::sheet::Row> = Vec::new();
+    for asset in &source.assets {
+        let status = crate::migration::status_word(asset.status);
+        rows.push(
+            crate::sheet::Row::new("", asset.name.clone())
+                .about(format!("[{status}] {}", asset.detail))
+                // The preview is what the row's own sentence says, in full —
+                // the `about` is the short form.
+                .preview(vec![asset.detail.clone()]),
+        );
+    }
+    crate::sheet::List::new("import", t(Msg::MigrationReportTitle), rows)
+        .summary(vec![crate::sheet::Piece::new(
+            t(Msg::MigrationSummaryLine {
+                source: &source.display_name,
+                count: source.assets.len(),
+            }),
+            crate::sheet::Tone::Plain,
+        )])
+        .empty(t(Msg::MigrationNoAssets))
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn import_source_selection_uses_the_current_project() {
+        use crate::migration::{
+            AssetStatusView, Migration, MigrationAssetView, MigrationReportView,
+            MigrationSourceView,
+        };
+        #[derive(Default)]
+        struct Port(std::sync::Mutex<Vec<std::path::PathBuf>>);
+        #[async_trait]
+        impl Migration for Port {
+            async fn report(
+                &self,
+                project: &std::path::Path,
+            ) -> Result<MigrationReportView, String> {
+                self.0.lock().unwrap().push(project.to_owned());
+                Ok(MigrationReportView {
+                    sources: ["codex", "opencode"]
+                        .into_iter()
+                        .map(|id| MigrationSourceView {
+                            source_id: id.into(),
+                            display_name: id.into(),
+                            assets: vec![MigrationAssetView {
+                                name: format!("{id}-asset"),
+                                status: AssetStatusView::Actionable,
+                                detail: "details".into(),
+                            }],
+                        })
+                        .collect(),
+                })
+            }
+        }
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .extend(["/first", "/after-cd"].map(|dir| {
+                Ok(HostReply::Context {
+                    window: 0,
+                    used: 0,
+                    model: String::new(),
+                    working_dir: dir.into(),
+                    persona: None,
+                    system_prompt: None,
+                })
+            }));
+        let (app, _, commands) = following(&host);
+        let port = Arc::new(Port::default());
+        let _ = app
+            .context()
+            .provide::<crate::plugin::MigrationSvc>(port.clone());
+        let _ = commands.add(Arc::new(ImportCommands));
+
+        let picker = sheet_of(commands.dispatch("/import", &app.context()).await);
+        let crate::sheet::Page::List(list) = picker.page else {
+            panic!("expected source picker");
+        };
+        assert_eq!(list.rows.len(), 2);
+
+        let report = sheet_of(commands.dispatch(&list.rows[1].value, &app.context()).await);
+        let crate::sheet::Page::List(list) = report.page else {
+            panic!("expected asset list");
+        };
+        assert_eq!(list.id, "import");
+        assert_eq!(list.rows[0].label, "opencode-asset");
+        assert_eq!(
+            *port.0.lock().unwrap(),
+            ["/first", "/after-cd"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn the_import_list_carries_each_asset_of_the_source() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "claude-code".into(),
+            display_name: "Claude Code".into(),
+            assets: vec![crate::migration::MigrationAssetView {
+                name: "web-access".into(),
+                status: crate::migration::AssetStatusView::Active,
+                detail: "Read directly".into(),
+            }],
+        };
+        let list = super::import_list(&source);
+        let rows = list.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "web-access");
+        // The status word is part of what the row means.
+        // The status word comes from the message table, so the criterion
+        // compares against the table — not against a literal that would
+        // only hold in one locale.
+        let active = crate::migration::status_word(crate::migration::AssetStatusView::Active);
+        assert!(
+            rows[0].about.contains(&active),
+            "{:?} should mention {active:?}",
+            rows[0].about
+        );
+        // The preview is the row's own sentence, in full — that is what
+        // "expand one item to read it" shows.
+        assert_eq!(rows[0].preview, vec!["Read directly".to_string()]);
+    }
+
+    #[test]
+    fn an_import_list_with_no_assets_says_so() {
+        let source = crate::migration::MigrationSourceView {
+            source_id: "codex".into(),
+            display_name: "Codex".into(),
+            assets: vec![],
+        };
+        let list = super::import_list(&source);
+        assert!(!list.empty.trim().is_empty());
+    }
+
     use super::*;
     #[tokio::test]
     async fn spec_picker_reviews_original_text_before_offering_a_mutation() {
@@ -3997,12 +4484,17 @@ mod tests {
             "Ctrl+T",
             "Ctrl+L",
             "Ctrl+G / /mouse",
+            "Ctrl+P / Ctrl+N",
             "Ctrl+R",
             "Shift+Tab",
             "Esc Esc",
         ] {
             assert!(body.contains(key), "missing {key}:\n{body}");
         }
+        assert!(
+            body.contains("HiShell"),
+            "HiShell's history-key exception must be discoverable in /keys"
+        );
         // 旧散文形态的行内分隔（` · `）不再出现：现在是逐行两列。
         assert!(
             !body.contains(" · "),
@@ -4128,7 +4620,7 @@ mod tests {
             "COMMAND"
         );
         let skills = shown.iter().find(|c| c.name == "skills").unwrap();
-        assert_eq!(skills.options.len(), 1);
+        assert_eq!(skills.options.len(), 2);
         assert_eq!(skills.options[0].value, "plugin:changelog");
         assert!(set.starts_turn("skills", "changelog task"));
         assert!(set.starts_turn("skills", "plugin:changelog task"));
@@ -4226,7 +4718,7 @@ mod tests {
                 .iter()
                 .map(|o| o.value.as_ref())
                 .collect::<Vec<_>>(),
-            ["brainstorming", "code"]
+            ["brainstorming", "code", "--list"]
         );
         assert_eq!(
             set.hidden()
@@ -4294,6 +4786,7 @@ mod tests {
             "/rewind",
             "/rewind 1",
             "/reload",
+            "/browser reload",
         ] {
             let host = Arc::new(Recording::default());
             let (app, client, all) = following(&host);
@@ -4327,6 +4820,32 @@ mod tests {
             "asked: {:?}",
             host.asked.lock().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn fork_is_discoverable_and_dispatched_as_an_explicit_host_operation() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::DoneWithNote {
+                note: "forked; original retained".into(),
+            }));
+        assert!(matches!(
+            all.dispatch("/fork", &app.context()).await,
+            Outcome::Said(_)
+        ));
+        assert!(host
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, HostCommand::ForkSession { .. })));
+        assert!(matches!(
+            all.dispatch("/fork unexpected", &app.context()).await,
+            Outcome::Refused(_)
+        ));
     }
 
     /// A successful busy resume carries the source/fork notice. It belongs on
@@ -4725,12 +5244,18 @@ mod tests {
                     account: "a".into(),
                     model: id.into(),
                     window: 1000,
+                    max_tokens: None,
                     vision: None,
                     effort: None,
                     levels,
                     current: false,
                     managed: false,
+                    alias: None,
+                    desc: None,
+                    alias_en: None,
+                    desc_en: None,
                 };
+
                 crate::providers::ProvidersView::new(
                     Vec::new(),
                     vec![
@@ -4831,11 +5356,16 @@ mod tests {
                         account: "a".into(),
                         model: id.into(),
                         window: 1000,
+                        max_tokens: None,
                         vision: None,
                         effort,
                         levels,
                         current: false,
                         managed: false,
+                        alias: None,
+                        desc: None,
+                        alias_en: None,
+                        desc_en: None,
                     }
                 };
                 crate::providers::ProvidersView::new(
@@ -5022,6 +5552,108 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn browser_commands_are_local_host_intents_and_reload_is_explicit() {
+        use atomcode_host_api::BrowserAction;
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        let catalogue = SessionCommands.commands();
+        let command = catalogue.iter().find(|c| c.name == "browser").unwrap();
+        assert_eq!(
+            command
+                .options
+                .iter()
+                .map(|o| o.value.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["status", "doctor", "enable", "disable", "reload", "help"]
+        );
+        let cases = [
+            ("", BrowserAction::Status),
+            ("status", BrowserAction::Status),
+            ("doctor", BrowserAction::Doctor),
+            ("enable", BrowserAction::Enable),
+            ("disable", BrowserAction::Disable),
+            (
+                "enable --allow-origin https://example.test --allow-origin http://localhost:8080",
+                BrowserAction::EnableScoped {
+                    origins: vec![
+                        "https://example.test".into(),
+                        "http://localhost:8080".into(),
+                    ],
+                },
+            ),
+            (
+                "enable --deny-all-origins",
+                BrowserAction::EnableScoped { origins: vec![] },
+            ),
+            (
+                "enable --origin-policy-file /trusted/policy file.json",
+                BrowserAction::EnablePolicyFile {
+                    path: "/trusted/policy file.json".into(),
+                },
+            ),
+            (
+                "enable --unrestricted-origins",
+                BrowserAction::EnableUnrestricted,
+            ),
+        ];
+        let expected = cases.len();
+        for (verb, action) in cases {
+            host.replies
+                .lock()
+                .unwrap()
+                .push_back(Ok(HostReply::DoneWithNote {
+                    note: "configuration only".into(),
+                }));
+            let out = all
+                .dispatch(&format!("/browser {verb}"), &app.context())
+                .await;
+            assert!(matches!(out, Outcome::Said(text) if text == "configuration only"));
+            assert_eq!(
+                host.asked.lock().unwrap().last(),
+                Some(&HostCommand::Browser {
+                    session: "lead".into(),
+                    action
+                })
+            );
+        }
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            expected,
+            "no implicit reload or desktop action"
+        );
+        for arg in [
+            "help",
+            "--help",
+            "unknown",
+            "enable extra",
+            "enable --allow-origin",
+            "enable --deny-all-origins --allow-origin https://example.test",
+            "enable --allow-origin --unrestricted-origins",
+            "doctor --server /tmp/custom",
+        ] {
+            let out = all
+                .dispatch(&format!("/browser {arg}"), &app.context())
+                .await;
+            assert!(matches!(out, Outcome::Said(_) | Outcome::Refused(_)));
+            assert_eq!(host.asked.lock().unwrap().len(), expected, "{arg}");
+        }
+        all.dispatch("/browser reload", &app.context()).await;
+        assert!(
+            matches!(host.asked.lock().unwrap().get(expected), Some(HostCommand::Reload { session }) if session == "lead")
+        );
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Err(HostError::Failed {
+                message: "permissions incomplete".into(),
+            }));
+        assert!(
+            matches!(all.dispatch("/browser enable", &app.context()).await, Outcome::Refused(text) if text == "permissions incomplete")
+        );
+    }
+
     /// A server with no tools says why, from its state: "connected and offers
     /// nothing" and "failed" were one sentence, and a person could not tell a
     /// server to fix from one with nothing to give.
@@ -5057,6 +5689,7 @@ mod tests {
 
     fn rows(names: &[&str]) -> HostReply {
         HostReply::McpRows {
+            paused: false,
             rows: names
                 .iter()
                 .map(|name| atomcode_host_api::McpRow {
@@ -5781,6 +6414,7 @@ mod tests {
                 running: Some(atomcode_host_api::Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,
@@ -5796,6 +6430,7 @@ mod tests {
                 running: Some(atomcode_host_api::Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,
@@ -7564,6 +8199,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     })
                     .collect(),
             }));
@@ -7619,6 +8255,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     },
                     atomcode_host_api::StoredSession {
                         id: "two".into(),
@@ -7629,6 +8266,7 @@ mod tests {
                         turns: 1,
                         needs_newer_version: false,
                         scheduled: false,
+                        held: None,
                     },
                 ],
             }));
@@ -7776,6 +8414,11 @@ mod tests {
             c.dispatch("/config", &app.context()).await,
             Outcome::Do(Action::ToggleSettings)
         );
+        assert_eq!(
+            c.dispatch("/theme", &app.context()).await,
+            Outcome::Do(Action::OpenSetting("ui.theme"))
+        );
+        assert!(c.all().iter().any(|command| command.name == "theme"));
         // And `/provider` is the other panel, on the same terms. It used to be a
         // picker over `HostCommand::Providers` that could only switch between
         // the legacy `[providers.*]` entries — which is why an account in the
@@ -8379,8 +9022,20 @@ mod setup_tests {
     #[async_trait]
     impl atomcode_host_api::HostControl for Recording {
         async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            let context = matches!(command, HostCommand::Context { .. });
             self.asked.lock().unwrap().push(command);
-            Ok(HostReply::Done)
+            if context {
+                Ok(HostReply::Context {
+                    window: 0,
+                    used: 0,
+                    model: String::new(),
+                    working_dir: "/current-project".into(),
+                    system_prompt: None,
+                    persona: None,
+                })
+            } else {
+                Ok(HostReply::Done)
+            }
         }
         fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
             tokio::sync::mpsc::unbounded_channel().1
@@ -8392,6 +9047,8 @@ mod setup_tests {
     #[derive(Default)]
     struct FakeSetup {
         installed: bool,
+        capabilities: bool,
+        applied: std::sync::Mutex<Vec<(String, String)>>,
         installs: std::sync::Mutex<usize>,
     }
 
@@ -8399,6 +9056,48 @@ mod setup_tests {
     impl crate::setup::Setup for FakeSetup {
         fn installed(&self) -> bool {
             self.installed
+        }
+        fn capability_setup(&self) -> bool {
+            self.capabilities
+        }
+        async fn check(
+            &self,
+            root: &std::path::Path,
+            _force: bool,
+        ) -> Result<Option<crate::setup::CapabilityReport>, String> {
+            assert_eq!(root, std::path::Path::new("/current-project"));
+            Ok(Some(crate::setup::CapabilityReport {
+                summary: "capabilities".into(),
+                entries: vec![crate::setup::CapabilityEntry {
+                    id: "context7".into(),
+                    name: "Context7".into(),
+                    status: "optional".into(),
+                    detail: "Docs".into(),
+                    installable: true,
+                }],
+            }))
+        }
+        async fn plan(
+            &self,
+            root: &std::path::Path,
+            id: &str,
+        ) -> Result<crate::setup::CapabilityPlan, String> {
+            assert_eq!(root, std::path::Path::new("/current-project"));
+            Ok(crate::setup::CapabilityPlan {
+                id: id.into(),
+                detail: "Add a disabled server".into(),
+                token: "reviewed".into(),
+            })
+        }
+        async fn apply(
+            &self,
+            root: &std::path::Path,
+            id: &str,
+            token: &str,
+        ) -> Result<String, String> {
+            assert_eq!(root, std::path::Path::new("/current-project"));
+            self.applied.lock().unwrap().push((id.into(), token.into()));
+            Ok("added disabled".into())
         }
         async fn install(&self) -> Result<String, String> {
             *self.installs.lock().unwrap() += 1;
@@ -8419,6 +9118,10 @@ mod setup_tests {
     }
 
     fn rig(installed: bool) -> Rig {
+        rig_with(installed, false)
+    }
+
+    fn rig_with(installed: bool, capabilities: bool) -> Rig {
         let app = App::new(PluginRegistry::new(), ConfigTree::default());
         let host = Arc::new(Recording::default());
         let client = Arc::new(crate::plugin::AgentClient::default());
@@ -8430,6 +9133,8 @@ mod setup_tests {
             .provide::<crate::plugin::AgentClientSvc>(client);
         let port = Arc::new(FakeSetup {
             installed,
+            capabilities,
+            applied: Default::default(),
             installs: std::sync::Mutex::new(0),
         });
         let _ = app
@@ -8464,6 +9169,48 @@ mod setup_tests {
                 _ => None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn capability_setup_checks_then_requires_review_before_applying_in_current_directory() {
+        let rig = rig_with(true, true);
+        rig.sent(); // Discard the initial Describe sent when the client follows lead.
+        let report = rig.all.dispatch("/setup", &rig.app.context()).await;
+        assert!(matches!(report, Outcome::Do(Action::OpenSheet(_))));
+        assert!(
+            rig.sent().is_empty(),
+            "inspection must not start a model turn"
+        );
+        assert!(rig.port.applied.lock().unwrap().is_empty());
+        assert_eq!(*rig.port.installs.lock().unwrap(), 0);
+        let review = rig
+            .all
+            .dispatch("/setup install context7", &rig.app.context())
+            .await;
+        let Outcome::Do(Action::OpenSheet(sheet)) = review else {
+            panic!("must review first")
+        };
+        let crate::sheet::Page::Read(read) = sheet.page else {
+            panic!("reviewed plan")
+        };
+        assert!(rig.port.applied.lock().unwrap().is_empty());
+        let (_, command) = read.action.unwrap();
+        let result = rig.all.dispatch(&command, &rig.app.context()).await;
+        assert!(matches!(result, Outcome::Said(_)));
+        assert_eq!(
+            *rig.port.applied.lock().unwrap(),
+            vec![("context7".into(), "reviewed".into())]
+        );
+        assert!(rig.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_recommendations_still_use_the_existing_skill_path() {
+        let rig = rig_with(true, true);
+        rig.all
+            .dispatch("/setup automations hooks", &rig.app.context())
+            .await;
+        assert!(rig.sent().iter().any(|c| matches!(c, atomcode_kernel::event::AgentCommand::Invoke { name, args, .. } if name == "setup" && args == "hooks")));
     }
 
     /// On a machine that already has the seeds, `/setup` is one thing: hand the

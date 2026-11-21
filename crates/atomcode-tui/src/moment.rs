@@ -8,6 +8,7 @@
 //! act, and every one of them has to be settable by a test.
 
 use crate::i18n::{t, Msg};
+use std::sync::Arc;
 
 use crate::frame::Rect;
 
@@ -490,6 +491,8 @@ pub struct Moment {
     pub suggestion: Option<String>,
     pub scroll: ScrollPos,
     pub scrollbar_mode: ScrollbarMode,
+    /// Inverted so a default screen wraps diffs without a launcher override.
+    pub clip_diff: bool,
     pub scrollbar_until: Option<tokio::time::Instant>,
     pub scrollbar_dragging: bool,
     /// What the pointer has selected, if anything. Screen state, not a fact —
@@ -508,7 +511,9 @@ pub struct Moment {
     /// Folded from the log rather than appended at submit, so a resumed session
     /// can arrow back through what was said before it was resumed — the log is
     /// the only thing that survives, and a second copy would drift from it.
-    pub history: Vec<String>,
+    /// Shared behind an `Arc` because a sent line can carry a whole pasted
+    /// document, and every frame's snapshot of this state clones the list.
+    pub history: Arc<Vec<String>>,
     /// Which entry is being shown, when arrowing through them. `None` means
     /// what is in the field is the person's own draft.
     pub history_at: Option<usize>,
@@ -537,8 +542,10 @@ pub struct Moment {
     /// [`input`](Self::input), in marker order (index 0 = paste #1). The
     /// composer shows the terse marker; `expand_pastes` puts the body back at
     /// submit, so the model gets the whole paste. Screen state, cleared when the
-    /// draft is sent or dropped.
-    pub pastes: Vec<String>,
+    /// draft is sent or dropped. Shared behind an `Arc` for the same reason
+    /// [`history`](Self::history) is: a frame's snapshot must not copy the
+    /// pasted bodies it does not draw.
+    pub pastes: Arc<Vec<String>>,
     /// The paste that was JUST folded, for the "paste it again to expand it"
     /// gesture: a second paste of the same block within a short window, with its
     /// marker still untouched at the caret, swaps the marker back for the body
@@ -650,7 +657,7 @@ pub struct Moment {
     /// edit and resend. Only the model-bound text (not a slash command), and
     /// only restored when the field is empty at the moment of the stop, so an
     /// Escape never overwrites something you had already started typing.
-    pub last_sent: Option<String>,
+    pub last_sent: Option<Arc<String>>,
     /// A prompt an Escape handed back to the composer, waiting to be taken out
     /// of the conversation too — see [`Retract`]. `None` once decided either way.
     pub retract: Option<Retract>,
@@ -781,6 +788,8 @@ pub struct Moment {
     /// a module that folded "is a question waiting?" from facts would be folding
     /// something that is not in them. See `modules::ask`.
     pub asking: Option<Ask>,
+    /// A tool approval rendered in the stream when the panel row is absent.
+    pub(crate) fallback_approval: Option<Ask>,
     /// The password a running process is blocked on, if one is being asked for:
     /// the asking program's own words, and how many characters have been typed.
     ///
@@ -985,9 +994,9 @@ pub struct Moment {
     /// It must not be written into a member's conversation.
     pub held_goal_end: Option<HeldGoalEnd>,
     /// 开屏时问到的「现在发不出回合」的原因(没有可用 provider、登录过期……),
-    /// `None` 是能发。画在状态行里、常挂着,而不是写进对话流顶上:和 tuix 一样,
-    /// 页面照常打开(欢迎块照画),原因在底下。agent 起来(`Described`)时清掉。
+    /// 输入框上方显示恢复提示，模型可用时清空。
     pub unready: Option<String>,
+    pub(crate) model_setup_required: bool,
     /// 有更新的版本时状态行那一句(启动器给的原话,`None` 是没有或没问到)。
     pub update: Option<String>,
     /// The installation changed while this process stayed alive. Shown above the
@@ -1067,8 +1076,18 @@ impl Moment {
         });
         self
     }
-    /// Set who is running under this agent. Every field of this struct has to
-    /// be settable by a test, or it is not really injected state.
+    /// Current work owned by the lead, without duplicating registry state.
+    pub fn working_members(&self) -> usize {
+        if self.viewing != self.lead {
+            return 0;
+        }
+        self.members
+            .iter()
+            .filter(|member| !member.gone && member.activity == Activity::Working)
+            .count()
+    }
+
+    /// Set who is running under this agent.
     pub fn with_members(mut self, members: Vec<MemberNow>) -> Self {
         self.members = members;
         self
@@ -1254,7 +1273,11 @@ impl Moment {
         if self.completion_held {
             return None;
         }
-        crate::text::ghost(&self.input, &self.history, self.history_at.is_some())
+        crate::text::ghost(
+            &self.input,
+            self.history.as_slice(),
+            self.history_at.is_some(),
+        )
     }
 
     /// Read a session's cumulative goal clock from its last runtime sample.
@@ -1316,8 +1339,8 @@ impl Moment {
         if let Some(search) = self.search.as_mut() {
             search.shift_by(grew);
         }
-        older.append(&mut self.history);
-        self.history = older;
+        older.append(Arc::make_mut(&mut self.history));
+        self.history = Arc::new(older);
         true
     }
 
@@ -1348,7 +1371,7 @@ impl Moment {
             } else {
                 format!("[Pasted #{id} +{line_count} lines]")
             };
-            self.pastes.push(text);
+            Arc::make_mut(&mut self.pastes).push(text);
             self.input.insert_str(at, &placeholder);
             self.caret = at + placeholder.len();
             self.recent_folded_paste = Some(RecentFoldedPaste {
@@ -1418,7 +1441,7 @@ impl Moment {
         }
         self.input.replace_range(recent.start..end, incoming);
         self.caret = recent.start + incoming.len();
-        self.pastes.pop();
+        Arc::make_mut(&mut self.pastes).pop();
         self.recent_folded_paste = None;
         self.history_at = None;
         true
@@ -1446,8 +1469,26 @@ impl Moment {
 
     /// Drop the folded-paste bookkeeping — after the draft is sent, or dropped.
     pub fn clear_pastes(&mut self) {
-        self.pastes.clear();
+        Arc::make_mut(&mut self.pastes).clear();
         self.recent_folded_paste = None;
+    }
+
+    /// Discard only the composer state; never change turn or stop state.
+    pub fn clear_composer(&mut self) {
+        self.disarm_quit();
+        self.input.clear();
+        self.caret = 0;
+        self.clear_pastes();
+        self.attachments.clear();
+        self.history_at = None;
+        self.search = None;
+        self.draft.clear();
+    }
+
+    pub fn hint_history_clear(&mut self) {
+        self.disarm_quit();
+        self.notice =
+            Some(Notice::for_ms(t(Msg::MomentHistoryClear), false, self.now, NOTICE_MS).below());
     }
 
     /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
@@ -1540,6 +1581,7 @@ mod tests {
             usage: None,
             kind: "goal".into(),
             recovering: true,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,
@@ -1578,7 +1620,7 @@ mod tests {
         // shoulder; a first Ctrl+C empties the field and must leave browsing too,
         // or the badge lingers over an empty composer (the reported bug).
         let mut m = Moment {
-            history: vec!["one".into(), "two".into(), "three".into()],
+            history: Arc::new(vec!["one".into(), "two".into(), "three".into()]),
             draft: "half-typed".into(),
             ..Default::default()
         };
@@ -1649,14 +1691,14 @@ mod tests {
     #[test]
     fn older_history_goes_in_front_and_takes_every_index_with_it() {
         let mut m = Moment {
-            history: vec!["mine one".into(), "mine two".into()],
+            history: Arc::new(vec!["mine one".into(), "mine two".into()]),
             // browsing the newest of this session's two
             history_at: Some(1),
             ..Default::default()
         };
         assert!(m.history_grew_older(vec!["older one".into(), "older two".into()]));
         assert_eq!(
-            m.history,
+            *m.history,
             vec!["older one", "older two", "mine one", "mine two"],
             "the project's older lines go in FRONT: the list is oldest-first"
         );
@@ -1670,11 +1712,11 @@ mod tests {
     #[test]
     fn a_line_this_session_already_said_is_not_listed_twice() {
         let mut m = Moment {
-            history: vec!["cargo fmt".into()],
+            history: Arc::new(vec!["cargo fmt".into()]),
             ..Default::default()
         };
         assert!(m.history_grew_older(vec!["git log".into(), "cargo fmt".into()]));
-        assert_eq!(m.history, vec!["git log", "cargo fmt"]);
+        assert_eq!(*m.history, vec!["git log", "cargo fmt"]);
         // And an answer that adds nothing says so, so the caller can skip the
         // repaint rather than redraw the same list.
         assert!(!m.history_grew_older(vec!["cargo fmt".into()]));
@@ -1686,9 +1728,39 @@ mod tests {
         let body = big(PASTE_FOLD_LINES);
         m.insert_paste(&body, Timestamp::millis(0));
         assert_eq!(m.input, format!("[Pasted #1 +{PASTE_FOLD_LINES} lines]"));
-        assert_eq!(m.pastes, vec![body.clone()]);
+        assert_eq!(*m.pastes, vec![body.clone()]);
         // And submit puts the whole thing back.
-        assert_eq!(expand_pastes(&m.input, &m.pastes), body);
+        assert_eq!(expand_pastes(&m.input, m.pastes.as_slice()), body);
+    }
+
+    // Same copy-on-write contract for the other payloads a frame snapshot
+    // shares: a render must keep the pastes, history and last prompt it was
+    // taken with, while the live state keeps growing.
+    #[test]
+    fn a_frame_snapshot_keeps_the_pastes_and_history_it_was_taken_with() {
+        let mut live = Moment::default();
+        let body = big(PASTE_FOLD_LINES);
+        live.insert_paste(&body, Timestamp::millis(0));
+        live.history = Arc::new(vec!["first".into()]);
+        live.last_sent = Some(Arc::new("sent".into()));
+        let snapshot = live.clone();
+
+        // A later, different block is a second paste, not the expand gesture.
+        live.insert_paste(
+            &format!("{body}\nsecond line"),
+            Timestamp::millis(DOUBLE_PASTE_EXPAND_MS + 1),
+        );
+        Arc::make_mut(&mut live.history).push("second".into());
+        live.last_sent = Some(Arc::new("sent again".into()));
+
+        assert_eq!(*snapshot.pastes, vec![body], "the snapshot keeps its paste");
+        assert_eq!(*snapshot.history, vec!["first".to_string()]);
+        assert_eq!(
+            snapshot.last_sent.as_deref().map(String::as_str),
+            Some("sent")
+        );
+        assert_eq!(live.pastes.len(), 2, "the live state still grew");
+        assert_eq!(live.history.len(), 2);
     }
 
     #[test]
@@ -1697,7 +1769,7 @@ mod tests {
         let url = "x".repeat(PASTE_FOLD_CHARS);
         m.insert_paste(&url, Timestamp::millis(0));
         assert_eq!(m.input, format!("[Pasted #1 {PASTE_FOLD_CHARS} chars]"));
-        assert_eq!(expand_pastes(&m.input, &m.pastes), url);
+        assert_eq!(expand_pastes(&m.input, m.pastes.as_slice()), url);
     }
 
     #[test]
@@ -1707,7 +1779,10 @@ mod tests {
         let body = "a\r\nb\r\nc\r\nd\r\ne";
         m.insert_paste(body, Timestamp::millis(0));
         assert_eq!(m.input, "[Pasted #1 +5 lines]");
-        assert_eq!(expand_pastes(&m.input, &m.pastes), "a\nb\nc\nd\ne");
+        assert_eq!(
+            expand_pastes(&m.input, m.pastes.as_slice()),
+            "a\nb\nc\nd\ne"
+        );
     }
 
     #[test]

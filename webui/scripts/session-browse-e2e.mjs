@@ -8,12 +8,15 @@ const root = resolve(import.meta.dirname, '../dist');
 const id = 'context-summary-fixture';
 const meta = { id, name: 'Context summary', working_dir: '/fixture', project_hash: 'fixture', created_at: 1700000000, updated_at: 1700000001, message_count: 2 };
 const specificationText = 'MUST NOT change public API\r\nconst exact = 42;';
-const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
+const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false, created_at:1700000000000 }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conversation with a long title for layout coverage' };
 let releaseSlowHistory = null;
 let switchRejection = null;
 let switches = 0;
+let pagedBrowse = false;
+let failOlder = false;
+let refreshOnConnect = true;
 let specificationPinned = false;
 const patchUploads = [];
 let patchReplyMode = 'ok';
@@ -55,23 +58,45 @@ const server = createServer(async (req, res) => {
     if(switchRejection && JSON.parse(body).session_id!==id) return json(switchRejection);
     return json({ok:true});
   }
-  if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other, messages: [{role:'user', content:'Historical question'}, {role:'assistant', content:'Historical answer'}] });
+  if (path === '/projects/fixture/sessions/' + other.id && pagedBrowse && new URL(req.url,'http://localhost').searchParams.has('before')) {
+    if (failOlder) {failOlder=false; res.statusCode=503; return json({error:'temporary history failure'});}
+    return json({...other,messages:[
+      {role:'user',content:'Older tool request',created_at:1699999990000},
+      {role:'assistant',content:'Inspecting the older file.',tool_calls:[{id:'old-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'old-tool',success:true,summary:'Older tool output'}},
+      {role:'assistant',content:'Older tool answer',created_at:1699999991000}
+    ]});
+  }
+  if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other,
+    ...(pagedBrowse ? {history_older:{session:other.id,before:4,digest:'fixture'}} : {}), messages: [
+    {role:'user', content:'Earlier historical question', created_at:1700000000000},
+    {role:'assistant', content:'## Original heading\n\n'+('Earlier paragraph with **bold** and `code`.\n\n'.repeat(24)), created_at:1700000001000},
+    {role:'user', content:'Historical question', ...(pagedBrowse ? {} : {created_at:1700000002000})},
+    ...(pagedBrowse ? [
+      {role:'assistant',content:'Inspecting the recent file.',tool_calls:[{id:'recent-tool',name:'bash',arguments:'{"command":"pwd"}'}]},
+      {role:'tool',tool_result:{call_id:'recent-tool',success:true,summary:'Recent tool output'}}
+    ] : []),
+    {role:'assistant', content:'Historical answer', created_at:1700000003000}
+  ] });
   if (path === '/projects/fixture/sessions/' + third.id) { releaseSlowHistory = () => json({ ...third, messages: [{role:'user',content:'Stale slow history'}] }); return; }
   if (path === '/live') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
     res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
     res.write('data: {"type":"state","running":false}\n\n');
-    clients.add(res); req.on('close', () => clients.delete(res)); return;
+    // Reconnect snapshot replaces an in-flight history load before active discovery resolves.
+    const refresh = refreshOnConnect ? setTimeout(() => res.write(`data: ${JSON.stringify(snapshot())}\n\n`), 80) : undefined;
+    refreshOnConnect = false;
+    clients.add(res); req.on('close', () => { clearTimeout(refresh); clients.delete(res); }); return;
   }
   if (path === '/project') return json({ working_dir: '/fixture', project_hash: 'fixture' });
   if (path === '/config') return json({ providers: [], notifications: { enabled: false } });
   if (path === '/models') return json([{ name: 'fixture', model: 'fixture', provider: 'fixture', effort_levels: [] }]);
-  if (path.startsWith('/sessions/resolve/')) return json(meta);
+  if (path.startsWith('/sessions/resolve/')) return json([meta,other,third].find(session=>session.id===path.split('/').pop())??meta);
   if (path === '/projects/fixture/sessions/' + id) return json({ ...meta, messages, summary_count: baseline });
   if (path.endsWith('/transcript')) return json({ session_id: id, turns: [] });
   if (path === '/live/mode') return json({ mode: 'build' });
   if (path === '/live/session') return json({ success: true, session_id: id });
-  if (path === '/chat/active') return json([]);
+  if (path === '/chat/active') { setTimeout(() => json([]), 200); return; }
   if (path === '/sessions' || path === '/projects/fixture/sessions') return json([meta, other, third]);
   if (path === '/projects' || path === '/skills') return json([]);
   try {
@@ -95,10 +120,120 @@ try {
   await page.locator('.message-input').waitFor();
   await page.waitForTimeout(1000);
   assert(clients.size > 0);
+  await page.locator('.message-input').fill('composer remains available after snapshot');
+  assert.equal(await page.locator('.btn-send').isEnabled(), true);
+  await page.locator('.message-input').fill('');
+  if (width === 1200) {
+    const sidebar = page.locator('.session-list');
+    const handle = page.locator('.sidebar-resize-handle');
+    const sidebarWidth = async () => Math.round((await sidebar.boundingBox()).width);
+    const drag = async delta => {
+      const box = await handle.boundingBox();
+      await page.mouse.move(box.x + box.width / 2, box.y + 100);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width / 2 + delta, box.y + 100);
+      await page.mouse.up();
+    };
+    assert.equal(await sidebarWidth(), 280, 'untouched desktop keeps responsive CSS');
+    await page.setViewportSize({width:2000,height:900});
+    assert.equal(await sidebarWidth(), 320, 'default follows viewport changes');
+    await page.setViewportSize({width:1200,height:900});
+    await drag(100);
+    await page.waitForFunction(() => localStorage.getItem('atomcode-sidebar-width') === '380');
+    assert.equal(await sidebarWidth(), 380, 'drag starts at the current edge without jumping');
+    await page.reload();
+    await page.locator('.message-input').waitFor();
+    assert.equal(await sidebarWidth(), 380, 'saved width survives reload');
+    await drag(1000);
+    assert.equal(await sidebarWidth(), 420, 'drag cannot exceed 35% of the viewport');
+    await page.setViewportSize({width:900,height:900});
+    assert.equal(await sidebarWidth(), 315, 'stored width is capped when the window shrinks');
+    await page.setViewportSize({width:2000,height:900});
+    assert.equal(await sidebarWidth(), 420, 'growing the window restores the preferred width');
+    await drag(1000);
+    assert.equal(await sidebarWidth(), 500, 'large windows retain the absolute maximum');
+    await page.setViewportSize({width:1200,height:900});
+    assert.equal(await sidebarWidth(), 420);
+    await drag(-260);
+    assert.equal(await sidebarWidth(), 180, 'above the collapse threshold the minimum remains expanded');
+    await drag(200);
+    assert.equal(await sidebarWidth(), 380);
+    const collapseBox = await handle.boundingBox();
+    await page.mouse.move(collapseBox.x + 3, collapseBox.y + 100);
+    await page.mouse.down();
+    await page.mouse.move(collapseBox.x - 187, collapseBox.y + 100);
+    await page.waitForFunction(() => document.querySelector('.session-list')?.getBoundingClientRect().width === 190);
+    await page.mouse.move(collapseBox.x - 247, collapseBox.y + 100);
+    await page.mouse.up();
+    await page.waitForFunction(() => document.querySelector('.session-list')?.classList.contains('collapsed'));
+    assert.equal(await sidebarWidth(), 52, 'dragging below 140px collapses to the icon rail');
+    assert.equal(await page.evaluate(() => document.body.style.userSelect), '', 'auto-collapse ends the drag');
+    assert.equal(await page.evaluate(() => localStorage.getItem('atomcode-sidebar-width')), '380', 'collapse preserves the width from before the gesture');
+    await page.locator('.sidebar-rail .rail-btn').first().click();
+    assert.equal(await sidebarWidth(), 380, 'expanding restores the last expanded width');
+    await page.evaluate(() => { document.body.style.cursor='help'; document.body.style.userSelect='text'; });
+    let box = await handle.boundingBox();
+    await page.mouse.move(box.x + 3, box.y + 100);
+    await page.mouse.down();
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    assert.deepEqual(await page.evaluate(() => [document.body.style.cursor,document.body.style.userSelect]), ['help','text']);
+    await page.mouse.up();
+    await page.evaluate(() => { document.body.style.cursor=''; document.body.style.userSelect=''; });
+    box = await handle.boundingBox();
+    await page.mouse.move(box.x + 3, box.y + 100);
+    await page.mouse.down();
+    await page.locator('.sidebar-collapse-btn').evaluate(button => button.click());
+    await page.waitForFunction(() => document.body.style.userSelect !== 'none');
+    assert.equal(await handle.count(), 0, 'collapsed rail has no drag handle');
+    await page.mouse.up();
+    await page.locator('.sidebar-rail .rail-btn').first().click();
+    await page.evaluate(() => localStorage.removeItem('atomcode-sidebar-width'));
+    await page.reload();
+    await page.locator('.message-input').waitFor();
+    await page.waitForTimeout(200);
+  } else {
+    assert.equal(await page.locator('.sidebar-resize-handle').isVisible(), false, 'mobile drawer has no resize handle');
+  }
   emit({type:'state', running:true});
   try { await page.getByText('Running', {exact:false}).first().waitFor({timeout:5000}); } catch (e) { console.log(await page.locator('body').innerText()); throw e; }
   const before = switches;
   if (width < 600) await page.locator('.mobile-menu-btn').click();
+  assert.equal(await page.locator('.session-browse-sidebar-hint').count(), 0);
+  const hoverRow = page.locator('.session-item-main').filter({hasText:third.name});
+  assert.equal(await hoverRow.getAttribute('title'), null, 'no competing native tooltip');
+  await hoverRow.hover();
+  const hoverCard = page.locator('.session-hover-card');
+  await hoverCard.waitFor();
+  assert.equal(await hoverCard.locator('.session-hover-card-title').textContent(), third.name);
+  assert.equal(await hoverCard.locator('.session-hover-card-directory').textContent(), third.working_dir);
+  const box = await hoverCard.boundingBox();
+  assert(box.x >= 0 && box.x + box.width <= width && box.y >= 0 && box.y + box.height <= 900);
+  await hoverCard.hover();
+  await page.waitForTimeout(450);
+  assert(await hoverCard.isVisible(), 'pointer can move onto the card');
+  if (width === 1200) {
+    await page.screenshot({path:'/tmp/atomcode-sidebar-session-hover.png'});
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'));
+    await page.screenshot({path:'/tmp/atomcode-sidebar-session-hover-dark.png'});
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'light'));
+  }
+  await page.keyboard.press('Escape');
+  await hoverCard.waitFor({state:'hidden'});
+  await hoverRow.focus();
+  await hoverCard.waitFor();
+  assert.equal(await hoverRow.getAttribute('aria-describedby'), await hoverCard.getAttribute('id'));
+  await page.mouse.move(width - 10, 20);
+  await page.waitForTimeout(180);
+  assert(await hoverCard.isVisible(), 'keyboard focus keeps the description visible');
+  await hoverCard.hover();
+  await hoverCard.locator('.session-hover-card-title').click();
+  await page.waitForTimeout(180);
+  assert(await hoverCard.isVisible(), 'selecting card text does not dismiss it');
+  await page.locator('.session-list-body').dispatchEvent('scroll');
+  await hoverCard.waitFor({state:'hidden'});
+  const liveTypography = await page.locator('.assistant-message-content').first().evaluate(el => {
+    const css=getComputedStyle(el); return {font:css.fontFamily,size:css.fontSize,color:css.color};
+  });
   await page.locator('.session-item-main').filter({hasText:'Other conversation'}).click();
   await page.getByText('Historical answer', {exact:true}).waitFor();
   assert.equal(switches, before);
@@ -107,7 +242,7 @@ try {
   await page.getByText('The task is still running', {exact:false}).waitFor();
   const openSidebar = async () => { if (width < 600) await page.locator('.mobile-menu-btn').click(); };
   await openSidebar();
-  await page.getByText('Task running · other sessions open read-only', {exact:true}).waitFor();
+  assert.equal(await page.locator('.session-browse-sidebar-hint').count(), 0);
   await page.locator('.session-item-main').filter({hasText:third.name}).click();
   await page.waitForFunction(name => document.querySelector('.session-browse-title')?.textContent === name, third.name);
   for(let attempt=0;!releaseSlowHistory&&attempt<50;attempt++)await page.waitForTimeout(20);
@@ -126,7 +261,30 @@ try {
   for(const button of await page.locator('.session-browse-actions button').all()) {
     const bounds=await button.boundingBox(); assert(bounds.x>=banner.x&&bounds.x+bounds.width<=banner.x+banner.width+1);
   }
+  const scroller = page.locator('.session-chat-column .messages-container');
+  const messageBounds = await scroller.boundingBox();
+  assert(banner.y >= messageBounds.y + messageBounds.height - 2, 'browse notice replaces the bottom composer');
+  assert(banner.y + banner.height <= 900, 'browse card stays inside viewport');
+  assert.equal(await page.locator('.user-message-bubble').count(), 2, 'history retains user bubbles');
+  assert.equal(await page.locator('.assistant-message-content').count(), 2, 'history uses normal assistant renderer');
+  assert.deepEqual(await page.locator('.assistant-message-content').first().evaluate(el => {
+    const css=getComputedStyle(el); return {font:css.fontFamily,size:css.fontSize,color:css.color};
+  }), liveTypography, 'read-only history keeps normal typography');
+  assert.equal(await page.locator('.timeline-inner > .markdown-body').count(), 0, 'no exported Markdown document');
+  const nav = page.locator('.turn-nav-rail');
+  await nav.waitFor();
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[1]?.classList.contains('is-active'));
+  if (width < 600) await nav.locator('.turn-nav-toggle').click();
+  await nav.locator('.turn-nav-node').first().click();
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[0]?.classList.contains('is-active'));
+  assert(await scroller.evaluate(el => el.scrollTop < 100), 'rail navigates to first historical turn');
+  await scroller.evaluate(el => {el.scrollTop=el.scrollHeight;});
+  await page.waitForFunction(() => document.querySelectorAll('.turn-nav-node')[1]?.classList.contains('is-active'));
   await page.screenshot({path:`/tmp/atomcode-session-browse-${width}.png`});
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme','dark'));
+  await page.screenshot({path:`/tmp/atomcode-session-browse-dark-${width}.png`});
+  await page.evaluate(() => document.documentElement.setAttribute('data-theme','light'));
+
   emit({type:'text', content:' Background stream stays with A.'});
   emit({type:'permission_request', tool_name:'bash', reason:'Approval from running A', call_id:'browse-call', arguments:'{"command":"pwd"}'});
   await page.getByText('Approval from running A', {exact:true}).waitFor();
@@ -239,6 +397,20 @@ try {
   await composer.waitFor();
   emit({type:'state', running:false});
   assert.equal(await composer.inputValue(), 'Draft before leaving');
+  const userRow = page.locator('.user-message-wrapper').first();
+  {
+    await page.mouse.move(0,0);
+    await page.waitForTimeout(150);
+    assert.equal(await userRow.locator('.msg-actions').evaluate(el=>getComputedStyle(el).opacity), '0');
+    await userRow.hover();
+  }
+  assert.match(await userRow.locator('.msg-time').textContent(), /^\d{2}:\d{2}$/);
+  assert.match(await userRow.locator('.msg-time').getAttribute('title'), /^\d{4}-/);
+  await userRow.getByRole('button',{name:'Edit message',exact:true}).click();
+  assert.equal(await composer.inputValue(), specificationText.replace(/\r\n/g,'\n')+'\nDraft before leaving');
+  assert.equal(specificationPinned,false,'editing only populates the draft');
+  await composer.fill('Draft before leaving');
+  await userRow.hover();
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).click();
   const specifications=page.getByRole('dialog',{name:'Task specifications'});
   await specifications.waitFor();
@@ -259,6 +431,20 @@ try {
   await inlineUnpin.click();
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).waitFor();
   assert.equal(specificationPinned,false);
+  delete messages[0].source_seq;
+  emit(snapshot());
+  const fallbackPin=page.getByRole('button',{name:'Pin as task specification',exact:true});
+  await page.waitForFunction(()=>document.querySelector('[title="Manage task specifications"]'));
+  await page.locator('.user-message-wrapper').first().hover();
+  await fallbackPin.click();
+  await specifications.waitFor();
+  await specifications.locator('.task-spec-list button').first().click();
+  await specifications.locator('pre').waitFor();
+  assert.equal(await specifications.locator('pre').textContent(),specificationText);
+  assert.equal(specificationPinned,false,'missing event identity opens original-message review instead of guessing');
+  await specifications.getByRole('button',{name:'Close',exact:true}).click();
+  messages[0].source_seq=12;
+  emit(snapshot());
 
   // Finishing does not silently activate the viewed history; continuing is explicit.
   emit({type:'state', running:true});
@@ -277,9 +463,44 @@ try {
   assert.deepEqual(errors, []);
   await page.close();
  }
+  {
+    pagedBrowse=true; failOlder=true;
+    const page=await browser.newPage({viewport:{width:1200,height:900}});
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
+    await page.goto(base+'/?sync=1&session=context-summary');
+    await page.locator('.message-input').waitFor();
+    emit({type:'state',running:true});
+    await page.locator('.session-running-mark').waitFor();
+    const before=switches;
+    await page.locator('.session-item-main').filter({hasText:other.name}).click();
+    await page.getByText('Historical answer',{exact:true}).waitFor();
+    await page.locator('.turn-process-toggle').click();
+    await page.locator('.tool-header').click();
+    await page.getByText('Recent tool output',{exact:true}).waitFor();
+    const prompt=page.getByText('Historical question',{exact:true});
+    const top=(await prompt.boundingBox()).y;
+    await page.locator('.history-load-more').evaluate(el=>el.click());
+    await page.locator('.messages-container [role="alert"]').waitFor();
+    assert.equal(await page.getByText('Historical answer',{exact:true}).count(),1,'older-page failure retains displayed history');
+    await page.locator('.messages-container [role="alert"] button').evaluate(el=>el.click());
+    await page.getByText('Older tool answer',{exact:true}).waitFor();
+    assert.equal(await page.locator('.user-message-bubble').count(),3);
+    assert.equal(await page.locator('.turn-nav-node').count(),3);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const afterTop=(await prompt.boundingBox()).y;
+    assert(Math.abs(afterTop-top)<3,`prepending history preserves reading position: ${top} -> ${afterTop}`);
+    assert.equal(await page.getByText('Recent tool output',{exact:true}).count(),1,'prepending preserves the expanded recent process and tool');
+    await page.locator('.turn-process-toggle').first().click();
+    await page.locator('.tool-header').first().click();
+    await page.getByText('Older tool output',{exact:true}).waitFor();
+    assert.equal(switches,before,'paging and expanding history never rebind the live runtime');
+    await page.close(); pagedBrowse=false;
+  }
   for (const refusal of [
     {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn'},
     {ok:false,active_turn:false,error:'session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")'},
+    {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn',idleReplay:true},
+    {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn',retry:true},
   ]) {
     const page=await browser.newPage({viewport:{width:1200,height:900}});
     await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
@@ -288,16 +509,37 @@ try {
     await page.getByText('The resource read boundary is ready.',{exact:false}).waitFor();
     switchRejection=refusal;
     await page.locator('.session-item-main').filter({hasText:other.name}).click();
-    await page.locator('.session-switch-notice').filter({hasText:'The current task is running, finishing, or switching.'}).waitFor();
+    await page.locator('.session-switch-notice').filter({hasText:'Session switch was deferred because the runtime is busy.'}).waitFor();
     assert.equal(await page.locator('.session-switch-notice').innerText().then(t=>t.includes('RuntimeRejected')),false);
     await page.waitForFunction(name=>document.querySelector('.session-item.active .session-item-name')?.textContent===name,meta.name);
     assert.equal(await page.locator('.session-item.active .session-item-name').innerText(),meta.name);
     await page.locator('.message-input').waitFor();
+    if (refusal.retry) {
+      switchRejection=null;
+      await page.getByRole('button',{name:'Retry switch',exact:true}).click();
+      await page.getByText('Historical answer',{exact:true}).waitFor();
+      await page.waitForFunction(() => !document.querySelector('.session-switch-notice'));
+      await page.close();
+      continue;
+    }
+    if (refusal.idleReplay) {
+      // No locally observed turn/terminal: an idle replay still clears Busy.
+      emit({type:'state',running:false});
+    } else if (refusal.active_turn) {
+      emit({type:"state",running:true});
+      await page.waitForTimeout(100);
+      emit({type:"state",running:false,stop_reason:"end_turn"});
+    } else {
+      // A successful authoritative handover also invalidates a previous refusal.
+      emit({type:"session_switched",session_id:id});
+    }
+    await page.waitForFunction(() => !document.querySelector(".session-switch-notice"));
     switchRejection=null;
     const count=switches;
     await page.locator('.session-item-main').filter({hasText:other.name}).click();
     await page.getByText('Historical answer',{exact:true}).waitFor();
     assert.equal(switches,count+1,'busy rejection must keep sync available for a later retry');
+    await page.waitForFunction(() => !document.querySelector('.session-switch-notice'));
     await page.close();
   }
   console.log('session browsing: history while running, return, completion retention, no rebind: passed');

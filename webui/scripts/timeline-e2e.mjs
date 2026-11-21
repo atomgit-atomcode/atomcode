@@ -98,21 +98,38 @@ try {
     await page.mouse.wheel(0, -25);
     await page.waitForTimeout(100);
     const up = await page.locator('.messages-container').evaluate(node => ({top: node.scrollTop, gap:node.scrollHeight-node.clientHeight-node.scrollTop}));
+    const readingAnchor = await page.locator('.tool-body').evaluateAll(nodes => {
+      const viewport = document.querySelector('.messages-container').getBoundingClientRect();
+      const index = nodes.findIndex(node => { const rect = node.getBoundingClientRect(); return rect.bottom > viewport.top + 2 && rect.top < viewport.bottom; });
+      return { index, top: nodes[index].getBoundingClientRect().top };
+    });
     for (const client of clients) for (const event of [{type:'state',running:true},{type:'text',content:'scroll-repro-chunk'},{type:'state',running:false}]) client.write(`data: ${JSON.stringify(event)}\n\n`);
     await page.waitForTimeout(200);
     const streamed = await page.locator('.messages-container').evaluate(node => ({top: node.scrollTop, gap:node.scrollHeight-node.clientHeight-node.scrollTop}));
     assert.ok(up.gap > 2);
     assert.ok(streamed.gap > 2, 'WebUI small upward scroll stays away from latest');
-    assert.equal(streamed.top, up.top, 'stream updates preserve the small-scroll reading position');
+    // Completion can add a process disclosure above the reader. Preserve the
+    // visible content anchor, rather than the absolute scroll offset.
+    const anchorTop = await page.locator('.tool-body').nth(readingAnchor.index).evaluate(node => node.getBoundingClientRect().top);
+    assert.ok(Math.abs(anchorTop - readingAnchor.top) <= 2, 'stream updates preserve the visible reading position');
     const initialCommand = await page.locator('.tool-name-secondary').first().innerText();
+    await page.evaluate(() => {
+      window.blankTimelineFrames = 0;
+      window.timelineObserver = new MutationObserver(() => {
+        if (!document.querySelector('.tool-body')) window.blankTimelineFrames++;
+      });
+      window.timelineObserver.observe(document.querySelector('.timeline-inner'), { childList: true, subtree: true });
+    });
     await page.locator('.messages-container').evaluate(node => { node.scrollTop = 0; });
     await new Promise(resolve => setTimeout(resolve, 550));
     await page.locator('.messages-container').hover(); await page.mouse.wheel(0, -300);
     await until(async () => (await page.locator('.tool-name-secondary').first().innerText()) !== initialCommand);
     for (let i = 0; i < 6; i++) {
-      await page.getByRole('button', { name: /加载更早的消息|Load earlier messages/ }).click();
+      await page.locator('.messages-container').evaluate(node => { node.scrollTop=0;node.dispatchEvent(new WheelEvent('wheel',{deltaY:-300,bubbles:true})); });
+      await page.waitForTimeout(550);
       await until(() => page.evaluate(() => !document.querySelector('.timeline-history-status[role="status"]')));
     }
+    assert.equal(await page.evaluate(() => { window.timelineObserver.disconnect(); return window.blankTimelineFrames; }), 0, 'archive hydration must keep the previous page visible');
     assert.ok(await page.locator('.tool-body').count() <= bound);
     const reading = await page.locator('.tool-name-secondary').first().innerText();
     for (const client of clients) {
@@ -132,7 +149,7 @@ try {
     await page.getByText(/needle-5/).first().waitFor();
     assert.ok(await page.locator('.tool-body').count() <= bound);
     await page.locator('.msg-search-close').click();
-    await page.getByRole('button', { name: /回到最新消息|Back to latest messages/ }).click();
+    await page.locator('.jump-to-bottom').click();
     await page.evaluate(() => navigator.clipboard.writeText('before-copy'));
     await page.locator('.msg-copy-btn').last().click();
     await until(() => page.evaluate(async () => { const text = await navigator.clipboard.readText(); return text.includes('output-0') && text.includes('needle-5') && text.includes('output-999'); }));

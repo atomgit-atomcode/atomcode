@@ -5,6 +5,7 @@
 //! plugin that can be disabled, reconfigured, or replaced, and that takes its
 //! tools *and* its prompt guidance with it when it goes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use serde_json::Value;
 
 use crate::events::{TurnStart, TurnStarted};
 use crate::seams::{CodeIndexSvc, McpSvc, SessionSvc, SkillsSvc};
-use crate::session::{InjectionOrigin, SessionEvent};
+use crate::session::{retained_events, InjectionOrigin, LoggedEvent, SessionEvent};
 
 use super::tools::{contribute_prompt, mount};
 
@@ -194,8 +195,8 @@ impl Plugin for SkillsPlugin {
                  per-project and per-user skill directories plus anything the \
                  row's `dirs` config adds. To add one, drop a markdown file in \
                  a skill directory and restart; nothing needs recompiling. \
-                 `list_skills` shows what is loaded now. Static debugging workflows can be \
-                 loaded before a user turn; auto-load: debugging opts in, auto-load: off opts out. \
+                 `list_skills` shows what is loaded now. Static task workflows can be \
+                 loaded before a user turn; auto-load: debugging opts into debugging tasks, auto-load: browser-use into explicit browser tasks; auto-load: off opts out. \
                  The skills row auto_load:false or user [no-auto-skills] disables auto-loading. \
                  Automatic loading executes no embedded commands and grants no allowed-tools."
             ),
@@ -290,6 +291,41 @@ impl Plugin for CodeGraphPlugin {
     }
 }
 
+// ---- read-only architectural evidence (explicit opt-in) --------------------
+
+pub struct ArchitectureTopologyPlugin;
+#[async_trait]
+impl Plugin for ArchitectureTopologyPlugin {
+    fn name(&self) -> &'static str {
+        "architecture-topology"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["product-dirs", "tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["code-index"]
+    }
+    fn description(&self) -> &'static str {
+        "opt-in read-only architectural evidence and placement candidate retrieval"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        // No traversal at mount: only an explicit tool call reads the repo.
+        let dirs = (*crate::product_dirs(ctx)?).clone();
+        let index = ctx.service::<CodeIndexSvc>();
+        mount(
+            ctx,
+            vec![Arc::new(
+                atomcode_capabilities::codeintel::architecture::RepositoryArchitectureTool::new(
+                    dirs, index,
+                ),
+            )],
+        )?;
+        contribute_prompt(ctx,"architecture-topology",57,
+            "For architectural planning or choosing a new file location, use `repo_architecture` for bounded evidence. Treat candidate rankings as retrieval hints, check applicable instructions and cited files, and report uncertainty rather than inventing module ownership.");
+        Ok(())
+    }
+}
+
 // ---- web ----------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]
@@ -360,7 +396,7 @@ impl Plugin for WebPlugin {
             .or_else(crate::model_source::web_search_provider);
         let search = match &provider {
             Some(name) => WebSearchTool::with_provider_and_key(name, self.api_key.clone()),
-            None => WebSearchTool::with_provider_and_key("exa", self.api_key.clone()),
+            None => WebSearchTool::with_provider_and_key("auto", self.api_key.clone()),
         };
         mount(
             ctx,
@@ -403,7 +439,23 @@ impl Plugin for WebPlugin {
 /// product once mounted the tool and not this, so on the product `/review`
 /// did not exist.
 pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
-    crate::commands::register(ctx, Arc::new(ReviewCommand(tool)))
+    register_review_command_with_policy(ctx, tool, false)
+}
+
+/// Register the built-in slash command with an explicit inline execution
+/// policy. Use this for tools whose command path must bypass model-oriented
+/// delegation; generic third-party reviewer tools should use
+/// [`register_review_command`] so their argument contract stays untouched.
+pub fn register_review_command_inline(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
+    register_review_command_with_policy(ctx, tool, true)
+}
+
+fn register_review_command_with_policy(
+    ctx: &Context,
+    tool: Arc<dyn Tool>,
+    inline: bool,
+) -> Result<(), String> {
+    crate::commands::register(ctx, Arc::new(ReviewCommand(tool, inline)))
 }
 
 /// `review`: the reviewer over the current changes, run by a person.
@@ -411,7 +463,7 @@ pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(),
 /// The same tool the row mounted, with the same rules and the same provider
 /// slot. What "the current changes" means — staged, a base, a range — is the
 /// tool's own argument, passed through as typed.
-struct ReviewCommand(Arc<dyn Tool>);
+struct ReviewCommand(Arc<dyn Tool>, bool);
 
 #[async_trait]
 impl crate::commands::CatalogCommand for ReviewCommand {
@@ -449,6 +501,13 @@ impl crate::commands::CatalogCommand for ReviewCommand {
             base => {
                 call.insert("base".into(), serde_json::Value::String(base.to_string()));
             }
+        }
+        // The command is already the user's explicit review request. Mark it
+        // internally so ReviewTool runs its read-only reviewer directly
+        // instead of handing the task to a second agent that only calls this
+        // same tool. This field is not part of the model-facing schema.
+        if self.1 {
+            call.insert("_inline_command".into(), serde_json::Value::Bool(true));
         }
         let result = self
             .0
@@ -633,7 +692,7 @@ impl crate::commands::CatalogCommand for RunSkill {
                 })
                 .into_owned(),
             ),
-            summary: self.skill.description.clone(),
+            summary: self.skill.summary(),
             target: atomcode_kernel::agent::CommandTarget::Session,
             args_requirement: self.skill.args_requirement,
             accepts_images: true,
@@ -676,7 +735,15 @@ impl crate::commands::CatalogCommand for RunSkill {
                     },
                 },
             ),
-            output: format!("按 `{name}` 开始"),
+            output: if self.command {
+                format!("按 `{name}` 开始")
+            } else {
+                with_skill_notice(
+                    format!("按 `{name}` 开始"),
+                    &agent.session().events(),
+                    std::slice::from_ref(&self.skill.name),
+                )
+            },
         }))
     }
 
@@ -709,6 +776,57 @@ fn missing_required_arg(
     }
 }
 
+/// History, not current authorization or a second session state owner. Retained
+/// facts survive compaction but exclude conversation rewind and undone turns.
+fn skill_history(events: &[LoggedEvent]) -> BTreeMap<String, BTreeSet<u64>> {
+    let mut history: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for entry in retained_events(events) {
+        if let SessionEvent::Injected {
+            turn,
+            origin: InjectionOrigin::Skill { name },
+            ..
+        } = &entry.event
+        {
+            for name in name
+                .split(" · ")
+                .filter(|name| !name.starts_with("[command] "))
+            {
+                history.entry(name.to_string()).or_default().insert(*turn);
+            }
+        }
+    }
+    history
+}
+
+fn skill_repeat_notice(events: &[LoggedEvent], names: &[String]) -> String {
+    let history = skill_history(events);
+    names
+        .iter()
+        .filter_map(|name| {
+            let turn = *history.get(name)?.last()?;
+            Some(t(Msg::CmdSkillReload { name, turn }).into_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn quoted_skill_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn with_skill_notice(output: String, events: &[LoggedEvent], names: &[String]) -> String {
+    let notice = skill_repeat_notice(events, names);
+    if notice.is_empty() {
+        output
+    } else {
+        format!("{output}\n{notice}")
+    }
+}
+
 /// The leading run of skill names in `args`, and the rest as one task.
 ///
 /// `known` answers "is this token the name of a skill", canonically — the
@@ -721,18 +839,21 @@ fn missing_required_arg(
 /// both "fix the auth bug".
 ///
 /// The failure this shape has, and the reason the caller echoes what it loaded:
-/// a misspelled second name is not an error, it silently becomes the first word
+/// an unmarked misspelled second name is not an error, it becomes the first word
 /// of the task. Nothing here can tell that apart from a task that happens to
 /// start with a word — but a person reading "loaded: plan" when they asked for
 /// two can.
+///
+/// Marked `$name` / `¥name` tokens in this leading run are explicit references:
+/// unknown ones fail the entire preparation before anything can be queued.
+/// After ordinary task text begins, markers in prose are left alone.
 ///
 /// The task keeps its original spacing: it is prose being handed to a model,
 /// and re-joining on single spaces would rewrite anything with alignment in it.
 fn skills_and_task<'a>(
     args: &'a str,
     known: impl Fn(&str) -> Option<String>,
-) -> (Vec<String>, &'a str) {
-    let mut taken: Vec<String> = Vec::new();
+) -> Result<(Vec<String>, &'a str), String> {
     let mut canonical: Vec<String> = Vec::new();
     let mut rest = args.trim_start();
     loop {
@@ -740,14 +861,19 @@ fn skills_and_task<'a>(
             Some(token) => token,
             None => break,
         };
-        let Some(name) = known(token) else { break };
+        let explicit = token.strip_prefix('$').or_else(|| token.strip_prefix('¥'));
+        let Some(name) = known(explicit.unwrap_or(token)) else {
+            if let Some(name) = explicit {
+                return Err(t(Msg::CmdSkillUnknownExplicit { name }).into_owned());
+            }
+            break;
+        };
         if !canonical.contains(&name) {
             canonical.push(name);
-            taken.push(token.to_string());
         }
         rest = rest[token.len()..].trim_start();
     }
-    (canonical, rest)
+    Ok((canonical, rest))
 }
 
 /// `skills`: what is installed, and — given names — running them.
@@ -784,17 +910,17 @@ impl crate::commands::CatalogCommand for ListSkills {
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         let args = args.trim();
-        if !args.is_empty() {
+        if !args.is_empty() && args != "--list" {
             return Ok(self.prepare_them(&agent, args)?.send(&agent, Vec::new()));
         }
-        Ok(self.listing())
+        Ok(self.listing(&agent.session().events()))
     }
     fn prepare_input(
         &self,
         agent: &crate::agent::Agent,
         args: &str,
     ) -> Result<Option<crate::commands::PreparedCommandInput>, String> {
-        if args.trim().is_empty() {
+        if args.trim().is_empty() || args.trim() == "--list" {
             return Ok(None);
         }
         self.prepare_them(agent, args.trim()).map(Some)
@@ -802,7 +928,8 @@ impl crate::commands::CatalogCommand for ListSkills {
 }
 
 impl ListSkills {
-    fn listing(&self) -> String {
+    fn listing(&self, events: &[LoggedEvent]) -> String {
+        let history = skill_history(events);
         let listed = self.0.all();
         let mut sections = Vec::new();
         if listed.is_empty() {
@@ -813,10 +940,20 @@ impl ListSkills {
                     .into_iter()
                     .map(|skill| {
                         format!(
-                            "{} · {}\n  {}",
+                            "{} · {}\n  {}{}",
                             skill.name,
-                            skill.description,
-                            skill.source_path.display()
+                            skill.summary(),
+                            skill.source_path.display(),
+                            history
+                                .get(&skill.name)
+                                .and_then(|turns| turns.last().map(|turn| format!(
+                                    "\n  {}",
+                                    t(Msg::CmdSkillUsed {
+                                        count: turns.len(),
+                                        turn: *turn
+                                    })
+                                )))
+                                .unwrap_or_default()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -846,6 +983,25 @@ impl ListSkills {
                     .join("\n")
             ));
         }
+        if !history.is_empty() {
+            let used = history
+                .iter()
+                .filter_map(|(name, turns)| {
+                    turns.last().map(|turn| {
+                        format!(
+                            "  {name} · {}",
+                            t(Msg::CmdSkillUsed {
+                                count: turns.len(),
+                                turn: *turn
+                            })
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            sections.push(format!("{}\n{used}", t(Msg::CmdSkillsHistory)));
+        }
+        sections.push(t(Msg::CmdSkillsHelp).into_owned());
         sections.join("\n\n")
     }
 
@@ -854,17 +1010,51 @@ impl ListSkills {
         agent: &crate::agent::Agent,
         args: &str,
     ) -> Result<crate::commands::PreparedCommandInput, String> {
+        let boundary =
+            atomcode_capabilities::skills::spelling::invocation_boundary(args, |token| {
+                self.0.get(token).is_some_and(|skill| skill.user_invocable)
+            });
+        let available: Vec<_> = self
+            .0
+            .all()
+            .into_iter()
+            .filter(|skill| skill.user_invocable)
+            .collect();
+        let candidates = |word: &str| {
+            atomcode_capabilities::skills::spelling::suggestions(
+                word,
+                available.iter().map(|skill| skill.name.as_str()),
+            )
+        };
+        let append_suggestion = |error: String| {
+            let suggested = boundary
+                .as_ref()
+                .map(|b| candidates(b.word))
+                .unwrap_or_default();
+            if suggested.is_empty() {
+                error
+            } else {
+                let candidates = quoted_skill_names(&suggested);
+                format!(
+                    "{error}\n{}",
+                    t(Msg::CmdSkillSpellingSuggestion {
+                        candidates: &candidates
+                    })
+                )
+            }
+        };
         let (names, task) = skills_and_task(args, |token| {
             self.0
                 .get(token)
                 .filter(|skill| skill.user_invocable)
                 .map(|skill| skill.name.clone())
-        });
+        })
+        .map_err(&append_suggestion)?;
         let Some(first) = args.split_whitespace().next() else {
             return Err("没说要用哪个 skill".into());
         };
         if names.is_empty() {
-            return Err(format!("没有叫 `{first}` 的 skill"));
+            return Err(append_suggestion(format!("没有叫 `{first}` 的 skill")));
         }
         // Each gets the same task: they are several ways of looking at one
         // thing, not a pipeline.
@@ -884,6 +1074,23 @@ impl ListSkills {
         if blocks.is_empty() {
             return Err("展开之后是空的".into());
         }
+        let spelling_notice = boundary.as_ref().and_then(|boundary| {
+            let suggested = atomcode_capabilities::skills::spelling::task_candidates(
+                boundary,
+                available.iter().map(|skill| skill.name.as_str()),
+            );
+            if suggested.is_empty() {
+                return None;
+            }
+            let candidates = quoted_skill_names(&suggested);
+            Some(
+                t(Msg::CmdSkillTaskSpelling {
+                    word: boundary.word,
+                    candidates: &candidates,
+                })
+                .into_owned(),
+            )
+        });
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
         Ok(crate::commands::PreparedCommandInput {
@@ -902,14 +1109,24 @@ impl ListSkills {
                         .join(" · "),
                 },
             ),
-            output: format!(
-                "按 {} 开始",
-                names
-                    .iter()
-                    .map(|name| bare_name(name))
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            ),
+            output: {
+                let output = with_skill_notice(
+                    format!(
+                        "按 {} 开始",
+                        names
+                            .iter()
+                            .map(|name| bare_name(name))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    ),
+                    &agent.session().events(),
+                    &names,
+                );
+                match spelling_notice {
+                    Some(notice) => format!("{output}\n{notice}"),
+                    None => output,
+                }
+            },
         })
     }
 }
@@ -1306,6 +1523,27 @@ impl Plugin for MemoryPlugin {
     }
 }
 
+struct McpTurnFinish(Arc<McpRegistry>);
+#[async_trait]
+impl atomcode_plexus::Listener<crate::events::TurnFinishing> for McpTurnFinish {
+    async fn call(&self, outcome: &crate::seams::TurnOutcome) -> Option<()> {
+        let here = crate::agent::current()?;
+        let session = here.service::<SessionSvc>()?;
+        let (turn, _) = session.current_turn_start()?;
+        if session.id() != outcome.session_id || turn != outcome.turn {
+            return None;
+        }
+        self.0.finish_turn().await;
+        Some(())
+    }
+}
+
+/// Both the generic harness row and coding's replacement use this existing
+/// awaited seam; no driver-owned or model-visible cleanup tool is added.
+pub fn mount_mcp_turn_lifecycle(ctx: &Context, registry: Arc<McpRegistry>) {
+    let _ = ctx.on_parallel::<crate::events::TurnFinishing>(Arc::new(McpTurnFinish(registry)));
+}
+
 // ---- mcp ----------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]
@@ -1364,6 +1602,7 @@ impl Plugin for McpPlugin {
             .wait_for_initial_connections(std::time::Duration::from_millis(row.connect_timeout_ms))
             .await;
 
+        mount_mcp_turn_lifecycle(ctx, registry.clone());
         let infos = registry.list_all_tools().await;
         let mut mounted = Vec::new();
         let mut adapters: Vec<Arc<dyn Tool>> = Vec::new();
@@ -1416,11 +1655,22 @@ mod tests {
     /// only duty: the front end reads `args_requirement` off the catalog
     /// description to route its Enter key, and this row is the only one that
     /// knows a skill's own declaration.
+    #[test]
+    fn skill_display_title_stays_out_of_the_command_identifier() {
+        let mut command =
+            runskill_with_requirement(atomcode_kernel::agent::ArgsRequirement::Unspecified);
+        std::sync::Arc::make_mut(&mut command.skill).display_name = Some("玲珑打包技能".into());
+        let described = command.describe();
+        assert_eq!(described.name, "cmd");
+        assert_eq!(described.summary, "玲珑打包技能 · a command");
+    }
+
     fn runskill_with_requirement(requirement: atomcode_kernel::agent::ArgsRequirement) -> RunSkill {
         use atomcode_capabilities::skills::{Skill, SkillRegistry};
         use std::path::PathBuf;
         let skill = std::sync::Arc::new(Skill {
             name: "cmd".into(),
+            display_name: None,
             description: "a command".into(),
             template: "body".into(),
             allowed_tools: vec![],
@@ -1551,7 +1801,7 @@ mod tests {
                 .as_path()
                 .to_path_buf()]));
         let command = super::ListSkills(registry.clone());
-        let output = command.listing();
+        let output = command.listing(&[]);
         assert!(output.contains("sample · test"));
         assert!(output.contains(
             &tmp.as_path()
@@ -1567,13 +1817,103 @@ mod tests {
         .unwrap();
         registry.reload_dirs(&[tmp.as_path().to_path_buf()], &[]);
         assert!(registry.is_empty());
-        let output = command.listing();
+        let output = command.listing(&[]);
         assert!(
             output.contains("SKILL.md"),
             "failures-only catalogs still have details"
         );
         assert!(output.contains("invalid"));
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn marked_skill_prefix_is_validated_before_any_submission() {
+        let _locale = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+        let known = |name: &str| match name {
+            "plan" | "plugin:plan" => Some("plugin:plan".into()),
+            "review" => Some("review".into()),
+            _ => None,
+        };
+        let (names, task) =
+            skills_and_task("$plan ¥review $plugin:plan fix  the bug", known).unwrap();
+        assert_eq!(names, ["plugin:plan", "review"]);
+        assert_eq!(task, "fix  the bug");
+        let error = skills_and_task("plan $typo task", known).unwrap_err();
+        assert!(error.contains("typo") && error.contains("no skills were submitted"));
+        let (_, task) = skills_and_task("plan use $HOME and $unknown", known).unwrap();
+        assert_eq!(task, "use $HOME and $unknown");
+        assert!(skills_and_task("plan $ task", known).is_err());
+    }
+
+    #[test]
+    fn skill_history_follows_retained_facts_not_compacted_context_or_commands() {
+        use crate::session::{InjectionOrigin, RewindScope, SessionEvent, SessionLog};
+        let log = SessionLog::new("history");
+        log.append(SessionEvent::Injected {
+            turn: 1,
+            text: "first".into(),
+            origin: InjectionOrigin::Skill {
+                name: "plugin:plan · review · [command] custom".into(),
+            },
+        });
+        log.append(SessionEvent::Injected {
+            turn: 1,
+            text: "again".into(),
+            origin: InjectionOrigin::Skill {
+                name: "review".into(),
+            },
+        });
+        log.append(SessionEvent::Injected {
+            turn: 1,
+            text: "auto".into(),
+            origin: InjectionOrigin::Reminder,
+        });
+        let second = log.append(SessionEvent::TurnStart { turn: 2 });
+        log.append(SessionEvent::Injected {
+            turn: 2,
+            text: "second".into(),
+            origin: InjectionOrigin::Skill {
+                name: "plugin:plan".into(),
+            },
+        });
+        log.append(SessionEvent::Compacted {
+            turn: 2,
+            through: second - 1,
+            from: 0,
+            summary: "compacted skill work".into(),
+        });
+        assert!(!log
+            .derive_messages()
+            .iter()
+            .any(|message| message.text == "first"));
+        let history = super::skill_history(&log.events());
+        assert_eq!(history["plugin:plan"].len(), 2);
+        assert_eq!(history["review"].len(), 1);
+        assert_eq!(history.len(), 2);
+        log.append(SessionEvent::Rewound {
+            turn: 2,
+            to: second,
+            scope: RewindScope::Code,
+        });
+        assert_eq!(super::skill_history(&log.events())["plugin:plan"].len(), 2);
+        log.append(SessionEvent::Rewound {
+            turn: 2,
+            to: second,
+            scope: RewindScope::Conversation,
+        });
+        let restored = SessionLog::new("resumed");
+        restored.restore(log.events());
+        let history = super::skill_history(&restored.events());
+        assert_eq!(
+            history["plugin:plan"].iter().copied().collect::<Vec<_>>(),
+            [1]
+        );
+        restored.append(SessionEvent::Interrupted {
+            turn: 1,
+            undone: true,
+        });
+        assert!(super::skill_history(&restored.events()).is_empty());
     }
 
     /// Where the names stop and the task starts.
@@ -1599,27 +1939,27 @@ mod tests {
             "plugin:plan" | "plugin:review" => Some(token.to_string()),
             _ => None,
         };
-        let (names, task) = skills_and_task("plan review fix the auth bug", known);
+        let (names, task) = skills_and_task("plan review fix the auth bug", known).unwrap();
         assert_eq!(names, vec!["plugin:plan", "plugin:review"]);
         assert_eq!(task, "fix the auth bug");
 
         // Spacing is the person's.
-        let (_, task) = skills_and_task("plan   look   at   this", known);
+        let (_, task) = skills_and_task("plan   look   at   this", known).unwrap();
         assert_eq!(task, "look   at   this");
 
         // Canonically the same skill, named twice.
-        let (names, task) = skills_and_task("plan plugin:plan go", known);
+        let (names, task) = skills_and_task("plan plugin:plan go", known).unwrap();
         assert_eq!(names, vec!["plugin:plan"], "loaded once");
         assert_eq!(task, "go");
 
         // The first word already ends it.
-        let (names, task) = skills_and_task("fix the plan", known);
+        let (names, task) = skills_and_task("fix the plan", known).unwrap();
         assert!(names.is_empty());
         assert_eq!(task, "fix the plan", "and nothing was eaten off the front");
 
         // Names and nothing else is a run with an empty task, not an error:
         // a skill that needs no argument is the ordinary case.
-        let (names, task) = skills_and_task("  plan  ", known);
+        let (names, task) = skills_and_task("  plan  ", known).unwrap();
         assert_eq!(names, vec!["plugin:plan"]);
         assert_eq!(task, "");
     }

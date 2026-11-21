@@ -22,6 +22,46 @@ fn _isolate_atomcode_home() {
 }
 
 #[tokio::test]
+async fn obsolete_model_reasoning_budgets_do_not_install_a_deadline() {
+    let project = tempfile::tempdir().unwrap();
+    let source: atomcode_config::Config = toml::from_str(
+        r#"
+default_model = "custom/slow"
+[provider_accounts.custom]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+[models."custom/slow"]
+account = "custom"
+model = "slow"
+reasoning_timeout_secs = 900
+[models."custom/unlimited"]
+account = "custom"
+model = "unlimited"
+reasoning_timeout_secs = 0
+"#,
+    )
+    .unwrap();
+    for selection in ["custom/slow", "custom/unlimited"] {
+        let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+            &source,
+            project.path(),
+            atomcode_coding::config::product_dirs_from_env(),
+            Some(selection),
+            None,
+            false,
+            false,
+        );
+        let cfg = runtime.agent_config();
+        assert!(cfg.chat_options.reasoning_effort.is_none());
+        let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+        assert!(!mounted.dump().contains("reasoning_timeout"));
+        assert!(!mounted.dump().contains("reasoning_recovery"));
+        assert!(!mounted.dump().contains("reasoning_checkpoint"));
+        mounted.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     let project = tempfile::tempdir().unwrap();
     let mut cfg = atomcode_coding::CodingAgentConfig::new(
@@ -33,6 +73,7 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     );
     cfg.first_token_timeout = std::time::Duration::from_secs(600);
     cfg.stream_timeout = std::time::Duration::from_secs(120);
+    cfg.round_cap_checkpoint = true;
     let dump = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
         .await
         .dump();
@@ -41,6 +82,7 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
         "{dump}"
     );
     assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
+    assert!(dump.contains("\"max_recoveries\": 3"), "{dump}");
 }
 
 #[tokio::test]
@@ -73,6 +115,31 @@ async fn the_configured_absolute_compaction_budget_reaches_the_existing_strategy
         false,
     );
     assert!(runtime.agent_config().compact_token_limit.is_none());
+}
+
+#[tokio::test]
+async fn the_configured_stub_keep_budget_reaches_the_existing_strategy_row() {
+    let project = tempfile::tempdir().unwrap();
+    let file: atomcode_config::config::Config =
+        toml::from_str("[compaction]\nstub_recent_budget=100000").unwrap();
+    let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    );
+    let cfg = runtime.agent_config();
+    assert_eq!(cfg.compact_stub_recent_budget, Some(100_000));
+    let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+    assert!(
+        mounted.dump().contains("\"stub_recent_budget\": 100000"),
+        "{}",
+        mounted.dump()
+    );
+    mounted.shutdown().await;
 }
 
 /// Answers with a little text and a usage report — enough for a metering
@@ -1142,4 +1209,103 @@ async fn loaded_skill_resources_are_readable_in_a_fenced_mount_and_revoked_on_re
         .unwrap();
     assert!(fs.read_text(&resource).await.is_err());
     next.shutdown().await;
+}
+
+#[tokio::test]
+async fn architecture_topology_follows_standard_config_and_host_can_disable_it() {
+    use atomcode_harness::seams::{SystemPromptSvc, ToolsSvc};
+    let project = tempfile::tempdir().unwrap();
+    for enabled in [false, true] {
+        let file: atomcode_config::Config =
+            toml::from_str(&format!("[coding]\narchitecture_topology = {enabled}\n")).unwrap();
+        let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+            &file,
+            project.path(),
+            atomcode_coding::config::product_dirs_from_env(),
+            None,
+            None,
+            false,
+            false,
+        );
+        let cfg = runtime.agent_config();
+        assert_eq!(cfg.architecture_topology, enabled);
+        let app = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+        assert_eq!(
+            app.context()
+                .service::<ToolsSvc>()
+                .unwrap()
+                .names()
+                .contains(&"repo_architecture".into()),
+            enabled
+        );
+        assert_eq!(
+            app.context()
+                .service::<SystemPromptSvc>()
+                .unwrap()
+                .render()
+                .contains("`repo_architecture`"),
+            enabled
+        );
+        app.shutdown().await;
+        if enabled {
+            let mut opts = quiet_options();
+            opts.host_plugins = atomcode_coding::HostPlugins::new()
+                .with_layer(atomcode_coding::host::Layer::new().disable("architecture-topology"));
+            let app = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+            assert!(!app
+                .context()
+                .service::<ToolsSvc>()
+                .unwrap()
+                .names()
+                .contains(&"repo_architecture".into()));
+            app.shutdown().await;
+        }
+    }
+    assert!(
+        !atomcode_config::Config::default()
+            .coding
+            .architecture_topology
+    );
+}
+
+#[tokio::test]
+async fn no_tools_does_not_advertise_a_disk_skill_catalog() {
+    use atomcode_kernel::stream::StreamEvent;
+    use atomcode_kernel::testkit::RecordingProvider;
+    let project = tempfile::tempdir().unwrap();
+    let dirs =
+        atomcode_capabilities::ProductDirs::new(project.path().join("user"), ".test-product");
+    let skill = dirs.user().join("skills/no-tools-catalog-sentinel");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: no-tools-catalog-sentinel\ndescription: unique-catalog-sentinel-do-not-advertise\n---\nUse this skill.\n").unwrap();
+    std::fs::write(
+        project.path().join("AGENTS.md"),
+        "Project instruction sentinel: keep-user-instructions.\n",
+    )
+    .unwrap();
+    let cfg = CodingAgentConfig::new(
+        "placeholder",
+        "http://localhost",
+        "lumen-alpha",
+        project.path(),
+        dirs,
+    );
+    let mut opts = quiet_options();
+    opts.tools = false;
+    opts.skill_dirs = Some(vec![skill.parent().unwrap().to_path_buf()]);
+    let provider = Arc::new(RecordingProvider::new(vec![vec![
+        StreamEvent::TextDelta("done".into()),
+        StreamEvent::Done { truncated: false },
+    ]]));
+    let mut mounted = support::mount(&cfg, opts, provider.clone()).await;
+    let result = turn(&mut mounted.handle, "hello", allow()).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let requests = provider.recorded();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].1.is_empty());
+    let prompt = format!("{:?}", requests[0].0);
+    assert!(!prompt.contains("no-tools-catalog-sentinel"), "{prompt}");
+    assert!(!prompt.contains("unique-catalog-sentinel"), "{prompt}");
+    assert!(prompt.contains("keep-user-instructions"), "{prompt}");
+    mounted.shutdown().await;
 }

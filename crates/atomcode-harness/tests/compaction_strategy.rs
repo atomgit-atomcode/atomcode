@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_capabilities::compaction::{OverflowCompaction, StubCompaction, ANCHOR_SENTINEL};
-use atomcode_harness::plugins::compaction::{decide_with_strategy, strategy_would_summarize};
+use atomcode_harness::plugins::compaction::{
+    decide_with_strategy, strategy_would_summarize, stub_on_overflow,
+};
 use atomcode_harness::seams::{CompactionAsk, CompactionDecision};
 use atomcode_harness::session::{SeqNo, SessionEvent, SessionLog};
 use atomcode_kernel::message::{
@@ -206,6 +208,52 @@ impl Writer {
 fn bulk(tag: &str, bytes: usize) -> String {
     let line = format!("{tag} line of output that nobody needs in full any more\n");
     line.repeat(bytes / line.len() + 1)
+}
+
+#[test]
+fn harness_overflow_only_rewrites_new_tool_output() {
+    let mut writer = Writer::new();
+    writer.ask("inspect output");
+    writer.call("bash", &format!("{}\nexit: 1", "输出\n".repeat(1_000)));
+    let overflow = ask(CompactTrigger::Overflow { attempt: 0 }, 1_000, 0);
+    let first = stub_on_overflow(&writer.log, &overflow).expect("large output is compressed");
+    assert_eq!(first.rewrites.len(), 1);
+    assert!(first.rewrites[0].text.contains("[omitted "));
+    assert!(first.rewrites[0].text.ends_with("exit: 1]"));
+    writer.apply(first);
+    let next_rung = ask(CompactTrigger::Overflow { attempt: 1 }, 1_000, 0);
+    assert!(stub_on_overflow(&writer.log, &next_rung).is_none());
+
+    let fresh = writer.call("bash", &"x".repeat(3_000));
+    let rewrites = stub_on_overflow(&writer.log, &next_rung).unwrap().rewrites;
+    assert_eq!(rewrites.len(), 1);
+    assert_eq!(rewrites[0].seq, fresh);
+}
+
+#[test]
+fn harness_overflow_compresses_raw_output_with_stub_like_headers() {
+    let mut writer = Writer::new();
+    writer.ask("inspect output");
+    let raw_preview = writer.call(
+        "bash",
+        &format!(
+            "[runner ok: 3000 lines, head: starting\n{}]",
+            "body\n".repeat(1_000)
+        ),
+    );
+    let raw_first_line = writer.call(
+        "bash",
+        &format!("[runner ok: 1 lines, first: {}]", "x".repeat(1_000)),
+    );
+    let overflow = ask(CompactTrigger::Overflow { attempt: 0 }, 1_000, 0);
+    let rewrites = stub_on_overflow(&writer.log, &overflow).unwrap().rewrites;
+    assert_eq!(
+        rewrites
+            .iter()
+            .map(|rewrite| rewrite.seq)
+            .collect::<Vec<_>>(),
+        vec![raw_preview, raw_first_line]
+    );
 }
 
 fn no_orphan_results(messages: &[Message]) -> Result<(), String> {
@@ -471,6 +519,7 @@ async fn a_cut_never_leaves_a_result_whose_call_it_removed() {
     impl CompactionStrategy for CutAt {
         async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
             CompactionPlan {
+                diagnostic: None,
                 drain_from: view.sacred_floor,
                 drain_to: self.0,
                 summary: Some("S".into()),
@@ -676,4 +725,87 @@ async fn a_late_explicit_specification_survives_model_and_model_free_compaction(
             1
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_failed_summary_keeps_its_reason_after_switching_to_a_larger_window() {
+    use atomcode_harness::plugins::compaction::attempt_with_strategy;
+    use atomcode_kernel::message::CompactionDiagnostic;
+    let mut writer = Writer::new();
+    writer.ask("keep the agreed design");
+    writer.answer(&"design details ".repeat(160_000));
+    writer.ask("continue");
+    let before = writer.log.events();
+    let provider = Arc::new(UnavailableSummary {
+        partial: false,
+        calls: Default::default(),
+    });
+    let policy = OverflowCompaction::new(StubCompaction::default(), Some(provider));
+    for window in [512_000, 1_000_000] {
+        let result = attempt_with_strategy(
+            &policy,
+            &writer.log,
+            &ask(CompactTrigger::Manual { focus: None }, window, 0),
+        )
+        .await;
+        assert!(result.decision.is_none());
+        assert_eq!(
+            result.diagnostic,
+            Some(CompactionDiagnostic::SummaryAuthenticationFailed)
+        );
+        assert_eq!(
+            writer.log.events(),
+            before,
+            "display diagnostics must not become session facts"
+        );
+    }
+    let healthy = strategy(Some(Summarizer::new()));
+    let result = attempt_with_strategy(
+        &healthy,
+        &writer.log,
+        &ask(CompactTrigger::Manual { focus: None }, 1_000_000, 0),
+    )
+    .await;
+    assert!(result.diagnostic.is_none());
+    assert!(result.decision.is_some());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_nonshrinking_proposal_is_distinct_from_nothing_to_compact() {
+    use atomcode_harness::plugins::compaction::attempt_with_strategy;
+    use atomcode_kernel::message::CompactionDiagnostic;
+    struct Growing;
+    #[async_trait]
+    impl CompactionStrategy for Growing {
+        async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+            CompactionPlan {
+                drain_from: view.sacred_floor,
+                drain_to: view.messages.len(),
+                summary: Some("x".repeat(100_000)),
+                ..Default::default()
+            }
+        }
+    }
+    let mut writer = Writer::new();
+    writer.ask("keep");
+    writer.answer("brief answer");
+    writer.ask("next");
+    let before = writer.log.events();
+    let result = attempt_with_strategy(
+        &Growing,
+        &writer.log,
+        &ask(CompactTrigger::Manual { focus: None }, 512_000, 0),
+    )
+    .await;
+    assert!(result.decision.is_none());
+    assert_eq!(result.diagnostic, Some(CompactionDiagnostic::NotSmaller));
+    assert_eq!(writer.log.events(), before);
+    let result = attempt_with_strategy(
+        &atomcode_kernel::message::NoCompaction,
+        &writer.log,
+        &ask(CompactTrigger::Manual { focus: None }, 512_000, 0),
+    )
+    .await;
+    assert!(result.decision.is_none());
+    assert!(result.diagnostic.is_none());
 }

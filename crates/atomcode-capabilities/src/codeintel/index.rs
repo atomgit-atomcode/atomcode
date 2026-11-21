@@ -214,7 +214,7 @@ impl std::error::Error for IndexError {}
 /// list keeps codeintel consistent with the other walkers instead of maintaining a
 /// second copy that drifts. (The `ignore` builder methods return `&mut WalkBuilder`,
 /// so options are set as statements and the owned builder returned at the end.)
-fn build_walk(root: &Path, skip: &crate::world::SkipDir) -> WalkBuilder {
+pub(super) fn build_walk(root: &Path, skip: &crate::world::SkipDir) -> WalkBuilder {
     let skip = skip.clone();
     let mut walker = WalkBuilder::new(root);
     walker.hidden(true);

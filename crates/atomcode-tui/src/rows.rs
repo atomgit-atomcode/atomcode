@@ -171,6 +171,21 @@ name = "tui-commands-plugin"
 # end in the same place.
 [[insert]]
 name = "tui-commands-setup"
+# `/setup`: unfold the seed skills on a machine that has never run it, reload,
+# then hand the name to the agent. Its own row rather than the agent's catalog,
+# because on the machine that needs it the agent's catalog does not have the
+# command yet — that is the whole problem this row solves. It takes the name
+# whether or not the agent has it (`CommandSet::overrides`), so both machines
+# end in the same place.
+[[insert]]
+name = "tui-commands-setup"
+
+# `/import`: what another AI coding agent left behind, and where each item
+# stands. Its own row like the others: the report comes from a host port,
+# and a screen with no such port keeps the command and says the service is
+# unavailable.
+[[insert]]
+name = "tui-commands-import"
 
 # `/tools`: the panel, and the same two switches typed out. Its own row for the
 # same reason `/plugin` has one — the panel it pulls up is the launcher's, and a
@@ -221,6 +236,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(PluginCommandsRow),
         Arc::new(ToolCommandsRow),
         Arc::new(SetupCommandsRow),
+        Arc::new(ImportCommandsRow),
         Arc::new(TakeAwayCommandsRow),
         Arc::new(AgentCatalogCommandsRow),
         Arc::new(HelpCommandsRow),
@@ -757,6 +773,12 @@ commands!(
     "tui-commands-screen",
     crate::commands::ScreenCommands,
     "clear, scroll, fold — the screen's own verbs"
+);
+commands!(
+    ImportCommandsRow,
+    "tui-commands-import",
+    crate::commands::ImportCommands,
+    "/import: what another AI coding agent left behind, and where each item stands"
 );
 commands!(
     SessionCommandsRow,

@@ -63,6 +63,7 @@ fn apply_blocking_proxy_policy(
     builder: reqwest::blocking::ClientBuilder,
     force_tls12: bool,
 ) -> reqwest::blocking::ClientBuilder {
+    let builder = crate::dns::apply_blocking(builder);
     atomcode_config::proxy::ensure_runtime_initialized();
     let builder = if std::env::var(atomcode_config::proxy::MODE_ENV)
         .ok()

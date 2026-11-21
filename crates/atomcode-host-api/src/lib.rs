@@ -25,10 +25,34 @@ use tokio::sync::mpsc;
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::SeqNo;
 
+/// Explicit user intents for the host-local browser integration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrowserAction {
+    Status,
+    Doctor,
+    Enable,
+    /// Exact origin restriction; an empty vector denies all origins.
+    EnableScoped {
+        origins: Vec<String>,
+    },
+    /// Read a trusted policy file on the execution host; save validated contents.
+    EnablePolicyFile {
+        path: String,
+    },
+    /// Explicit return to the stock backend without a saved origin restriction.
+    EnableUnrestricted,
+    Disable,
+}
+
 /// What a front end asks the host to do.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Host-local browser MCP configuration; Reload applies it to live sessions.
+    Browser {
+        session: String,
+        action: BrowserAction,
+    },
     /// Host-local hooks configuration preview and explicit script diagnostic.
     Hooks { session: String, args: String },
     /// Explicit user registration of a one-shot same-session follow-up.
@@ -40,6 +64,8 @@ pub enum HostCommand {
     /// Put an empty session in place of `session`, in the same working
     /// directory.
     NewSession { session: String },
+    /// Copy the current conversation and switch to the independent session.
+    ForkSession { session: String },
     /// Put the stored session `target` in place of `session`.
     Resume { session: String, target: String },
     /// The thinking level `session`'s requests carry from now on. `None` is no
@@ -51,6 +77,12 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// Read committed display history only; does not restore or mutate the agent.
+    DisplayHistory {
+        session: String,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        turns: usize,
+    },
     /// The last few exchanges of a stored session, for someone deciding whether
     /// to come back to it. Answered from the log the session already keeps —
     /// nothing is opened or resumed by asking.
@@ -356,7 +388,10 @@ impl HostCommand {
     /// The live session this command acts on, if it acts on one.
     pub fn addressed(&self) -> Option<&str> {
         match self {
-            Self::NewSession { session }
+            Self::Browser { session, .. }
+            | Self::DisplayHistory { session, .. }
+            | Self::NewSession { session }
+            | Self::ForkSession { session }
             | Self::Resume { session, .. }
             | Self::TaskSpecs { session, .. }
             | Self::FollowUp { session, .. }
@@ -434,6 +469,12 @@ pub struct PersonaInfo {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    /// `seed` is render-free, disposable display state, not authoritative facts.
+    /// Never send it to the model or append it to the session log.
+    DisplayHistory {
+        page: atomcode_kernel::session::history::Page,
+        seed: Vec<atomcode_kernel::session::Committed>,
+    },
     Hooks {
         value: serde_json::Value,
     },
@@ -500,6 +541,8 @@ pub enum HostReply {
         tools: Vec<String>,
     },
     McpRows {
+        #[serde(default)]
+        paused: bool,
         rows: Vec<McpRow>,
     },
     McpDetail {
@@ -728,6 +771,9 @@ pub struct Running {
     /// Work is retained while the agent itself is idle (evaluation or recovery).
     #[serde(default)]
     pub recovering: bool,
+    /// Waiting for a verified quota reset, rather than a provider outage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting_for_quota: bool,
     /// Remaining automatic retry delay at the time of this sample; zero means
     /// recovery is in flight. Absent for ordinary execution and true pauses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -750,6 +796,10 @@ pub struct Running {
     /// Why it is not running right now, when it is registered but paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Cumulative provider usage for the whole autonomous goal. Unknown history is
@@ -1263,6 +1313,9 @@ pub struct McpServerDetail {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpAction {
+    /// Pause all MCP servers in the addressed session only.
+    PauseAll,
+    ResumeAll,
     /// Reconnect only this server, keeping the current session.
     Reconnect,
     /// Cancel the current reconnect of this server, without cancelling a turn.
@@ -1302,6 +1355,23 @@ pub struct StoredSession {
     /// A persistent conversation used by an automation task.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scheduled: bool,
+    /// What another runtime holding the session — a TUI in another terminal —
+    /// is doing with it. `None` when nobody holds it. Resuming one held
+    /// elsewhere opens a copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<HeldActivity>,
+}
+
+/// What the runtime holding a stored session is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldActivity {
+    /// Open, between turns.
+    Open,
+    /// A turn is under way.
+    Running,
+    /// A turn is waiting on a question to the person.
+    Waiting,
 }
 
 /// Something that happened on the host, whoever caused it.
@@ -1591,6 +1661,16 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::DisplayHistory {
+                session: "a".into(),
+                turns: 8,
+                cursor: Some(atomcode_kernel::session::history::Cursor {
+                    session: "a".into(),
+                    through: 100,
+                    before: 70,
+                    revision: 0,
+                }),
+            },
             HostCommand::Hooks {
                 session: "a".into(),
                 args: "list".into(),
@@ -1599,11 +1679,50 @@ mod tests {
                 session: "a".into(),
                 args: "list".into(),
             },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Status,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Doctor,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Enable,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::Disable,
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnableScoped {
+                    origins: vec!["https://example.test".into()],
+                },
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnableScoped { origins: vec![] },
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnablePolicyFile {
+                    path: "/trusted/policy file.json".into(),
+                },
+            },
+            HostCommand::Browser {
+                session: "a".into(),
+                action: BrowserAction::EnableUnrestricted,
+            },
             HostCommand::ImportPatch {
                 session: "a".into(),
                 bytes: b"patch\r\n".to_vec(),
             },
             HostCommand::NewSession {
+                session: "a".into(),
+            },
+            HostCommand::ForkSession {
                 session: "a".into(),
             },
             HostCommand::Resume {
@@ -1776,7 +1895,10 @@ mod tests {
         ];
         for c in &all {
             match c {
-                HostCommand::NewSession { .. }
+                HostCommand::Browser { .. }
+                | HostCommand::DisplayHistory { .. }
+                | HostCommand::NewSession { .. }
+                | HostCommand::ForkSession { .. }
                 | HostCommand::Resume { .. }
                 | HostCommand::SetReasoningEffort { .. }
                 | HostCommand::ListSessions { .. }
@@ -1837,6 +1959,21 @@ mod tests {
 
     fn replies() -> Vec<HostReply> {
         let all = vec![
+            HostReply::DisplayHistory {
+                page: atomcode_kernel::session::history::Page {
+                    session: "a".into(),
+                    through: 100,
+                    revision: 0,
+                    events: vec![],
+                    older: Some(atomcode_kernel::session::history::Cursor {
+                        session: "a".into(),
+                        through: 100,
+                        before: 70,
+                        revision: 0,
+                    }),
+                },
+                seed: vec![],
+            },
             HostReply::Done,
             HostReply::Hooks {
                 value: serde_json::json!({"items":[]}),
@@ -1860,6 +1997,7 @@ mod tests {
                     turns: 3,
                     needs_newer_version: true,
                     scheduled: true,
+                    held: Some(HeldActivity::Running),
                 }],
             },
             HostReply::Undone {
@@ -1922,6 +2060,7 @@ mod tests {
                 tools: vec!["fs__read".into(), "fs__write".into()],
             },
             HostReply::McpRows {
+                paused: false,
                 rows: vec![McpRow {
                     name: "fs".into(),
                     state: McpServerState::Connected,
@@ -1971,6 +2110,7 @@ mod tests {
                 running: Some(Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,
@@ -2120,7 +2260,8 @@ mod tests {
             .collect();
         for r in &all {
             match r {
-                HostReply::Done
+                HostReply::DisplayHistory { .. }
+                | HostReply::Done
                 | HostReply::TaskSpecs { .. }
                 | HostReply::FollowUp { .. }
                 | HostReply::Hooks { .. }
@@ -2184,6 +2325,10 @@ mod tests {
         });
         let json = serde_json::to_value(&running).unwrap();
         assert_eq!(serde_json::from_value::<Running>(json).unwrap(), running);
+        running.waiting_for_quota = true;
+        let json = serde_json::to_value(&running).unwrap();
+        assert_eq!(json["waiting_for_quota"], true);
+        assert_eq!(serde_json::from_value::<Running>(json).unwrap(), running);
         // Old goal-end events still decode without the final runtime snapshot.
         let event = HostEvent::GoalEnded {
             session: "lead".into(),
@@ -2211,6 +2356,7 @@ mod tests {
                 running: Some(Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,

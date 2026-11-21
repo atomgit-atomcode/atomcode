@@ -33,9 +33,23 @@ fn reminder(body: &str) -> String {
 
 /// What changed between two configurations the conversation ran on — the
 /// model, the reasoning effort, thinking — or `None` when none of those did.
-pub(crate) fn reconfigured(from: &CodingAgentConfig, to: &CodingAgentConfig) -> Option<String> {
+pub(crate) fn reconfigured(
+    from: &CodingAgentConfig,
+    to: &CodingAgentConfig,
+    used_tokens: Option<u64>,
+) -> Option<String> {
     let mut said = Vec::new();
     if from.provider_name != to.provider_name || from.model != to.model {
+        // The window is the NEW model's. Usage is the previous model's last
+        // reported prompt count, so it is only an estimate across tokenizers.
+        // Say it now, while the cause is on screen. The trigger mirrors the
+        // product's own compaction point — `compact_threshold` (default 0.7,
+        // config.rs) of the window, capped by `compact_token_limit`, the same
+        // pair the `compaction-tail` patch hands to loop_policy
+        // (crates/atomcode-coding/src/on_harness.rs).
+        let next_window = u64::from(to.context_window);
+        let compact_threshold = to.compact_threshold;
+        let compact_token_limit = to.compact_token_limit;
         let name = |config: &CodingAgentConfig| {
             if from.provider_name == to.provider_name {
                 format!("`{}`", config.model)
@@ -48,6 +62,31 @@ pub(crate) fn reconfigured(from: &CodingAgentConfig, to: &CodingAgentConfig) -> 
             "The model for this conversation was switched from {from} to {to}. The replies \
              above this point were written by {from}; from here on you are {to}."
         ));
+        if next_window > 0 {
+            if let Some(used) = used_tokens {
+                let mut trigger = (next_window as f32 * compact_threshold) as u64;
+                if let Some(limit) = compact_token_limit {
+                    trigger = trigger.min(u64::from(limit));
+                }
+                if used >= next_window {
+                    said.push(format!(
+                        "The previous model last reported about {used} input tokens. This is at \
+                         or above the new model's {next_window}-token context window, but it is \
+                         only an estimate because tokenization and provider accounting may differ. \
+                         The host may compact the conversation before the next request; if that \
+                         is unavailable or fails, the provider may reject the request."
+                    ));
+                } else if used > 0 && used >= trigger {
+                    said.push(format!(
+                        "The previous model last reported about {used} input tokens, at or above the \
+                         new model's configured compaction trigger ({trigger} of a \
+                         {next_window}-token window). This is only an estimate because \
+                         tokenization and provider accounting may differ; the host may compact \
+                         the conversation before the next request."
+                    ));
+                }
+            }
+        }
     }
     let effort = from.chat_options.reasoning_effort;
     let next_effort = to.chat_options.reasoning_effort;
@@ -72,6 +111,38 @@ pub(crate) fn reconfigured(from: &CodingAgentConfig, to: &CodingAgentConfig) -> 
         );
     }
     (!said.is_empty()).then(|| reminder(&said.join(" ")))
+}
+
+/// A user-facing warning for a model switch whose previous prompt usage is at
+/// or beyond the new model's configured automatic-compaction trigger.
+///
+/// This deliberately describes risk rather than predicting rejection: usage is
+/// reported by the old provider, and automatic compaction gets a chance to run
+/// before the next request.
+pub(crate) fn context_window_warning(
+    from: &CodingAgentConfig,
+    to: &CodingAgentConfig,
+    used_tokens: Option<u64>,
+) -> Option<String> {
+    if (from.provider_name == to.provider_name && from.model == to.model) || to.context_window == 0
+    {
+        return None;
+    }
+    let used = used_tokens?;
+    let window = u64::from(to.context_window);
+    let mut trigger = (window as f32 * to.compact_threshold) as u64;
+    if let Some(limit) = to.compact_token_limit {
+        trigger = trigger.min(u64::from(limit));
+    }
+    if used == 0 || (used < window && used < trigger) {
+        return None;
+    }
+
+    let percent = used.saturating_mul(100) / window;
+    Some(format!(
+        "已切换到模型 {}。上一模型最近一次上报的输入约 {used} tokens，相当于新模型 {window} tokens 上下文窗口的约 {percent}%；已达到新模型的上下文窗口或配置的自动压缩触发线。不同模型的 tokenizer 和用量统计可能不同，此数值仅供参考。下一次请求可能先触发自动压缩；如果压缩不可用或失败，服务端可能拒绝请求。可先执行 /compact，或切换到上下文窗口更大的模型。",
+        to.model
+    ))
 }
 
 fn mode_name(mode: RuntimeMode) -> &'static str {
@@ -119,6 +190,8 @@ pub(crate) fn mode_changed(from: RuntimeMode, to: RuntimeMode) -> Option<String>
 
 pub(crate) fn mcp_acted(server: &str, action: McpAction) -> String {
     reminder(&match action {
+        McpAction::PauseAll => "The person paused all MCP servers for this session.".into(),
+        McpAction::ResumeAll => "The person resumed this session MCP servers according to their individual configuration.".into(),
         // Trust is the project's, not one server's: `/mcp trust` names none, and
         // a trust given from one server's page lets in all of the project's.
         McpAction::Trust => "The person trusted this project's MCP servers; their tools are \
@@ -219,6 +292,7 @@ mod tests {
     pub(super) fn heard(control: &CodingRuntimeControl) -> Heard {
         use CodingRuntimeControl as C;
         match control {
+            C::Quality { args, .. } => if matches!(args.trim(), "on" | "off") || args.trim().starts_with("waive ") { Heard::Told } else { Heard::Nothing },
             C::ReassembleProvider { .. }
             | C::SetMode { .. }
             | C::McpAct { .. }
@@ -227,10 +301,11 @@ mod tests {
             | C::ApplyUndo { .. }
             | C::FinishRewind { .. } => Heard::Told,
             C::Reprepare { target, .. } => match target {
-                ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_) => Heard::Told,
+                ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_) | ReprepareTarget::McpSessionPaused { .. } => Heard::Told,
                 // A new session: its prompt says where it is, and there is no
                 // conversation above it to be told about.
-                ReprepareTarget::Fresh
+                ReprepareTarget::Fork { .. }
+                | ReprepareTarget::Fresh
                 | ReprepareTarget::Resume(_)
                 | ReprepareTarget::ResumeWithLease { .. }
                 | ReprepareTarget::ChangeDirectory(_) => Heard::AlreadyAFact,
@@ -284,6 +359,7 @@ mod tests {
             | C::UndoTarget { .. }
             | C::Autonomy { .. }
             | C::Usage { .. }
+            | C::RefreshQuotaWait { .. }
             | C::WorkspaceChanges { .. }
             | C::PendingQuestions { .. }
             | C::TaskSpecs { .. } | C::FollowUp { .. } | C::ImportPatch { .. }
@@ -321,8 +397,226 @@ mod tests {
             ".",
             crate::config::product_dirs_from_env(),
         );
-        assert_eq!(reconfigured(&config, &config), None);
+        assert_eq!(reconfigured(&config, &config, None), None);
         assert_eq!(mode_changed(RuntimeMode::Plan, RuntimeMode::Plan), None);
+    }
+
+    #[test]
+    fn a_switch_past_the_new_window_reports_risk_without_predicting_rejection() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        new.context_window = 128_000;
+        let said =
+            reconfigured(&old, &new, Some(200_000)).expect("a switch past the new window is told");
+        assert!(said.contains("only an estimate"), "{said}");
+        assert!(said.contains("provider may reject"), "{said}");
+        assert!(!said.contains("cannot fit"), "{said}");
+        assert!(said.contains("128000"), "the window is named: {said}");
+    }
+
+    #[test]
+    fn a_switch_over_the_compaction_threshold_says_what_comes_next() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        new.context_window = 128_000;
+        let said =
+            reconfigured(&old, &new, Some(100_000)).expect("a switch over the threshold is told");
+        assert!(said.contains("host may compact"), "{said}");
+        assert!(!said.contains("cannot fit"), "{said}");
+    }
+
+    #[test]
+    fn a_switch_within_the_window_or_an_unknown_window_stays_quiet() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        new.context_window = 128_000;
+        // 50_000 of 128_000 is under the compaction threshold: the switch is
+        // still told, but without a window warning.
+        let said = reconfigured(&old, &new, Some(50_000)).expect("the switch itself is told");
+        assert!(
+            !said.contains("configured compaction trigger") && !said.contains("cannot fit"),
+            "no window warning under the threshold: {said}"
+        );
+        // An unknown window cannot be judged; keep the quiet.
+        new.context_window = 0;
+        let said = reconfigured(&old, &new, Some(200_000)).expect("the switch itself is told");
+        assert!(
+            !said.contains("input tokens") && !said.contains("configured compaction trigger"),
+            "no window warning for an unknown window: {said}"
+        );
+    }
+
+    #[test]
+    fn the_trigger_follows_the_configured_compaction_threshold() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        // 92_000 of 128_000 is 72% — past the product default trigger (0.7 →
+        // 89_600) yet under a hard-coded 0.75: the hint must appear because
+        // the trigger reads the config, not a constant.
+        let said = reconfigured(&old, &new, Some(92_000)).expect("over the configured trigger");
+        assert!(said.contains("host may compact"), "{said}");
+    }
+
+    #[test]
+    fn the_person_gets_a_qualified_warning_when_the_new_model_may_compact() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+
+        let warning = context_window_warning(&old, &new, Some(92_000))
+            .expect("usage exceeds the configured compaction trigger");
+        assert!(warning.contains("约 71%"), "{warning}");
+        assert!(
+            warning.contains("已达到新模型的上下文窗口或配置的自动压缩触发线"),
+            "{warning}"
+        );
+        assert!(warning.contains("tokenizer"), "{warning}");
+        assert!(warning.contains("/compact"), "{warning}");
+        assert!(!warning.contains("无法继续"), "{warning}");
+    }
+
+    #[test]
+    fn no_user_warning_is_emitted_below_trigger_or_for_unknown_usage() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        assert_eq!(context_window_warning(&old, &new, Some(89_599)), None);
+        assert_eq!(context_window_warning(&old, &new, None), None);
+        new.context_window = 0;
+        assert_eq!(context_window_warning(&old, &new, Some(200_000)), None);
+    }
+
+    #[test]
+    fn a_lower_token_limit_warns_without_claiming_the_window_is_near_full() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        new.compact_token_limit = Some(20_000);
+
+        let warning = context_window_warning(&old, &new, Some(25_000))
+            .expect("usage exceeds the configured token cap");
+        assert!(warning.contains("约 19%"), "{warning}");
+        assert!(warning.contains("压缩触发线"), "{warning}");
+        assert!(!warning.contains("已接近新模型"), "{warning}");
+    }
+
+    #[test]
+    fn a_raised_threshold_pushes_the_hint_out() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 128_000;
+        new.compact_threshold = 0.9;
+        // 100_000 of 128_000 is 78% — under a 0.9 trigger (115_200): quiet.
+        let said = reconfigured(&old, &new, Some(100_000)).expect("the switch itself is told");
+        assert!(
+            !said.contains("host may compact") && !said.contains("cannot fit"),
+            "no window warning under a raised threshold: {said}"
+        );
     }
 
     #[test]
@@ -335,4 +629,17 @@ mod tests {
         );
         assert!(said.contains("and 5 more"), "{said}");
     }
+}
+
+/// An independent human quality policy changed; no authority is granted here.
+pub(crate) fn quality_changed(enabled: bool) -> String {
+    reminder(if enabled {
+        "The person enabled quality checks. The host will run configured checks before ordinary changed-task handoff, through normal approvals. Do not claim quality passed before the host's result."
+    } else {
+        "The person disabled quality checks. This is not evidence that checks passed; report verification limits accurately."
+    })
+}
+
+pub(crate) fn quality_waived(reason: &str) -> String {
+    reminder(&format!("The person explicitly waived the previous quality result: {reason}. This is a waiver, not passing verification. Future tasks still follow the configured quality policy."))
 }

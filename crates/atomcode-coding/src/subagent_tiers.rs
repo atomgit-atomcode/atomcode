@@ -49,6 +49,7 @@ mod tests {
 
     fn pc(model: &str, capable: Option<i64>) -> ProviderConfig {
         ProviderConfig {
+            api_key_is_resolved: false,
             headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("sk-x".into()),
@@ -64,12 +65,17 @@ mod tests {
             reasoning_history: None,
             reasoning_effort: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
             capable_model: capable,
             retry_max_attempts: None,
+            response_header_timeout_secs: None,
         }
     }
 

@@ -1,3 +1,4 @@
+import { displayImageMarkers } from './historyMessages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -128,3 +129,14 @@ test('sessionMessagesToMarkdownLines keeps verify cadence assistants with tool c
   assert.equal(isRetainedHistoryUserMessage({ ...historical, internal_origin: undefined }), false);
   assert.equal(isRetainedHistoryUserMessage({ ...historical, role: 'assistant' }), false);
  });
+
+
+test('visible thumbnails replace trailing image markers without removing inline references', () => {
+  const images = [{ media_type: 'image/png', data: 'eA==' }, { media_type: 'image/png', data: 'eQ==' }];
+  assert.equal(displayImageMarkers('compare these [Image #1] [Image #2]', images), 'compare these');
+  assert.equal(displayImageMarkers('[Image #1] differs from [Image #2].', images), '[Image #1] differs from [Image #2].');
+  assert.equal(displayImageMarkers('look [Image #1]'), 'look [Image #1]');
+  assert.equal(displayImageMarkers('look [Image #1] [Image #2]', images.slice(0, 1)), 'look [Image #1] [Image #2]');
+  assert.equal(displayImageMarkers('[Image #1]', [{ media_type: 'image/png', data: '', missing: true }]), '[Image #1]');
+  assert.equal(displayImageMarkers('[Image #1]', [{ media_type: 'image/png', data: '', missing: true }, images[1]]), '[Image #1]');
+});

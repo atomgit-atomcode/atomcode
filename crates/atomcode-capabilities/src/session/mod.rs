@@ -31,6 +31,7 @@ pub mod recall;
 mod recovery;
 pub mod reference;
 pub mod rewind;
+mod rewind_retention;
 pub mod session_list;
 pub mod snapshot;
 pub mod status_reminder;
@@ -38,6 +39,7 @@ pub mod transcript;
 mod usage_provider;
 pub mod worklog;
 pub use context::SessionContextHook;
+pub use events::SessionActivity;
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
     CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,

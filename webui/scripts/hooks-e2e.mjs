@@ -94,6 +94,10 @@ try {
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
     await page.screenshot({path:`/tmp/atomcode-hooks-${width}.png`,fullPage:true});
     await page.keyboard.press('Escape');
+    assert(await dialog.isVisible(), 'Escape must not dismiss the completed hooks dialog');
+    await page.mouse.click(5, 5);
+    assert(await dialog.isVisible(), 'backdrop click must not dismiss hooks');
+    await dialog.locator('.modal-close').click();
     await dialog.waitFor({state:'hidden'});
     await page.close();
   }

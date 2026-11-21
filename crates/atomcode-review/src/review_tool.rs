@@ -13,9 +13,8 @@
 //!
 //! Deep mode: `{"depth":"deep"}` fans out one read-only reviewer per concern
 //! dimension (see `crate::fanout`) and merges/dedups their findings;
-//! `{"depth":"deep+verify"}` additionally runs one verify pass per finding to
-//! cull false positives (single vote, biased toward keep). The default
-//! single-reviewer path is unchanged.
+//! `{"depth":"deep+verify"}` additionally verifies findings to cull false
+//! positives. Large diffs use bounded batches with immutable on-demand evidence.
 
 use std::path::Path;
 use std::process::Command;
@@ -30,9 +29,11 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
+use futures::{stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::assemble::build_review_agent_inner;
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
@@ -41,13 +42,17 @@ use crate::fanout::{
     VERIFY_CONCURRENCY, VERIFY_LENS,
 };
 use crate::impact_plan::render_review_impact_plan;
+use crate::review_batches::{self, Batch, ReviewPatch};
 use crate::rules::{changed_files_from_diff, render_rules_section};
-use crate::{build_review_agent_with, Finding};
+use crate::timing::ReviewTiming;
+use crate::Finding;
 
 /// Prefix for ephemeral review activity. It deliberately matches the existing sub-agent
 /// activity convention so terminal drivers can update one latest-wins line instead of adding
 /// every child round/tool to scrollback.
 pub const REVIEW_ACTIVITY_MARKER: char = '\u{1e}';
+
+const SCOPED_VERIFY_LENS: &str = "\n\nFor this initial check, the diff covers only the candidate's file. Re-report only when the supplied evidence confirms the finding. If evidence is insufficient or the change in another file matters, defer by reporting nothing. A full-diff verifier will handle the deferred candidate.";
 
 pub(crate) struct ReviewProgressHook {
     progress: ProgressSink,
@@ -207,10 +212,16 @@ impl Default for ReviewToolConfig {
 /// conversation that is itself out of view — run it inline, as before.
 #[async_trait]
 pub trait ReviewDelegate: Send + Sync + std::fmt::Debug {
+    /// Whether this runtime is currently a host-owned, one-review reporting task.
+    /// False after a person takes it over, and for ordinary conversations.
+    fn report_only(&self) -> bool {
+        false
+    }
+
     /// Start `task` elsewhere, in `working_dir` — where this conversation is
     /// now, which is where the changes are. `scope` is the host's word for the
-    /// changes (`working_tree`, `staged`, or a base ref), so it can say how many
-    /// files are in play; `None` when it has none.
+    /// changes (`working_tree`, `staged`, or a base ref). `files` counts the
+    /// exact diff after all range and path filters are applied.
     ///
     /// `None` means "not here": run it inline. `Some(Err)` means the host
     /// would have, but could not (all its places are taken, say) — also inline,
@@ -220,6 +231,7 @@ pub trait ReviewDelegate: Send + Sync + std::fmt::Debug {
         working_dir: &Path,
         task: String,
         scope: Option<String>,
+        files: usize,
     ) -> Option<Result<DelegatedReview, String>>;
 }
 
@@ -335,6 +347,12 @@ struct Args {
     /// User review focus and constraints, retained across delegation.
     #[serde(default)]
     instructions: Option<String>,
+    /// Internal dispatch hint set only by the built-in `/review` command. It
+    /// is deliberately absent from the model-facing schema: slash commands
+    /// run the review directly, while model tool calls may use background
+    /// delegation.
+    #[serde(default, rename = "_inline_command")]
+    inline_command: bool,
 }
 
 #[derive(Deserialize)]
@@ -543,7 +561,7 @@ impl Tool for ReviewTool {
                 "instructions": { "type": "string", "description": "User review focus and constraints, verbatim. Include report-only/no-edit requirements and any authorized follow-up work so the background session retains them. Does not grant the read-only reviewer permission to edit." },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
                 "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
-                "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth — choose by the change's risk/scope. `single` (default, omit): routine or low-risk edits (docs, formatting, small localized fixes, config). `deep`: substantive multi-file / logic changes, refactors, or concurrency — fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings. `deep+verify`: high-risk, security-sensitive, or correctness-critical changes, or when the user asks for a thorough/high-confidence review — additionally runs one verify pass per finding to cull false positives. `deep`/`deep+verify` cost several× more, so escalate only when warranted." }
+                "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth — choose by the change's risk/scope. `single` (default, omit): routine or low-risk edits (docs, formatting, small localized fixes, config). `deep`: substantive multi-file / logic changes, refactors, or concurrency — checks correctness, security, performance, and tests; uses bounded evidence batches for large diffs. `deep+verify`: high-risk, security-sensitive, or correctness-critical changes, or when the user asks for a thorough/high-confidence review — additionally verifies findings using the available evidence. `deep`/`deep+verify` cost several× more, so escalate only when warranted." }
             }
         })
     }
@@ -568,6 +586,7 @@ impl Tool for ReviewTool {
         // launching the child when the deterministic preflight says the scope is large.
         ctx.progress
             .emit(format!("{REVIEW_ACTIVITY_MARKER}review · preparing diff"));
+        let preparing = tokio::time::Instant::now();
         let scoped = match git_diff(&ctx.working_dir, &scope, &a.paths) {
             Ok(d) => d,
             Err(e) => return err(format!("code_review: {e}")),
@@ -592,19 +611,20 @@ impl Tool for ReviewTool {
         }
 
         // The scope is settled — non-empty, and confirmed if it had to be — so
-        // this is the review the person asked for. Where the host can run it out
-        // of view, it goes there and this turn is free again. After the
-        // preflight on purpose: a scope that needs a yes is asked about here,
-        // where the person is, not in a session nobody is looking at. The
-        // arguments go along as they came, `confirm_scope` included, so the
-        // review over there starts on the same scope without asking again.
-        if let Some(delegate) = &self.delegate {
-            let task = delegated_task(args, a.instructions.as_deref());
-            if let Some(Ok(started)) = delegate
-                .delegate(&ctx.working_dir, task, scope.host_word())
-                .await
-            {
-                return ok(delegated_reply(&started));
+        // this is the review the person asked for. Model tool calls may go to a
+        // background session; `/review` sets `inline_command` because it is
+        // already the explicit command to run this reviewer. Keep this after
+        // preflight so oversized scopes are always confirmed in the visible
+        // conversation before either execution path starts.
+        if !a.inline_command {
+            if let Some(delegate) = &self.delegate {
+                let task = delegated_task(args, a.instructions.as_deref());
+                if let Some(Ok(started)) = delegate
+                    .delegate(&ctx.working_dir, task, scope.host_word(), manifest.files)
+                    .await
+                {
+                    return ok(delegated_reply(&started));
+                }
             }
         }
 
@@ -613,17 +633,9 @@ impl Tool for ReviewTool {
             manifest.files
         ));
 
-        // 2. Build the review task: annotated diff + per-language rules for changed files.
-        let annotated = annotate_diff_line_numbers(&diff);
         let files = changed_files_from_diff(&diff);
-        let rules = render_rules_section(&files, self.cfg.rules_dir.as_deref());
-        let impact_plan = render_review_impact_plan(&diff);
         let instructions = review_instructions(a.instructions.as_deref());
-        let task = format!(
-            "Review the following changes. Report each issue via the `report_finding` tool \
-             with an accurate file path and line range. Only flag issues in the CHANGED \
-             code.\n\n{instructions}\n\n{rules}\n\n{impact_plan}\n\n=== DIFF ===\n{annotated}"
-        );
+        let annotated = annotate_diff_line_numbers(&diff);
 
         // 3. Reuse the host's provider (set at assembly) so a signing gateway still works.
         let provider = match self.provider.read().ok().and_then(|g| g.clone()) {
@@ -631,7 +643,15 @@ impl Tool for ReviewTool {
             None => return err("code_review: review provider is not wired (internal error)"),
         };
 
-        // Shared per-agent config seed (both paths).
+        // One existing cancellation deadline covers dimensions AND verification;
+        // verification must not restart a fresh full-length time allowance.
+        let timing = ReviewTiming::new(ctx.progress.source_id());
+        timing.prepared(
+            preparing.elapsed().as_millis() as u64,
+            files.len(),
+            diff.len(),
+        );
+        let started = tokio::time::Instant::now();
         let make_cfg = || {
             let mut cfg = ReviewAgentConfig::new(
                 "",
@@ -645,34 +665,75 @@ impl Tool for ReviewTool {
             cfg.first_token_timeout = self.cfg.first_token_timeout;
             cfg.request_timeout = self.cfg.request_timeout;
             cfg.max_rounds = self.max_rounds;
-            cfg.max_turn_duration = self.max_turn_duration;
+            cfg.max_turn_duration = self
+                .max_turn_duration
+                .map(|d| d.saturating_sub(started.elapsed()));
             cfg.tool_loop_policy = self.tool_loop_policy;
             cfg.progress = Some(ctx.progress.clone());
             cfg.review_paths = files.clone();
             cfg
         };
 
+        let patch_limit =
+            review_batches::PATCH_BYTES.min((self.cfg.context_window as usize / 2).max(1024));
+        if annotated.len() > patch_limit || manifest.files > 20 {
+            return run_batched_review(
+                &annotated,
+                patch_limit,
+                &manifest.label,
+                manifest.files,
+                &instructions,
+                &make_cfg(),
+                self.cfg.rules_dir.as_deref(),
+                provider,
+                &timing,
+                ctx,
+                a.wants_verify(),
+                a.is_deep(),
+                self.max_turn_duration,
+            )
+            .await;
+        }
+
+        let rules = render_rules_section(&files, self.cfg.rules_dir.as_deref());
+        let impact_plan = render_review_impact_plan(&diff);
+        let task = format!(
+            "Review the following changes. Report each issue via the `report_finding` tool \
+             with an accurate file path and line range. Only flag issues in the CHANGED \
+             code.\n\n{instructions}\n\n{rules}\n\n{impact_plan}\n\n=== DIFF ===\n{annotated}"
+        );
+
+        let deadline = crate::shared_review_deadline(self.max_turn_duration);
         if !a.is_deep() {
-            // --- single-agent path (unchanged behavior) ---
-            let (agent, report) = build_review_agent_with(&make_cfg(), provider);
-            let (stop, run_error) = tokio::select! {
-                _ = ctx.cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-                outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                    (outcome.stop, outcome.error)
-                }
-            };
+            // --- single-agent path ---
+            let (stop, run_error, report, _) = run_review_pass(
+                &make_cfg(),
+                provider,
+                &deadline,
+                &ctx.cancel,
+                &timing.pass("single", None),
+                task,
+                None,
+            )
+            .await;
+            let run_error =
+                review_failure_reason(&stop, run_error, &deadline, self.max_turn_duration);
             let mut findings = report.findings();
             findings.retain(|f| files.iter().any(|cf| paths_match(cf, &f.file_path)));
             sort_findings(&mut findings);
             return if stop == StopReason::Stopped && run_error.is_none() {
                 ok(render_findings(&findings, files.len()))
             } else {
-                err(render_incomplete_review(
-                    &findings,
-                    files.len(),
-                    stop,
-                    run_error.as_deref(),
-                ))
+                let timeout = run_error.as_deref().is_some_and(is_review_open_timeout);
+                classify_review_error(
+                    render_incomplete_review(
+                        &findings,
+                        files.len(),
+                        stop,
+                        run_error.as_deref().map(without_open_timeout_marker),
+                    ),
+                    timeout,
+                )
             };
         }
 
@@ -683,75 +744,118 @@ impl Tool for ReviewTool {
             let task = task.clone();
             let mut cfg = make_cfg();
             let cancel = ctx.cancel.clone();
+            let deadline = deadline.clone();
+            let duration = self.max_turn_duration;
+            let progress = ctx.progress.clone();
+            let pass = timing.pass(dim.id, None);
             async move {
+                let dimension_started = tokio::time::Instant::now();
                 cfg.progress_label = Some(dim.id.to_string());
                 cfg = cfg.with_persona_append(dim.lens);
-                let (agent, report) = build_review_agent_with(&cfg, provider);
-                let (stop, run_error) = tokio::select! {
-                    _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-                    outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
-                        (outcome.stop, outcome.error)
-                    }
-                };
+                let (stop, run_error, report, _) =
+                    run_review_pass(&cfg, provider, &deadline, &cancel, &pass, task, None).await;
+                let completed = stop == StopReason::Stopped && run_error.is_none();
+                let status = if completed { "finished" } else { "incomplete" };
+                let elapsed = dimension_started.elapsed().as_secs_f64();
+                progress.emit(format!(
+                    "{REVIEW_ACTIVITY_MARKER}review [{}] · {status} in {elapsed:.1}s",
+                    dim.id
+                ));
                 DimensionOutcome {
                     dimension: dim.id,
                     findings: report.findings(),
-                    completed: stop == StopReason::Stopped && run_error.is_none(),
-                    error: run_error,
+                    completed,
+                    error: review_failure_reason(&stop, run_error, &deadline, duration),
                 }
             }
         })
         .await;
 
-        // Merge the fan-out outcomes; optionally cull false positives with a
-        // single verify pass per surviving finding.
+        // Merge the fan-out outcomes before verifying each surviving finding.
         let (mut merged, deduped) = merge_deep_findings(&outcomes, &files);
         let (completed, failed) = dimension_coverage(&outcomes);
         let mut verify_dropped = None;
+        let mut verify_incomplete = 0;
         if a.wants_verify() && !merged.is_empty() {
-            // One verify agent per finding, capped. Keep a finding when its verify
-            // agent re-reports a corresponding finding (or fails open on error/cancel).
-            // Snapshot only the candidate findings (cheap Finding clones); the task —
-            // which embeds the whole diff — is rendered lazily inside each closure, so
-            // at most `VERIFY_CONCURRENCY` copies of the diff are live at once.
+            ctx.progress.emit(format!(
+                "{REVIEW_ACTIVITY_MARKER}review · verifying {} finding(s)",
+                merged.len()
+            ));
             let candidates: Vec<Finding> = merged.iter().map(|m| m.finding.clone()).collect();
+            let verification_diffs = VerificationDiffs::new(&annotated);
+            let full: Arc<str> = Arc::from(annotated.as_str());
+            let rules: Arc<str> = Arc::from(rules);
+            let instructions: Arc<str> = Arc::from(instructions);
+            let verified = Arc::new(AtomicU32::new(0));
             let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
+                let verified = verified.clone();
                 let provider = provider.clone();
                 let candidate = candidates[i].clone();
-                let vtask = format!(
-                    "{instructions}\n\n{}",
-                    render_verify_task(&candidate, &rules, &annotated)
-                );
-                let mut cfg = make_cfg();
+                let scoped = verification_diffs.for_path(&candidate.file_path);
+                let timing = timing.clone();
+                let full = full.clone();
+                let rules = rules.clone();
+                let instructions = instructions.clone();
+                let mut cfg = make_cfg().with_persona_append(VERIFY_LENS);
+                cfg.progress_label = Some("verify".to_string());
+                let duration = self.max_turn_duration;
                 let cancel = ctx.cancel.clone();
+                let deadline = deadline.clone();
                 async move {
-                    cfg.progress_label = Some("verify".to_string());
-                    cfg = cfg.with_persona_append(VERIFY_LENS);
-                    let (agent, report) = build_review_agent_with(&cfg, provider);
-                    let (stop, run_error) = tokio::select! {
-                        _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string())),
-                        outcome = agent.run_to_completion(vtask, AutoRespond::AllowAll) => {
-                            (outcome.stop, outcome.error)
+                    for (input, scoped) in scoped
+                        .into_iter()
+                        .map(|range| (&full[range], true))
+                        .chain(std::iter::once((full.as_ref(), false)))
+                    {
+                        if cancel.is_cancelled()
+                            || deadline.as_ref().is_some_and(|t| t.is_cancelled())
+                        {
+                            return (i, true);
                         }
-                    };
-                    // Fail-open: keep on error/cancel; else keep iff the verifier
-                    // re-reported a finding corresponding to THIS candidate.
-                    let clean = stop == StopReason::Stopped && run_error.is_none();
-                    let kept = if clean {
-                        verify_reconfirms(&candidate, &report.findings())
-                    } else {
-                        true
-                    };
-                    (i, kept)
+                        let task = render_verify_task(&candidate, &rules, input);
+                        let task = format!("{instructions}\n\n{task}");
+                        let mut pass_cfg = if scoped {
+                            cfg.clone().with_persona_append(SCOPED_VERIFY_LENS)
+                        } else {
+                            cfg.clone()
+                        };
+                        pass_cfg.max_turn_duration =
+                            duration.map(|d| d.saturating_sub(started.elapsed()));
+                        let stage = if scoped { "verify_file" } else { "verify_full" };
+                        let pass = timing.pass(stage, Some(i + 1));
+                        let (stop, error, report, _) = run_review_pass(
+                            &pass_cfg,
+                            provider.clone(),
+                            &deadline,
+                            &cancel,
+                            &pass,
+                            task,
+                            None,
+                        )
+                        .await;
+                        if stop != StopReason::Stopped || error.is_some() {
+                            return (i, true);
+                        }
+                        let confirmed = verify_reconfirms(&candidate, &report.findings());
+                        // A scoped negative is inconclusive. Only full evidence can drop it.
+                        if confirmed || !scoped {
+                            verified.fetch_add(1, Ordering::Relaxed);
+                            return (i, confirmed);
+                        }
+                    }
+                    (i, true)
                 }
             })
             .await;
+            verify_incomplete = merged
+                .len()
+                .saturating_sub(verified.load(Ordering::Relaxed) as usize);
             let before = merged.len();
             let mut mask = keep.into_iter();
             merged.retain(|_| mask.next().unwrap_or(true));
             verify_dropped = Some(before - merged.len());
         }
-        let (is_error, content) = render_deep_result(
+        let (is_error, mut content) = render_deep_result(
             &merged,
             files.len(),
             &completed,
@@ -759,8 +863,24 @@ impl Tool for ReviewTool {
             deduped,
             verify_dropped,
         );
+        let open_timeout = failed.len() == REVIEW_DIMENSIONS.len()
+            && outcomes
+                .iter()
+                .all(|outcome| outcome.error.as_deref().is_some_and(is_review_open_timeout));
+        let mut outcomes = outcomes;
+        for outcome in &mut outcomes {
+            if let Some(error) = outcome.error.as_mut() {
+                if let Some(detail) = error.strip_prefix(REVIEW_OPEN_TIMEOUT) {
+                    *error = detail.to_owned();
+                }
+            }
+        }
+        content.push_str(&crate::fanout::failure_details(&outcomes));
+        if verify_incomplete > 0 {
+            content.push_str(&format!("\nVerification incomplete for {verify_incomplete} candidate(s); unverified findings were retained, not reconfirmed.\n"));
+        }
         if is_error {
-            err(content)
+            classify_review_error(content, open_timeout)
         } else {
             ok(content)
         }
@@ -771,10 +891,391 @@ impl Tool for ReviewTool {
 // Helpers (pure where possible, testable)
 // ---------------------------------------------------------------------------
 
+// The native tool-result event stores text and an error flag. A leading
+// review-owned diagnostic carries the typed cause across that existing boundary.
+const REVIEW_OPEN_TIMEOUT: &str = "code_review: model response headers timed out.\n";
+
+pub fn review_open_timeout_detail(content: &str) -> Option<&str> {
+    content.strip_prefix(REVIEW_OPEN_TIMEOUT)
+}
+
+const REVIEW_DEADLINE: &str = "code_review: review wall-clock budget exhausted.\n";
+
+pub fn review_deadline_detail(content: &str) -> Option<&str> {
+    content.strip_prefix(REVIEW_DEADLINE)
+}
+
+fn is_review_open_timeout(content: &str) -> bool {
+    review_open_timeout_detail(content).is_some()
+}
+
+fn without_open_timeout_marker(content: &str) -> &str {
+    review_open_timeout_detail(content).unwrap_or(content)
+}
+
+fn classify_review_error(content: String, open_timeout: bool) -> ToolResult {
+    if open_timeout {
+        err(format!("{REVIEW_OPEN_TIMEOUT}{content}"))
+    } else {
+        err(content)
+    }
+}
+
+struct BatchOutcome {
+    findings: Vec<Finding>,
+    error: Option<String>,
+    unverified: usize,
+    retry_smaller: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_batched_review(
+    annotated: &str,
+    patch_limit: usize,
+    scope: &str,
+    file_count: usize,
+    instructions: &str,
+    cfg: &ReviewAgentConfig,
+    rules_dir: Option<&Path>,
+    provider: Arc<dyn LlmProvider>,
+    timing: &ReviewTiming,
+    ctx: &ToolContext,
+    verify: bool,
+    deep: bool,
+    duration: Option<Duration>,
+) -> ToolResult {
+    let (batches, omitted) = review_batches::plan(annotated, patch_limit);
+    let total = batches.len();
+    let duration = duration.unwrap_or(review_batches::TOTAL_TIMEOUT);
+    let deadline = crate::shared_review_deadline(Some(duration));
+    let timing = timing.clone().bounded();
+    let mut outcomes = stream::iter(batches.into_iter().enumerate())
+        .map(|(index, batch)| {
+            let provider = provider.clone();
+            let timing = &timing;
+            let deadline = &deadline;
+            async move {
+                let label = format!("batch {}/{}", index + 1, total);
+                let scope_files = batch.describe();
+                ctx.progress
+                    .emit(format!("{REVIEW_ACTIVITY_MARKER}review · {label}"));
+                if ctx.cancel.is_cancelled() || deadline.as_ref().is_some_and(|t| t.is_cancelled())
+                {
+                    return (
+                        index,
+                        scope_files,
+                        BatchOutcome {
+                            findings: vec![],
+                            error: Some(
+                                "not started before cancellation or review deadline".into(),
+                            ),
+                            unverified: 0,
+                            retry_smaller: false,
+                        },
+                    );
+                }
+                let mut outcome = review_batch(
+                    &batch,
+                    &label,
+                    scope,
+                    instructions,
+                    cfg,
+                    rules_dir,
+                    provider.clone(),
+                    timing,
+                    deadline,
+                    ctx,
+                    verify,
+                    deep,
+                    duration,
+                )
+                .await;
+                // Retry a failed batch once with smaller evidence, sharing
+                // the original concurrency slot and the review deadline.
+                if outcome.retry_smaller && batch.patch.len() > 1024 {
+                    let (parts, skipped) =
+                        review_batches::plan(&batch.patch, batch.patch.len() / 2);
+                    if parts.len() > 1 && skipped == 0 {
+                        let mut errors = Vec::new();
+                        let mut all_timed_out = true;
+                        for (part_index, part) in parts.iter().enumerate() {
+                            let part_label =
+                                format!("{label}, retry part {}/{}", part_index + 1, parts.len());
+                            let retried = review_batch(
+                                part,
+                                &part_label,
+                                scope,
+                                instructions,
+                                cfg,
+                                rules_dir,
+                                provider.clone(),
+                                timing,
+                                deadline,
+                                ctx,
+                                verify,
+                                deep,
+                                duration,
+                            )
+                            .await;
+                            outcome.findings.extend(retried.findings);
+                            outcome.unverified += retried.unverified;
+                            if let Some(error) = retried.error {
+                                all_timed_out &= is_review_open_timeout(&error);
+                                errors.push(format!(
+                                    "{part_label} ({}): {}",
+                                    part.describe(),
+                                    without_open_timeout_marker(&error)
+                                ));
+                            }
+                        }
+                        outcome.error = if errors.is_empty() {
+                            None
+                        } else {
+                            Some(format!(
+                                "{}{}",
+                                if all_timed_out {
+                                    REVIEW_OPEN_TIMEOUT
+                                } else {
+                                    ""
+                                },
+                                errors.join("\n")
+                            ))
+                        };
+                    }
+                }
+                (index, scope_files, outcome)
+            }
+        })
+        .buffer_unordered(review_batches::CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    outcomes.sort_by_key(|(index, _, _)| *index);
+
+    let completed = outcomes
+        .iter()
+        .filter(|(_, _, outcome)| outcome.error.is_none())
+        .count();
+    let timed_out = outcomes
+        .iter()
+        .any(|(_, _, outcome)| outcome.error.as_deref().is_some_and(is_review_open_timeout));
+    let unverified: usize = outcomes
+        .iter()
+        .map(|(_, _, outcome)| outcome.unverified)
+        .sum();
+    let merged = crate::fanout::merge_findings(
+        outcomes
+            .iter_mut()
+            .map(|(_, _, outcome)| ("batch", std::mem::take(&mut outcome.findings)))
+            .collect(),
+    );
+    let mut findings: Vec<_> = merged.into_iter().map(|item| item.finding).collect();
+    sort_findings(&mut findings);
+    let incomplete = completed != total || omitted > 0;
+    let deadline_exhausted = !ctx.cancel.is_cancelled()
+        && deadline.as_ref().is_some_and(|token| token.is_cancelled())
+        && (completed != total || unverified > 0);
+    let mut content = if incomplete || deadline_exhausted {
+        let mut text = format!("Code review incomplete — {completed}/{total} batches completed. {} finding(s) from the evidence reviewed.\n", findings.len());
+        if !findings.is_empty() {
+            text.push_str(&render_findings(&findings, file_count));
+        }
+        text
+    } else {
+        render_findings(&findings, file_count)
+    };
+    content.push_str(&format!(
+        "\nBatch coverage: {completed}/{total} complete.\n"
+    ));
+    if omitted > 0 {
+        content.push_str(&format!(
+            "{omitted} diff line(s) could not fit the evidence budget and were not reviewed.\n"
+        ));
+    }
+    for (index, files, outcome) in outcomes {
+        if let Some(error) = outcome.error {
+            content.push_str(&format!(
+                "Batch {} ({files}): {}\n",
+                index + 1,
+                without_open_timeout_marker(&error)
+            ));
+        }
+    }
+    if unverified > 0 {
+        content.push_str(&format!("{unverified} candidate(s) could not be reconfirmed using their assigned evidence and were retained.\n"));
+    }
+    if deadline_exhausted {
+        err(format!(
+            "{REVIEW_DEADLINE}Review wall-clock budget ({}s) exhausted.\n{content}",
+            duration.as_secs()
+        ))
+    } else if incomplete {
+        classify_review_error(content, timed_out && completed == 0)
+    } else {
+        ok(content)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn review_batch(
+    batch: &Batch,
+    label: &str,
+    scope: &str,
+    instructions: &str,
+    cfg: &ReviewAgentConfig,
+    rules_dir: Option<&Path>,
+    provider: Arc<dyn LlmProvider>,
+    timing: &ReviewTiming,
+    deadline: &Option<tokio_util::sync::CancellationToken>,
+    ctx: &ToolContext,
+    verify: bool,
+    deep: bool,
+    duration: Duration,
+) -> BatchOutcome {
+    let rules = render_rules_section(&batch.files, rules_dir);
+    let files = batch.files.join("\n");
+    let mut cfg = cfg.clone();
+    cfg.review_paths = batch.files.clone();
+    cfg.max_rounds = Some(
+        cfg.max_rounds
+            .unwrap_or(review_batches::MAX_ROUNDS)
+            .min(review_batches::MAX_ROUNDS),
+    );
+    cfg.progress_label = Some(label.into());
+    if deep {
+        cfg = cfg.with_persona_append("\n\nCheck correctness, security, performance, tests and public contracts for the assigned changes.");
+    }
+    let task = format!(
+        "Review scope: {scope}\nAssigned {label}. Changed files:\n{files}\n\n         Call read_review_patch before reviewing. It returns only the immutable evidence assigned          to this batch. Use focused reads and searches only when needed. Report verified issues on changed lines with report_finding and finish when the assigned evidence is covered.\n\n{instructions}\n\n{rules}"
+    );
+    let patch = Arc::new(ReviewPatch::new(batch.patch.clone()));
+    let (stop, error, report, code) = run_review_pass(
+        &cfg,
+        provider.clone(),
+        deadline,
+        &ctx.cancel,
+        &timing.pass("batch", None),
+        task,
+        Some(patch.clone()),
+    )
+    .await;
+    let retry_smaller = matches!(
+        code.as_deref(),
+        Some(review_batches::INPUT_BUDGET_CODE | atomcode_kernel::stream::OPEN_TIMEOUT_CODE)
+    );
+    let error = review_failure_reason(&stop, error, deadline, Some(duration))
+        .or_else(|| (!patch.was_read()).then(|| "reviewer did not read the assigned diff".into()));
+    let findings: Vec<_> = report
+        .findings()
+        .into_iter()
+        .filter(|finding| {
+            batch
+                .files
+                .iter()
+                .any(|file| paths_match(file, &finding.file_path))
+        })
+        .collect();
+
+    let mut unverified = 0;
+    if verify {
+        for candidate in &findings {
+            if ctx.cancel.is_cancelled() || deadline.as_ref().is_some_and(|t| t.is_cancelled()) {
+                unverified += 1;
+                continue;
+            }
+            let evidence = Arc::new(ReviewPatch::new(batch.patch.clone()));
+            let task = format!(
+                "{instructions}\n\nCall read_review_patch to read the candidate's assigned batch.                  Re-report only if the available evidence confirms it.\n\n{}",
+                render_verify_task(candidate, &rules, ""),
+            );
+            let (stop, error, report, _) = run_review_pass(
+                &cfg,
+                provider.clone(),
+                deadline,
+                &ctx.cancel,
+                &timing.pass("verify_batch", None),
+                task,
+                Some(evidence.clone()),
+            )
+            .await;
+            if stop != StopReason::Stopped
+                || error.is_some()
+                || !evidence.was_read()
+                || !verify_reconfirms(candidate, &report.findings())
+            {
+                unverified += 1;
+            }
+        }
+    }
+    BatchOutcome {
+        findings,
+        error,
+        unverified,
+        retry_smaller,
+    }
+}
+
+async fn run_review_pass(
+    cfg: &ReviewAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+    deadline: &Option<tokio_util::sync::CancellationToken>,
+    cancel: &tokio_util::sync::CancellationToken,
+    timing: &ReviewTiming,
+    task: String,
+    patch: Option<Arc<ReviewPatch>>,
+) -> (
+    StopReason,
+    Option<String>,
+    crate::ReportFindingTool,
+    Option<String>,
+) {
+    let mut timer = timing.start();
+    let (agent, report) =
+        build_review_agent_inner(cfg, provider, deadline.clone(), Some(timing), patch);
+    let (stop, error, code) = tokio::select! {
+        _ = cancel.cancelled() => (StopReason::Cancelled, Some("cancelled by user".to_string()), None),
+        outcome = agent.run_to_completion(task, AutoRespond::AllowAll) => {
+            let error = if outcome.error_code.as_deref() == Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE) {
+                Some(format!("{REVIEW_OPEN_TIMEOUT}{}", outcome.error.unwrap_or_default()))
+            } else {
+                outcome.error
+            };
+            (outcome.stop, error, outcome.error_code)
+        },
+    };
+    timer.finish(match stop {
+        StopReason::Stopped if error.is_none() => "completed",
+        _ if cancel.is_cancelled() => "cancelled",
+        _ if deadline.as_ref().is_some_and(|token| token.is_cancelled()) => "deadline",
+        _ => "incomplete",
+    });
+    (stop, error, report, code)
+}
+
+fn review_failure_reason(
+    stop: &StopReason,
+    error: Option<String>,
+    deadline: &Option<tokio_util::sync::CancellationToken>,
+    duration: Option<Duration>,
+) -> Option<String> {
+    if *stop == StopReason::Stopped && error.is_none() {
+        return None;
+    }
+    error.or_else(|| {
+        Some(if deadline.as_ref().is_some_and(|t| t.is_cancelled()) {
+            format!(
+                "review wall-clock budget exhausted ({}s); coverage is incomplete",
+                duration.unwrap_or_default().as_secs()
+            )
+        } else {
+            format!("review stopped with {stop:?}; coverage is incomplete")
+        })
+    })
+}
+
 /// Keep user constraints visible to both the delegate and the read-only reviewer.
 fn review_instructions(instructions: Option<&str>) -> String {
     match instructions.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(text) => format!("=== USER REVIEW INSTRUCTIONS ===\n{text}\n\nThe code_review reviewer remains read-only and reports findings. The calling agent follows the user's authorized task."),
+        Some(text) => format!("=== USER REVIEW INSTRUCTIONS ===\n{text}\n\nThe code_review reviewer remains read-only and reports findings. The originating conversation handles any authorized follow-up work."),
         None => String::new(),
     }
 }
@@ -796,9 +1297,12 @@ fn delegated_task(args: &str, instructions: Option<&str>) -> String {
     format!(
         "代码审查 · {scope} · {depth}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
          concise summary of its findings. Preserve the user's instructions in the tool call and \
-         in your summary. If they requested conclusions only or no edits, stop after reporting; \
-         do not apply fixes. Otherwise, follow their authorized task. Findings themselves are \
-         not new authorization to modify files.\n\n{instructions}"
+         in your summary. Call code_review exactly once for this delegated task. If it fails, \
+         times out, or reports partial coverage, return that outcome and any collected findings \
+         immediately; do not retry with another depth or start another review. This background \
+         session only reviews and reports: do not apply fixes, create commits, push, or open a PR. \
+         Leave authorized follow-up work to the calling conversation. Findings themselves are \
+         not new authorization to modify files.\n\n{instructions}\n\nYour assignment here remains review and report only. Return after the one tool outcome, including failure; the originating conversation owns fixes and PR creation."
     )
 }
 
@@ -844,9 +1348,55 @@ struct ScopedDiff {
     commit_count: Option<usize>,
 }
 
+/// Borrow whole file sections from the authoritative diff. If Git's headers
+/// cannot identify a unique section, use the full diff for that finding.
+struct VerificationDiffs<'a> {
+    files: Vec<(&'a str, std::ops::Range<usize>)>,
+}
+
+impl<'a> VerificationDiffs<'a> {
+    fn new(diff: &'a str) -> Self {
+        let sections: Vec<_> = diff
+            .split_inclusive('\n')
+            .scan(0, |offset, line| {
+                let start = *offset;
+                *offset += line.len();
+                Some((start, line))
+            })
+            .filter_map(|(start, line)| line.starts_with("diff --git ").then_some(start))
+            .chain(std::iter::once(diff.len()))
+            .collect();
+        let mut files = Vec::new();
+        if sections.len() > 2 && sections[0] == 0 {
+            for offsets in sections.windows(2) {
+                let section = &diff[offsets[0]..offsets[1]];
+                let Some(path) = section
+                    .lines()
+                    .take_while(|line| !line.starts_with("@@"))
+                    .find_map(|line| line.strip_prefix("+++ b/"))
+                else {
+                    return Self { files: Vec::new() };
+                };
+                files.push((path.trim_end_matches('\t'), offsets[0]..offsets[1]));
+            }
+        }
+        Self { files }
+    }
+
+    fn for_path(&self, path: &str) -> Option<std::ops::Range<usize>> {
+        let mut matches = self
+            .files
+            .iter()
+            .filter(|(file, _)| paths_match(file, path));
+        let (_, section) = matches.next()?;
+        matches.next().is_none().then(|| section.clone())
+    }
+}
+
 fn git_diff(dir: &Path, scope: &ReviewScope, paths: &[String]) -> Result<ScopedDiff, String> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(dir).arg("diff").arg("--no-color");
+    cmd.current_dir(dir)
+        .args(["diff", "--no-color", "--full-index"]);
     let (label, commit_count) = match scope {
         ReviewScope::WorkingTree => {
             cmd.arg("HEAD");
@@ -1176,11 +1726,13 @@ mod tests {
     #[test]
     fn args_parse_defaults_and_fields() {
         let d: Args = serde_json::from_str("{}").unwrap();
-        assert!(d.base.is_none() && !d.staged);
+        assert!(d.base.is_none() && !d.staged && !d.inline_command);
         let s: Args = serde_json::from_str(r#"{"staged":true}"#).unwrap();
         assert!(s.staged);
         let b: Args = serde_json::from_str(r#"{"base":"main"}"#).unwrap();
         assert_eq!(b.base.as_deref(), Some("main"));
+        let command: Args = serde_json::from_str(r#"{"_inline_command":true}"#).unwrap();
+        assert!(command.inline_command);
     }
 
     #[test]
@@ -1216,6 +1768,13 @@ mod tests {
             test_dirs(),
         );
         assert_no_forbidden_keys(&tool.parameters_schema(), "$");
+        assert!(
+            !tool.parameters_schema()["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("_inline_command"),
+            "the internal slash-command dispatch hint must not be exposed to models"
+        );
     }
 
     #[test]
@@ -1510,6 +2069,313 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BoundedBatchProvider {
+        active: AtomicU32,
+        peak: AtomicU32,
+        first_bytes: std::sync::atomic::AtomicUsize,
+        max_bytes: std::sync::atomic::AtomicUsize,
+        returned_lines: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        stall_first: std::sync::atomic::AtomicBool,
+        budget_error_first: std::sync::atomic::AtomicBool,
+        stall_all: bool,
+        stall_batch: Option<&'static str>,
+        finding_path: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BoundedBatchProvider {
+        fn model_name(&self) -> &str {
+            "bounded-review-fixture"
+        }
+        fn context_window(&self) -> u32 {
+            512_000
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            struct Active<'a>(&'a AtomicU32);
+            impl Drop for Active<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let _guard = Active(&self.active);
+            self.peak.fetch_max(
+                self.active.fetch_add(1, Ordering::SeqCst) + 1,
+                Ordering::SeqCst,
+            );
+            let bytes = serde_json::to_vec(&(messages, tools, options.max_tokens))
+                .unwrap()
+                .len();
+            self.max_bytes.fetch_max(bytes, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let mut results = messages.iter().filter(|m| m.role == Role::Tool);
+            let reply = if let Some(patch) = results.next() {
+                let first_result = results.next().is_none();
+                if first_result {
+                    let mut lines = self.returned_lines.lock().unwrap();
+                    for line in patch.text.lines().filter(|line| annotated_content(line)) {
+                        *lines.entry(line.to_owned()).or_default() += 1;
+                    }
+                }
+                if let Some(path) = self.finding_path.filter(|_| first_result) {
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "finding".into(),
+                        name: "report_finding".into(),
+                        arguments: json!({
+                            "title": "fixture finding", "body": "the changed line has an issue",
+                            "priority": "P1", "confidence": 0.9,
+                            "file_path": path, "line_start": 1, "line_end": 1
+                        })
+                        .to_string(),
+                    })
+                } else {
+                    StreamEvent::TextDelta("Assigned evidence reviewed.".into())
+                }
+            } else {
+                self.first_bytes.fetch_max(bytes, Ordering::SeqCst);
+                assert!(tools.iter().any(|tool| tool.name == "read_review_patch"));
+                assert!(!messages
+                    .iter()
+                    .any(|message| message.text.contains("diff --git ")));
+                if self.budget_error_first.swap(false, Ordering::SeqCst) {
+                    return Err(ProviderError {
+                        code: Some(review_batches::INPUT_BUDGET_CODE.into()),
+                        message: "fixture exceeded review input budget".into(),
+                        ..Default::default()
+                    });
+                }
+                if self.stall_all
+                    || self.stall_first.swap(false, Ordering::SeqCst)
+                    || self
+                        .stall_batch
+                        .is_some_and(|label| messages.iter().any(|m| m.text.contains(label)))
+                {
+                    std::future::pending::<()>().await;
+                }
+                StreamEvent::ToolCall(ToolCall {
+                    id: "evidence".into(),
+                    name: "read_review_patch".into(),
+                    arguments: "{}".into(),
+                })
+            };
+            Ok(stream::iter([reply, StreamEvent::Done { truncated: false }]).boxed())
+        }
+    }
+
+    fn annotated_content(line: &str) -> bool {
+        line.split_once(": ").is_some_and(|(number, _)| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }
+
+    async fn exercise_batched_review(raw: &str, provider: Arc<BoundedBatchProvider>) -> ToolResult {
+        let annotated = annotate_diff_line_numbers(raw);
+        let cfg = ReviewAgentConfig::new("", "", "bounded-review-fixture", ".", test_dirs());
+        run_batched_review(
+            &annotated,
+            review_batches::PATCH_BYTES,
+            "review regression",
+            raw.lines().filter(|l| l.starts_with("diff --git ")).count(),
+            "",
+            &cfg,
+            None,
+            provider,
+            &ReviewTiming::new(None),
+            &ctx_in(Path::new(".")),
+            false,
+            true,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn large_review_bounds_requests_and_retries_only_the_stalled_batch() {
+        let latest_fixture = std::env::var_os("ATOMCODE_REVIEW_434_FILE_FIXTURE");
+        let (head, file_count) = if latest_fixture.is_some() {
+            ("c429dc69f", 434)
+        } else {
+            ("a6dfe6599", 373)
+        };
+        let fixture = latest_fixture.or_else(|| std::env::var_os("ATOMCODE_REVIEW_RANGE_FIXTURE"));
+        let raw = if let Some(path) = fixture.as_ref() {
+            let raw = std::fs::read_to_string(path).unwrap();
+            assert_eq!(
+                raw.lines().filter(|l| l.starts_with("diff --git ")).count(),
+                file_count
+            );
+            raw
+        } else {
+            let changes = (1..=1800)
+                .map(|i| format!("+{i:05} {}\n", "evidence".repeat(12)))
+                .collect::<String>();
+            format!("diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,0 +1,1800 @@\n{changes}")
+        };
+        let provider = Arc::new(BoundedBatchProvider {
+            stall_first: std::sync::atomic::AtomicBool::new(file_count == 373),
+            budget_error_first: std::sync::atomic::AtomicBool::new(file_count == 434),
+            ..Default::default()
+        });
+        let result = if fixture.is_some() {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let scope = ReviewScope::Range {
+                base: "dd97065f7be6".into(),
+                head: head.into(),
+            };
+            let scoped = git_diff(&repo, &scope, &[]).unwrap();
+            let manifest =
+                ScopeManifest::from_diff(scoped.label, &scoped.diff, scoped.commit_count);
+            assert_eq!(manifest.files, file_count);
+            let args = json!({
+                "scope": {"kind":"range","base":"dd97065f7be6","head":head},
+                "depth":"deep", "confirm_scope":manifest.confirmation_token
+            });
+            let slot: SharedReviewProvider = Arc::new(RwLock::new(Some(provider.clone())));
+            let tool = ReviewTool::new(slot, ReviewToolConfig::default(), test_dirs());
+            let result = tool.execute(&args.to_string(), &ctx_in(&repo)).await;
+            assert_eq!(
+                raw, scoped.diff,
+                "the fixture must match the production diff flags"
+            );
+            result
+        } else {
+            exercise_batched_review(&raw, provider.clone()).await
+        };
+        assert!(!result.is_error, "{}", result.content);
+        let mut expected = std::collections::HashMap::new();
+        for line in annotate_diff_line_numbers(&raw)
+            .lines()
+            .filter(|line| annotated_content(line))
+        {
+            *expected.entry(line.to_owned()).or_default() += 1;
+        }
+        let seen = provider.returned_lines.lock().unwrap();
+        assert_eq!(seen.len(), expected.len());
+        assert!(
+            expected
+                .iter()
+                .all(|(line, count)| seen.get(line) == Some(count)),
+            "each changed/context line must reach the model exactly once"
+        );
+        assert_eq!(
+            provider.peak.load(Ordering::SeqCst),
+            review_batches::CONCURRENCY as u32
+        );
+        let first = provider.first_bytes.load(Ordering::SeqCst);
+        let max = provider.max_bytes.load(Ordering::SeqCst);
+        println!(
+            "{} Max first request {first} bytes; max request {max} bytes.",
+            result.content
+        );
+        assert!(first < 64 * 1024);
+        assert!(max <= review_batches::REQUEST_BYTES);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn large_review_surfaces_header_timeout_and_incomplete_coverage() {
+        let raw = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n";
+        let provider = Arc::new(BoundedBatchProvider {
+            stall_all: true,
+            ..Default::default()
+        });
+        let result = exercise_batched_review(raw, provider).await;
+        assert!(result.is_error);
+        let detail = review_open_timeout_detail(&result.content).unwrap();
+        assert!(detail.contains("0/1 batches completed"), "{detail}");
+        assert!(
+            detail.contains("waiting for model response headers"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn batched_review_keeps_findings_on_git_quoted_chinese_paths() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "core.quotePath", "true"]);
+        let path = "中文 文件.rs";
+        std::fs::write(root.path().join(path), "fn fixture() {}\n").unwrap();
+        git(root.path(), &["add", "--", path]);
+        let raw = git_diff(root.path(), &ReviewScope::Staged, &[])
+            .unwrap()
+            .diff;
+        assert!(!raw.contains(path), "{raw}");
+        let provider = Arc::new(BoundedBatchProvider {
+            finding_path: Some(path),
+            ..Default::default()
+        });
+        let result = exercise_batched_review(&raw, provider).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("fixture finding"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains(path), "{}", result.content);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn batched_review_preserves_completed_results_after_the_shared_deadline() {
+        let raw = concat!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+            "diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        );
+        let cfg = ReviewAgentConfig::new("", "", "bounded-review-fixture", ".", test_dirs());
+        let result = run_batched_review(
+            &annotate_diff_line_numbers(raw),
+            raw.len() / 2 + 6,
+            "partial timeout fixture",
+            2,
+            "",
+            &cfg,
+            None,
+            Arc::new(BoundedBatchProvider {
+                finding_path: Some("a.rs"),
+                stall_batch: Some("Assigned batch 2/2."),
+                ..Default::default()
+            }),
+            &ReviewTiming::new(None),
+            &ctx_in(Path::new(".")),
+            false,
+            true,
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(review_open_timeout_detail(&result.content).is_none());
+        let detail = review_deadline_detail(&result.content).expect(&result.content);
+        assert!(detail.contains("1/2 batches completed"), "{detail}");
+        assert!(detail.contains("fixture finding"), "{detail}");
+        assert!(detail.contains("budget (1s) exhausted"), "{detail}");
+    }
+
+    struct SlowReviewAndVerify;
+    #[async_trait]
+    impl LlmProvider for SlowReviewAndVerify {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            if !messages.iter().any(|m| m.role == Role::Tool) {
+                tokio::time::sleep(Duration::from_secs(200)).await;
+            }
+            ScriptedReviewProvider
+                .chat_stream(messages, tools, options)
+                .await
+        }
+    }
+
     struct FinishesAfterTenMinutes;
 
     #[async_trait]
@@ -1602,11 +2468,12 @@ mod tests {
             _working_dir: &Path,
             task: String,
             scope: Option<String>,
+            files: usize,
         ) -> Option<Result<DelegatedReview, String>> {
             self.asked.lock().unwrap().push((task, scope));
             self.takes.then_some(Ok(DelegatedReview {
                 slot: 2,
-                files: Some(1),
+                files: Some(files),
             }))
         }
     }
@@ -1630,6 +2497,8 @@ mod tests {
             return;
         }
         let dir = repo_with_working_tree_change();
+        std::fs::write(dir.path().join("other.rs"), "fn other() {}\n").unwrap();
+        git(dir.path(), &["add", "--", "other.rs"]);
         let delegate = Arc::new(Recorded {
             takes: true,
             asked: Default::default(),
@@ -1642,10 +2511,15 @@ mod tests {
         .with_delegate(Some(delegate.clone()));
 
         let result = tool
-            .execute(r#"{"depth":"deep"}"#, &ctx_in(dir.path()))
+            .execute(r#"{"depth":"deep","paths":["a.rs"]}"#, &ctx_in(dir.path()))
             .await;
 
         assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("1 file(s) in scope"),
+            "{}",
+            result.content
+        );
         assert!(
             result.content.contains("background session [#2]"),
             "{}",
@@ -1654,8 +2528,37 @@ mod tests {
         assert!(result.content.contains("Do not wait"), "{}", result.content);
         let asked = delegate.asked.lock().unwrap();
         assert_eq!(asked.len(), 1);
-        assert!(asked[0].0.contains(r#"{"depth":"deep"}"#), "{}", asked[0].0);
+        assert!(
+            asked[0].0.contains(r#"{"depth":"deep","paths":["a.rs"]}"#),
+            "{}",
+            asked[0].0
+        );
         assert_eq!(asked[0].1.as_deref(), Some("working_tree"));
+    }
+
+    #[tokio::test]
+    async fn inline_command_hint_skips_background_delegate() {
+        let dir = repo_with_working_tree_change();
+        let delegate = Arc::new(Recorded {
+            takes: true,
+            asked: Default::default(),
+        });
+        let tool = ReviewTool::new(
+            Arc::new(RwLock::new(None)),
+            ReviewToolConfig::default(),
+            test_dirs(),
+        )
+        .with_delegate(Some(delegate.clone()));
+
+        let result = tool
+            .execute(r#"{"_inline_command":true}"#, &ctx_in(dir.path()))
+            .await;
+
+        assert!(result.content.contains("review provider is not wired"));
+        assert!(
+            delegate.asked.lock().unwrap().is_empty(),
+            "the slash command executes this reviewer directly"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1861,15 +2764,93 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn interactive_review_can_complete_after_more_than_ten_minutes() {
+    #[test]
+    fn delegated_review_is_one_report_task_not_a_second_coding_task() {
+        let task = delegated_task(r#"{"depth":"deep"}"#, Some("Audit, fix, and open a PR"));
+        assert!(task.contains("exactly once"));
+        assert!(task.contains("do not retry with another depth"));
+        assert!(task.contains("calling conversation"));
+        assert!(task.contains("Audit, fix, and open a PR"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deep_deadline_surfaces_all_failed_dimensions_and_the_reason() {
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(FinishesAfterTenMinutes))));
+        let mut tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                stream_timeout: Duration::from_secs(700),
+                ..Default::default()
+            },
+            test_dirs(),
+        );
+        tool.max_turn_duration = Some(Duration::from_secs(300));
+        let start = tokio::time::Instant::now();
+        let result = tool
+            .execute(r#"{"depth":"deep"}"#, &ctx_in(dir.path()))
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("0/4"), "{}", result.content);
+        for dimension in ["correctness", "security", "performance", "tests_contracts"] {
+            assert!(
+                result.content.contains(&format!(
+                    "{dimension}: review wall-clock budget exhausted (300s)"
+                )),
+                "{}",
+                result.content
+            );
+        }
+        assert!(start.elapsed() <= Duration::from_secs(301));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn verify_uses_the_remaining_deadline_and_keeps_unverified_findings() {
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(SlowReviewAndVerify))));
+        let mut tool = ReviewTool::new(
+            provider,
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                first_token_timeout: Duration::from_secs(700),
+                ..Default::default()
+            },
+            test_dirs(),
+        );
+        tool.max_turn_duration = Some(Duration::from_secs(300));
+        let start = tokio::time::Instant::now();
+        let result = tool
+            .execute(r#"{"depth":"deep+verify"}"#, &ctx_in(dir.path()))
+            .await;
+        assert!(
+            result.content.contains("unchecked unwrap"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Verification incomplete"),
+            "{}",
+            result.content
+        );
+        assert!(
+            start.elapsed() <= Duration::from_secs(301),
+            "elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn explicitly_extended_review_can_complete_after_more_than_ten_minutes() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
         }
         let dir = repo_with_working_tree_change();
         let provider: SharedReviewProvider =
             Arc::new(RwLock::new(Some(Arc::new(FinishesAfterTenMinutes))));
-        let tool = ReviewTool::new(
+        let mut tool = ReviewTool::new(
             provider,
             ReviewToolConfig {
                 model: "mock-model".into(),
@@ -1879,6 +2860,7 @@ mod tests {
             },
             test_dirs(),
         );
+        tool.max_turn_duration = Some(Duration::from_secs(900));
         let ctx = ToolContext {
             working_dir: dir.path().to_path_buf(),
             cancel: Default::default(),
@@ -2006,6 +2988,160 @@ mod tests {
         assert!(d.is_deep() && !d.wants_verify());
         let s: Args = serde_json::from_str("{}").unwrap();
         assert!(!s.is_deep() && !s.wants_verify());
+    }
+
+    #[test]
+    fn embedded_review_diff_supplies_shared_git_blob_evidence() {
+        let dir = repo_with_working_tree_change();
+        let root = dir.path();
+        let a = std::fs::read(root.join("a.rs")).unwrap();
+        std::fs::write(root.join("mirror.rs"), a).unwrap();
+        std::fs::write(root.join("different.rs"), "fn different() {}\n").unwrap();
+        git(root, &["add", "mirror.rs", "different.rs"]);
+
+        let diff = git_diff(root, &ReviewScope::WorkingTree, &[]).unwrap().diff;
+        let plan = render_review_impact_plan(&diff);
+        let evidence = plan
+            .lines()
+            .find(|line| line.contains("Same post-change Git content"));
+        assert_eq!(
+            evidence,
+            Some(r#"- Same post-change Git content: "a.rs" "mirror.rs""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn review_trace_correlates_pass_model_tool_and_verification() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let dir = repo_with_working_tree_change();
+        let provider: SharedReviewProvider =
+            Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
+        let tool = ReviewTool::new(provider, ReviewToolConfig::default(), test_dirs());
+        let mut context = ctx_in(dir.path());
+        context.progress = ProgressSink::with_source_id("review-source", Arc::new(|_| {}));
+        let result = tool
+            .execute(
+                r#"{"depth":"deep+verify","instructions":"review-test-private-text"}"#,
+                &context,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let log = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        for (stage, operation) in [
+            ("security", "review pass"),
+            ("performance", "model request"),
+            ("correctness", "tool execution"),
+            ("verify_full", "review pass"),
+        ] {
+            assert!(
+                log.lines().any(|line| line.contains("review-source")
+                    && line.contains(stage)
+                    && line.contains(operation)
+                    && line.contains("elapsed_ms=")),
+                "missing {stage} {operation} in {log}"
+            );
+        }
+        assert!(log.contains("review model first content"));
+        assert!(log.contains("candidate=1"));
+        assert!(!log.contains("review-test-private-text"));
+    }
+
+    struct ScopedVerificationProvider {
+        defer: bool,
+        inputs: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScopedVerificationProvider {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            if let Some(task) = messages
+                .iter()
+                .find(|m| m.role == Role::User && m.text.contains("CANDIDATE FINDING:"))
+            {
+                if !messages.iter().any(|m| m.role == Role::Tool) {
+                    let full = task.text.contains("+fn cross_file_evidence()");
+                    assert!(task.text.contains("+fn main()"));
+                    self.inputs.lock().unwrap().push(full);
+                    if self.defer && !full {
+                        return Ok(stream::iter(vec![
+                            StreamEvent::TextDelta("Need the other file's change.".into()),
+                            StreamEvent::Done { truncated: false },
+                        ])
+                        .boxed());
+                    }
+                }
+            }
+            ScriptedReviewProvider
+                .chat_stream(messages, tools, options)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_verify_uses_full_diff_only_when_file_evidence_does_not_confirm() {
+        for defer in [false, true] {
+            let dir = repo_with_working_tree_change();
+            std::fs::write(dir.path().join("b.rs"), "fn cross_file_evidence() {}\n").unwrap();
+            git(dir.path(), &["add", "b.rs"]);
+            let observed = Arc::new(ScopedVerificationProvider {
+                defer,
+                inputs: Default::default(),
+            });
+            let provider: SharedReviewProvider = Arc::new(RwLock::new(Some(observed.clone())));
+            let tool = ReviewTool::new(provider, ReviewToolConfig::default(), test_dirs());
+            let result = tool
+                .execute(r#"{"depth":"deep+verify"}"#, &ctx_in(dir.path()))
+                .await;
+            assert!(!result.is_error, "{}", result.content);
+            assert!(
+                result.content.contains("verify dropped 0"),
+                "{}",
+                result.content
+            );
+            let inputs = observed.inputs.lock().unwrap();
+            let expected: &[bool] = if defer { &[false, true] } else { &[false] };
+            assert_eq!(inputs.as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn verification_scope_uses_full_diff_if_the_file_is_ambiguous() {
+        let diff = "diff --git a/a/helpers.rs b/a/helpers.rs\n+++ b/a/helpers.rs\n@@ -1 +1 @@\ndiff --git a/b/helpers.rs b/b/helpers.rs\n+++ b/b/helpers.rs\n@@ -1 +1 @@\n";
+        let sections = VerificationDiffs::new(diff);
+        assert!(sections.for_path("helpers.rs").is_none());
+        let range = sections.for_path("b/helpers.rs").unwrap();
+        assert!(diff[range].starts_with("diff --git a/b/helpers.rs"));
+        assert!(sections.for_path("missing.rs").is_none());
     }
 
     #[tokio::test]

@@ -18,6 +18,11 @@
 mod anthropic;
 mod atomgit_sign;
 mod auto_proxy;
+/// Thin benchmark-only entry points for `benches/core.rs`. Compiled only with
+/// the `bench` feature, which is not part of any default or test build.
+#[cfg(feature = "bench")]
+pub mod bench;
+mod content_marker;
 pub mod discovery;
 mod input_profile;
 mod latency;
@@ -32,6 +37,7 @@ mod sign;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use atomgit_sign::{atomgit_request_signer, is_atomgit_gateway, signer_available};
+pub use content_marker::contains_native_chat_template_token;
 pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai_compat::{
     model_suggests_vision, reason_effort_applicable, OpenAiCompatConfig, OpenAiCompatProvider,

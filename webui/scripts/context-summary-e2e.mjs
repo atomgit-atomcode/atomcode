@@ -52,36 +52,43 @@ try {
     await page.goto(base + '/?sync=1&session=context-summary');
     const footer = page.locator('.input-footer');
     if (width < 600) await page.locator('.message-input').click();
-    try { await footer.getByText('Summarized 3 times', { exact: false }).waitFor({ timeout: 5000 }); } catch (error) { await page.screenshot({path:'/tmp/context-summary-failure.png', fullPage:true}); console.log((await page.locator('body').innerText()).slice(0,1800)); throw error; }
+    await page.getByText('The resource read boundary is ready.').waitFor();
+    const footerCount = footer.getByText(/Summarized \d+ times/);
+    assert.equal(await footerCount.count(), 0);
     emit({ type: 'tokens', prompt: 420000, completion: 100, total: 420100 });
     emit({ type: 'context_compacting', active: true });
+    await footer.getByText('420.1k tokens', { exact: true }).waitFor({ state: 'attached' });
     await page.getByRole('status').filter({ hasText: 'Summarizing context' }).waitFor();
     assert(!(await footer.textContent()).includes('Summarizing'));
     emit({ type: 'context_summary', count: 4, record: true });
-    await footer.getByText('Summarized 4 times', { exact: false }).waitFor();
-    emit({ type: 'context_summary', count: 4, record: true });
     await page.getByText('Context summarized · #4', { exact: true }).waitFor();
+    assert.equal(await footerCount.count(), 0);
+    emit({ type: 'context_summary', count: 4, record: true });
+    emit({ type: 'context_compacting', active: true });
+    await page.getByRole('status').filter({ hasText: 'Summarizing context' }).waitFor();
     assert.equal(await page.getByText('Context summarized · #4', { exact: true }).count(), 1);
-    await footer.getByRole('button', { name: 'Summarized 4 times', exact: false }).click();
-    assert.equal(await page.getByRole('status').filter({ hasText: 'Summarizing context' }).count(), 0);
-    if (width < 600) await page.locator('.message-input').click();
-    await page.screenshot({ path: `/tmp/atomcode-context-summary-${width}.png`, fullPage: true });
     baseline = 4;
     await page.reload();
     if (width < 600) await page.locator('.message-input').click();
-    await footer.getByText('Summarized 4 times', { exact: false }).waitFor();
+    await page.getByText('The resource read boundary is ready.').waitFor();
+    assert.equal(await footerCount.count(), 0);
     assert.equal(await page.getByText('Context summarized · #4', { exact: true }).count(), 0);
     // A late/older history response with no reading must not erase a known count.
     const unknownSnapshot = { ...snapshot() }; delete unknownSnapshot.summary_count;
     emit(unknownSnapshot);
-    await footer.getByText('Summarized 4 times', { exact: false }).waitFor({ state: 'attached' });
+    emit({ type: 'context_summary', count: 4, record: true });
+    emit({ type: 'context_summary', count: 5, record: true });
+    await page.getByText('Context summarized · #5', { exact: true }).waitFor();
+    assert.equal(await page.getByText('Context summarized · #4', { exact: true }).count(), 0);
+    assert.equal(await footerCount.count(), 0);
     baseline = 0;
     emit({ ...snapshot(), session_id: 'fresh-summary-fixture', messages: [] });
-    await page.waitForFunction(() => !document.querySelector('.input-footer')?.textContent.includes('Summarized'));
+    await page.getByText('Context summarized · #5', { exact: true }).waitFor({ state: 'detached' });
+    assert.equal(await footerCount.count(), 0);
     await page.close();
   }
   assert.deepEqual(errors, []);
-  console.log('Passed: footer count, live progress outside footer, replay deduplication, reconnect and fresh-session reset, at 1200/390px.');
+  console.log('Passed: no footer count, live progress outside footer, replay deduplication, reconnect and fresh-session reset, at 1200/390px.');
 } finally {
   await browser.close(); for (const client of clients) client.end(); await new Promise(resolve => server.close(resolve));
 }

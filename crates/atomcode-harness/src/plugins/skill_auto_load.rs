@@ -77,7 +77,7 @@ impl Waterfall<PreStep> for AutoSkills {
                             if existing || retained {
                                 tracing::info!(target: "atomcode_skills", turn = step.turn, outcome = "skipped", skill = %skill.name, reason = "already_loaded", "automatic skill selection");
                             } else {
-                                tracing::info!(target: "atomcode_skills", turn = step.turn, outcome = "loaded", skill = %skill.name, bytes = content.len(), reason = "debugging_task", "automatic skill selection");
+                                tracing::info!(target: "atomcode_skills", turn = step.turn, outcome = "loaded", skill = %skill.name, bytes = content.len(), reason = "matched_task_policy", "automatic skill selection");
                                 // Skill provenance activates allowed-tools. A runtime
                                 // selection must supply context without that authority.
                                 step.injections.push((content, InjectionOrigin::Reminder));

@@ -71,6 +71,9 @@ cp "target/${TARGET}/release/atomcode-daemon" "${DIST}/atomcode-daemon-${VERSION
 echo "  -> ${DIST}/atomcode-${VERSION}-${SUFFIX}"
 echo "  -> ${DIST}/atomcode-daemon-${VERSION}-${SUFFIX}"
 
+python3 scripts/report-package-size.py --artifacts "$DIST" \
+    --baseline latest.json --output "$DIST/package-size.json"
+
 # Package
 echo ""
 echo "=== Packaging ==="

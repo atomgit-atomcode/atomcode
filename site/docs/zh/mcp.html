@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.6</span>
+    <span class="dhdr-ver">v5.2.8</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -78,6 +78,9 @@
 <h1 id="mcp-集成">MCP 集成</h1>
       <p class="lede">MCP（Model Context Protocol）是一个开放协议,把外部程序或 HTTP 服务的「工具」接到 AtomCode,让模型像调用内置工具一样使用它们。从 v4.20.4 起 AtomCode 内置 MCP 客户端,直接复用 Cursor 等同样使用 <code>mcpServers</code> 配置块的生态。</p>
 
+      <h2 id="session-pause">暂停本会话全部 MCP</h2>
+      <p>在 <code>/mcp</code> 面板顶部点击“暂停全部”，或在列表页按 <code>Ctrl+S</code>；WebUI 的 MCP 菜单顶部也提供同样入口。暂停后工具不再提供给模型，连接会释放。“恢复”按各服务器原有配置重新连接，不会启用原本禁用的服务器，也不修改配置文件。</p>
+      <p>请先结束当前任务、goal/loop，收取后台任务并停止子 agent。暂停状态在同一会话内的模型切换和配置重载后保留；新建、重新打开会话或切换工作目录后重置，不作为持久化配置保存。</p>
       <h2 id="它能做什么">它能做什么</h2>
       <ul>
         <li>通过官方 MCP server 操作 GitHub、GitLab、Jira 等外部服务</li>
@@ -107,6 +110,13 @@
       <p>如果同一个 server 同时写了 <code>command</code> 和 <code>url</code>,当前实现会优先按 stdio(<code>command</code>)处理;为避免歧义,对外配置请不要双写。</p>
       <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
       <p><code>.mcp.json</code> 还支持 <strong>JSONC 注释</strong> —— <code>//</code> 行注释和 <code>/* */</code> 块注释 —— 可以给某个 server 加说明或临时注释掉而不必删除。字符串值内部的注释符号(比如 URL 里的 <code>//</code>)会被原样保留。</p>
+
+      <h3 id="required-experimental-capabilities">所需扩展能力（可选）</h3>
+      <p>在单个服务配置中，<code>requiredExperimentalCapabilities</code> 将后端明确声明的能力名映射到精确的正整数版本，例如：</p>
+      <pre><code>"requiredExperimentalCapabilities": {
+  "vendor/feature": 1
+}</code></pre>
+      <p>只填写后端文档明确支持的能力和版本。每次 MCP 初始化（包括 stdio 自动恢复）都会在连接可用前检查；缺失、格式错误或版本不同均拒绝连接。对配置了该要求的 HTTP 会话，未经重新初始化的会话 ID 变化也会被拒绝，需重连。省略该字段保持原行为。版本校验不会自动启用功能或协商其使用协议，不授予工具权限，也不能证明外部后端正确实现了其声明的策略。</p>
 
       <h3 id="stdio-示例本地子进程">stdio 示例(本地子进程)</h3>
       <pre><code>{
@@ -180,6 +190,44 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         </tbody>
       </table>
       <p>TUI 下可在会话区看到 <code>✓ MCP server 'github' connected</code> 或 <code>✗ MCP server '…' failed: …</code>。<strong>单个 server 失败不会拖垮其他 server 与主程序。</strong></p>
+
+      <h2 id="image-results">图片结果</h2>
+      <p>MCP 工具返回的内联 <code>image</code> 内容会与文字结果一起传入现有工具图片链路，供支持视觉输入的模型查看。支持 PNG、JPEG、GIF 和 WebP，保留原始图片字节和尺寸，不静默缩放截图。工具返回 <code>isError: true</code> 时仍保留其有效截图和错误标记。</p>
+      <p>图片会校验 Base64、声明的 MIME 类型、实际编码和像素数据。每张图片最多 4 MiB Base64，每次结果最多 4 张、合计 8 MiB Base64；单边最多 8192 像素，总像素最多 1600 万。请求级图片预算还可能进一步裁减历史图片。无效或超限时保留原文字、返回明确的工具错误，不附带部分截图，也不自动重跑已执行的操作；需要更小的截图时，应让服务端裁取目标区域。</p>
+      <p>此能力不包含桌面执行器，不会自动获取屏幕录制或辅助功能权限，也不会替换当前模型。文本模型不会因此获得视觉能力。暂不自动获取图片资源链接或将嵌入资源的 blob 作为截图使用。</p>
+
+      <h2 id="browser-use">隔离浏览器工作流</h2>
+      <p>浏览器集成采用外部 <a href="https://github.com/microsoft/playwright-mcp">Playwright MCP</a> 后端。AtomCode 不捆绑 Node 或浏览器，启动时也不下载它们。请显式安装 Node 20+ 和 Chrome。目前仅有 macOS 本机验收条件；Windows、Linux 需要分别完成实机验收，不能视为已验证。</p>
+      <pre><code># 显式安装到仓库之外的自选目录
+npm install --prefix /absolute/path/browser-backend @playwright/mcp@0.0.85
+atomcode browser doctor --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
+atomcode browser enable --server /absolute/path/browser-backend/node_modules/@playwright/mcp/cli.js
+atomcode</code></pre>
+      <p>Windows 请使用绝对 Windows 路径；<code>--node</code> 可指定已安装的 Node 可执行文件。诊断仅检查版本，不启动 Chrome，也不能证明浏览器已安装。缺少浏览器时运行会明确报错，AtomCode 不自动安装。</p>
+      <pre><code>/browser status
+/browser doctor
+/browser reload
+打开本地测试页，填写已授权的表单并核对结果。
+/browser disable
+/browser reload</code></pre>
+      <p>首次设置需在终端指定后端路径；设置后 <code>/browser enable</code> 可复用它。修改配置需要显式重载或重启。<code>status</code> 读取保存的配置，实时连接、项目覆盖和暂停状态请看 <code>/mcp</code>。自定义同名配置及修改过的技能会保留，不覆盖。</p>
+      <p>托管后端使用隔离 profile，关闭页面提供的 WebMCP，不连接个人 Chrome profile，不导入 Cookie。保留原生 MCP 审批（<code>trust: false</code>、空 <code>autoApprove</code>）；只读标记与工具级“始终允许”仍按现有机制生效。它们<strong>不等于站点授权</strong>，原版后端没有强制 origin 白名单；下方可选来源限制后端提供显式执行边界。浏览器位于 MCP 宿主机器，不一定是客户端所在电脑。</p>
+      <p>托管 <code>allowedTools</code> 只暴露已审查的导航、观察、表单、交互和关闭工具，排除代码求值、不安全脚本、文件上传和浏览器安装工具。通用 MCP 也可配置精确原始工具名列表：省略表示不限，空数组表示全部禁止。发现、缓存和调用入口都检查该列表；它不授予审批，也不是操作系统或网络沙箱。</p>
+      <p>生成的页面快照和截图放在项目外的 <code>&lt;用户目录&gt;/integrations/browser-use/artifacts</code>。Unix 设置为仅所有者可访问，Windows 沿用目录 ACL。后端设置 16 MiB 输出清理目标，不是硬磁盘配额；禁用不会删除这些文件，不再需要时请自行清理。</p>
+      <p>一次配置并重载后，直接描述打开网页、填写表单、点击或截图等任务，会自动加载浏览器指引并由模型使用已连接的工具，无需每次输入命令；仍可用 <code>$browser-use</code> 显式选择。<code>[no-auto-skills]</code>、技能的 <code>auto-load: off</code> 和宿主自动加载关闭设置仍然有效；暂停的 MCP 不会被自动恢复。截图任务需要视觉模型；结构化页面快照可供文本模型使用。取消和禁用不能撤销已发出的外部操作；结果未知时重新观察后再决定是否重试，只关闭本工作流拥有的浏览器资源。</p>
+
+      <h3 id="browser-origin-scope">确切来源范围（可选后端）</h3>
+      <p>首次配置需要显式指定已安装的来源后端 <code>backend.cjs</code> 和固定版本依赖目录，不会自动下载或复制。这一后端检查实际 HTTP(S)/WS(S) 目标，覆盖重定向、iframe 与子资源，不把 Playwright 的便利性 <code>allowed-origins</code> 参数当作执行边界。</p>
+      <pre><code>atomcode browser enable --origin-backend /absolute/path/to/backend.cjs \
+  --backend-root /absolute/installed/node_modules/@playwright/mcp \
+  --allow-origin https://example.test
+/browser enable --allow-origin https://example.test --allow-origin https://example.test:8443
+/browser enable --deny-all-origins
+# 显式切回原版；普通 enable 保留范围
+/browser enable --unrestricted-origins
+/browser reload</code></pre>
+      <p>来源必须是确切的 HTTP(S) 协议、主机和端口，不接受凭据、路径、查询或通配符。<code>--deny-all-origins</code> 保存空允许列表。配置前验证无浏览器 doctor 报告，并同时保存策略和必需的 <code>atomcode/browser-origin-scope</code> v1 能力；每次实际初始化或恢复独立检查能力。其他必需能力和已有更窄工具限制会保留。保存的范围无效时会报错，不会静默移除。<code>doctor</code>、<code>status</code> 理解保存的范围，但不查询当前连接；项目覆盖和显式 reload 仍然适用。</p>
+      <p>限制模式的截图和快照放在 <code>&lt;用户目录&gt;/integrations/browser-use/origin-artifacts/files</code>，所有权标记位于清理目录之外；后端拒绝已有的无标记非空根目录和末级符号链接。本版拒绝接受下载文件、本地文件上传和完整 CDP 工具，尚未实现按来源放开传输或 CDP 的设置；HTTPS 响应字节仍可能进入 Chrome。这不是系统沙箱，也不全局限制 Shell、其他浏览器服务或客户端、以及允许站点内部的效果。目前仅有 macOS Chrome 本机验证，其他平台执行与完整策略矩阵尚待验收。</p>
 
       <h2 id="工具命名">工具命名</h2>
       <p>每个远端 tool 注册成 <code>mcp__&lt;server 键名&gt;__&lt;远端 tool 名&gt;</code>。</p>

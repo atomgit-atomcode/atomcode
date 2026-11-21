@@ -27,6 +27,16 @@ pub struct Session {
     /// 这个会话是更新版本写的,当前构建读不了——列表说出来,选中也不恢复。
     pub needs_newer_version: bool,
     pub scheduled: bool,
+    /// 另一个 runtime(别的终端)正拿着它在做什么;选中会 Fork 一份。
+    pub held: Option<Held>,
+}
+
+/// 别处拿着这个会话时它在做的事。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    Open,
+    Running,
+    Waiting,
 }
 
 impl Session {
@@ -236,6 +246,7 @@ mod delete_tests {
                 turns: 2,
                 needs_newer_version: false,
                 scheduled: false,
+                held: None,
             },
             Session {
                 id: "bbb".into(),
@@ -245,6 +256,7 @@ mod delete_tests {
                 turns: 1,
                 needs_newer_version: false,
                 scheduled: false,
+                held: None,
             },
         ])
     }
@@ -299,6 +311,7 @@ mod tests {
             turns: 3,
             needs_newer_version: false,
             scheduled: false,
+            held: None,
         }
     }
 

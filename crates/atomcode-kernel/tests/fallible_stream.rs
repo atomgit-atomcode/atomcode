@@ -191,6 +191,7 @@ async fn recovered_truncation_continues_without_warning() {
             AgentEvent::OutputTruncationRecovery {
                 attempt,
                 max_attempts,
+                ..
             } => recovery_progress.push((attempt, max_attempts)),
             AgentEvent::TurnComplete { .. } => {
                 completed = true;

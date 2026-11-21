@@ -12,7 +12,7 @@ html {
 
 body {
   font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
-  font-size: var(--vscode-font-size, 13px);
+  font-size: var(--app-font-size, 13px);
   color: var(--app-primary-foreground);
   background: var(--app-primary-background);
   height: 100%;

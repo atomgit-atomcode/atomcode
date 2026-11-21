@@ -374,6 +374,7 @@ pub(crate) fn attach(
                     if !watched.tell_unavailable(reason) {
                         continue;
                     }
+                    watched.redescribe();
                     if let Some(event) =
                         translate(CodingRuntimeEvent::ProviderUnavailable { reason, forced })
                     {
@@ -1015,6 +1016,8 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
                 cached: usage.cached,
             }),
         recovering: goal.active && goal.recovery.is_some(),
+        waiting_for_quota: goal.active
+            && goal.recovery.as_ref().is_some_and(|r| r.waiting_for_quota),
         retry_in_secs: goal
             .recovery
             .as_ref()
@@ -1036,8 +1039,17 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
 fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
         usage: None,
-        recovering: false,
-        retry_in_secs: None,
+        recovering: looping.active && looping.recovery.is_some(),
+        waiting_for_quota: looping.active
+            && looping
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.waiting_for_quota),
+        retry_in_secs: looping
+            .recovery
+            .as_ref()
+            .filter(|_| looping.active)
+            .map(|r| r.retry_in_secs),
         goal_stage: None,
         goal_detail: None,
         kind: "loop".into(),
@@ -1155,6 +1167,8 @@ fn to_mcp_action(
     use atomcode_coding::parts::McpAction as Runtime;
     use atomcode_host_api::McpAction;
     match action {
+        McpAction::PauseAll => Some(Runtime::PauseAll),
+        McpAction::ResumeAll => Some(Runtime::ResumeAll),
         McpAction::Reconnect => Some(Runtime::Reconnect),
         McpAction::CancelReconnect => Some(Runtime::CancelReconnect),
         McpAction::Trust => Some(Runtime::Trust),
@@ -1242,6 +1256,7 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
         }
         CodingRuntimeEvent::CompactionFinished { completion } => match completion {
             CompactionCompletion::Completed(outcome) => Some(AgentEvent::Compacted {
+                diagnostic: outcome.diagnostic,
                 trigger: outcome.trigger,
                 epoch: outcome.epoch,
                 removed: outcome.removed_messages,
@@ -1274,6 +1289,11 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
         }
         // 没有可用的 provider。话与「改去哪里」都已经有现成的 ——
         // `readiness_for` 就是干这个的,只是只在开屏那一次被问过。
+        // The explicit sign-out command already confirms success in the transcript.
+        CodingRuntimeEvent::ProviderUnavailable {
+            reason: ProviderUnavailableReason::SignedOut,
+            ..
+        } => None,
         CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
             match readiness_for(Some(reason)) {
                 HostReply::Readiness { why: Some(why), .. } => Some(said(why.into())),
@@ -1680,9 +1700,16 @@ impl RuntimeControl {
                         needs_newer_version: entry.needs_newer_version,
                         scheduled: entry.origin
                             == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
+                        held: None,
                     },
                 )
             })
+            .collect();
+        let sessions_root =
+            SessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
+        let buckets: std::collections::HashMap<String, String> = all
+            .iter()
+            .map(|(bucket, session)| (session.id.clone(), bucket.clone()))
             .collect();
         let here_bucket = working_dir.as_deref().map(|dir| {
             SessionManager::project_hash(
@@ -1691,8 +1718,37 @@ impl RuntimeControl {
             )
         });
         let mut sessions = scope_sessions(all, working_dir.as_deref(), here_bucket.as_deref());
+        // Only the rows the picker shows are probed: a lease and a log tail each.
+        for session in &mut sessions {
+            if let Some(bucket) = buckets.get(&session.id) {
+                session.held = held_activity(
+                    &SessionManager::with_root(sessions_root.join(bucket)),
+                    &session.id,
+                );
+            }
+        }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions
+    }
+}
+
+/// What another runtime holding `id` is doing with it. A failed probe leaves
+/// the row unmarked: the mark is a hint, resuming still decides.
+fn held_activity(
+    bucket: &atomcode_capabilities::session::SessionManager,
+    id: &str,
+) -> Option<atomcode_host_api::HeldActivity> {
+    use atomcode_capabilities::session::SessionActivity;
+    use atomcode_host_api::HeldActivity;
+    match bucket.activity(id) {
+        Ok(Some(SessionActivity::Open)) => Some(HeldActivity::Open),
+        Ok(Some(SessionActivity::Running)) => Some(HeldActivity::Running),
+        Ok(Some(SessionActivity::Waiting)) => Some(HeldActivity::Waiting),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(session = id, %error, "session activity probe failed");
+            None
+        }
     }
 }
 
@@ -2079,6 +2135,19 @@ impl HostControl for RuntimeControl {
                 let changed = self.handle.fresh_session().await.map_err(refused)?;
                 self.changed(changed.session_id)
             }
+            HostCommand::ForkSession { session } => {
+                self.addressed(&session)?;
+                let changed = self.handle.fork_session(&session).await.map_err(refused)?;
+                let id = changed.session_id.clone().ok_or(HostError::Unavailable)?;
+                self.changed(changed.session_id)?;
+                Ok(HostReply::DoneWithNote {
+                    note: tr(SMsg::SessionForked {
+                        source: &session,
+                        id: &id,
+                    })
+                    .into_owned(),
+                })
+            }
             HostCommand::Resume { session, target } => {
                 use atomcode_capabilities::session::SessionManager;
                 self.addressed(&session)?;
@@ -2091,13 +2160,7 @@ impl HostControl for RuntimeControl {
                 // picker offers (a 0-message phantom is not resumable).
                 let scan =
                     SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
-                let Some(entry) = scan
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id == target && entry.message_count > 0)
-                else {
-                    return Err(HostError::NotFound);
-                };
+                let entry = find_switchable_entry(&scan.entries, &target)?;
                 if entry.needs_newer_version {
                     return Err(HostError::Failed {
                         message: format!(
@@ -2195,6 +2258,58 @@ impl HostControl for RuntimeControl {
                 self.delete_stored(&session)?;
                 Ok(HostReply::Done)
             }
+            HostCommand::DisplayHistory {
+                session,
+                cursor,
+                turns,
+            } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                // Disk reads see committed native facts under the runtime's lease;
+                // the runtime remains the only writer and lifecycle owner.
+                let id = session.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let dirs = atomcode_coding::config::product_dirs_from_env();
+                    let manager =
+                        atomcode_capabilities::session::SessionManager::for_project(&here, &dirs);
+                    let events = if manager.is_event_session(&id) {
+                        manager.load_events(&id).map_err(|e| e.to_string())?
+                    } else if manager.list().iter().any(|m| m.id == id) {
+                        return Err("Display paging requires a native event session".into());
+                    } else {
+                        Vec::new()
+                    };
+                    let source = if cursor.is_none() {
+                        atomcode_kernel::session::history::bootstrap_events(&events)
+                    } else {
+                        &events
+                    };
+                    let (range, page) = atomcode_kernel::session::history::range(
+                        &id,
+                        source,
+                        cursor.as_ref(),
+                        turns,
+                    )
+                    .map_err(|e| format!("History cursor refused: {e:?}"))?;
+                    let seed = atomcode_tui::history::state_seed(&id, &events[..range.start]);
+                    Ok::<_, String>((page, seed))
+                })
+                .await
+                .map_err(|e| HostError::Failed {
+                    message: e.to_string(),
+                })?
+                .map_err(|message| HostError::Failed { message })?;
+                self.addressed(&session)?;
+                Ok(HostReply::DisplayHistory {
+                    page: result.0,
+                    seed: result.1,
+                })
+            }
             HostCommand::PreviewSession { session } => Ok(HostReply::SessionPreview {
                 lines: preview_of(&session)?,
             }),
@@ -2221,26 +2336,25 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 self.fresh(&session, based_on)?;
                 let undone = match turn {
-                    None => self.handle.undo_to_prompt(None).await,
+                    None => self.handle.undo_to_prompt(None).await.map_err(refused),
                     // A point names a turn of the log, and is undone as one: not
                     // as its prompt ordinal, which a compaction since has made
                     // point past the end of the folded conversation.
+                    // Conversation undo is owned by the native log. A turn
+                    // cancelled before its first request may have no workspace
+                    // checkpoint, but its accepted prompt is still undoable.
                     Some(turn) => {
-                        if !self
-                            .handle
-                            .rewind_points()
+                        self.handle
+                            .undo_to_turn(turn)
                             .await
-                            .map_err(refused)?
-                            .points
-                            .iter()
-                            .any(|point| point.turn_id == turn)
-                        {
-                            return Err(HostError::RewindPointNotFound { turn });
-                        }
-                        self.handle.undo_to_turn(turn).await
+                            .map_err(|error| match error {
+                                atomcode_coding::RuntimeError::RewindPointUnavailable {
+                                    turn_id,
+                                } => HostError::RewindPointNotFound { turn: turn_id },
+                                other => refused(other),
+                            })
                     }
-                }
-                .map_err(refused)?;
+                }?;
                 Ok(HostReply::Undone {
                     prompt: Some(undone.restored_prompt),
                     restored_files: Vec::new(),
@@ -2370,6 +2484,56 @@ impl HostControl for RuntimeControl {
                 *self.fingerprint.lock().expect("fingerprint poisoned") = source.fingerprint();
                 Ok(reply)
             }
+            HostCommand::Browser { session, action } => {
+                self.addressed(&session)?;
+                use crate::browser_cmd::BrowserCli;
+                use atomcode_host_api::BrowserAction;
+                let command = match action {
+                    BrowserAction::Status => BrowserCli::Status,
+                    BrowserAction::Doctor => BrowserCli::Doctor {
+                        server: None,
+                        node: None,
+                    },
+                    BrowserAction::Enable => BrowserCli::Enable {
+                        server: None,
+                        node: None,
+                        scope: Default::default(),
+                    },
+                    BrowserAction::EnableScoped { origins } => BrowserCli::Enable {
+                        server: None,
+                        node: None,
+                        scope: crate::browser_cmd::OriginArgs {
+                            deny_all_origins: origins.is_empty(),
+                            allowed_origins: origins,
+                            ..Default::default()
+                        },
+                    },
+                    BrowserAction::EnablePolicyFile { path } => BrowserCli::Enable {
+                        server: None,
+                        node: None,
+                        scope: crate::browser_cmd::OriginArgs {
+                            origin_policy_file: Some(path.into()),
+                            ..Default::default()
+                        },
+                    },
+                    BrowserAction::EnableUnrestricted => BrowserCli::Enable {
+                        server: None,
+                        node: None,
+                        scope: crate::browser_cmd::OriginArgs {
+                            unrestricted_origins: true,
+                            ..Default::default()
+                        },
+                    },
+                    BrowserAction::Disable => BrowserCli::Disable,
+                };
+                let dirs = self.config.lock().expect("config poisoned").dirs.clone();
+                let note = crate::browser_cmd::execute(&dirs, command)
+                    .await
+                    .map_err(|error| HostError::Failed {
+                        message: format!("{error:#}"),
+                    })?;
+                Ok(HostReply::DoneWithNote { note })
+            }
             HostCommand::McpStatus { session } => {
                 self.addressed(&session)?;
                 use atomcode_capabilities::mcp::ServerStatus;
@@ -2401,6 +2565,7 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 let rows = self.handle.mcp_rows().await.map_err(refused)?;
                 Ok(HostReply::McpRows {
+                    paused: rows.paused,
                     rows: rows.rows.into_iter().map(to_mcp_row).collect(),
                 })
             }
@@ -2433,9 +2598,24 @@ impl HostControl for RuntimeControl {
                 let action = to_mcp_action(action).ok_or_else(|| HostError::Failed {
                     message: "this build does not know that MCP action".into(),
                 })?;
-                self.handle.mcp_act(server, action).await.map_err(refused)?;
+                if matches!(
+                    action,
+                    atomcode_coding::parts::McpAction::PauseAll
+                        | atomcode_coding::parts::McpAction::ResumeAll
+                ) {
+                    self.handle
+                        .set_mcp_paused(
+                            session,
+                            action == atomcode_coding::parts::McpAction::PauseAll,
+                        )
+                        .await
+                        .map_err(refused)?;
+                } else {
+                    self.handle.mcp_act(server, action).await.map_err(refused)?;
+                }
                 let rows = self.handle.mcp_rows().await.map_err(refused)?;
                 Ok(HostReply::McpRows {
+                    paused: rows.paused,
                     rows: rows.rows.into_iter().map(to_mcp_row).collect(),
                 })
             }
@@ -2634,7 +2814,10 @@ impl HostControl for RuntimeControl {
                     .ok_or_else(|| HostError::Failed {
                         message: tr(SMsg::HostNoModelCatalog).into_owned(),
                     })?;
-                let current = models.current();
+                // The mounted catalog can outlive a provider swap. The runtime
+                // owns the live selection, including mode-bound model changes.
+                let current = self.handle.model_selection().await.map_err(refused)?.model;
+                let current = (!current.is_empty()).then_some(current);
                 Ok(HostReply::Models {
                     models: models
                         .list()
@@ -2741,13 +2924,21 @@ impl HostControl for RuntimeControl {
                         message: error.to_string(),
                     })?;
                 self.handle
-                    .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+                    .deactivate_provider(ProviderUnavailableReason::SignedOut)
                     .await
                     .map_err(refused)?;
                 Ok(HostReply::Done)
             }
             HostCommand::SignIn { session } => {
                 self.addressed(&session)?;
+                // A quota wait already owns a live foreground operation. Refresh
+                // its allowance without rebuilding the agent or silently applying
+                // changed permissions/models to the running task.
+                if self.handle.refresh_quota_wait().await.map_err(refused)? {
+                    return Ok(HostReply::DoneWithNote {
+                        note: tr(SMsg::QuotaRefreshCheckingCurrentConfig).into_owned(),
+                    });
+                }
                 let next = match self.host_config.clone() {
                     Some(source) => source
                         .after_sign_in()
@@ -3114,20 +3305,9 @@ pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
                 fix: None,
             }
         }
-        Some(ProviderUnavailableReason::NotConfigured) => {
-            // Nothing is run for the person: the sentence names `/login` and
-            // `/provider`, and they pick. It says "in the atomcode terminal"
-            // because the same sentence reaches ACP clients (a refused send,
-            // the runtime's `ProviderUnavailable`), which offer neither. This used to name the first-run
-            // wizard (`tui_onboarding`), which the screen then opened on its
-            // own at every start without a provider — a full-screen walkthrough
-            // over someone who only needed to sign in. `/onboarding` is still
-            // there to type.
-            (tr(SMsg::NoProviderConfigured), None)
-        }
-        Some(ProviderUnavailableReason::AuthenticationRequired) => {
-            (tr(SMsg::LoginExpired), Some("login"))
-        }
+        Some(ProviderUnavailableReason::NotConfigured) => (tr(SMsg::NoProviderConfigured), None),
+        Some(ProviderUnavailableReason::SignedOut) => (tr(SMsg::SignedOutHint), None),
+        Some(ProviderUnavailableReason::AuthenticationRequired) => (tr(SMsg::LoginExpired), None),
         Some(ProviderUnavailableReason::UnsupportedBuild) => {
             (tr(SMsg::ProviderUnsupportedByBuild), None)
         }
@@ -3165,6 +3345,22 @@ fn file_change(
     }
 }
 
+/// The destination of a session switch, looked up in the catalog. A
+/// session with no messages is found but not switchable: say so, instead of
+/// answering "not found" for a session that exists.
+pub(crate) fn find_switchable_entry<'a>(
+    entries: &'a [atomcode_capabilities::session::CatalogEntry],
+    target: &str,
+) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
+    match entries.iter().find(|entry| entry.id == target) {
+        Some(entry) if entry.message_count > 0 => Ok(entry),
+        Some(_) => Err(HostError::Failed {
+            message: "That session has no messages yet, so there is nothing to switch to.".into(),
+        }),
+        None => Err(HostError::NotFound),
+    }
+}
+
 pub fn refused(error: RuntimeError) -> HostError {
     {
         match error {
@@ -3179,7 +3375,8 @@ pub fn refused(error: RuntimeError) -> HostError {
                     ProviderUnavailableReason::NotConfigured => {
                         atomcode_host_api::ProviderUnavailableReason::NotConfigured
                     }
-                    ProviderUnavailableReason::AuthenticationRequired => {
+                    ProviderUnavailableReason::AuthenticationRequired
+                    | ProviderUnavailableReason::SignedOut => {
                         atomcode_host_api::ProviderUnavailableReason::AuthenticationRequired
                     }
                     ProviderUnavailableReason::UnsupportedBuild => {
@@ -3490,6 +3687,38 @@ fn catalog_tool(listing: atomcode_harness::seams::ToolListing) -> atomcode_host_
 mod tests {
     use super::*;
 
+    #[test]
+    fn find_switchable_entry_tells_missing_from_empty() {
+        use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+        fn entry(id: &str, message_count: usize) -> CatalogEntry {
+            CatalogEntry {
+                id: id.into(),
+                name: String::new(),
+                fork_root_id: None,
+                project_bucket: "bucket".into(),
+                working_dir: std::path::PathBuf::from("/tmp"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                message_count,
+                turn_count: 0,
+                presence: CatalogPresence::NativeOnly,
+                needs_newer_version: false,
+                origin: atomcode_capabilities::session::manager::SessionOrigin::Manual,
+            }
+        }
+        let entries = vec![entry("empty", 0), entry("full", 2)];
+        assert!(matches!(
+            find_switchable_entry(&entries, "ghost"),
+            Err(HostError::NotFound)
+        ));
+        assert!(matches!(
+            find_switchable_entry(&entries, "empty"),
+            Err(HostError::Failed { message }) if message.contains("no messages")
+        ));
+        let found = find_switchable_entry(&entries, "full").expect("switchable");
+        assert_eq!(found.id, "full");
+    }
+
     /// 运行时说了话的事件,不能在转给屏幕的路上被 `_ => None` 吃掉。
     ///
     /// `translate` 的兜底那一臂把**每一种没列出来的事件**扔掉,而其中几种是这块
@@ -3600,6 +3829,7 @@ mod tests {
             last_reason: Some("retrying provider".into()),
             recovery: Some(GoalRecoveryProgress {
                 kind: GoalRecoveryKind::Provider,
+                waiting_for_quota: false,
                 attempt: 1,
                 max_attempts: 3,
                 retry_in_secs: 30,
@@ -3615,6 +3845,10 @@ mod tests {
             running.goal_stage,
             Some(atomcode_host_api::GoalStage::Recovering)
         );
+        assert!(!running.waiting_for_quota);
+        goal.recovery.as_mut().unwrap().waiting_for_quota = true;
+        assert!(running_of_goal(goal.clone()).waiting_for_quota);
+        goal.recovery.as_mut().unwrap().waiting_for_quota = false;
         goal.recovery.as_mut().unwrap().kind = GoalRecoveryKind::Evaluator;
         assert_eq!(
             running_of_goal(goal.clone()).goal_stage,

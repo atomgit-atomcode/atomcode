@@ -105,7 +105,13 @@ pub enum Msg<'a> {
 
     // ── the moment (`moment.rs`) ──
     /// After the first Ctrl+C: press it again and the screen closes.
+    UpgradeProgressDownloading,
+    UpgradeProgressEta {
+        seconds: u64,
+    },
+    UpgradeProgressEtaUnknown,
     MomentQuitAgain,
+    MomentHistoryClear,
     MomentEofAgain,
 
     // ── overlays (`overlay.rs`) ──
@@ -150,6 +156,7 @@ pub enum Msg<'a> {
     MentionEmpty,
     MentionLegend,
     MentionSessions,
+    MentionSessionsWorkspace,
     MentionSelected,
     MentionFilter,
 
@@ -223,6 +230,9 @@ pub enum Msg<'a> {
     AskStepLimitQuestion,
     AskStepLimitTitle,
     AskTruncatedQuestion,
+    AskReasoningTruncatedQuestion,
+    AskNoProgressTruncatedQuestion,
+    AskLowerEffortOnce,
     AskTruncatedTitle,
     AskContinue,
     AskStop,
@@ -432,6 +442,7 @@ pub enum Msg<'a> {
     /// Checkpoint details are logged, not expanded in the panel.
     RewindCodeFailed,
     RewindPanelTurnNoFiles,
+    RewindPanelTurnNoCheckpoint,
     RewindLegendChoose,
     RewindLegendContinue,
     RewindLegendGo,
@@ -456,6 +467,13 @@ pub enum Msg<'a> {
     },
     /// On the row a second Delete would throw away.
     ResumeDeleteArmed,
+    /// Another runtime (another terminal) is running this session; picking it
+    /// opens a copy.
+    ResumeHeldRunning,
+    /// Another runtime's turn on this session is waiting for an answer.
+    ResumeHeldWaiting,
+    /// Another runtime has this session open, between turns.
+    ResumeHeldOpen,
     /// While the last words of the selected session are being fetched.
     ResumePreviewWaiting,
     ResumeDeleted {
@@ -519,6 +537,7 @@ pub enum Msg<'a> {
     CmdAboutMouse,
     /// `/provider`'s model picker: the listing had nothing the account lacks.
     ProviderDiscoverNothingNew,
+    ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
@@ -605,6 +624,7 @@ pub enum Msg<'a> {
     PatchLeadOnly,
     PatchContextChanged,
     CmdAboutConfig,
+    CmdAboutTheme,
     CmdAboutProviderPanel,
     CmdAboutCopy,
     CmdAboutSave,
@@ -617,6 +637,12 @@ pub enum Msg<'a> {
     CmdAboutClear,
     CmdAboutSession,
     CmdAboutResume,
+    CmdAboutFork,
+    ForkLeadOnly,
+    SessionForked {
+        source: &'a str,
+        id: &'a str,
+    },
     CmdAboutEffort,
     CmdAboutUndo,
     CmdAboutRewind,
@@ -633,6 +659,15 @@ pub enum Msg<'a> {
     CmdAboutCost,
     CmdAboutUsage,
     CmdAboutMcp,
+    CmdAboutBrowser,
+    CmdTakesBrowser,
+    BrowserHelp,
+    BrowserStatusAbout,
+    BrowserDoctorAbout,
+    BrowserEnableAbout,
+    BrowserDisableAbout,
+    BrowserReloadAbout,
+    BrowserHelpAbout,
     CmdAboutLanguage,
     CmdAboutReload,
     CmdAboutLogout,
@@ -945,6 +980,11 @@ pub enum Msg<'a> {
     /// 一个后台会话的成果,投回发起它的那段对话(`background.rs`):就是内容本身。
     /// 不是一句"去 /bg 读" —— 那句把读它这件事留给了一个人;也不再附一句指令 ——
     /// 要不要接着核实,是那段对话看了上下文自己决定的事。
+    BackgroundIncomplete {
+        reason: &'a str,
+        partial: &'a str,
+    },
+    BackgroundNoConclusion,
     BackgroundResult {
         title: &'a str,
         answer: &'a str,
@@ -1088,6 +1128,10 @@ pub enum Msg<'a> {
     ShellFailed {
         code: &'a str,
     },
+    ShellContextHeading,
+    ShellWorkingDir {
+        dir: &'a str,
+    },
     ShellSaidNothing,
     CostNothingYet,
     CostTokens {
@@ -1186,6 +1230,7 @@ pub enum Msg<'a> {
     },
     Reloaded,
     SignedOut,
+    SignedOutHint,
     SignedIn,
 
     // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
@@ -1231,6 +1276,10 @@ pub enum Msg<'a> {
     McpActionReconnect,
     McpActionEnable,
     McpActionDisable,
+    McpPauseAll,
+    McpResumeAll,
+    McpSessionPaused,
+    McpSessionEnabled,
     /// The key legend: on the list, on the detail page, and while a round trip
     /// is out.
     McpRefreshTimeout,
@@ -1298,6 +1347,12 @@ pub enum Msg<'a> {
     /// 种子齐了、转发给 agent 之后说。说的是「这条命令接住了」,不是「模型答完了」
     /// ——后者是那个回合的事,由它在屏上自己出现。
     SetupRunningSkill,
+    SetupCapabilities,
+    SetupAutomations,
+    SetupDismiss,
+    SetupConfirm,
+    SetupWorking,
+    SetupUsage,
     PluginNothingInstalled,
     PluginInstalledList {
         lines: &'a str,
@@ -1611,6 +1666,9 @@ pub enum Msg<'a> {
     /// This front end cannot show a file — no desktop opener is wired.
     NoOpener,
     /// The clicked image marker no longer resolves to any bytes.
+    ToolImage {
+        ordinal: usize,
+    },
     ImageGone,
     /// The attached image's stored bytes could not be decoded.
     ImageCorrupt,
@@ -1711,6 +1769,9 @@ pub enum Msg<'a> {
     ToolsRun {
         count: usize,
     },
+    BrowserActions {
+        count: usize,
+    },
     ToolsFailed {
         failed: usize,
     },
@@ -1763,6 +1824,7 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderResponseTimeout,
     ProviderConnectionTimeout,
     ProviderTlsInterrupted,
     ProviderPartialReply,
@@ -1780,6 +1842,7 @@ pub enum Msg<'a> {
     ProviderNoFallback,
     ProviderErrorDetails,
     ProviderRetryDetailsHint,
+    ProviderRetryProlonged,
     TeamPanelEmpty,
     TeamPanelExpanded,
     TeamPanelCollapsed,
@@ -1802,6 +1865,12 @@ pub enum Msg<'a> {
     },
 
     // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
+    StopWithMembersRunning {
+        n: usize,
+    },
+    LiveWaitingForMember {
+        n: usize,
+    },
     LiveStopping,
     /// Shown while the runtime's VL helper is turning a pasted picture into text
     /// for a non-vision model — before the turn's first fact, so the screen is
@@ -1926,6 +1995,10 @@ pub enum Msg<'a> {
     FieldEffort,
     FieldLevels,
     FieldWindow,
+    /// Source of the current budget, not a measurement of server capacity.
+    ContextBudgetSource,
+    /// Routed responses do not guarantee the next request uses the same model.
+    AutoContextBudgetNote,
     FieldUseAfterSaving,
     VisionYes,
     VisionNo,
@@ -1943,6 +2016,10 @@ pub enum Msg<'a> {
     WindowAutomatic,
     /// The last stop on a model form's window row: a window typed by hand.
     WindowCustom,
+    FieldOutputTokens,
+    OutputAutomatic,
+    LegendTypeOutput,
+    OutputInvalid,
     /// What the custom window field takes.
     LegendTypeWindow,
     /// The arrows on the custom window field: leave it for the presets.
@@ -2109,6 +2186,18 @@ pub enum Msg<'a> {
     ConfigWrittenReloadFailedCli {
         error: &'a str,
     },
+    QuotaAvailableContinueManually,
+    QuotaRefreshCheckingCurrentConfig,
+    GoalQuotaWaiting {
+        secs: u64,
+    },
+    GoalQuotaChecking,
+    GoalQuotaShort,
+    LoopQuotaWaiting {
+        secs: u64,
+    },
+    LoopQuotaChecking,
+    LoopQuotaShort,
     SignedInSettingUpProvider,
     AlreadySignedInRefreshing,
     TokenRejectedSigningInAgain,
@@ -2140,44 +2229,22 @@ pub enum Msg<'a> {
         error: &'a str,
     },
 
-    // ── the first-run wizard (`atomcode-cli`) ──
-    OnboardIntroTitle,
-    OnboardIntroLine1,
-    OnboardIntroLine2,
-    OnboardIntroLine3,
-    OnboardLanguageTitle,
-    OnboardLanguageChinese,
-    OnboardLanguageFollowSystem,
-    OnboardLanguageFollowSystemAbout,
-    OnboardSetupTitle,
-    OnboardSetupCodingPlan,
-    OnboardSetupCodingPlanAbout,
-    OnboardSetupManual,
-    OnboardSetupManualAbout,
-    OnboardSetupSkip,
-    OnboardSetupSkipAbout,
-    OnboardSetupByHand,
-    OnboardLoginTitle,
-    OnboardFetchingLoginUrl,
-    OnboardConfirmTitle,
-    OnboardWouldClearTitle,
-    OnboardWouldClearLine1,
-    OnboardWouldClearLine2,
-    OnboardModalTitle,
-    OnboardAlreadyFinished,
-    OnboardLanguageSet {
-        language: &'a str,
-    },
-    OnboardLanguageNotWritten {
-        error: &'a str,
-    },
-    OnboardLoginSkipped,
-    OnboardSkipHint,
-    OnboardSignedInConfigNotWritten {
-        error: &'a str,
-    },
-    CmdAboutOnboarding,
-    CmdAboutOnboardingFinished,
+    RecoveryTitle,
+    RecoveryLogin,
+    RecoveryProvider,
+    ModelSetupTitle,
+    ModelSetupLogin,
+    ModelSetupLoginAbout,
+    ModelSetupProvider,
+    ModelSetupProviderAbout,
+    ModelSetupKeys,
+    ModelSetupWaiting,
+    ModelSetupOpenLink,
+    ModelSetupCompleting,
+    LoginCancelKey,
+    LoginLinkKeys,
+    LoginCancelled,
+    LoginAlreadyRunning,
     /// The confirmation before a rollback (titled by the product's
     /// `UpgradeOptRollback`).
     RollbackConfirmSwitch,
@@ -2395,6 +2462,7 @@ pub enum Msg<'a> {
     ComposerSuggested {
         text: &'a str,
     },
+    ComposerPlaceholder,
     /// A command that replaces or rewinds the conversation, typed while a turn
     /// is running: it has to wait for the turn, and Esc stops the turn now.
     WaitsForTheTurn {
@@ -2454,5 +2522,21 @@ pub enum Msg<'a> {
         releases: usize,
         highlights: &'a [String],
         more: bool,
+    },
+    CmdAboutImport,
+    NoMigrationPort,
+    /// The sheet's title: the assets another agent left behind.
+    MigrationReportTitle,
+    /// The sheet when the chosen source has no assets.
+    MigrationNoAssets,
+    /// Picking which source to look at, when more than one has assets.
+    MigrationPickSource,
+    MigrationSourceUnavailable,
+    /// How many assets a source has.
+    MigrationAssetsCount,
+    /// The sheet's summary line: which source, how many assets.
+    MigrationSummaryLine {
+        source: &'a str,
+        count: usize,
     },
 }

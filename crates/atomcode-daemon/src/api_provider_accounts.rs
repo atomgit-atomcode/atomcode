@@ -52,6 +52,8 @@ pub(crate) struct CreateAccountRequest {
     pub id: Option<String>,
     /// A vendor preset (`deepseek`) or a protocol (`openai-compatible`).
     pub provider: String,
+    /// Optional choice from the selected vendor's connection catalog.
+    pub protocol: Option<String>,
     pub display_name: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -286,6 +288,41 @@ fn normalize_models(models: &mut [NewModelRequest]) -> Result<(), axum::response
     Ok(())
 }
 
+pub(crate) async fn enrich_new_models(models: &mut [NewModelRequest], base_url: &str, wire: &str) {
+    use atomcode_capabilities::provider::discovery::{catalog, DiscoveredModel};
+    if !models.iter().any(|m| {
+        m.context_window.is_none()
+            || m.max_tokens.is_none()
+            || m.supports_vision.is_none()
+            || m.reasoning_effort_levels.is_none()
+    }) {
+        return;
+    }
+    let ids: Vec<_> = models.iter().map(|m| m.model.trim()).collect();
+    let entries = catalog::models(base_url, wire, &ids).await;
+    for model in models {
+        let Some(entry) = entries.iter().find(|entry| entry.id == model.model.trim()) else {
+            continue;
+        };
+        let mut metadata = DiscoveredModel {
+            id: entry.id.clone(),
+            name: model.display_name.clone(),
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            supports_vision: model.supports_vision,
+            reasoning_effort: model.reasoning_effort.clone(),
+            reasoning_effort_levels: model.reasoning_effort_levels.clone(),
+            ..Default::default()
+        };
+        catalog::fill_missing(&mut metadata, entry);
+        model.display_name = metadata.name;
+        model.context_window = metadata.context_window;
+        model.max_tokens = metadata.max_tokens;
+        model.supports_vision = metadata.supports_vision;
+        model.reasoning_effort_levels = metadata.reasoning_effort_levels;
+    }
+}
+
 fn bad_request(code: &str, message: impl Into<String>) -> axum::response::Response {
     coded_json_error(StatusCode::BAD_REQUEST, code, message, false).into_response()
 }
@@ -343,9 +380,6 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
     if let Err(refusal) = validate_new_models(&req.models) {
         return refusal;
     }
-    if let Err(refusal) = normalize_models(&mut req.models) {
-        return refusal;
-    }
     if let Err(refusal) = refuse_gateway(req.base_url.as_deref()) {
         return refusal;
     }
@@ -353,6 +387,30 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
     let Some(preset) = provider_preset::preset(provider) else {
         return bad_request("unknown_provider", format!("Unknown provider '{provider}'"));
     };
+    let connection = if let Some(wire) = req.protocol.as_deref() {
+        let choice = provider_preset::connections(provider)
+            .iter()
+            .find(|choice| choice.provider_type.wire() == wire);
+        if choice.is_none() && wire != preset.provider_type.wire() {
+            return bad_request(
+                "unsupported_protocol",
+                "This provider does not offer the selected protocol",
+            );
+        }
+        choice
+    } else {
+        None
+    };
+    let connection_preset = connection
+        .map(|choice| choice.preset_id)
+        .unwrap_or(preset.id);
+    let endpoint = req
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .or_else(|| connection.and_then(|choice| choice.base_urls.first().copied()))
+        .unwrap_or_default();
     // The gateway account is signed in through /login; one typed here would be
     // a lookalike that never gets its token.
     if atomcode_config::config::is_codingplan_provider_name(preset.id)
@@ -383,13 +441,25 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
         }
         None => (preset.id, false),
     };
+    let wire = connection
+        .map(|choice| choice.provider_type)
+        .unwrap_or(preset.provider_type);
+    let catalog_endpoint = if endpoint.is_empty() {
+        preset.default_base_url.unwrap_or_default()
+    } else {
+        endpoint
+    };
+    enrich_new_models(&mut req.models, catalog_endpoint, wire.wire()).await;
+    if let Err(refusal) = normalize_models(&mut req.models) {
+        return refusal;
+    }
     let models = model_inputs(&req.models, req.set_default);
     match ProviderBook::default_book().create_account(
         &AccountInput {
             name,
-            protocol: preset.id,
+            protocol: connection_preset,
             display_name: req.display_name.as_deref(),
-            endpoint: req.base_url.as_deref().unwrap_or_default(),
+            endpoint,
             key: req.api_key.as_deref(),
             headers: req.headers.as_ref(),
             exact_id,
@@ -1022,6 +1092,118 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# kept by hand"), "{text}");
+
+        // The vendor identity names the account, while its selected protocol
+        // and explicit plan endpoint survive the actual write/reload boundary.
+        for (vendor, endpoint) in [
+            ("taotoken", "https://api.taotoken.net/coding"),
+            ("zhipu", "https://open.bigmodel.cn/api/anthropic"),
+            ("zhipu-coding", "https://open.bigmodel.cn/api/anthropic"),
+            ("minimax", "https://api.minimaxi.com/anthropic"),
+            ("minimax-token-plan", "https://api.minimax.cn/anthropic"),
+            ("moonshot", "https://api.moonshot.cn/anthropic"),
+            (
+                "xiaomi-mimo",
+                "https://token-plan-cn.xiaomimimo.com/anthropic",
+            ),
+            ("longcat", "https://api.longcat.chat/anthropic"),
+            (
+                "volcengine",
+                "https://ark.cn-beijing.volces.com/api/compatible",
+            ),
+            (
+                "volcengine-coding",
+                "https://ark.cn-beijing.volces.com/api/coding",
+            ),
+            ("siliconflow", "https://api.siliconflow.cn"),
+            ("openrouter", "https://openrouter.ai/api"),
+            (
+                "aliyun",
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            ),
+        ] {
+            let created = http.post(format!("{base}/provider-accounts"))
+                .json(&serde_json::json!({"provider":vendor,"protocol":"anthropic","base_url":endpoint,"api_key":"fixture-key","models":[{"model":"fixture"}]}))
+                .send().await.unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let body: serde_json::Value = created.json().await.unwrap();
+            assert_eq!(body["account"], vendor);
+            let choices = body["config"]["provider_presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == vendor)
+                .unwrap();
+            assert_eq!(choices["connections"][1]["type"], "anthropic");
+            let saved = config();
+            let resolved = saved
+                .resolve_model(Some(&format!("{vendor}/fixture")))
+                .unwrap();
+            assert_eq!(resolved.provider_type, "anthropic");
+            assert_eq!(resolved.base_url.as_deref(), Some(endpoint));
+            assert_eq!(
+                saved.provider_accounts[vendor].provider,
+                "anthropic-compatible"
+            );
+        }
+        // Newly offered products work with only a key/model: each protocol
+        // supplies its own default, persisted without changing billing routes.
+        for vendor in [
+            "aliyun-token-plan",
+            "aliyun-coding",
+            "xiaomi-token-plan",
+            "kimi-code",
+            "tencent-tokenhub",
+            "tencent-token-plan",
+            "tencent-coding",
+        ] {
+            let preset = atomcode_config::config::provider_preset::preset(vendor).unwrap();
+            for protocol in ["openai", "anthropic"] {
+                let options = atomcode_config::config::provider_preset::connections(vendor);
+                let option = options.iter().find(|o| o.provider_type.wire() == protocol);
+                if protocol == "anthropic" && option.is_none() {
+                    continue;
+                }
+                let id = format!("{vendor}-{protocol}");
+                let created = http
+                    .post(format!("{base}/provider-accounts"))
+                    .json(
+                        &serde_json::json!({"id":id,"provider":vendor,"protocol":protocol,
+                        "api_key":"fixture-key","models":[{"model":"fixture"}]}),
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(created.status(), StatusCode::CREATED, "{id}");
+                let saved = config();
+                let resolved = saved.resolve_model(Some(&format!("{id}/fixture"))).unwrap();
+                assert_eq!(resolved.provider_type, protocol, "{id}");
+                assert_eq!(
+                    resolved.base_url.as_deref(),
+                    option.map(|o| o.base_urls[0]).or(preset.default_base_url),
+                    "{id}"
+                );
+            }
+        }
+        let defaulted = http.post(format!("{base}/provider-accounts"))
+            .json(&serde_json::json!({"id":"ali-default", "provider":"aliyun", "protocol":"anthropic", "api_key":"fixture-key", "models":[{"model":"fixture"}]}))
+            .send().await.unwrap();
+        assert_eq!(defaulted.status(), StatusCode::CREATED);
+        assert_eq!(
+            config()
+                .resolve_model(Some("ali-default/fixture"))
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("https://dashscope.aliyuncs.com/apps/anthropic")
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.contains("# kept by hand"));
+        let refused = http.post(format!("{base}/provider-accounts"))
+            .json(&serde_json::json!({"provider":"taotoken","protocol":"ollama","models":[{"model":"fixture"}]}))
+            .send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         match previous {
             Some(value) => std::env::set_var("ATOMCODE_HOME", value),

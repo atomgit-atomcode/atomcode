@@ -34,6 +34,7 @@ __pycache__/
 node_modules/
 **/node_modules/
 package-lock.json
+!/crates/atomcode-cli/assets/huaweicloud/package-lock.json
 !extensions/vscode/package-lock.json
 !tools/weixin-bridge/package-lock.json
 npm-debug.log*
@@ -174,3 +175,6 @@ android-tools/app/src/main/jniLibs/*/*.so
 
 # Termux 包缓存（scripts/termux/fetch.sh 的 workdir，可重现）
 .termux-cache/
+
+# Playwright MCP 在项目目录留下的浏览器控制台日志
+.playwright-mcp/

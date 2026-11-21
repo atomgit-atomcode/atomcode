@@ -27,6 +27,30 @@ fn action_of(args: &str) -> Option<String> {
 
 // ─────────────────────────── atomgit_repo ───────────────────────────
 
+/// Parse a tool's arguments with duplicate keys resolved last-wins.
+///
+/// The model (or a middleware merging schema defaults) can emit the same key
+/// twice; serde's derived struct deserializer turns that into a hard
+/// "duplicate field" error mid-request. `serde_json::Value` keeps the last
+/// occurrence, so routing through it turns that failure class into an
+/// ordinary overwrite.
+fn parse_tool_args<T: serde::de::DeserializeOwned>(label: &str, args: &str) -> Result<T, String> {
+    let value = serde_json::from_str::<serde_json::Value>(args)
+        .map_err(|e| format!("{label}: invalid arguments: {e}"))?;
+    serde_json::from_value(value).map_err(|e| format!("{label}: invalid arguments: {e}"))
+}
+
+/// The gateway answers 400 UN_KNOW when it drops a mutating body (observed on
+/// PATCH/POST): retrying blind repeats the loss — the read path confirms what
+/// actually landed, so a re-send can be informed instead of repeated.
+fn write_error_hint(e: String) -> String {
+    if e.contains("UN_KNOW") {
+        format!("{e} — the gateway may have dropped this write's body; verify with the matching read/list call before resending.")
+    } else {
+        e
+    }
+}
+
 #[derive(Deserialize)]
 struct RepoArgs {
     action: String,
@@ -198,9 +222,9 @@ impl Tool for AtomgitRepoTool {
         }
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let a: RepoArgs = match serde_json::from_str(args) {
+        let a: RepoArgs = match parse_tool_args("atomgit_repo", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_repo: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         if a.url.is_some() && a.action != "view" {
             return err(
@@ -441,9 +465,9 @@ impl Tool for AtomgitIssueTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: IssueArgs = match serde_json::from_str(args) {
+        let a: IssueArgs = match parse_tool_args("atomgit_issue", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_issue: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         let c = &self.client;
         match a.action.as_str() {
@@ -647,7 +671,11 @@ impl Tool for AtomgitApiTool {
          does not exist. If the docs are unreachable, you may still call the \
          endpoints already established as working (/search, /search/repositories, \
          /repos/{owner}/{repo}); what you must not do is invent an unconfirmed path \
-         or parameter name."
+         or parameter name. On 400, consult that endpoint's schema before correcting fields. \
+         A 403 is an access refusal, not evidence of a wrong endpoint; verify account access \
+         and the intended source/target repositories before changing the request. On 404, \
+         check the documented path and resource visibility rather than probing GitHub-style \
+         alternatives. For an unconfirmed write outcome, query first before resending."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -673,9 +701,9 @@ impl Tool for AtomgitApiTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: ApiArgs = match serde_json::from_str(args) {
+        let a: ApiArgs = match parse_tool_args("atomgit_api", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_api: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         let Some(method) = parse_api_method(&a.method) else {
             return err(format!(
@@ -722,6 +750,29 @@ pub fn atomgit_tool_names() -> &'static [&'static str] {
 
 // ─────────────────────────── atomgit_pr ───────────────────────────
 
+// Tool schemas still request integers. Accept an exact unsigned decimal string
+// from providers that stringify arguments; reject fractions, signs and overflow.
+fn pr_integer_arg<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let value = match value {
+        serde_json::Value::String(text) => {
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(serde::de::Error::custom(
+                    "expected an unsigned decimal integer",
+                ));
+            }
+            let number = text.parse::<u64>().map_err(serde::de::Error::custom)?;
+            json!(number)
+        }
+        value => value,
+    };
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
 #[derive(Deserialize)]
 struct PrArgs {
     action: String,
@@ -729,7 +780,7 @@ struct PrArgs {
     owner: Option<String>,
     #[serde(default)]
     repo: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "pr_integer_arg")]
     number: Option<u64>,
     #[serde(default)]
     title: Option<String>,
@@ -739,9 +790,9 @@ struct PrArgs {
     base: Option<String>,
     #[serde(default)]
     head: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "pr_integer_arg")]
     comment_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "pr_integer_arg")]
     parent_id: Option<u64>,
     #[serde(default)]
     issues: Vec<u64>,
@@ -768,12 +819,12 @@ struct PrArgs {
     updated_after: Option<String>,
     #[serde(default)]
     updated_before: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "pr_integer_arg")]
     page: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "pr_integer_arg")]
     per_page: Option<u32>,
     // update (PATCH .../pulls/{n}) fields.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "pr_integer_arg")]
     milestone_number: Option<u64>,
     #[serde(default)]
     draft: Option<bool>,
@@ -783,8 +834,36 @@ struct PrArgs {
     prune_branch: Option<bool>,
     #[serde(default)]
     squash_merge: Option<bool>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", deserialize_with = "pr_integer_arg")]
     limit: usize,
+}
+
+/// Branch aliases are action-specific: list_mine keeps its existing filters.
+/// Never silently replace the caller's requested target with `master`.
+fn pr_create_branches(a: &PrArgs) -> Result<(String, String), String> {
+    if let (Some(base), Some(target)) = (&a.base, &a.target_branch) {
+        if base != target {
+            return Err("atomgit_pr create: base and target_branch conflict; specify the target branch once.".into());
+        }
+    }
+    if let (Some(head), Some(source)) = (&a.head, &a.source_branch) {
+        if head != source && head.split_once(':').map(|(_, branch)| branch) != Some(source.as_str())
+        {
+            return Err("atomgit_pr create: head and source_branch conflict. head is a branch or fork_owner:branch; title is the PR title.".into());
+        }
+    }
+    let base = a
+        .base
+        .as_deref()
+        .or(a.target_branch.as_deref())
+        .unwrap_or("master");
+    let head = a.head.as_deref().or(a.source_branch.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("atomgit_pr create: owner, repo, title and head are required; source_branch is accepted as a head alias.")?;
+    if base.trim().is_empty() || base.contains(':') {
+        return Err("atomgit_pr create: base/target_branch must be a target branch without an owner prefix; owner/repo already identifies the TARGET repository.".into());
+    }
+    Ok((base.to_string(), head.to_string()))
 }
 
 /// `atomgit_pr` tool.
@@ -857,7 +936,13 @@ impl Tool for AtomgitPrTool {
          \"comment_view\" (owner+repo+number; body for create), \"comment_edit\"/\
          \"comment_delete\" (owner+repo+comment_id; body for edit), \"comment_reply\" \
          (owner+repo+number+parent_id+body), \"link_issues\"/\"unlink_issues\" \
-         (owner+repo+number+issues=[numbers])."
+         (owner+repo+number+issues=[numbers]). For create, owner/repo is the TARGET \
+         repository, base is its target branch (defaults to master); head is the source branch, \
+         or fork_owner:branch for a fork. source_branch/target_branch are also accepted for \
+         create as head/base aliases; conflicting values are rejected. Example: \
+         {action: create, owner: upstream, repo: project, title: Fix, base: main, \
+         head: contributor:fix}. Preserve the same target repository when creating from a fork; \
+         do not swap it to the fork or retry permission failures with guessed endpoints."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -873,8 +958,8 @@ impl Tool for AtomgitPrTool {
                 "number": { "type": "integer", "description": "PR number." },
                 "title": { "type": "string" },
                 "body": { "type": "string" },
-                "base": { "type": "string", "description": "Base branch (create)." },
-                "head": { "type": "string", "description": "Head branch (create), e.g. \"owner/repo:branch\"." },
+                "base": { "type": "string", "description": "Target branch in owner/repo (create; default master). Alias: target_branch." },
+                "head": { "type": "string", "description": "Source branch (create), e.g. \"fix\" in the same repo or \"fork_owner:fix\" from a fork. owner/repo remains the target repository. Alias: source_branch." },
                 "comment_id": { "type": "integer", "description": "Comment id for comment_edit/comment_delete." },
                 "parent_id": { "type": "integer", "description": "Parent comment id for comment_reply." },
                 "issues": { "type": "array", "items": { "type": "integer" }, "description": "Issue numbers for link/unlink." },
@@ -883,8 +968,8 @@ impl Tool for AtomgitPrTool {
                 "sort": { "type": "string", "description": "list_mine sort field: created|updated|merged_at." },
                 "direction": { "type": "string", "description": "list_mine sort direction: asc|desc." },
                 "labels": { "type": "string", "description": "Comma-separated label names (list_mine filter / update)." },
-                "source_branch": { "type": "string", "description": "list_mine: filter by source branch." },
-                "target_branch": { "type": "string", "description": "list_mine: filter by target branch." },
+                "source_branch": { "type": "string", "description": "list_mine: filter by source branch. create: alias for head." },
+                "target_branch": { "type": "string", "description": "list_mine: filter by target branch. create: alias for base." },
                 "created_after": { "type": "string", "description": "list_mine: ISO 8601 lower bound on creation time." },
                 "created_before": { "type": "string", "description": "list_mine: ISO 8601 upper bound on creation time." },
                 "updated_after": { "type": "string", "description": "list_mine: ISO 8601 lower bound on update time." },
@@ -910,9 +995,9 @@ impl Tool for AtomgitPrTool {
         }
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: PrArgs = match serde_json::from_str(args) {
+        let a: PrArgs = match parse_tool_args("atomgit_pr", args) {
             Ok(a) => a,
-            Err(e) => return err(format!("atomgit_pr: invalid arguments: {e}")),
+            Err(e) => return err(e),
         };
         let c = &self.client;
         match a.action.as_str() {
@@ -948,16 +1033,21 @@ impl Tool for AtomgitPrTool {
                 },
                 Err(e) => e,
             },
-            "create" => match (a.owner, a.repo, a.title, a.head) {
-                (Some(o), Some(r), Some(t), Some(h)) => {
-                    let base = a.base.as_deref().unwrap_or("master");
-                    match c.pr_create(&o, &r, &t, a.body.as_deref().unwrap_or(""), base, &h).await {
-                        Ok(pr) => ok(format!("Created {}", render_pr(&pr))),
-                        Err(e) => err(e),
+            "create" => {
+                let (base, head) = match pr_create_branches(&a) {
+                    Ok(branches) => branches,
+                    Err(error) => return err(error),
+                };
+                match (a.owner, a.repo, a.title) {
+                    (Some(o), Some(r), Some(t)) if !o.trim().is_empty() && !r.trim().is_empty() && !t.trim().is_empty() => {
+                        match c.pr_create(&o, &r, &t, a.body.as_deref().unwrap_or(""), &base, &head).await {
+                            Ok(pr) => ok(format!("Created {}", render_pr(&pr))),
+                            Err(e) => err(write_error_hint(e)),
+                        }
                     }
+                    _ => err("atomgit_pr create: owner, repo, title and head are required. owner/repo is the TARGET repository; use base for its target branch and head=fork_owner:branch for a fork.".to_string()),
                 }
-                _ => err("atomgit_pr create: owner, repo, title and head are required".to_string()),
-            },
+            }
             "update" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr update") {
                 Ok((o, r, n)) => {
                     let u = PrUpdate {
@@ -976,7 +1066,7 @@ impl Tool for AtomgitPrTool {
                     }
                     match c.pr_update(&o, &r, n, &u).await {
                         Ok(pr) => ok(format!("Updated {}", render_pr(&pr))),
-                        Err(e) => err(e),
+                        Err(e) => err(write_error_hint(e)),
                     }
                 }
                 Err(e) => e,
@@ -984,7 +1074,7 @@ impl Tool for AtomgitPrTool {
             "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr close") {
                 Ok((o, r, n)) => match c.pr_close(&o, &r, n).await {
                     Ok(pr) => ok(format!("Closed {}", render_pr(&pr))),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 Err(e) => e,
             },
@@ -992,7 +1082,7 @@ impl Tool for AtomgitPrTool {
                 Ok((o, r, n)) => match a.body {
                     Some(b) => match c.pr_comment_create(&o, &r, n, &b).await {
                         Ok(cc) => ok(render_created_comment(&cc)),
-                        Err(e) => err(e),
+                        Err(e) => err(write_error_hint(e)),
                     },
                     None => err("atomgit_pr comment_create: body is required".to_string()),
                 },
@@ -1008,28 +1098,28 @@ impl Tool for AtomgitPrTool {
             "comment_edit" => match (a.owner, a.repo, a.comment_id, a.body) {
                 (Some(o), Some(r), Some(id), Some(b)) => match c.pr_comment_edit(&o, &r, id, &b).await {
                     Ok(cm) => ok(format!("Edited comment {}", cm.id)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 _ => err("atomgit_pr comment_edit: owner, repo, comment_id and body are required".to_string()),
             },
             "comment_delete" => match (a.owner, a.repo, a.comment_id) {
                 (Some(o), Some(r), Some(id)) => match c.pr_comment_delete(&o, &r, id).await {
                     Ok(()) => ok(format!("Deleted comment {id}")),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 _ => err("atomgit_pr comment_delete: owner, repo and comment_id are required".to_string()),
             },
             "comment_reply" => match (a.owner, a.repo, a.number, a.parent_id, a.body) {
                 (Some(o), Some(r), Some(n), Some(pid), Some(b)) => match c.pr_comment_reply(&o, &r, n, pid, &b).await {
                     Ok(cm) => ok(format!("Replied (comment {})", cm.id)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 _ => err("atomgit_pr comment_reply: owner, repo, number, parent_id and body are required".to_string()),
             },
             "link_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr link_issues") {
                 Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_link_issues(&o, &r, n, &a.issues).await {
                     Ok(()) => ok(format!("Linked issues {:?} to PR #{n}", a.issues)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 Ok(_) => err("atomgit_pr link_issues: issues=[...] is required".to_string()),
                 Err(e) => e,
@@ -1037,7 +1127,7 @@ impl Tool for AtomgitPrTool {
             "unlink_issues" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr unlink_issues") {
                 Ok((o, r, n)) if !a.issues.is_empty() => match c.pr_unlink_issues(&o, &r, n, &a.issues).await {
                     Ok(()) => ok(format!("Unlinked issues {:?} from PR #{n}", a.issues)),
-                    Err(e) => err(e),
+                    Err(e) => err(write_error_hint(e)),
                 },
                 Ok(_) => err("atomgit_pr unlink_issues: issues=[...] is required".to_string()),
                 Err(e) => e,
@@ -1055,6 +1145,27 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn parse_tool_args_resolves_duplicate_keys_last_wins() {
+        // The model (or a middleware merging schema defaults) can emit the
+        // same key twice; the struct deserializer used to fail with
+        // "duplicate field" before this helper routed through Value.
+        let a: PrArgs =
+            parse_tool_args("atomgit_pr", r#"{"action":"view","number":1,"number":2}"#).unwrap();
+        assert_eq!(a.number, Some(2));
+    }
+
+    #[test]
+    fn write_error_hint_flags_unknown_gateway_errors() {
+        let hinted = write_error_hint("400 UN_KNOW: dropped".to_string());
+        assert!(
+            hinted.contains("verify with the matching read/list call"),
+            "{}",
+            hinted
+        );
+        assert_eq!(write_error_hint("404: nope".to_string()), "404: nope");
+    }
 
     fn ctx() -> ToolContext {
         ToolContext {
@@ -1424,6 +1535,140 @@ mod tests {
             "{}",
             r.content
         );
+    }
+
+    #[test]
+    fn pr_numeric_strings_are_exact_unsigned_integers() {
+        let args: PrArgs = serde_json::from_str(
+            r#"{"action":"view","number":"1102","limit":"30","page":"2","per_page":"40"}"#,
+        )
+        .unwrap();
+        assert_eq!(args.number, Some(1102));
+        assert_eq!(args.limit, 30);
+        assert_eq!(args.page, Some(2));
+        assert_eq!(args.per_page, Some(40));
+        let args: PrArgs = serde_json::from_str(r#"{"action":"list","number":null}"#).unwrap();
+        assert_eq!(args.number, None);
+        assert_eq!(args.limit, default_limit());
+        for value in [
+            json!("-1"),
+            json!("1.5"),
+            json!("1e2"),
+            json!(""),
+            json!(true),
+            json!(1.5),
+            json!("18446744073709551616"),
+        ] {
+            assert!(
+                serde_json::from_value::<PrArgs>(json!({"action":"list","limit":value})).is_err()
+            );
+        }
+        assert!(
+            serde_json::from_str::<PrArgs>(r#"{"action":"list_mine","page":"4294967296"}"#)
+                .is_err()
+        );
+    }
+
+    /// Match the successful request observed in the session, through the typed
+    /// tool, with its description preserved in the first write.
+    #[tokio::test]
+    async fn pr_create_fork_keeps_the_explicit_target_branch_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/upstream/project/pulls"))
+            .and(body_json(json!({"title":"Fix engine","body":"中文说明","base":"weekly","head":"contributor:feat/engine"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"number":1102,"title":"Fix engine","state":"open"})))
+            .expect(1)
+            .mount(&server).await;
+        let result = pr_tool(&server).execute(
+            r#"{"action":"create","owner":"upstream","repo":"project","title":"Fix engine","body":"中文说明","head":"contributor:feat/engine","source_branch":"feat/engine","target_branch":"weekly"}"#, &ctx()
+        ).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("#1102"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_create_accepts_source_and_target_aliases_without_head_or_base() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/o/r/pulls"))
+            .and(body_json(
+                json!({"title":"T","body":"","base":"main","head":"feature"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"number":1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = pr_tool(&server).execute(
+            r#"{"action":"create","owner":"o","repo":"r","title":"T","source_branch":"feature","target_branch":"main"}"#, &ctx()
+        ).await;
+        assert!(!result.is_error, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn pr_create_rejects_ambiguous_branches_without_sending_a_write() {
+        let server = MockServer::start().await;
+        for branches in [
+            json!({"head":"feat(engine): a title","source_branch":"feature","target_branch":"main"}),
+            json!({"head":"feature","base":"master","target_branch":"weekly"}),
+            json!({"head":"feature","target_branch":"upstream:main"}),
+            json!({"head":"feature","base":""}),
+        ] {
+            let mut args = json!({"action":"create","owner":"o","repo":"r","title":"T"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(branches.as_object().unwrap().clone());
+            let result = pr_tool(&server).execute(&args.to_string(), &ctx()).await;
+            assert!(result.is_error, "{}", result.content);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_create_permission_denial_does_not_retry_or_change_repository() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/upstream/project/pulls"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = pr_tool(&server).execute(
+            r#"{"action":"create","owner":"upstream","repo":"project","title":"T","head":"contributor:feature","base":"main"}"#, &ctx()
+        ).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("403"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_create_unknow_gateway_error_carries_the_self_correction_hint() {
+        // The hint's premise is that the client's error string carries the
+        // gateway's UN_KNOW marker; if a client-side rewrite ever drops it,
+        // the hint silently never fires while the suite stays green — this
+        // end-to-end criterion pins the premise against the real client path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v5/repos/upstream/project/pulls"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"message": "proxy error", "error_code": "UN_KNOW"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = pr_tool(&server).execute(
+            r#"{"action":"create","owner":"upstream","repo":"project","title":"T","head":"contributor:feature","base":"main"}"#, &ctx()
+        ).await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("verify with the matching read/list call"),
+            "the UN_KNOW hint must ride the tool result: {}",
+            result.content
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

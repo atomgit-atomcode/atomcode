@@ -1,7 +1,8 @@
+import { HistoryLoading } from './HistoryLoading';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { getSessionTranscript, type TranscriptTurn } from '../api';
-import { historyBoundary, historyWindow, type HistoryMessage } from '../lib/inlineHistory';
+import { historyBoundary, historyWindow, hasHistoryPage, type HistoryMessage } from '../lib/inlineHistory';
 import { useT } from '../settings';
 
 /** Display-only paging. The runtime conversation and composer are never replaced. */
@@ -12,6 +13,7 @@ export function CompactionHistory(props: {
   viewport: () => HTMLElement | null;
   onBeforeRead: () => void;
   onWindow: (active: boolean, showLive: boolean, liveStart: number) => void;
+  isNavigating?: () => boolean;
   onNavigate: (node: HTMLElement) => void;
   onReadingTurn?: (turnId: number | null) => void;
   renderTurn: (turn: TranscriptTurn, onEdges: (before: boolean, after: boolean) => void) => ComponentChildren;
@@ -35,6 +37,7 @@ export function CompactionHistory(props: {
   function cancel() { epoch.current += 1; pending.current?.abort(); pending.current = null; }
   function reset() {
     cancel(); setBusy(false); setError(''); setWindow(null); windowRef.current = null;
+    index.current = null; setBounds(null);
     latest.current.onWindow(false, true, 0);
   }
   useLayoutEffect(() => { reset(); return cancel; }, [props.reset]);
@@ -55,6 +58,12 @@ export function CompactionHistory(props: {
 
   async function load(direction: 'before' | 'after' | 'target', target?: number) {
     if (pending.current && direction !== 'target') return;
+    if (direction !== 'target' && index.current) {
+      const current = windowRef.current;
+      const boundary = historyBoundary(index.current, latest.current.messages);
+      const end = current && current.end > boundary.end ? index.current.length : boundary.end;
+      if (!hasHistoryPage(current, end, direction)) return;
+    }
     cancel();
     const run = epoch.current;
     const controller = new AbortController(); pending.current = controller;
@@ -159,7 +168,7 @@ export function CompactionHistory(props: {
         if (y <= line && (!reading || y > reading.top)) reading = { id, top: y, bottom: rect.bottom };
       }
       latest.current.onReadingTurn?.(reading && reading.bottom > line ? reading.id : null);
-      if (performance.now() < ignoreScrollUntil.current) { previous = top; return; }
+      if (performance.now() < ignoreScrollUntil.current || latest.current.isNavigating?.()) { previous = top; return; }
       if (top < previous) older();
       else if (top > previous && viewport.scrollHeight - top - viewport.clientHeight < 160 && windowRef.current) newer();
       previous = top;
@@ -183,7 +192,7 @@ export function CompactionHistory(props: {
   }, []);
 
   return <>
-    {busy && <div class="timeline-history-status is-loading" role="status"><span>{t('chat.historyLoading')}</span></div>}
+    <HistoryLoading active={busy} />
     {error && <div class="timeline-history-status" role="alert">{t('chat.historyFailed')} {error} <button onClick={() => retry.current()}>{t('chat.historyRetry')}</button></div>}
     {window?.turns.map(turn => <div key={turn.turn_id} data-history-turn={turn.turn_id}
       class={turn.undone ? 'timeline-history-turn is-undone' : 'timeline-history-turn'}
@@ -191,8 +200,5 @@ export function CompactionHistory(props: {
       {turn.undone && <div class="timeline-history-status">{t('chat.historyUndone')}</div>}
       {props.renderTurn(turn, (before, after) => { if (before || after) innerEdges.current.set(turn.turn_id, { before, after }); else innerEdges.current.delete(turn.turn_id); })}
     </div>)}
-    {window && bounds && window.end < bounds.end && !busy && <div class="timeline-history-status">
-      <button onClick={() => void load('after')}>{t('chat.historyLoadNext')}</button>
-    </div>}
   </>;
 }

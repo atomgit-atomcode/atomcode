@@ -179,6 +179,7 @@ impl Projector {
         if !closes {
             if let Some(trigger) = self.compacting.take() {
                 out.push(AgentEvent::Compacted {
+                    diagnostic: None,
                     trigger,
                     epoch: 0,
                     removed: 0,
@@ -359,6 +360,7 @@ impl Projector {
                 });
                 let (count_before, bytes_before, count_after, bytes_after) = self.measure(seq);
                 vec![AgentEvent::Compacted {
+                    diagnostic: None,
                     trigger,
                     epoch: 0,
                     removed: count_before.saturating_sub(count_after),
@@ -409,12 +411,14 @@ impl Projector {
                         max_attempts: 0,
                         recovered: true,
                     },
-                    crate::session::NoticeKind::OutputTruncated => {
-                        AgentEvent::OutputTruncationRecovery {
-                            attempt: 0,
-                            max_attempts: 0,
-                        }
-                    }
+                    crate::session::NoticeKind::OutputTruncated => match retry {
+                        Some(retry) => AgentEvent::OutputTruncationRecovery {
+                            attempt: retry.attempt,
+                            max_attempts: retry.max_attempts,
+                            reason: Some(detail.clone()),
+                        },
+                        None => AgentEvent::Warning(detail.clone()),
+                    },
                     // Compaction is not a recovery the protocol names; it stays
                     // a warning rather than being forced into a shape that means
                     // something else.
@@ -1896,6 +1900,7 @@ async fn compact(
         // Refused, not failed: nothing is mounted that could compact, and the
         // history is byte-identical.
         let _ = events.send(AgentEvent::Compacted {
+            diagnostic: None,
             trigger,
             epoch: 0,
             removed: 0,
@@ -1922,7 +1927,7 @@ async fn compact(
             .service::<LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0),
-        used_tokens: super::loop_policy::last_prompt_tokens(&log),
+        used_tokens: log.last_prompt_tokens(),
     };
     // A summary is a model call, and it is the one piece of work between turns
     // that a person can be left waiting on: stopping has to reach it, or a
@@ -1940,9 +1945,10 @@ async fn compact(
             });
             return;
         }
-        decided = compaction.compact(&log, &ask) => decided,
+        decided = compaction.compact_attempt(&log, &ask) => decided,
     };
-    let committed = match decision {
+    let diagnostic = decision.diagnostic;
+    let committed = match decision.decision {
         Some(decision) => {
             reporting.store(true, std::sync::atomic::Ordering::SeqCst);
             crate::session::apply_compaction(ctx, &log, decision);
@@ -1954,6 +1960,7 @@ async fn compact(
     let after = log.derive_messages();
     let (count_after, bytes_after) = measure(&after);
     let _ = events.send(AgentEvent::Compacted {
+        diagnostic,
         trigger,
         epoch: 0,
         removed: count_before.saturating_sub(count_after),

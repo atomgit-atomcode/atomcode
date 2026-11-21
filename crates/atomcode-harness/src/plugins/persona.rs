@@ -24,6 +24,10 @@ the problem. After an edit, verify it — run the build or the tests — and rep
 you actually observed rather than what you expect. If something is blocked, say so \
 plainly and continue with the rest.\n\
 \n\
+Batch independent tool calls in one response: several reads, independent searches, or \
+a task-list update alongside the next substantive call. Every extra round re-reads the \
+whole context; sequence calls only when one needs another's result.\n\
+\n\
 Say what you are about to do before you do it. One line ahead of a run of tool calls — \
 what you are looking for, or what you are about to change and why — not a line per call, \
 and not a plan nobody asked for. A person watching a screen that shows twenty tool calls \
@@ -118,5 +122,16 @@ impl Plugin for SecurityPersonaPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         super::tools::contribute_prompt(ctx, "persona-security", 0, SECURITY_PERSONA);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_coding_persona_asks_for_independent_calls_in_one_round() {
+        assert!(CODING_PERSONA.contains("Batch independent tool calls"));
+        assert!(CODING_PERSONA.contains("task-list update alongside the next substantive call"));
     }
 }

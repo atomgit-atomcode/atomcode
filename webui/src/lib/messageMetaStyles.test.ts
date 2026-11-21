@@ -5,18 +5,17 @@ import { join } from 'node:path';
 
 const root = process.cwd();
 
-test('message time and copy controls are persistent and ordered by message side', () => {
+test('assistant controls remain persistent and user controls retain their ordering', () => {
   const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
   const css = readFileSync(join(root, 'src/styles/app.css'), 'utf8');
 
   assert.match(chat, /msg-actions msg-actions-left[\s\S]*?\{copyBtn\}[\s\S]*?\{showTimestamp/);
   assert.match(chat, /class="msg-actions"[\s\S]*?msg-time msg-time-user[\s\S]*?\{copyBtn\}/);
-  assert.doesNotMatch(css, /\.user-message-wrapper:hover \.msg-actions/);
   assert.doesNotMatch(css, /\.timeline-message:hover \.msg-actions/);
-  assert.doesNotMatch(css, /\.msg-actions\s*\{[^}]*opacity:\s*0/s);
+  assert.doesNotMatch(css, /(?:^|\n)\.msg-actions\s*\{[^}]*opacity:\s*0/s);
 });
 
-test('message times use a full local date with seconds', () => {
+test('full dates remain available while user messages can show compact time', () => {
   const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
 
   assert.match(chat, /d\.getFullYear\(\).*pad2\(d\.getMonth\(\) \+ 1\).*pad2\(d\.getDate\(\)\).*pad2\(d\.getHours\(\)\).*pad2\(d\.getMinutes\(\)\).*pad2\(d\.getSeconds\(\)\)/s);
@@ -27,7 +26,7 @@ test('live assistant timestamps are assigned at the terminal boundary', () => {
   const chat = readFileSync(join(root, 'src/components/Chat.tsx'), 'utf8');
 
   assert.doesNotMatch(chat, /role: 'assistant', parts: \[\], ts: now/);
-  assert.match(chat, /function stampLastAssistantCompletion\(ts = Date\.now\(\)\)/);
-  assert.match(chat, /case 'done': \{[\s\S]*?stampLastAssistantCompletion\(\)/);
-  assert.match(chat, /if \(terminal\) \{[\s\S]*?stampLastAssistantCompletion\(\)/);
+  assert.match(chat, /function stampLastAssistantCompletion\(ts = Date\.now\(\), stopReason\?: string, scope = activeIdRef\.current\)/);
+  assert.match(chat, /case 'done': \{[\s\S]*?stampLastAssistantCompletion\(Date\.now\(\),/);
+  assert.match(chat, /if \(terminal\) \{[\s\S]*?stampLastAssistantCompletion\(Date\.now\(\),/);
 });

@@ -159,7 +159,14 @@ impl Tool for McpToolAdapter {
         String::new()
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
+        if ctx.cancel.is_cancelled() {
+            return ToolResult {
+                content: "MCP tool cancelled before dispatch; no request was sent.".into(),
+                is_error: true,
+                ..ToolResult::default()
+            };
+        }
         let trimmed = args.trim();
         let arguments: serde_json::Value = if trimmed.is_empty() || trimmed == "{}" {
             json!({})
@@ -177,17 +184,35 @@ impl Tool for McpToolAdapter {
             }
         };
 
-        match self
-            .registry
-            .call_tool(&self.server, &self.tool, arguments)
-            .await
-        {
-            Ok(content) => ToolResult {
-                call_id: String::new(),
-                content,
-                is_error: false,
-                images: vec![],
-            },
+        let response = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return ToolResult {
+                    content: "MCP tool cancelled; an already dispatched operation may have taken effect. Its result is unverified; do not replay it. Reconnect and re-observe if the connection reports an unknown result.".into(),
+                    is_error: true,
+                    ..ToolResult::default()
+                };
+            }
+            response = self.registry.call_tool(&self.server, &self.tool, arguments) => response,
+        };
+        match response {
+            Ok(result) => {
+                if result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, super::types::ContentBlock::Image { .. }))
+                {
+                    tokio::task::spawn_blocking(move || super::result::into_tool_result(result))
+                        .await
+                        .unwrap_or_else(|_| ToolResult {
+                            is_error: true,
+                            content: "MCP tool executed, but image processing failed.".into(),
+                            ..ToolResult::default()
+                        })
+                } else {
+                    super::result::into_tool_result(result)
+                }
+            }
             Err(e) => ToolResult {
                 call_id: String::new(),
                 content: e.to_string(),

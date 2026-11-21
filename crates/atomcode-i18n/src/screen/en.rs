@@ -108,6 +108,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── the moment ──
+        Msg::MomentHistoryClear => "History recalled · Ctrl+C clears input · Esc stops the task".into(),
+        Msg::UpgradeProgressDownloading => "Downloading update".into(),
+        Msg::UpgradeProgressEta { seconds } => format!("~{seconds}s remaining").into(),
+        Msg::UpgradeProgressEtaUnknown => "ETA —".into(),
         Msg::MomentQuitAgain => "press Ctrl+C again to quit".into(),
         Msg::MomentEofAgain => "press Ctrl+D again to quit".into(),
 
@@ -137,6 +141,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MentionEmpty => "  No matching items".into(),
         Msg::MentionLegend => "  enter/tab insert · esc close · up/down select · left/right category".into(),
         Msg::MentionSessions => "Sessions".into(),
+        Msg::MentionSessionsWorkspace => "Sessions · this workspace".into(),
         Msg::MentionSelected => "Selected".into(),
         Msg::MentionFilter => "Filter · Enter / Tab".into(),
         Msg::MenuFolder => "folder".into(),
@@ -186,9 +191,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskStepLimitQuestion => "this turn has taken a lot of steps. Go on?".into(),
         Msg::AskStepLimitTitle => "step limit".into(),
         Msg::AskTruncatedQuestion => {
-            "the answer keeps being cut off and the automatic continuations are used up. Go on?"
+            "Output was repeatedly cut off; automatic recovery has stopped. Go on?"
                 .into()
         }
+        Msg::AskReasoningTruncatedQuestion => "The model repeatedly exhausted its output budget during reasoning without an answer. Try again?".into(),
+        Msg::AskNoProgressTruncatedQuestion => "The output limit was reached without an answer or a complete tool call. Automatic recovery has stopped. Try again?".into(),
+        Msg::AskLowerEffortOnce => "Retry once with lower reasoning effort".into(),
         Msg::AskTruncatedTitle => "output cut off".into(),
         Msg::AskContinue => "go on".into(),
         Msg::AskStop => "stop".into(),
@@ -303,6 +311,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelCurrent => "(current)".into(),
         Msg::RewindPanelNoCodeChanges => "no code changes".into(),
         Msg::RewindPanelFiles { files } => format!("{files} files").into(),
+        Msg::RewindPanelTurnNoCheckpoint => "No code checkpoint was kept for this turn.".into(),
         Msg::RewindPanelScopeAsk => "  going back there takes what with it?".into(),
         Msg::RewindCodeNotEnabled => "workspace rewind is turned off by ATOMCODE_CODE_REWIND; unset it to turn it back on".into(),
         Msg::RewindCodeNoSession => "this session is not written down, so the workspace cannot go back".into(),
@@ -328,6 +337,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CdPinned { dir } => format!("{dir} is marked — /cd offers it first").into(),
         Msg::CdUnpinned { dir } => format!("{dir} is no longer marked").into(),
         Msg::ResumeDeleteArmed => "once more to throw it away".into(),
+        Msg::ResumeHeldRunning => "● running elsewhere".into(),
+        Msg::ResumeHeldWaiting => "● waiting elsewhere".into(),
+        Msg::ResumeHeldOpen => "● open elsewhere".into(),
         Msg::ResumePreviewWaiting => "reading what it last talked about…".into(),
         Msg::ResumeDeleted { id } => format!("Session {id} is gone").into(),
         Msg::ResumeDeleteFailed { why } => format!("It was not deleted: {why}").into(),
@@ -390,6 +402,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderWillUse => "Will use".into(),
         Msg::ProviderSetUse => "Use this model".into(),
         Msg::ProviderBatchChoose => "Use focused model".into(),
+        Msg::ProviderCatalogCandidates => "models.dev suggestions · account access unverified".into(),
         Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),
@@ -448,6 +461,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PatchReady => "Apply this imported user patch with apply_patch using its artifact_id and exact file_paths. Do not reproduce its body:".into(),
         Msg::CmdAboutPaste => "put the clipboard (or a file) into the composer; for when the terminal or the system eats Ctrl+V".into(),
         Msg::CmdAboutConfig => "open the settings panel: search, change a value; esc closes it".into(),
+        Msg::CmdAboutTheme => "open the terminal theme setting (applies after restart)".into(),
         Msg::CmdAboutProviderPanel => "open the provider panel: accounts and models, add/edit/remove; enter switches, esc closes".into(),
         Msg::CmdAboutCopy => "copy the model's last reply; /copy code copies a code block (N picks which one, all takes every one)".into(),
         Msg::CmdAboutSave => "save this conversation as markdown".into(),
@@ -461,6 +475,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutTranscript => "list the conversation the way the model sees it".into(),
         Msg::CmdAboutClear => "start a new session: this conversation is put down and a clean one begins".into(),
         Msg::CmdAboutSession => "start a new session (same as /clear)".into(),
+        Msg::ForkLeadOnly => "Return to the main conversation before using /fork.".into(),
+        Msg::CmdAboutFork => "copy this conversation and switch to an independent session".into(),
+        Msg::SessionForked { source, id } => format!("Forked to {id}. Original: {source}. Use /compact here, or /resume {source} to return. Files in the working directory are shared.").into(),
         Msg::CmdAboutResume => "go back to a stored session; pick one from a list with no id".into(),
         Msg::CmdAboutEffort => "change this session's reasoning effort (independent of the model)".into(),
         Msg::CmdAboutUndo => "take back the last thing said (or one turn) and everything after it; the words go back into the composer".into(),
@@ -477,6 +494,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutStatus => "where this session stands: model, mode, directory, which turn it is on".into(),
         Msg::CmdAboutCost => "how many tokens this session has used (same as /context)".into(),
         Msg::CmdAboutUsage => "what is left on the account: which window is spent and when it comes back".into(),
+        Msg::CmdAboutBrowser => "manage the external isolated browser MCP; /browser help lists setup".into(),
+        Msg::CmdTakesBrowser => "[status|doctor|enable|disable|reload|help]".into(),
+        Msg::BrowserStatusAbout => "read the saved configuration".into(),
+        Msg::BrowserDoctorAbout => "check Node and backend versions without opening a browser".into(),
+        Msg::BrowserEnableAbout => "save managed isolated-browser configuration".into(),
+        Msg::BrowserDisableAbout => "save disabled configuration; dispatched operations may continue".into(),
+        Msg::BrowserReloadAbout => "apply configuration to this session".into(),
+        Msg::BrowserHelpAbout => "show setup and usage".into(),
+        Msg::BrowserHelp => "/browser [status|doctor|enable|disable|reload|help]\nstatus reads saved configuration; doctor checks Node/backend versions, not browser launch. First setup: atomcode browser enable --server <absolute-path-to-cli.js>. Install @playwright/mcp@0.0.85 and its browser explicitly. enable/disable change configuration; reload applies it through normal reload. Disabling cannot stop or undo dispatched actions. After setup, describe a webpage task to load browser guidance automatically; $browser-use remains available explicitly. Tool approval is not site-scoped permission. Scope: /browser enable --allow-origin https://example.test (repeatable); --deny-all-origins denies all; --unrestricted-origins explicitly returns to the stock backend. Plain enable preserves scope. First scoped setup needs terminal --origin-backend and --backend-root; reload stays explicit. V2 policy: /browser enable --origin-policy-file /absolute/policy.json (execution-host file; the remainder is the path, without quotes). Validated contents are saved; existing tool restrictions remain.".into(),
         Msg::CmdAboutMcp => "the MCP server panel; reload, tools, trust/untrust, login/logout, withdraw — /mcp help lists them".into(),
         Msg::CmdAboutLanguage => "which language the screen and the model answer in; with no argument it says which one is set and what it takes".into(),
         Msg::CmdAboutReload => "read the skills, the MCP servers and the config again; the session stays".into(),
@@ -549,18 +575,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 start / end of the current line
     Ctrl+U / Ctrl+K                 delete to line start / end
     Ctrl+Z                          suspend to the shell, fg to return (not on Windows)
-    Up / Down                       move the caret, and page through history once at the end
-    Ctrl+P / Ctrl+N                 page through history (with the mouse handed back, ↑↓ scroll instead)
+    Up / Down                       move the caret, then history (HiShell: scroll chat at the edge)
+    Ctrl+P / Ctrl+N                 previous / next input history (use these keys in HiShell)
     click the composer              put the caret where you clicked
     Ctrl+R                          search what you have typed in this project before; type to narrow, ctrl-r again for older, enter takes it, esc gives your draft back
 
   ── During a turn ──
-    Esc / Ctrl+C                    stop the turn and hand what was queued back to the composer
+    Esc                             stop the turn and return queued messages
+    Ctrl+C                          clear input; stop the turn only when input is empty
     Ctrl+X                          stop the turn and send what was queued right away
 
   ── Idle ──
     Esc Esc                         clear the composer; twice more on an empty one opens rewind
-    Ctrl+C                          clear the composer, again to quit
+    Ctrl+C                          clear input; on an empty composer, press twice to quit
 
   ── Reading & display ──
     PgUp / PgDn                     page through the conversation
@@ -692,6 +719,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // Content only, no instruction: the sentence that used to follow was a
         // decision made on the conversation's behalf, spoken in the person's own
         // voice. Whether to go through it now is that conversation's to make.
+        Msg::BackgroundIncomplete { reason, partial } => format!("Background task incomplete ({reason}). Partial output below is not a successful conclusion:\n\n{partial}").into(),
+        Msg::BackgroundNoConclusion => "The background task ended without a conclusion.".into(),
         Msg::BackgroundResult { title, answer } =>
             format!("“{title}” is back from the background. Its result:\n\n{answer}").into(),
 
@@ -778,6 +807,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ShellTimedOut { secs } => format!("(still going after {secs}s — stopped)").into(),
         Msg::ShellFailed { code } => format!("(exit {code})").into(),
+        Msg::ShellContextHeading => "Previously run locally".into(),
+        Msg::ShellWorkingDir { dir } => format!("Working directory: {dir}").into(),
         Msg::ShellSaidNothing => "(completed with no output)".into(),
         Msg::CompactionInterrupted => {
             "the compaction was interrupted — the context is as long as it was".into()
@@ -839,7 +870,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::Reloaded => "Reload complete. See /status for loaded instruction sources; a lightweight skill reload keeps instruction text unchanged.".into(),
-        Msg::SignedOut => "signed out; /login signs in again".into(),
+        Msg::SignedOutHint => "Signed out of AtomGit. /model to switch models · /login to sign in · /provider to configure providers".into(),
+        Msg::SignedOut => "Signed out.".into(),
         Msg::SignedIn => "signed in".into(),
 
         // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
@@ -873,6 +905,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpActionLogout => "Sign out".into(),
         Msg::McpActionReconnect => "Reconnect".into(),
         Msg::McpActionEnable => "Enable".into(),
+        Msg::McpPauseAll => "Pause all".into(),
+        Msg::McpResumeAll => "Resume".into(),
+        Msg::McpSessionPaused => "MCP paused (this session)".into(),
+        Msg::McpSessionEnabled => "MCP enabled (this session)".into(),
         Msg::McpActionDisable => "Disable".into(),
         Msg::McpRefreshTimeout => "MCP status refresh timed out; press Ctrl+R to retry".into(),
         Msg::McpLegendList => "↑/↓ move · Enter details · Esc close · Ctrl+R refresh".into(),
@@ -898,12 +934,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginAmbiguous { name, lines } => format!("there are several called {name}; say which one:\n{lines}").into(),
         Msg::NoPluginPort => "this screen has no plugins: the launcher provided no `tui-plugins`".into(),
         Msg::NoMcpPort => "this screen has no MCP port: the launcher provided no `tui-mcp`".into(),
-        Msg::CmdTakesSetup => "[focus area, e.g. hooks, mcp, skills, all]".into(),
-        Msg::CmdAboutSetup => "analyze this project, install the seed skill, and recommend which automations to set up".into(),
+        Msg::CmdTakesSetup => "[check|install <id>|cancel|skip|automations|--force]".into(),
+        Msg::CmdAboutSetup => "check project capabilities and review optional tool setup".into(),
         Msg::NoSetupPort => "this screen installs no seeds: the launcher provided no `tui-setup`, so there is nothing to unseal".into(),
         Msg::SetupJobDidNotStart { error } => format!("the seed installation did not start: {error}").into(),
         Msg::SetupFailed { error } => format!("installing the seeds failed: {error}").into(),
         Msg::SetupInstalling => "installing the seed files…".into(),
+        Msg::SetupCapabilities => "Project capabilities".into(),
+        Msg::SetupAutomations => "Automation recommendations".into(),
+        Msg::SetupDismiss => "Skip these recommendations".into(),
+        Msg::SetupConfirm => "Confirm".into(),
+        Msg::SetupWorking => "Applying the confirmed setup plan… /setup cancel stops it.".into(),
+        Msg::SetupUsage => "Use /setup [check|--force|cancel|skip|automations], or /setup install <ast-grep|context7>".into(),
         Msg::SetupRunningSkill => "the seeds are in place — having the model look over this project…".into(),
         Msg::PluginNothingInstalled => "nothing is installed yet".into(),
         Msg::PluginInstalledList { lines } => format!("installed:\n{lines}").into(),
@@ -1055,6 +1097,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OpenLinkFailed { reason } => format!("could not open the link: {reason}").into(),
         Msg::ImagePreviewFailed { reason } => format!("could not open the image: {reason}").into(),
         Msg::NoOpener => "this front end cannot open files".into(),
+        Msg::ToolImage { ordinal } => format!("Image {ordinal} · click to open").into(),
         Msg::ImageGone => "that image is no longer available".into(),
         Msg::ImageCorrupt => "the image data is corrupt".into(),
         Msg::MouseTaken => "mouse taken back · ctrl+g hands it to the terminal".into(),
@@ -1062,8 +1105,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
         Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel scroll · ↑↓/ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · application mouse stays off · enable mouse in tmux and restart to use application scrolling".into(),
-        Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
+        Msg::MouseUnreportedAtStart => "Input history: Ctrl+P previous · Ctrl+N next · Ctrl+R search\n/keys for all shortcuts · terminal keeps mouse; drag to select".into(),
+        Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel scroll · Ctrl+P/N input history".into(),
         Msg::MouseHandedBackAtStart => "Mouse handed to terminal · drag to copy, right-click to paste · Ctrl+T expands/collapses tool output".into(),
         Msg::ReasoningNotReceived => "No reasoning received yet; incoming content will appear live.".into(),
         Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows/hides it · tool output: ctrl-t".into(),
@@ -1127,6 +1170,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── how the conversation reads (`content.rs`) ──
         Msg::ThoughtLines { gutter, n } => format!("{gutter} thought, {n} lines").into(),
         Msg::ToolsRun { count } => format!("{count} tools were run").into(),
+        Msg::BrowserActions { count } => format!("{count} browser actions").into(),
         Msg::ToolsFailed { failed } => format!(" · {failed} failed").into(),
         Msg::VerbSkill => "skill".into(),
         Msg::VerbMemory => "memory".into(),
@@ -1156,6 +1200,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "Model service authentication failed".into(),
         Msg::ProviderRateLimitError => "Model service rate limit reached".into(),
         Msg::ProviderConnectionError => "Cannot connect to the model service".into(),
+        Msg::ProviderResponseTimeout => "The model service did not respond in time".into(),
         Msg::ProviderConnectionTimeout => "Connection to the model service timed out".into(),
         Msg::ProviderTlsInterrupted => "The TLS connection was interrupted".into(),
         Msg::ProviderPartialReply => "Response interrupted; partial reply preserved".into(),
@@ -1167,6 +1212,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderCheckRequest => "Check the error details and model configuration, or contact the service provider.".into(),
         Msg::ProviderCheckConnection => "Check the network connection and model service URL, then try again.".into(),
         Msg::ProviderNoFallback => "No available fallback route was found for this model; automatic switching failed.".into(),
+        Msg::ProviderRetryProlonged => "The model service is temporarily unstable; retrying automatically. Keep waiting or cancel. Details: /errors".into(),
         Msg::ProviderRetryDetailsHint => "details: /errors".into(),
         Msg::ProviderErrorDetails => "Original error details · click to expand/collapse, or /errors show".into(),
         Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),
@@ -1196,6 +1242,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopAt { at } => format!("stopped {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
+        Msg::StopWithMembersRunning { n } => format!("Turn ended · {n} sub-agents still working").into(),
+        Msg::LiveWaitingForMember { n } => format!("Waiting for {n} sub-agents").into(),
         Msg::LiveStopping => "stopping".into(),
         Msg::LiveRecognizingImage => "recognizing image".into(),
         Msg::LiveCompacting => "compacting".into(),
@@ -1267,7 +1315,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FieldVision => "sees images".into(),
         Msg::FieldEffort => "reasoning effort".into(),
         Msg::FieldLevels => "efforts it takes".into(),
-        Msg::FieldWindow => "context".into(),
+        Msg::FieldWindow => "context budget".into(),
+        Msg::ContextBudgetSource => "Budget source: current model configuration or defaults; not measured server capacity.".into(),
+        Msg::AutoContextBudgetNote => "For auto routing, the actual window is unknown. Set a conservative budget; the last response model does not guarantee the next route.".into(),
         Msg::FieldUseAfterSaving => "use it once saved".into(),
         Msg::VisionYes => "yes".into(),
         Msg::VisionNo => "no".into(),
@@ -1279,7 +1329,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendChangeValue => "change".into(),
         Msg::LegendToggleLevel => "turn this level on/off (✓ is on)".into(),
         Msg::LegendPickLevel => "pick a level".into(),
-        Msg::WindowAutomatic => "automatic (protocol default)".into(),
+        Msg::WindowAutomatic => "unspecified (protocol default)".into(),
+        Msg::FieldOutputTokens => "Max output tokens".into(),
+        Msg::OutputAutomatic => "automatic (clear output override)".into(),
+        Msg::LegendTypeOutput => "positive tokens, e.g. 4096 or 32k; per-request output budget, automatic uses runtime defaults".into(),
+        Msg::OutputInvalid => "invalid: enter 1–4294967295 tokens (k/m allowed), or use arrows for automatic".into(),
         Msg::WindowCustom => "custom".into(),
         Msg::LegendTypeWindow => "type the tokens, e.g. 200000, 200k, 1m".into(),
         Msg::LegendBackToPresets => "back to presets".into(),
@@ -1316,7 +1370,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SettingThinking => "thinking".into(),
         Msg::RuntimeAlreadyStopped => "this session's runtime has already stopped".into(),
         Msg::NoProviderConfigured => "no provider is available — in the atomcode terminal, sign in with /login or add one with /provider".into(),
-        Msg::LoginExpired => "the login has expired; sign in again".into(),
+        Msg::LoginExpired => "Sign-in expired. /login to sign in again · /provider to select a provider".into(),
         Msg::ProviderUnsupportedByBuild => "this build cannot use the official AtomGit gateway — install an official build, or switch with /model or /provider".into(),
         Msg::ScreenNotConnectedAgent => "the screen is not connected to an agent".into(),
         Msg::HostHasNoControl => "this host has no control surface".into(),
@@ -1371,6 +1425,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── signing in, from the screen (`atomcode-cli`) ──
         Msg::CmdAboutTuiLogin => "sign in and set up a provider; if already signed in, refresh the CodingPlan configuration".into(),
         Msg::SetupThreadDied => "the CodingPlan setup thread died".into(),
+        Msg::QuotaRefreshCheckingCurrentConfig => "Plan refresh requested an allowance check. The current task keeps its existing configuration; reload changed settings after it finishes.".into(),
+        Msg::GoalQuotaWaiting { secs } => format!("Goal waiting for quota · {secs}s").into(),
+        Msg::GoalQuotaChecking => "Goal checking quota".into(),
+        Msg::LoopQuotaWaiting { secs } => format!("Loop waiting for quota · {secs}s").into(),
+        Msg::LoopQuotaChecking => "Loop checking quota".into(),
+        Msg::LoopQuotaShort => "Loop quota wait".into(),
+        Msg::GoalQuotaShort => "Goal quota wait".into(),
+        Msg::QuotaAvailableContinueManually => "Quota is currently available. If the task is still paused, send “continue” to continue this conversation; restart an ended loop manually.".into(),
         Msg::ConfigWrittenReloadFailedCli { error } => format!("the config was written, but reloading failed: {error}").into(),
         Msg::SignedInSettingUpProvider => "signed in — setting up a provider…".into(),
         Msg::AlreadySignedInRefreshing => "already signed in — refreshing the CodingPlan configuration…".into(),
@@ -1388,38 +1450,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ScanOrOpen => "scan it with your phone, or open it in a browser:".into(),
         Msg::InternalError { error } => format!("internal error: {error}").into(),
 
-        // ── the first-run wizard (`atomcode-cli`) ──
-        Msg::OnboardIntroTitle => "let us set this machine up first".into(),
-        Msg::OnboardIntroLine1 => "there is no usable provider yet, so there is no work to be done.".into(),
-        Msg::OnboardIntroLine2 => "pick the language, decide where the provider comes from, and look at what came of it.".into(),
-        Msg::OnboardIntroLine3 => "esc leaves at any step; /onboarding comes back to it.".into(),
-        Msg::OnboardLanguageTitle => "interface language".into(),
-        Msg::OnboardLanguageChinese => "中文".into(),
-        Msg::OnboardLanguageFollowSystem => "follow the system".into(),
-        Msg::OnboardLanguageFollowSystemAbout => "decided by the environment variables".into(),
-        Msg::OnboardSetupTitle => "where the provider comes from".into(),
-        Msg::OnboardSetupCodingPlan => "sign in to CodingPlan".into(),
-        Msg::OnboardSetupCodingPlanAbout => "scan a code; the free allowance comes with it".into(),
-        Msg::OnboardSetupManual => "configure one myself".into(),
-        Msg::OnboardSetupManualAbout => "for an API key of your own, or a model you host".into(),
-        Msg::OnboardSetupSkip => "not now".into(),
-        Msg::OnboardSetupSkipAbout => "this machine still cannot do any work".into(),
-        Msg::OnboardSetupByHand => "opening the provider panel next: the API key, the address and the model all go in there".into(),
-        Msg::OnboardWouldClearTitle => "this clears the screen".into(),
-        Msg::OnboardWouldClearLine1 => "there is a conversation going here. a sign-in that succeeds opens a new session, and what is on screen now will not be in it.".into(),
-        Msg::OnboardWouldClearLine2 => "enter goes on, esc leaves it alone.".into(),
-        Msg::OnboardLoginTitle => "sign in".into(),
-        Msg::OnboardFetchingLoginUrl => "fetching the sign-in address…".into(),
-        Msg::OnboardConfirmTitle => "that is it".into(),
-        Msg::OnboardModalTitle => "before you start".into(),
-        Msg::OnboardAlreadyFinished => "the walkthrough is over".into(),
-        Msg::OnboardLanguageSet { language } => format!("interface language: {language}").into(),
-        Msg::OnboardLanguageNotWritten { error } => format!("the interface language was not written: {error}").into(),
-        Msg::OnboardLoginSkipped => "signing in was skipped — there is still no provider, and /onboarding comes back to it".into(),
-        Msg::OnboardSkipHint => "not now? enter skips it.".into(),
-        Msg::OnboardSignedInConfigNotWritten { error } => format!("signed in, but the config was not written: {error}").into(),
-        Msg::CmdAboutOnboarding => "set this machine up to work: language, sign in, and a look at the result".into(),
-        Msg::CmdAboutOnboardingFinished => "the walkthrough is done".into(),
+        Msg::RecoveryTitle => "Sign-in expired. Choose how to continue".into(),
+        Msg::RecoveryLogin => "Sign in to AtomGit again".into(),
+        Msg::RecoveryProvider => "Switch or connect another model provider".into(),
+        Msg::ModelSetupTitle => "Choose how to connect a model".into(),
+        Msg::ModelSetupLogin => "Sign in with AtomGit".into(),
+        Msg::ModelSetupLoginAbout => "Authorize to claim free Coding Plan credits.".into(),
+        Msg::ModelSetupProvider => "Connect your own model provider".into(),
+        Msg::ModelSetupProviderAbout => "Use a third-party or self-hosted service. Enter its API URL and key as needed.".into(),
+        Msg::ModelSetupKeys => "↑/↓ Select · Enter Confirm".into(),
+        Msg::ModelSetupWaiting => "Waiting for AtomGit authorization…".into(),
+        Msg::ModelSetupOpenLink => "Open this link in your browser.".into(),
+        Msg::ModelSetupCompleting => "Applying the sign-in result…".into(),
+        Msg::LoginLinkKeys => "Click to open · c Copy link · Esc Cancel sign-in and go back".into(),
+        Msg::LoginCancelKey => "Esc Cancel sign-in and go back".into(),
+        Msg::LoginCancelled => "Sign-in cancelled.".into(),
+        Msg::LoginAlreadyRunning => "Sign-in is already in progress.".into(),
         Msg::RollbackConfirmSwitch => "AtomCode switches to the previous version and starts again in this directory.".into(),
         Msg::RollbackConfirmNoUpdates => {
             "Automatic updates stay off afterwards; to go back to the newer version, run /upgrade (or `atomcode upgrade` on the command line).".into()
@@ -1626,6 +1672,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "Appended instructions: unknown".into(),
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerPlaceholder => "Ask AtomCode to do Anything".into(),
         Msg::WaitsForTheTurn { command } => format!(
             "A reply is in progress: /{command} has to wait for this turn to end; Esc stops the turn now"
         )
@@ -1675,7 +1722,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
         )
         .into(),
-    }
+
+        Msg::CmdAboutImport => "Look at the assets another AI coding agent left behind".into(),
+        Msg::NoMigrationPort => "No migration service is available".into(),
+        Msg::MigrationReportTitle => "Assets another agent left behind".into(),
+        Msg::MigrationNoAssets => "This source has no assets".into(),
+        Msg::MigrationSourceUnavailable => "That agent has no assets in the current project.".into(),
+        Msg::MigrationPickSource => "Which agent's assets do you want to see?".into(),
+        Msg::MigrationAssetsCount => "assets".into(),
+        Msg::MigrationSummaryLine { source, count } => {
+            format!("{source}: {count} assets").into()
+        }
+}
 }
 
 /// `team · 2 members · 1 background task`, leaving out a count that is zero.

@@ -1,3 +1,5 @@
+import type { ImageData } from '../api.ts';
+
 // Tool-row model + the dedup primitive shared by the chat view.
 //
 // Tool calls render as rows under an assistant message. The bug this guards
@@ -18,6 +20,7 @@ export interface ToolRow {
   status: 'pending' | 'done' | 'error' | 'incomplete' | 'waiting_approval';
   duration_ms?: number;
   output?: string;
+  images?: ImageData[];
   /** Ephemeral latest activity for a long-running tool. Replaced in place, never persisted. */
   progress?: string;
 }
@@ -74,4 +77,10 @@ export function settlePendingToolParts(parts: MsgPart[]): MsgPart[] {
     delete tool.progress;
     return { kind: 'tool', tool };
   });
+}
+
+/** One result projection shared by live updates and persisted history. */
+export function completedToolPatch(success: boolean, output: string, images?: ImageData[], duration_ms?: number): Partial<ToolRow> {
+  return { status: toolResultStatus(success, output), output, duration_ms,
+    images: images?.length ? images : undefined, progress: undefined };
 }

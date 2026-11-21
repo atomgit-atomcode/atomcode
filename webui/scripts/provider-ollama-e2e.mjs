@@ -8,6 +8,7 @@ const root = resolve(import.meta.dirname, '../dist');
 const clients = new Set(), requests = [];
 let writes = 0, pending;
 let answer = { error: 'Could not connect to Ollama at http://localhost:11434. Run `ollama serve` on the machine running atomcode, then retry model discovery. Default port: 11434.' };
+const initialAnswer = answer;
 const preset = (id, type, url) => ({ id, display_name: id, type, default_base_url: url, requires_api_key: type !== 'ollama' });
 const config = { providers: [], provider_accounts: [], provider_presets: [preset('OpenAI', 'openai', 'https://api.openai.com/v1'), preset('Ollama', 'ollama', 'http://localhost:11434')], provider_protocols: [] };
 const server = createServer(async (req, res) => {
@@ -35,12 +36,26 @@ const browser = await chromium.launch({ executablePath: process.env.OLLAMA_BROWS
 const page = await browser.newPage({ viewport: { width: 1200, height: 1000 } });
 const errors = []; page.on('pageerror', error => errors.push(error.message));
 try {
+ for (const width of [1200, 390]) {
+  requests.length = 0; answer = initialAnswer;
+  await page.setViewportSize({width, height:1000});
   await page.addInitScript(() => { localStorage.setItem('atomcode.lang', 'en'); localStorage.setItem('atomcode.onboarding.done', '1'); });
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  await page.locator('.sidebar-settings-btn, .rail-btn-settings').first().click();
+  if (width < 768) await page.locator('.mobile-menu-btn').click();
+  await page.locator('.sidebar-settings-btn:visible, .rail-btn-settings:visible').first().click();
   await page.getByRole('button', { name: 'Model configuration', exact: true }).click();
   await page.getByRole('button', { name: 'Add model provider' }).click();
   const form = page.locator('.add-provider-card');
+  // A draft must survive accidental backdrop clicks and Escape.
+  const key = form.locator('input[type=password]').first();
+  await key.fill('unsaved-fixture-key');
+  await page.mouse.click(5, 5);
+  assert(await form.isVisible(), 'backdrop must not dismiss the provider form');
+  await key.press('Escape');
+  assert(await form.isVisible(), 'Escape must not dismiss the provider form');
+  assert.equal(await key.inputValue(), 'unsaved-fixture-key');
+  await page.screenshot({path:`/tmp/atomcode-modal-provider-${width}.png`});
+  await key.fill('');
   const choose = async name => { await form.locator('.custom-select-trigger').first().click(); await form.locator('.custom-select-option').filter({ hasText: name }).click(); };
   await choose('Ollama');
   await form.getByRole('alert').filter({ hasText: 'ollama serve' }).waitFor();
@@ -52,6 +67,12 @@ try {
   await form.getByRole('button', { name: 'Retry model discovery' }).click();
   const picker = page.locator('.model-picker-modal');
   await picker.getByText('local-model', { exact: true }).waitFor();
+  await page.mouse.click(5, 5);
+  assert(await picker.isVisible(), 'backdrop must not dismiss the nested picker');
+  await picker.locator('button').first().focus();
+  await page.keyboard.press('Escape');
+  assert(await picker.isVisible(), 'Escape must not dismiss the nested picker');
+  assert(await form.isVisible(), 'the parent dialog remains open');
   await picker.getByRole('button', { name: 'Cancel', exact: true }).click();
   assert.equal(requests.length, 2);
   let release;
@@ -79,7 +100,11 @@ try {
   await page.waitForTimeout(400);
   assert.equal(requests.length, beforeManual + 1);
   assert.equal(writes, 0); assert.deepEqual(errors, []);
-  console.log('PASS: automatic discovery, startup guidance, retry, stale address/provider responses, no implicit writes');
+  await page.locator('.model-config-modal > .modal-header .modal-close').click();
+  await form.waitFor({state:'detached'});
+
+ }
+  console.log('PASS: desktop/mobile modal dismissal, draft preservation, automatic discovery, retry, stale responses, no implicit writes');
 } catch (error) {
   await page.screenshot({ path: '/tmp/atomcode-ollama-failure.png' });
   console.error((await page.locator('body').innerText()).slice(-4000)); throw error;

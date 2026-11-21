@@ -16,10 +16,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
-use super::client::McpClient;
-use super::types::{
-    initialize_params, CallToolResult, InitializeResult, ListToolsResult, ServerStatus,
-};
+use super::client::{McpClient, ToolRequestGuard, CANCELLED_TOOL_REQUEST};
+use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStatus};
 
 /// Default timeout for MCP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -36,6 +34,7 @@ const MAX_MCP_HEADER_BYTES: usize = 16 * 1024;
 /// stdio-based MCP client.
 pub struct StdioClient {
     server_name: String,
+    required_experimental_capabilities: BTreeMap<String, u64>,
     command: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
@@ -76,6 +75,9 @@ pub struct StdioClient {
     /// its failed generation after taking `reconnect_lock` to detect that another
     /// caller already repaired the connection.
     connection_generation: Arc<AtomicU64>,
+    /// A dispatched tool future was dropped before its result was reconciled.
+    /// The stream is no longer usable until an explicit replacement client.
+    abandoned_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -109,6 +111,21 @@ struct RequestAttemptError {
 }
 
 impl StdioClient {
+    /// Requirements belong to this connection's lifetime and cannot be changed
+    /// after construction. They grant no approval or tool authority.
+    pub fn new_with_required_experimental_capabilities(
+        server_name: String,
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        timeout_ms: Option<u64>,
+        requirements: BTreeMap<String, u64>,
+    ) -> Self {
+        let mut client = Self::new(server_name, command, args, env, timeout_ms);
+        client.required_experimental_capabilities = requirements;
+        client
+    }
+
     /// Create a new stdio client.
     pub fn new(
         server_name: String,
@@ -119,6 +136,7 @@ impl StdioClient {
     ) -> Self {
         Self {
             server_name,
+            required_experimental_capabilities: BTreeMap::new(),
             command,
             args,
             env,
@@ -137,6 +155,7 @@ impl StdioClient {
             recovery_cancel: CancellationToken::new(),
             owns_transport_lifetime: true,
             connection_generation: Arc::new(AtomicU64::new(0)),
+            abandoned_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -199,12 +218,25 @@ impl StdioClient {
         &self,
         method: &str,
         params: Option<serde_json::Value>,
+        tool_guard: Option<&ToolRequestGuard>,
     ) -> std::result::Result<serde_json::Value, RequestAttemptError> {
         let _req_guard = self.request_lock.lock().await;
         // Record the generation only after entering the serialized request
         // section. A caller may have waited here while another caller replaced
         // the process.
         let generation = self.connection_generation.load(Ordering::SeqCst);
+        if method != "initialize"
+            && !self.required_experimental_capabilities.is_empty()
+            && !matches!(*self.status.lock().await, ServerStatus::Connected)
+        {
+            return Err(RequestAttemptError {
+                error: anyhow::anyhow!(
+                    "MCP required capabilities have not been validated for this connection"
+                ),
+                generation,
+                request_may_have_been_sent: false,
+            });
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // IMPORTANT: omit `params` when it's None.
@@ -258,6 +290,9 @@ impl StdioClient {
             // Once write_all starts, a failure can still mean that a partial or
             // complete request reached the server. Treat the outcome as unknown
             // so side-effecting tools are never replayed automatically.
+            if let Some(guard) = tool_guard {
+                guard.dispatched(generation);
+            }
             tokio::time::timeout_at(deadline, stdin.write_all(&body))
                 .await
                 .with_context(|| {
@@ -332,16 +367,22 @@ impl StdioClient {
     }
 
     async fn initialize_connection(&self) -> Result<InitializeResult> {
+        super::requirements::validate(&self.required_experimental_capabilities)?;
         *self.status.lock().await = ServerStatus::Connecting;
         self.start().await?;
         self.drain_startup_messages().await?;
 
         let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", Some(initialize_params()))
+            self.send_request("initialize", Some(super::types::initialize_params()), None)
                 .await
                 .map_err(|attempt| attempt.error)?,
         )
         .context("Failed to parse initialize result")?;
+
+        super::requirements::check(
+            &self.required_experimental_capabilities,
+            &result.capabilities,
+        )?;
 
         {
             let mut stdin = self.stdin.lock().await;
@@ -366,12 +407,12 @@ impl StdioClient {
     }
 
     async fn clear_transport(&self) {
-        self.stdin.lock().await.take();
-        self.reader.lock().await.take();
+        let stdin = self.stdin.lock().await.take();
+        let reader = self.reader.lock().await.take();
         self.preread_line.lock().await.take();
-        if let Some(mut child) = self.process.lock().await.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        let child = self.process.lock().await.take();
+        if let Some(child) = child {
+            stop_owned_process(child, stdin, reader).await;
         }
     }
 
@@ -454,6 +495,7 @@ impl StdioClient {
     fn clone_for_recovery(&self) -> Self {
         Self {
             server_name: self.server_name.clone(),
+            required_experimental_capabilities: self.required_experimental_capabilities.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
             env: self.env.clone(),
@@ -472,6 +514,7 @@ impl StdioClient {
             recovery_cancel: self.recovery_cancel.clone(),
             owns_transport_lifetime: false,
             connection_generation: self.connection_generation.clone(),
+            abandoned_generation: self.abandoned_generation.clone(),
         }
     }
 
@@ -481,42 +524,94 @@ impl StdioClient {
         params: Option<serde_json::Value>,
         retry_after_send: bool,
     ) -> Result<serde_json::Value> {
+        tokio::select! {
+            biased;
+            _ = self.recovery_cancel.cancelled() => anyhow::bail!("MCP transport is shut down"),
+            result = self.send_request_with_reconnect_open(method, params, retry_after_send) => result,
+        }
+    }
+
+    async fn send_request_with_reconnect_open(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        retry_after_send: bool,
+    ) -> Result<serde_json::Value> {
         let _operation = self.operation_lock.lock().await;
+        self.send_request_locked(method, params, retry_after_send)
+            .await
+    }
+
+    /// Caller holds operation_lock across related control and tool RPCs.
+    async fn send_request_locked(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        retry_after_send: bool,
+    ) -> Result<Value> {
+        if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
+            anyhow::bail!(CANCELLED_TOOL_REQUEST);
+        }
         self.wait_for_background_recovery().await?;
-        match self.send_request(method, params.clone()).await {
-            Ok(value) => Ok(value),
-            Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
-                if attempt.request_may_have_been_sent && !retry_after_send {
-                    let first_error = format!("{:#}", attempt.error);
-                    self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
-                        .await;
-                    return Err(attempt.error).context(
+        let guard = matches!(method, "tools/call")
+            .then(|| ToolRequestGuard::new(self.abandoned_generation.clone()));
+        let result = async {
+            match self
+                .send_request(method, params.clone(), guard.as_ref())
+                .await
+            {
+                Ok(value) => Ok(value),
+                Err(attempt) if is_reconnectable_stdio_error(&attempt.error) => {
+                    if attempt.request_may_have_been_sent && !retry_after_send {
+                        let first_error = format!("{:#}", attempt.error);
+                        self.reconnect_unknown_tool_in_background(attempt.generation, first_error)
+                            .await;
+                        return Err(attempt.error).context(
                         "MCP tool execution result is unknown; request was not replayed to avoid \
                          duplicate side effects, and stdio recovery continues in the background",
                     );
-                }
-                if let Err(reconnect_error) = self
-                    .reconnect_after_failure(attempt.generation, &attempt.error)
-                    .await
-                {
-                    return Err(reconnect_error);
-                }
-                match self.send_request(method, params).await {
-                    Ok(value) => Ok(value),
-                    Err(retry) => {
-                        if is_reconnectable_stdio_error(&retry.error) {
-                            self.mark_failed_if_generation_current(
-                                retry.generation,
-                                format!("stdio connection lost after reconnect: {:#}", retry.error),
-                            )
-                            .await;
+                    }
+                    if let Err(reconnect_error) = self
+                        .reconnect_after_failure(attempt.generation, &attempt.error)
+                        .await
+                    {
+                        return Err(reconnect_error);
+                    }
+                    match self.send_request(method, params, guard.as_ref()).await {
+                        Ok(value) => Ok(value),
+                        Err(retry) => {
+                            if is_reconnectable_stdio_error(&retry.error) {
+                                self.mark_failed_if_generation_current(
+                                    retry.generation,
+                                    format!(
+                                        "stdio connection lost after reconnect: {:#}",
+                                        retry.error
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(retry.error).context("MCP request failed after one stdio reconnect")
                         }
-                        Err(retry.error).context("MCP request failed after one stdio reconnect")
                     }
                 }
+                Err(attempt) => Err(attempt.error),
             }
-            Err(attempt) => Err(attempt.error),
         }
+        .await;
+        if let Some(guard) = &guard {
+            guard.disarm();
+        }
+        result
+    }
+
+    async fn call_tool_open(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult> {
+        let _operation = self.operation_lock.lock().await;
+        self.wait_for_background_recovery().await?;
+        let params = serde_json::json!({"name":tool_name,"arguments":arguments});
+        let value = self
+            .send_request_locked("tools/call", Some(params), false)
+            .await?;
+        serde_json::from_value(value).context("Failed to parse tools/call result")
     }
 }
 
@@ -524,7 +619,12 @@ impl StdioClient {
 impl McpClient for StdioClient {
     async fn initialize(&mut self) -> Result<InitializeResult> {
         let _reconnect = self.reconnect_lock.lock().await;
-        match self.initialize_connection().await {
+        let initialized = tokio::select! {
+            biased;
+            _ = self.recovery_cancel.cancelled() => anyhow::bail!("MCP transport is shut down"),
+            result = self.initialize_connection() => result,
+        };
+        match initialized {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.mark_failed(format!("stdio initialize failed: {error:#}"))
@@ -541,20 +641,38 @@ impl McpClient for StdioClient {
         serde_json::from_value(result).context("Failed to parse tools/list result")
     }
 
-    async fn call_tool(
-        &self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<CallToolResult> {
-        let params = serde_json::json!({
-            "name": tool_name,
-            "arguments": arguments
-        });
+    async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult> {
+        tokio::select! {
+            biased;
+            _ = self.recovery_cancel.cancelled() => anyhow::bail!("MCP transport is shut down"),
+            result = self.call_tool_open(tool_name, arguments) => result,
+        }
+    }
+    async fn finish_turn(&self) -> Result<()> {
+        if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
+            let _reconnect = self.reconnect_lock.lock().await;
+            self.clear_transport().await;
+        }
+        Ok(())
+    }
 
-        let result = self
-            .send_request_with_reconnect("tools/call", Some(params), false)
-            .await?;
-        serde_json::from_value(result).context("Failed to parse tools/call result")
+    async fn shutdown(&self) {
+        self.recovery_cancel.cancel();
+        let settled = async {
+            loop {
+                let notified = self.recovery_notify.notified();
+                if !self.recovery_in_progress.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(4), settled).await;
+        // Recovery relinquishes any in-progress replacement before we take the
+        // same transport lock. No replacement may start after cancellation.
+        let _reconnect = self.reconnect_lock.lock().await;
+        self.clear_transport().await;
+        *self.status.lock().await = ServerStatus::Disconnected;
     }
 
     fn server_name(&self) -> &str {
@@ -562,6 +680,13 @@ impl McpClient for StdioClient {
     }
 
     fn status(&self) -> ServerStatus {
+        if self.recovery_cancel.is_cancelled() {
+            return ServerStatus::Disconnected;
+        }
+
+        if self.abandoned_generation.load(Ordering::SeqCst) != 0 {
+            return ServerStatus::Failed(CANCELLED_TOOL_REQUEST.into());
+        }
         if let Ok(mut process) = self.process.try_lock() {
             if let Some(child) = process.as_mut() {
                 match child.try_wait() {
@@ -877,14 +1002,56 @@ fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>)
     wrap_cmd_script(command, args, "cmd.exe")
 }
 
+/// EOF lets a cooperative MCP server dispose its owned resources. Drain stdout
+/// so disposal cannot block on a full pipe; never call a business cleanup tool.
+async fn stop_owned_process(
+    mut child: Child,
+    stdin: Option<ChildStdin>,
+    reader: Option<BufReader<ChildStdout>>,
+) {
+    drop(stdin);
+    let graceful = async {
+        let drain = async {
+            if let Some(mut reader) = reader {
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            }
+        };
+        let _ = tokio::join!(child.wait(), drain);
+    };
+    if tokio::time::timeout(Duration::from_secs(2), graceful)
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    }
+    // kill_on_drop is still the fallback if cleanup is itself interrupted.
+}
+
 impl Drop for StdioClient {
     fn drop(&mut self) {
         if !self.owns_transport_lifetime {
             return;
         }
         self.recovery_cancel.cancel();
-        // Try to kill the subprocess gracefully
-        if let Ok(mut process) = self.process.try_lock() {
+        let owned = match (
+            self.process.try_lock(),
+            self.stdin.try_lock(),
+            self.reader.try_lock(),
+        ) {
+            (Ok(mut process), Ok(mut stdin), Ok(mut reader)) => process
+                .take()
+                .map(|child| (child, stdin.take(), reader.take())),
+            _ => None,
+        };
+        if let Some((child, stdin, reader)) = owned {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(stop_owned_process(child, stdin, reader));
+            }
+            // Without an executor the owned Child drops here (kill_on_drop).
+        } else if let Ok(mut process) = self.process.try_lock() {
+            // Recovery can hold a pipe lock. Its cancelled branch also tears
+            // down the transport; do not wait synchronously from Drop.
             if let Some(mut child) = process.take() {
                 let _ = child.start_kill();
             }
@@ -895,6 +1062,139 @@ impl Drop for StdioClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn wait_for_cleanup_marker(marker: std::path::PathBuf) {
+        tokio::task::spawn_blocking(move || {
+            let began = std::time::Instant::now();
+            while !marker.exists() && began.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(marker.exists(), "owned child observed stdin EOF");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn owned_process_observes_eof_and_uncooperative_exit_is_bounded() {
+        let (keep_clock, release_clock) = std::sync::mpsc::channel::<()>();
+        let clock = tokio::task::spawn_blocking(move || {
+            let _ = release_clock.recv_timeout(Duration::from_secs(10));
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        for stubborn in [false, true] {
+            let marker = scratch
+                .path()
+                .join(if stubborn { "stubborn" } else { "graceful" });
+            let script = if stubborn {
+                "cat >/dev/null; printf eof > \"$1\"; exec sleep 60"
+            } else {
+                "cat >/dev/null; printf eof > \"$1\""
+            };
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", script, "cleanup-test"])
+                .arg(&marker)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            let stdin = child.stdin.take();
+            let reader = child.stdout.take().map(BufReader::new);
+            let began = tokio::time::Instant::now();
+            let cleanup = tokio::spawn(stop_owned_process(child, stdin, reader));
+            wait_for_cleanup_marker(marker).await;
+            if stubborn {
+                assert!(!cleanup.is_finished());
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+            cleanup.await.unwrap();
+            assert_eq!(
+                began.elapsed(),
+                if stubborn {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::ZERO
+                }
+            );
+            let exists = Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .unwrap()
+                .success();
+            assert!(!exists, "the owned child was reaped");
+        }
+        drop(keep_clock);
+        clock.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dropping_stdio_client_allows_its_owned_child_to_dispose() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("disposed");
+        let client = StdioClient::new(
+            "cleanup".into(),
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "cat >/dev/null; printf eof > \"$1\"".into(),
+                "cleanup-test".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            BTreeMap::new(),
+            None,
+        );
+        client.start().await.unwrap();
+        drop(client);
+        wait_for_cleanup_marker(marker).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn turn_end_retires_abandoned_unscoped_work_but_preserves_healthy_transport() {
+        tokio::time::resume(); // Real subprocess EOF, not a virtual timeout assertion.
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("retired");
+        let client = StdioClient::new(
+            "turn-cleanup".into(),
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "cat >/dev/null; printf eof > \"$1\"".into(),
+                "cleanup-test".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            BTreeMap::new(),
+            None,
+        );
+        client.start().await.unwrap();
+        client.finish_turn().await.unwrap();
+        assert!(
+            client.process.lock().await.is_some(),
+            "healthy unscoped process was retired"
+        );
+        assert!(!marker.exists());
+        // This is the same synchronous fence armed by a dispatched future drop.
+        client.abandoned_generation.store(1, Ordering::SeqCst);
+        client.finish_turn().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "eof");
+        assert!(client.process.lock().await.is_none());
+        assert!(
+            matches!(client.status(), ServerStatus::Failed(message) if message.contains("cancelled after dispatch"))
+        );
+        assert!(client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .is_err());
+        client.finish_turn().await.unwrap(); // Idempotent; no implicit respawn.
+        assert!(client.process.lock().await.is_none());
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bounded_lines_check_before_appending_and_preserve_following_frames() {

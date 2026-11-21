@@ -255,6 +255,12 @@ name = "skills"
 [[insert]]
 name = "skills-advert"
 
+# Experimental architecture evidence is absent until explicitly enabled.
+# Enabling only mounts a tool; it never starts a repository scan.
+[[insert]]
+name = "architecture-topology"
+disabled = true
+
 [[insert]]
 name = "codeintel"
 

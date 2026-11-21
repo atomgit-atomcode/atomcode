@@ -17,7 +17,8 @@
 //!     adapter replays as signed `thinking`/`redacted_thinking` content next request.
 //!   - `system` is a TOP-LEVEL request field (not a message role); `max_tokens` is
 //!     REQUIRED; tool `input_schema` (not `function.parameters`); `tool_use.input` is a
-//!     JSON OBJECT (not a string). Auth is `x-api-key` + `anthropic-version`, not Bearer.
+//!     JSON OBJECT (not a string). Native auth uses `x-api-key` + `anthropic-version`;
+//!     documented compatible gateways may require Bearer authentication.
 //!   - PREFIX BYTE-STABILITY for prompt caching: the body is built from a BTreeMap-backed
 //!     `Map` (sorted on serialize) with no timestamps/uuids, so the same
 //!     `(system, messages, tools)` always serialize identically.
@@ -75,7 +76,7 @@ pub struct AnthropicConfig {
     /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call — see the matching
+    /// Per-attempt response-header timeout (default 300s) — see the matching
     /// field on `OpenAiCompatConfig`. A gateway that accepts the connection but never
     /// responds would otherwise hang forever. A timeout is classified retryable.
     pub open_timeout: Duration,
@@ -118,7 +119,7 @@ impl AnthropicConfig {
             send_sampling_params: false,
             idle_timeout: Duration::from_secs(120),
             first_token_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
+            open_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
@@ -253,7 +254,8 @@ impl LlmProvider for AnthropicProvider {
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
         let policy = retry::policy_for_call(&self.cfg.retry, options);
-        let caller_recovers = options.request_recovery.is_some();
+        let request_recovery = options.request_recovery.clone();
+        let caller_recovers = request_recovery.is_some();
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
@@ -273,7 +275,7 @@ impl LlmProvider for AnthropicProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
-            caller_recovers,
+            request_recovery.as_ref(),
             open_timeout,
         )
         .await?;
@@ -364,7 +366,7 @@ impl LlmProvider for AnthropicProvider {
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, caller_recovers, open_timeout).await
+                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, request_recovery.as_ref(), open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -398,7 +400,7 @@ impl LlmProvider for AnthropicProvider {
                             return;
                         }
                         Ok(Some(Ok(chunk))) => {
-                            let mut saw_done = false;
+                            let mut terminal = false;
                             for ev in dec.feed(chunk.as_ref()) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
@@ -411,12 +413,12 @@ impl LlmProvider for AnthropicProvider {
                                 }
                                 watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                if matches!(ev, StreamEvent::Done { .. }) {
-                                    saw_done = true;
+                                if matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_)) {
+                                    terminal = true;
                                 }
                                 yield ev;
                             }
-                            if saw_done { return; }
+                            if terminal { return; }
                         }
                     }
                 }
@@ -461,11 +463,12 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
-    caller_recovers: bool,
+    request_recovery: Option<&atomcode_kernel::provider::RequestRecoveryBudget>,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
         open_timeout,
+        request_recovery,
         open_stream_attempts(
             client,
             url,
@@ -475,11 +478,62 @@ async fn open_stream(
             session_id,
             policy,
             rate_limit_retry_owner,
-            caller_recovers,
+            request_recovery.is_some(),
             open_timeout,
         ),
     )
     .await
+}
+
+/// The Messages wire does not imply the native Anthropic authentication scheme.
+/// Keep discovery and inference on the same documented auth policy. Match exact
+/// hosts AND routes; custom gateways retain native auth and account overrides.
+/// Sources: LongCat APIDocs, Kimi Messages, SiliconFlow messages-post and
+/// OpenRouter / Ark Coding Plan Claude Code integration (linked in the catalog).
+pub(super) fn authenticate(
+    request: reqwest::RequestBuilder,
+    url: &str,
+    key: &str,
+) -> reqwest::RequestBuilder {
+    let bearer = reqwest::Url::parse(url).ok().is_some_and(|url| {
+        matches!(
+            (url.host_str().unwrap_or_default(), url.path()),
+            ("api.longcat.chat", "/anthropic/v1/messages" | "/v1/models")
+                | ("api.moonshot.cn", "/anthropic/v1/messages" | "/v1/models")
+                | ("api.siliconflow.cn", "/v1/messages" | "/v1/models")
+                | ("openrouter.ai", "/api/v1/messages" | "/api/v1/models")
+                | (
+                    "api.lkeap.cloud.tencent.com",
+                    "/coding/anthropic/v1/messages" | "/coding/anthropic/v1/models"
+                )
+                | (
+                    "tokenhub.tencentmaas.com",
+                    "/plan/anthropic/v1/messages" | "/plan/anthropic/v1/models"
+                )
+                | (
+                    "ark.cn-beijing.volces.com",
+                    "/api/coding/v1/messages" | "/api/coding/v1/models"
+                )
+        )
+    });
+    if bearer {
+        request.bearer_auth(key)
+    } else {
+        request.header("x-api-key", key)
+    }
+}
+
+pub(super) fn default_auth_key<'a>(
+    key: Option<&'a str>,
+    headers: &atomcode_config::provider_headers::ProviderHeaders,
+) -> Option<&'a str> {
+    // 显式鉴权头优先，避免默认凭据以另一种头部发给同一端点。
+    key.filter(|key| {
+        !key.is_empty()
+            && !headers
+                .iter()
+                .any(|(name, _)| matches!(name, "authorization" | "x-api-key"))
+    })
 }
 
 async fn open_stream_attempts(
@@ -504,8 +558,8 @@ async fn open_stream_attempts(
             .header("anthropic-version", anthropic_version)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes.clone());
-        if !api_key.is_empty() {
-            req = req.header("x-api-key", api_key);
+        if let Some(key) = default_auth_key(Some(api_key), &client.headers) {
+            req = authenticate(req, url, key);
         }
         req = with_session_headers(req, url, session_id);
         req = super::apply_account_headers(req, &client.headers)?;
@@ -542,8 +596,8 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
-                        open_timeout.as_secs()
+                        "open failed: 等待模型服务响应头超过 {}",
+                        retry::format_wait(open_timeout)
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),
                     ..Default::default()
@@ -640,12 +694,13 @@ fn build_request_body(
     } else {
         "anthropic".to_owned()
     };
-    let (system, msgs) = format_messages_for_provider(
+    let (system, msgs) = format_messages_with_cache_boundaries(
         messages,
         cfg.thinking,
         cfg.supports_vision,
         &source,
         cfg.deepseek_messages,
+        !cfg.deepseek_messages,
     );
     if let Some(s) = system {
         body.insert("system".into(), json!(s));
@@ -730,56 +785,54 @@ fn build_request_body(
     body
 }
 
-/// Place markers only after wire messages have been merged. Tools and system
-/// reserve two stable prefixes; up to two recent message boundaries cover the
-/// rolling conversation. Never mark signed/generated thinking blocks.
+/// Tools and system reserve two stable prefixes. Conversation markers are selected
+/// from message provenance before merging, so request-only reminders stay outside.
 fn apply_prompt_cache(body: &mut Value) {
     let marker = json!({"type": "ephemeral"});
-    let mut remaining = 4usize;
     if let Some(tool) = body
         .get_mut("tools")
         .and_then(Value::as_array_mut)
         .and_then(|t| t.last_mut())
     {
         tool["cache_control"] = marker.clone();
-        remaining -= 1;
     }
     if let Some(system) = body.get_mut("system") {
         if let Some(text) = system.as_str().filter(|s| !s.is_empty()) {
-            *system = json!([{"type": "text", "text": text, "cache_control": marker.clone()}]);
-            remaining -= 1;
+            *system = json!([{"type": "text", "text": text, "cache_control": marker}]);
         }
     }
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        let mut marked = 0;
-        for message in messages.iter_mut().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let Some(content) = message.get_mut("content") else {
-                continue;
-            };
-            if let Some(text) = content.as_str().filter(|s| !s.is_empty()) {
-                *content = json!([{"type": "text", "text": text}]);
-            }
-            let Some(blocks) = content.as_array_mut() else {
-                continue;
-            };
-            if let Some(block) = blocks.iter_mut().rev().find(|block| {
-                matches!(
-                    block.get("type").and_then(Value::as_str),
-                    Some("text" | "image" | "tool_use" | "tool_result")
-                ) && !(block["type"] == "text" && block["text"].as_str().is_none_or(str::is_empty))
-            }) {
-                block["cache_control"] = marker.clone();
-                remaining -= 1;
-                // Keep the strategy small: at most two rolling messages.
-                marked += 1;
-                if marked == 2 {
-                    break;
-                }
-            }
+}
+
+fn cacheable_block(block: &Value) -> bool {
+    matches!(
+        block["type"].as_str(),
+        Some("text" | "image" | "tool_use" | "tool_result")
+    ) && !(block["type"] == "text" && block["text"].as_str().is_none_or(str::is_empty))
+}
+
+fn cache_boundary(message: &Value) -> Option<usize> {
+    let content = &message["content"];
+    if let Some(text) = content.as_str() {
+        return (!text.is_empty()).then_some(0);
+    }
+    content.as_array()?.iter().rposition(cacheable_block)
+}
+
+/// Mark at most two stable conversation boundaries BEFORE adjacent users merge.
+/// Converting a selected string to a block also keeps a later reminder separate
+/// instead of joining it into the cached text. Never mark signed thinking.
+fn mark_recent_message_boundaries(messages: &mut [(Value, Option<usize>)]) {
+    for (message, boundary) in messages
+        .iter_mut()
+        .rev()
+        .filter(|(_, b)| b.is_some())
+        .take(2)
+    {
+        let content = &mut message["content"];
+        if let Some(text) = content.as_str() {
+            *content = json!([{"type":"text", "text":text}]);
         }
+        content[boundary.unwrap()]["cache_control"] = json!({"type":"ephemeral"});
     }
 }
 
@@ -800,6 +853,7 @@ fn format_messages_with_vision(
     format_messages_for_provider(messages, echo_thinking, supports_vision, "anthropic", false)
 }
 
+#[cfg(test)]
 fn format_messages_for_provider(
     messages: &[Message],
     echo_thinking: bool,
@@ -807,38 +861,66 @@ fn format_messages_for_provider(
     reasoning_source: &str,
     deepseek: bool,
 ) -> (Option<String>, Vec<Value>) {
+    format_messages_with_cache_boundaries(
+        messages,
+        echo_thinking,
+        supports_vision,
+        reasoning_source,
+        deepseek,
+        false,
+    )
+}
+
+fn format_messages_with_cache_boundaries(
+    messages: &[Message],
+    echo_thinking: bool,
+    supports_vision: bool,
+    reasoning_source: &str,
+    deepseek: bool,
+    cache: bool,
+) -> (Option<String>, Vec<Value>) {
     // Leading System messages lift to the top-level `system` (joined). Anthropic has no
     // system message ROLE on the wire.
-    let system_text: String = messages
+    let system_parts = messages
         .iter()
         .filter(|m| m.role == Role::System)
-        .map(|m| m.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .map(|m| m.text.as_str());
+    let (bytes, count) = system_parts
+        .clone()
+        .fold((0, 0usize), |(bytes, count), text| {
+            (bytes + text.len(), count + 1)
+        });
+    let mut system_text = String::with_capacity(bytes + count.saturating_sub(1) * 2);
+    for (index, text) in system_parts.enumerate() {
+        // Empty messages still occupy a position in the original join.
+        if index > 0 {
+            system_text.push_str("\n\n");
+        }
+        system_text.push_str(text);
+    }
     let system = if system_text.is_empty() {
         None
     } else {
         Some(system_text)
     };
 
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut out: Vec<(Value, Option<usize>)> = Vec::with_capacity(messages.len());
     let mut i = 0;
     while i < messages.len() {
         let m = &messages[i];
         match m.role {
             Role::System => {} // lifted above
             Role::User => {
-                out.push(format_user_message(m, supports_vision));
+                let wire = format_user_message(m, supports_vision);
+                let boundary = (!m.synthetic).then(|| cache_boundary(&wire)).flatten();
+                out.push((wire, boundary));
                 i += 1;
                 continue;
             }
             Role::Assistant => {
-                out.push(format_assistant_message(
-                    m,
-                    echo_thinking,
-                    reasoning_source,
-                    deepseek,
-                ));
+                let wire = format_assistant_message(m, echo_thinking, reasoning_source, deepseek);
+                let boundary = (!m.synthetic).then(|| cache_boundary(&wire)).flatten();
+                out.push((wire, boundary));
                 i += 1;
                 continue;
             }
@@ -846,9 +928,13 @@ fn format_messages_for_provider(
                 // Fold the CONSECUTIVE run of tool results into ONE user message — the
                 // typical shape after an assistant fired N parallel tool calls.
                 let mut blocks: Vec<Value> = Vec::new();
+                let mut boundary = None;
                 while i < messages.len() && messages[i].role == Role::Tool {
                     let tr = &messages[i];
                     if let Some(id) = tr.tool_call_id.as_deref().filter(|s| !s.is_empty()) {
+                        if !tr.synthetic {
+                            boundary = Some(blocks.len());
+                        }
                         blocks.push(json!({
                             "type": "tool_result",
                             "tool_use_id": id,
@@ -859,7 +945,7 @@ fn format_messages_for_provider(
                     i += 1;
                 }
                 if !blocks.is_empty() {
-                    out.push(json!({ "role": "user", "content": blocks }));
+                    out.push((json!({ "role": "user", "content": blocks }), boundary));
                 }
                 continue;
             }
@@ -872,7 +958,19 @@ fn format_messages_for_provider(
     // history places a synthetic-summary user beside the real user; multiple tail hooks
     // stack. Merge every consecutive `role:"user"` run into one (others — OpenAI/Ollama —
     // tolerate adjacency, so they don't need this).
-    let out = merge_consecutive_user(out);
+    if cache {
+        // Keep content-block boundaries stable even after a moving marker leaves
+        // an older message. Otherwise adjacent text users would later join into
+        // one string, rewriting a prefix that used to contain separate blocks.
+        for (message, _) in &mut out {
+            let content = &mut message["content"];
+            if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
+                *content = json!([{"type":"text", "text":text}]);
+            }
+        }
+        mark_recent_message_boundaries(&mut out);
+    }
+    let out = merge_consecutive_user(out.into_iter().map(|(wire, _)| wire).collect());
     (system, out)
 }
 
@@ -1083,6 +1181,12 @@ fn error_type(err: &serde_json::Value) -> Option<String> {
 /// (and same rationale) as `openai_compat`'s `MAX_TOOL_CALLS`.
 const MAX_BLOCKS: usize = 256;
 
+/// Upper bound on one SSE line, and on the unterminated tail kept between
+/// chunks. Same defensive limit as `openai_compat::MAX_SSE_LINE_BYTES`: an
+/// endpoint that never sends `\n` must not grow [`AnthropicSseDecoder::buf`]
+/// until the process is OOM-killed.
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// In-flight state for one content block (by index).
 #[derive(Default)]
 struct BlockState {
@@ -1116,6 +1220,9 @@ struct AnthropicSseDecoder {
     /// `message_stop`. After this a trailing transport EOF is benign.
     seen_stop: bool,
     response_id_seen: bool,
+    /// Largest one line (or its unterminated tail) may grow before the decoder
+    /// refuses the stream. See [`MAX_SSE_LINE_BYTES`].
+    max_line_bytes: usize,
 }
 
 impl AnthropicSseDecoder {
@@ -1132,24 +1239,100 @@ impl AnthropicSseDecoder {
             done: false,
             seen_stop: false,
             response_id_seen: false,
+            max_line_bytes: MAX_SSE_LINE_BYTES,
         }
     }
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
     /// across arbitrary chunk boundaries (UTF-8 is only decoded on whole lines).
+    ///
+    /// Framing is linear in received bytes, including lines fragmented across
+    /// chunks: only new bytes are scanned, and a complete line already in the
+    /// chunk is borrowed instead of copied into `buf`.
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let raw: Vec<u8> = self.buf.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&raw);
-            let text = text.trim_end_matches('\n').trim_end_matches('\r');
-            self.process_line(text, &mut out);
-            if self.done {
-                break;
-            }
+        if self.done {
+            return out;
         }
+        let mut start = 0;
+        while let Some(offset) = chunk[start..].iter().position(|&b| b == b'\n') {
+            let end = start + offset;
+            let part = &chunk[start..end];
+            // Check before appending, so an oversized chunk is never copied
+            // into the line buffer just to be rejected afterwards.
+            if part.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+                out.extend(self.line_too_large());
+                return out;
+            }
+            if self.buf.is_empty() {
+                let text = String::from_utf8_lossy(part);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+            } else {
+                self.buf.extend_from_slice(part);
+                let mut line = std::mem::take(&mut self.buf);
+                let text = String::from_utf8_lossy(&line);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+                line.clear();
+                if !self.done {
+                    // Reuse storage for the next fragmented line.
+                    self.buf = line;
+                }
+            }
+            if self.done {
+                self.buf = Vec::new();
+                return out;
+            }
+            start = end + 1;
+        }
+        let rest = &chunk[start..];
+        if rest.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+            out.extend(self.line_too_large());
+            return out;
+        }
+        self.buf.extend_from_slice(rest);
         out
+    }
+
+    /// Refuse a line the provider never terminated (or sent longer than the
+    /// cap) instead of growing `buf` without bound. The stream is terminal:
+    /// there is no safe point to resume a line whose start was dropped.
+    fn line_too_large(&mut self) -> Vec<StreamEvent> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        self.buf = Vec::new();
+        // Never silently dropped: a refused line is traced so a provider that
+        // batched its SSE stays distinguishable from a transport truncation.
+        tracing::warn!(
+            error_origin = "sse_line_too_large",
+            "provider stream diagnostic"
+        );
+        let mut out = Vec::new();
+        // A failed response still consumed the usage the provider reported.
+        if self.has_usage() {
+            out.push(StreamEvent::Usage(self.usage()));
+        }
+        out.push(StreamEvent::Error(ProviderError {
+            retryable: false,
+            message: format!(
+                "provider stream line exceeded the {}-byte limit; the response was \
+                 refused instead of buffering it without bound",
+                self.max_line_bytes
+            ),
+            http_status: None,
+            code: Some("sse_line_too_large".into()),
+            retry_after_secs: None,
+        }));
+        out
+    }
+
+    /// Test-only override for the line cap, so the boundary can be exercised
+    /// without allocating a production-sized (16 MiB) line.
+    #[cfg(test)]
+    fn with_line_cap(mut self, cap: usize) -> Self {
+        self.max_line_bytes = cap;
+        self
     }
 
     /// True once a `stop_reason` has arrived (see `seen_stop`). After this a
@@ -1164,7 +1347,9 @@ impl AnthropicSseDecoder {
         if self.done {
             return out;
         }
-        if self.input_tokens > 0 || self.output_tokens > 0 || self.cached_total() > 0 {
+        // `feed` keeps the tail at or below `max_line_bytes`, and a tail above
+        // it was refused there, so there is nothing left to reject here.
+        if self.has_usage() {
             out.push(StreamEvent::Usage(self.usage()));
         }
         out.push(StreamEvent::Done {
@@ -1176,6 +1361,18 @@ impl AnthropicSseDecoder {
 
     fn cached_total(&self) -> u32 {
         self.cache_read
+    }
+
+    /// True when the provider reported any usage worth delivering. `usage()`
+    /// folds `cache_creation` into `prompt`, so a check that looks only at
+    /// `input_tokens`, `output_tokens`, and `cache_read` drops a response whose
+    /// whole prompt was a cache write. Both the refused-line and EOF paths use
+    /// this, so they keep the same rule.
+    fn has_usage(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cached_total() > 0
+            || self.cache_creation > 0
     }
 
     fn usage(&self) -> TokenUsage {
@@ -1561,6 +1758,28 @@ mod tests {
         assert!(!body.to_string().contains("redacted_thinking"));
     }
 
+    #[test]
+    fn tokenhub_preset_builds_the_documented_messages_request() {
+        let connection = atomcode_config::config::provider_preset::connections("tencent-tokenhub")
+            .iter()
+            .find(|c| c.provider_type.wire() == "anthropic")
+            .unwrap();
+        let provider = AnthropicProvider::new(AnthropicConfig::new(
+            "test-key",
+            connection.base_urls[0],
+            "fixture-model",
+        ))
+        .unwrap();
+        assert_eq!(provider.url, "https://tokenhub.tencentmaas.com/v1/messages");
+        let client = reqwest::Client::new();
+        let request = authenticate(client.post(&provider.url), &provider.url, "test-key")
+            .build()
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.headers()["x-api-key"], "test-key");
+        assert!(!request.headers().contains_key("authorization"));
+    }
+
     #[tokio::test]
     async fn deepseek_rejects_unsupported_effort_before_opening_a_connection() {
         let mut c =
@@ -1720,6 +1939,14 @@ mod tests {
             {"role":"user", "content":"old question"},
             {"role":"assistant", "content":[{"type":"thinking","thinking":"private","signature":"sig"}, {"type":"text","text":"answer"}]},
             {"role":"user", "content":[{"type":"tool_result","tool_use_id":"id","content":"result"}]}]});
+        let mut messages: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m.clone(), cache_boundary(m)))
+            .collect();
+        mark_recent_message_boundaries(&mut messages);
+        body["messages"] = json!(messages.into_iter().map(|(m, _)| m).collect::<Vec<_>>());
         apply_prompt_cache(&mut body);
         assert_eq!(body.to_string().matches("cache_control").count(), 4);
         assert!(body["messages"][0]["content"].is_string());
@@ -1742,6 +1969,14 @@ mod tests {
             {"role":"user", "content":"question"},
             {"role":"assistant", "content":[{"type":"text", "text":"answer"}, {"type":"thinking", "thinking":"private", "signature":"signed"}]},
             thinking.clone()]});
+        let mut messages: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m.clone(), cache_boundary(m)))
+            .collect();
+        mark_recent_message_boundaries(&mut messages);
+        body["messages"] = json!(messages.into_iter().map(|(m, _)| m).collect::<Vec<_>>());
         apply_prompt_cache(&mut body);
         assert_eq!(body["messages"][2], thinking);
         assert!(body["messages"][1]["content"][0]
@@ -1751,6 +1986,204 @@ mod tests {
             .get("cache_control")
             .is_none());
         assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    }
+
+    #[test]
+    fn cache_boundary_separates_real_user_from_request_only_reminders() {
+        let messages = [
+            Message::user("<system-reminder>real user text</system-reminder>"),
+            Message::synthetic_user("date"),
+            Message::synthetic_user("todo state"),
+        ];
+        let body = build_request_body(
+            "qwen4-max-preview",
+            &messages,
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(wire.len(), 1, "strict user alternation remains intact");
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], messages[0].text);
+        assert!(
+            blocks[0].get("cache_control").is_some(),
+            "provenance, not reminder-looking text, selects boundaries"
+        );
+        assert!(blocks[1].get("cache_control").is_none());
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    fn cache_test_call(id: &str) -> Message {
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }],
+        )
+    }
+
+    // Normalize content encodings, but keep every semantic block and its role.
+    fn conversation_blocks(body: &Value) -> (Vec<Value>, Option<usize>) {
+        let mut blocks = Vec::new();
+        let mut boundary = None;
+        for message in body["messages"].as_array().unwrap() {
+            for mut block in content_to_blocks(message["content"].clone()) {
+                if block
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cache_control")
+                    .is_some()
+                {
+                    boundary = Some(blocks.len());
+                }
+                blocks.push(json!({"role":message["role"], "block":block}));
+            }
+        }
+        (blocks, boundary)
+    }
+
+    #[test]
+    fn cached_tool_result_prefix_survives_the_next_tool_round() {
+        let mut messages = vec![
+            Message::user("reference material"),
+            cache_test_call("one"),
+            Message::tool_result("one", "first result", false),
+        ];
+        let body = |messages: &[Message]| {
+            build_request_body(
+                "qwen4-max-preview",
+                messages,
+                &[],
+                &ChatOptions::default(),
+                &cfg(),
+            )
+        };
+        let mut request = messages.clone();
+        request.push(Message::synthetic_user("temporary date and todo A"));
+        let first = body(&request);
+        let (prefix, boundary) = conversation_blocks(&first);
+        let end = boundary.unwrap();
+        assert_eq!(prefix[end]["block"]["type"], "tool_result");
+        assert_eq!(prefix[end]["block"]["content"], "first result");
+        messages.extend([
+            cache_test_call("two"),
+            Message::tool_result("two", "second result", false),
+            Message::synthetic_user("temporary date and todo B"),
+        ]);
+        let next = body(&messages);
+        let (extended, next_boundary) = conversation_blocks(&next);
+        assert_eq!(
+            prefix[..=end],
+            extended[..=end],
+            "the cached prefix excludes the disappearing reminder"
+        );
+        assert!(
+            next_boundary.unwrap() > end,
+            "the rolling boundary advances"
+        );
+        assert_eq!(next["messages"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn moving_cache_marker_does_not_rejoin_earlier_user_context() {
+        let history = vec![
+            Message::user("large reference"),
+            Message::synthetic_user("persisted bootstrap context"),
+        ];
+        let body = |messages: &[Message]| {
+            build_request_body(
+                "qwen4-max-preview",
+                messages,
+                &[],
+                &ChatOptions::default(),
+                &cfg(),
+            )
+        };
+        let mut first_request = history.clone();
+        first_request.push(Message::synthetic_user("temporary date"));
+        let (prefix, boundary) = conversation_blocks(&body(&first_request));
+        let mut next = history;
+        next.extend([
+            cache_test_call("one"),
+            Message::tool_result("one", "result", false),
+            Message::synthetic_user("temporary date"),
+        ]);
+        let (extended, _) = conversation_blocks(&body(&next));
+        assert_eq!(prefix[..=boundary.unwrap()], extended[..=boundary.unwrap()]);
+        assert_eq!(extended[0]["block"]["text"], "large reference");
+        assert_eq!(extended[1]["block"]["text"], "persisted bootstrap context");
+    }
+
+    #[test]
+    fn parallel_results_cache_the_last_stable_result_before_reminders() {
+        let mut call = cache_test_call("one");
+        call.tool_calls.push(ToolCall {
+            id: "two".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        let body = build_request_body(
+            "qwen4-max-preview",
+            &[
+                Message::system("stable system"),
+                Message::user("question"),
+                call,
+                Message::tool_result("one", "A", false),
+                Message::tool_result("two", "B", true),
+                Message::synthetic_user("date"),
+                Message::synthetic_user("todo"),
+            ],
+            &[ToolDef {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        let blocks = body["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 4);
+        assert!(blocks[0].get("cache_control").is_none());
+        assert!(blocks[1].get("cache_control").is_some());
+        assert_eq!(blocks[1]["is_error"], true);
+        assert!(blocks[2].get("cache_control").is_none());
+        assert!(blocks[3].get("cache_control").is_none());
+        assert_eq!(body.to_string().matches("cache_control").count(), 4);
+    }
+
+    #[test]
+    fn synthetic_only_requests_do_not_get_conversation_cache_markers() {
+        let body = build_request_body(
+            "qwen4-max-preview",
+            &[
+                Message::system("stable"),
+                Message::synthetic_user("reminder"),
+            ],
+            &[],
+            &ChatOptions::default(),
+            &cfg(),
+        );
+        assert!(!body["messages"].to_string().contains("cache_control"));
+        assert_eq!(body.to_string().matches("cache_control").count(), 1);
+    }
+
+    #[test]
+    fn deepseek_keeps_user_reminder_encoding_without_cache_markers() {
+        let mut config = cfg();
+        config.deepseek_messages = true;
+        let body = build_request_body(
+            "deepseek-flash",
+            &[Message::user("question"), Message::synthetic_user("date")],
+            &[],
+            &ChatOptions::default(),
+            &config,
+        );
+        assert_eq!(body["messages"][0]["content"], "question\n\ndate");
+        assert!(!body.to_string().contains("cache_control"));
     }
 
     #[test]
@@ -1868,6 +2301,37 @@ mod tests {
     }
 
     // ---- request building ----
+
+    #[test]
+    fn system_join_matches_reference_including_empty_and_interleaved_messages() {
+        for texts in [
+            vec![],
+            vec![""],
+            vec!["", ""],
+            vec!["first", "", "third"],
+            vec![" 中文\n", "\t ", "tail"],
+        ] {
+            let mut messages = vec![Message::user("not a system message")];
+            for text in texts {
+                messages.push(Message::system(text));
+                messages.push(Message::user("between"));
+            }
+            let expected = messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let expected = if expected.is_empty() {
+                None
+            } else {
+                Some(expected)
+            };
+            for deepseek in [false, true] {
+                assert_eq!(format_messages(&messages, deepseek).0, expected);
+            }
+        }
+    }
 
     #[test]
     fn system_is_lifted_to_top_level_and_roles_map_to_content() {
@@ -2642,6 +3106,188 @@ mod tests {
         // stream EOF without message_stop → finish() flushes a Done.
         ev.extend(d.finish());
         assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
+    }
+
+    // ---- line cap (untrusted provider input) ----
+
+    #[test]
+    fn sse_complete_line_over_cap_is_refused() {
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        let mut chunk = vec![b'x'; 33];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        // The stream is terminal: no Done, and later chunks are ignored.
+        assert!(d.finish().is_empty());
+        assert!(d.feed(b"data: {}\n").is_empty());
+    }
+
+    #[test]
+    fn sse_unterminated_line_over_cap_is_refused() {
+        // A provider that never sends '\n' must not grow the tail forever.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        assert!(d.feed(b"data: {").is_empty());
+        let mut ev = Vec::new();
+        for _ in 0..4 {
+            ev.extend(d.feed(&[b'x'; 10]));
+        }
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn sse_fragmented_line_over_cap_is_refused() {
+        // The cap covers the WHOLE line: a tail already held in `buf` plus this
+        // chunk is refused even though this chunk alone stays under the cap.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(32);
+        assert!(d.feed(&[b'x'; 20]).is_empty());
+        let mut chunk = vec![b'x'; 20];
+        chunk.push(b'\n');
+        let ev = d.feed(&chunk);
+        assert!(
+            matches!(
+                ev.last(),
+                Some(StreamEvent::Error(e)) if e.code.as_deref() == Some("sse_line_too_large")
+            ),
+            "{ev:?}"
+        );
+        assert!(d.finish().is_empty());
+    }
+
+    #[test]
+    fn sse_line_exactly_at_cap_is_accepted() {
+        // The check refuses a line LONGER than the cap, not one equal to it.
+        // Cover both sides of the boundary: a whole line that is exactly the
+        // cap, and a held tail that fills the cap before its newline arrives.
+        let body = format!(
+            "data: {}",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}})
+        );
+        let cap = body.len();
+
+        // Whole line in one chunk: `part.len() == cap`, `buf` empty.
+        let mut whole = AnthropicSseDecoder::new().with_line_cap(cap);
+        let ev = whole.feed(format!("{body}\n").as_bytes());
+        assert!(
+            matches!(ev.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{ev:?}"
+        );
+
+        // Tail fills the cap exactly (`rest.len() == cap`), then its newline
+        // completes the line from a full buffer.
+        let mut split = AnthropicSseDecoder::new().with_line_cap(cap);
+        assert!(split.feed(body.as_bytes()).is_empty());
+        let ev = split.feed(b"\n");
+        assert!(
+            matches!(ev.last(), Some(StreamEvent::TextDelta(t)) if t == "a"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn sse_line_over_cap_still_reports_usage() {
+        let mut d = AnthropicSseDecoder::new().with_line_cap(128);
+        let start = line(
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":7}}}),
+        );
+        assert!(start.len() < 128);
+        d.feed(start.as_bytes());
+        let ev = d.feed(&[b'x'; 129]);
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 7),
+            "{ev:?}"
+        );
+        assert!(matches!(ev.last(), Some(StreamEvent::Error(_))), "{ev:?}");
+    }
+
+    #[test]
+    fn sse_line_over_cap_reports_cache_creation_only_usage() {
+        // A fully cached prompt can report only `cache_creation_input_tokens`:
+        // input, output, and cache_read all stay zero. The refused stream still
+        // consumed those tokens, so the usage must survive the refusal.
+        let mut d = AnthropicSseDecoder::new().with_line_cap(128);
+        let start = line(
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":9}}}),
+        );
+        assert!(start.len() < 128);
+        d.feed(start.as_bytes());
+        let ev = d.feed(&[b'x'; 129]);
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 9),
+            "{ev:?}"
+        );
+        assert!(matches!(ev.last(), Some(StreamEvent::Error(_))), "{ev:?}");
+    }
+
+    #[test]
+    fn sse_finish_reports_cache_creation_only_usage() {
+        // The EOF path shares the rule with the refused-line path.
+        let mut d = AnthropicSseDecoder::new();
+        d.feed(
+            line(
+                "message_start",
+                json!({"type":"message_start","message":{"usage":{"cache_creation_input_tokens":9}}}),
+            )
+            .as_bytes(),
+        );
+        let ev = d.finish();
+        assert!(
+            matches!(ev.first(), Some(StreamEvent::Usage(u)) if u.prompt == 9),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn sse_small_cap_keeps_fragmented_and_multi_line_chunks() {
+        let one = line(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}),
+        );
+        let two = line(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}),
+        );
+        let payload = [one.as_bytes(), two.as_bytes()].concat();
+        let texts = |ev: &[StreamEvent]| -> Vec<String> {
+            ev.iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let cap = one.len() + two.len();
+        let start = line(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+
+        // One chunk, two lines: ordered.
+        let mut whole = AnthropicSseDecoder::new().with_line_cap(cap);
+        whole.feed(start.as_bytes());
+        let ev = whole.feed(&payload);
+        // Fragmented across chunks: same events.
+        let mut split = AnthropicSseDecoder::new().with_line_cap(cap);
+        split.feed(start.as_bytes());
+        let mut split_ev = Vec::new();
+        for chunk in payload.chunks(7) {
+            split_ev.extend(split.feed(chunk));
+        }
+        assert_eq!(texts(&ev), vec!["a", "b"]);
+        assert_eq!(format!("{ev:?}"), format!("{split_ev:?}"));
     }
 
     // ---- mid-stream re-open (v1 parity) ----

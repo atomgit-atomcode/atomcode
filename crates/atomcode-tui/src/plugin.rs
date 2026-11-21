@@ -59,6 +59,7 @@ plexus_service!(WelcomeWordsSvc => dyn crate::content::WelcomeWords, "tui-welcom
 // `content::OpeningNotices`. Unfilled means a launch with nothing to report,
 // which is the ordinary case.
 plexus_service!(OpeningNoticesSvc => crate::content::OpeningNotices, "tui-opening-notices", Seam, "What the launcher has to say about this launch, the moment the screen opens");
+plexus_service!(ModelSetupSvc => crate::model_setup::ModelSetup, "tui-model-setup", Seam, "First-run model choice and interactive sign-in cancellation");
 plexus_service!(WelcomeNoteSeenSvc => dyn crate::content::WelcomeNoteSeen, "tui-welcome-note-seen", Seam, "Told once the welcome's note has actually been drawn");
 // 跑一条本机命令。手势(`!`)归屏幕,开一个进程归启动器 —— 这块屏幕
 // 碰不到操作系统。没填就没有这个功能,`!git status` 还是一句发给模型的话。
@@ -146,7 +147,8 @@ plexus_service!(PlacesSvc => dyn crate::places::Places, "tui-places", Seam, "The
 // scanning the project and locking a file are the launcher's to do — this crate
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and
 // `/setup` on a brand-new machine is the one thing that needs more than that.
-plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Installing the seed skills on a machine that has none yet");
+plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Inspecting project capabilities, reviewing setup actions, and bootstrapping seed skills");
+plexus_service!(MigrationSvc => dyn crate::migration::Migration, "tui-migration", Seam, "Read the assets another AI coding agent left behind");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -202,6 +204,8 @@ pub struct AgentClient {
     link: Mutex<Option<Link>>,
     view: Mutex<Views>,
     receipts: AtomicU64,
+    history_sink: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
+    history_enabled: AtomicBool,
 }
 
 struct Link {
@@ -240,18 +244,16 @@ struct SessionView {
     /// The last fact folded.
     high: Option<SeqNo>,
     events: Vec<LoggedEvent>,
+    history: Option<atomcode_kernel::session::history::Cursor>,
+    history_request: Option<u64>,
+    history_seed: Vec<Committed>,
     described: Option<AgentDescription>,
-    /// The **selection id** the session is on — `AtomGit/deepseek-flash`, which
-    /// an alias differs from — as of the last `/model` this screen saw land.
-    ///
-    /// The description reports the name sent on the wire, which is exactly what
-    /// cannot tell two accounts running the same model apart (see
-    /// [`crate::providers::ProvidersView::marked_row`]). This is the other name
-    /// for the same choice, and the one the providers list is keyed by. It is
-    /// the screen's own fact, not one the agent reports about itself: a build
-    /// whose rows never carried a selection id would leave this empty, and
-    /// `ProvidersView` falls back to matching the wire name.
+    /// Runtime-owned selection id reported by host control, cached for drawing.
+    /// The wire model name alone cannot distinguish accounts serving the same
+    /// model. This is a presentation projection, never a configuration default.
     selection: Option<String>,
+    /// Latest host query; an older reply must not replace a newer selection.
+    selection_request: Option<u64>,
     status: Option<AgentStatus>,
     /// Messages sent and not yet taken by a turn.
     outstanding: HashSet<CommandId>,
@@ -366,11 +368,73 @@ impl AgentClient {
         let mut views = self.view.lock().expect("client poisoned");
         let root = views.root.clone();
         if let Some(view) = views.sessions.get_mut(&root) {
+            // A reply accepted after an older query supersedes that query.
+            view.selection_request = None;
             if view.selection != selection {
                 view.selection = selection;
                 views.remark = true;
             }
         }
+    }
+
+    /// Ask the host for its runtime-owned selection. Wire names and the
+    /// configuration file's default cannot distinguish two live accounts.
+    pub(crate) fn refresh_model_selection(self: &Arc<Self>, session: &str) {
+        if session != self.root() {
+            return;
+        }
+        let Some(control) = self.control() else {
+            return;
+        };
+        let Some(wake) = self.history_sink.lock().expect("client poisoned").clone() else {
+            return;
+        };
+        let request = self.receipts.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut views = self.view.lock().expect("client poisoned");
+            let Some(view) = views.sessions.get_mut(session) else {
+                return;
+            };
+            view.selection_request = Some(request);
+        }
+        let client = self.clone();
+        let session = session.to_string();
+        tokio::spawn(async move {
+            let selection = match control
+                .call(HostCommand::Models {
+                    session: session.clone(),
+                })
+                .await
+            {
+                Ok(HostReply::Models { current, .. }) => current,
+                _ => None,
+            };
+            if client.accept_model_selection(&session, request, selection) {
+                let _ = wake.send(Wake::Fact);
+            }
+        });
+    }
+
+    fn accept_model_selection(
+        &self,
+        session: &str,
+        request: u64,
+        selection: Option<String>,
+    ) -> bool {
+        let mut views = self.view.lock().expect("client poisoned");
+        let Some(view) = views.sessions.get_mut(session) else {
+            return false;
+        };
+        if view.selection_request != Some(request) {
+            return false;
+        }
+        view.selection_request = None;
+        if view.selection == selection {
+            return false;
+        }
+        view.selection = selection;
+        views.remark = true;
+        true
     }
 
     /// Whether a `/model` moved the selection id since this was last asked —
@@ -380,7 +444,7 @@ impl AgentClient {
     }
 
     /// The selection id the session on screen is on, when this screen knows it
-    /// ([`Self::chose_model`]).
+    /// (refreshed from host control as well as an accepted local choice).
     pub fn selection(&self) -> Option<String> {
         self.view
             .lock()
@@ -654,9 +718,21 @@ impl AgentClient {
         for old in previous.into_iter().filter(|old| old != session) {
             self.command(AgentCommand::Unsubscribe { session: old });
         }
+        if !self.request_history(session, None, true) {
+            self.subscribe_history(session, 0);
+        }
+    }
+
+    fn subscribe_history(&self, session: &str, from: SeqNo) {
+        let receipt = self
+            .view
+            .lock()
+            .expect("client poisoned")
+            .replay_receipt
+            .clone();
         let subscribe = AgentCommand::Subscribe {
-            session: session.to_string(),
-            from: 0,
+            session: session.into(),
+            from,
         };
         self.command(match receipt {
             Some(id) => AgentCommand::Tagged {
@@ -665,6 +741,71 @@ impl AgentClient {
             },
             None => subscribe,
         });
+    }
+
+    fn request_history(
+        &self,
+        session: &str,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        initial: bool,
+    ) -> bool {
+        if !self.history_enabled.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(sink) = self.history_sink.lock().expect("client poisoned").clone() else {
+            return false;
+        };
+        let Some(control) = self.control() else {
+            return false;
+        };
+        let request = self.receipts.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut views = self.view.lock().expect("client poisoned");
+            let Some(view) = views.sessions.get_mut(session) else {
+                return false;
+            };
+            if view.history_request.is_some() {
+                return false;
+            }
+            view.history_request = Some(request);
+        }
+        let session = session.to_string();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                control.call(HostCommand::DisplayHistory {
+                    session: session.clone(),
+                    cursor: cursor.clone(),
+                    turns: atomcode_kernel::session::history::DEFAULT_TURNS,
+                }),
+            )
+            .await
+            .unwrap_or(Err(atomcode_host_api::HostError::Unavailable));
+            let _ = sink.send(Wake::History {
+                session,
+                request,
+                initial,
+                cursor,
+                result,
+            });
+        });
+        true
+    }
+
+    fn request_older(&self) {
+        let (session, cursor) = {
+            let views = self.view.lock().expect("client poisoned");
+            let Some(view) = views.screen() else {
+                return;
+            };
+            if view.history_request.is_some() {
+                return;
+            }
+            (views.on_screen.clone(), view.history.clone())
+        };
+        if let Some(cursor) = cursor {
+            self.request_history(&session, Some(cursor), false);
+        }
     }
 
     /// Let a member go once it has left the team — unless it is on screen,
@@ -747,6 +888,23 @@ impl AgentClient {
         };
         if view.high.is_some_and(|h| committed.seq <= h) {
             return false;
+        }
+        if matches!(
+            committed.event,
+            atomcode_kernel::session::SessionEvent::Rewound { .. }
+                | atomcode_kernel::session::SessionEvent::Interrupted { undone: true, .. }
+                | atomcode_kernel::session::SessionEvent::Compacted { .. }
+                | atomcode_kernel::session::SessionEvent::MessagesRewritten { .. }
+                | atomcode_kernel::session::SessionEvent::ToolResultsStubbed { .. }
+        ) {
+            // The log is append-only. Rebase the omitted range only after this
+            // view observed the mutation; a response based on the earlier
+            // revision is discarded. Current undo markers are applied after
+            // prepending original historical events.
+            if let Some(cursor) = &mut view.history {
+                cursor.revision = committed.seq;
+            }
+            view.history_request = None;
         }
         view.high = Some(committed.seq);
         view.events.push(LoggedEvent {
@@ -845,6 +1003,8 @@ fn skill_prefix(input: &str) -> Option<&str> {
 }
 
 /// Turn the composer spelling into the existing `/skills` gateway command.
+/// Preserve secondary $/¥ references: the shared gateway validates them all
+/// before queuing, rather than silently treating an unknown name as task text.
 fn skill_command(input: &str, known: impl FnOnce(&str) -> bool) -> Option<String> {
     let rest = input
         .strip_prefix('$')
@@ -923,13 +1083,15 @@ fn effort_menu_options(levels: &[String]) -> Vec<crate::command::CommandOption> 
         .collect()
 }
 
-/// Lines the conversation moves per wheel notch.
-///
-/// One, not three. The terminal already sends one event per notch, so three
-/// lines an event is three times the distance the hand asked for — and the
-/// reason to reach for the wheel here is to study something that went past,
-/// which is exactly when precision beats speed.
+/// Lines panels and lists move per wheel event.
 const WHEEL_LINES: i32 = 1;
+
+/// Windows and HarmonyOS wheel notches need a larger step.
+const CONVERSATION_WHEEL_LINES: i32 = if cfg!(any(windows, target_env = "ohos")) {
+    3
+} else {
+    1
+};
 
 /// How close two presses on the same cell must be to count as a double- (then
 /// triple-) click. 400ms is the common desktop default — long enough for a
@@ -1048,6 +1210,41 @@ async fn answer_prompts(
 /// for this long. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Where a key goes while an approval or question panel waits: the panel, or —
+/// when the composer is still on screen AND holds text the person was
+/// mid-typing — the composer, so the tail of an interrupted IME composition
+/// cannot be mistaken for an answer to a question nobody has read.
+pub enum AskKeyRoute {
+    Panel,
+    Composer(char),
+}
+
+/// Keep plain text going into a visible draft. The ask handler owns digits
+/// and navigation, and applies the appropriate rules to the pending request.
+pub fn route_ask_key(
+    input_holds_text: bool,
+    composer_hidden: bool,
+    press: &crate::surface::KeyPress,
+) -> AskKeyRoute {
+    use crate::surface::{Key, Mods};
+    if composer_hidden {
+        // The composer has stepped aside for the panel: typing into the field
+        // would be writing where nobody looks. The panel takes the key — its
+        // typing rows live on characters.
+        return AskKeyRoute::Panel;
+    }
+    let typed = match &press.key {
+        Key::Char(c) if press.mods == Mods::NONE || press.mods == Mods::SHIFT => {
+            (!c.is_ascii_digit()).then_some(*c)
+        }
+        _ => None,
+    };
+    match (input_holds_text, typed) {
+        (true, Some(c)) => AskKeyRoute::Composer(c),
+        _ => AskKeyRoute::Panel,
+    }
+}
+
 /// The most lines of history to bring in from this project's other sessions.
 ///
 /// The number the other front end settled on for its own history file. This is
@@ -1090,12 +1287,50 @@ async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ApprovalInput {
+    presentation: crate::ask::PresentedApproval,
+    frame: u64,
+}
+
+impl ApprovalInput {
+    fn for_input(self, input: &Input, current: Self) -> Option<crate::ask::PresentedApproval> {
+        if self.presentation.id != current.presentation.id {
+            return None;
+        }
+        match input {
+            Input::Mouse(..) if self.frame != current.frame => None,
+            Input::Key(press)
+                if press.key == crate::surface::Key::Enter
+                    && self.presentation.selected != current.presentation.selected =>
+            {
+                None
+            }
+            _ => Some(self.presentation),
+        }
+    }
+}
+
 enum Wake {
+    History {
+        session: String,
+        request: u64,
+        initial: bool,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        result: Result<HostReply, atomcode_host_api::HostError>,
+    },
     Copied {
         session: String,
         message: String,
     },
     Fact,
+    ProviderModelsEnriched {
+        original: crate::providers::Step,
+        drafts: Vec<crate::providers::ModelDraft>,
+        before: Option<crate::providers::Panel>,
+        after: Option<crate::providers::Panel>,
+        session: String,
+    },
     SessionReferences,
     Foreground {
         request: u64,
@@ -1113,6 +1348,7 @@ enum Wake {
     /// The host replaced the session.
     Host(HostEvent),
     Input(Input),
+    InputOverApproval(Input, ApprovalInput),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
     /// A command the far end (phone, browser) asked this screen to run.
@@ -1135,11 +1371,25 @@ enum Wake {
 /// The scrollbar is screen policy. The old knob — `mascot = true` — is now
 /// `[[insert]] name = "tui-panel-mascot"`, which is the point: a panel is a row,
 /// not a boolean on somebody else's row.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
     #[serde(default)]
     scrollbar: crate::moment::ScrollbarMode,
+    #[serde(default = "default_diff_wrap")]
+    wrap_diff: bool,
+}
+
+fn default_diff_wrap() -> bool {
+    true
+}
+impl Default for Row {
+    fn default() -> Self {
+        Self {
+            scrollbar: Default::default(),
+            wrap_diff: true,
+        }
+    }
 }
 
 /// Whether a fact is the line a turn opens with on screen — what the working
@@ -1373,9 +1623,58 @@ impl TeamRoster for Roster {
 /// Cached metadata for asynchronous session reference discovery.
 #[derive(Default)]
 struct SessionSuggestions {
-    entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    entries: Vec<SessionSuggestion>,
     checked: Option<std::time::Instant>,
     loading: bool,
+}
+
+struct SessionSuggestion {
+    entry: atomcode_capabilities::session::CatalogEntry,
+    preview: Option<String>,
+}
+
+impl SessionSuggestion {
+    fn scan(root: &std::path::Path) -> Vec<Self> {
+        use atomcode_capabilities::session::{reference, SessionManager, SessionMeta};
+
+        let mut candidates: Vec<_> = SessionManager::scan_catalog(root)
+            .entries
+            .into_iter()
+            .filter(reference::available)
+            .map(|entry| Self {
+                entry,
+                preview: None,
+            })
+            .collect();
+        // The catalog is newest first. Cap preview reads per refresh.
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| {
+                let entry = &candidate.entry;
+                entry.name.trim().is_empty()
+                    || SessionMeta::name_needs_fallback(&entry.name, &entry.id)
+            })
+            .take(200)
+        {
+            let entry = &candidate.entry;
+            candidate.preview = SessionManager::with_root(root.join(&entry.project_bucket))
+                .first_prompt_preview(&entry.id)
+                .ok()
+                .flatten();
+        }
+        candidates
+    }
+
+    fn label(&self) -> &str {
+        self.preview.as_deref().unwrap_or_else(|| {
+            let name = self.entry.name.trim();
+            if name.is_empty() {
+                &self.entry.id
+            } else {
+                name
+            }
+        })
+    }
 }
 
 /// Own and abort superseded panel reads.
@@ -1481,11 +1780,14 @@ pub struct Tui {
     /// What this screen last told the terminal the window is called, so a
     /// frame that changes nothing writes nothing.
     named: Mutex<Option<String>>,
-    /// Where an attached image's bytes were written on disk, by marker number, so
-    /// a person clicking `[Image #N]` opens it in their desktop viewer. Written
-    /// on first open and reused after — the picture is decoded once, not on every
-    /// click. Session-scoped, like the gallery it mirrors.
-    image_files: Mutex<std::collections::HashMap<usize, std::path::PathBuf>>,
+    /// Private previews keyed by exact content, independent of attachment numbers.
+    /// Retained files are removed when the TUI drops them.
+    image_files: Mutex<
+        Vec<(
+            atomcode_kernel::message::ImageContent,
+            tempfile::NamedTempFile,
+        )>,
+    >,
     /// What a click hands a picture or a link to: this machine's desktop.
     ///
     /// [`LocalOpener`](atomcode_capabilities::tools::LocalOpener) directly, not
@@ -1569,12 +1871,14 @@ impl UserInterface for Tui {
         // Kept before the connection takes it: the one question asked of the
         // host before a person has typed anything.
         let readiness = control.clone();
+        let model_setup = ctx.service::<ModelSetupSvc>();
         // And the second one — which mode this session is in, which a host may
         // have set before this screen subscribed.
         let mode_of_session = control.clone();
         client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
+        *client.history_sink.lock().expect("client poisoned") = Some(wake_tx.clone());
         // Started before anything can commit a fact, so the first turn's
         // opening reading is measured on the same clock as every later one.
         let clock = Clock::start();
@@ -1676,6 +1980,7 @@ impl UserInterface for Tui {
             let mut m = self.host.moment.write().expect("moment poisoned");
             m.lead = session.clone();
             m.viewing = session.clone();
+            m.model_setup_required = model_setup.as_ref().is_some_and(|setup| setup.required());
         }
 
         // What the launcher has to say about this launch
@@ -1689,10 +1994,8 @@ impl UserInterface for Tui {
         // every session change, which is right for a welcome and wrong for
         // news about how the process started.
         //
-        // Leaving these in the stream does not cost the welcome its place:
-        // `open_conversation` stands down only for a block some *other*
-        // producer made, and these are `commands`, like the readiness notice
-        // below that has always been able to arrive first.
+        // The welcome owns the opening prefix, even if these launch notices
+        // or paged history were rendered before its model became known.
         // The note for the welcome's foot goes to the first welcome only: it is
         // this launch's, and `owes_opening` comes round again per session.
         let mut welcome_note = ctx
@@ -1766,31 +2069,41 @@ impl UserInterface for Tui {
         // subscription just sent (`follow` above) — there is nothing to say yet
         // at this point.
         //
-        // The stream is emission-ordered (`block.rs`: positions are assigned on
-        // open and never move), so the welcome sits on top only by being emitted
-        // before any history. The feed's order (`harness/src/feed.rs`) makes that
-        // reachable: on `Subscribe` it sends `Described` first, then the status,
-        // the members, and only then the facts, one wake at a time. So the loop
-        // emits the welcome the moment `described()` first answers — into a
-        // still-empty stream — and the backfill folds in beneath it over the
-        // wakes that follow. Waiting for a drained queue instead would fold the
-        // history first and leave the welcome stranded at the bottom.
+        // A paged bootstrap can precede the description. The stream reserves
+        // its opening prefix when the model becomes known; later pages always
+        // go below that prefix, independent of event arrival order.
         let mut owes_opening = true;
+        let mut setup_opening: Option<crate::module::Opening> = None;
 
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
         let keys_tx = wake_tx.clone();
+        let presented_approval = Arc::new(Mutex::new(None));
+        let input_approval = presented_approval.clone();
         let reader = match self.surface.take_input() {
             Some(mut scripted) => tokio::spawn(async move {
                 while let Some(input) = scripted.recv().await {
-                    if keys_tx.send(Wake::Input(input)).is_err() {
+                    if keys_tx
+                        .send(input_wake(
+                            input,
+                            *input_approval.lock().expect("approval poisoned"),
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                 }
             }),
             None => {
                 let surface = self.surface.clone();
-                tokio::spawn(async move { read_input(keys_tx, move || !surface.mouse()).await })
+                tokio::spawn(async move {
+                    read_input(
+                        keys_tx,
+                        move || !surface.mouse(),
+                        move || *input_approval.lock().expect("approval poisoned"),
+                    )
+                    .await
+                })
             }
         };
         // Keep the existing transient hint too; the welcome carries the durable
@@ -1820,10 +2133,7 @@ impl UserInterface for Tui {
                 else {
                     return;
                 };
-                // On the status row, not at the top of the conversation: the
-                // page opens as it always does (the welcome is drawn — see
-                // `owes_opening`) and the reason stands under it, the way tuix
-                // shows "no provider" in its footer.
+                // Keep the recovery commands available above the composer.
                 if let Some(why) = why {
                     host.moment.write().expect("moment poisoned").unready = Some(why);
                     let _ = keys.send(Wake::Fact);
@@ -1907,7 +2217,8 @@ impl UserInterface for Tui {
             // yet, so there is nothing it could have been attached to. Kept as
             // `last_sent` all the same, so an Escape that stops this first turn
             // hands it back the way it would any other (see `Action::Escape`).
-            self.host.moment.write().expect("moment poisoned").last_sent = Some(text.clone());
+            self.host.moment.write().expect("moment poisoned").last_sent =
+                Some(Arc::new(text.clone()));
             let _ = client.send(text, Vec::new());
         }
 
@@ -1930,6 +2241,9 @@ impl UserInterface for Tui {
         // Wakes answered since that frame. See [`COALESCE_LIMIT`].
         let mut coalesced = 0usize;
         let mut painted_size = self.surface.size();
+        let mut approval_on_screen = None;
+        let mut frame = 0;
+        let mut composer_on_screen = false;
         let mut last_menu_hover = None;
         // Whether the screen could take a background question at the last frame,
         // so the moment it can is seen once (see [`became_ready`]).
@@ -1973,16 +2287,8 @@ impl UserInterface for Tui {
             // new session has no facts, so nothing else would mark the screen
             // stale and the welcome would wait for a frame that never comes.
             //
-            // Asked the instant the session is described, **not** once the queue
-            // is drained. The stream is append-ordered (`block.rs`), so the
-            // welcome has to be emitted before the history to sit above it — and
-            // the feed's order makes that safe: on `Subscribe` it sends
-            // `Described` first and then, one wake at a time, the facts. So the
-            // turn after `described()` first answers, `open_conversation` finds a
-            // still-empty stream and lands the welcome on top; the backfill folds
-            // in below it over the wakes that follow. `described()` is reset by
-            // `follow` and re-answered per session, so a resume waits for the
-            // resumed session's own description rather than the outgoing one's.
+            // Open once the session's model is known. A late description still
+            // places the welcome above already rendered paged history.
             {
                 // The welcome waits for the agent's description, which never
                 // comes while no turn can be taken (no provider, no agent). The
@@ -1995,16 +2301,51 @@ impl UserInterface for Tui {
                     .expect("moment poisoned")
                     .unready
                     .is_some();
+                let setup_view = model_setup
+                    .as_ref()
+                    .filter(|setup| setup.required())
+                    .and_then(|setup| {
+                        if self.host.providers_open() {
+                            Some(crate::model_setup::SetupView::Provider)
+                        } else {
+                            setup.view(self.surface.size().1)
+                        }
+                    });
+                if let Some(opening) = setup_opening.as_mut() {
+                    if opening.model_setup != setup_view {
+                        opening.model_setup = setup_view.clone();
+                        if setup_view.is_none() {
+                            opening.model =
+                                client.described().and_then(|description| description.model);
+                        }
+                        stale |= self.host.refresh_opening(opening);
+                    }
+                    if setup_view.is_none() {
+                        setup_opening = None;
+                    }
+                }
                 if owes_opening {
                     let described = client.described();
-                    if described.is_some() || unready {
-                        let cwd = self
-                            .host
-                            .moment
-                            .read()
-                            .expect("moment poisoned")
-                            .cwd
-                            .clone();
+                    if described.is_some()
+                        || unready
+                        || model_setup.as_ref().is_some_and(|setup| setup.required())
+                    {
+                        let (cwd, providers) = {
+                            let m = self.host.moment.read().expect("moment poisoned");
+                            (m.cwd.clone(), m.providers.clone())
+                        };
+                        // The welcome names the model the way the picker and the
+                        // status row do: by the gateway's display alias when the
+                        // live model has one, the wire name otherwise.
+                        let model = described.as_ref().and_then(|d| d.model.clone());
+                        let model = model.map(|name| {
+                            providers
+                                .models()
+                                .iter()
+                                .find(|m| m.model == name || m.id == name)
+                                .and_then(|m| m.localized_alias().map(str::to_string))
+                                .unwrap_or(name)
+                        });
                         let open =
                             crate::module::Opening {
                                 // Folded upstream: reading the environment is this
@@ -2016,7 +2357,7 @@ impl UserInterface for Tui {
                                 // is what `tests/guards.rs`
                                 // (`the_screen_reads_no_service_of_the_agents`)
                                 // forbids.
-                                model: described.as_ref().and_then(|d| d.model.clone()),
+                                model,
                                 version: env!("CARGO_PKG_VERSION"),
                                 commands: self.host.commands.all(),
                                 // Resolved **here**, not when the welcome producer
@@ -2028,12 +2369,16 @@ impl UserInterface for Tui {
                                     |ctx| ctx.service::<crate::plugin::WelcomeWordsSvc>(),
                                 ),
                                 note: welcome_note.clone(),
+                                model_setup: setup_view.clone(),
                             };
                         // Spent only by a welcome that was drawn: a session whose
                         // history stood the welcome down leaves it for the next.
                         let opened = self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);
+                        if opened && setup_view.is_some() {
+                            setup_opening = Some(open);
+                        }
                         if opened && welcome_note.take().is_some() && launcher_note_pending {
                             // Drawn: only now is it spent on the launcher's side.
                             if let Some(seen) = self
@@ -2051,12 +2396,8 @@ impl UserInterface for Tui {
                         // or, where the history stood it down, after what is
                         // there. Once: the list is drained.
                         stale |= say_opening_notices(&mut opening_notices);
-                        // Answered once per session, whatever the answer: a
-                        // stream that was not empty will not become empty
-                        // again, and one that opened is no longer empty. It is
-                        // *per session* rather than once in a lifetime because
-                        // the `SessionChanged` arm above raises it again — the
-                        // one thing that can empty the stream under this loop.
+                        // Try once per view; SessionChanged raises this again
+                        // and replaces the stream, including its opening marker.
                         owes_opening = false;
                     }
                 }
@@ -2098,7 +2439,14 @@ impl UserInterface for Tui {
                 was_ready = ready;
                 painted_size = self.surface.size();
                 last_menu_hover = None;
-                self.paint(painted_size);
+                let (approval, composer) = self.paint(painted_size);
+                frame += 1;
+                approval_on_screen = approval.map(|presentation| ApprovalInput {
+                    presentation,
+                    frame,
+                });
+                composer_on_screen = composer;
+                *presented_approval.lock().expect("approval poisoned") = approval_on_screen;
                 stale = false;
                 coalesced = 0;
             }
@@ -2153,6 +2501,14 @@ impl UserInterface for Tui {
                     None => wake.recv().await.unwrap_or(Wake::Closed),
                 },
             };
+            let (woke, input_approval) = match woke {
+                Wake::InputOverApproval(input, receipt) => {
+                    let approval =
+                        approval_on_screen.and_then(|current| receipt.for_input(&input, current));
+                    (Wake::Input(input), approval)
+                }
+                other => (other, None),
+            };
             if matches!(woke, Wake::EdgeScroll) {
                 edge_due = None;
             }
@@ -2163,6 +2519,8 @@ impl UserInterface for Tui {
             // (the turn streaming on, a resize) goes on as usual — the frames
             // it asks for are not drawn until the screen is back.
             if self.surface.showing_transcript() {
+                approval_on_screen = None;
+                *presented_approval.lock().expect("approval poisoned") = None;
                 match &woke {
                     Wake::Input(Input::Key(_)) => {
                         self.surface.back_from_transcript();
@@ -2223,6 +2581,7 @@ impl UserInterface for Tui {
             }
             let closed = matches!(woke, Wake::Closed | Wake::TerminalInputFailed(_));
             match woke {
+                Wake::InputOverApproval(..) => unreachable!("input was normalized"),
                 Wake::Closed => quit = true,
                 Wake::TerminalInputFailed(error) => {
                     terminal_input_error = Some(error);
@@ -2246,11 +2605,52 @@ impl UserInterface for Tui {
                         stale = true;
                     }
                 }
+                Wake::History {
+                    session,
+                    request,
+                    initial,
+                    cursor,
+                    result,
+                } => {
+                    stale |= self.accept_history(&session, request, initial, cursor, result);
+                }
                 Wake::Fact => {
                     stale = true;
                     if client.take_remark() {
                         self.refresh_providers();
                     }
+                }
+                Wake::ProviderModelsEnriched {
+                    original,
+                    mut drafts,
+                    before,
+                    after,
+                    session,
+                } => {
+                    use crate::providers::Step;
+                    let still_here = self.client.session() == session
+                        && self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .providers_panel
+                            == after;
+                    if !still_here {
+                        for draft in &mut drafts {
+                            draft.use_now = false;
+                        }
+                    }
+                    let step = match original {
+                        Step::SaveModel { id: None, draft } => Step::SaveModel {
+                            id: None,
+                            draft: drafts.pop().unwrap_or(draft),
+                        },
+                        Step::SaveModels { .. } => Step::SaveModels { drafts },
+                        step => step,
+                    };
+                    self.finish_provider_step(step, before.filter(|_| still_here));
+                    stale = true;
                 }
                 // Most of what arrives here moves nothing on the screen: a
                 // streamed delta is already in the transcript by the time it is
@@ -2303,6 +2703,18 @@ impl UserInterface for Tui {
                                 current_label: pending.label,
                             });
                         }
+                        // This runtime may have changed mode while it was in the
+                        // background, when its host events were not forwarded.
+                        if let Some(control) = client.control() {
+                            if let Ok(HostReply::Mode { mode }) = control
+                                .call(HostCommand::Mode {
+                                    session: session.clone(),
+                                })
+                                .await
+                            {
+                                took_mode(&self.host.moment, &session, mode);
+                            }
+                        }
                         // The session that arrives owes its own first word.
                         // `switch_session` empties the stream (`host.rs`
                         // `switch_view`), so the question below is live again —
@@ -2311,6 +2723,7 @@ impl UserInterface for Tui {
                         // welcome block is produced by `open_conversation` alone,
                         // and nothing else asks.
                         owes_opening = true;
+                        setup_opening = None;
                         self.host.say(
                             t(Msg::SwitchedToSession { session: &session }).into_owned(),
                             false,
@@ -2522,7 +2935,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::ArrowBurst { up, n }) => {
                     // A lone ↓ the composer and the conversation have no use
                     // for steps into the team panel, as a pressed one does.
-                    if !up && n == 1 && self.down_reaches_team() && self.host.focus_team() {
+                    if !up
+                        && n == 1
+                        && !crate::ansi::alternate_scroll_enabled()
+                        && self.down_reaches_team()
+                        && self.host.focus_team()
+                    {
                         stale = true;
                         continue;
                     }
@@ -2540,11 +2958,16 @@ impl UserInterface for Tui {
                     if arrows_scroll(
                         self.surface.mouse(),
                         crate::caps::mouse_reported(),
-                        crate::ansi::alternate_scroll_enabled() && n > 1,
+                        crate::ansi::alternate_scroll_enabled(),
                         self.arrows_reach_the_composer()
                             && !(n == 1 && self.caret_moves_within_draft(up)),
                     ) {
-                        let lines = n.min(i32::MAX as usize) as i32;
+                        let step = if crate::ansi::alternate_scroll_enabled() {
+                            CONVERSATION_WHEEL_LINES
+                        } else {
+                            1
+                        };
+                        let lines = (n.min(i32::MAX as usize) as i32).saturating_mul(step);
                         quit = self.act(Action::Scroll(if up { -lines } else { lines }), &client);
                     } else {
                         let key = crate::surface::KeyPress::plain(if up {
@@ -2686,8 +3109,8 @@ impl UserInterface for Tui {
                         continue;
                     }
                     let action = match click {
-                        Click::WheelUp => Some(Action::Scroll(-WHEEL_LINES)),
-                        Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
+                        Click::WheelUp => Some(Action::Scroll(-CONVERSATION_WHEEL_LINES)),
+                        Click::WheelDown => Some(Action::Scroll(CONVERSATION_WHEEL_LINES)),
                         Click::Press => {
                             self.presses.fetch_add(1, Ordering::SeqCst);
                             *self.pressed_at.lock().expect("press poisoned") = Some((x, y));
@@ -2720,8 +3143,12 @@ impl UserInterface for Tui {
                             // another one's row.
                             if self.host.asks.is_waiting() {
                                 if let Some(row) = self.host.answer_row_at(x, y) {
-                                    let _ = self.host.point_ask_at(row);
-                                    quit = self.confirm_question();
+                                    if let Some((id, step)) = self
+                                        .host
+                                        .click_ask(row, input_approval.map(|approval| approval.id))
+                                    {
+                                        self.deliver_answer(id, step);
+                                    }
                                     stale = true;
                                     continue;
                                 }
@@ -2821,6 +3248,14 @@ impl UserInterface for Tui {
                             // the second half of a double click land on an
                             // action that was not on screen for the first half.
                             if self.host.mcp_open() {
+                                if self.host.mcp_switch_at(x, y) {
+                                    self.run_mcp_key(crate::surface::KeyPress {
+                                        key: crate::surface::Key::Char('s'),
+                                        mods: crate::surface::Mods::CTRL,
+                                    });
+                                    stale = true;
+                                    continue;
+                                }
                                 if let Some(row) = self.host.mcp_row_at(x, y) {
                                     if self.host.mcp_click(row) {
                                         self.run_mcp_key(crate::surface::KeyPress::plain(
@@ -3179,6 +3614,8 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Paste(text)) if self.host.mcp_open() => {
                     stale |= self.host.mcp_paste(&text);
                 }
+                Wake::Input(Input::Paste(_))
+                    if model_setup.as_ref().is_some_and(|setup| setup.required()) => {}
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
                     stale = true;
@@ -3187,10 +3624,11 @@ impl UserInterface for Tui {
                 // before anything else — above a modal, because it is not one:
                 // it is the field, it is one key from being refused, and a
                 // `sudo` is holding the turn open until it is. Everything else
-                // is swallowed rather than passed on, so a key cannot act on a
-                // screen whose field is showing something else.
+                // is swallowed rather than passed on, except explicit mouse
+                // handoff/selection copy and text paste into this same field.
+                // Ordinary composer actions must never receive these keys.
                 Wake::Input(Input::Key(press)) if self.host.secret_waiting() => {
-                    self.host.secret_key(press);
+                    self.run_secret_key(press, &client);
                     stale = true;
                 }
                 // A modal has the keyboard while it is open, then the
@@ -3309,7 +3747,100 @@ impl UserInterface for Tui {
                 // place its keys are routed — and focus is still arbitration,
                 // not composition: exactly one thing can hold it.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
-                    quit = self.answer_question(press);
+                    let holds = !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .input
+                        .is_empty();
+                    match route_ask_key(holds, !composer_on_screen, &press) {
+                        AskKeyRoute::Composer(c) => {
+                            // Through `act`, so the insert keeps its side
+                            // effects (draft history, suggestion dismissal).
+                            quit = self.act(Action::Insert(c), &client);
+                            stale = true;
+                        }
+                        AskKeyRoute::Panel => {
+                            quit = self.answer_question(press, input_approval);
+                            stale = true;
+                        }
+                    }
+                }
+                Wake::Input(Input::Key(press))
+                    if press.key == crate::surface::Key::Esc
+                        && model_setup
+                            .as_ref()
+                            .is_some_and(|setup| setup.cancel_login()) =>
+                {
+                    if !model_setup.as_ref().is_some_and(|setup| setup.required()) {
+                        self.host.say(t(Msg::LoginCancelled).into_owned(), false);
+                    }
+                    stale = true;
+                }
+                Wake::Input(Input::Key(press))
+                    if model_setup.as_ref().is_some_and(|setup| setup.required()) =>
+                {
+                    use crate::surface::{Key, Mods};
+                    let setup = model_setup.as_ref().expect("setup is required");
+                    match (press.key, press.mods) {
+                        (Key::Char('c' | 'd'), Mods::CTRL) => quit = true,
+                        (Key::Char('c'), Mods::NONE) => {
+                            if let Some(crate::model_setup::SetupView::Authorize {
+                                url: Some(url),
+                                ..
+                            }) = setup.view(self.surface.size().1)
+                            {
+                                self.copy_text(url, t(Msg::CopiedSelection).into_owned());
+                            }
+                        }
+                        (key, Mods::NONE) if !setup.signing_in() => {
+                            let choice = match key {
+                                Key::Up | Key::Down => {
+                                    setup.select(!setup.second());
+                                    None
+                                }
+                                Key::Char('1') => Some(false),
+                                Key::Char('2') => Some(true),
+                                Key::Enter => Some(setup.second()),
+                                _ => None,
+                            };
+                            if let Some(second) = choice {
+                                setup.select(second);
+                                let command = if second { "/provider" } else { "/login" };
+                                match self.host.commands.dispatch(command, ctx).await {
+                                    crate::command::Outcome::Do(action) => {
+                                        quit = self.act(action, &client)
+                                    }
+                                    outcome => deliver(&self.host, &wake_tx, outcome),
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    stale = true;
+                }
+                Wake::Input(Input::Key(press))
+                    if press.mods == crate::surface::Mods::ALT
+                        && matches!(press.key, crate::surface::Key::Char('1' | '2'))
+                        && composer_on_screen
+                        && self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .unready
+                            .is_some() =>
+                {
+                    let command = if press.key == crate::surface::Key::Char('1') {
+                        "/login"
+                    } else {
+                        "/provider"
+                    };
+                    match self.host.commands.dispatch(command, ctx).await {
+                        crate::command::Outcome::Do(action) => quit = self.act(action, &client),
+                        outcome => deliver(&self.host, &wake_tx, outcome),
+                    }
                     stale = true;
                 }
                 // A reverse search owns the keyboard while it is up — the
@@ -3426,6 +3957,9 @@ impl UserInterface for Tui {
         // A question brought up from a background session is taken back first,
         // unanswered: refusing it would be deciding for that session, and the
         // host stops it on the way out anyway.
+        if let Some(setup) = model_setup.as_ref() {
+            setup.cancel_login();
+        }
         self.host.withdraw_any_bg_question();
         self.host.asks.refuse_all();
         // And the password, for the same reason and with the same meaning: a
@@ -3463,6 +3997,52 @@ impl UserInterface for Tui {
         };
         self.surface.restore();
         result
+    }
+}
+
+struct UpgradeProgressDisplay {
+    tui: std::sync::Weak<Tui>,
+    block: Mutex<Option<crate::block::BlockId>>,
+}
+
+impl crate::update::ProgressDisplay for UpgradeProgressDisplay {
+    fn finish(&self) {
+        let Some(tui) = self.tui.upgrade() else {
+            return;
+        };
+        if let Some(id) = self.block.lock().expect("upgrade progress poisoned").take() {
+            tui.host
+                .stream
+                .write()
+                .expect("stream poisoned")
+                .writer("upgrade-progress")
+                .settle(id);
+        };
+    }
+    fn draw(&self, frame: crate::update::ProgressFrame, finished: bool) {
+        let Some(tui) = self.tui.upgrade() else {
+            return;
+        };
+        let mut slot = self.block.lock().expect("upgrade progress poisoned");
+        {
+            let mut stream = tui.host.stream.write().expect("stream poisoned");
+            let mut writer = stream.writer("upgrade-progress");
+            let content: Arc<dyn crate::block::Content> =
+                Arc::new(crate::update::ProgressBlock(frame));
+            let id = match *slot {
+                Some(id) if writer.amend(id, content.clone()) => id,
+                _ => writer.open(crate::block::Coord::default(), content),
+            };
+            if finished {
+                writer.settle(id);
+                *slot = None;
+            } else {
+                *slot = Some(id);
+            }
+        }
+        if let Some(sender) = tui.wake.lock().expect("wake poisoned").clone() {
+            let _ = sender.send(Wake::Fact);
+        };
     }
 }
 
@@ -3686,7 +4266,8 @@ impl Tui {
     /// there belongs here too, or the wheel scrolls under it.
     fn arrows_reach_the_composer(&self) -> bool {
         let up = crate::surface::KeyPress::plain(crate::surface::Key::Up);
-        !(self.host.secret_waiting()
+        !(self.host.model_setup_required()
+            || self.host.secret_waiting()
             || self.host.overlays.is_open()
             || self.host.context_menu_open()
             || self.host.settings_open()
@@ -3704,7 +4285,7 @@ impl Tui {
             || self.host.team_focused())
     }
 
-    fn paint(&self, size: (u16, u16)) {
+    fn paint(&self, size: (u16, u16)) -> (Option<crate::ask::PresentedApproval>, bool) {
         self.name_the_window();
         // Where the pointer is, for the status row's marker: the surface is the
         // one that knows, and every way it changes (ctrl+g, `[ui] mouse`, the
@@ -3716,8 +4297,11 @@ impl Tui {
                 m.mouse_handed_back = back;
             }
         }
-        let frame = self.host.compose(size);
+        let (frame, approval) = self.host.compose_with_approval(size);
+        let approval = approval.filter(|_| !self.surface.showing_transcript());
+        let composer = frame.part("input").is_some();
         self.surface.present(&frame);
+        (approval, composer)
     }
 
     /// Put the session's name in the window title, when it has changed.
@@ -3791,6 +4375,96 @@ impl Tui {
     /// the only way to learn the rows — the screen has no other road to the
     /// configuration, which is what keeps it an App apart (`docs/adr/0022` §3).
     ///
+    fn accept_history(
+        &self,
+        session: &str,
+        request: u64,
+        initial: bool,
+        cursor: Option<atomcode_kernel::session::history::Cursor>,
+        result: Result<HostReply, atomcode_host_api::HostError>,
+    ) -> bool {
+        let on_screen = {
+            let mut views = self.client.view.lock().expect("client poisoned");
+            let on_screen = views.on_screen == session;
+            let Some(view) = views.sessions.get_mut(session) else {
+                return false;
+            };
+            if view.history_request != Some(request) {
+                return false;
+            }
+            view.history_request = None;
+            if !initial && view.history != cursor {
+                return false;
+            }
+            on_screen
+        };
+        let (page, seed) = match result {
+            Ok(HostReply::DisplayHistory { page, seed }) if page.session == session => (page, seed),
+            other => {
+                // A host without this optional display read still speaks the
+                // existing full subscription protocol; never strand the screen.
+                if initial {
+                    self.client.subscribe_history(session, 0);
+                }
+                if let Err(error) = other {
+                    let error = format!("{error:?}");
+                    self.host.say(
+                        pt(PMsg::SessionLoadFailed { error: &error }).into_owned(),
+                        true,
+                    );
+                }
+                return true;
+            }
+        };
+        if initial {
+            if on_screen {
+                self.host.seed_history(&seed);
+            }
+            // Retain the lightweight seed for projections rebuilt when looking
+            // at a team member and then returning to the lead.
+            {
+                let mut views = self.client.view.lock().expect("client poisoned");
+                let view = views.sessions.get_mut(session).expect("checked session");
+                view.history_seed = seed;
+                view.events = view.history_seed.iter().map(Committed::logged).collect();
+            }
+            for event in page.events {
+                self.on_event(AgentEvent::Fact(Box::new(event)));
+            }
+            {
+                let mut views = self.client.view.lock().expect("client poisoned");
+                let view = views.sessions.get_mut(session).expect("checked session");
+                view.high = Some(page.through);
+                view.history = page.older;
+            }
+            // Reading before subscribing closes the read/live gap: appends
+            // during the read are replayed from the frozen high-water mark.
+            self.client
+                .subscribe_history(session, page.through.saturating_add(1));
+        } else {
+            if on_screen {
+                self.host.prepend_history(&seed, &page.events);
+            }
+            let mut views = self.client.view.lock().expect("client poisoned");
+            let view = views.sessions.get_mut(session).expect("checked session");
+            let before = cursor.as_ref().expect("older page has a cursor").before;
+            view.events.retain(|e| e.seq >= before);
+            view.events.splice(
+                0..0,
+                seed.iter()
+                    .map(Committed::logged)
+                    .chain(page.events.iter().map(Committed::logged)),
+            );
+            view.history_seed = seed;
+            view.history = page.older;
+            drop(views);
+            if on_screen {
+                self.mark_undone();
+            }
+        }
+        true
+    }
+
     /// **True when the rows changed**, so a caller can tell "read them again"
     /// from "and they were different".
     fn refresh_settings(&self) -> bool {
@@ -3805,6 +4479,9 @@ impl Tui {
         };
         self.host
             .set_history_layout_rows(port.history_replay_rows());
+        self.client
+            .history_enabled
+            .store(port.history_replay_rows().is_some(), Ordering::SeqCst);
         let view = port.rows();
         let value = view
             .rows()
@@ -3837,6 +4514,13 @@ impl Tui {
             sheet.edit_key = crate::keymap::parse_question_edit_key(edit_key)
                 .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
         }
+        if let Some(row) = view.rows().iter().find(|row| row.id == "ui.wrap_diff") {
+            moment.clip_diff = row.value == "false";
+            let wrap = !moment.clip_diff;
+            if let Some(sheet) = moment.sheet.as_mut() {
+                sheet.set_diff_wrap(wrap);
+            }
+        }
         if moment.settings == view {
             return false;
         }
@@ -3864,25 +4548,10 @@ impl Tui {
         // have been switched with `/model` since. The screen knows that, so it
         // marks the row rather than asking the port to know it.
         //
-        // The selection id first when this screen has one: it is the only name
-        // that can tell two accounts running the same model apart, and a wire
-        // name alone is exactly what `marked_row` refuses to guess from. The
-        // wire name is the fallback, for a session opened on a model this
-        // screen never switched.
-        //
-        // The id only while it still names a row. One the configuration has
-        // since dropped — a model deleted or renamed in the panel — resolves to
-        // nothing, and marking nothing is not neutral: `model_after` steps from
-        // the marked row, so F2 would step off the first one every time. The
-        // wire name is never stale in that way (it tracks what the agent
-        // reports), so it is the right thing to fall back to.
-        //
-        // And only while it still names what the agent reports. The id is a
-        // note of the last `/model` this screen sent; the model can move without
-        // one — a switch from the web page, `/login` adopting the server's
-        // default — and then the id describes a model the session has left.
-        // The description is the agent's own word on what it runs, so an id
-        // whose row sends anything else is dropped for it.
+        // Prefer the runtime selection reported by host control. Keep matching
+        // it against the description's wire name: while a swap is in flight the
+        // selection and description may arrive separately. Never infer an
+        // account from the file's default when that wire name is ambiguous.
         let rows = port.rows();
         let wire = self.client.described().and_then(|d| d.model);
         let live = self
@@ -3913,10 +4582,65 @@ impl Tui {
         } else {
             None
         };
+        let returns_to_setup = press.key == crate::surface::Key::Esc && {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.model_setup_required
+                && matches!(
+                    moment.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
+                    Some(crate::providers::Form::Account(form)) if form.editing.is_none()
+                )
+        };
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
+            if returns_to_setup {
+                return self.host.toggle_providers() || changed;
+            }
             return changed;
         };
+        use crate::providers::Step;
+        let drafts = match &step {
+            Step::SaveModel { id: None, draft } => std::slice::from_ref(draft),
+            Step::SaveModels { drafts } => drafts.as_slice(),
+            _ => &[],
+        };
+        if !drafts.is_empty() {
+            let ctx = self.ctx.lock().expect("ctx poisoned").clone();
+            let wake = self.wake.lock().expect("wake poisoned").clone();
+            if let Some((job, wake)) = ctx
+                .and_then(|ctx| ctx.service::<ProvidersSvc>())
+                .and_then(|port| port.enrich_models(drafts))
+                .zip(wake)
+            {
+                let after = self
+                    .host
+                    .moment
+                    .read()
+                    .expect("moment poisoned")
+                    .providers_panel
+                    .clone();
+                let session = self.client.session();
+                tokio::spawn(async move {
+                    let drafts = job.await;
+                    let _ = wake.send(Wake::ProviderModelsEnriched {
+                        original: step,
+                        drafts,
+                        before,
+                        after,
+                        session,
+                    });
+                });
+                return true;
+            }
+        }
+        self.finish_provider_step(step, before);
+        true
+    }
+
+    fn finish_provider_step(
+        &self,
+        step: crate::providers::Step,
+        before: Option<crate::providers::Panel>,
+    ) {
         let key = match &step {
             crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
             crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
@@ -3944,7 +4668,6 @@ impl Tui {
             }
         }
         self.refresh_providers();
-        true
     }
 
     /// Send one change over the providers seam, then tell the runtime.
@@ -4365,24 +5088,45 @@ impl Tui {
     }
 
     /// Ask the host again whether a turn would be taken, and put its answer on
-    /// the status row (`Moment::unready`): the reason while it still holds,
+    /// the tip row (`Moment::unready`): the reason while it still holds,
     /// nothing once it does not.
     fn recheck_readiness(&self, session: String) {
         let Some(control) = self.client.control() else {
             return;
         };
+        let setup = self
+            .ctx
+            .lock()
+            .expect("ctx poisoned")
+            .as_ref()
+            .and_then(|ctx| ctx.service::<ModelSetupSvc>());
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
-            let unready = match control.call(HostCommand::Readiness { session }).await {
+            let (ready, unready) = match control
+                .call(HostCommand::Readiness {
+                    session: session.clone(),
+                })
+                .await
+            {
                 Ok(HostReply::Readiness {
                     ready: false, why, ..
-                }) => why,
-                Ok(HostReply::Readiness { ready: true, .. }) => None,
+                }) => (false, why),
+                Ok(HostReply::Readiness { ready: true, .. }) => (true, None),
                 _ => return,
             };
             let mut moment = host.moment.write().expect("moment poisoned");
-            if moment.unready != unready {
+            if moment.lead != session {
+                return;
+            }
+            let finished = ready && moment.model_setup_required;
+            if finished {
+                if let Some(setup) = setup.as_ref() {
+                    setup.ready();
+                }
+                moment.model_setup_required = false;
+            }
+            if moment.unready != unready || finished {
                 moment.unready = unready;
                 drop(moment);
                 if let Some(keys) = keys {
@@ -4943,7 +5687,7 @@ impl Tui {
             let mut m = self.host.moment.write().expect("moment poisoned");
             // 和一次普通提交一样:这是「最后发出去的那句」,下一次 Escape
             // 要把它退回来。
-            m.last_sent = Some(text.clone());
+            m.last_sent = Some(Arc::new(text.clone()));
             m.interrupted = false;
             // 新的一句已经在路上:上一次停下欠着的撤回不再做 —— 撤回按回合往回退,
             // 会连这一句一起退掉。
@@ -5062,7 +5806,7 @@ impl Tui {
         {
             let mut m = host.moment.write().expect("moment poisoned");
             if m.history.last() != Some(&line) {
-                m.history.push(line);
+                Arc::make_mut(&mut m.history).push(line);
             }
         }
         // 为哪个会话跑的、在哪儿跑:发起这一刻定下。一条命令能跑两分钟,期间
@@ -5128,6 +5872,9 @@ impl Tui {
             // 那句原因只在 `ran.output` 里。不画它的话,人只看到一个「退出码 —」。
             if lines.is_empty() && !ran.output.trim().is_empty() {
                 lines = ran.output.trim_end().lines().map(str::to_string).collect();
+            }
+            if ran.failed() && !ran_in.is_empty() {
+                lines.push(t(Msg::ShellWorkingDir { dir: &ran_in }).into_owned());
             }
             let tail = match (ran.timed_out, ran.code) {
                 (true, _) => Some(
@@ -6122,7 +6869,18 @@ impl Tui {
         let stopped = self.host.take_stopped();
         self.host.switch_view();
         self.hand_back(stopped);
-        for logged in &known {
+        let seed = self
+            .client
+            .view
+            .lock()
+            .expect("client poisoned")
+            .sessions
+            .get(session)
+            .map(|view| view.history_seed.clone())
+            .unwrap_or_default();
+        self.host.seed_history(&seed);
+        let through = seed.last().map_or(0, |e| e.seq);
+        for logged in known.iter().filter(|e| e.seq > through) {
             self.host.absorb_logged(logged);
         }
         self.mark_undone();
@@ -6621,12 +7379,30 @@ impl Tui {
                         *self.last_reply.lock().expect("reply poisoned") = text.clone();
                     }
                 }
-                self.host
-                    .absorb_logged(&atomcode_kernel::session::LoggedEvent {
+                let members_working = if committed.session == self.client.root()
+                    && matches!(
+                        &committed.event,
+                        atomcode_kernel::session::SessionEvent::TurnEnd {
+                            stop: atomcode_kernel::event::StopReason::Stopped,
+                            ..
+                        }
+                    ) {
+                    self.members
+                        .moment_members()
+                        .iter()
+                        .filter(|member| !member.gone && member.activity == Activity::Working)
+                        .count()
+                } else {
+                    0
+                };
+                self.host.absorb_logged_with_members(
+                    &atomcode_kernel::session::LoggedEvent {
                         seq: committed.seq,
                         at: committed.at,
                         event: committed.event.clone(),
-                    });
+                    },
+                    members_working,
+                );
                 // What an undo took back is the whole log's to say, so it is
                 // read off the facts rather than folded fact by fact.
                 if matches!(
@@ -6713,6 +7489,7 @@ impl Tui {
                 let refresh_allowance = description.session == self.client.session()
                     || description.session == self.client.root();
                 self.client.describe(&description);
+                self.client.refresh_model_selection(&description.session);
                 // Keep the status row's context window in step with the screen
                 // agent's mounted model. Read it back off the screen agent's
                 // description (not the one that just arrived, which may be a team
@@ -6739,7 +7516,7 @@ impl Tui {
                     // turn would now be taken is the host's to say, so it is asked
                     // again rather than assumed: a session whose sign-in expired
                     // still has an agent that describes itself.
-                    if moment.unready.is_some() {
+                    if description.session == moment.lead {
                         self.recheck_readiness(moment.lead.clone());
                     }
                     let changed = moment.ctx_window != window
@@ -6841,7 +7618,9 @@ impl Tui {
                 {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     if m.input.is_empty() {
-                        if let Some(sent) = rejected_text.or_else(|| m.last_sent.clone()) {
+                        if let Some(sent) =
+                            rejected_text.or_else(|| m.last_sent.as_deref().cloned())
+                        {
                             m.input = sent;
                             m.caret = m.input.len();
                             m.history_at = None;
@@ -6947,6 +7726,13 @@ impl Tui {
                 if let Some(line) = invocation {
                     self.host.stop_recognizing();
                     if failed == Some(false) {
+                        let notice = self.client.described().and_then(|description| {
+                            crate::commands::skill_spelling_notice(&description.commands, &line)
+                        });
+                        if let Some(notice) = notice {
+                            self.say(&notice);
+                            return true;
+                        }
                         return false;
                     }
                     self.host.echo_command(&line);
@@ -7153,7 +7939,7 @@ impl Tui {
                             }
                         ) && m.input.is_empty()
                         {
-                            if let Some(sent) = m.last_sent.clone() {
+                            if let Some(sent) = m.last_sent.as_deref().cloned() {
                                 m.input = sent;
                                 m.caret = m.input.len();
                                 m.history_at = None;
@@ -7238,6 +8024,7 @@ impl Tui {
                 true
             }
             AgentEvent::Compacted {
+                diagnostic,
                 trigger,
                 committed,
                 bytes_before,
@@ -7245,6 +8032,14 @@ impl Tui {
                 ..
             } => {
                 let _ = self.host.stop_compacting();
+                if let Some(reason) = diagnostic {
+                    self.say(&atomcode_i18n::product::format_compaction_diagnostic(
+                        reason.code(),
+                        bytes_before,
+                        bytes_after,
+                        committed,
+                    ));
+                }
                 if committed {
                     // The window just emptied, and no request has reported it yet:
                     // hand the sizes to the status row so its reading scales down
@@ -7258,16 +8053,20 @@ impl Tui {
                         .note_fold(bytes_before, bytes_after);
                     // Automatic cleanup also arrives as Compacted. Genuine
                     // summary folds already have their own transcript notice.
-                    if matches!(
-                        trigger,
-                        atomcode_kernel::message::CompactTrigger::Manual { .. }
-                    ) {
+                    if diagnostic.is_none()
+                        && matches!(
+                            trigger,
+                            atomcode_kernel::message::CompactTrigger::Manual { .. }
+                        )
+                    {
                         self.say(&t(Msg::Compacted));
                     }
-                } else if matches!(
-                    trigger,
-                    atomcode_kernel::message::CompactTrigger::Manual { .. }
-                ) {
+                } else if diagnostic.is_none()
+                    && matches!(
+                        trigger,
+                        atomcode_kernel::message::CompactTrigger::Manual { .. }
+                    )
+                {
                     self.say(&t(Msg::NothingWorthCompacting));
                 }
                 true
@@ -7416,8 +8215,8 @@ impl Tui {
     /// bytes, cannot write the file) are said out loud; the open itself runs
     /// off-thread, since `act` is not async and a desktop launcher must not block
     /// the render loop.
-    fn preview_image(&self, n: usize, image: Option<atomcode_kernel::message::ImageContent>) {
-        let path = match self.image_temp_file(n, image) {
+    fn preview_image(&self, image: Option<atomcode_kernel::message::ImageContent>) {
+        let path = match self.image_temp_file(image) {
             Ok(path) => path,
             Err(reason) => {
                 self.say_refused(&t(Msg::ImagePreviewFailed { reason: &reason }));
@@ -7478,52 +8277,58 @@ impl Tui {
         });
     }
 
-    /// The on-disk path of attached image `n`, written once and cached. `image`
-    /// is the bytes if the caller had them; otherwise they come from the gallery.
-    /// The extension follows the media type so the desktop viewer opens it right.
+    /// Decode on explicit click only. Exact content, not an attachment number,
+    /// identifies previews across tools and session switches. Random private
+    /// files remain alive for this TUI and are removed when it drops them.
     fn image_temp_file(
         &self,
-        n: usize,
         image: Option<atomcode_kernel::message::ImageContent>,
     ) -> Result<std::path::PathBuf, String> {
         use base64::Engine as _;
-
-        let mut cache = self.image_files.lock().expect("image files poisoned");
-        if let Some(path) = cache.get(&n) {
-            if path.exists() {
-                return Ok(path.clone());
-            }
-        }
+        use std::io::Write as _;
         let image = image.ok_or_else(|| t(Msg::ImageGone).into_owned())?;
-        let ext = match image.media_type.as_str() {
-            "image/jpeg" => "jpg",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            _ => "png",
+        let corrupt = || t(Msg::ImageCorrupt).into_owned();
+        let suffix = match image.media_type.as_str() {
+            "image/png" => ".png",
+            "image/jpeg" => ".jpg",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            _ => return Err(corrupt()),
         };
+        // Bound base64 decoding and file writes; the desktop viewer decodes the raster.
+        const MAX_ENCODED: usize = 32 * 1024 * 1024;
+        if image.data.len() > MAX_ENCODED {
+            return Err(corrupt());
+        }
+        let mut cache = self.image_files.lock().expect("image files poisoned");
+        if let Some((_, file)) = cache
+            .iter()
+            .find(|(prior, file)| prior == &image && file.path().exists())
+        {
+            return Ok(file.path().to_owned());
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(image.data.as_bytes())
-            .map_err(|_| t(Msg::ImageCorrupt).into_owned())?;
-        // A per-run subdirectory: `std::process::id` scopes it so two sessions do
-        // not clobber each other's `[Image #1]`, and on unix it is created private
-        // (0700) so another local user on a shared machine cannot read a person's
-        // screenshots or pre-create a file for the viewer to open — the temp dir
-        // is world-traversable and the path would otherwise be predictable.
-        let dir = std::env::temp_dir().join(format!("atomcode-images-{}", std::process::id()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)
-                .map_err(|e| e.to_string())?;
+            .map_err(|_| corrupt())?;
+        let matches_type = match suffix {
+            ".png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            ".jpg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            ".gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            ".webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+            _ => false,
+        };
+        if !matches_type {
+            return Err(corrupt());
         }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join(format!("img-{n}.{ext}"));
-        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-        cache.insert(n, path.clone());
+        let mut file = tempfile::Builder::new()
+            .prefix("atomcode-preview-")
+            .suffix(suffix)
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        let path = file.path().to_owned();
+        cache.push((image, file));
         Ok(path)
     }
 
@@ -7630,6 +8435,14 @@ impl Tui {
         if m.eof_armed {
             m.disarm_quit();
         }
+        // Editing wins over process control: clearing a draft must neither
+        // stop an active turn nor arm exit, including attachment-only drafts.
+        let action =
+            if action == Action::Cancel && (!m.input.is_empty() || !m.attachments.is_empty()) {
+                Action::Clear
+            } else {
+                action
+            };
         // Any action other than a repeat Ctrl+C disarms the "press again to quit"
         // latch, and takes the exit hint below the box down with it: an accidental
         // first press followed by real work must never leave the terminal one
@@ -7769,7 +8582,7 @@ impl Tui {
                 // The composer shows `[Pasted #N …]` markers to stay terse; the
                 // model gets the whole paste — put the bodies back before
                 // anything reads the text.
-                let text = crate::moment::expand_pastes(&m.input, &m.pastes);
+                let text = crate::moment::expand_pastes(&m.input, m.pastes.as_slice());
                 let mut text = text.trim().to_string();
                 // A recalled line's markers point at images only the gallery still
                 // holds — the send queue drained on their first submit. Re-attach
@@ -7874,7 +8687,7 @@ impl Tui {
                     // Kept for an Escape that stops the next running turn to hand
                     // back (see the `Escape` arm); the `已中断` note is stale the
                     // instant a new prompt is on its way.
-                    m.last_sent = Some(text.clone());
+                    m.last_sent = Some(Arc::new(text.clone()));
                     m.interrupted = false;
                     // A retraction still owed by the last stop is off: an undo
                     // goes back by turns, and would take this one with it.
@@ -8080,15 +8893,7 @@ impl Tui {
                 }
             }
             Action::Clear => {
-                m.input.clear();
-                // The `[Pasted …]` markers went with the text, so the bodies they
-                // stood for go too.
-                m.clear_pastes();
-                // The markers went with the text, so the images they stood for
-                // go too. Leaving them held would make the composer's state
-                // disagree with the only place a person can see it.
-                m.attachments.clear();
-                m.caret = 0;
+                m.clear_composer();
             }
             Action::CaretLeft => {
                 // Nothing typed: left opens the background sessions, where there
@@ -8425,6 +9230,9 @@ impl Tui {
                 let max = self.host.scroll_limit(self.surface.size(), &m);
                 let next = m.scroll.0 as i64 - by as i64;
                 m.scroll = crate::moment::ScrollPos(next.clamp(0, max as i64) as usize);
+                if by < 0 && m.scroll.0.saturating_add(40) >= max {
+                    client.request_older();
+                }
             }
             Action::ScrollToBottom => {
                 m.edge_scroll = None;
@@ -8454,7 +9262,7 @@ impl Tui {
                         if let Some(n) = crate::attach::marker_at_offset(&m.input, at) {
                             if let Some(image) = m.attachments.image_at(n).cloned() {
                                 drop(m);
-                                self.preview_image(n, Some(image));
+                                self.preview_image(Some(image));
                                 return false;
                             }
                         }
@@ -8491,6 +9299,10 @@ impl Tui {
                 // hit map is per-row, not per-cell, so the block-level answer —
                 // open the image the message holds — is the one available here;
                 // a message is one screenshot in the overwhelmingly common case.
+                if let Some(image) = self.host.result_image_at(id) {
+                    self.preview_image(Some(image));
+                    return false;
+                }
                 let markers = self.host.image_markers_at(id);
                 for &n in &markers {
                     let image = self
@@ -8502,7 +9314,7 @@ impl Tui {
                         .image_at(n)
                         .cloned();
                     if let Some(image) = image {
-                        self.preview_image(n, Some(image));
+                        self.preview_image(Some(image));
                         return false;
                     }
                 }
@@ -8673,6 +9485,14 @@ impl Tui {
                 };
                 drop(m);
                 self.host.open_settings_on(tab);
+                self.refresh_settings();
+                self.fetch_usage();
+                self.fetch_status();
+                return false;
+            }
+            Action::OpenSetting(id) => {
+                drop(m);
+                self.host.open_settings_for(id);
                 self.refresh_settings();
                 self.fetch_usage();
                 self.fetch_status();
@@ -9027,7 +9847,7 @@ impl Tui {
                     m.resend_withdrawn = false;
                     m.stopping = true;
                     if m.input.is_empty() && !queued {
-                        if let Some(sent) = m.last_sent.clone() {
+                        if let Some(sent) = m.last_sent.as_deref().cloned() {
                             // Back in the field — and, if the model had said
                             // nothing yet, out of the conversation once the turn
                             // is over (`Moment::retract`, `try_retract`).
@@ -9161,19 +9981,23 @@ impl Tui {
 
     /// Route one key to the question on screen. Returns `true` to quit.
     ///
-    /// A question is a panel riding the stream's tail, not a modal, so the keys come
-    /// here directly — there is no overlay that holds the keyboard first. What has
-    /// not changed is the rule: while a question is waiting, every key is the
-    /// question's. Exactly one thing can hold focus, and this is what holds it.
-    ///
-    /// **Every answer is reachable by one key.** Up/down walk the list, which is what
-    /// a highlighted row is for; enter takes the row that is lit; a digit or a first
-    /// letter goes straight to an answer, which is faster once the list is known; esc
-    /// declines. With the panel up, what each key does is the panel's own
-    /// ([`crate::ask::Sheet::key`]) — the rows it draws and the keys that take them are
-    /// one implementation rather than two that agree until one changes.
-    fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
+    /// Tool approval answers belong to the request shown when the input arrived.
+    /// Ordinary questions retain their panel and stream shortcuts.
+    fn answer_question(
+        &self,
+        press: crate::surface::KeyPress,
+        approval_at_input: Option<crate::ask::PresentedApproval>,
+    ) -> bool {
         use crate::surface::{Key, Mods};
+        let Some((id, page, asked)) = self.host.asks.current_with_id() else {
+            return false;
+        };
+        if asked.is_tool_approval() {
+            if let Some(approval) = approval_at_input.filter(|approval| approval.id == id) {
+                self.deliver_answer(id, self.host.approval_key(approval, press));
+            }
+            return false;
+        }
         if self.panel_mounted() {
             if let Some((id, step)) = self.host.ask_key(press) {
                 self.deliver_answer(id, step);
@@ -9183,9 +10007,6 @@ impl Tui {
         // No panel: the question at the foot of the stream, one at a time. It
         // marks no row, so there is no highlight to trust — enter takes an
         // answer only when there is exactly one to take.
-        let Some(asked) = self.host.asks.current() else {
-            return false;
-        };
         let question = asked.question;
         let chosen = match (press.key, press.mods) {
             // Esc and ctrl-c decline. Declining is an answer; it is never consent,
@@ -9205,7 +10026,7 @@ impl Tui {
         if let Some(answer) = chosen {
             self.host
                 .asks
-                .answer_current(answer.map(crate::ask::Reply::from));
+                .answer_current(id, page, answer.map(crate::ask::Reply::from));
         }
         false
     }
@@ -9234,31 +10055,6 @@ impl Tui {
             .is_some()
     }
 
-    /// Take the row the panel has lit, as a return would. `true` to quit, for the
-    /// key path.
-    ///
-    /// One path for both the return key and a click on a row, so a confirm and a
-    /// pick cannot disagree about what is pointed at.
-    fn confirm_question(&self) -> bool {
-        // A click elsewhere in the card must not accidentally commit an edit.
-        if self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .asking
-            .as_ref()
-            .is_some_and(|sheet| sheet.option_edit().is_some())
-        {
-            return false;
-        }
-        let press = crate::surface::KeyPress::plain(crate::surface::Key::Enter);
-        if let Some((id, step)) = self.host.ask_key(press) {
-            self.deliver_answer(id, step);
-        }
-        false
-    }
-
     /// What has been typed after the slash, while a command is being named.
     ///
     /// `None` when the line is not a command being typed: no slash, or one with
@@ -9276,6 +10072,9 @@ impl Tui {
             .input
             .clone();
         let rest = typed.strip_prefix('/')?;
+        if !rest.is_empty() && !crate::command::looks_like_command(&typed) {
+            return None;
+        }
         if let Some((name, args)) = rest.split_once(char::is_whitespace) {
             let command = self.host.commands.find(name)?;
             if command.options.is_empty() {
@@ -9305,7 +10104,7 @@ impl Tui {
         use atomcode_capabilities::session::SessionManager;
         let kind = *self.mention_kind.lock().expect("mention kind poisoned");
         let mut rows = Vec::new();
-        if kind != 2 {
+        if kind != 2 && kind != 3 {
             rows.extend(paths_under(
                 &self.files,
                 cwd,
@@ -9313,7 +10112,7 @@ impl Tui {
                 self.host.project_dir_name(),
             ));
         }
-        if kind == 2 {
+        if kind == 2 || kind == 3 {
             let mut cache = self
                 .session_references
                 .lock()
@@ -9325,7 +10124,7 @@ impl Tui {
                     let shared = self.session_references.clone();
                     let wake = self.wake.lock().expect("wake poisoned").clone();
                     std::thread::spawn(move || {
-                        let entries = SessionManager::scan_catalog(&root).entries;
+                        let entries = SessionSuggestion::scan(&root);
                         {
                             let mut held = shared.lock().expect("session suggestions poisoned");
                             held.entries = entries;
@@ -9343,27 +10142,37 @@ impl Tui {
             let mut candidates: Vec<_> = cache
                 .entries
                 .iter()
-                .filter(|e| {
-                    atomcode_capabilities::session::reference::available(e)
+                .filter(|candidate| {
+                    let e = &candidate.entry;
+                    (kind == 2 || e.working_dir == std::path::Path::new(cwd))
                         && (e.id != current || e.working_dir != std::path::Path::new(cwd))
-                        && format!("{} {}", e.name, e.working_dir.display())
-                            .to_lowercase()
-                            .contains(&query)
+                        && format!(
+                            "{} {} {} {}",
+                            e.name,
+                            e.id,
+                            e.working_dir.display(),
+                            candidate.preview.as_deref().unwrap_or_default()
+                        )
+                        .to_lowercase()
+                        .contains(&query)
                 })
                 .collect();
-            candidates.sort_by_key(|e| {
+            candidates.sort_by_key(|candidate| {
+                let e = &candidate.entry;
                 (
                     e.working_dir != std::path::Path::new(cwd),
                     std::cmp::Reverse(e.updated_at_ms),
                 )
             });
-            for e in candidates {
+            for candidate in candidates {
+                let e = &candidate.entry;
+                let label = candidate.label();
                 let reference = atomcode_capabilities::session::reference::SessionReference {
                     bucket: e.project_bucket.clone(),
                     id: e.id.clone(),
                 };
                 rows.push(
-                    crate::menu::Item::new(reference.spelling(&e.name), e.name.clone())
+                    crate::menu::Item::new(reference.spelling(label), label)
                         .about(format!(
                             "{} · {}",
                             chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
@@ -9529,12 +10338,17 @@ impl Tui {
             let tabs = [
                 ("files", t(Msg::MentionFiles)),
                 ("sessions", t(Msg::MentionSessions)),
+                ("workspace", t(Msg::MentionSessionsWorkspace)),
             ]
             .into_iter()
             .map(|(key, label)| crate::menu::Item::new(format!("@\0mention-filter:{key}"), label))
             .collect();
-            self.host
-                .set_mention_menu(menu, tabs, usize::from(kind == 2));
+            let tab = match kind {
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            };
+            self.host.set_mention_menu(menu, tabs, tab);
         } else {
             self.host.set_menu(menu);
         }
@@ -9548,7 +10362,7 @@ impl Tui {
     /// sits on its first row.
     ///
     /// **Tab completes and enter takes.** Tab puts the lit name on the line so
-    /// its argument can be typed; enter dispatches the lit name outright, and a
+    /// its argument can be typed; enter takes the lit name, and a
     /// command that needs an argument answers with a panel to pick it from —
     /// which is where the second level of a command comes from, not from this
     /// screen knowing what the arguments are.
@@ -9612,7 +10426,8 @@ impl Tui {
     /// business. This screen knows how to lay a list out; it does not know that
     /// `/effort` takes a level.
     ///
-    /// The one exception is a command with a closed set of values: taking its
+    /// A description-only match completes the name before dispatch. A command
+    /// with a closed set of values also completes: taking its
     /// row opens that set — one row per value — rather than running it bare,
     /// because the pick a person came for is a level below. That is [`complete`]
     /// followed by the menu recomputing into the values, the same as tab. A row
@@ -9660,15 +10475,21 @@ impl Tui {
         // has nothing after it. If the person has already typed arguments
         // (`/rename hello`), the tokens are two or more and the pick is a
         // dispatch, not a completion.
-        let line_is_bare_pick = {
-            let line = self
-                .host
-                .moment
-                .read()
-                .expect("moment poisoned")
-                .input
-                .clone();
-            line.trim_start_matches('/').split_whitespace().count() <= 1
+        let (line_is_bare_pick, description_pick) = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let description_pick = command.as_ref().is_some_and(|c| {
+                m.input
+                    .strip_prefix('/')
+                    .filter(|query| !query.contains(char::is_whitespace))
+                    .is_some_and(|query| {
+                        let query = query.to_lowercase();
+                        !c.matches_prefix(&query) && c.matches_description(&query)
+                    })
+            });
+            (
+                m.input.trim_start_matches('/').split_whitespace().count() <= 1,
+                description_pick,
+            )
         };
         // `Required` is routed here the same as `Optional`: the person's
         // first Enter on a required command asks for the argument's slot, and
@@ -9689,9 +10510,10 @@ impl Tui {
                         | atomcode_kernel::agent::ArgsRequirement::Required
                 )
         });
-        if argument_completion_bare_pick
+        if description_pick
+            || argument_completion_bare_pick
             || command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
-            || option_owner.is_some_and(|c| c.require_arg)
+            || option_owner.is_some_and(|c| c.require_arg && name != "skills --list")
         {
             self.complete_command(name);
             return false;
@@ -9772,6 +10594,7 @@ impl Tui {
             *self.mention_kind.lock().expect("mention kind poisoned") = match kind {
                 "files" => 1,
                 "sessions" => 2,
+                "workspace" => 3,
                 _ => 0,
             };
             self.refresh_menu();
@@ -9919,7 +10742,25 @@ impl Tui {
         }
     }
 
-    /// Paste the clipboard's text into the composer: the menu's `粘贴`, the
+    fn run_secret_key(&self, press: crate::surface::KeyPress, client: &AgentClient) {
+        // These presentation actions do not edit the draft or answer the
+        // waiting process. Resolve the mounted bindings rather than hard-code
+        // Ctrl+G, so configured shortcuts retain the same focus semantics.
+        match self.keys.resolve(press) {
+            Some(action @ (Action::ToggleMouse | Action::CopySelection)) => {
+                self.act(action, client);
+            }
+            Some(Action::AttachImage) => {
+                // In a password field Ctrl+V pastes text, never an attachment.
+                self.paste_clipboard_text(client);
+            }
+            _ => {
+                self.host.secret_key(press);
+            }
+        }
+    }
+
+    /// Paste the clipboard's text into the focused field: the menu's `粘贴`, the
     /// middle button, and Ctrl+V with no picture to attach. Returns `true` to
     /// quit, as `act` does.
     fn paste_clipboard_text(&self, client: &AgentClient) -> bool {
@@ -9937,6 +10778,13 @@ impl Tui {
                 .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
             return false;
         };
+        if self.host.secret_waiting() {
+            use zeroize::Zeroize;
+            let mut text = text;
+            self.host.secret_paste(&text);
+            text.zeroize();
+            return false;
+        }
         self.act(Action::Paste(text), client)
     }
 
@@ -10276,6 +11124,42 @@ impl Tui {
             let outcome = host.commands.dispatch(&value, &ctx).await;
             deliver(&host, &keys, outcome);
         });
+    }
+}
+
+/// A TUI-only password field: no kernel question, tool parameter or session fact.
+#[async_trait]
+pub trait SecretInput: Send + Sync {
+    async fn read(&self, prompt: &str) -> Option<zeroize::Zeroizing<String>>;
+}
+plexus_service!(SecretInputSvc => dyn SecretInput, "tui-secret-input", Seam, "Host-only masked input that is never recorded as a conversation fact");
+struct ScreenSecretInput {
+    host: Arc<Host>,
+    repaint: Arc<dyn Repaint>,
+}
+struct SecretFlight {
+    host: Arc<Host>,
+    repaint: Arc<dyn Repaint>,
+    id: u64,
+}
+impl Drop for SecretFlight {
+    fn drop(&mut self) {
+        self.host.refuse_owned_secret(self.id);
+        self.repaint.now();
+    }
+}
+#[async_trait]
+impl SecretInput for ScreenSecretInput {
+    async fn read(&self, prompt: &str) -> Option<zeroize::Zeroizing<String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = self.host.try_ask_protected_secret(prompt, tx)?;
+        let _flight = SecretFlight {
+            host: self.host.clone(),
+            repaint: self.repaint.clone(),
+            id,
+        };
+        self.repaint.now();
+        rx.await.ok().flatten()
     }
 }
 
@@ -10803,7 +11687,7 @@ fn take_suggestion(m: &mut crate::moment::Moment) -> bool {
     if !m.input.is_empty() || m.activity != crate::moment::Activity::Idle || m.secret.is_some() {
         return false;
     }
-    let Some(words) = m.suggestion.take() else {
+    let Some(words) = m.suggestion.take().filter(|words| !words.trim().is_empty()) else {
         return false;
     };
     m.input = words;
@@ -10850,9 +11734,13 @@ fn recall_back(m: &mut crate::moment::Moment) {
         Some(0) => return, // already at the oldest; going further is nowhere
         Some(i) => i - 1,
     };
+    let entering = m.history_at.is_none();
     m.history_at = Some(at);
     m.input = m.history[at].clone();
     m.caret = 0;
+    if entering {
+        m.hint_history_clear();
+    }
 }
 
 /// Forward one entry, and out the far side to the draft that was set aside.
@@ -10960,10 +11848,17 @@ fn sanitize_paste(text: &str) -> String {
 fn arrows_scroll(
     mouse_held: bool,
     mouse_reported: bool,
-    alternate_scroll_burst: bool,
+    alternate_scroll: bool,
     would_scroll: bool,
 ) -> bool {
-    !mouse_held && (mouse_reported || alternate_scroll_burst) && would_scroll
+    !mouse_held && (mouse_reported || alternate_scroll) && would_scroll
+}
+
+fn input_wake(input: Input, approval: Option<ApprovalInput>) -> Wake {
+    match approval {
+        Some(receipt) => Wake::InputOverApproval(input, receipt),
+        None => Wake::Input(input),
+    }
 }
 
 /// Read the terminal, gathering keystroke bursts that are really a paste.
@@ -10989,12 +11884,13 @@ fn arrows_scroll(
 async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
+    presented_approval: impl Fn() -> Option<ApprovalInput> + Send + 'static,
 ) {
     let events = crate::terminal_modes::input_records(
         crossterm::event::EventStream::new(),
         crate::terminal_modes::ensure_input,
     );
-    pump_terminal_input(events, wake, handed_back).await;
+    pump_terminal_input(events, wake, handed_back, presented_approval).await;
 }
 
 /// Keep read/mode failures visible and stop accepting input after the first one.
@@ -11002,6 +11898,7 @@ async fn pump_terminal_input<S>(
     events: S,
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
+    presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = std::io::Result<crossterm::event::Event>>,
 {
@@ -11016,7 +11913,14 @@ async fn pump_terminal_input<S>(
         })
         .filter_map(|result| futures::future::ready(result.ok()));
     futures::pin_mut!(events);
-    pump_input(events, wake.clone(), handed_back).await;
+    pump_input(
+        events,
+        wake.clone(),
+        handed_back,
+        crate::ansi::alternate_scroll_enabled(),
+        presented_approval,
+    )
+    .await;
     let _ = wake.send(Wake::Closed);
 }
 
@@ -11032,7 +11936,7 @@ async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
             KeyModifiers::NONE,
         ))),
     ]);
-    pump_terminal_input(events, wake, || false).await;
+    pump_terminal_input(events, wake, || false, || None).await;
     assert!(
         matches!(received.recv().await, Some(Wake::TerminalInputFailed(message)) if message.contains("console mode refused"))
     );
@@ -11046,8 +11950,13 @@ async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
 /// stream needs a tty, and what is worth judging here is not that crossterm
 /// reads — it is the timing decision, and a judgement that cannot supply the
 /// timing judges nothing. Everything above is one line of plumbing.
-async fn pump_input<S>(events: S, wake: mpsc::UnboundedSender<Wake>, handed_back: impl Fn() -> bool)
-where
+async fn pump_input<S>(
+    events: S,
+    wake: mpsc::UnboundedSender<Wake>,
+    handed_back: impl Fn() -> bool,
+    alternate_scroll: bool,
+    presented_approval: impl Fn() -> Option<ApprovalInput>,
+) where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
 {
     use futures::StreamExt;
@@ -11060,10 +11969,12 @@ where
                 if key.kind == crossterm::event::KeyEventKind::Release
         ))
     });
+    // Sample before burst detection can defer a key past a frame boundary.
+    let events = events.map(|event| (event, presented_approval()));
     futures::pin_mut!(events);
-    let forward = |event| -> bool {
+    let forward = |event, approval| -> bool {
         match crate::surface::from_crossterm(event) {
-            Some(input) => wake.send(Wake::Input(input)).is_ok(),
+            Some(input) => wake.send(input_wake(input, approval)).is_ok(),
             // Not an event this screen has a use for; the reader lives on.
             None => true,
         }
@@ -11072,7 +11983,7 @@ where
     // after a replayed paste) goes round again, through every check above —
     // forwarded straight on, a reversed wheel's first arrow was one ↑ into the
     // composer, and a paste's first character was a keystroke.
-    let mut next_up: Option<crossterm::event::Event> = None;
+    let mut next_up = None;
     let mut paste_continuation = false;
     loop {
         // Reaching the allocation cap is not a paste boundary. Carry its
@@ -11087,13 +11998,14 @@ where
                 }
             }
         }
-        let event = match next_up.take() {
+        let (event, approval) = match next_up.take() {
             Some(event) => event,
             None => match events.next().await {
                 Some(event) => event,
                 None => break,
             },
         };
+        let approval_id = approval.map(|receipt| receipt.presentation.id);
         // **The wheel, turned into arrow keys by the terminal.** With the
         // pointer handed back, iTerm2 ("scroll wheel sends arrow keys when in
         // alternate screen mode", on by default) and Terminal.app send the
@@ -11107,10 +12019,15 @@ where
         if let Some(up) = crate::surface::bare_arrow(&event).filter(|_| handed_back()) {
             paste_continuation = false;
             let mut n = 1usize;
-            let mut after: Option<crossterm::event::Event> = None;
+            let mut after = None;
             loop {
                 match tokio::time::timeout(crate::surface::BURST_PENDING, events.next()).await {
-                    Ok(Some(next)) if crate::surface::bare_arrow(&next) == Some(up) => n += 1,
+                    Ok(Some(next))
+                        if next.1.map(|receipt| receipt.presentation.id) == approval_id
+                            && crate::surface::bare_arrow(&next.0) == Some(up) =>
+                    {
+                        n += 1;
+                    }
                     Ok(Some(next)) => {
                         after = Some(next);
                         break;
@@ -11118,11 +12035,12 @@ where
                     _ => break,
                 }
             }
-            // A lone arrow has exactly the same bytes as a keyboard press.
-            // Preserve normal caret/history navigation, including over SSH.
-            // Only a confirmed multi-arrow burst takes the wheel path.
-            let sent = if n == 1 {
-                forward(event)
+            // HiShell also sends isolated wheel arrows. In its explicitly
+            // enabled alternate-scroll mode they must never recall input
+            // history; Ctrl+P/Ctrl+N remain unambiguous history keys. Other
+            // terminals preserve the usual single-arrow keyboard behavior.
+            let sent = if n == 1 && !alternate_scroll {
+                forward(event, approval)
             } else {
                 wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
             };
@@ -11134,13 +12052,13 @@ where
         }
         let Some(first) = crate::surface::burst_char(&event) else {
             paste_continuation = false;
-            if !forward(event) {
+            if !forward(event, approval) {
                 break;
             }
             continue;
         };
-        let mut held: Vec<(char, crossterm::event::Event)> = vec![(first, event)];
-        let mut after: Option<crossterm::event::Event> = None;
+        let mut held = vec![(first, event, approval)];
+        let mut after = None;
         // The wider window opens only once a second character has confirmed
         // there is something to bridge: until then a lone keystroke must not
         // pay for the paste case.
@@ -11155,9 +12073,11 @@ where
                 break; // quiet: whatever this was, it is over
             };
             let Some(next) = next else { break };
-            match crate::surface::burst_char(&next) {
+            match crate::surface::burst_char(&next.0)
+                .filter(|_| next.1.map(|receipt| receipt.presentation.id) == approval_id)
+            {
                 Some(c) => {
-                    held.push((c, next));
+                    held.push((c, next.0, next.1));
                     confirmed = true;
                 }
                 None => {
@@ -11166,13 +12086,14 @@ where
                 }
             }
         }
-        let chars: Vec<char> = held.iter().map(|(c, _)| *c).collect();
+        let chars: Vec<char> = held.iter().map(|(c, _, _)| *c).collect();
         let capped = held.len() == crate::surface::BURST_CAP;
         let sent = if paste_continuation || capped || crate::surface::is_paste_burst(&chars) {
             wake.send(Wake::Input(Input::Paste(chars.into_iter().collect())))
                 .is_ok()
         } else {
-            held.into_iter().all(|(_, event)| forward(event))
+            held.into_iter()
+                .all(|(_, event, receipt)| forward(event, receipt))
         };
         if !sent {
             break;
@@ -11237,7 +12158,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),
-            image_files: Mutex::new(std::collections::HashMap::new()),
+            image_files: Mutex::new(Vec::new()),
             opener: Arc::new(atomcode_capabilities::tools::LocalOpener),
             presses: Arc::default(),
             probes: Arc::default(),
@@ -11276,6 +12197,7 @@ impl Plugin for TuiUiPlugin {
             // launcher's audit is for.
             "tui-team-roster",
             "tui-repaint",
+            "tui-secret-input",
             "tui-mcp-phase",
         ]
     }
@@ -11296,6 +12218,7 @@ impl Plugin for TuiUiPlugin {
         let surface = ctx.require::<SurfaceSvc>().map_err(|e| e.to_string())?;
         let (host, tui) = assemble(surface);
         host.moment.write().expect("moment poisoned").scrollbar_mode = row.scrollbar;
+        host.moment.write().expect("moment poisoned").clip_diff = !row.wrap_diff;
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
             .map_err(|e| e.to_string())?;
@@ -11325,12 +12248,24 @@ impl Plugin for TuiUiPlugin {
             .provide::<McpPhaseSvc>(Arc::new(Phases(host.clone())) as Arc<dyn McpPhase>)
             .map_err(|e| e.to_string())?;
         let tui = Arc::new(tui);
+        let _ = ctx
+            .provide::<crate::update::ProgressDisplaySvc>(Arc::new(UpgradeProgressDisplay {
+                tui: Arc::downgrade(&tui),
+                block: Mutex::new(None),
+            }))
+            .map_err(|e| e.to_string())?;
         // The seam anything outside the loop asks for a frame through. Provided
         // here, with the screen itself behind it, so the slot is full from the
         // moment this row mounts; what it rings is filled in when the loop
         // starts.
         let _ = ctx
             .provide::<RepaintSvc>(Arc::new(Waker(tui.clone())) as Arc<dyn Repaint>)
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<SecretInputSvc>(Arc::new(ScreenSecretInput {
+                host: tui.host.clone(),
+                repaint: Arc::new(Waker(tui.clone())),
+            }) as Arc<dyn SecretInput>)
             .map_err(|e| e.to_string())?;
         let _ = ctx.provide::<UiSvc>(tui).map_err(|e| e.to_string())?;
         Ok(())
@@ -11526,8 +12461,9 @@ mod history_tests {
     use super::arrows_scroll;
 
     /// With the mouse handed back, arrows the wheel may have sent scroll.
-    /// HarmonyOS contributes only grouped alternate-scroll bursts; a lone arrow
-    /// still walks input history. With the mouse held arrows always remain keys.
+    /// HarmonyOS contributes grouped and isolated alternate-scroll arrows;
+    /// input history has the explicit Ctrl+P/Ctrl+N keys. With the mouse held,
+    /// arrows always remain keys.
     #[test]
     fn arrows_scroll_only_where_the_wheel_can_send_them() {
         assert!(arrows_scroll(false, true, false, true), "mouse handed back");
@@ -11551,7 +12487,7 @@ mod history_tests {
 
     fn said(entries: &[&str], typing: &str) -> Moment {
         let mut m = Moment::default();
-        m.history = entries.iter().map(|s| s.to_string()).collect();
+        m.history = std::sync::Arc::new(entries.iter().map(|s| s.to_string()).collect());
         m.input = typing.to_string();
         m.caret = m.input.len();
         m
@@ -11872,7 +12808,7 @@ mod suggestion_tests {
         let mut m = moment.write().unwrap();
         m.input = "接着".into();
         m.caret = m.input.len();
-        m.history = vec!["接着把登录那条补上".into()];
+        m.history = std::sync::Arc::new(vec!["接着把登录那条补上".into()]);
 
         assert!(!take_suggestion(&mut m), "非空行不是这个手势的");
         assert_eq!(m.input, "接着", "而且什么都没往里接");
@@ -11914,7 +12850,12 @@ mod suggestion_tests {
 
         // 没有猜的话,空编辑区上的 → 什么也不做 —— 这个键不许让人意外。
         let empty = idle("lead");
-        assert!(!accept_ghost(&mut empty.write().unwrap()));
+        let mut m = empty.write().unwrap();
+        assert!(!accept_ghost(&mut m));
+        m.suggestion = Some(" \t".into());
+        assert!(!accept_ghost(&mut m));
+        assert!(m.input.is_empty());
+        assert_eq!(m.caret, 0);
     }
 }
 
@@ -11928,6 +12869,7 @@ mod autonomy_tests {
         atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,
@@ -13109,6 +14051,14 @@ mod paste_burst_tests {
 
     /// [`pumped`], with the pointer handed back to the terminal (`true`) or ours.
     async fn pumped_with(script: Vec<(u64, Event)>, handed_back: bool) -> Vec<Input> {
+        pumped_with_scroll(script, handed_back, false).await
+    }
+
+    async fn pumped_with_scroll(
+        script: Vec<(u64, Event)>,
+        handed_back: bool,
+        alternate_scroll: bool,
+    ) -> Vec<Input> {
         let events = futures::stream::unfold(script.into_iter(), |mut rest| async move {
             let (gap_ms, event) = rest.next()?;
             tokio::time::sleep(std::time::Duration::from_millis(gap_ms)).await;
@@ -13117,7 +14067,7 @@ mod paste_burst_tests {
         .fuse();
         futures::pin_mut!(events);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        super::pump_input(events, tx, move || handed_back).await;
+        super::pump_input(events, tx, move || handed_back, alternate_scroll, || None).await;
         let mut seen = Vec::new();
         while let Ok(Wake::Input(input)) = rx.try_recv() {
             seen.push(input);
@@ -13201,7 +14151,7 @@ mod paste_burst_tests {
         }
         let moment = host.moment.read().unwrap();
         assert_eq!(
-            crate::moment::expand_pastes(&moment.input, &moment.pastes),
+            crate::moment::expand_pastes(&moment.input, moment.pastes.as_slice()),
             text
         );
         assert!(!moment.pending_working && !moment.turn_open);
@@ -13227,7 +14177,7 @@ mod paste_burst_tests {
             }
             let moment = host.moment.read().unwrap();
             assert_eq!(
-                crate::moment::expand_pastes(&moment.input, &moment.pastes),
+                crate::moment::expand_pastes(&moment.input, moment.pastes.as_slice()),
                 text
             );
             assert!(!moment.pending_working);
@@ -13328,6 +14278,50 @@ mod paste_burst_tests {
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn harmony_isolated_wheel_arrows_never_become_history_keys() {
+        assert_eq!(
+            pumped_with_scroll(
+                vec![(0, arrow(true)), (35, arrow(false)), (35, arrow(true))],
+                true,
+                true
+            )
+            .await,
+            vec![
+                Input::ArrowBurst { up: true, n: 1 },
+                Input::ArrowBurst { up: false, n: 1 },
+                Input::ArrowBurst { up: true, n: 1 }
+            ]
+        );
+        assert_eq!(
+            pumped_with_scroll(vec![(0, arrow(true))], false, true).await,
+            vec![Input::Key(KeyPress::plain(Key::Up))],
+            "a terminal reporting real mouse events keeps keyboard arrows"
+        );
+        assert_eq!(
+            pumped_with_scroll(
+                vec![
+                    (
+                        0,
+                        Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                    ),
+                    (
+                        0,
+                        Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+                    ),
+                ],
+                true,
+                true,
+            )
+            .await,
+            vec![
+                Input::Key(KeyPress::ctrl('p')),
+                Input::Key(KeyPress::ctrl('n'))
+            ],
+            "explicit history shortcuts remain keyboard input"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -13434,6 +14428,32 @@ mod paste_burst_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn windows_paste_keeps_committed_unicode_symbols_and_spaces_exactly() {
+        use crossterm::event::KeyEventKind;
+        let text = "【验证】✅一致 px 53:16 |  推断:Int64  |  悬停:Int64\n❌❓⚠️⏭😀";
+        // The Windows parser normalizes an Alt-release text commit to Press.
+        // Genuine key-up events must still be ignored, without duplicating text.
+        let script = text
+            .chars()
+            .flat_map(|c| {
+                let Event::Key(key) = (if c == '\n' { enter() } else { press(c) }) else {
+                    unreachable!()
+                };
+                let mut release = key;
+                release.kind = KeyEventKind::Release;
+                [(0, Event::Key(key)), (0, Event::Key(release))]
+            })
+            .collect();
+        let seen = pumped(script).await;
+        assert_eq!(seen, vec![Input::Paste(text.into())]);
+        let (host, tui) = assemble(Headless::new(80, 24));
+        tui.act(Action::Paste(text.into()), &tui.client);
+        let m = host.moment.read().unwrap();
+        assert_eq!(m.input, text);
+        assert!(!m.turn_open);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn windows_paste_releases_do_not_split_lines_into_submits() {
         use crossterm::event::KeyEventKind;
         let text =
@@ -13505,7 +14525,10 @@ mod paste_burst_tests {
         tui.act(Action::Paste(text.into()), &tui.client);
         let m = host.moment.read().unwrap();
         assert_eq!(m.input, "[Pasted #1 +5 lines]");
-        assert_eq!(crate::moment::expand_pastes(&m.input, &m.pastes), text);
+        assert_eq!(
+            crate::moment::expand_pastes(&m.input, m.pastes.as_slice()),
+            text
+        );
         assert!(!m.pending_working);
     }
 
@@ -14173,12 +15196,18 @@ mod provider_probe_tests {
                     account: account.into(),
                     model: wire.into(),
                     window: 128_000,
+                    max_tokens: None,
                     vision: None,
                     effort: None,
                     levels: Vec::new(),
                     current,
                     managed: false,
+                    alias: None,
+                    desc: None,
+                    alias_en: None,
+                    desc_en: None,
                 };
+
             ProvidersView::new(
                 Vec::new(),
                 vec![
@@ -14228,9 +15257,86 @@ mod provider_probe_tests {
         m.providers.live_row().map(|row| row.id.clone())
     }
 
-    /// `/model` typed on a member's tab switches the lead — so the id it chose
-    /// is the lead's, and neither labels the member nor goes missing from the
-    /// lead.
+    struct LiveSelection(std::sync::Mutex<Option<String>>);
+
+    #[async_trait]
+    impl HostControl for LiveSelection {
+        async fn call(
+            &self,
+            command: HostCommand,
+        ) -> Result<HostReply, atomcode_host_api::HostError> {
+            assert!(matches!(command, HostCommand::Models { .. }));
+            Ok(HostReply::Models {
+                models: Vec::new(),
+                current: self.0.lock().unwrap().clone(),
+            })
+        }
+
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_live_provider_is_resolved_at_startup_and_after_same_wire_switches() {
+        let (host, tui, _woken) = screen_with(Arc::new(TwoAccounts));
+        tui.client.follow("lead");
+        let control = Arc::new(LiveSelection(std::sync::Mutex::new(Some(
+            "taotoken/ds".into(),
+        ))));
+        let (commands, _commands) = mpsc::unbounded_channel();
+        tui.client.connect(commands, control.clone());
+        let (wake, mut replies) = mpsc::unbounded_channel();
+        *tui.client.history_sink.lock().unwrap() = Some(wake);
+        for selected in ["taotoken/ds", "atomgit/ds", "taotoken/ds"] {
+            *control.0.lock().unwrap() = Some(selected.into());
+            tui.on_event(AgentEvent::Described {
+                description: Box::new(AgentDescription {
+                    session: "lead".into(),
+                    model: Some("deepseek-flash".into()),
+                    ..Default::default()
+                }),
+            });
+            assert!(matches!(replies.recv().await, Some(Wake::Fact)));
+            assert_eq!(live(&tui, &host).as_deref(), Some(selected));
+            described(&tui, "lead", "deepseek-flash");
+            assert_eq!(
+                live(&tui, &host).as_deref(),
+                Some(selected),
+                "a refresh keeps the account"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_selection_reply_cannot_overwrite_a_newer_provider() {
+        let (host, tui, _woken) = screen_with(Arc::new(TwoAccounts));
+        tui.client.follow("lead");
+        described(&tui, "lead", "deepseek-flash");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .selection_request = Some(2);
+        assert!(!tui
+            .client
+            .accept_model_selection("lead", 1, Some("atomgit/ds".into())));
+        assert!(tui
+            .client
+            .accept_model_selection("lead", 2, Some("taotoken/ds".into())));
+        assert!(!tui
+            .client
+            .accept_model_selection("lead", 1, Some("atomgit/ds".into())));
+        assert_eq!(live(&tui, &host).as_deref(), Some("taotoken/ds"));
+        assert!(!tui
+            .client
+            .accept_model_selection("gone", 2, Some("atomgit/ds".into())));
+    }
+
+    /// A lead selection must never label a member's same-named model.
     #[test]
     fn a_model_chosen_on_a_member_tab_is_the_leads() {
         let (host, tui, _woken) = screen_with(Arc::new(TwoAccounts));
@@ -14989,7 +16095,7 @@ mod midturn_command_tests {
         let (host, tui, _) = screen();
         host.add_steering("first", "first message");
         host.add_steering("second", "second message");
-        host.moment.write().unwrap().last_sent = Some("second message".into());
+        host.moment.write().unwrap().last_sent = Some(std::sync::Arc::new("second message".into()));
         tui.on_event(AgentEvent::Rejected {
             command: "first".into(),
             error: atomcode_kernel::event::CommandError::Busy {
@@ -15250,6 +16356,127 @@ mod paste_habit_tests {
     }
 
     #[test]
+    fn password_focus_keeps_mouse_handoff_without_answering_or_changing_the_draft() {
+        let (host, tui) = screen();
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        host.moment.write().unwrap().input = "keep draft".into();
+        host.moment.write().unwrap().turn_open = true;
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        host.ask_secret("SSH password:", reply);
+        host.secret_paste("private");
+        assert!(tui.surface.mouse());
+        tui.run_secret_key(crate::surface::KeyPress::ctrl('g'), &tui.client);
+        assert!(
+            !tui.surface.mouse(),
+            "Ctrl+G reaches the mouse even during askpass"
+        );
+        assert!(host.secret_waiting());
+        assert_eq!(host.secrets.asking().unwrap().typed, 7);
+        assert!(matches!(
+            answered.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(typed(&host), "keep draft");
+        assert!(host.moment.read().unwrap().turn_open);
+        assert!(!host.moment.read().unwrap().stopping);
+        tui.run_secret_key(crate::surface::KeyPress::ctrl('c'), &tui.client);
+        assert_eq!(
+            answered.try_recv().unwrap(),
+            None,
+            "Ctrl+C still refuses only the password"
+        );
+        assert_eq!(typed(&host), "keep draft");
+    }
+
+    #[test]
+    fn password_paste_gestures_never_edit_the_composer_or_attach_images() {
+        for gesture in ["middle", "menu", "ctrl-v"] {
+            let (host, tui) = screen();
+            tui.keys.add(&crate::keymap::Default_).unwrap();
+            host.moment.write().unwrap().input = "keep draft".into();
+            let before = host.stream.read().unwrap().len();
+            let (reply, mut answered) = tokio::sync::oneshot::channel();
+            host.ask_secret("password:", reply);
+            tui.surface.copy("private");
+            match gesture {
+                "middle" => {
+                    tui.paste_clipboard_text(&tui.client);
+                }
+                "menu" => {
+                    tui.run_menu_item("paste", &tui.client);
+                }
+                _ => tui.run_secret_key(crate::surface::KeyPress::ctrl('v'), &tui.client),
+            }
+            assert!(host.secret_waiting(), "{gesture}");
+            assert_eq!(host.secrets.asking().unwrap().typed, 7, "{gesture}");
+            assert_eq!(typed(&host), "keep draft", "{gesture}");
+            assert!(host.moment.read().unwrap().attachments.is_empty());
+            assert_eq!(host.stream.read().unwrap().len(), before);
+            tui.run_secret_key(
+                crate::surface::KeyPress::plain(crate::surface::Key::Enter),
+                &tui.client,
+            );
+            assert_eq!(answered.try_recv().unwrap().as_deref(), Some("private"));
+        }
+    }
+
+    #[test]
+    fn password_copy_shortcut_copies_only_the_masked_screen_selection() {
+        let (host, tui) = screen();
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        host.moment.write().unwrap().input = "keep draft".into();
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        host.ask_secret("password:", reply);
+        host.secret_paste("private");
+        host.compose((60, 24));
+        let field = host.field_rect().unwrap();
+        let mut selection = crate::moment::Selection::at(field.x, field.y + 1);
+        selection.head = (field.x + field.w - 1, field.y + 1);
+        host.moment.write().unwrap().selection = Some(selection);
+        tui.run_secret_key(
+            crate::surface::KeyPress::new(
+                crate::surface::Key::Char('c'),
+                crate::surface::Mods {
+                    cmd: true,
+                    ..crate::surface::Mods::NONE
+                },
+            ),
+            &tui.client,
+        );
+        let copied = tui.surface.clipboard_text().expect("selection was copied");
+        assert!(copied.contains("password:"), "{copied:?}");
+        assert!(!copied.contains("private"));
+        assert!(!copied.contains("keep draft"));
+        assert!(host.secret_waiting());
+        assert!(matches!(
+            answered.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(typed(&host), "keep draft");
+    }
+
+    #[test]
+    fn password_ctrl_v_over_ssh_does_not_read_the_server_clipboard() {
+        let (host, tui) = assemble(Arc::new(RemotePasteSurface));
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        host.ask_secret("password:", reply);
+        tui.run_secret_key(crate::surface::KeyPress::ctrl('v'), &tui.client);
+        assert!(host.secret_waiting());
+        assert_eq!(host.secrets.asking().unwrap().typed, 0);
+        host.secret_paste("client paste");
+        tui.run_secret_key(
+            crate::surface::KeyPress::plain(crate::surface::Key::Enter),
+            &tui.client,
+        );
+        assert_eq!(
+            answered.try_recv().unwrap().as_deref(),
+            Some("client paste")
+        );
+        assert!(typed(&host).is_empty());
+    }
+
+    #[test]
     fn status_and_usage_open_their_tabs_without_toggling_the_panel_closed() {
         let (host, tui) = screen();
         for (action, tab) in [
@@ -15262,6 +16489,49 @@ mod paste_habit_tests {
             let m = host.moment.read().unwrap();
             assert_eq!(m.settings_panel.as_ref().unwrap().tab, tab);
         }
+    }
+
+    #[test]
+    fn the_theme_command_selects_the_theme_setting_in_the_existing_panel() {
+        use crate::settings::{Applies, SettingKind, SettingRow, SettingsView, Step, Tab};
+        let (host, tui) = screen();
+        host.moment.write().unwrap().settings = SettingsView::new(vec![
+            SettingRow {
+                id: "ui.mouse".into(),
+                label: "Mouse".into(),
+                value: "true".into(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Restart,
+            },
+            SettingRow {
+                id: "ui.theme".into(),
+                label: "Theme".into(),
+                value: "dark".into(),
+                kind: SettingKind::Choice(vec!["auto".into(), "dark".into(), "light".into()]),
+                applies: Applies::Restart,
+            },
+        ]);
+        tui.act(Action::OpenStatus, &tui.client);
+        for _ in 0..2 {
+            tui.act(Action::OpenSetting("ui.theme"), &tui.client);
+            let moment = host.moment.read().unwrap();
+            let panel = moment.settings_panel.as_ref().unwrap();
+            assert_eq!(panel.tab, Tab::Config);
+            assert_eq!(panel.query, "ui.theme");
+            assert_eq!(panel.query_caret, panel.query.len());
+            let rows = moment.settings.matching(&panel.query);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[panel.cursor].id, "ui.theme");
+        }
+        let (_, step) =
+            host.settings_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert_eq!(
+            step,
+            Some(Step::Set {
+                id: "ui.theme".into(),
+                value: "light".into(),
+            })
+        );
     }
 
     fn typed(host: &Host) -> String {
@@ -15284,6 +16554,7 @@ mod paste_habit_tests {
                 tips: Vec::new(),
                 brand: Arc::new(crate::content::Brand::default()),
                 note: None,
+                model_setup: None,
             }),
         );
         {
@@ -15373,6 +16644,42 @@ mod paste_habit_tests {
             assert_eq!(host.compose((60, 24)).selected_text(&selection), text);
             tui.act(Action::Backspace, &tui.client);
             assert!(host.moment.read().unwrap().input.is_empty());
+        }
+    }
+
+    #[test]
+    fn transcript_selection_copies_user_text_without_its_display_prompt() {
+        for text in ["你好世界", "❯ literal", "  indented"] {
+            let (host, tui) = screen();
+            host.modules
+                .add_producer(crate::modules::transcript::Transcript::new())
+                .unwrap();
+            host.absorb(&atomcode_harness::session::SessionEvent::UserMessage {
+                turn: 1,
+                text: text.into(),
+                images: Vec::new(),
+            });
+            let size = (60, 24);
+            let frame = host.compose(size);
+            let y = frame
+                .rows()
+                .iter()
+                .position(|row| row.contains(text))
+                .unwrap() as u16;
+            tui.act(Action::SelectLine(3, y), &tui.client);
+            assert_eq!(tui.surface.clipboard_text().as_deref(), Some(text));
+            if text == "你好世界" {
+                tui.act(Action::SelectWord(3, y), &tui.client);
+                assert_eq!(tui.surface.clipboard_text().as_deref(), Some(text));
+            }
+            let moment = host.moment.read().unwrap();
+            let row = host.block_view(size, &moment).unwrap().row_at(y).unwrap();
+            let selected = crate::moment::StreamSelection {
+                anchor: (0, row),
+                head: (59, row),
+                extended: false,
+            };
+            assert_eq!(host.block_text(size, &moment, &selected), text);
         }
     }
 
@@ -15742,6 +17049,119 @@ mod skills_menu_tests {
     }
 
     #[test]
+    fn update_progress_amends_one_card_and_freezes_only_on_completion() {
+        use crate::update::{ProgressDisplay, ProgressFrame};
+        let (host, tui) = screen();
+        let tui = Arc::new(tui);
+        let display = UpgradeProgressDisplay {
+            tui: Arc::downgrade(&tui),
+            block: Mutex::new(None),
+        };
+        for n in 0..100 {
+            display.draw(
+                ProgressFrame {
+                    title: format!("step {n}"),
+                    ..Default::default()
+                },
+                false,
+            );
+        }
+        let before = host.stream.read().unwrap().len();
+        assert_eq!(
+            host.stream
+                .read()
+                .unwrap()
+                .slots()
+                .iter()
+                .filter(|slot| slot.block().content.kind() == "upgrade_progress")
+                .count(),
+            1
+        );
+        display.draw(
+            ProgressFrame {
+                title: "done".into(),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(display.block.lock().unwrap().is_none());
+        assert_eq!(host.stream.read().unwrap().len(), before);
+        display.draw(
+            ProgressFrame {
+                title: "next update".into(),
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(host.stream.read().unwrap().len(), before + 1);
+        display.finish();
+        assert!(display.block.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn ctrl_c_discards_a_draft_without_stopping_or_arming_exit() {
+        for running in [false, true] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = "history text".into();
+                m.caret = m.input.len();
+                m.draft = "old draft".into();
+                m.history = Arc::new(vec!["history text".into()]);
+                m.history_at = Some(0);
+                m.pastes = Arc::new(vec!["paste body".into()]);
+                m.turn_open = running;
+                m.activity = if running {
+                    crate::moment::Activity::Working
+                } else {
+                    crate::moment::Activity::Idle
+                };
+                m.quit_armed = true;
+                m.attachments.add(atomcode_kernel::message::ImageContent {
+                    media_type: "image/png".into(),
+                    data: "test".into(),
+                });
+            }
+            assert!(!tui.act(Action::Cancel, &tui.client));
+            let m = host.moment.read().unwrap();
+            assert!(
+                m.input.is_empty()
+                    && m.draft.is_empty()
+                    && m.pastes.is_empty()
+                    && m.attachments.is_empty()
+            );
+            assert_eq!(m.caret, 0);
+            assert!(m.history_at.is_none() && m.search.is_none());
+            assert!(!m.quit_armed && !m.eof_armed && !m.stopping);
+            assert_eq!(m.turn_open, running);
+            assert_eq!(m.history.len(), 1, "history records are retained");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_clears_attachment_only_drafts_and_requires_fresh_exit_presses() {
+        let (host, tui) = screen();
+        host.moment
+            .write()
+            .unwrap()
+            .attachments
+            .add(atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "test".into(),
+            });
+        assert!(!tui.act(Action::Cancel, &tui.client));
+        assert!(!host.moment.read().unwrap().quit_armed);
+        assert!(
+            !tui.act(Action::Cancel, &tui.client),
+            "empty line first press only arms"
+        );
+        assert!(
+            tui.act(Action::Cancel, &tui.client),
+            "empty line second press exits"
+        );
+    }
+
+    #[test]
     fn eof_deletes_unicode_and_does_not_exit_at_draft_end() {
         let (host, tui) = screen();
         type_line(&host, "甲乙\n丙");
@@ -15793,7 +17213,7 @@ mod skills_menu_tests {
         for _ in 0..3 {
             assert!(!tui.act(Action::EndOfInput, &tui.client));
         }
-        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d')));
+        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d'), None));
         assert!(!tui.team_key(crate::surface::KeyPress::ctrl('d')));
     }
 
@@ -15831,13 +17251,33 @@ mod skills_menu_tests {
         assert!(host.menu_selected().is_some());
         {
             let mut moment = host.moment.write().unwrap();
-            moment.history = vec!["/init".into(), "/skills ".into()];
+            moment.history = Arc::new(vec!["/init".into(), "/skills ".into()]);
             moment.history_at = Some(1);
             moment.caret = 0;
         }
         tui.act(Action::CaretUp, &tui.client);
         assert_eq!(host.moment.read().unwrap().input, "/init");
         assert!(host.menu_selected().is_none());
+    }
+
+    #[test]
+    fn display_titles_filter_both_skill_menus_but_complete_the_identifier() {
+        let (host, tui) = screen();
+        let mut description = tui.client.described().unwrap();
+        description
+            .commands
+            .iter_mut()
+            .find(|c| c.name == "code")
+            .unwrap()
+            .summary = "玲珑打包技能 · 实现代码".into();
+        tui.client.describe(&description);
+        for (typed, selected) in [("$玲珑", "$code"), ("/skills 玲珑", "skills code")] {
+            type_line(&host, typed);
+            tui.refresh_menu();
+            assert_eq!(host.menu_selected().as_deref(), Some(selected));
+        }
+        tui.complete_skill("code");
+        assert_eq!(host.moment.read().unwrap().input, "$code ");
     }
 
     #[test]
@@ -15901,11 +17341,30 @@ mod skills_menu_tests {
 
     #[test]
     fn a_committed_skill_prefix_uses_the_skills_gateway() {
+        assert_eq!(skill_prefix("$玲珑打包技能"), Some("玲珑打包技能"));
+        assert_eq!(
+            skill_command("$玲珑打包技能 打包应用", |name| name
+                == "玲珑打包技能"),
+            Some("/skills 玲珑打包技能 打包应用".into())
+        );
         let known = |name: &str| name == "code";
         assert_eq!(skill_command("$code", known), Some("/skills code".into()));
         assert_eq!(
             skill_command("¥code fix the test", known),
             Some("/skills code fix the test".into())
+        );
+        assert_eq!(
+            skill_command("$code $review fix  the test", known),
+            Some("/skills code $review fix  the test".into())
+        );
+        assert_eq!(
+            skill_command("¥code ¥review task", known),
+            Some("/skills code ¥review task".into())
+        );
+        assert_eq!(
+            skill_command("$code $unknown task", known),
+            Some("/skills code $unknown task".into()),
+            "the gateway must reject the explicit second reference"
         );
         assert_eq!(skill_command("use $code", known), None);
         assert_eq!(skill_command("$", known), None);
@@ -15926,6 +17385,53 @@ mod skills_menu_tests {
         assert_eq!(m.caret, m.input.len());
         drop(m);
         assert!(!host.menu_open(), "the next words are the skill's task");
+    }
+
+    #[test]
+    fn successful_skill_gateway_shows_spelling_hints_without_echoing_acknowledgements() {
+        let (host, tui) = screen();
+        let description = tui.client.described().unwrap();
+        for (line, expects_notice) in [
+            ("/skills code brainstormnig task", true),
+            ("/skills code BRAINSTORMING task", true),
+            ("/skills code fix brainstormnig later", false),
+            ("/skills code $brainstormnig task", false),
+            ("/skills code brainstorming task", false),
+            ("/code brainstormnig task", false),
+        ] {
+            let before = host.stream.read().unwrap().slots().len();
+            tui.client
+                .view
+                .lock()
+                .unwrap()
+                .turn_invocations
+                .insert("spelling".into(), line.into());
+            tui.on_event(AgentEvent::Invoked {
+                id: "spelling".into(),
+                output: "ordinary acknowledgement".into(),
+                queued: false,
+                failed: Some(false),
+            });
+            let stream = host.stream.read().unwrap();
+            assert_eq!(
+                stream.slots().len(),
+                before + usize::from(expects_notice),
+                "{line}"
+            );
+            if expects_notice {
+                let expected =
+                    crate::commands::skill_spelling_notice(&description.commands, line).unwrap();
+                assert!(expected.contains("brainstorming"));
+                let said = crate::content::CommandSaid {
+                    text: expected,
+                    refused: false,
+                };
+                assert_eq!(
+                    stream.slots().last().unwrap().block().content_hash(),
+                    crate::block::Content::content_hash(&said)
+                );
+            }
+        }
     }
 
     #[test]
@@ -16000,8 +17506,20 @@ mod args_requirement_menu_tests {
         let mut m = host.moment.write().expect("moment poisoned");
         m.input = line.into();
         m.caret = line.len();
-        m.history.clear();
+        Arc::make_mut(&mut m.history).clear();
         m.history_at = None;
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_description_match_completes_before_dispatch() {
+        let (host, tui) = screen_with(ArgsRequirement::None);
+        type_line(&host, "/thing");
+        tui.refresh_menu();
+        assert_eq!(host.menu_selected().as_deref(), Some("cmd"));
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(m.input, "/cmd");
+        assert!(m.history.is_empty());
     }
 
     #[tokio::test]
@@ -16409,6 +17927,65 @@ mod newline_settings_tests {
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
 
     struct Port(Mutex<String>);
+    struct DiffPort(Mutex<bool>);
+    impl Settings for DiffPort {
+        fn rows(&self) -> SettingsView {
+            SettingsView::new(vec![SettingRow {
+                id: "ui.wrap_diff".into(),
+                label: "Wrap diff".into(),
+                value: self.0.lock().unwrap().to_string(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Immediately,
+            }])
+        }
+        fn set(&self, _: &str, value: &str) -> Result<SettingsView, String> {
+            *self.0.lock().unwrap() = value.parse().map_err(|_| "invalid boolean")?;
+            Ok(self.rows())
+        }
+        fn reset(&self, id: &str) -> Result<SettingsView, String> {
+            self.set(id, "true")
+        }
+    }
+
+    #[test]
+    fn settings_reflow_an_open_diff_without_rebuilding_the_runtime() {
+        let (host, tui) = assemble(crate::surface::Headless::new(30, 24));
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .unwrap();
+        assert!(
+            host.open_sheet(crate::sheet::Sheet::read(crate::sheet::Read::diff(
+                "diff",
+                "a",
+                "@@ -0,0 +1 @@\n+longlonglonglonglonglonglonglonglonglonglonglong",
+            )))
+        );
+        let port = Arc::new(DiffPort(Mutex::new(false)));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<SettingsSvc>(port).unwrap();
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.refresh_settings();
+        {
+            let moment = host.moment.read().unwrap();
+            assert!(moment.clip_diff);
+            let crate::sheet::Page::Read(read) = &moment.sheet.as_ref().unwrap().page else {
+                unreachable!()
+            };
+            assert!(!read.wrap_diff);
+        }
+        tui.apply_setting("ui.wrap_diff", "true").unwrap();
+        // The settings panel refreshes its projection after a successful edit.
+        tui.refresh_settings();
+        let moment = host.moment.read().unwrap();
+        assert!(!moment.clip_diff);
+        let crate::sheet::Page::Read(read) = &moment.sheet.as_ref().unwrap().page else {
+            unreachable!()
+        };
+        assert!(read.wrap_diff);
+        assert!(read.display_len(20) > 1);
+    }
     impl Settings for Port {
         fn rows(&self) -> SettingsView {
             SettingsView::new(vec![SettingRow {
@@ -16490,6 +18067,82 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 0);
         tui.complete_path("@\0mention-filter:sessions");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
+        tui.complete_path("@\0mention-filter:workspace");
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn preview_labels_and_workspace_filters_keep_their_reference_identity() {
+        use atomcode_capabilities::session::{
+            reference, SessionManager, SessionMeta, StorageOwner,
+        };
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+        let root = tempfile::tempdir().unwrap();
+        let local = "0123456789abcdef";
+        let other = "fedcba9876543210";
+        for (bucket, cwd, prompt) in [
+            (local, "/local", "  Local\n  question  "),
+            (other, "/another", "Other question"),
+        ] {
+            let manager = SessionManager::with_root(root.path().join(bucket));
+            let lease = manager.acquire_lease("same-id").unwrap();
+            let mut meta = SessionMeta::new("same-id", cwd, 1);
+            meta.owner = StorageOwner::Native;
+            manager
+                .create_event_session(&lease, &SessionHeader::new("same-id"), &meta)
+                .unwrap();
+            manager
+                .append_events(
+                    &lease,
+                    &[
+                        LoggedEvent {
+                            seq: 1,
+                            at: 1,
+                            event: SessionEvent::TurnStart { turn: 1 },
+                        },
+                        LoggedEvent {
+                            seq: 2,
+                            at: 2,
+                            event: SessionEvent::UserMessage {
+                                turn: 1,
+                                text: prompt.into(),
+                                images: Vec::new(),
+                            },
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+
+        let (_, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut cache = tui.session_references.lock().unwrap();
+            cache.entries = super::SessionSuggestion::scan(root.path());
+            cache.checked = Some(std::time::Instant::now());
+        }
+        *tui.mention_kind.lock().unwrap() = 2;
+        let rows = tui.mention_rows("/local", "same-id");
+        assert_eq!(rows.len(), 2);
+        for (row, label, bucket) in [
+            (&rows[0], "Local question", local),
+            (&rows[1], "Other question", other),
+        ] {
+            assert_eq!(row.label, label);
+            assert_eq!(
+                reference::parse(&row.value).unwrap(),
+                vec![reference::SessionReference {
+                    bucket: bucket.into(),
+                    id: "same-id".into(),
+                }]
+            );
+        }
+        assert_eq!(
+            tui.mention_rows("/local", "other question"),
+            vec![rows[1].clone()]
+        );
+        *tui.mention_kind.lock().unwrap() = 3;
+        assert_eq!(tui.mention_rows("/local", "same-id"), vec![rows[0].clone()]);
     }
 }
 
@@ -16704,5 +18357,625 @@ mod allowance_switch_tests {
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
         );
+    }
+}
+
+#[cfg(test)]
+mod ask_route_tests {
+    use super::*;
+    use crate::surface::Key;
+
+    fn press(key: Key) -> crate::surface::KeyPress {
+        crate::surface::KeyPress::plain(key)
+    }
+
+    #[test]
+    fn a_committed_tail_goes_to_the_draft_not_the_panel() {
+        assert!(matches!(
+            route_ask_key(true, false, &press(Key::Char('m'))),
+            AskKeyRoute::Composer('m')
+        ));
+    }
+
+    #[test]
+    fn a_composer_stepped_aside_never_takes_the_key() {
+        // With the panel mounted the composer is hidden: the key must not be
+        // written into a field nobody can see.
+        assert!(matches!(
+            route_ask_key(true, true, &press(Key::Char('m'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn digits_stay_with_the_panel_even_over_a_draft() {
+        assert!(matches!(
+            route_ask_key(true, false, &press(Key::Char('1'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn an_empty_composer_leaves_the_keys_with_the_panel() {
+        assert!(matches!(
+            route_ask_key(false, false, &press(Key::Char('y'))),
+            AskKeyRoute::Panel
+        ));
+    }
+
+    #[test]
+    fn navigation_keys_stay_with_the_panel_while_the_draft_holds_text() {
+        for key in [Key::Enter, Key::Esc, Key::Up, Key::Tab] {
+            assert!(
+                matches!(route_ask_key(true, false, &press(key)), AskKeyRoute::Panel),
+                "navigation key stays with the panel"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_dispatch_requires_the_presented_request_and_selection() {
+        use atomcode_capabilities::tools::approval::APPROVAL_KIND;
+        use tokio::sync::oneshot::error::TryRecvError;
+        let approval = || {
+            crate::ask::question_for(
+                APPROVAL_KIND,
+                &serde_json::json!({"tool": "write_file", "args": r#"{"file_path":"note.txt"}"#}),
+                &[],
+            )
+            .expect("a tool approval")
+        };
+
+        for mounted in [false, true] {
+            let (host, tui) = assemble(Headless::new(100, 30));
+            if mounted {
+                host.modules
+                    .add_view(Arc::new(
+                        crate::module::Mounted::<crate::modules::ask::Ask>::new(),
+                    ))
+                    .unwrap();
+            }
+            let (id, mut answer) = host.asks.push_with_id(approval());
+            for key in [Key::Char('1'), Key::Down, Key::Enter] {
+                tui.answer_question(press(key), None);
+            }
+            assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
+
+            host.sync_asking();
+            let (shown, _) = tui.paint((100, 30));
+            assert_eq!(shown.unwrap().id, id);
+            tui.answer_question(press(Key::Down), shown);
+            tui.answer_question(press(Key::Enter), shown);
+            assert_eq!(
+                answer.try_recv(),
+                Err(TryRecvError::Empty),
+                "selection has not been painted"
+            );
+            let (selected, _) = tui.paint((100, 30));
+            assert_eq!(selected.unwrap().selected, Some(0));
+
+            let (next, mut next_answer) = host.asks.push_with_id(approval());
+            assert!(host.asks.withdraw(id));
+            host.sync_asking();
+            tui.answer_question(press(Key::Enter), selected);
+            assert_eq!(next_answer.try_recv(), Err(TryRecvError::Empty));
+
+            let (next_shown, _) = tui.paint((100, 30));
+            assert_eq!(next_shown.unwrap().id, next);
+            tui.answer_question(press(Key::Down), next_shown);
+            let (next_selected, _) = tui.paint((100, 30));
+            tui.answer_question(press(Key::Enter), next_selected);
+            assert_eq!(
+                next_answer.try_recv(),
+                Ok(Some(crate::ask::Reply::from("allow")))
+            );
+        }
+    }
+
+    #[test]
+    fn queued_confirmation_cannot_pick_up_a_later_selection_or_mouse_layout() {
+        let before = ApprovalInput {
+            presentation: crate::ask::PresentedApproval {
+                id: 1,
+                selected: None,
+            },
+            frame: 1,
+        };
+        let after = ApprovalInput {
+            presentation: crate::ask::PresentedApproval {
+                id: 1,
+                selected: Some(0),
+            },
+            frame: 2,
+        };
+        let enter = Input::Key(press(Key::Enter));
+        assert!(before.for_input(&enter, after).is_none());
+        assert_eq!(after.for_input(&enter, after).unwrap().selected, Some(0));
+
+        let click = Input::Mouse(crate::surface::Click::Press, 0, 0);
+        assert!(before.for_input(&click, after).is_none());
+        assert!(after.for_input(&click, after).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn queued_keys_keep_the_approval_seen_when_they_arrived() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (wake, mut received) = mpsc::unbounded_channel();
+        // The input reader replays short candidate lines as individual keys.
+        let keys = futures::stream::iter(
+            [
+                KeyCode::Char('1'),
+                KeyCode::Enter,
+                KeyCode::Char('2'),
+                KeyCode::Enter,
+            ]
+            .map(|key| Event::Key(KeyEvent::new(key, KeyModifiers::NONE))),
+        );
+        let sampled = std::cell::Cell::new(0);
+        pump_input(
+            keys,
+            wake,
+            || false,
+            false,
+            || {
+                let frame = sampled.get();
+                sampled.set(frame + 1);
+                Some(ApprovalInput {
+                    presentation: crate::ask::PresentedApproval {
+                        id: 1,
+                        selected: (frame > 0).then_some(0),
+                    },
+                    frame,
+                })
+            },
+        )
+        .await;
+        assert!(
+            matches!(received.try_recv(), Ok(Wake::InputOverApproval(Input::Key(key), receipt))
+            if key.key == Key::Char('1') && receipt.presentation.selected.is_none())
+        );
+        assert!(
+            matches!(received.try_recv(), Ok(Wake::InputOverApproval(Input::Key(key), receipt))
+            if key.key == Key::Enter && receipt.presentation.selected == Some(0))
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_history_tests {
+    use super::*;
+    use atomcode_kernel::session::{history, SessionEvent};
+
+    struct Noop;
+    #[async_trait]
+    impl HostControl for Noop {
+        async fn call(&self, _: HostCommand) -> Result<HostReply, atomcode_host_api::HostError> {
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+    fn events() -> Vec<LoggedEvent> {
+        (1..=25)
+            .flat_map(|turn| {
+                [
+                    SessionEvent::TurnStart { turn },
+                    SessionEvent::UserMessage {
+                        turn,
+                        text: format!("prompt {turn}"),
+                        images: vec![],
+                    },
+                    SessionEvent::AssistantMessage {
+                        turn,
+                        round: 1,
+                        text: format!("answer {turn}"),
+                        reasoning: String::new(),
+                        tool_calls: vec![],
+                        reasoning_blocks: vec![],
+                        meta: None,
+                    },
+                    SessionEvent::TurnEnd {
+                        turn,
+                        stop: atomcode_kernel::event::StopReason::Stopped,
+                        error: None,
+                    },
+                ]
+            })
+            .enumerate()
+            .map(|(i, event)| LoggedEvent {
+                seq: i as u64 + 1,
+                at: i as u64,
+                event,
+            })
+            .collect()
+    }
+    fn reply(events: &[LoggedEvent], cursor: Option<&history::Cursor>) -> HostReply {
+        let (range, page) = history::range("lead", events, cursor, 8).unwrap();
+        HostReply::DisplayHistory {
+            page,
+            seed: crate::history::state_seed("lead", &events[..range.start]),
+        }
+    }
+    #[test]
+    fn paged_history_keeps_one_welcome_above_every_page_in_both_arrival_orders() {
+        for opening_first in [false, true] {
+            let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+            host.modules
+                .add_producer(crate::modules::welcome::Welcome::new(Arc::new(
+                    crate::content::Brand::default(),
+                )))
+                .unwrap();
+            host.modules
+                .add_producer(Arc::new(crate::modules::transcript::Transcript::default()))
+                .unwrap();
+            tui.client.follow("lead");
+            if opening_first {
+                assert!(host.open_conversation(crate::block::Coord::default(), &Default::default()));
+            }
+            tui.client
+                .view
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut("lead")
+                .unwrap()
+                .history_request = Some(1);
+            assert!(tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None))));
+            if !opening_first {
+                assert!(host.open_conversation(crate::block::Coord::default(), &Default::default()));
+            }
+            let live = host.stream.write().unwrap().writer("test-live").open(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::NoticeBlock {
+                    detail: "live".into(),
+                }),
+            );
+            host.moment.write().unwrap().scroll = crate::moment::ScrollPos(7);
+            host.moment.write().unwrap().input = "draft".into();
+            let mut request = 2;
+            loop {
+                let cursor = tui.client.view.lock().unwrap().sessions["lead"]
+                    .history
+                    .clone();
+                let Some(cursor) = cursor else {
+                    break;
+                };
+                tui.client
+                    .view
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get_mut("lead")
+                    .unwrap()
+                    .history_request = Some(request);
+                assert!(tui.accept_history(
+                    "lead",
+                    request,
+                    false,
+                    Some(cursor.clone()),
+                    Ok(reply(&events(), Some(&cursor)))
+                ));
+                let stream = host.stream.read().unwrap();
+                assert_eq!(stream.slots()[0].block().content.kind(), "welcome");
+                assert_eq!(
+                    stream
+                        .slots()
+                        .iter()
+                        .filter(|s| s.block().content.kind() == "welcome")
+                        .count(),
+                    1
+                );
+                assert!(!stream.get(live).unwrap().is_settled());
+                drop(stream);
+                assert!(
+                    !host.open_conversation(crate::block::Coord::default(), &Default::default())
+                );
+                assert_eq!(host.moment.read().unwrap().scroll.0, 7);
+                assert_eq!(host.moment.read().unwrap().input, "draft");
+                request += 1;
+            }
+            assert!(request > 2, "older pages were actually fetched");
+            host.switch_view();
+            assert!(host.open_conversation(crate::block::Coord::default(), &Default::default()));
+            assert_eq!(host.stream.read().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn bounded_bootstrap_subscribes_after_watermark_and_old_pages_preserve_live_state() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        let (send, mut commands) = mpsc::unbounded_channel();
+        tui.client.connect(send, Arc::new(Noop));
+        tui.client.follow("lead");
+        commands.try_recv().unwrap();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(1);
+        assert!(tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None))));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            AgentCommand::Subscribe { from: 101, .. }
+        ));
+        assert_eq!(tui.client.root_high(), 100);
+        assert_eq!(
+            tui.client
+                .events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+                .count(),
+            8
+        );
+        host.moment.write().unwrap().input = "unsent draft".into();
+        let live = host.stream.write().unwrap().writer("test-live").open(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::NoticeBlock {
+                detail: "live".into(),
+            }),
+        );
+        let cursor = tui.client.view.lock().unwrap().sessions["lead"]
+            .history
+            .clone()
+            .unwrap();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(2);
+        assert!(tui.accept_history(
+            "lead",
+            2,
+            false,
+            Some(cursor.clone()),
+            Ok(reply(&events(), Some(&cursor)))
+        ));
+        assert_eq!(host.moment.read().unwrap().input, "unsent draft");
+        assert_eq!(tui.client.root_high(), 100);
+        assert!(host.stream.write().unwrap().writer("test-live").amend(
+            live,
+            Arc::new(crate::content::NoticeBlock {
+                detail: "continued".into()
+            })
+        ));
+        assert_eq!(
+            tui.client
+                .events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+                .count(),
+            16
+        );
+        assert_eq!(
+            tui.client
+                .events()
+                .iter()
+                .map(|e| e.seq)
+                .collect::<HashSet<_>>()
+                .len(),
+            tui.client.events().len()
+        );
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(3);
+        tui.client.keep(&Committed {
+            session: "lead".into(),
+            seq: 101,
+            at: 101,
+            event: SessionEvent::Interrupted {
+                turn: 25,
+                undone: true,
+            },
+        });
+        let views = tui.client.view.lock().unwrap();
+        assert_eq!(
+            views.sessions["lead"].history.as_ref().unwrap().revision,
+            101
+        );
+        assert_eq!(views.sessions["lead"].history_request, None);
+    }
+    #[test]
+    fn a_leads_old_page_does_not_prepend_into_a_member_now_on_screen() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow("lead");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(1);
+        tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None)));
+        let cursor = tui.client.view.lock().unwrap().sessions["lead"]
+            .history
+            .clone()
+            .unwrap();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(2);
+        tui.look_at("member");
+        let before = host.stream.read().unwrap().len();
+        tui.accept_history(
+            "lead",
+            2,
+            false,
+            Some(cursor.clone()),
+            Ok(reply(&events(), Some(&cursor))),
+        );
+        assert_eq!(tui.client.session(), "member");
+        assert_eq!(host.stream.read().unwrap().len(), before);
+        assert_eq!(
+            tui.client.view.lock().unwrap().sessions["lead"]
+                .events
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+                .count(),
+            16
+        );
+    }
+    #[test]
+    fn a_late_page_from_an_earlier_view_of_the_same_session_is_ignored() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow("lead");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(1);
+        tui.client.follow("other");
+        tui.client.follow("lead");
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("lead")
+            .unwrap()
+            .history_request = Some(2);
+        assert!(!tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None))));
+        assert!(tui.client.events().is_empty());
+        assert_eq!(
+            tui.client.view.lock().unwrap().sessions["lead"].history_request,
+            Some(2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_image_tests {
+    use super::*;
+    use atomcode_harness::session::SessionEvent;
+    use atomcode_kernel::message::ImageContent;
+    use base64::Engine as _;
+
+    fn png(bytes: &[u8]) -> ImageContent {
+        ImageContent {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    #[test]
+    fn preview_files_follow_exact_bytes_and_are_private_and_temporary() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        let first = png(crate::terminal_image::MASCOT_PNG);
+        let second = png(crate::terminal_image::MASCOT_WAIT_PNG);
+        let a = tui.image_temp_file(Some(first.clone())).unwrap();
+        let b = tui.image_temp_file(Some(second)).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a, tui.image_temp_file(Some(first)).unwrap());
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            crate::terminal_image::MASCOT_PNG
+        );
+        assert!(tui.image_temp_file(None).is_err());
+        for bad in [
+            ImageContent {
+                media_type: "image/svg+xml".into(),
+                data: "PHN2Zz4=".into(),
+            },
+            ImageContent {
+                media_type: "image/png".into(),
+                data: "not base64".into(),
+            },
+            png(b"not png"),
+        ] {
+            assert!(tui.image_temp_file(Some(bad)).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(tui);
+        assert!(!a.exists() && !b.exists());
+    }
+
+    #[derive(Default)]
+    struct Opened(Mutex<Vec<std::path::PathBuf>>);
+    #[async_trait]
+    impl atomcode_capabilities::tools::Opener for Opened {
+        fn describe(&self) -> String {
+            "test viewer".into()
+        }
+        async fn open(
+            &self,
+            target: &atomcode_capabilities::tools::OpenTarget,
+        ) -> Result<String, String> {
+            if let atomcode_capabilities::tools::OpenTarget::Path(path) = target {
+                self.0.lock().unwrap().push(path.clone());
+            }
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn each_returned_picture_has_its_own_click_target_and_opens_its_own_bytes() {
+        let (host, mut tui) = assemble(crate::surface::Headless::new(80, 40));
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        let opened = Arc::new(Opened::default());
+        tui.opener = opened.clone();
+        host.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "unpaired".into(),
+            content: "ok".into(),
+            is_error: false,
+            images: vec![
+                png(crate::terminal_image::MASCOT_PNG),
+                png(crate::terminal_image::MASCOT_WAIT_PNG),
+            ],
+        });
+        let frame = host.compose((80, 40));
+        let rect = frame.part("stream").unwrap().rect;
+        let mut targets = Vec::new();
+        for y in rect.y..rect.bottom() {
+            if let Some((id, "tool_image")) = host.block_at(2, y) {
+                if !targets.iter().any(|(prior, _)| *prior == id) {
+                    targets.push((id, y));
+                }
+            }
+        }
+        assert_eq!(targets.len(), 2);
+        for (_, y) in targets {
+            tui.act(Action::ClickAt(2, y), &tui.client);
+        }
+        tokio::task::yield_now().await;
+        let paths = opened.0.lock().unwrap().clone();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            crate::terminal_image::MASCOT_PNG
+        );
+        assert_eq!(
+            std::fs::read(&paths[1]).unwrap(),
+            crate::terminal_image::MASCOT_WAIT_PNG
+        );
+        assert!(host.moment.read().unwrap().attachments.is_empty());
     }
 }

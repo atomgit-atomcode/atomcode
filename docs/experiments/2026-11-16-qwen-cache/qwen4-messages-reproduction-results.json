@@ -1,0 +1,3519 @@
+{
+  "binary_version": "5.2.7 (eab22d60d+dirty)",
+  "endpoint": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages",
+  "model": "qwen4-max-preview",
+  "experiments": {
+    "resumed_turns": {
+      "runs": [
+        {
+          "turn": 1,
+          "exit_code": 0,
+          "elapsed_ms": 12095,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 1,
+              "request_id": 1,
+              "prompt_tokens": 39392,
+              "completion_tokens": 77,
+              "cached_tokens": 0,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 1,
+              "request_id": 2,
+              "prompt_tokens": 39376,
+              "completion_tokens": 57,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 11985,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 78902,
+              "prompt_tokens": 78768,
+              "completion_tokens": 134,
+              "cached_tokens": 39235,
+              "cache_hit_rate": 0.49810836888076376,
+              "ttft_ms": 3984,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 2,
+          "exit_code": 0,
+          "elapsed_ms": 12381,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 2,
+              "request_id": 1,
+              "prompt_tokens": 39409,
+              "completion_tokens": 61,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 2,
+              "request_id": 2,
+              "prompt_tokens": 39487,
+              "completion_tokens": 72,
+              "cached_tokens": 39346,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 12277,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 79029,
+              "prompt_tokens": 78896,
+              "completion_tokens": 133,
+              "cached_tokens": 78581,
+              "cache_hit_rate": 0.9960074021496654,
+              "ttft_ms": 5958,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 3,
+          "exit_code": 0,
+          "elapsed_ms": 10732,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 3,
+              "request_id": 1,
+              "prompt_tokens": 39520,
+              "completion_tokens": 59,
+              "cached_tokens": 39346,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 3,
+              "request_id": 2,
+              "prompt_tokens": 39598,
+              "completion_tokens": 17,
+              "cached_tokens": 39457,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 10637,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 79194,
+              "prompt_tokens": 79118,
+              "completion_tokens": 76,
+              "cached_tokens": 78803,
+              "cache_hit_rate": 0.9960186051214641,
+              "ttft_ms": 2017,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 4,
+          "exit_code": 0,
+          "elapsed_ms": 11817,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 4,
+              "request_id": 1,
+              "prompt_tokens": 39631,
+              "completion_tokens": 108,
+              "cached_tokens": 39457,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 4,
+              "request_id": 2,
+              "prompt_tokens": 39709,
+              "completion_tokens": 80,
+              "cached_tokens": 39568,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 11764,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 79528,
+              "prompt_tokens": 79340,
+              "completion_tokens": 188,
+              "cached_tokens": 79025,
+              "cache_hit_rate": 0.9960297453995463,
+              "ttft_ms": 2660,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 5,
+          "exit_code": 0,
+          "elapsed_ms": 8117,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 5,
+              "request_id": 1,
+              "prompt_tokens": 39742,
+              "completion_tokens": 47,
+              "cached_tokens": 39568,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 5,
+              "request_id": 2,
+              "prompt_tokens": 39820,
+              "completion_tokens": 63,
+              "cached_tokens": 39679,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 8069,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 79672,
+              "prompt_tokens": 79562,
+              "completion_tokens": 110,
+              "cached_tokens": 79247,
+              "cache_hit_rate": 0.9960408235087101,
+              "ttft_ms": 3012,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 6,
+          "exit_code": 0,
+          "elapsed_ms": 7176,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 6,
+              "request_id": 1,
+              "prompt_tokens": 39853,
+              "completion_tokens": 47,
+              "cached_tokens": 39679,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 6,
+              "request_id": 2,
+              "prompt_tokens": 39931,
+              "completion_tokens": 61,
+              "cached_tokens": 39790,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 7137,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 79892,
+              "prompt_tokens": 79784,
+              "completion_tokens": 108,
+              "cached_tokens": 79469,
+              "cache_hit_rate": 0.9960518399679134,
+              "ttft_ms": 3075,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 7,
+          "exit_code": 0,
+          "elapsed_ms": 8113,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 7,
+              "request_id": 1,
+              "prompt_tokens": 39964,
+              "completion_tokens": 60,
+              "cached_tokens": 39790,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 7,
+              "request_id": 2,
+              "prompt_tokens": 40042,
+              "completion_tokens": 57,
+              "cached_tokens": 39901,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 8065,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 80123,
+              "prompt_tokens": 80006,
+              "completion_tokens": 117,
+              "cached_tokens": 79691,
+              "cache_hit_rate": 0.9960627952903532,
+              "ttft_ms": 3823,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 8,
+          "exit_code": 0,
+          "elapsed_ms": 8527,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 8,
+              "request_id": 1,
+              "prompt_tokens": 40075,
+              "completion_tokens": 47,
+              "cached_tokens": 39901,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 8,
+              "request_id": 2,
+              "prompt_tokens": 40153,
+              "completion_tokens": 59,
+              "cached_tokens": 40012,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 8476,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 80334,
+              "prompt_tokens": 80228,
+              "completion_tokens": 106,
+              "cached_tokens": 79913,
+              "cache_hit_rate": 0.9960736899835468,
+              "ttft_ms": 3941,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 9,
+          "exit_code": 0,
+          "elapsed_ms": 7845,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 9,
+              "request_id": 1,
+              "prompt_tokens": 40186,
+              "completion_tokens": 47,
+              "cached_tokens": 40012,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 9,
+              "request_id": 2,
+              "prompt_tokens": 40264,
+              "completion_tokens": 55,
+              "cached_tokens": 40123,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 7806,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 80552,
+              "prompt_tokens": 80450,
+              "completion_tokens": 102,
+              "cached_tokens": 80135,
+              "cache_hit_rate": 0.9960845245494095,
+              "ttft_ms": 4401,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        },
+        {
+          "turn": 10,
+          "exit_code": 0,
+          "elapsed_ms": 7206,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 10,
+              "request_id": 1,
+              "prompt_tokens": 40298,
+              "completion_tokens": 49,
+              "cached_tokens": 40123,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 10,
+              "request_id": 2,
+              "prompt_tokens": 40379,
+              "completion_tokens": 20,
+              "cached_tokens": 40234,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 7152,
+              "rounds": 2,
+              "tool_calls": 1,
+              "total_tokens": 80746,
+              "prompt_tokens": 80677,
+              "completion_tokens": 69,
+              "cached_tokens": 80357,
+              "cache_hit_rate": 0.9960335659481636,
+              "ttft_ms": 3995,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file"
+          ],
+          "errors": []
+        }
+      ],
+      "wire_metadata": [
+        {
+          "ordinal": 1,
+          "lane": "auxiliary",
+          "model": "qwen4-max-preview",
+          "tools": 0,
+          "messages": 1,
+          "blocks": 2,
+          "markers": [
+            {
+              "path": "system[0]",
+              "block": 0,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 1,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 2,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 1,
+          "blocks": 45,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 44,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 3,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 3,
+          "blocks": 48,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[1].content[0]",
+              "block": 45,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[2].content[1]",
+              "block": 47,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 44,
+          "previous_blocks": 45,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 4,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 5,
+          "blocks": 49,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[3].content[0]",
+              "block": 47,
+              "type": "text"
+            },
+            {
+              "path": "messages[4].content[0]",
+              "block": 48,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 47,
+          "previous_blocks": 48,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 5,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 7,
+          "blocks": 52,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[5].content[0]",
+              "block": 49,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[6].content[1]",
+              "block": 51,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 48,
+          "previous_blocks": 49,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 6,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 9,
+          "blocks": 53,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[7].content[0]",
+              "block": 51,
+              "type": "text"
+            },
+            {
+              "path": "messages[8].content[0]",
+              "block": 52,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 51,
+          "previous_blocks": 52,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 7,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 11,
+          "blocks": 56,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[9].content[0]",
+              "block": 53,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[10].content[1]",
+              "block": 55,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 52,
+          "previous_blocks": 53,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 8,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 13,
+          "blocks": 57,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[11].content[0]",
+              "block": 55,
+              "type": "text"
+            },
+            {
+              "path": "messages[12].content[0]",
+              "block": 56,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 55,
+          "previous_blocks": 56,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 9,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 15,
+          "blocks": 60,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[13].content[0]",
+              "block": 57,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[14].content[1]",
+              "block": 59,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 56,
+          "previous_blocks": 57,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 10,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 17,
+          "blocks": 61,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[15].content[0]",
+              "block": 59,
+              "type": "text"
+            },
+            {
+              "path": "messages[16].content[0]",
+              "block": 60,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 59,
+          "previous_blocks": 60,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 11,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 19,
+          "blocks": 64,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[17].content[0]",
+              "block": 61,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[18].content[1]",
+              "block": 63,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 60,
+          "previous_blocks": 61,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 12,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 21,
+          "blocks": 65,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[19].content[0]",
+              "block": 63,
+              "type": "text"
+            },
+            {
+              "path": "messages[20].content[0]",
+              "block": 64,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 63,
+          "previous_blocks": 64,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 13,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 23,
+          "blocks": 68,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[21].content[0]",
+              "block": 65,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[22].content[1]",
+              "block": 67,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 64,
+          "previous_blocks": 65,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 14,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 25,
+          "blocks": 69,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[23].content[0]",
+              "block": 67,
+              "type": "text"
+            },
+            {
+              "path": "messages[24].content[0]",
+              "block": 68,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 67,
+          "previous_blocks": 68,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 15,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 27,
+          "blocks": 72,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[25].content[0]",
+              "block": 69,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[26].content[1]",
+              "block": 71,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 68,
+          "previous_blocks": 69,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 16,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 29,
+          "blocks": 73,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[27].content[0]",
+              "block": 71,
+              "type": "text"
+            },
+            {
+              "path": "messages[28].content[0]",
+              "block": 72,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 71,
+          "previous_blocks": 72,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 17,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 31,
+          "blocks": 76,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[29].content[0]",
+              "block": 73,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[30].content[1]",
+              "block": 75,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 72,
+          "previous_blocks": 73,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 18,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 33,
+          "blocks": 77,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[31].content[0]",
+              "block": 75,
+              "type": "text"
+            },
+            {
+              "path": "messages[32].content[0]",
+              "block": 76,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 75,
+          "previous_blocks": 76,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 19,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 35,
+          "blocks": 80,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[33].content[0]",
+              "block": 77,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[34].content[1]",
+              "block": 79,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 76,
+          "previous_blocks": 77,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 20,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 37,
+          "blocks": 81,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[35].content[0]",
+              "block": 79,
+              "type": "text"
+            },
+            {
+              "path": "messages[36].content[0]",
+              "block": 80,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 79,
+          "previous_blocks": 80,
+          "usage_events": [],
+          "http_status": 200
+        },
+        {
+          "ordinal": 21,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 39,
+          "blocks": 84,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[37].content[0]",
+              "block": 81,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[38].content[1]",
+              "block": 83,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 80,
+          "previous_blocks": 81,
+          "usage_events": [],
+          "http_status": 200
+        }
+      ],
+      "summary": {
+        "main_streams": 20,
+        "prompt_tokens": 796829,
+        "cache_reads": 754456
+      }
+    },
+    "one_turn_tail": {
+      "runs": [
+        {
+          "turn": 1,
+          "exit_code": 0,
+          "elapsed_ms": 46441,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 1,
+              "request_id": 1,
+              "prompt_tokens": 39446,
+              "completion_tokens": 133,
+              "cached_tokens": 0,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 1,
+              "request_id": 2,
+              "prompt_tokens": 39491,
+              "completion_tokens": 74,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 3,
+              "turn_id": 1,
+              "request_id": 3,
+              "prompt_tokens": 39623,
+              "completion_tokens": 75,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 4,
+              "turn_id": 1,
+              "request_id": 4,
+              "prompt_tokens": 39757,
+              "completion_tokens": 75,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 5,
+              "turn_id": 1,
+              "request_id": 5,
+              "prompt_tokens": 39894,
+              "completion_tokens": 78,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 6,
+              "turn_id": 1,
+              "request_id": 6,
+              "prompt_tokens": 40032,
+              "completion_tokens": 77,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 7,
+              "turn_id": 1,
+              "request_id": 7,
+              "prompt_tokens": 40170,
+              "completion_tokens": 77,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 8,
+              "turn_id": 1,
+              "request_id": 8,
+              "prompt_tokens": 40306,
+              "completion_tokens": 123,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 9,
+              "turn_id": 1,
+              "request_id": 9,
+              "prompt_tokens": 40442,
+              "completion_tokens": 77,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 10,
+              "turn_id": 1,
+              "request_id": 10,
+              "prompt_tokens": 40577,
+              "completion_tokens": 74,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 11,
+              "turn_id": 1,
+              "request_id": 11,
+              "prompt_tokens": 40685,
+              "completion_tokens": 20,
+              "cached_tokens": 39235,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 46235,
+              "rounds": 11,
+              "tool_calls": 10,
+              "total_tokens": 441306,
+              "prompt_tokens": 440423,
+              "completion_tokens": 883,
+              "cached_tokens": 392350,
+              "cache_hit_rate": 0.8908481164698483,
+              "ttft_ms": 7277,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file"
+          ],
+          "errors": []
+        }
+      ],
+      "wire_metadata": [
+        {
+          "ordinal": 1,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 1,
+          "blocks": 45,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 44,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38309,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 133,
+                "cache_creation_input_tokens": 39440,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 39440,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 2,
+          "lane": "auxiliary",
+          "model": "qwen4-max-preview",
+          "tools": 0,
+          "messages": 1,
+          "blocks": 2,
+          "markers": [
+            {
+              "path": "system[0]",
+              "block": 0,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 1,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 122,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 149,
+                "output_tokens": 87,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 3,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 3,
+          "blocks": 48,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[1].content[0]",
+              "block": 45,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[2].content[1]",
+              "block": 47,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 44,
+          "previous_blocks": 45,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 74,
+                "cache_creation_input_tokens": 250,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 250,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 4,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 5,
+          "blocks": 50,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[3].content[0]",
+              "block": 47,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[4].content[1]",
+              "block": 49,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 47,
+          "previous_blocks": 48,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 75,
+                "cache_creation_input_tokens": 382,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 382,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 5,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 7,
+          "blocks": 52,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[5].content[0]",
+              "block": 49,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[6].content[1]",
+              "block": 51,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 49,
+          "previous_blocks": 50,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 75,
+                "cache_creation_input_tokens": 516,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 516,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 6,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 9,
+          "blocks": 54,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[7].content[0]",
+              "block": 51,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[8].content[1]",
+              "block": 53,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 51,
+          "previous_blocks": 52,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 78,
+                "cache_creation_input_tokens": 653,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 653,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 7,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 11,
+          "blocks": 56,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[9].content[0]",
+              "block": 53,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[10].content[1]",
+              "block": 55,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 53,
+          "previous_blocks": 54,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 77,
+                "cache_creation_input_tokens": 791,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 791,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 8,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 13,
+          "blocks": 58,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[11].content[0]",
+              "block": 55,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[12].content[1]",
+              "block": 57,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 55,
+          "previous_blocks": 56,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 77,
+                "cache_creation_input_tokens": 929,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 929,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 9,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 15,
+          "blocks": 60,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[13].content[0]",
+              "block": 57,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[14].content[1]",
+              "block": 59,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 57,
+          "previous_blocks": 58,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 123,
+                "cache_creation_input_tokens": 1065,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 1065,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 10,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 17,
+          "blocks": 62,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[15].content[0]",
+              "block": 59,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[16].content[1]",
+              "block": 61,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 59,
+          "previous_blocks": 60,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 77,
+                "cache_creation_input_tokens": 1201,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 1201,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 11,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 19,
+          "blocks": 64,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[17].content[0]",
+              "block": 61,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[18].content[1]",
+              "block": 63,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 61,
+          "previous_blocks": 62,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 74,
+                "cache_creation_input_tokens": 1336,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 1336,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 12,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 21,
+          "blocks": 66,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[19].content[0]",
+              "block": 63,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[20].content[1]",
+              "block": 65,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 63,
+          "previous_blocks": 64,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38214,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 1444,
+                "cache_read_input_tokens": 39235,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 1444,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        }
+      ],
+      "summary": {
+        "main_streams": 11,
+        "prompt_tokens": 440423,
+        "cache_reads": 392350
+      }
+    },
+    "one_turn_stable": {
+      "runs": [
+        {
+          "turn": 1,
+          "exit_code": 0,
+          "elapsed_ms": 56149,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 1,
+              "request_id": 1,
+              "prompt_tokens": 39452,
+              "completion_tokens": 161,
+              "cached_tokens": 0,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 1,
+              "request_id": 2,
+              "prompt_tokens": 39495,
+              "completion_tokens": 76,
+              "cached_tokens": 39239,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 3,
+              "turn_id": 1,
+              "request_id": 3,
+              "prompt_tokens": 39622,
+              "completion_tokens": 72,
+              "cached_tokens": 39454,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 4,
+              "turn_id": 1,
+              "request_id": 4,
+              "prompt_tokens": 39749,
+              "completion_tokens": 104,
+              "cached_tokens": 39581,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 5,
+              "turn_id": 1,
+              "request_id": 5,
+              "prompt_tokens": 39877,
+              "completion_tokens": 73,
+              "cached_tokens": 39708,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 6,
+              "turn_id": 1,
+              "request_id": 6,
+              "prompt_tokens": 40008,
+              "completion_tokens": 73,
+              "cached_tokens": 39836,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 7,
+              "turn_id": 1,
+              "request_id": 7,
+              "prompt_tokens": 40138,
+              "completion_tokens": 72,
+              "cached_tokens": 39967,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 8,
+              "turn_id": 1,
+              "request_id": 8,
+              "prompt_tokens": 40270,
+              "completion_tokens": 75,
+              "cached_tokens": 40097,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 9,
+              "turn_id": 1,
+              "request_id": 9,
+              "prompt_tokens": 40404,
+              "completion_tokens": 126,
+              "cached_tokens": 40229,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 10,
+              "turn_id": 1,
+              "request_id": 10,
+              "prompt_tokens": 40538,
+              "completion_tokens": 74,
+              "cached_tokens": 40363,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 11,
+              "turn_id": 1,
+              "request_id": 11,
+              "prompt_tokens": 40646,
+              "completion_tokens": 20,
+              "cached_tokens": 40497,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 56018,
+              "rounds": 11,
+              "tool_calls": 10,
+              "total_tokens": 441125,
+              "prompt_tokens": 440199,
+              "completion_tokens": 926,
+              "cached_tokens": 398971,
+              "cache_hit_rate": 0.9063423587968169,
+              "ttft_ms": 4128,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file",
+            "read_file"
+          ],
+          "errors": []
+        }
+      ],
+      "wire_metadata": [
+        {
+          "ordinal": 1,
+          "lane": "auxiliary",
+          "model": "qwen4-max-preview",
+          "tools": 0,
+          "messages": 1,
+          "blocks": 2,
+          "markers": [
+            {
+              "path": "system[0]",
+              "block": 0,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 1,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 124,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 151,
+                "output_tokens": 69,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 2,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 1,
+          "blocks": 45,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 44,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38315,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 161,
+                "cache_creation_input_tokens": 39446,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 39446,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 3,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 3,
+          "blocks": 48,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[1].content[0]",
+              "block": 45,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[2].content[0]",
+              "block": 46,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 44,
+          "previous_blocks": 45,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 76,
+                "cache_creation_input_tokens": 215,
+                "cache_read_input_tokens": 39239,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 215,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 4,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 5,
+          "blocks": 50,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[3].content[0]",
+              "block": 47,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[4].content[0]",
+              "block": 48,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 47,
+          "previous_blocks": 48,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 72,
+                "cache_creation_input_tokens": 127,
+                "cache_read_input_tokens": 39454,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 127,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 5,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 7,
+          "blocks": 52,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[5].content[0]",
+              "block": 49,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[6].content[0]",
+              "block": 50,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 49,
+          "previous_blocks": 50,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 104,
+                "cache_creation_input_tokens": 127,
+                "cache_read_input_tokens": 39581,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 127,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 6,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 9,
+          "blocks": 54,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[7].content[0]",
+              "block": 51,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[8].content[0]",
+              "block": 52,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 51,
+          "previous_blocks": 52,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 73,
+                "cache_creation_input_tokens": 128,
+                "cache_read_input_tokens": 39708,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 128,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 7,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 11,
+          "blocks": 56,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[9].content[0]",
+              "block": 53,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[10].content[0]",
+              "block": 54,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 53,
+          "previous_blocks": 54,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 73,
+                "cache_creation_input_tokens": 131,
+                "cache_read_input_tokens": 39836,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 131,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 8,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 13,
+          "blocks": 58,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[11].content[0]",
+              "block": 55,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[12].content[0]",
+              "block": 56,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 55,
+          "previous_blocks": 56,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 72,
+                "cache_creation_input_tokens": 130,
+                "cache_read_input_tokens": 39967,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 130,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 9,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 15,
+          "blocks": 60,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[13].content[0]",
+              "block": 57,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[14].content[0]",
+              "block": 58,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 57,
+          "previous_blocks": 58,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 75,
+                "cache_creation_input_tokens": 132,
+                "cache_read_input_tokens": 40097,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 132,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 10,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 17,
+          "blocks": 62,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[15].content[0]",
+              "block": 59,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[16].content[0]",
+              "block": 60,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 59,
+          "previous_blocks": 60,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 126,
+                "cache_creation_input_tokens": 134,
+                "cache_read_input_tokens": 40229,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 134,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 11,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 19,
+          "blocks": 64,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[17].content[0]",
+              "block": 61,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[18].content[0]",
+              "block": 62,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 61,
+          "previous_blocks": 62,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 74,
+                "cache_creation_input_tokens": 134,
+                "cache_read_input_tokens": 40363,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 134,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 12,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 21,
+          "blocks": 66,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[19].content[0]",
+              "block": 63,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[20].content[0]",
+              "block": 64,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 63,
+          "previous_blocks": 64,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 38220,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 108,
+                "cache_read_input_tokens": 40497,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 108,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        }
+      ],
+      "summary": {
+        "main_streams": 11,
+        "prompt_tokens": 440199,
+        "cache_reads": 398971
+      }
+    },
+    "large_user_history_tail": {
+      "runs": [
+        {
+          "turn": 1,
+          "exit_code": 0,
+          "elapsed_ms": 32743,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 1,
+              "request_id": 1,
+              "prompt_tokens": 150056,
+              "completion_tokens": 147,
+              "cached_tokens": 0,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 1,
+              "request_id": 2,
+              "prompt_tokens": 150098,
+              "completion_tokens": 85,
+              "cached_tokens": 39234,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 3,
+              "turn_id": 1,
+              "request_id": 3,
+              "prompt_tokens": 150231,
+              "completion_tokens": 72,
+              "cached_tokens": 39234,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 4,
+              "turn_id": 1,
+              "request_id": 4,
+              "prompt_tokens": 150336,
+              "completion_tokens": 16,
+              "cached_tokens": 39234,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 32617,
+              "rounds": 4,
+              "tool_calls": 3,
+              "total_tokens": 601041,
+              "prompt_tokens": 600721,
+              "completion_tokens": 320,
+              "cached_tokens": 117702,
+              "cache_hit_rate": 0.1959345519800373,
+              "ttft_ms": 14398,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file",
+            "read_file",
+            "read_file"
+          ],
+          "errors": []
+        }
+      ],
+      "wire_metadata": [
+        {
+          "ordinal": 1,
+          "lane": "auxiliary",
+          "model": "qwen4-max-preview",
+          "tools": 0,
+          "messages": 1,
+          "blocks": 2,
+          "markers": [
+            {
+              "path": "system[0]",
+              "block": 0,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 1,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 737,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 764,
+                "output_tokens": 39,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 2,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 1,
+          "blocks": 45,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 44,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148919,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 147,
+                "cache_creation_input_tokens": 150050,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 150050,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 3,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 3,
+          "blocks": 48,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[1].content[0]",
+              "block": 45,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[2].content[1]",
+              "block": 47,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 44,
+          "previous_blocks": 45,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148824,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 85,
+                "cache_creation_input_tokens": 110858,
+                "cache_read_input_tokens": 39234,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 110858,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 4,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 5,
+          "blocks": 50,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[3].content[0]",
+              "block": 47,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[4].content[1]",
+              "block": 49,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 47,
+          "previous_blocks": 48,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148824,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 72,
+                "cache_creation_input_tokens": 110991,
+                "cache_read_input_tokens": 39234,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 110991,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 5,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 7,
+          "blocks": 52,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[5].content[0]",
+              "block": 49,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[6].content[1]",
+              "block": 51,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": 49,
+          "previous_blocks": 50,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148824,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 16,
+                "cache_creation_input_tokens": 111096,
+                "cache_read_input_tokens": 39234,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 111096,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        }
+      ],
+      "summary": {
+        "main_streams": 4,
+        "prompt_tokens": 600721,
+        "cache_reads": 117702
+      }
+    },
+    "large_user_history_stable": {
+      "runs": [
+        {
+          "turn": 1,
+          "exit_code": 0,
+          "elapsed_ms": 31229,
+          "usage": [
+            {
+              "type": "usage",
+              "round": 1,
+              "turn_id": 1,
+              "request_id": 1,
+              "prompt_tokens": 150063,
+              "completion_tokens": 175,
+              "cached_tokens": 0,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 2,
+              "turn_id": 1,
+              "request_id": 2,
+              "prompt_tokens": 150106,
+              "completion_tokens": 73,
+              "cached_tokens": 39238,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 3,
+              "turn_id": 1,
+              "request_id": 3,
+              "prompt_tokens": 150239,
+              "completion_tokens": 120,
+              "cached_tokens": 150065,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            },
+            {
+              "type": "usage",
+              "round": 4,
+              "turn_id": 1,
+              "request_id": 4,
+              "prompt_tokens": 150347,
+              "completion_tokens": 21,
+              "cached_tokens": 150198,
+              "elapsed_ms": 0,
+              "reasoning_elapsed_ms": 0
+            }
+          ],
+          "terminal": [
+            {
+              "type": "turn.completed",
+              "stop_reason": "Stopped",
+              "exit_code": 0,
+              "duration_ms": 31088,
+              "rounds": 4,
+              "tool_calls": 3,
+              "total_tokens": 601144,
+              "prompt_tokens": 600755,
+              "completion_tokens": 389,
+              "cached_tokens": 339501,
+              "cache_hit_rate": 0.5651238857770639,
+              "ttft_ms": 13241,
+              "snapshot_error": null
+            }
+          ],
+          "tool_names": [
+            "read_file",
+            "read_file",
+            "read_file"
+          ],
+          "errors": []
+        }
+      ],
+      "wire_metadata": [
+        {
+          "ordinal": 1,
+          "lane": "auxiliary",
+          "model": "qwen4-max-preview",
+          "tools": 0,
+          "messages": 1,
+          "blocks": 2,
+          "markers": [
+            {
+              "path": "system[0]",
+              "block": 0,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 1,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 737,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 252,
+                "output_tokens": 47,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 512
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 2,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 1,
+          "blocks": 45,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[0].content[0]",
+              "block": 44,
+              "type": "text"
+            }
+          ],
+          "shared_prior_blocks": null,
+          "previous_blocks": null,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148926,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 6,
+                "output_tokens": 175,
+                "cache_creation_input_tokens": 150057,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 150057,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 3,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 3,
+          "blocks": 48,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[1].content[0]",
+              "block": 45,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[2].content[0]",
+              "block": 46,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 44,
+          "previous_blocks": 45,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148831,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 73,
+                "cache_creation_input_tokens": 110827,
+                "cache_read_input_tokens": 39238,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 110827,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 4,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 5,
+          "blocks": 50,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[3].content[0]",
+              "block": 47,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[4].content[0]",
+              "block": 48,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 47,
+          "previous_blocks": 48,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148831,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 120,
+                "cache_creation_input_tokens": 133,
+                "cache_read_input_tokens": 150065,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 133,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        },
+        {
+          "ordinal": 5,
+          "lane": "main",
+          "model": "qwen4-max-preview",
+          "tools": 43,
+          "messages": 7,
+          "blocks": 52,
+          "markers": [
+            {
+              "path": "tools[42]",
+              "block": 42,
+              "type": "tool_definition"
+            },
+            {
+              "path": "system[0]",
+              "block": 43,
+              "type": "text"
+            },
+            {
+              "path": "messages[5].content[0]",
+              "block": 49,
+              "type": "tool_use"
+            },
+            {
+              "path": "messages[6].content[0]",
+              "block": 50,
+              "type": "tool_result"
+            }
+          ],
+          "shared_prior_blocks": 49,
+          "previous_blocks": 50,
+          "usage_events": [
+            {
+              "event": "message_start",
+              "usage": {
+                "input_tokens": 148831,
+                "output_tokens": 0
+              }
+            },
+            {
+              "event": "message_delta",
+              "usage": {
+                "input_tokens": 41,
+                "output_tokens": 21,
+                "cache_creation_input_tokens": 108,
+                "cache_read_input_tokens": 150198,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 108,
+                  "ephemeral_1h_input_tokens": 0
+                }
+              }
+            }
+          ],
+          "http_status": 200
+        }
+      ],
+      "summary": {
+        "main_streams": 4,
+        "prompt_tokens": 600755,
+        "cache_reads": 339501
+      }
+    }
+  }
+}

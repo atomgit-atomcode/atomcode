@@ -14,6 +14,10 @@ use anyhow::Result;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+mod cloud_cmd;
+use atomcode::browser_cmd;
+use atomcode::git_auth_cmd;
+mod grape_cmd;
 mod headless_json;
 mod lsp_cmd;
 mod review;
@@ -630,7 +634,7 @@ struct Cli {
     #[arg(long)]
     provider: Option<String>,
 
-    /// Model to use (overrides config provider model)
+    /// Model to use; a configured provider/model selection switches the full route
     #[arg(long)]
     model: Option<String>,
 
@@ -680,6 +684,10 @@ struct Cli {
     #[arg(long, requires = "headless_input")]
     no_tools: bool,
 
+    /// Disable default pre-handoff review guidance; explicit /review remains available.
+    #[arg(long)]
+    no_review: bool,
+
     /// Headless stdout format: assistant text (default) or versioned JSON Lines.
     #[arg(
         long,
@@ -688,6 +696,14 @@ struct Cli {
         requires = "headless_input"
     )]
     output_format: HeadlessOutputFormat,
+
+    /// Require an enabled, catch-all required approval hook for headless tools.
+    #[arg(
+        long,
+        requires = "headless_input",
+        conflicts_with = "dangerously_skip_permissions"
+    )]
+    require_approval_hook: bool,
 
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
@@ -762,6 +778,32 @@ enum HeadlessOutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Look at the assets another AI coding agent left behind: instructions,
+    /// skills, MCP servers, provider settings. Read-only unless --apply.
+    Import {
+        /// Print the report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Import the provider accounts, asking before each one.
+        #[arg(long)]
+        apply: bool,
+        /// Skip confirmation for user accounts without a literal credential.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Configure an externally installed isolated browser MCP.
+    #[command(subcommand)]
+    Browser(browser_cmd::BrowserCli),
+    /// Enable, disable or diagnose the bundled Huawei Cloud sandbox integration.
+    #[command(subcommand)]
+    Cloud(cloud_cmd::CloudCli),
+    /// Connect Grape once, then query and hand off tasks through native tools.
+    #[command(subcommand)]
+    Grape(grape_cmd::GrapeCli),
+    /// Diagnose local Git authentication without retrieving credentials or contacting a remote.
+    #[command(subcommand)]
+    GitAuth(git_auth_cmd::GitAuthCli),
     /// Sign in with AtomGit OAuth and claim CodingPlan models in one
     /// flow: OAuth (if needed) → claim → fetch models → register
     /// providers → fetch status. Reports each step and exits.
@@ -821,8 +863,8 @@ enum Commands {
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
         /// 端口（默认 13457，刻意错开 VSCode 守护进程的 13456，避免抢端口导致扩展 401/无响应）
-        #[arg(long, default_value_t = atomcode_daemon::WEBUI_DEFAULT_PORT)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
         /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -861,11 +903,23 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
+    /// Check project capabilities and install optional tools after confirmation.
     Setup {
         /// Take over a stale lock AND force reinstall even if seeds are already present.
         #[arg(long)]
         force: bool,
+        /// Inspect capabilities without installing seed skills.
+        #[arg(long, conflicts_with_all = ["install", "skip"])]
+        check: bool,
+        /// Review a setup plan: ast-grep or context7. Requires --yes to apply it.
+        #[arg(long, value_parser = ["ast-grep", "context7"], conflicts_with = "skip")]
+        install: Option<String>,
+        /// Apply the requested installation/configuration plan.
+        #[arg(long, requires = "install")]
+        yes: bool,
+        /// Acknowledge the current project recommendations without installing.
+        #[arg(long)]
+        skip: bool,
     },
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
@@ -1154,8 +1208,8 @@ fn warn_console_encoding() {
         let (input, output) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
         if input != CP_UTF8 || output != CP_UTF8 {
             eprintln!(
-                "Console code pages: input {input}, output {output} (expected UTF-8 / 65001).\n\
-                 CJK input/output may be garbled. Use Windows Terminal, or launch with:\n\
+                "Console code pages before TUI setup: input {input}, output {output} (UTF-8 is 65001).\n\
+                 The TUI will request UTF-8 and verify it before accepting input. Legacy console paths may alter pasted Unicode, including emoji, not just its display. If setup fails, use Windows Terminal or launch with:\n\
                  cmd.exe /c \"chcp 65001 >nul & atomcode\""
             );
         }
@@ -1333,7 +1387,46 @@ fn merge_startup_notices(
     }
 }
 
+/// Host bootstrap only; local diagnostic/setup commands never call this.
+async fn load_saved_git_auth() -> Result<()> {
+    let root = atomcode_coding::config::product_dirs_from_env()
+        .user()
+        .to_path_buf();
+    let executable = std::env::current_exe()?;
+    let loaded = tokio::task::spawn_blocking(move || {
+        atomcode_auth::git_ssh::unlock_registered(&root, &executable)
+    })
+    .await;
+    if !matches!(loaded, Ok(Ok(_))) {
+        eprintln!("SSH automatic key loading failed. Run `atomcode git-auth unlock` externally to diagnose; no password prompt or retry was attempted.");
+    }
+    Ok(())
+}
+
 async fn async_main(process_start: std::time::Instant) {
+    if let Some(code) = atomcode_auth::git_ssh::worker_exit_code() {
+        std::process::exit(code);
+    }
+    // Local desktop setup/diagnosis must precede logging, install bookkeeping
+    // and pending upgrades. In particular, status and a failed permission probe
+    // must not create a product tree. Parse the full CLI, not an argv substring
+    // that could also be a prompt or an option value.
+    if let Ok(cli) = Cli::try_parse() {
+        let local_result = match cli.command {
+            Some(Commands::Browser(command)) => Some(browser_cmd::handle(command).await),
+            Some(Commands::GitAuth(command)) => Some(git_auth_cmd::handle(command).await),
+            _ => None,
+        };
+        if let Some(result) = local_result {
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("AtomCode error: {}", error_report(&error));
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
@@ -1550,6 +1643,7 @@ fn set_env_command(env: &str) -> String {
 
 async fn run(process_start: std::time::Instant) -> Result<i32> {
     let _webui_relay = atomcode::webui_relay::ShutdownGuard;
+    let _phone_relay = atomcode::tui_share::PhoneRelayGuard;
     // All total_ms values share the native-entry clock, including local upgrade setup.
     let run_start = process_start;
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --
@@ -1587,6 +1681,23 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    if matches!(
+        &cli.command,
+        None | Some(Commands::Resume { .. } | Commands::Acp)
+    ) {
+        load_saved_git_auth().await?;
+    }
+    if let Some(Commands::Cloud(cloud_cmd::CloudCli::Prepare { user_dir })) = &cli.command {
+        return cloud_cmd::handle(cloud_cmd::CloudCli::Prepare {
+            user_dir: user_dir.clone(),
+        })
+        .map(|()| 0);
+    }
+    // Launch-only override: inherited by deferred runtimes and reloads, never
+    // written to config.toml. CLI takes precedence over an inherited env value.
+    if cli.no_review {
+        std::env::set_var("ATOMCODE_AUTO_REVIEW", "0");
+    }
     let prompt_overrides = resolve_prompt_overrides(&cli)?;
     if cli.command.is_some()
         && (prompt_overrides.replace.is_some()
@@ -1789,6 +1900,21 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         .await;
     // ── End telemetry init ────────────────────────────────────────────────────
 
+    if matches!(
+        &cli.command,
+        None | Some(
+            Commands::Resume { .. }
+                | Commands::Login
+                | Commands::Codingplan
+                | Commands::Webui { .. }
+                | Commands::Daemon { .. }
+                | Commands::Acp
+        )
+    ) {
+        // Optional local integration must never block or fail the coding session.
+        let _ = cloud_cmd::preinstall();
+    }
+
     // Handle subcommands. Most are self-contained (`handle_command` runs
     // and exits); `Login` (and its hidden alias `Codingplan`) run the
     // full OAuth + CodingPlan setup flow and then fall through to the
@@ -1813,6 +1939,15 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     };
     if let Some(cmd) = cli.command {
         match cmd {
+            Commands::Import { json, apply, yes } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let exit_code = run_import_command(json, apply, yes, cli.config.as_deref()).await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return Ok(exit_code);
+            }
+
             // Not a terminal command: fall through to the TUI/headless launch with
             // `resume_selector` already captured above (interactive by default; add
             // `-p` to run headless resumed).
@@ -2055,9 +2190,23 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     .await;
                 return Ok(0);
             }
-            Commands::Setup { force } => {
+            Commands::Setup {
+                force,
+                check,
+                install,
+                yes,
+                skip,
+            } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let exit_code = run_setup_command(force);
+                let exit_code = run_setup_command(
+                    force,
+                    check,
+                    install.as_deref(),
+                    yes,
+                    skip,
+                    cli.config.clone().unwrap_or_else(Config::default_path),
+                )
+                .await;
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
@@ -2080,7 +2229,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     &mut config,
                     cli.provider.as_deref(),
                     cli.model.as_deref(),
-                );
+                )?;
                 let working_dir = resolve_working_dir(cli.dir.clone());
                 let runtime_cfg = runtime_config_from(
                     &config,
@@ -2236,7 +2385,9 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 return Ok(code);
             }
             other => {
-                let result = handle_command(other, &telemetry).await.map(|_| 0);
+                let result = handle_command(other, &telemetry, cli.config.as_deref())
+                    .await
+                    .map(|_| 0);
                 // Flush any events emitted by the subcommand (e.g. login_success)
                 // before the process exits. Bounded by the same 500ms budget as
                 // other exit paths.
@@ -2336,7 +2487,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     // background task fires on completion, so the slash menu refreshes
     // without a restart.
 
-    apply_cli_runtime_overrides(&mut config, cli.provider.as_deref(), cli.model.as_deref());
+    apply_cli_runtime_overrides(&mut config, cli.provider.as_deref(), cli.model.as_deref())?;
 
     // Mutable: a `resume <id>` whose session lives in another project adopts that
     // session's own directory below (Plan A).
@@ -2462,7 +2613,11 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         !is_headless,
     );
     runtime_cfg.prompt_overrides = prompt_overrides.clone();
+    runtime_cfg.require_approval_hook = cli.require_approval_hook;
     runtime_cfg.next_prompt_suggestions = !is_headless;
+    // The TUI shows the turn a background completion starts; `-p` exits at its
+    // first turn terminal, so there the model must wait with `bash_poll`.
+    runtime_cfg.background_wakeups = !is_headless;
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
     } else {
@@ -2759,6 +2914,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     // still forces it off on a single run.
                     mouse: config.ui.mouse && !cli.no_mouse,
                     scrollbar: format!("{:?}", config.ui.scrollbar).to_lowercase(),
+                    wrap_diff: config.ui.wrap_diff,
                     ..Default::default()
                 };
                 tracing::info!(
@@ -3108,7 +3264,38 @@ fn apply_cli_runtime_overrides(
     config: &mut atomcode_config::config::Config,
     provider_override: Option<&str>,
     model_override: Option<&str>,
-) {
+) -> anyhow::Result<()> {
+    // A qualified `provider/model` that is itself a configured selection is a
+    // complete route, not a model name to send to whichever account happens to
+    // be active. Keep `--provider` authoritative when both flags are supplied;
+    // in that case `--model` retains its historical meaning as an override of
+    // the explicitly selected provider's model.
+    if let Some(selection) = model_override.filter(|selection| {
+        provider_override.is_none() && selection.contains('/') && config.selection_exists(selection)
+    }) {
+        let selection = selection.to_string();
+        config.default_model = Some(selection.clone());
+        config.default_provider = selection;
+        return Ok(());
+    }
+    // A qualified model whose prefix names another configured account is
+    // almost certainly a provider-selection typo. Fail before making a request
+    // to the currently active account with the other account's model id.
+    if provider_override.is_none() {
+        if let Some(model) = model_override {
+            if let Some((account, _)) = model.split_once('/') {
+                if config.logical_accounts().contains_key(account)
+                    && config
+                        .resolve_model(None)
+                        .is_ok_and(|active| active.account_id != account)
+                {
+                    anyhow::bail!(
+                        "model `{model}` belongs to account `{account}`, while the active model uses another account; use `--provider <selection>` to switch the complete provider route"
+                    );
+                }
+            }
+        }
+    }
     let provider_name = provider_override
         .map(str::to_string)
         // Fall back to the canonical active selection (new-schema `default_model`
@@ -3124,10 +3311,10 @@ fn apply_cli_runtime_overrides(
         } else if let Some(m) = config.models.get_mut(&provider_name) {
             m.model = model.to_string();
         } else {
-            return;
+            return Ok(());
         }
     } else if !config.selection_exists(&provider_name) {
-        return;
+        return Ok(());
     }
     if provider_override.is_some() {
         // `default_model` is canonical (`effective_model_selection` prefers it);
@@ -3135,6 +3322,7 @@ fn apply_cli_runtime_overrides(
         config.default_model = Some(provider_name.clone());
         config.default_provider = provider_name;
     }
+    Ok(())
 }
 
 /// Derive the coding runtime config from the current config + working dir.
@@ -3262,6 +3450,13 @@ pub(crate) async fn spawn_native_cli_runtime(
     // CLI serves both interactive and headless spawns, which is why
     // `prepare_from_config` resolves bypass-downgrade from `cfg.interactive`.
     let mut prepare = atomcode_coding::prepare_from_config(cfg);
+    if ephemeral {
+        // This headless session is neither shown in a picker nor persisted.
+        // Its first prompt must not spend a separate model call on a title.
+        prepare.host_plugins = prepare.host_plugins.with_layer(
+            atomcode_coding::host::Layer::new().disable("session-title-on-first-prompt"),
+        );
+    }
     if no_tools {
         prepare.tools = false;
         prepare.skill_dirs = Some(Vec::new());
@@ -3421,7 +3616,7 @@ pub(crate) async fn run_native_headless_detailed(
         handle,
         mut events,
         task,
-        ..
+        session,
     } = runtime;
     let jsonl = output_format == HeadlessOutputFormat::Jsonl;
     let captured = capture.then(String::new);
@@ -3429,6 +3624,7 @@ pub(crate) async fn run_native_headless_detailed(
     if jsonl {
         write_headless_json_event(&headless_json::HeadlessEvent::RunStarted {
             schema_version: 1,
+            session_id: session.map(|binding| binding.id),
             provider: provider_name,
             model: model_name,
         })?;
@@ -3655,6 +3851,7 @@ pub(crate) async fn run_native_headless_detailed(
             CodingRuntimeEvent::Agent(KernelEvent::OutputTruncationRecovery {
                 attempt,
                 max_attempts,
+                reason,
             }) if jsonl => {
                 write_headless_json_event(&headless_json::HeadlessEvent::Retry {
                     kind: "output_truncation".into(),
@@ -3662,7 +3859,7 @@ pub(crate) async fn run_native_headless_detailed(
                     max_attempts,
                     recovered: None,
                     backoff_secs: None,
-                    reason: None,
+                    reason,
                 })?;
             }
             CodingRuntimeEvent::Agent(KernelEvent::ProviderRetry {
@@ -3791,7 +3988,9 @@ pub(crate) async fn run_native_headless_detailed(
                 if let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) =
                     completion
                 {
-                    if outcome.committed {
+                    if let Some(message) = outcome.diagnostic_message() {
+                        eprintln!("[compact] {message}");
+                    } else if outcome.committed {
                         eprintln!(
                             "[compact] {}",
                             atomcode_config::i18n::format_compaction_mark(
@@ -3899,45 +4098,146 @@ pub(crate) async fn run_native_headless_detailed(
     Ok((exit_code, captured, failure_diagnostic))
 }
 
-/// Drive `atomcode_capabilities::setup::run` end-to-end and return the CLI exit code
-/// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
-/// run it directly since `Commands::Setup` already runs outside the TUI loop.
-fn run_setup_command(force: bool) -> i32 {
-    use atomcode_capabilities::setup;
+/// Seed bootstrap and capability setup share the same local service as the TUI.
+/// Where our configuration lives.
+///
+/// The host owns this path. `--config` wins when it is given, the same way it
+/// does everywhere else in this binary (`main.rs:1801`); otherwise it is the
+/// default location — the same file `atomcode login` writes to.
+fn cli_config_path(cli_config: Option<&std::path::Path>) -> std::path::PathBuf {
+    match cli_config {
+        Some(path) => path.to_path_buf(),
+        None => atomcode_config::config::Config::default_path(),
+    }
+}
 
-    let project_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("setup error: cannot read current directory: {e}");
-            return 1;
+async fn run_import_command(
+    json: bool,
+    apply: bool,
+    yes: bool,
+    cli_config: Option<&std::path::Path>,
+) -> i32 {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let project = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let config_path = cli_config_path(cli_config);
+    let ctx = atomcode::import_cmd::scan_context(&home, &project, dirs, &config_path);
+    let sources = atomcode_capabilities::migration::builtin_sources();
+    if !apply {
+        let (mut report, drafts) =
+            atomcode_capabilities::migration::scan_with_provider_drafts(&sources, &ctx);
+        atomcode::import_cmd::mark_already_imported(&mut report, &drafts, &config_path);
+        println!("{}", atomcode::import_cmd::render(&report, json));
+        return 0;
+    }
+
+    // Phase two: provider accounts. `--apply` without `--yes` asks per item.
+    match atomcode::import_cmd::apply_provider_accounts(
+        &sources,
+        &ctx,
+        yes,
+        &config_path,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    ) {
+        Ok((text, skipped)) => {
+            println!("{text}");
+            // Something was left out on purpose: that is not a success.
+            if skipped > 0 {
+                1
+            } else {
+                0
+            }
         }
-    };
-    let mut opts = setup::RunOptions::new(
-        project_root,
-        atomcode_coding::config::product_dirs_from_env(),
-    );
-    opts.force = force;
+        Err(error) => {
+            eprintln!("import: {error}");
+            1
+        }
+    }
+}
 
-    match setup::run(opts) {
-        Ok(report) => {
+async fn run_setup_command(
+    force: bool,
+    check: bool,
+    install: Option<&str>,
+    yes: bool,
+    skip: bool,
+    config_path: std::path::PathBuf,
+) -> i32 {
+    let result: anyhow::Result<()> = async {
+        use atomcode_capabilities::setup;
+        let root = std::env::current_dir()?;
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let service = atomcode::project_setup::ProjectSetup {
+            root: root.clone(),
+            dirs: dirs.clone(),
+            config_path,
+        };
+        if skip {
+            println!("{}", service.dismiss()?);
+            return Ok(());
+        }
+        if let Some(id) = install {
+            let plan = service.plan(id).await?;
+            println!("{}", plan.detail);
+            if !yes {
+                println!("{} setup --install {id} --yes", env!("CARGO_BIN_NAME"));
+                return Ok(());
+            }
+            let result = tokio::select! {
+                result = service.apply(id, &plan.token) => result?,
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("Setup cancelled; inspect the package manager before retrying"),
+            };
+            println!("{result}");
+            return Ok(());
+        }
+        if !check {
+            let mut opts = setup::RunOptions::new(root, dirs);
+            opts.force = force;
+            let report = tokio::task::spawn_blocking(move || setup::run(opts)).await??;
             println!("{}", report.render_cli());
-            0
         }
+        let report = service.check(force).await?;
+        println!("{}", report.summary);
+        for entry in report.entries {
+            println!("\n{}: {}\n{}", entry.name, entry.status, entry.detail);
+            if entry.installable {
+                println!("  {} setup --install {}", env!("CARGO_BIN_NAME"), entry.id);
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => 0,
         Err(e) => {
-            eprintln!("setup error: {e}");
+            eprintln!("setup: {e:#}");
             1
         }
     }
 }
 
 /// Handle subcommands (login, logout, status)
-async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) -> Result<()> {
+async fn handle_command(
+    cmd: Commands,
+    telemetry: &std::sync::Arc<Telemetry>,
+    cli_config: Option<&std::path::Path>,
+) -> Result<()> {
     // Subcommands never enter TUI, so tell the panic hook to skip terminal
     // cleanup — otherwise `disable_raw_mode` panics on Windows with
     // "initial console mode not set" because raw mode was never enabled.
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
     match cmd {
+        Commands::Import { json, apply, yes } => {
+            HEADLESS_MODE.store(true, Ordering::Relaxed);
+            // The exit code is the command's own answer: "something was left
+            // out" is not a success, and a script reading the exit code must
+            // not be told everything went in when it did not. `handle_command`
+            // speaks `Result<()>`, so the code leaves through the process
+            // status — there is no other channel for it here.
+            let exit_code = run_import_command(json, apply, yes, cli_config).await;
+            std::process::exit(exit_code);
+        }
         Commands::Login => {
             // `run()` intercepts Login (and its Codingplan alias) before
             // handle_command is called, running the full OAuth + setup
@@ -4015,6 +4315,10 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Setup is handled inline in run() before handle_command")
         }
         Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
+        Commands::Browser(sub) => browser_cmd::handle(sub).await,
+        Commands::Cloud(sub) => cloud_cmd::handle(sub),
+        Commands::GitAuth(sub) => git_auth_cmd::handle(sub).await,
+        Commands::Grape(sub) => tokio::task::spawn_blocking(move || grape_cmd::handle(sub)).await?,
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
             name,
@@ -4710,29 +5014,50 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
     // writes don't interleave unpredictably with the upgrade work.
     let driver = tokio::spawn(self_update::run_upgrade(current.clone(), force, tx));
 
-    let mut last_pct: i32 = -1;
-    while let Some(ev) = rx.recv().await {
+    use std::io::IsTerminal;
+    let interactive = io::stdout().is_terminal();
+    let mut meter = atomcode::upgrade_progress::DownloadMeter::default();
+    let mut started = None;
+    let mut progress_line = false;
+    let mut ticks = tokio::time::interval(atomcode::upgrade_progress::REFRESH);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let next = tokio::select! {
+            event = rx.recv() => event,
+            _ = ticks.tick(), if interactive && started.is_some() => {
+                if let Some(start) = started {
+                    let frame = meter.frame(tokio::time::Instant::now() - start);
+                    let width = crossterm::terminal::size().map(|size| size.0 as usize).unwrap_or(80).saturating_sub(5);
+                    print!("\r\x1b[2K    {}", frame.download_line(width));
+                    io::stdout().flush().ok();
+                    progress_line = true;
+                }
+                continue;
+            }
+        };
+        let Some(ev) = next else {
+            break;
+        };
+        if !matches!(&ev, UpgradeEvent::Downloading { .. }) {
+            started = None;
+            if progress_line {
+                print!("\r\x1b[2K");
+                io::stdout().flush().ok();
+                progress_line = false;
+            }
+        }
         match ev {
             UpgradeEvent::ManifestFetched { version } => {
                 println!("==> Latest: {}", version);
             }
             UpgradeEvent::Downloading { bytes, total } => {
-                // Debounce to whole percents so we don't spam stdout —
-                // piping the CLI through `tee` with 10k updates is no
-                // fun for anyone.
-                let pct = if total == 0 {
-                    0
-                } else {
-                    ((bytes * 100) / total) as i32
-                };
-                if pct != last_pct {
-                    print!(
-                        "\r    downloading {}% ({} / {} bytes)   ",
-                        pct, bytes, total
-                    );
-                    io::stdout().flush().ok();
-                    last_pct = pct;
+                if started.is_none() {
+                    started = Some(tokio::time::Instant::now());
+                    if !interactive {
+                        println!("==> Downloading update");
+                    }
                 }
+                meter.update(bytes, total);
             }
             UpgradeEvent::Verifying => {
                 println!("\n==> Verifying SHA256");
@@ -4776,6 +5101,10 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         }
     }
 
+    if progress_line {
+        print!("\r\x1b[2K");
+        io::stdout().flush().ok();
+    }
     match driver.await {
         Ok(Ok(summary)) => {
             if let Some(note) = atomcode_updater::upgrade_note(&summary.updates) {
@@ -5047,6 +5376,18 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_review_is_available_without_disabling_tools_or_interactivity() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["atomcode", "--no-review"]).unwrap();
+        assert!(cli.no_review);
+        assert!(!cli.no_tools);
+        let headless =
+            super::Cli::try_parse_from(["atomcode", "--no-review", "-p", "fix it"]).unwrap();
+        assert!(headless.no_review);
+        assert!(!headless.no_tools);
+    }
+
     #[test]
     fn powershell_headless_authorization_is_not_inherited_from_bash() {
         for tool in ["pwsh", "pwsh_start"] {
@@ -5525,6 +5866,18 @@ mod tests {
     }
 
     #[test]
+    fn webui_distinguishes_an_omitted_port_from_an_explicit_port() {
+        for (args, expected) in [
+            (vec!["atomcode", "webui"], None),
+            (vec!["atomcode", "webui", "--port", "13457"], Some(13457)),
+            (vec!["atomcode", "webui", "--port", "0"], Some(0)),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Some(Commands::Webui { port, .. }) if port == expected));
+        }
+    }
+
+    #[test]
     fn completion_subcommand_defaults_to_bash_and_accepts_all_supported_shells() {
         let default = Cli::try_parse_from(["atomcode", "completion"]).unwrap();
         assert!(matches!(
@@ -5987,9 +6340,154 @@ mod tests {
         )
         .unwrap();
 
-        apply_cli_runtime_overrides(&mut config, Some("direct"), None);
+        apply_cli_runtime_overrides(&mut config, Some("direct"), None).unwrap();
 
         assert_eq!(config.default_provider, "direct");
+    }
+
+    #[test]
+    fn qualified_model_selection_switches_the_complete_provider_route() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "deepseek/flash"
+
+                [provider_accounts.deepseek]
+                provider = "openai"
+                base_url = "https://deepseek.example/v1"
+                api_key = "deepseek-key"
+
+                [models."deepseek/flash"]
+                account = "deepseek"
+                model = "deepseek-flash"
+                context_window = 131072
+
+                [provider_accounts.qianwenai]
+                provider = "anthropic"
+                base_url = "https://qianwen.example/v1"
+                api_key = "qianwen-key"
+
+                [models."qianwenai/qwen3.8-flash"]
+                account = "qianwenai"
+                model = "qwen3.8-flash"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(&mut config, None, Some("qianwenai/qwen3.8-flash")).unwrap();
+
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("qianwenai/qwen3.8-flash")
+        );
+        let runtime = runtime_config_from(
+            &config,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.provider_name, "qianwenai/qwen3.8-flash");
+        assert_eq!(runtime.model, "qwen3.8-flash");
+        assert_eq!(runtime.base_url, "https://qianwen.example/v1");
+        assert_eq!(runtime.api_key, "qianwen-key");
+    }
+
+    #[test]
+    fn bare_model_override_stays_on_the_current_provider() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_provider = "deepseek"
+
+                [providers.deepseek]
+                type = "openai"
+                model = "deepseek-flash"
+                base_url = "https://deepseek.example/v1"
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(&mut config, None, Some("another-model")).unwrap();
+
+        assert_eq!(config.providers["deepseek"].model, "another-model");
+        assert_eq!(config.default_provider, "deepseek");
+    }
+
+    #[test]
+    fn qualified_model_for_another_account_fails_before_requesting() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "deepseek/flash"
+
+                [provider_accounts.deepseek]
+                provider = "openai"
+                base_url = "https://deepseek.example/v1"
+
+                [models."deepseek/flash"]
+                account = "deepseek"
+                model = "deepseek-flash"
+                context_window = 131072
+
+                [provider_accounts.qianwenai]
+                provider = "anthropic"
+                base_url = "https://qianwen.example/v1"
+
+                [models."qianwenai/other-model"]
+                account = "qianwenai"
+                model = "other-model"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+
+        let error =
+            apply_cli_runtime_overrides(&mut config, None, Some("qianwenai/unconfigured-model"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("use `--provider <selection>`"));
+        assert_eq!(config.default_model.as_deref(), Some("deepseek/flash"));
+    }
+
+    #[test]
+    fn explicit_provider_keeps_precedence_over_qualified_model_override() {
+        let mut config: atomcode_config::config::Config = toml::from_str(
+            r#"
+                default_model = "deepseek/flash"
+
+                [provider_accounts.deepseek]
+                provider = "openai"
+                base_url = "https://deepseek.example/v1"
+
+                [models."deepseek/flash"]
+                account = "deepseek"
+                model = "deepseek-flash"
+                context_window = 131072
+
+                [provider_accounts.qianwenai]
+                provider = "anthropic"
+                base_url = "https://qianwen.example/v1"
+
+                [models."qianwenai/qwen3.8-flash"]
+                account = "qianwenai"
+                model = "qwen3.8-flash"
+                context_window = 131072
+            "#,
+        )
+        .unwrap();
+
+        apply_cli_runtime_overrides(
+            &mut config,
+            Some("deepseek/flash"),
+            Some("qianwenai/qwen3.8-flash"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.models["deepseek/flash"].model,
+            "qianwenai/qwen3.8-flash"
+        );
+        assert_eq!(config.default_model.as_deref(), Some("deepseek/flash"));
     }
 
     #[test]

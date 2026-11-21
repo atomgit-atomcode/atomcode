@@ -1,23 +1,7 @@
-//! 种子安装端口:`atomcode --tui` 这一侧的另一半。
-//!
-//! `atomcode_tui::commands::SetupCommands` 编排那三步(装 → 重载 → 转发);
-//! 这里只回答「装过没有」和「装一遍,装在哪个项目上」(`docs/adr/0022` §3)。
-//!
-//! **为什么住在 cli 而不在 tui**:装种子要 `atomcode-capabilities` 的 `setup`
-//! feature —— 解压内嵌的 `setup-seeds.tar.zst`、扫描项目、原子写、文件锁。
-//! `atomcode-tui` 刻意把 feature 收到 `tools`(见它的 `Cargo.toml`),而 cli 本来就
-//! 开着 `setup`(`atomcode setup` 子命令用的是同一套函数)。给 tui 开这个 feature,
-//! 等于为了重复这个二进制已经会做的动作,把解压栈拉进每一个用它的前端。
-//!
-//! **装是阻塞的,所以走 `spawn_blocking`**:`setup::run` 通篇是文件 I/O(自带注释
-//! 说明「If called from an async context, use `tokio::task::spawn_blocking`」)。
-//! 老前端在 tokio 里用 `block_in_place` 硬扛,那是它跑在事件循环线程上的形状;
-//! 这里的端口是 async 的,于是一个阻塞线程就够,而且不拖住别人的回合。
-//!
-//! **种子装到哪**:宿主交进来的用户目录(`ProductDirs::user`)
-//! —— 和 `SkillRegistry` 扫的是同一个目录(`standard_skill_dirs`),所以装完重载一下
-//! agent 就看得见。老前端装的是**同一个位置**,不是项目级:`/setup` 在一台新机器上
-//! 装的那一个 `setup` skill,是全机器共用的。
+//! Host implementation of the TUI setup port. Capability checks and confirmed
+//! actions follow the current session directory supplied by the screen. Settings
+//! are reread from the launcher's selected config file, not copied into row config.
+//! Seed skills remain user-wide and bootstrap through the existing setup installer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,15 +21,75 @@ pub struct DiskSetup {
     home: PathBuf,
     working_dir: PathBuf,
     dirs: ProductDirs,
+    config_path: PathBuf,
+    operations: SetupOperations,
 }
 
 impl DiskSetup {
-    pub fn new(working_dir: PathBuf, dirs: ProductDirs) -> Arc<Self> {
+    pub fn new(working_dir: PathBuf, dirs: ProductDirs, config_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             home: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
             working_dir,
             dirs,
+            config_path,
+            operations: SetupOperations::default(),
         })
+    }
+}
+
+impl DiskSetup {
+    fn capabilities(&self, root: &std::path::Path) -> crate::project_setup::ProjectSetup {
+        crate::project_setup::ProjectSetup {
+            root: root.into(),
+            dirs: self.dirs.clone(),
+            config_path: self.config_path.clone(),
+        }
+    }
+}
+
+/// One local setup operation at a time; cancellation drops its owned process future.
+#[derive(Default)]
+struct SetupOperations {
+    active: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+}
+
+struct OperationGuard<'a>(&'a SetupOperations);
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .lock()
+            .expect("setup operation poisoned")
+            .take();
+    }
+}
+
+impl SetupOperations {
+    async fn run(
+        &self,
+        operation: impl std::future::Future<Output = Result<String, String>>,
+    ) -> Result<String, String> {
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        {
+            let mut active = self.active.lock().expect("setup operation poisoned");
+            if active.is_some() {
+                return Err("Setup is already running; use /setup cancel first".into());
+            }
+            *active = Some(stop);
+        }
+        let _guard = OperationGuard(self);
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => Err("Setup cancelled; inspect capability state before retrying".into()),
+            result = operation => result,
+        }
+    }
+    fn cancel(&self) -> Result<String, String> {
+        let active = self.active.lock().expect("setup operation poisoned");
+        let stop = active.as_ref().ok_or("No setup operation is running")?;
+        stop.send(true)
+            .map_err(|_| "Setup has already finished".to_string())?;
+        Ok("Cancelling setup…".into())
     }
 }
 
@@ -78,6 +122,44 @@ fn seed_installed(home: &std::path::Path, project: &std::path::Path, dirs: &Prod
 impl Setup for DiskSetup {
     fn installed(&self) -> bool {
         seed_installed(&self.home, &self.working_dir, &self.dirs)
+    }
+
+    fn capability_setup(&self) -> bool {
+        true
+    }
+
+    async fn check(
+        &self,
+        root: &std::path::Path,
+        force: bool,
+    ) -> Result<Option<atomcode_tui::setup::CapabilityReport>, String> {
+        self.capabilities(root)
+            .check(force)
+            .await
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+    async fn plan(
+        &self,
+        root: &std::path::Path,
+        id: &str,
+    ) -> Result<atomcode_tui::setup::CapabilityPlan, String> {
+        self.capabilities(root)
+            .plan(id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn apply(&self, root: &std::path::Path, id: &str, token: &str) -> Result<String, String> {
+        let service = self.capabilities(root);
+        self.operations
+            .run(async { service.apply(id, token).await.map_err(|e| e.to_string()) })
+            .await
+    }
+    async fn cancel(&self) -> Result<String, String> {
+        self.operations.cancel()
+    }
+    async fn dismiss(&self, root: &std::path::Path) -> Result<String, String> {
+        self.capabilities(root).dismiss().map_err(|e| e.to_string())
     }
 
     async fn install(&self) -> Result<String, String> {
@@ -121,11 +203,28 @@ mod tests {
         let setup = Arc::new(DiskSetup {
             home,
             working_dir: project.path().to_path_buf(),
+            config_path: dirs.user().join("config.toml"),
+            operations: SetupOperations::default(),
             dirs,
         });
         (project, setup)
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancellation_settles_the_pending_operation_and_allows_another() {
+        let operations = Arc::new(SetupOperations::default());
+        let worker = operations.clone();
+        let task = tokio::spawn(async move { worker.run(std::future::pending()).await });
+        tokio::task::yield_now().await;
+        assert!(operations.run(async { Ok("second".into()) }).await.is_err());
+        operations.cancel().unwrap();
+        assert!(task.await.unwrap().unwrap_err().contains("cancelled"));
+        assert_eq!(
+            operations.run(async { Ok("next".into()) }).await.unwrap(),
+            "next"
+        );
+        assert!(operations.cancel().is_err());
+    }
     /// 没装过就是没装过:一台新机器上 `/setup` 之所以需要屏幕侧那一步,正是因为这
     /// 时候 agent 的命令目录里没有它。
     #[test]

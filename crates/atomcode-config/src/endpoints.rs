@@ -187,6 +187,8 @@ pub fn is_codingplan_llm_gateway(base_url: &str) -> bool {
         Some("llm-api.atomgit.com")
             | Some("pre-llm-api-cce.atomgit.com")
             | Some("api-ai.gitcode.com")
+            | Some("llm-auto-api.atomgit.com")
+            | Some("pre-llm-auto-api.atomgit.com")
     ) {
         return true;
     }
@@ -386,6 +388,8 @@ mod tests {
             "https://llm-api.atomgit.com/v1",
             "https://pre-llm-api-cce.atomgit.com/v1/chat/completions",
             "https://api-ai.gitcode.com/v1",
+            "https://llm-auto-api.atomgit.com/v1",
+            "https://pre-llm-auto-api.atomgit.com/v1",
         ] {
             assert!(is_codingplan_llm_gateway(url), "expected gateway: {url}");
         }

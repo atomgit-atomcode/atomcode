@@ -134,8 +134,11 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 | `atomcode.chat.fontFamily` | `""` | 代码块/工具输出/输入框字体，留空跟随 `editor.fontFamily`；可填 CSS font-family 列表 |
 | `atomcode.autoSave` | `true` | 操作前自动保存 |
 | `atomcode.sendWithCtrlEnter` | `false` | Ctrl+Enter 发送 |
-| `atomcode.fontSize` | `13` | 聊天面板字号 |
+| `atomcode.fontSize` | `13` | 聊天面板默认字号（9–40），修改后实时生效 |
 | `atomcode.showInlineHints` | `true` | 显示内联 diff 提示 |
+
+在聊天消息区按住 Ctrl（macOS 也支持 Cmd）滚动滚轮可缩放字号；正文、代码块和工具输出联动。
+滚轮调整仅保存在当前面板，切换会话或恢复面板时保留，不写入 VS Code 设置。修改 `atomcode.fontSize` 会采用新的默认值。
 
 ---
 

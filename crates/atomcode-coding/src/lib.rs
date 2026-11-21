@@ -53,8 +53,10 @@ mod background_jobs;
 pub mod config;
 mod controllers;
 pub mod discipline;
+mod display_images;
 mod follow_up;
 pub mod front_end;
+mod git_index_policy;
 pub mod host;
 pub mod on_harness;
 pub mod parts;
@@ -149,3 +151,9 @@ pub use atomcode_plexus as plexus;
 mod session_reference;
 
 mod mode_models;
+
+/// Opt-in, runtime-owned quality verification and evidence.
+pub mod quality;
+
+#[cfg(test)]
+mod auxiliary_response_tests;

@@ -285,12 +285,16 @@ class AtomCodeDaemonClient(
     fun sendPermissionDecision(
         sessionId: String,
         decision: String,
+        callId: String,
+        approvalId: String,
         toolName: String? = null,
     ): CompletableFuture<PermissionDecisionResponse> {
         val body = buildString {
             append("{")
             append("\"session_id\":${sessionId.jsonQuoted()},")
-            append("\"decision\":${decision.jsonQuoted()}")
+            append("\"decision\":${decision.jsonQuoted()},")
+            append("\"call_id\":${callId.jsonQuoted()},")
+            append("\"approval_id\":${approvalId.jsonQuoted()}")
             toolName?.takeIf { it.isNotBlank() }?.let {
                 append(",\"tool_name\":${it.jsonQuoted()}")
             }

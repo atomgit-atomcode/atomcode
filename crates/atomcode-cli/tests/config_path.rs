@@ -29,3 +29,29 @@ fn missing_explicit_config_is_reported_by_headless_and_acp() {
         );
     }
 }
+
+#[test]
+fn headless_required_approval_rejects_a_project_hook_without_a_user_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    std::fs::write(
+        dir.path().join(".hooks.json"),
+        r#"{"hooks":{"guard":{"event":"PreToolUse","command":"exit 0","required_approval":true}}}"#,
+    )
+    .unwrap();
+    assert_cmd::Command::new(env!("CARGO_BIN_EXE_atomcode"))
+        .current_dir(dir.path())
+        .env("ATOMCODE_HOME", dir.path().join("state"))
+        .env_remove("ATOMCODE_SEED_CONFIG")
+        .arg("--config")
+        .arg(config)
+        .args(["--require-approval-hook", "--ephemeral", "-p", "hi"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("coding runtime prepare failed"))
+        .stderr(predicates::str::contains(
+            "--require-approval-hook requires",
+        ));
+}

@@ -13,8 +13,8 @@
 //! a hard "final round" nudge on the last executing round. It fabricates no findings; it only
 //! forces the model to commit the ones it already believes in before the cutoff.
 //!
-//! Only active when `max_rounds` is set (engineering callers pass `--max-rounds`); a bare
-//! unbounded CLI run has no budget to pressure against, so the hook is a no-op there.
+//! Active for round or wall-clock budgets. Time pressure prevents a slow model from
+//! reaching its deadline long before its round threshold. Unbounded runs remain unchanged.
 
 use async_trait::async_trait;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -31,6 +31,7 @@ pub struct RoundBudgetHook {
     threshold: f32,
     /// See `ReviewAgentConfig::trace_budget_to_stderr`.
     trace: bool,
+    clock: Option<(tokio::time::Instant, std::time::Duration)>,
 }
 
 impl RoundBudgetHook {
@@ -38,7 +39,17 @@ impl RoundBudgetHook {
         Self {
             threshold: DEFAULT_THRESHOLD,
             trace: false,
+            clock: None,
         }
+    }
+
+    /// Use the caller's remaining wall-clock allowance as landing pressure,
+    /// alongside the existing hard cancellation deadline.
+    pub fn with_duration(mut self, duration: Option<std::time::Duration>) -> Self {
+        self.clock = duration
+            .filter(|d| !d.is_zero())
+            .map(|d| (tokio::time::Instant::now(), d));
+        self
     }
 
     /// Also say on stderr when landing is forced — for a caller that owns the
@@ -79,7 +90,26 @@ fn soft_reminder(round: u32, max: u32) -> String {
 #[async_trait]
 impl LifecycleHooks for RoundBudgetHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
-        // No budget → nothing to pressure against.
+        if let Some((started, limit)) = self.clock {
+            let elapsed = started.elapsed();
+            let remaining = limit.saturating_sub(elapsed).as_secs();
+            let pressure = elapsed >= std::time::Duration::from_secs(300)
+                || elapsed.as_nanos() * 100 >= limit.as_nanos() * 70;
+            let final_pass = elapsed.as_nanos() * 100 >= limit.as_nanos() * 85;
+            if pressure || ctx.round == 1 {
+                let action = if final_pass {
+                    "FINAL landing window: report_finding for every confirmed issue NOW, then close. Do not begin new exploration."
+                } else if pressure {
+                    "Stop broad exploration. Use report_finding for confirmed issues now and conclude; only inspect evidence needed to settle a specific suspicion."
+                } else {
+                    "Prioritize the changed code and use report_finding as soon as an issue is confirmed. Budget expires even if round budget remains; report partial coverage honestly."
+                };
+                messages.push(Message::synthetic_user(format!(
+                    "[review time budget] {remaining}s remaining. {action}"
+                )));
+            }
+        }
+        // No round budget → time pressure above still applies.
         let Some(max) = ctx.max_rounds else { return };
         if max == 0 {
             return;
@@ -126,6 +156,48 @@ mod tests {
             .pre_request(&mut msgs, &ctx(round, max_rounds))
             .await;
         msgs
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wall_clock_pressure_lands_even_with_many_rounds_remaining() {
+        let hook = RoundBudgetHook::new().with_duration(Some(std::time::Duration::from_secs(100)));
+        tokio::time::advance(std::time::Duration::from_secs(70)).await;
+        let mut messages = vec![];
+        hook.pre_request(&mut messages, &ctx(3, Some(200))).await;
+        assert!(messages
+            .iter()
+            .any(|m| m.text.contains("report_finding") && m.text.contains("30s")));
+        tokio::time::advance(std::time::Duration::from_secs(15)).await;
+        let mut messages = vec![];
+        hook.pre_request(&mut messages, &ctx(4, None)).await;
+        assert!(messages
+            .iter()
+            .any(|m| m.text.contains("FINAL") && m.text.contains("15s")));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn default_long_budget_starts_soft_landing_at_five_minutes() {
+        let hook = RoundBudgetHook::new().with_duration(Some(std::time::Duration::from_secs(900)));
+        tokio::time::advance(std::time::Duration::from_secs(299)).await;
+        let mut messages = vec![];
+        hook.pre_request(&mut messages, &ctx(2, Some(200))).await;
+        assert!(messages.is_empty());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        hook.pre_request(&mut messages, &ctx(3, Some(200))).await;
+        assert!(messages
+            .iter()
+            .any(|m| m.text.contains("Stop broad exploration") && m.text.contains("600s")));
+        assert!(messages.iter().all(|m| !m.text.contains("FINAL")));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn duration_only_budget_is_visible_before_exploration() {
+        let hook = RoundBudgetHook::new().with_duration(Some(std::time::Duration::from_secs(300)));
+        let mut messages = vec![];
+        hook.pre_request(&mut messages, &ctx(1, None)).await;
+        assert!(messages
+            .iter()
+            .any(|m| m.text.contains("300s") && m.text.contains("report_finding")));
     }
 
     #[tokio::test]

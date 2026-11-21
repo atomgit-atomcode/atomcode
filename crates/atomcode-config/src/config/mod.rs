@@ -61,12 +61,41 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// Default-on stdio DAP debugging; optional adapter overrides, no credential payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DapConfig {
+    pub enabled: bool,
+    pub adapters: std::collections::BTreeMap<String, DapAdapterConfig>,
+}
+
+impl Default for DapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            adapters: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DapAdapterConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// `[coding]` table. Turn-level knobs for the main coding agent. `max_rounds` is
 /// the per-turn round cap (the interactive checkpoint threshold); `0` = unbounded.
 /// Env `ATOMCODE_TURN_MAX_ROUNDS` overrides this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodingConfig {
+    /// Opt-in read-only repository architecture evidence; scans only on tool use.
+    pub architecture_topology: bool,
+    /// Default pre-handoff code review guidance; explicit reviews remain available.
+    pub auto_review: bool,
     pub max_rounds: u32,
     pub shell_guard_policy: ShellGuardPolicy,
     /// After how many rounds of the very same tool calls a turn is stopped as a
@@ -389,6 +418,8 @@ impl PermissionsConfig {
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
+            architecture_topology: false,
+            auto_review: true,
             max_rounds: 0,
             shell_guard_policy: ShellGuardPolicy::Prompt,
             repeat_stop_rounds: None,
@@ -483,7 +514,7 @@ impl Default for TeamConfig {
 pub struct ExternalSubagentConfig {
     /// Instance name, e.g. `"codex-primary"` → tool `subagent_codex_primary`.
     pub name: String,
-    /// `"codex"` or `"claude-code"`.
+    /// `"codex"`, `"claude-code"`, `"grok"`, or `"opencode"`.
     pub kind: String,
     /// Optional model override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,10 +605,17 @@ pub struct SkillsConfig {
 pub struct CompactionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<std::num::NonZeroU32>,
+    /// Token budget for the recent turns kept full before old tool results are
+    /// stubbed. Lower values stub older output sooner; a value above the
+    /// window-relative budget (a quarter of the context window, clamped) is
+    /// clamped to it, so this can only make stubbing earlier. Omission keeps
+    /// the window-relative default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stub_recent_budget: Option<std::num::NonZeroU32>,
 }
 impl CompactionConfig {
     fn is_default(&self) -> bool {
-        self.token_limit.is_none()
+        self.token_limit.is_none() && self.stub_recent_budget.is_none()
     }
 }
 
@@ -634,6 +672,9 @@ pub struct Config {
     /// having to know the field names in advance.
     #[serde(default, skip_serializing)]
     pub datalog: DatalogConfig,
+    /// Explicit opt-in coding quality checks, independent of approval mode.
+    #[serde(default, skip_serializing_if = "QualityConfig::is_default")]
+    pub quality: QualityConfig,
     /// Task-finished notifications. Saved manually with help comments so users
     /// can discover the terminal-first strategy and platform fallbacks.
     #[serde(default, skip_serializing)]
@@ -657,6 +698,9 @@ pub struct Config {
     /// LSP integration configuration.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Dynamic debugging; runtime sessions are never persisted.
+    #[serde(default)]
+    pub dap: DapConfig,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
     /// [`SubAgentConfig`], including an optional per-subtask round budget (default unbounded).
     #[serde(default)]
@@ -751,9 +795,13 @@ pub struct Config {
 /// Web search backend configuration. Persisted as the `[web_search]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchConfig {
-    /// Search backend: `"exa"` (default — MCP API at mcp.exa.ai, reachable
-    /// without a VPN and returns LLM-ready result text) or `"duckduckgo"`
-    /// (legacy HTML scraping of html.duckduckgo.com, blocked in some regions).
+    /// One-time upgrade marker. After migration, explicit provider choices stay pinned.
+    #[serde(default)]
+    pub auto_default_migrated: bool,
+    /// Search backend: `auto` (default, bounded failover across hosted providers),
+    /// `exa`, `parallel`, `tavily`, `firecrawl`, `tinyfish`, or legacy `duckduckgo`.
+    /// Explicit providers stay pinned. Other provider keys use their corresponding
+    /// PARALLEL_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / TINYFISH_API_KEY env vars.
     #[serde(default = "default_search_provider")]
     pub provider: String,
     /// Optional Exa API key. Also read from the `EXA_API_KEY` env var, which
@@ -763,12 +811,34 @@ pub struct WebSearchConfig {
 }
 
 fn default_search_provider() -> String {
-    "exa".to_string()
+    "auto".to_string()
+}
+
+impl WebSearchConfig {
+    fn migrate_auto_default(&mut self) {
+        if !self.auto_default_migrated {
+            if self.provider.trim().eq_ignore_ascii_case("exa") {
+                self.provider = default_search_provider();
+            }
+            self.auto_default_migrated = true;
+        }
+    }
+
+    pub const PROVIDERS: &'static [&'static str] = &[
+        "auto",
+        "exa",
+        "parallel",
+        "tavily",
+        "firecrawl",
+        "tinyfish",
+        "duckduckgo",
+    ];
 }
 
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
+            auto_default_migrated: true,
             provider: default_search_provider(),
             api_key: None,
         }
@@ -840,6 +910,9 @@ pub enum ScrollbarMode {
 /// Terminal UI preferences, persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// Soft-wrap diff rows in tool results and the /diff reader.
+    #[serde(default = "default_true")]
+    pub wrap_diff: bool,
     /// User overrides for composer shortcuts; omitted actions keep defaults.
     #[serde(default)]
     pub keybindings: UiKeybindings,
@@ -955,6 +1028,7 @@ pub struct UiKeybindings {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            wrap_diff: true,
             keybindings: UiKeybindings::default(),
             theme: UiTheme::default(),
             screen: Screen::default(),
@@ -1152,12 +1226,14 @@ impl Default for Config {
             models: HashMap::new(),
             default_model: None,
             modes: Default::default(),
+            quality: Default::default(),
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
+            dap: Default::default(),
             subagent: Default::default(),
             team: Default::default(),
             loop_config: Default::default(),
@@ -1260,13 +1336,23 @@ impl Config {
     pub fn logical_accounts(&self) -> HashMap<String, ProviderAccountConfig> {
         let mut out: HashMap<String, ProviderAccountConfig> = HashMap::new();
         for (name, p) in &self.providers {
-            if is_codingplan_provider_name(name) {
-                // All CodingPlan flat providers share one gateway + OAuth signer;
-                // fold them into a single account per wire format. Fields are
-                // uniform across the group, so the first one seen defines them.
+            if is_codingplan_provider_name(name)
+                && codingplan_shares_group_gateway(p.base_url.as_deref())
+            {
+                // All CodingPlan flat providers on the canonical shared gateway
+                // share one account + OAuth signer; fold them together. Fields
+                // are uniform across the group, so the first one seen defines
+                // them. Providers on a different per-model gateway keep their
+                // own account (see `codingplan_shares_group_gateway`).
                 let id = codingplan_group_account_id(&p.provider_type);
                 out.entry(id.to_string())
                     .or_insert_with(|| project_legacy_account(p));
+            } else if is_codingplan_provider_name(name) {
+                // A per-model gateway keeps its own account; the provider key
+                // is the composite `{account}-{model}`, so strip the model
+                // suffix to recover the account id.
+                let id = codingplan_explicit_account_id(name, &p.model);
+                out.entry(id).or_insert_with(|| project_legacy_account(p));
             } else {
                 out.insert(name.clone(), project_legacy_account(p));
             }
@@ -1323,9 +1409,15 @@ impl Config {
         let mut out: HashMap<String, ModelProfileConfig> = HashMap::new();
         for (name, p) in &self.providers {
             // Model id stays the legacy provider name (so `default_provider`
-            // resolves); only the parent account folds for CodingPlan providers.
-            let account = if is_codingplan_provider_name(name) {
+            // resolves); only the parent account folds for CodingPlan providers
+            // on the canonical shared gateway. A per-model gateway keeps its
+            // own account id (== provider name) so distinct base URLs survive.
+            let account = if is_codingplan_provider_name(name)
+                && codingplan_shares_group_gateway(p.base_url.as_deref())
+            {
                 codingplan_group_account_id(&p.provider_type).to_string()
+            } else if is_codingplan_provider_name(name) {
+                codingplan_explicit_account_id(name, &p.model)
             } else {
                 name.clone()
             };
@@ -1500,6 +1592,9 @@ impl Config {
             .clone()
             .or_else(|| preset.default_base_url.map(str::to_string));
         let api_key = resolve_account_api_key(account, preset);
+        if account.disable_api_key_fallback && account.api_key.is_some() && api_key.is_none() {
+            return Err(MissingBoundApiKey(model.account.clone()).into());
+        }
         Ok(ResolvedModelConfig {
             selection_id,
             account_id: model.account.clone(),
@@ -1528,10 +1623,15 @@ impl Config {
                 model.reasoning_effort_levels.as_deref(),
             ),
             reasoning_effort_levels: model.reasoning_effort_levels.clone(),
+            alias: model.alias.clone(),
+            desc: model.desc.clone(),
+            alias_en: model.alias_en.clone(),
+            desc_en: model.desc_en.clone(),
             thinking_enabled: model.thinking_enabled,
             thinking_budget: model.thinking_budget,
             capable_model: model.capable_model,
             retry_max_attempts: model.retry_max_attempts,
+            response_header_timeout_secs: model.response_header_timeout_secs,
         })
     }
 
@@ -1644,6 +1744,22 @@ pub struct ReasoningFieldsMut<'a> {
     pub reasoning_effort: &'a mut Option<String>,
 }
 
+/// The account requires its own configured key, which could not be resolved.
+#[derive(Debug)]
+pub struct MissingBoundApiKey(String);
+
+impl std::fmt::Display for MissingBoundApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "account `{}` has no value for its configured API key",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for MissingBoundApiKey {}
+
 /// See [`Config::account_endpoint`]. `Debug` redacts the key.
 #[derive(Clone)]
 pub struct AccountEndpoint {
@@ -1675,6 +1791,14 @@ fn resolve_account_api_key(
     account: &ProviderAccountConfig,
     preset: &provider_preset::ProviderPreset,
 ) -> Option<String> {
+    if account.disable_api_key_fallback {
+        let value = account.api_key.as_deref()?.trim();
+        if value.contains('$') {
+            let expanded = provider::expand_env_vars(value);
+            return (!expanded.trim().is_empty()).then_some(expanded);
+        }
+        return (!value.is_empty()).then(|| value.to_owned());
+    }
     if let Some(raw) = account.api_key.as_deref() {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -1999,9 +2123,42 @@ mod codingplan_prefix_tests {
     }
 }
 
+/// Recover the explicit CodingPlan account id from a composite selection key:
+/// the setup writes `{account}-{model}` for providers on a per-model gateway,
+/// so stripping the trailing `-{model}` yields the account (`AtomGit-Auto-
+/// Gateway-auto` → `AtomGit-Auto-Gateway`). Falls back to the full name when
+/// the suffix does not match, keeping the key usable as an account id.
+fn codingplan_explicit_account_id(name: &str, model: &str) -> String {
+    let suffix = format!("-{model}");
+    match name.strip_suffix(&suffix) {
+        Some(head) if !head.is_empty() => head.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Whether a legacy CodingPlan provider points at the canonical shared
+/// gateway (same origin as `codingplan_llm_base_url`). Only those fold into
+/// the single group account; a per-model gateway (e.g. an `auto` route on a
+/// different host) keeps its own account so its distinct base URL survives.
+/// Strict origin equality — not `is_codingplan_llm_gateway`, whose whitelist
+/// deliberately admits sibling gateways that must NOT be folded together.
+fn codingplan_shares_group_gateway(base_url: Option<&str>) -> bool {
+    let Some(u) = base_url else {
+        return true; // no base_url ⇒ historical payload ⇒ shared gateway
+    };
+    match (
+        url::Url::parse(u),
+        url::Url::parse(crate::endpoints::codingplan_llm_base_url()),
+    ) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => u == crate::endpoints::codingplan_llm_base_url(),
+    }
+}
+
 /// Project a legacy provider into a synthetic [`ProviderAccountConfig`].
 fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
     ProviderAccountConfig {
+        disable_api_key_fallback: p.api_key_is_resolved,
         provider: legacy_provider_to_preset_id(&p.provider_type).to_string(),
         display_name: None,
         api_key: p.api_key.clone(),
@@ -2036,9 +2193,14 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         reasoning_history: p.reasoning_history.clone(),
         reasoning_effort: p.reasoning_effort.clone(),
         reasoning_effort_levels: p.reasoning_effort_levels.clone(),
+        alias: p.alias.clone(),
+        desc: p.desc.clone(),
+        alias_en: p.alias_en.clone(),
+        desc_en: p.desc_en.clone(),
         thinking_enabled: p.thinking_enabled,
         thinking_budget: p.thinking_budget,
         retry_max_attempts: p.retry_max_attempts,
+        response_header_timeout_secs: p.response_header_timeout_secs,
         origin: None,
         rank: None,
     }
@@ -2602,6 +2764,7 @@ impl Config {
         // Pricing support was retired after v5.0.7. Clean only those known
         // legacy tables; keep startup readable when the file is read-only.
         let _ = crate::store::ConfigStore::new(path).remove_legacy_pricing();
+        let _ = crate::store::ConfigStore::new(path).migrate_web_search_default();
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
         Self::parse_disk_content_tolerant(&content, path)
@@ -2613,6 +2776,7 @@ impl Config {
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         migrate_legacy_coding_round_default(&mut config);
+        config.web_search.migrate_auto_default();
         apply_env_overrides(&mut config);
         Ok(config)
     }
@@ -2653,6 +2817,7 @@ impl Config {
         config.quarantined_providers = quarantined;
         migrate_legacy_lsp_default(&mut config);
         migrate_legacy_coding_round_default(&mut config);
+        config.web_search.migrate_auto_default();
         apply_env_overrides(&mut config);
         if config
             .quarantined_providers
@@ -3791,6 +3956,28 @@ model = "missing-type"
     }
 
     #[test]
+    fn dap_is_default_on_and_rejects_unknown_adapter_fields() {
+        assert!(Config::default().dap.enabled);
+        assert!(toml::from_str::<Config>("[dap]").unwrap().dap.enabled);
+        assert!(
+            !toml::from_str::<Config>("[dap]\nenabled=false")
+                .unwrap()
+                .dap
+                .enabled
+        );
+        let config: Config = toml::from_str("[dap]\nenabled=true\n[dap.adapters.python]\ncommand='python3'\nargs=['-m','debugpy.adapter']").unwrap();
+        assert!(config.dap.enabled);
+        assert_eq!(
+            config.dap.adapters["python"].args,
+            ["-m", "debugpy.adapter"]
+        );
+        assert!(toml::from_str::<Config>(
+            "[dap.adapters.python]\ncommand='python3'\nenv={TOKEN='not-accepted'}"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn migrate_keeps_custom_coding_round_caps() {
         for expected in [0, 199, 500] {
             let mut cfg = Config::with_default_provider("x");
@@ -3979,6 +4166,7 @@ model = "missing-type"
             models: HashMap::new(),
             default_model: None,
             modes: Default::default(),
+            quality: Default::default(),
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),
@@ -3988,6 +4176,7 @@ model = "missing-type"
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
+            dap: Default::default(),
             subagent: Default::default(),
             team: Default::default(),
             loop_config: Default::default(),
@@ -4020,6 +4209,7 @@ model = "missing-type"
         cfg.providers.insert(
             "p".to_string(),
             ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".to_string(),
                 api_key: Some("k".to_string()),
                 model: "m".to_string(),
@@ -4035,12 +4225,17 @@ model = "missing-type"
                 reasoning_history: None,
                 reasoning_effort: None,
                 reasoning_effort_levels: None,
+                alias: None,
+                desc: None,
+                alias_en: None,
+                desc_en: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                response_header_timeout_secs: None,
             },
         );
         cfg.save(&tmp).unwrap();
@@ -4244,6 +4439,7 @@ model = "missing-type"
         cfg.providers.insert(
             "p".to_string(),
             ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".to_string(),
                 api_key: Some("k".to_string()),
                 model: "m".to_string(),
@@ -4259,12 +4455,17 @@ model = "missing-type"
                 reasoning_history: None,
                 reasoning_effort: None,
                 reasoning_effort_levels: None,
+                alias: None,
+                desc: None,
+                alias_en: None,
+                desc_en: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                response_header_timeout_secs: None,
             },
         );
         cfg.save(&target).unwrap();
@@ -4345,6 +4546,7 @@ model = "missing-type"
         providers.insert(
             "active".to_string(),
             crate::config::provider::ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".into(),
                 api_key: Some("sk-test".into()),
                 model: active_model.into(),
@@ -4360,12 +4562,17 @@ model = "missing-type"
                 reasoning_history: None,
                 reasoning_effort: None,
                 reasoning_effort_levels: None,
+                alias: None,
+                desc: None,
+                alias_en: None,
+                desc_en: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                response_header_timeout_secs: None,
             },
         );
         Config {
@@ -4481,6 +4688,7 @@ model = "missing-type"
         cfg.providers.insert(
             "vl-helper".into(),
             crate::config::provider::ProviderConfig {
+                api_key_is_resolved: false,
                 provider_type: "openai".into(),
                 api_key: Some("sk-vl".into()),
                 model: "Qwen/Qwen3-VL-32B-Instruct".into(),
@@ -4496,12 +4704,17 @@ model = "missing-type"
                 reasoning_history: None,
                 reasoning_effort: None,
                 reasoning_effort_levels: None,
+                alias: None,
+                desc: None,
+                alias_en: None,
+                desc_en: None,
                 thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
                 capable_model: None,
                 retry_max_attempts: None,
+                response_header_timeout_secs: None,
             },
         );
         assert!(cfg.can_handle_attached_images());
@@ -4699,6 +4912,46 @@ capable_model = 5
 "#;
 
     #[test]
+    fn imported_accounts_never_resolve_an_unrelated_api_key() {
+        let previous = std::env::var_os("ATOMCODE_API_KEY");
+        std::env::set_var("ATOMCODE_API_KEY", "ambient-key");
+        let config: Config = toml::from_str(
+            r#"
+[provider_accounts.explicit]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+disable_api_key_fallback = true
+api_key = "${ATOMCODE_TEST_MIGRATION_UNSET_KEY}"
+[models.explicit-model]
+account = "explicit"
+model = "demo"
+
+[provider_accounts.anonymous]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+disable_api_key_fallback = true
+[models.anonymous-model]
+account = "anonymous"
+model = "demo"
+"#,
+        )
+        .unwrap();
+        let missing = config.resolve_model(Some("explicit-model"));
+        let explicit_endpoint = config.account_endpoint("explicit").unwrap();
+        let anonymous = config.resolve_model(Some("anonymous-model")).unwrap();
+        let projected_key = anonymous.to_provider_config().resolved_api_key();
+        match previous {
+            Some(value) => std::env::set_var("ATOMCODE_API_KEY", value),
+            None => std::env::remove_var("ATOMCODE_API_KEY"),
+        }
+
+        assert!(missing.unwrap_err().is::<MissingBoundApiKey>());
+        assert!(explicit_endpoint.api_key.is_none());
+        assert!(anonymous.api_key.is_none());
+        assert!(projected_key.is_none());
+    }
+
+    #[test]
     fn new_schema_parses_accounts_models_and_default_model() {
         let cfg: Config = toml::from_str(NEW_SCHEMA).unwrap();
         assert_eq!(cfg.provider_accounts.len(), 1);
@@ -4738,6 +4991,7 @@ capable_model = 5
         cfg.provider_accounts.insert(
             "oauth-live".into(),
             provider::ProviderAccountConfig {
+                disable_api_key_fallback: false,
                 provider: "openai".into(),
                 display_name: None,
                 api_key: Some("sk-runtime-only".into()),
@@ -4762,6 +5016,7 @@ capable_model = 5
                 capable_model: None,
                 note: None,
                 retry_max_attempts: None,
+                response_header_timeout_secs: None,
                 origin: None,
                 rank: None,
                 thinking_type: None,
@@ -4769,6 +5024,10 @@ capable_model = 5
                 reasoning_history: None,
                 reasoning_effort: None,
                 reasoning_effort_levels: None,
+                alias: None,
+                desc: None,
+                alias_en: None,
+                desc_en: None,
                 thinking_enabled: None,
                 thinking_budget: None,
             },
@@ -4792,6 +5051,7 @@ capable_model = 5
         cfg.provider_accounts.insert(
             "corp".into(),
             provider::ProviderAccountConfig {
+                disable_api_key_fallback: false,
                 provider: "openai-compatible".into(), // no default endpoint…
                 display_name: None,
                 api_key: None,
@@ -4816,6 +5076,7 @@ capable_model = 5
                 capable_model: None,
                 note: None,
                 retry_max_attempts: None,
+                response_header_timeout_secs: None,
                 origin: None,
                 rank: None,
                 thinking_type: None,
@@ -4823,6 +5084,10 @@ capable_model = 5
                 reasoning_history: None,
                 reasoning_effort: None,
                 reasoning_effort_levels: None,
+                alias: None,
+                desc: None,
+                alias_en: None,
+                desc_en: None,
                 thinking_enabled: None,
                 thinking_budget: None,
             },
@@ -5010,6 +5275,7 @@ context_window = 131072
         legacy2.provider_accounts.insert(
             "MyDeepSeek".into(),
             provider::ProviderAccountConfig {
+                disable_api_key_fallback: false,
                 provider: "deepseek".into(),
                 display_name: None,
                 api_key: None,
@@ -5529,5 +5795,108 @@ mod goal_recovery_policy_tests {
         );
         let roundtrip: Config = toml::from_str(&toml::to_string(&overnight).unwrap()).unwrap();
         assert_eq!(roundtrip.goal, overnight.goal);
+    }
+}
+
+/// Trusted, explicitly configured foreground checks. Never inferred from repository text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gates: Vec<QualityGate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityGate {
+    pub name: String,
+    pub command: String,
+    #[serde(default = "quality_timeout")]
+    pub timeout_secs: u64,
+}
+fn quality_timeout() -> u64 {
+    60
+}
+impl QualityConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.gates.is_empty() {
+            return Err(
+                "Quality has no configured gates. Configure [[quality.gates]] first.".into(),
+            );
+        }
+        if self.gates.len() > 16 {
+            return Err("Quality supports at most 16 gates.".into());
+        }
+        let mut names = std::collections::HashSet::new();
+        for gate in &self.gates {
+            if gate.name.trim().is_empty()
+                || gate.command.trim().is_empty()
+                || !names.insert(&gate.name)
+            {
+                return Err(
+                    "Quality gates need unique nonempty names and nonempty commands.".into(),
+                );
+            }
+            if !(1..=300).contains(&gate.timeout_secs) {
+                return Err("Quality timeout_secs must be between 1 and 300.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod quality_config_tests {
+    use super::*;
+    #[test]
+    fn quality_configuration_survives_save_and_load() {
+        let mut config = Config::default();
+        config.quality = QualityConfig {
+            enabled: true,
+            gates: vec![QualityGate {
+                name: "types".into(),
+                command: "tsc --noEmit".into(),
+                timeout_secs: 120,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().quality, config.quality);
+    }
+    #[test]
+    fn quality_requires_explicit_bounded_unique_checks() {
+        assert!(QualityConfig::default().validate().is_err());
+        let gate = QualityGate {
+            name: "test".into(),
+            command: "true".into(),
+            timeout_secs: 60,
+        };
+        assert!(QualityConfig {
+            enabled: true,
+            gates: vec![gate.clone()]
+        }
+        .validate()
+        .is_ok());
+        assert!(QualityConfig {
+            enabled: true,
+            gates: vec![gate.clone(), gate.clone()]
+        }
+        .validate()
+        .is_err());
+        assert!(QualityConfig {
+            enabled: true,
+            gates: vec![QualityGate {
+                timeout_secs: 301,
+                ..gate
+            }]
+        }
+        .validate()
+        .is_err());
     }
 }

@@ -1,4 +1,4 @@
-import type { SessionMessage } from '../api';
+import type { ImageData, SessionMessage } from '../api';
 
 const INTERNAL_USER_PREFIXES = [
   '<system-reminder>',
@@ -100,4 +100,30 @@ export function sessionMessagesToMarkdownLines(
 /** Provenance is explicit; matching text alone must never reclassify a user. */
 export function isRetainedHistoryUserMessage(msg: SessionMessage): boolean {
   return msg.role === 'user' && (msg.internal_origin ?? msg.internalOrigin) === 'compaction_retained_user';
+}
+
+/** Display only: captions are model context, never the person's typed prompt. */
+export function displayHistoryUser(text: string, images?: ImageData[]): { text: string; images?: ImageData[] } {
+  const markers = ['[图片内容（由', '[图片识别失败]', '[what is in the picture, read by ', '[the picture could not be read]'];
+  const positions = markers.map(m => text.indexOf(m)).filter(i => i >= 0);
+  const cut = positions.length ? Math.min(...positions) : -1;
+  let prompt = cut >= 0 ? text.slice(0, cut).trimEnd() : text;
+  const actual = images?.filter(image => !image.missing && image.data.length > 0);
+  const missing = images?.filter(image => image.missing || !image.data).length ?? (cut >= 0 ? 1 : 0);
+  if (missing && !/\[Image #\d+\]/i.test(prompt)) {
+    prompt = [prompt, ...Array.from({ length: missing }, (_, i) => `[Image #${i + 1}]`)].filter(Boolean).join(' ');
+  }
+  return { text: prompt, images: actual?.length ? actual : undefined };
+}
+
+/** Hide only a redundant trailing attachment list, never inline image references
+ * or markers whose corresponding payload is unavailable. Source text stays intact. */
+export function displayImageMarkers(text: string, images?: readonly ImageData[]): string {
+  const count = images?.length ?? 0;
+  if (!count || images?.some(image => image.missing || !image.data.length)) return text;
+  const suffix = text.match(/(?:\s*\[Image #\d+\])+\s*$/i);
+  if (!suffix) return text;
+  const markers = [...suffix[0].matchAll(/\[Image #(\d+)\]/gi)].map(match => Number(match[1]));
+  if (markers.length !== count || markers.some((number, index) => number !== index + 1)) return text;
+  return text.slice(0, suffix.index).trimEnd();
 }

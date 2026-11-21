@@ -135,6 +135,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         },
         apply: ApplyPolicy::AgentReassemble,
     },
+    SettingSpec {
+        id: "compaction.stub_recent_budget",
+        path: &["compaction", "stub_recent_budget"],
+        label_en: "Recent tool-output budget (tokens)",
+        label_zh: "近期工具输出保留预算（token）",
+        aliases: &["stub", "compact", "打桩", "上下文"],
+        kind: SettingKind::Integer {
+            min: 1,
+            max: 4_294_967_295,
+        },
+        apply: ApplyPolicy::AgentReassemble,
+    },
     bool_setting(
         "auto_update",
         &["auto_update"],
@@ -238,6 +250,23 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Choice(TODO_EAGERNESS),
         apply: ApplyPolicy::AgentReassemble,
     },
+    bool_setting(
+        "coding.architecture_topology",
+        &["coding", "architecture_topology"],
+        "ATI read-only architecture analysis",
+        "ATI 只读架构分析",
+        &["ATI", "architecture", "topology", "架构", "文件放置"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
+    SettingSpec {
+        id: "coding.auto_review",
+        path: &["coding", "auto_review"],
+        label_en: "Automatic pre-handoff review",
+        label_zh: "任务完成前自动评审",
+        aliases: &["review", "评审", "自动评审"],
+        kind: SettingKind::Boolean,
+        apply: ApplyPolicy::AgentReassemble,
+    },
     SettingSpec {
         id: "coding.max_rounds",
         path: &["coding", "max_rounds"],
@@ -327,6 +356,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["scrollbar", "滚动条"],
         kind: SettingKind::Choice(SCROLLBARS),
         apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
+        id: "ui.wrap_diff",
+        path: &["ui", "wrap_diff"],
+        label_en: "Wrap long diff lines",
+        label_zh: "Diff 长行自动换行",
+        aliases: &["wrap_diff", "diff wrap", "差异换行"],
+        kind: SettingKind::Boolean,
+        apply: ApplyPolicy::ImmediateUi,
     },
     // `false` hands the pointer to the terminal, so PLAIN click-drag does the
     // terminal's OWN selection (spans the scrollback, copies clean) — at the cost
@@ -567,6 +605,11 @@ impl SettingSpec {
                 .token_limit
                 .map(|limit| limit.to_string())
                 .unwrap_or_default(),
+            "compaction.stub_recent_budget" => config
+                .compaction
+                .stub_recent_budget
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
             "tools.search.respect_gitignore" => config.tools.search.respect_gitignore.to_string(),
@@ -579,6 +622,8 @@ impl SettingSpec {
             "tools.atomgit.tool_search" => config.tools.atomgit.tool_search.to_string(),
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
+            "coding.auto_review" => config.coding.auto_review.to_string(),
+            "coding.architecture_topology" => config.coding.architecture_topology.to_string(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
             "coding.shell_guard_policy" => {
                 format!("{:?}", config.coding.shell_guard_policy).to_lowercase()
@@ -595,6 +640,7 @@ impl SettingSpec {
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.scrollbar" => format!("{:?}", config.ui.scrollbar).to_lowercase(),
+            "ui.wrap_diff" => config.ui.wrap_diff.to_string(),
             "ui.mouse" => config.ui.mouse.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.keybindings.newline" => config
@@ -938,6 +984,37 @@ mod tests {
     }
 
     #[test]
+    fn stub_recent_budget_is_optional_positive_and_resettable() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "compaction.stub_recent_budget")
+            .unwrap();
+        let mut document = "# preserve\n".parse::<DocumentMut>().unwrap();
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(setting.value(&config), "");
+        setting.patch(&mut document, "100000").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(config.compaction.stub_recent_budget.unwrap().get(), 100_000);
+        assert_eq!(setting.value(&config), "100000");
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("stub_recent_budget"));
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.compaction, config.compaction);
+        for invalid in ["0", "-1", "4294967296"] {
+            assert!(setting.patch(&mut document, invalid).is_err());
+            assert!(toml::from_str::<Config>(&format!(
+                "[compaction]\nstub_recent_budget={invalid}"
+            ))
+            .is_err());
+        }
+        setting.patch(&mut document, "").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(config.compaction.stub_recent_budget.is_none());
+        assert!(!toml::to_string(&config).unwrap().contains("[compaction]"));
+        assert!(document.to_string().contains("# preserve"));
+    }
+
+    #[test]
     fn atomgit_schema_search_defaults_on_and_can_be_reset() {
         let setting = SETTINGS
             .iter()
@@ -1016,8 +1093,10 @@ mod tests {
         const CONCEPT_WORDS: &[&str] = &["provider", "model", "credential"];
 
         for setting in SETTINGS {
-            let public_budget = setting.id == "compaction.token_limit"
+            let public_budget = (setting.id == "compaction.token_limit"
                 && setting.path == ["compaction", "token_limit"]
+                || setting.id == "compaction.stub_recent_budget"
+                    && setting.path == ["compaction", "stub_recent_budget"])
                 && matches!(
                     setting.kind,
                     SettingKind::Integer {
@@ -1146,6 +1225,54 @@ mod tests {
         assert_eq!(setting.value(&configured), "read-only");
         // An out-of-range value is rejected.
         assert!(setting.patch(&mut DocumentMut::new(), "yolo").is_err());
+    }
+
+    #[test]
+    fn ati_is_discoverable_default_off_and_patches_without_changing_other_settings() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "coding.architecture_topology")
+            .unwrap();
+        assert_eq!(setting.value(&Config::default()), "false");
+        assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
+        for query in ["ATI", "architecture", "topology", "架构", "文件放置"] {
+            assert!(setting.matches(query), "{query}");
+        }
+        let mut document: DocumentMut =
+            "# preserve\n[coding]\nauto_review = false\nmax_rounds = 42\n"
+                .parse()
+                .unwrap();
+        for enabled in [true, false] {
+            setting.patch(&mut document, &enabled.to_string()).unwrap();
+            let config: Config = toml::from_str(&document.to_string()).unwrap();
+            assert_eq!(config.coding.architecture_topology, enabled);
+            assert_eq!(setting.value(&config), enabled.to_string());
+            assert!(!config.coding.auto_review);
+            assert_eq!(config.coding.max_rounds, 42);
+            assert!(document.to_string().contains("# preserve"));
+        }
+        let before = document.to_string();
+        assert!(setting.patch(&mut document, "maybe").is_err());
+        assert_eq!(document.to_string(), before);
+        setting.reset(&mut document);
+        let reset: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!reset.coding.architecture_topology);
+        assert!(!document.to_string().contains("architecture_topology"));
+    }
+
+    #[test]
+    fn auto_review_is_a_separate_default_on_config_switch() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "coding.auto_review")
+            .unwrap();
+        assert_eq!(setting.value(&Config::default()), "true");
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "false").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!config.coding.auto_review);
+        assert_eq!(setting.value(&config), "false");
+        assert!(matches!(setting.apply, ApplyPolicy::AgentReassemble));
     }
 
     #[test]
@@ -1285,6 +1412,23 @@ mod tests {
     }
 
     #[test]
+    fn diff_wrap_defaults_on_and_is_editable_through_config() {
+        let config = Config::default();
+        assert!(config.ui.wrap_diff);
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(empty.ui.wrap_diff);
+        let setting = SETTINGS.iter().find(|s| s.id == "ui.wrap_diff").unwrap();
+        assert_eq!(setting.value(&config), "true");
+        assert_eq!(setting.apply, ApplyPolicy::ImmediateUi);
+        let mut document = "# keep\n".parse::<toml_edit::DocumentMut>().unwrap();
+        setting.patch(&mut document, "false").unwrap();
+        let saved: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!saved.ui.wrap_diff);
+        assert_eq!(setting.value(&saved), "false");
+        assert!(document.to_string().contains("# keep"));
+    }
+
+    #[test]
     fn init_prompt_file_is_editable_and_empty_input_resets_it() {
         let setting = SETTINGS
             .iter()
@@ -1421,6 +1565,7 @@ model = "model-a"
             "tools.atomgit.enabled",
             "tools.todo.eager",
             "coding.max_rounds",
+            "coding.architecture_topology",
             "coding.shell_guard_policy",
             "subagent.max_concurrent",
             "subagent.max_rounds",
@@ -1433,6 +1578,7 @@ model = "model-a"
             let setting = SETTINGS.iter().find(|setting| setting.id == id).unwrap();
             let expected = match id {
                 "tools.todo.enabled"
+                | "coding.architecture_topology"
                 | "tools.atomgit.enabled"
                 | "subagent.max_concurrent"
                 | "subagent.max_rounds"

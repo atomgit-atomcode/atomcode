@@ -207,13 +207,10 @@ pub struct OpenAiCompatConfig {
     /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
-    /// accepts the connection but never responds would otherwise hang FOREVER —
-    /// no overall request timeout is set here (deliberately: a streaming response
-    /// must not be capped). Applied to EACH attempt, not to the retry loop as a
-    /// whole, so a slow-but-alive gateway still gets the full budget. `send()`
-    /// resolves once the response HEAD arrives, so this never truncates a slow body.
-    /// A timeout is classified retryable.
+    /// Per-attempt HTTP response-header timeout (default 300s). `send()` resolves
+    /// when headers arrive, so this never caps response-body streaming. The OPEN
+    /// retry loop additionally has a cumulative 2x allowance; native requests
+    /// share it across outer retries and include their reserved backoff.
     pub open_timeout: Duration,
     /// Retry policy for the OPEN call only (mid-stream errors are never retried).
     pub retry: RetryPolicy,
@@ -309,7 +306,7 @@ impl OpenAiCompatConfig {
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
             first_token_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
+            open_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             request_signer: None,
@@ -619,6 +616,11 @@ pub(crate) struct SwappableClient {
         Option<atomcode_config::proxy::ProxyConfig>,
     )>,
     refresh: tokio::sync::Mutex<()>,
+    /// Test-only: pin the request path to "no proxy". A judge that counts pool
+    /// rebuilds must not see the developer's own system proxy add one (nor its
+    /// refresh latency, which is spent inside the open budget).
+    #[cfg(test)]
+    direct_requests: std::sync::atomic::AtomicBool,
     #[allow(clippy::type_complexity)]
     build: Box<
         dyn Fn(
@@ -662,6 +664,8 @@ impl SwappableClient {
             headers: Default::default(),
             current: std::sync::RwLock::new((initial, force_tls12, None)),
             refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            direct_requests: std::sync::atomic::AtomicBool::new(false),
             build: Box::new(build),
         })
     }
@@ -683,8 +687,26 @@ impl SwappableClient {
     /// allocating another retry. Cancellation drops this future; the blocking
     /// resolver only returns data and cannot later mutate this client.
     pub(crate) async fn for_request(&self) -> Result<reqwest::Client, ProviderError> {
+        #[cfg(test)]
+        if self
+            .direct_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.for_request_with(std::future::ready(Ok(None))).await;
+        }
         self.for_request_with(super::auto_proxy::for_request())
             .await
+    }
+
+    /// Test-only: resolve every request as "no proxy". Without this a machine
+    /// whose system proxy is live rebuilds the pool once just to APPLY that
+    /// route (and spends the proxy probe inside the open budget), which makes a
+    /// rebuild-counting judge fail for reasons that have nothing to do with the
+    /// behaviour under test.
+    #[cfg(test)]
+    pub(crate) fn skip_auto_proxy(&self) {
+        self.direct_requests
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn for_request_with(
@@ -753,6 +775,12 @@ impl LlmProvider for OpenAiCompatProvider {
         self.cfg.effort_levels.clone()
     }
 
+    /// The same policy `format_messages` encodes with: only `Exclude` drops every
+    /// prior turn's thinking.
+    fn replays_reasoning(&self) -> bool {
+        self.policy != ReasoningPolicy::Exclude
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         // One-shot: the kernel binds exactly once at spawn. Ignore a redundant
         // re-bind (OnceLock keeps the first value) rather than panicking.
@@ -771,6 +799,16 @@ impl LlmProvider for OpenAiCompatProvider {
         let effort_known_unsupported = self
             .effort_unsupported
             .load(std::sync::atomic::Ordering::Relaxed);
+        let requested_effort = options.reasoning_effort;
+        let effort_disposition = if requested_effort.is_none() {
+            "api_default"
+        } else if effort_known_unsupported {
+            "gateway_rejected"
+        } else if !self.cfg.supports_reasoning_effort {
+            "endpoint_capability_disabled"
+        } else {
+            "sent"
+        };
         let stripped_opts;
         let options = if effort_known_unsupported && options.reasoning_effort.is_some() {
             let mut o = options.clone();
@@ -802,8 +840,12 @@ impl LlmProvider for OpenAiCompatProvider {
         timing.mark("request_start");
         timing.span().in_scope(|| tracing::info!(request_id = timing.id, model = %self.cfg.model,
             reasoning_effort = body.get("reasoning_effort").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
+            adapter_requested_effort = requested_effort.map(ReasoningEffort::as_str).unwrap_or("omitted"),
+            reasoning_effort_disposition = effort_disposition,
             thinking_type = body.pointer("/thinking/type").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
             enable_thinking = ?body.get("enable_thinking").and_then(serde_json::Value::as_bool),
+            max_tokens = ?body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            max_completion_tokens = ?body.get("max_completion_tokens").and_then(serde_json::Value::as_u64),
             request_bytes = body_bytes.len(), messages = messages.len(), tools = tools.len(),
             "provider request parameters"));
 
@@ -1207,6 +1249,7 @@ pub(crate) async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
         open_timeout,
+        request_recovery,
         open_stream_attempts(
             client,
             url,
@@ -1332,8 +1375,8 @@ async fn open_stream_attempts(
                 return Err(ProviderError {
                     retryable: true,
                     message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
-                        open_timeout.as_secs()
+                        "open failed: 等待模型服务响应头超过 {}",
+                        retry::format_wait(open_timeout)
                     ),
                     code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.to_string()),
                     ..Default::default()
@@ -1785,6 +1828,18 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
         return;
     };
 
+    // Some strict OpenAI-compatible validators (observed on Volcano Ark
+    // `kimi-k3-1-pro`) reject a bare `enum` without `type` with a 400, although
+    // JSON Schema permits it. Only a non-empty enum whose values all share one
+    // scalar kind gets the matching `type`; the enum itself still constrains the
+    // exact values, so `number` covers integer literals safely. Empty, mixed,
+    // null-bearing, and object/array enums are left untouched.
+    if !map.contains_key("type") {
+        if let Some(kind) = map.get("enum").and_then(homogeneous_scalar_enum_type) {
+            map.insert("type".into(), Value::String(kind.into()));
+        }
+    }
+
     let allows_object = match map.get("type") {
         Some(Value::String(kind)) => kind == "object",
         Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
@@ -1829,6 +1884,23 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
             }
         }
     }
+}
+
+fn homogeneous_scalar_enum_type(values: &Value) -> Option<&'static str> {
+    let Value::Array(values) = values else {
+        return None;
+    };
+    let kind_of = |value: &Value| match value {
+        Value::String(_) => Some("string"),
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        _ => None,
+    };
+    let (first, rest) = values.split_first()?;
+    let kind = kind_of(first)?;
+    rest.iter()
+        .all(|value| kind_of(value) == Some(kind))
+        .then_some(kind)
 }
 
 fn normalize_openai_tool_schema_children(children: &mut Value) {
@@ -2122,6 +2194,13 @@ const MAX_TOOL_CALL_DELTAS: usize = 20000;
 /// never rejected, while keeping the buffer trivially small.
 const MAX_TOOL_CALLS: usize = 256;
 
+/// Upper bound on one SSE line, and on the unterminated tail the decoder keeps
+/// between chunks. This is a defensive client limit, not an SSE protocol limit:
+/// gateways may batch payloads, so even syntactically valid larger lines are
+/// refused. Without a cap, an endpoint that never sends `\n` could grow
+/// [`SseDecoder::buf`] until the process is OOM-killed.
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
 /// inline in the network loop) makes the wire→event mapping deterministic and
@@ -2138,6 +2217,9 @@ struct SseDecoder {
     /// kept short, to show in that error.
     stray: String,
     buf: Vec<u8>,
+    /// Largest one line (or its unterminated tail) may grow before the decoder
+    /// refuses the stream. See [`MAX_SSE_LINE_BYTES`].
+    max_line_bytes: usize,
     /// Per-index `(id, name, accumulated_args)` for in-flight tool calls.
     tool_calls: Vec<(String, String, String)>,
     last_usage: Option<TokenUsage>,
@@ -2157,6 +2239,8 @@ struct SseDecoder {
     /// layer has no reasoning parser configured. Per decoder, so an unclosed
     /// block cannot reach the next response — see [`InlineThink`].
     think: super::reasoning::InlineThink,
+    /// Observe the original content field without changing its meaning/output.
+    content_marker: super::content_marker::ContentMarker,
     /// Where to record the name thinking came under in its own field, for the
     /// provider to answer in. `None` in tests that feed bytes directly.
     heard: Option<std::sync::Arc<HeardReasoningField>>,
@@ -2169,6 +2253,7 @@ impl SseDecoder {
             saw_data: false,
             stray: String::new(),
             buf: Vec::new(),
+            max_line_bytes: MAX_SSE_LINE_BYTES,
             tool_calls: Vec::new(),
             last_usage: None,
             truncated: false,
@@ -2179,8 +2264,35 @@ impl SseDecoder {
             tool_call_delta_count: 0,
             last_tool_idx: 0,
             think: super::reasoning::InlineThink::new(),
+            content_marker: super::content_marker::ContentMarker::default(),
             heard: None,
         }
+    }
+
+    /// Assign once, after assembly: the resulting ID is then shared by execution,
+    /// persistence and every subsequent request. Never invent IDs per serialization.
+    fn take_tool_calls(&mut self) -> Vec<(String, String, String)> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut calls = std::mem::take(&mut self.tool_calls);
+        let mut used: std::collections::HashSet<String> =
+            calls.iter().map(|(id, _, _)| id.clone()).collect();
+        for (id, name, _) in &mut calls {
+            if !name.is_empty() && id.trim().is_empty() {
+                loop {
+                    let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let candidate = format!("call_ac_{at:x}_{sequence:x}");
+                    if used.insert(candidate.clone()) {
+                        *id = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        calls
     }
 
     /// Decode the body `url` answered, which claimed to be `content_type`.
@@ -2217,21 +2329,75 @@ impl SseDecoder {
         self.stray.extend(line.chars().take(KEEP));
     }
 
-    /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
-    /// across arbitrary chunk boundaries (UTF-8 is only decoded on whole lines).
+    /// Feed a chunk of raw bytes; decode UTF-8 only when a whole line is ready.
+    /// Scan only new bytes: an incomplete line is appended in place, never
+    /// rescanned or copied wholesale on the next chunk. Complete lines already
+    /// in a chunk are borrowed directly. Framing and amortized buffering are
+    /// linear in received bytes, including lines fragmented across chunks.
     fn feed(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
-        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&line);
-            let text = text.trim_end_matches('\n').trim_end_matches('\r');
-            self.process_line(text, &mut out);
-            if self.done {
-                break;
-            }
+        if self.done {
+            return out;
         }
+        let mut start = 0;
+        while let Some(offset) = chunk[start..].iter().position(|&b| b == b'\n') {
+            let end = start + offset;
+            let part = &chunk[start..end];
+            // Check before appending, so an oversized chunk is never copied
+            // into the line buffer just to be rejected afterwards.
+            if part.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+                out.extend(self.line_too_large());
+                return out;
+            }
+            if self.buf.is_empty() {
+                let text = String::from_utf8_lossy(part);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+            } else {
+                self.buf.extend_from_slice(part);
+                let mut line = std::mem::take(&mut self.buf);
+                let text = String::from_utf8_lossy(&line);
+                self.process_line(text.trim_end_matches('\r'), &mut out);
+                line.clear();
+                if !self.done {
+                    // Reuse storage for the next fragmented line.
+                    self.buf = line;
+                }
+            }
+            if self.done {
+                self.buf = Vec::new();
+                return out;
+            }
+            start = end + 1;
+        }
+        let rest = &chunk[start..];
+        if rest.len() > self.max_line_bytes.saturating_sub(self.buf.len()) {
+            out.extend(self.line_too_large());
+            return out;
+        }
+        self.buf.extend_from_slice(rest);
         out
+    }
+
+    /// Refuse a line the provider never terminated (or sent longer than the
+    /// cap) instead of growing `buf` without bound. The stream is terminal:
+    /// there is no safe point to resume a line whose start was dropped.
+    fn line_too_large(&mut self) -> Vec<StreamEvent> {
+        let limit = self.max_line_bytes;
+        self.fail_incomplete(
+            "sse_line_too_large",
+            &format!(
+                "provider stream line exceeded the {limit}-byte limit; the response was \
+                 refused instead of buffering it without bound"
+            ),
+        )
+    }
+
+    /// Test-only override for the line cap, so the boundary can be exercised
+    /// without allocating a production-sized (16 MiB) line.
+    #[cfg(test)]
+    fn with_line_cap(mut self, cap: usize) -> Self {
+        self.max_line_bytes = cap;
+        self
     }
 
     /// True once a NON-EMPTY `finish_reason` has been seen — the model's own
@@ -2245,6 +2411,7 @@ impl SseDecoder {
 
     fn fail_incomplete(&mut self, code: &str, message: &str) -> Vec<StreamEvent> {
         self.done = true;
+        self.buf = Vec::new();
         self.tool_calls.clear();
         tracing::warn!(error_origin = code, "provider stream diagnostic");
         let mut out = Vec::new();
@@ -2273,8 +2440,12 @@ impl SseDecoder {
         // Some gateways omit the final newline as well as [DONE]. Parse the
         // last line before deciding whether its finish_reason completed us.
         if !self.buf.is_empty() {
-            let pending = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
-            self.process_line(pending.trim_end_matches('\r'), &mut out);
+            if self.buf.len() > self.max_line_bytes {
+                return self.line_too_large();
+            }
+            let pending = std::mem::take(&mut self.buf);
+            let text = String::from_utf8_lossy(&pending);
+            self.process_line(text.trim_end_matches('\r'), &mut out);
         }
         if self.done {
             return out;
@@ -2389,7 +2560,7 @@ impl SseDecoder {
         if !held.reasoning.is_empty() {
             out.push(StreamEvent::Reasoning(held.reasoning));
         }
-        for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+        for (id, name, args) in self.take_tool_calls() {
             // A tool call with NO function name is UNDISPATCHABLE: executors resolve tools
             // BY NAME, so emitting one buys a guaranteed failed round trip — a 0ms
             // "unknown tool" result that burns a round and, on hosts that classify tools
@@ -2530,6 +2701,7 @@ impl SseDecoder {
             }
         }
         if let Some(c) = choice.delta.content {
+            self.content_marker.observe(&c);
             if !c.is_empty() {
                 // A `<think>` block here is reasoning that came down the wrong
                 // channel; it goes out of the right one rather than to the
@@ -2655,13 +2827,14 @@ impl SseDecoder {
         // above discard every subsequent tool_call delta, so the whole call is
         // dropped and the model shows "0 工具". Treat "" as non-terminal.
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
+            tracing::info!(finish_reason = %fr, "provider finish reason");
             self.seen_finish = true;
             if fr == "length" {
                 self.truncated = true;
                 self.tool_calls.clear();
                 return;
             }
-            for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+            for (id, name, args) in self.take_tool_calls() {
                 // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
                 // dropping it beats emitting a call that is certain to fail.
                 if name.is_empty() {
@@ -2789,6 +2962,31 @@ struct ChunkUsage {
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+}
+
+/// Feed `lines` synthetic SSE deltas in chunks of `per_chunk` lines.
+///
+/// Benchmark-only: `benches/core.rs` is a separate crate and cannot name the
+/// private decoder. The return value is the number of decoded events, so the
+/// harness has a real result to keep the work from being optimized away.
+#[cfg(feature = "bench")]
+pub(crate) fn bench_sse_feed(lines: usize, per_chunk: usize) -> usize {
+    const DELTA: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+    let per_chunk = per_chunk.max(1);
+    let mut decoder = SseDecoder::new();
+    let mut decoded = 0usize;
+    let mut chunk = String::new();
+    for index in 0..lines {
+        chunk.push_str(DELTA);
+        if (index + 1) % per_chunk == 0 {
+            decoded += decoder.feed(chunk.as_bytes()).len();
+            chunk.clear();
+        }
+    }
+    if !chunk.is_empty() {
+        decoded += decoder.feed(chunk.as_bytes()).len();
+    }
+    decoded + decoder.finish().len()
 }
 
 // ---------------------------------------------------------------------------
@@ -3431,6 +3629,11 @@ mod tests {
             Ok(reqwest::Client::builder().no_proxy().build().unwrap())
         })
         .unwrap();
+        // This judge counts pool rebuilds: "initial build + one rebuild caused by
+        // the silent timeout". A live system proxy would add a third build (to
+        // apply that route) and spend its probe inside the open budget, so pin
+        // the request path to direct and assert the behaviour, not the machine.
+        client.skip_auto_proxy();
         let policy = RetryPolicy {
             max_attempts: 3,
             base_delay: Duration::ZERO,
@@ -3643,6 +3846,145 @@ mod tests {
         }
         assert_eq!(proxy.received_requests().await.unwrap().len(), 2);
         assert_eq!(origin.received_requests().await.unwrap().len(), 2);
+    }
+
+    fn outgoing_wire_is_paired(messages: &[Value]) -> bool {
+        let mut pending = std::collections::HashSet::new();
+        for message in messages {
+            if message["role"] == "tool" {
+                if !pending.remove(message["tool_call_id"].as_str().unwrap_or("")) {
+                    return false;
+                }
+            } else {
+                if !pending.is_empty() {
+                    return false;
+                }
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    for call in calls {
+                        if !pending.insert(call["id"].as_str().unwrap_or("")) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        pending.is_empty()
+    }
+
+    #[test]
+    fn outgoing_wire_pairing_matrix() {
+        let call = |id: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            )
+        };
+        let cases = [
+            Message::user("injected"),
+            call("a"),
+            call("b"),
+            Message::tool_result("a", "ok", false),
+            Message::tool_result("b", "ok", false),
+            Message::tool_result("orphan", "error", true),
+        ];
+        for n in 0..6usize.pow(6) {
+            let mut v = n;
+            let mut messages = Vec::new();
+            for _ in 0..6 {
+                messages.push(cases[v % 6].clone());
+                v /= 6;
+            }
+            atomcode_kernel::message::Conversation::repair_pairing(&mut messages);
+            let wire = format_messages(
+                &messages,
+                ReasoningPolicy::Exclude,
+                ReasoningField::ReasoningContent,
+                true,
+            );
+            assert!(outgoing_wire_is_paired(&wire), "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn assembled_call_ids_preserve_late_ids_and_separate_parallel_calls() {
+        for finish_reason in [Some("tool_calls"), None] {
+            let mut decoder = SseDecoder::new();
+            let first = line(json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"read_file","arguments":"{}"}},
+                {"index":1,"id":" ","function":{"name":"read_file","arguments":"{}"}},
+                {"index":2,"function":{"name":"read_file","arguments":"{}"}}
+            ]}}]}));
+            let mut events = decoder.feed(first.as_bytes());
+            let last = line(
+                json!({"choices":[{"delta":{"tool_calls":[{"index":2,"id":"late-id"}]},"finish_reason":finish_reason}]}),
+            );
+            events.extend(decoder.feed(last.as_bytes()));
+            if finish_reason.is_none() {
+                events.extend(decoder.feed(b"data: [DONE]\n\n"));
+            }
+            events.extend(decoder.finish());
+            let calls: Vec<_> = events
+                .into_iter()
+                .filter_map(|event| match event {
+                    StreamEvent::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[2].id, "late-id");
+            let ids: std::collections::HashSet<_> = calls.iter().map(|call| &call.id).collect();
+            assert_eq!(ids.len(), 3);
+            assert!(calls.iter().all(|call| !call.id.trim().is_empty()));
+            let mut messages = vec![Message::assistant("", calls.clone())];
+            for call in calls {
+                messages.push(Message::tool_result(&call.id, "ok", false));
+            }
+            let wire = format_messages(
+                &messages,
+                ReasoningPolicy::Exclude,
+                ReasoningField::ReasoningContent,
+                true,
+            );
+            assert!(outgoing_wire_is_paired(&wire));
+        }
+    }
+
+    #[test]
+    fn a_missing_stream_call_id_is_assigned_before_execution() {
+        let mut decoder = SseDecoder::new();
+        let chunk = line(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        );
+        let events = decoder.feed(chunk.as_bytes());
+        let calls: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "the real SSE decoder emitted a call");
+        assert!(!calls[0].id.is_empty());
+        let id = calls[0].id.clone();
+        let mut messages = vec![
+            Message::assistant("", calls),
+            Message::tool_result(&id, "ok", false),
+        ];
+        atomcode_kernel::message::Conversation::repair_pairing(&mut messages);
+        let wire = format_messages(
+            &messages,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
+        assert!(
+            outgoing_wire_is_paired(&wire),
+            "outbound request has an unanswered tool call: {wire:?}"
+        );
     }
 
     #[test]
@@ -3860,6 +4202,30 @@ mod tests {
         assert!(
             !s.contains("data:image"),
             "no image_url bytes may leak: {s:?}"
+        );
+    }
+
+    /// The size estimate must count prior thinking exactly where the encoder
+    /// sends it: a model whose policy drops it would otherwise look several
+    /// times larger than it is and be compacted at a fraction of its window.
+    #[test]
+    fn replays_reasoning_follows_the_reasoning_policy() {
+        let provider = |model: &str| {
+            OpenAiCompatProvider::new(OpenAiCompatConfig::new(
+                "k",
+                "https://example.invalid/v1",
+                model,
+            ))
+            .unwrap()
+        };
+        assert!(!provider("lumen-alpha").replays_reasoning(), "Exclude");
+        assert!(provider("deepseek-v4-flash").replays_reasoning(), "Include");
+        assert!(provider("glm-5.2").replays_reasoning(), "Preserve");
+        let mut cfg = OpenAiCompatConfig::new("k", "https://example.invalid/v1", "glm-5.2");
+        cfg.reasoning_policy = Some(ReasoningPolicy::Exclude);
+        assert!(
+            !OpenAiCompatProvider::new(cfg).unwrap().replays_reasoning(),
+            "override"
         );
     }
 
@@ -4460,6 +4826,76 @@ mod tests {
     }
 
     #[test]
+    fn bare_scalar_enum_types_reach_the_chat_wire_without_mutating_input() {
+        let schema = json!({"type":"object", "properties": {
+            "action": {"enum":["launch", "status"]},
+            "level": {"enum":[1, 2.5]},
+            "flag": {"enum":[true, false]},
+            "nested": {"type":"array", "items":{"enum":["a"]}},
+            "union": {"anyOf":[{"enum":[false]}, {"type":"null"}]},
+            "map": {"type":"object", "additionalProperties":{"enum":[3]}},
+            "literal": {"default":{"enum":["data"]}, "examples":[{"enum":["data"]}], "const":{"enum":["data"]}}
+        }, "$defs":{"Mode":{"enum":["fast"]}}});
+        let before = schema.clone();
+        let tools = [ToolDef {
+            name: "external".into(),
+            description: "fixture".into(),
+            parameters: schema.clone(),
+        }];
+        let cfg = OpenAiCompatConfig::new("fixture", "http://localhost", "kimi-k3-1-pro");
+        let body = build_request_body(
+            "kimi-k3-1-pro",
+            &[Message::user("hi")],
+            &tools,
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+        );
+        let out = &body["tools"][0]["function"]["parameters"];
+        let props = &out["properties"];
+        assert_eq!(props["action"]["type"], "string");
+        assert_eq!(
+            props["action"]["enum"],
+            before["properties"]["action"]["enum"]
+        );
+        assert_eq!(props["level"]["type"], "number");
+        assert_eq!(props["flag"]["type"], "boolean");
+        assert_eq!(props["nested"]["items"]["type"], "string");
+        assert_eq!(props["union"]["anyOf"][0]["type"], "boolean");
+        assert_eq!(props["map"]["additionalProperties"]["type"], "number");
+        assert_eq!(out["$defs"]["Mode"]["type"], "string");
+        assert_eq!(props["literal"], before["properties"]["literal"]);
+        assert_eq!(tools[0].parameters, before);
+        assert_eq!(schema, before);
+        assert_eq!(*out, shared_normalize_tool_schema(&schema));
+        assert_eq!(
+            *out,
+            shared_normalize_tool_schema(out),
+            "normalization is idempotent"
+        );
+    }
+
+    #[test]
+    fn enum_normalization_preserves_ambiguous_and_explicit_schemas() {
+        for schema in [
+            json!({"enum":[]}),
+            json!({"enum":[null]}),
+            json!({"enum":["a",null]}),
+            json!({"enum":[1,"a"]}),
+            json!({"enum":[true,1]}),
+            json!({"enum":[{}]}),
+            json!({"enum":[{"enum":["literal"]}]}),
+            json!({"enum":[[1]]}),
+            json!({"type":"integer", "enum":[1,2]}),
+            json!({"type":["string","null"], "enum":["a",null]}),
+            json!({"enum":"not-an-array"}),
+        ] {
+            assert_eq!(shared_normalize_tool_schema(&schema), schema);
+        }
+    }
+
+    #[test]
     fn reasoning_effort_max_reaches_wire() {
         // DeepSeek V4 accepts "max" beyond low/medium/high — the `/effort max` path.
         let mut cfg = OpenAiCompatConfig::new("k", "https://x", "deepseek-v4-flash");
@@ -4825,6 +5261,90 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn native_tool_markers_in_content_remain_text_at_every_split_point() {
+        let text = "Literal example: `]<]minimax[>[<tool_call>PRIVATE_ARGUMENTS</tool_call>`。";
+        for split in text.char_indices().map(|(i, _)| i).chain([text.len()]) {
+            let mut decoder = SseDecoder::new();
+            let mut events = Vec::new();
+            for part in [&text[..split], &text[split..]] {
+                events.extend(
+                    decoder.feed(line(json!({"choices":[{"delta":{"content":part}}]})).as_bytes()),
+                );
+            }
+            events.extend(
+                decoder.feed(
+                    line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes(),
+                ),
+            );
+            events.extend(decoder.finish());
+            assert!(decoder.content_marker.seen, "split {split}");
+            let actual: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actual, text, "literal text must remain intact at {split}");
+            assert!(events.iter().all(|e| !matches!(
+                e,
+                StreamEvent::ToolCall(_)
+                    | StreamEvent::ToolCallDelta { .. }
+                    | StreamEvent::Error(_)
+                    | StreamEvent::Malformed
+            )));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { truncated: false })));
+        }
+    }
+
+    #[test]
+    fn native_content_observation_does_not_duplicate_a_structured_call() {
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(line(json!({"choices":[{"delta":{
+            "content":"]<]minimax[>[<tool_call>",
+            "tool_calls":[{"index":0,"id":"real-call","type":"function","function":{"name":"read_file","arguments":"{}"}}]
+        }}]})).as_bytes());
+        events.extend(
+            decoder.feed(
+                line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes(),
+            ),
+        );
+        events.extend(decoder.finish());
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "real-call");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "{}");
+        assert!(decoder.content_marker.seen);
+    }
+
+    #[test]
+    fn native_marker_observation_is_scoped_to_the_original_content_field() {
+        let mut decoder = SseDecoder::new();
+        decoder.feed(
+            line(json!({"choices":[{"delta":{"reasoning_content":"]<]minimax[>[<tool_call>"}}]}))
+                .as_bytes(),
+        );
+        assert!(!decoder.content_marker.seen);
+        // Inline thinking is still the content wire field, even though it is
+        // routed to Reasoning events for display after this observation.
+        let events = decoder.feed(line(json!({"choices":[{"delta":{"content":"<think>]<]minimax[>[<tool_call></think>"}}]})).as_bytes());
+        assert!(decoder.content_marker.seen);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Reasoning(_))));
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::ToolCall(_))));
+    }
+
     /// A gateway whose reasoning parser is not configured passes `<think>`
     /// straight through in `content`. It must still reach the reasoning
     /// channel — the same place the parsed path puts it — rather than being
@@ -4953,6 +5473,149 @@ mod tests {
             !noise.iter().any(|e| matches!(e, StreamEvent::Malformed)),
             "comments / blank / empty-data lines must NOT be malformed; got {:?}",
             kinds(&noise)
+        );
+    }
+
+    #[test]
+    fn sse_terminal_decoder_ignores_all_later_chunks() {
+        for failed in [false, true] {
+            let mut d = SseDecoder::new().with_line_cap(64);
+            let terminal = if failed {
+                d.feed(&[b'x'; 65])
+            } else {
+                d.feed(b"data: [DONE]\n")
+            };
+            assert!(terminal
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Done { .. } | StreamEvent::Error(_))));
+            for chunk in [
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n".as_slice(),
+                &[b'x'; 65],
+                b"unfinished",
+            ] {
+                assert!(d.feed(chunk).is_empty(), "terminal decoder emitted again");
+                assert!(d.buf.is_empty(), "terminal decoder retained bytes");
+            }
+            assert!(d.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn sse_fragmented_line_reuses_reserved_storage() {
+        let mut d = SseDecoder::new().with_line_cap(2048);
+        d.buf.reserve_exact(2048);
+        let storage = d.buf.as_ptr();
+        for _ in 0..1024 {
+            assert!(d.feed(b"x").is_empty());
+            assert_eq!(
+                d.buf.as_ptr(),
+                storage,
+                "existing tail was reallocated despite reserved space"
+            );
+        }
+        assert_eq!(d.buf.len(), 1024);
+    }
+
+    #[test]
+    fn sse_line_cap_boundary_and_split_crlf_are_chunk_independent() {
+        let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n";
+        for split in 0..=bytes.len() {
+            let mut d = SseDecoder::new().with_line_cap(bytes.len() - 1);
+            let mut events = d.feed(&bytes[..split]);
+            events.extend(d.feed(&bytes[split..]));
+            assert_eq!(kinds(&events), ["text"], "split at {split}");
+            let mut d = SseDecoder::new().with_line_cap(bytes.len() - 2);
+            let mut events = d.feed(&bytes[..split]);
+            events.extend(d.feed(&bytes[split..]));
+            assert_eq!(kinds(&events), ["error"], "split at {split}");
+            assert!(d.buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn sse_every_byte_fragment_preserves_utf8_and_eof_completion() {
+        let payload = format!(
+            "{}data: [DONE]",
+            line(json!({"choices":[{"delta":{"content":"你好🦀"}}]}))
+        );
+        let mut d = SseDecoder::new();
+        let mut events = Vec::new();
+        for byte in payload.as_bytes() {
+            events.extend(d.feed(std::slice::from_ref(byte)));
+        }
+        events.extend(d.finish());
+        assert_eq!(kinds(&events), ["text", "done"]);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "你好🦀"));
+    }
+
+    /// A provider that never sends `\n` must not grow the decoder without
+    /// bound. The tail is refused once it passes the cap, and the stream is
+    /// terminal (a later chunk cannot resume a line whose start was dropped).
+    #[test]
+    fn sse_unterminated_line_past_the_cap_fails_instead_of_buffering() {
+        let mut d = SseDecoder::new().with_line_cap(64);
+        let ev = d.feed(&[b'x'; 65]);
+        assert_eq!(kinds(&ev), vec!["error"], "{ev:?}");
+        let StreamEvent::Error(err) = &ev[0] else {
+            unreachable!()
+        };
+        assert_eq!(err.code.as_deref(), Some("sse_line_too_large"));
+        assert!(!err.retryable);
+        assert!(d.feed(b"data: [DONE]\n").is_empty());
+        assert!(d.finish().is_empty());
+    }
+
+    /// A complete line longer than the cap is refused before it is parsed.
+    #[test]
+    fn sse_complete_line_past_the_cap_fails() {
+        let mut d = SseDecoder::new().with_line_cap(8);
+        let ev = d.feed(b"xxxxxxxxx\n");
+        assert_eq!(kinds(&ev), vec!["error"], "{ev:?}");
+        assert!(matches!(
+            &ev[0],
+            StreamEvent::Error(e) if e.code.as_deref() == Some("sse_line_too_large")
+        ));
+    }
+
+    /// The cap applies to the line, not to one transport chunk: a line split
+    /// below the cap is still reassembled.
+    #[test]
+    fn sse_a_line_split_across_chunks_is_reassembled_under_the_cap() {
+        let mut d = SseDecoder::new().with_line_cap(128);
+        let line = line(json!({"choices":[{"delta":{"content":"ok"}}]}));
+        assert!(line.len() <= 128, "fixture must fit the cap");
+        let (head, tail) = line.split_at(line.len() / 2);
+        assert!(d.feed(head.as_bytes()).is_empty());
+        let ev = d.feed(tail.as_bytes());
+        assert_eq!(kinds(&ev), vec!["text"]);
+    }
+
+    /// Many events in one transport chunk are decoded in order. This is the
+    /// shape that made a per-line front-drain quadratic; it stays linear.
+    #[test]
+    fn sse_many_lines_in_one_chunk_decode_in_order() {
+        let mut d = SseDecoder::new();
+        let mut sse = String::new();
+        for i in 0..1000 {
+            sse.push_str(&line(
+                json!({"choices":[{"delta":{"content":format!("{i},")}}]}),
+            ));
+        }
+        let ev = d.feed(sse.as_bytes());
+        let text: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected: String = (0..1000).map(|i| format!("{i},")).collect();
+        assert_eq!(text, expected);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::TextDelta(_)))
+                .count(),
+            1000
         );
     }
 

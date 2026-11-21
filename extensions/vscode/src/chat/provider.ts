@@ -189,6 +189,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // the webview HTML — a rebuild would reset the active chat. Initial load is handled by the
     // `{{fontStyle}}` injection in `_getHtml`.
     this._settingsWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('atomcode.fontSize')) {
+        const msg = { type: 'chromeFontSize', value: resolveChatFontSize() };
+        this._view?.webview.postMessage(msg);
+        for (const webview of this._webviewPanels.keys()) webview.postMessage(msg);
+      }
       if (
         e.affectsConfiguration('atomcode.chat.fontFamily') ||
         e.affectsConfiguration('chatEditor.fontFamily')
@@ -652,6 +657,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'ready':
           this._markPanelNotReady(webview);
+          // Reconcile settings changed while the webview was loading/suspended.
+          webview.postMessage({ type: 'chromeFontSize', value: resolveChatFontSize() });
           {
             const replayCursor = await this._sendInitialState(webview, mode);
             this._finishPanelReadyReplay(webview, replayCursor);
@@ -1328,6 +1335,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const msg = {
           sessionId: request.sessionId,
           id: request.callId,
+          ...(request.approvalId ? { approvalId: request.approvalId } : {}),
           toolName: request.toolName,
           reason: request.reason,
           args: request.args,
@@ -1595,6 +1603,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     sessionId?: string;
     id?: string;
     toolName?: string;
+    approvalId?: string;
     decision?: unknown;
     allowed?: boolean;
     persist?: boolean;
@@ -1610,6 +1619,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessageForSession(msg.sessionId, {
         type: 'permissionResponseResult',
         id: msg.id,
+        ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: false,
         message: 'Invalid permission decision',
       });
@@ -1621,10 +1631,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         msg.sessionId,
         decision,
         msg.toolName,
+        msg.id,
+        msg.approvalId,
       );
       this._postMessageForSession(msg.sessionId, {
         type: 'permissionResponseResult',
         id: msg.id,
+        ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: result.success,
         message: result.error,
       });
@@ -1632,6 +1645,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessageForSession(msg.sessionId, {
         type: 'permissionResponseResult',
         id: msg.id,
+        ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: false,
         message: this._messageFromError(e),
       });
@@ -3101,6 +3115,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
     html = html.replace(/\{\{viewMode\}\}/g, mode);
     html = html.replace(/\{\{locale\}\}/g, vscode.env.language || 'en');
+    html = html.replace(/\{\{fontSize\}\}/g, String(resolveChatFontSize()));
     // VS Code injects `editor.fontFamily` as `--vscode-editor-font-family` but NOT
     // `chatEditor.fontFamily` (that setting is for the built-in chat only). Resolve the chat
     // font ourselves and, when set, override the monospace var so code blocks AND the input
@@ -3116,6 +3131,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     return html;
   }
+}
+
+export function resolveChatFontSize(): number {
+  const size = vscode.workspace.getConfiguration('atomcode').get<number>('fontSize', 13);
+  return typeof size === 'number' && Number.isFinite(size)
+    ? Math.min(40, Math.max(9, Math.round(size))) : 13;
 }
 
 /**

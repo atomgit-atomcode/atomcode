@@ -596,8 +596,30 @@ async fn skills_with_names_on_it_runs_them_together_rather_than_listing() {
             .expect("offered, so findable")
     };
 
+    // An explicit unknown second reference must not queue the first skill,
+    // including the image command path; preparation is atomic.
+    assert!(skills()
+        .run(agent.clone(), "plan $missing task")
+        .await
+        .is_err());
+    assert!(skills()
+        .run_with_images(
+            agent.clone(),
+            "plan $missing task",
+            vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }]
+        )
+        .await
+        .is_err());
+    assert!(!agent
+        .inbox()
+        .waiting_from(atomcode_harness::agent::MessageOrigin::User));
+    assert!(agent.inbox().claim().injections.is_empty());
+
     let said = skills()
-        .run(agent.clone(), "plan review fix the auth bug")
+        .run(agent.clone(), "plan $review $plan fix the auth bug")
         .await
         .expect("running two skills");
     assert!(
@@ -633,6 +655,58 @@ async fn skills_with_names_on_it_runs_them_together_rather_than_listing() {
         1,
         "one turn with a rule between them, not two turns: {queued}"
     );
+
+    agent.session().append(SessionEvent::Injected {
+        turn: 7,
+        text: queued.clone(),
+        origin: origin.clone(),
+    });
+    let before = agent.session().events();
+    let resumed = start(tree(&dir, STOP, &[])).await;
+    let restored = atomcode_harness::create_agent(&resumed).await.unwrap();
+    restored.session().restore(before);
+    let command = resumed
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap()
+        .find("skills", &restored)
+        .unwrap();
+    let listing = command.run(restored.clone(), "--list").await.unwrap();
+    let expected_usage =
+        atomcode_config::i18n::t(atomcode_config::i18n::Msg::CmdSkillUsed { count: 1, turn: 7 });
+    assert!(
+        listing.contains(expected_usage.as_ref()) && listing.contains("$<"),
+        "{listing}"
+    );
+    let first_use = skills()
+        .run(agent.clone(), "plan $review next task")
+        .await
+        .unwrap();
+    assert!(
+        first_use.contains("7"),
+        "repeat notice must name the logged turn: {first_use}"
+    );
+    let again = agent.inbox().claim();
+    assert_eq!(
+        again.injections.len(),
+        1,
+        "history never blocks explicit reinjection"
+    );
+    assert_eq!(
+        again.message.as_deref(),
+        Some("/skills plan review next task")
+    );
+    let direct = catalog
+        .find("plan", &agent)
+        .unwrap()
+        .run(agent.clone(), "direct task")
+        .await
+        .unwrap();
+    assert!(
+        direct.contains("7"),
+        "direct skill commands share repeat notices: {direct}"
+    );
+    agent.inbox().claim();
 
     // A name nothing answers to is refused, rather than silently becoming a
     // task nobody asked to run.
@@ -1747,4 +1821,169 @@ async fn optional_and_legacy_templates_keep_empty_input_and_model_loading_is_unc
         "model loading behavior changed: {}",
         result.content
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skill_spelling_hints_preserve_atomic_rejection_and_original_task_text() {
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+    let dir = scratch("skill-spelling");
+    for (name, hidden) in [("plan", false), ("review", false), ("secret-review", true)] {
+        let at = dir.join(format!(".claude/skills/{name}"));
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("SKILL.md"), format!("---\nname: {name}\ndescription: {name} test\nuser-invocable: {}\n---\n{name} body\n", !hidden)).unwrap();
+    }
+    let app = start(tree(&dir, STOP, &[])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let command = catalog.find("skills", &agent).unwrap();
+    for args in [
+        "plan $reveiw task",
+        "plan ¥reveiw task",
+        "$reveiw task",
+        "reveiw task",
+    ] {
+        let error = command.run(agent.clone(), args).await.unwrap_err();
+        assert!(error.contains("Did you mean `review`?"), "{error}");
+        assert!(!agent
+            .inbox()
+            .waiting_from(atomcode_harness::agent::MessageOrigin::User));
+        assert!(agent.inbox().claim().injections.is_empty());
+    }
+    let hidden = command
+        .run(agent.clone(), "$secret-reveiw task")
+        .await
+        .unwrap_err();
+    assert!(!hidden.contains("Did you mean"), "{hidden}");
+    let prepared = command
+        .prepare_input(&agent, "plan reveiw  fix   the bug")
+        .unwrap()
+        .unwrap();
+    assert!(prepared
+        .output
+        .contains("`reveiw` was not recognized as a skill"));
+    assert!(prepared.output.contains("Did you mean `review`?"));
+    assert_eq!(prepared.text, "/skills plan reveiw  fix   the bug");
+    assert!(matches!(&prepared.context.1, InjectionOrigin::Skill { name } if name == "plan"));
+    assert!(!prepared.context.0.contains("review body"));
+    assert!(
+        !prepared.context.0.contains("Did you mean"),
+        "advisory must not enter the skill body"
+    );
+    for args in [
+        "plan fix reveiw later",
+        "plan fix $reveiw later",
+        "plan ./reveiw task",
+        "plan review task",
+    ] {
+        let prepared = command.prepare_input(&agent, args).unwrap().unwrap();
+        assert!(
+            !prepared.output.contains("Did you mean"),
+            "{args}: {}",
+            prepared.output
+        );
+    }
+    let prepared = command
+        .prepare_input(&agent, "plan REVIEW task")
+        .unwrap()
+        .unwrap();
+    assert!(prepared.output.contains("Did you mean `review`?"));
+    let prepared = command
+        .prepare_input(&agent, "plan reveiw  fix   the bug")
+        .unwrap()
+        .unwrap();
+    let output = prepared.send(
+        &agent,
+        vec![atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        }],
+    );
+    assert!(output.contains("Did you mean `review`?"));
+    let claimed = agent.inbox().claim();
+    assert_eq!(
+        claimed.message.as_deref(),
+        Some("/skills plan reveiw  fix   the bug")
+    );
+    assert_eq!(claimed.images.len(), 1);
+}
+
+#[tokio::test]
+async fn architecture_topology_is_absent_by_default_and_opt_in_does_not_require_a_graph() {
+    let dir = scratch("ati-default");
+    let base = start(tree(&dir, STOP, &[])).await;
+    assert!(!base
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .names()
+        .contains(&"repo_architecture".into()));
+    assert!(!base
+        .context()
+        .service::<SystemPromptSvc>()
+        .unwrap()
+        .render()
+        .contains("repo_architecture"));
+    drop(base);
+    let enabled = start(tree(
+        &dir,
+        STOP,
+        &["[[patch]]\nid = \"architecture-topology\"\ndisabled = false\n"],
+    ))
+    .await;
+    assert!(enabled
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .names()
+        .contains(&"repo_architecture".into()));
+    assert!(enabled
+        .context()
+        .service::<SystemPromptSvc>()
+        .unwrap()
+        .render()
+        .contains("repo_architecture"));
+    assert!(enabled
+        .context()
+        .service::<atomcode_harness::seams::CodeIndexSvc>()
+        .is_none());
+}
+
+#[tokio::test]
+async fn architecture_topology_executes_through_the_normal_tool_loop_and_can_be_disabled() {
+    let dir = scratch("ati-tool");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname='ati_fixture'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let enabled = "[[patch]]\nid = \"architecture-topology\"\ndisabled = false\n";
+    let app = start(tree(
+        &dir,
+        &script_one("repo_architecture", r#"{ action = "overview" }"#),
+        &[enabled],
+    ))
+    .await;
+    run_turn(&app, "inspect architecture").await.unwrap();
+    let log = transcript(&app);
+    assert!(log.contains("ati_fixture"), "{log}");
+    drop(app);
+    let disabled = start(tree(
+        &dir,
+        STOP,
+        &[
+            enabled,
+            "[[patch]]\nid = \"architecture-topology\"\ndisabled = true\n",
+        ],
+    ))
+    .await;
+    assert!(!disabled
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .names()
+        .contains(&"repo_architecture".into()));
 }

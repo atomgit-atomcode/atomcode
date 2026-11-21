@@ -1348,3 +1348,18 @@ testToolProgressReplacesLatestActivity();
 testPartialReviewResultIsMarkedIncomplete();
 testIdleNoticeAddsSingleStatusBlock();
 testIdleNoticePredicateRequiresGeneratingAndThreshold();
+
+
+function testLateApprovalResultCannotApproveAReusedProviderCall() {
+  let state = startAssistantState();
+  const request = {type:'PERMISSION_REQUEST' as const,id:'reused',sessionId:'session',toolName:'mcp__browser-use__browser_click',reason:'Approve',args:'{}',isDestructive:true};
+  state = chatReducer(state, {...request,approvalId:'old'});
+  state = chatReducer(state, {...request,approvalId:'new'});
+  state = chatReducer(state, {type:'PERMISSION_RESPONSE_RESULT',id:'reused',approvalId:'old',success:true});
+  assert.equal(state.messages[0].permissionRequest?.approvalId,'new');
+  assert.equal(state.messages[0].permissionRequest?.status,'pending');
+  state = chatReducer(state, {type:'PERMISSION_RESPOND',id:'reused',approvalId:'new',decision:'allow'});
+  state = chatReducer(state, {type:'PERMISSION_RESPONSE_RESULT',id:'reused',approvalId:'new',success:true});
+  assert.equal(state.messages[0].permissionRequest?.status,'allowed');
+}
+testLateApprovalResultCannotApproveAReusedProviderCall();

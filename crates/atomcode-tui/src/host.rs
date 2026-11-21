@@ -893,6 +893,7 @@ fn behind_a_lid(block: &crate::block::Block) -> bool {
         // not swallowed by the neighbouring calls' group count.
         && !block.content.as_tool_call().is_some_and(|call| {
             call.edit_text_mismatch()
+                || call.is_interrupted()
                 // A slow call's activity must stay visible even when a later
                 // parallel call would otherwise own the merged run's lid.
                 || (call.is_running() && call.progress.is_some())
@@ -917,6 +918,18 @@ fn same_poll_run(a: &crate::block::Block, b: &crate::block::Block) -> bool {
     job.is_some() && job == next.idle_poll_job() && a.at.turn == b.at.turn && first.dir == next.dir
 }
 
+/// Drawing and expansion use the same membership rule. Names only select
+/// presentation; the runtime remains responsible for identity and permissions.
+fn same_tool_run(a: &crate::block::Block, b: &crate::block::Block) -> bool {
+    let (Some(first), Some(next)) = (a.content.as_tool_call(), b.content.as_tool_call()) else {
+        return false;
+    };
+    if first.idle_poll_job().is_some() || next.idle_poll_job().is_some() {
+        return same_poll_run(a, b);
+    }
+    a.at.turn == b.at.turn && first.activity() == next.activity()
+}
+
 /// The run of drawn calls starting at `start`, and the slot the scan stopped on.
 ///
 /// A block the reader cannot see is stepped over, not stopped at — a hidden
@@ -938,11 +951,6 @@ fn run_from(
     pres: &Presentation,
 ) -> (Vec<usize>, usize) {
     let mut members = vec![start];
-    let poll = slots[start]
-        .block()
-        .content
-        .as_tool_call()
-        .is_some_and(|c| c.idle_poll_job().is_some());
     let mut j = start + 1;
     while j < slots.len() {
         if pres.is_hidden(slots[j].block().kind()) {
@@ -952,13 +960,7 @@ fn run_from(
         if !behind_a_lid(slots[j].block()) {
             break;
         }
-        let next_poll = slots[j]
-            .block()
-            .content
-            .as_tool_call()
-            .is_some_and(|c| c.idle_poll_job().is_some());
-        if (poll && !same_poll_run(slots[start].block(), slots[j].block())) || (!poll && next_poll)
-        {
+        if !same_tool_run(slots[start].block(), slots[j].block()) {
             break;
         }
         members.push(j);
@@ -1248,11 +1250,6 @@ fn run_around(
     }
     // Back to the run's first call: over the members, and over the hidden slots
     // between them, stopping at the first thing that is neither.
-    let poll = slots[at]
-        .block()
-        .content
-        .as_tool_call()
-        .is_some_and(|c| c.idle_poll_job().is_some());
     let mut start = at;
     let mut j = at;
     while j > 0 {
@@ -1263,13 +1260,7 @@ fn run_around(
         if !behind_a_lid(slots[j].block()) {
             break;
         }
-        let previous_poll = slots[j]
-            .block()
-            .content
-            .as_tool_call()
-            .is_some_and(|c| c.idle_poll_job().is_some());
-        if (poll && !same_poll_run(slots[at].block(), slots[j].block())) || (!poll && previous_poll)
-        {
+        if !same_tool_run(slots[at].block(), slots[j].block()) {
             break;
         }
         start = j;
@@ -1891,6 +1882,8 @@ impl Host {
         // over the window, which is worse, because a window is what a person
         // picks between.
         m.title = None;
+        // The replacement session's mode is read from its host after switching.
+        m.mode = None;
     }
 
     /// Where the session on screen works, as its host answered: what the status
@@ -2226,56 +2219,107 @@ impl Host {
         });
     }
 
-    /// Let this conversation say its first word, if any producer will.
-    ///
-    /// **Only when the stream is empty**, and that is the whole test for "opens
-    /// its top": a fresh session is empty, and a resumed one is empty too *at the
-    /// moment this is asked* — `Tui::run` asks the instant the session has been
-    /// described but before its history has begun to fold in (the stream is
-    /// append-ordered, so the welcome has to be emitted first to sit first). A
-    /// separate "is this new?" flag would be a second source of truth for one
-    /// fact.
-    ///
-    /// **It does not go through `absorb`.** That path stands for a committed fact
-    /// in the log, and what this synthesises is a way of opening, not a fact:
-    /// going through it would write to `SessionLog` and be replayed on resume. So
-    /// it writes the stream directly — the one place in this crate that does. A
-    /// resumed conversation therefore folds a log that never had the welcome, and
-    /// this re-emits it on top per view.
-    ///
-    /// The first producer with something to say wins and the loop stops: the rule
-    /// is "when the stream is empty", and once it has spoken the stream is not.
-    /// That is also why no second mechanism is needed to stop a second opener.
-    ///
-    /// `true` when a block was emitted, which is the caller's cue that a frame is
-    /// owed.
-    ///
-    /// "Empty" for this purpose is "no conversational block yet": a reply a
-    /// slash command left behind (the `commands` channel) is not a turn — the
-    /// wizard's closing line arrives through it, and a machine that finished
-    /// onboarding still owes its first word.
+    /// Emit the first producer's presentation-only opening once per view.
+    /// A paged bootstrap may render history before the agent is described;
+    /// the opener still belongs above that history and all subsequent pages.
+    /// It never enters the session log or model context.
     pub fn open_conversation(
         &self,
         at: crate::block::Coord,
         open: &crate::module::Opening,
     ) -> bool {
         let mut stream = self.stream.write().expect("stream poisoned");
-        if stream
-            .slots()
-            .iter()
-            .any(|slot| slot.block().producer != "commands")
-        {
+        if stream.has_opening() {
             return false;
         }
         for producer in self.modules.producers() {
             if let Some(content) = producer.opening(at, open) {
                 // Under the producer's own id: the block's `producer` field says
                 // who made it, and it is what would have to settle it later.
-                stream.writer(producer.id()).emit(at, content);
+                let mut opening = stream.history_buffer();
+                opening.writer(producer.id()).emit(at, content);
+                stream.prepend_opening(opening);
+                drop(stream);
+                self.forget_row_index();
                 return true;
             }
         }
         false
+    }
+
+    /// Update the setup view without adding a transcript entry or moving history.
+    pub(crate) fn refresh_opening(&self, opening: &crate::module::Opening) -> bool {
+        let content = self
+            .modules
+            .producers()
+            .iter()
+            .find_map(|producer| producer.opening(crate::block::Coord::default(), opening));
+        let changed = content.is_some_and(|content| {
+            self.stream
+                .write()
+                .expect("stream poisoned")
+                .replace_opening(content)
+        });
+        if changed {
+            self.forget_row_index();
+        }
+        changed
+    }
+
+    /// Seed sidebars/producer indexes without presenting old transcript bodies.
+    pub(crate) fn seed_history(&self, seed: &[atomcode_kernel::session::Committed]) {
+        let before = self.stream.read().expect("stream poisoned").len();
+        for event in seed {
+            self.absorb_logged(&event.logged());
+        }
+        self.stream
+            .write()
+            .expect("stream poisoned")
+            .discard_after(before);
+        self.forget_row_index();
+    }
+
+    /// Old pages use an isolated transcript fold. Live producers, questions,
+    /// editor state and sidebar counters are untouched.
+    pub(crate) fn prepend_history(
+        &self,
+        seed: &[atomcode_kernel::session::Committed],
+        events: &[atomcode_kernel::session::Committed],
+    ) {
+        let renderer = crate::modules::transcript::Transcript::default();
+        let mut stream = self.stream.write().expect("stream poisoned");
+        let mut older = stream.history_buffer();
+        let dir = self.session_dir.read().expect("dir poisoned").clone();
+        for event in seed {
+            crate::module::Producer::absorb(
+                &renderer,
+                &event.logged(),
+                &mut older.writer("transcript").in_dir(dir.clone()),
+            );
+        }
+        older.discard_seed_blocks();
+        for event in events {
+            crate::module::Producer::absorb(
+                &renderer,
+                &event.logged(),
+                &mut older.writer("transcript").in_dir(dir.clone()),
+            );
+        }
+        older.writer("transcript").settle_all();
+        let calls: Vec<_> = older
+            .slots()
+            .iter()
+            .filter(|s| s.block().content.as_tool_call().is_some())
+            .map(|s| s.block().id)
+            .collect();
+        stream.prepend_history(older);
+        drop(stream);
+        let mut presentation = self.presentation.write().expect("presentation poisoned");
+        for id in calls {
+            presentation.fold_by_default(id);
+        }
+        drop(presentation);
+        self.forget_row_index();
     }
 
     /// Deliver one committed fact to every module, as the log carries it.
@@ -2283,6 +2327,11 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb_logged(&self, logged: &LoggedEvent) {
+        self.absorb_logged_with_members(logged, 0);
+    }
+
+    /// Live-only context, captured before immutable transcript blocks are emitted.
+    pub fn absorb_logged_with_members(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         {
             let mut m = self.moment.write().expect("moment poisoned");
@@ -2360,7 +2409,7 @@ impl Host {
         // result landing on that lid can still change how many rows the lid
         // draws, since it carries the result (`summary_lines`).
         self.pinned(true, || {
-            self.fold(logged);
+            self.fold(logged, members_working);
         });
     }
 
@@ -2369,7 +2418,7 @@ impl Host {
     ///
     /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
     /// "measure, change, measure again", and the change is this.
-    fn fold(&self, logged: &LoggedEvent) {
+    fn fold(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         // What this fold appended, as the blocks themselves: a fact may open
         // several at once (one per tool call in a message), and each of them is a
@@ -2381,7 +2430,10 @@ impl Host {
             let before = stream.len();
             let dir = self.session_dir.read().expect("dir poisoned").clone();
             for p in self.modules.producers() {
-                let mut w = stream.writer(p.id()).in_dir(dir.clone());
+                let mut w = stream
+                    .writer(p.id())
+                    .in_dir(dir.clone())
+                    .with_members_working(members_working);
                 p.absorb(logged, &mut w);
             }
             for slot in &stream.slots()[before..] {
@@ -2419,7 +2471,7 @@ impl Host {
             if !typed.trim().is_empty()
                 && m.history.last().map(String::as_str) != Some(typed.as_str())
             {
-                m.history.push(typed);
+                Arc::make_mut(&mut m.history).push(typed);
             }
         }
     }
@@ -2903,20 +2955,29 @@ impl Host {
     ///
     /// **True when a frame is owed.**
     pub fn sync_asking(&self) -> bool {
-        // Only when the panel is mounted. Unmounted, there is no panel to draw
-        // the question and no panel for the composer to step aside for: the
-        // question goes to the foot of the stream the way it did before there was
-        // a panel, and the composer stays exactly where it was. Gating here rather
-        // than in each of the four places that read `asking` is what keeps them
-        // from disagreeing about whether a question is on screen.
-        let waiting = self.ask_panel_mounted().then(|| self.asks.peek()).flatten();
+        // Without the panel, an approval still needs a sheet to track its
+        // selection. Its sheet is drawn in the stream and leaves the composer up.
+        let mounted = self.ask_panel_mounted();
+        let waiting = self.asks.peek().filter(|(_, asked)| {
+            mounted
+                || asked
+                    .first()
+                    .is_some_and(crate::ask::Asked::is_tool_approval)
+        });
         let mut m = self.moment.write().expect("moment poisoned");
+        let (shown, cleared) = if mounted {
+            let cleared = m.fallback_approval.take().is_some();
+            (&mut m.asking, cleared)
+        } else {
+            let cleared = m.asking.take().is_some();
+            (&mut m.fallback_approval, cleared)
+        };
         match waiting {
-            None => m.asking.take().is_some(),
+            None => shown.take().is_some() || cleared,
             // The same request keeps its sheet — the lit row, the page, what
             // has been ticked and typed. Keyed on the request's id rather than
             // on its words: two questions worded alike are still two questions.
-            Some((id, _)) if m.asking.as_ref().is_some_and(|had| had.id == id) => false,
+            Some((id, _)) if shown.as_ref().is_some_and(|had| had.id == id) => cleared,
             Some((id, asked)) => {
                 let mut sheet = crate::moment::Ask::new(id, asked);
                 let key = m
@@ -2928,7 +2989,11 @@ impl Host {
                     .unwrap_or("ctrl+e");
                 sheet.edit_key = crate::keymap::parse_question_edit_key(key)
                     .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
-                m.asking = Some(sheet);
+                if mounted {
+                    m.asking = Some(sheet);
+                } else {
+                    m.fallback_approval = Some(sheet);
+                }
                 true
             }
         }
@@ -2937,14 +3002,58 @@ impl Host {
     /// Move the highlight to a row, by index. True when it moved.
     pub fn point_ask_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        m.asking.as_mut().is_some_and(|a| a.point_at(row))
+        m.asking.as_mut().is_some_and(|a| a.hover_at(row))
     }
 
     /// Give a key to the question panel, and say what it came to.
     pub fn ask_key(&self, press: crate::surface::KeyPress) -> Option<(u64, crate::ask::Step)> {
         let mut m = self.moment.write().expect("moment poisoned");
-        let sheet = m.asking.as_mut()?;
+        let sheet = m
+            .asking
+            .as_mut()
+            .filter(|sheet| !sheet.is_tool_approval())?;
         Some((sheet.id, sheet.key(press)))
+    }
+
+    pub(crate) fn approval_key(
+        &self,
+        presented: crate::ask::PresentedApproval,
+        press: crate::surface::KeyPress,
+    ) -> crate::ask::Step {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let sheet = match m.asking.as_mut() {
+            Some(sheet) => Some(sheet),
+            None => m.fallback_approval.as_mut(),
+        };
+        let Some(sheet) =
+            sheet.filter(|sheet| sheet.id == presented.id && sheet.is_tool_approval())
+        else {
+            return crate::ask::Step::Stay;
+        };
+        if press.key == crate::surface::Key::Enter
+            && !presented
+                .selected
+                .is_some_and(|row| sheet.row_selected(row))
+        {
+            return crate::ask::Step::Stay;
+        }
+        sheet.key(press)
+    }
+
+    pub(crate) fn click_ask(
+        &self,
+        row: usize,
+        approval_on_screen: Option<u64>,
+    ) -> Option<(u64, crate::ask::Step)> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let sheet = m.asking.as_mut()?;
+        if sheet.option_edit().is_some()
+            || (sheet.is_tool_approval() && approval_on_screen != Some(sheet.id))
+        {
+            return None;
+        }
+        sheet.point_at(row);
+        Some((sheet.id, sheet.enter()))
     }
 
     /// Paste into the question panel's typing row. True when it took it.
@@ -2962,6 +3071,20 @@ impl Host {
     /// showing a prompt nobody is waiting on from being possible.
     pub fn ask_secret(&self, prompt: &str, reply: tokio::sync::oneshot::Sender<Option<String>>) {
         self.secrets.ask(prompt, reply);
+        self.sync_secret();
+    }
+
+    pub(crate) fn try_ask_protected_secret(
+        &self,
+        prompt: &str,
+        reply: tokio::sync::oneshot::Sender<Option<zeroize::Zeroizing<String>>>,
+    ) -> Option<u64> {
+        let id = self.secrets.try_ask_protected(prompt, reply);
+        self.sync_secret();
+        id
+    }
+    pub(crate) fn refuse_owned_secret(&self, id: u64) {
+        self.secrets.refuse_owned(id);
         self.sync_secret();
     }
 
@@ -3055,6 +3178,19 @@ impl Host {
             self.toggle_settings();
         }
         self.show_settings_tab(tab);
+    }
+
+    /// Open Config with the requested setting selected.
+    pub fn open_settings_for(&self, id: &str) {
+        if !self.settings_open() {
+            self.toggle_settings();
+        }
+        let mut moment = self.moment.write().expect("moment poisoned");
+        moment.settings_panel = Some(crate::settings::Panel {
+            query: id.to_owned(),
+            query_caret: id.len(),
+            ..crate::settings::Panel::new()
+        });
     }
 
     /// Put the settings panel away. True when it was up.
@@ -4181,6 +4317,23 @@ impl Host {
         }
     }
 
+    /// Whether the pointer is over the current-session MCP switch.
+    pub fn mcp_switch_at(&self, x: u16, y: u16) -> bool {
+        let rect = *self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .mcp
+            .as_ref()
+            .unwrap_or(&crate::frame::Rect::sized(0, 0));
+        if !rect.contains(x, y) {
+            return false;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::mcp::geometry(&m, &vp).is_session_switch((y - rect.y) as usize)
+    }
+
     /// Which row of the MCP panel is under the pointer.
     ///
     /// 列表层是**服务器**的第几行,详情层是**动作**的第几行——正是 `Panel::cursor`
@@ -4674,7 +4827,7 @@ impl Host {
     /// is a new list in the old one's place. What goes *behind* a page (Esc's
     /// way back) is decided by whoever opened it ([`crate::sheet::Sheet::back`]),
     /// not here.
-    pub fn open_sheet(&self, sheet: crate::sheet::Sheet) -> bool {
+    pub fn open_sheet(&self, mut sheet: crate::sheet::Sheet) -> bool {
         if !self.modules.has_view(crate::modules::sheet::ID) {
             return false;
         }
@@ -4692,6 +4845,7 @@ impl Host {
         m.mcp_panel = None;
         m.resume_panel = None;
         m.bg_panel = None;
+        sheet.set_diff_wrap(!m.clip_diff);
         m.sheet = Some(sheet);
         true
     }
@@ -4792,6 +4946,7 @@ impl Host {
         current.pending = None;
         m.sheet = match next {
             Some(mut next) => {
+                next.set_diff_wrap(!m.clip_diff);
                 let behind = m.sheet.take().map(|sheet| sheet.page);
                 if let (Page::Read(_) | Page::Doc(_), None, Some(list @ Page::List(_))) =
                     (&next.page, &next.back, behind)
@@ -5010,8 +5165,16 @@ impl Host {
     /// 键盘此刻是不是在一个问询之外的东西手里：密码框、modal、菜单、各个面板、反查、
     /// 团队面板 —— 主循环分键时排在问询前面或会吃掉字母的那些（`plugin.rs` 的键路由）。
     /// 一个地方列全，分键那边加了新的面板，这里跟着加一行。
+    pub(crate) fn model_setup_required(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .model_setup_required
+    }
+
     pub fn keyboard_held_elsewhere(&self) -> bool {
-        self.secret_waiting()
+        self.model_setup_required()
+            || self.secret_waiting()
             || self.overlays.is_open()
             || self.context_menu_open()
             || self.settings_open()
@@ -5969,7 +6132,7 @@ impl Host {
         };
         let mut moment = self.moment.write().expect("moment poisoned");
         if moment.history.last().map(String::as_str) != Some(recalled) {
-            moment.history.push(recalled.to_owned());
+            Arc::make_mut(&mut moment.history).push(recalled.to_owned());
         }
         moment.history_at = None;
         moment.draft.clear();
@@ -6257,6 +6420,27 @@ impl Host {
         out
     }
 
+    /// Fit the first-run Provider form immediately below the opening when
+    /// both fit. The ordinary Provider panel still follows the conversation's tail.
+    fn setup_pane_room(&self, mut room: Rect, heights: &[(String, u16)], moment: &Moment) -> Rect {
+        if moment.model_setup_required
+            && moment.scroll.0 == 0
+            && heights
+                .iter()
+                .any(|(id, height)| id == crate::modules::providers::ID && *height > 0)
+        {
+            let tail_rows = heights
+                .iter()
+                .map(|(_, height)| usize::from(*height))
+                .sum::<usize>();
+            let rows = self
+                .block_total_in(room.w, moment, usize::from(room.h))
+                .max(1);
+            room.h = rows.saturating_add(tail_rows).min(usize::from(room.h)) as u16;
+        }
+        room
+    }
+
     fn pane_geometry_capped(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
         // Everything below is in "distance from the bottom of the pane", which
         // is the coordinate `scroll` is already measured in: `d = 0` is the last
@@ -6311,7 +6495,7 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let ctx = crate::block::RenderCtx {
             width: rect.w,
-            caps: crate::block::ShapeCaps::of(&moment.caps),
+            caps: crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
         };
         let index = self.row_index_window(
             &ctx,
@@ -6396,9 +6580,10 @@ impl Host {
         rect: Rect,
         scroll: usize,
         caps: crate::block::ShapeCaps,
-        activity: crate::moment::Activity,
-        tick: u64,
+        moment: &Moment,
     ) -> (Vec<Line>, Vec<RowOwner>) {
+        let activity = moment.activity;
+        let tick = moment.tick;
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let calls_apart = pres.calls_apart();
@@ -6422,17 +6607,14 @@ impl Host {
         // is what makes the row a product's decision instead of a dependency of
         // the front end.
         if !self.ask_panel_mounted() {
-            if let Some(asked) = self.asks.current() {
-                let pending = fallback_question(&asked);
-                let mut lines =
-                    crate::block::Content::lines(&pending, &crate::block::RenderCtx::bare(rect.w));
-                lines.reverse();
-                for line in lines {
-                    if out.len() < want {
-                        out.push(line);
-                        owner.push(None); // a question is not a block yet
-                    }
-                }
+            for line in self
+                .fallback_ask_lines(rect.w, want, moment)
+                .into_iter()
+                .rev()
+                .take(want)
+            {
+                out.push(line);
+                owner.push(None); // a question is not a block yet
             }
         }
         // The same table `stream_height` summed, so the two cannot disagree
@@ -6498,10 +6680,11 @@ impl Host {
             // click worked once and then the row stopped answering.
             let foldable = !block.content.always_open();
             // A block that carries a picture is clickable too — clicking its
-            // `[Image #N]` opens the picture — even though a user message does not
-            // fold and so is not in `CLICKABLE`. Without this the row never enters
+            // attachment marker or result-image row opens the picture, even
+            // though neither folds. Without this the row never enters
             // the hit map and `block_at` could never answer a click on it.
-            let carries_image = !block.content.image_markers().is_empty();
+            let carries_image =
+                !block.content.image_markers().is_empty() || block.content.result_image().is_some();
             let mut own = ((foldable && CLICKABLE.contains(&kind)) || carries_image)
                 .then_some((block.id, kind));
             // The column this block leaves on the left, and the width that is
@@ -6707,7 +6890,15 @@ impl Host {
 
     /// Compose one frame.
     pub fn compose(&self, size: (u16, u16)) -> Frame {
+        self.compose_with_approval(size).0
+    }
+
+    pub(crate) fn compose_with_approval(
+        &self,
+        size: (u16, u16),
+    ) -> (Frame, Option<crate::ask::PresentedApproval>) {
         let (w, h) = size;
+        let mut approval = None;
         let mut frame = Frame::new(w, h);
         self.hits.lock().expect("hits poisoned").scrollbar = None;
         let mut moment = self.moment.read().expect("moment poisoned").clone();
@@ -6724,7 +6915,7 @@ impl Host {
         // rather than read inside `rows_at` because `stream_height`'s contract is
         // that the caller may already hold the moment's write lock (two callers
         // in `plugin.rs` do), so nothing below may take it again.
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
 
         let layout = self.layout.tree();
         let modules = self.modules.clone();
@@ -6748,7 +6939,8 @@ impl Host {
                     // is why every layout in this build still composes the same
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
-                    let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    let pane_room = self.setup_pane_room(rect, &heights, &moment);
+                    let mut pane = Self::pane_geometry(pane_room, moment.scroll.0, &heights);
                     let header_rect =
                         Rect::new(pane.block_rect.x, pane.block_rect.y, pane.block_rect.w, 1);
                     if let Some(header) = self.reserve_prompt_header(&mut pane, &moment) {
@@ -6767,13 +6959,14 @@ impl Host {
                             head: view.screen_of(sel.head),
                         });
                     }
-                    let (lines, owners) = self.stream_lines(
-                        pane.block_rect,
-                        pane.block_scroll,
-                        caps,
-                        moment.activity,
-                        moment.tick,
-                    );
+                    let (lines, owners) =
+                        self.stream_lines(pane.block_rect, pane.block_scroll, caps, &moment);
+                    if let Some(sheet) = moment.fallback_approval.as_ref() {
+                        if !self.ask_panel_mounted() {
+                            approval =
+                                crate::modules::ask::presented_approval(sheet, pane.block_rect);
+                        }
+                    }
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
                         rows: owners,
@@ -6847,6 +7040,14 @@ impl Host {
                         // have to reproduce the tail's split.
                         if id == crate::modules::ask::ID {
                             self.hits.lock().expect("hits poisoned").ask = Some(*tail_rect);
+                            if let Some(sheet) = moment
+                                .asking
+                                .as_ref()
+                                .filter(|sheet| sheet.is_tool_approval())
+                            {
+                                approval =
+                                    crate::modules::ask::presented_approval(sheet, *tail_rect);
+                            }
                         }
                         if id == crate::modules::todo::ID {
                             let mut hits = self.hits.lock().expect("hits poisoned");
@@ -7132,7 +7333,7 @@ impl Host {
             frame.containment_violations()
         );
         *self.painted.lock().expect("counter poisoned") += 1;
-        frame
+        (frame, approval)
     }
 
     /// How many rows the conversation gets on a screen this size.
@@ -7295,7 +7496,8 @@ impl Host {
             let idx = self.row_index.lock().expect("row index poisoned");
             if idx.loaded_start != 0
                 || idx.width != width
-                || idx.caps != crate::block::ShapeCaps::of(&moment.caps)
+                || idx.caps
+                    != crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff)
                 || idx.presentation != presentation
                 || idx.activity != moment.activity
             {
@@ -7509,7 +7711,8 @@ impl Host {
                 _ => None,
             })?;
         let heights = self.tail_heights_of(&tail, rect.w, moment);
-        let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+        let pane_room = self.setup_pane_room(rect, &heights, moment);
+        let mut pane = Self::pane_geometry(pane_room, moment.scroll.0, &heights);
         self.reserve_prompt_header(&mut pane, moment);
         Some(BlockView {
             rect: pane.block_rect,
@@ -7521,7 +7724,11 @@ impl Host {
     /// How many rows the conversation's blocks render to at `width` — the
     /// painter's own count ([`Host::row_index_window`]), tail not included.
     fn block_total(&self, width: u16, moment: &Moment) -> usize {
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        self.block_total_in(width, moment, 0)
+    }
+
+    fn block_total_in(&self, width: u16, moment: &Moment, height: usize) -> usize {
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         self.row_index_window(
@@ -7529,7 +7736,7 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            self.selection_layout_budget(width, moment, moment.scroll.0, 0, pres.revision()),
+            self.selection_layout_budget(width, moment, moment.scroll.0, height, pres.revision()),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         )
         .total
@@ -7542,7 +7749,8 @@ impl Host {
             .row_index_window(
                 &crate::block::RenderCtx {
                     width,
-                    caps: crate::block::ShapeCaps::of(&moment.caps),
+                    caps: crate::block::ShapeCaps::of(&moment.caps)
+                        .with_diff_wrap(!moment.clip_diff),
                 },
                 stream.slots(),
                 &pres,
@@ -7569,7 +7777,7 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let ctx = crate::block::RenderCtx {
             width: 120,
-            caps: crate::block::ShapeCaps::of(&moment.caps),
+            caps: crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
         };
         let mut text = String::new();
         for slot in stream.slots() {
@@ -7592,7 +7800,7 @@ impl Host {
     /// tall and a long session is not.
     pub fn transcript_lines(&self, width: u16, moment: &Moment) -> Vec<Line> {
         let total = self.full_block_total(width, moment);
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         // A question in flight with no panel to ride is drawn under the
         // blocks in every window (`stream_lines`), taking rows the count above
         // does not know about; each slice asks for that much more room so the
@@ -7601,13 +7809,7 @@ impl Host {
         let asked = if self.ask_panel_mounted() {
             0
         } else {
-            self.asks.current().map_or(0, |asked| {
-                crate::block::Content::lines(
-                    &fallback_question(&asked),
-                    &crate::block::RenderCtx::bare(width),
-                )
-                .len()
-            })
+            self.fallback_ask_lines(width, usize::MAX, moment).len()
         };
         let most = (u16::MAX as usize).saturating_sub(asked).max(1);
         let mut out = Vec::with_capacity(total);
@@ -7618,8 +7820,7 @@ impl Host {
                 Rect::new(0, 0, width, (rows + asked).min(u16::MAX as usize) as u16),
                 total - start - rows,
                 caps,
-                moment.activity,
-                moment.tick,
+                moment,
             );
             out.extend(lines.into_iter().take(rows));
             start += rows;
@@ -7659,9 +7860,8 @@ impl Host {
         let (lines, _) = self.stream_lines(
             rect,
             end - last,
-            crate::block::ShapeCaps::of(&moment.caps),
-            moment.activity,
-            moment.tick,
+            crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff),
+            moment,
         );
         let width = view.rect.w;
         let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -7677,14 +7877,7 @@ impl Host {
                 out.push(String::new());
                 continue;
             }
-            let text = line.plain();
-            let head = crate::width::take_width(&text, a as usize);
-            #[allow(
-                clippy::string_slice,
-                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
-            )]
-            let rest = &text[head.len()..];
-            let piece = crate::width::take_width(rest, (b - a) as usize);
+            let piece = line.selected_text(a as usize, b as usize);
             out.push(piece.trim_end().to_string());
         }
         out.join("\n")
@@ -7729,7 +7922,7 @@ impl Host {
     /// until one of them changed.
     fn stream_height_in(&self, room: Rect, moment: &Moment) -> (usize, usize) {
         let width = room.w;
-        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let caps = crate::block::ShapeCaps::of(&moment.caps).with_diff_wrap(!moment.clip_diff);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         // The sum, from the one place both this and the painter read it — see
@@ -7770,15 +7963,27 @@ impl Host {
         // see `stream_lines`. Counted here for the reason the tail is: a row the
         // frame drew and this did not would be out of reach at the bottom of the
         // scroll, which is the whole failure `row_index` exists to prevent.
-        let pending = match self.ask_panel_mounted() {
-            false => self.asks.current(),
-            true => None,
+        let question = if self.ask_panel_mounted() {
+            0
+        } else {
+            self.fallback_ask_lines(width, usize::MAX, moment).len()
         };
-        let question = pending.map_or(0, |asked| {
-            let block = fallback_question(&asked);
-            crate::block::Content::lines(&block, &crate::block::RenderCtx::bare(width)).len()
-        });
         (total + tail + question, tail)
+    }
+
+    fn fallback_ask_lines(&self, width: u16, height: usize, moment: &Moment) -> Vec<Line> {
+        if let Some(sheet) = &moment.fallback_approval {
+            return crate::modules::ask::render_sheet(sheet, moment, width, height);
+        }
+        self.asks
+            .current()
+            .filter(|asked| !asked.is_tool_approval())
+            .map_or_else(Vec::new, |asked| {
+                crate::block::Content::lines(
+                    &fallback_question(&asked),
+                    &crate::block::RenderCtx::bare(width),
+                )
+            })
     }
 
     /// The view modules riding the stream's tail, with the height each asks for
@@ -7837,6 +8042,14 @@ impl Host {
             .get(id)
             .map(|slot| slot.block().content.image_markers())
             .unwrap_or_default()
+    }
+
+    pub fn result_image_at(&self, id: BlockId) -> Option<atomcode_kernel::message::ImageContent> {
+        self.stream
+            .read()
+            .expect("stream poisoned")
+            .get(id)
+            .and_then(|slot| slot.block().content.result_image().cloned())
     }
 
     /// Fold or unfold what a click landed on.
@@ -8029,7 +8242,7 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
     // covers, read as one more row of the panel. Asked here for the same reason
     // the composer is: it is what the screen does with the row, not what the
     // row needs.
-    if id == crate::modules::status::ID && panel_is_up(moment) {
+    if id == crate::modules::status::ID && (panel_is_up(moment) || moment.model_setup_required) {
         return 0;
     }
     asked
@@ -8097,7 +8310,8 @@ pub fn displaces_composer(moment: &Moment) -> bool {
     // The background panel has a box of its own, where the keys go while it is
     // up; a second one under it would leave a person asking which one they are
     // typing into.
-    moment.asking.is_some()
+    moment.model_setup_required
+        || moment.asking.is_some()
         || moment.settings_panel.is_some()
         || moment.providers_panel.is_some()
         || moment.bg_panel.is_some()
@@ -8351,21 +8565,16 @@ mod tests {
             model: "m".into(),
             reason: atomcode_harness::session::HeaderReason::Append,
         });
-        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(10_000);
-        h.absorb(&SessionEvent::AssistantChunk {
-            turn: 1,
-            round: 1,
-            delta: "a".repeat(400),
-            reasoning: true,
-        });
-        assert_eq!(
-            h.moment
-                .read()
-                .unwrap()
-                .generation
-                .rate(crate::moment::Timestamp::millis(12_000)),
-            Some(8)
-        );
+        for at in [10_000, 12_000] {
+            h.moment.write().unwrap().now = crate::moment::Timestamp::millis(at);
+            h.absorb(&SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "a".repeat(800),
+                reasoning: true,
+            });
+        }
+        assert_eq!(h.moment.read().unwrap().generation.rate(), Some(100));
         h.absorb(&SessionEvent::TurnEnd {
             turn: 1,
             stop: atomcode_kernel::event::StopReason::Stopped,
@@ -8453,6 +8662,7 @@ mod tests {
             tips: Vec::new(),
             brand: Arc::new(crate::content::Brand::default()),
             note: None,
+            model_setup: None,
         };
         h.stream
             .write()
@@ -8502,7 +8712,7 @@ mod tests {
         h.remember_command("/connect sk-or-v1-SECRET");
         h.remember_command("/rename my session");
         assert_eq!(
-            h.moment.read().unwrap().history,
+            *h.moment.read().unwrap().history,
             ["/connect", "/rename my session"]
         );
         h.echo_command("/connect sk-or-v1-SECRET");
@@ -8592,8 +8802,11 @@ mod tests {
             Rect::sized(80, 20),
             0,
             caps,
-            crate::moment::Activity::Working,
-            tick,
+            &Moment {
+                activity: crate::moment::Activity::Working,
+                tick,
+                ..Moment::default()
+            },
         );
         // The call's opening row is the one naming the file; its first span is
         // the `●` mark, whose colour the pulse moves.
@@ -8655,8 +8868,10 @@ mod tests {
                 Rect::sized(80, 20),
                 0,
                 caps,
-                crate::moment::Activity::Working,
-                0,
+                &Moment {
+                    activity: crate::moment::Activity::Working,
+                    ..Moment::default()
+                },
             )
             .0
             .iter()
@@ -8751,7 +8966,7 @@ mod tests {
         {
             let mut m = h.moment.write().expect("moment poisoned");
             m.interrupted = true;
-            m.last_sent = Some("fix the parser".into());
+            m.last_sent = Some(Arc::new("fix the parser".into()));
             m.todo_expanded = true;
             m.todo_offset = 20;
             m.suggestion = Some("接着把登录那条补上".into());
@@ -9627,7 +9842,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_thing_a_conversation_says_happens_once_and_only_when_it_is_empty() {
+    fn the_first_thing_a_conversation_says_happens_once_per_view() {
         let mods = Arc::new(Modules::new());
         let opener = Arc::new(Opener {
             said: std::sync::atomic::AtomicU32::new(0),
@@ -9647,22 +9862,20 @@ mod tests {
 
         assert!(
             !h.open_conversation(crate::block::Coord::default(), &open),
-            "a stream that already has something in it is not opening"
+            "a stream with an opener must not open again"
         );
         assert_eq!(h.stream.read().unwrap().len(), 1, "still just the one");
         assert_eq!(
             opener.said.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "the producer must not be asked twice — the stream was not empty, so \
-             the loop should not have turned at all"
+            "the opening prefix already exists; the producer must not be asked twice"
         );
     }
 
     #[test]
     fn the_first_producer_with_something_to_say_wins_and_the_rest_are_not_asked() {
-        // The rule is "when the stream is empty", and the first answer makes it
-        // not-empty. So no second mechanism is needed to stop a helper opener, and
-        // the count proves the second one was never consulted.
+        // Only the first producer with an opening wins, including third-party
+        // openers whose content is not the built-in welcome kind.
         struct Silent;
         impl crate::module::Producer for Silent {
             fn id(&self) -> &'static str {
@@ -12399,17 +12612,11 @@ mod tests {
         }
         let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
         let draw = |rows: u16, scroll: usize| -> Vec<String> {
-            h.stream_lines(
-                Rect::sized(80, rows),
-                scroll,
-                caps,
-                crate::moment::Activity::Idle,
-                0,
-            )
-            .0
-            .iter()
-            .map(|l| l.plain())
-            .collect()
+            h.stream_lines(Rect::sized(80, rows), scroll, caps, &Moment::default())
+                .0
+                .iter()
+                .map(|l| l.plain())
+                .collect()
         };
         let whole = draw(400, 0);
         let total = whole.iter().rposition(|l| !l.is_empty()).unwrap() + 1;
@@ -13720,6 +13927,61 @@ mod tests {
     }
 
     #[test]
+    fn live_turn_end_captures_member_work_without_rewriting_history() {
+        use crate::block::RenderCtx;
+        use crate::i18n::{t, Msg};
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        let end = LoggedEvent {
+            seq: 2,
+            at: 0,
+            event: SessionEvent::TurnEnd {
+                turn: 1,
+                stop: atomcode_harness::seams::StopReason::Stopped,
+                error: None,
+            },
+        };
+        h.absorb_logged_with_members(&end, 2);
+        let endings = |h: &Host| -> Vec<String> {
+            h.stream
+                .read()
+                .unwrap()
+                .slots()
+                .iter()
+                .filter(|slot| slot.block().kind() == "turn_end")
+                .flat_map(|slot| slot.block().content.lines(&RenderCtx::bare(160)))
+                .map(|line| line.plain())
+                .collect()
+        };
+        let captured = endings(&h);
+        let expected = t(Msg::StopWithMembersRunning { n: 2 }).into_owned();
+        assert!(
+            captured.iter().any(|line| line.contains(&expected)),
+            "{captured:?}"
+        );
+        h.moment.write().unwrap().members.clear();
+        assert_eq!(endings(&h), captured, "settled history retains its meaning");
+        let replay = host();
+        replay.absorb(&SessionEvent::TurnStart { turn: 1 });
+        replay.absorb_logged(&end);
+        assert!(!endings(&replay).iter().any(|line| line.contains(&expected)));
+        let failed = host();
+        failed.absorb(&SessionEvent::TurnStart { turn: 1 });
+        failed.absorb_logged_with_members(
+            &LoggedEvent {
+                event: SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: atomcode_harness::seams::StopReason::ProviderError,
+                    error: Some("failure".into()),
+                },
+                ..end
+            },
+            2,
+        );
+        assert!(!endings(&failed).iter().any(|line| line.contains(&expected)));
+    }
+
+    #[test]
     fn the_run_stays_live_until_the_turn_ends_not_until_the_call_does() {
         // 折叠成一行是为了展示简洁的历史；还在跑的东西不是历史。所以收敛
         // 的判据是回合是否还在进行、run 后面有没有可见块，而不是最后一个
@@ -14309,6 +14571,117 @@ mod tests {
             "the failure earlier in the run is not on the lid: {:?}",
             &rows[count..count + 3]
         );
+    }
+
+    #[test]
+    fn browser_and_generic_activity_runs_keep_turns_and_expansion_together() {
+        let h = host();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(ToolOutput::Group);
+        let calls = [
+            (1, "mcp__browser-use__navigate"),
+            (1, "mcp__browser-use__click"),
+            (1, "mcp__external__screenshot"),
+            (1, "mcp__external__click"),
+            (1, "read_file"),
+            (1, "mcp__browser-use-evil__click"),
+            (2, "mcp__external__click"),
+            (3, "mcp__external__click"),
+        ];
+        for (i, (turn, name)) in calls.into_iter().enumerate() {
+            let id = format!("activity-{i}");
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                    id: id.clone(),
+                    name: name.into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            });
+            h.absorb(&SessionEvent::ToolResultLogged {
+                turn,
+                round: 1,
+                call_id: id,
+                content: format!("detail-{i}"),
+                is_error: i == 0,
+                images: Vec::new(),
+            });
+        }
+        let stream = h.stream.read().unwrap();
+        let slots = stream.slots();
+        let pres = h.presentation.read().unwrap();
+        let ids: Vec<_> = slots
+            .iter()
+            .filter(|slot| slot.block().content.as_tool_call().is_some())
+            .map(|slot| slot.block().id)
+            .collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(run_around(slots, &pres, ids[0]), ids[0..2]);
+        assert_eq!(run_around(slots, &pres, ids[1]), ids[0..2]);
+        assert_eq!(run_around(slots, &pres, ids[3]), ids[2..6]);
+        assert_eq!(run_around(slots, &pres, ids[4]), ids[2..6]);
+        assert_eq!(run_around(slots, &pres, ids[6]), vec![ids[6]]);
+        assert_eq!(run_around(slots, &pres, ids[7]), vec![ids[7]]);
+        drop(pres);
+        drop(stream);
+        let rows = h.compose((100, 60)).rows().join("\n");
+        assert!(rows.contains("已执行 2 次浏览器操作"), "{rows}");
+        assert!(rows.contains("1 失败"), "{rows}");
+        assert!(rows.contains("已执行了 4 个工具"), "{rows}");
+        h.toggle_block(ids[0], "tool_call");
+        let expanded = h.compose((100, 80)).rows().join("\n");
+        assert!(expanded.contains("detail-0"), "{expanded}");
+        assert!(expanded.contains("detail-1"), "{expanded}");
+        assert!(expanded.contains("已执行了 4 个工具"), "{expanded}");
+    }
+
+    #[test]
+    fn interrupted_mcp_actions_remain_individually_visible() {
+        let h = host();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(ToolOutput::Group);
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: ["first", "second"]
+                .into_iter()
+                .map(|id| atomcode_kernel::tool::ToolCall {
+                    id: id.into(),
+                    name: "mcp__external__click".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::Cancelled,
+            error: None,
+        });
+        let stream = h.stream.read().unwrap();
+        let calls: Vec<_> = stream
+            .slots()
+            .iter()
+            .map(|slot| slot.block())
+            .filter(|block| block.content.as_tool_call().is_some())
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|block| block.content.as_tool_call().unwrap().is_interrupted()));
+        assert!(calls.iter().all(|block| !behind_a_lid(block)));
     }
 
     #[test]
@@ -15456,7 +15829,7 @@ mod tests {
         // only thing that survives, and a second copy would drift from it.
         let h = fed();
         let history = h.moment.read().unwrap().history.clone();
-        assert_eq!(history, vec!["fix the build", "now break it"]);
+        assert_eq!(*history, vec!["fix the build", "now break it"]);
 
         // Consecutive repeats collapse, the way every shell collapses them.
         h.absorb(&SessionEvent::UserMessage {
@@ -15513,7 +15886,7 @@ mod tests {
             images: Vec::new(),
         });
         assert_eq!(
-            h.moment.read().unwrap().history,
+            *h.moment.read().unwrap().history,
             vec!["[Image #1] 看看这是啥？".to_string()],
             "recall the typed words, not the folded caption"
         );

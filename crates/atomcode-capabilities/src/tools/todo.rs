@@ -81,9 +81,11 @@ pub fn render_todos_text(todos: &[TodoItem], unicode: bool) -> String {
         .join("\n")
 }
 
-/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. This is the shape the
-/// TUI title cache (`parse_todo_titles_into`) reads to learn `id → title`, so an incremental
-/// `todo update id=N` row can render the task NAME, not just `#N`. Empty list → "(no tasks)".
+/// One line per item WITH its 1-based id: `<glyph> <id>. <content>`. The coding crate's
+/// plan-continuity reminder re-renders the live plan with this, so `id → content` stays
+/// readable wherever the list is quoted. The TUI derives task titles from the
+/// transcript-derived plan itself (`plan.title_as_of`), not from this shape.
+/// Empty list → "(no tasks)".
 pub fn render_todos_numbered(todos: &[TodoItem], unicode: bool) -> String {
     if todos.is_empty() {
         return "(no tasks)".to_string();
@@ -370,48 +372,52 @@ pub struct ActiveTodoCall<'a> {
     pub index: usize,
 }
 
-/// The todo calls that still shape the list, in order: after the most recent user
-/// interruption and without the ones that came back an error. The input
-/// [`derive_current_todos`] folds, exposed so a caller that folds over a baseline of
-/// its own (the session's todo sidecar) reads the same calls.
+/// The todo calls that still shape the list, in order, excluding failed calls.
+/// Interrupting execution preserves the plan; only an explicit todo update or
+/// conversation rewind changes it. Exposed so sidecar folds read the same calls.
 pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
-    // A user cancel retires the active plan without deleting its history. Fold
-    // only calls after the most recent authoritative interruption boundary; an
-    // explicit later "continue" can create a fresh full-list plan from history.
-    let active_messages = messages
-        .iter()
-        .rposition(Message::is_user_interruption)
-        .map_or(messages, |index| &messages[index + 1..]);
-    let mut calls = Vec::new();
+    let active_messages = messages;
+    // A result settles only the latest call with this id, once. Keep even
+    // non-todo calls in the map so a reused id cannot reach an older todo.
+    // Removing the entry on settlement ignores duplicate results without
+    // searching backwards into an older, unanswered occurrence of the id.
     let mut pending = std::collections::HashMap::new();
     let mut failed = std::collections::HashSet::new();
-    for message in active_messages {
-        for (index, call) in message.tool_calls.iter().enumerate() {
-            // IDs can be reused in a later round. A settlement belongs to this
-            // occurrence, never every historical call carrying the same ID.
-            pending.remove(call.id.as_str());
-            if is_todo_call(&call.name) {
-                pending.insert(call.id.as_str(), calls.len());
-                calls.push(ActiveTodoCall {
-                    call,
-                    meta: message.meta.as_ref(),
-                    index,
-                });
-            }
+    for (message_index, message) in active_messages.iter().enumerate() {
+        for (call_index, call) in message.tool_calls.iter().enumerate() {
+            pending.insert(call.id.as_str(), (message_index, call_index));
         }
-        if let Some(call_id) = message.tool_call_id.as_deref() {
-            if let Some(index) = pending.remove(call_id) {
-                if message.is_error {
-                    failed.insert(index);
-                }
+        if let Some(call) = message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| pending.remove(id))
+        {
+            if message.is_error {
+                failed.insert(call);
             }
         }
     }
-    calls
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, call)| (!failed.contains(&index)).then_some(call))
-        .collect()
+    let mut active = Vec::new();
+    for (message_index, message) in active_messages.iter().enumerate() {
+        for (call_index, call) in message.tool_calls.iter().enumerate() {
+            if !is_todo_call(&call.name) || failed.contains(&(message_index, call_index)) {
+                continue;
+            }
+            active.push(ActiveTodoCall {
+                call,
+                meta: message.meta.as_ref(),
+                index: call_index,
+            });
+        }
+    }
+    active
+}
+
+/// Host-provided view of the CURRENT plan length. `TodoTool` is stateless — the list
+/// lives in the transcript — so without this it cannot tell a valid id from a stale
+/// one, and would echo an update the reducer silently drops.
+pub trait TodoListAccess: Send + Sync {
+    fn len(&self) -> Result<usize, String>;
 }
 
 /// Stateless full-list-replace todo tool. No interior state — current list is derived
@@ -419,6 +425,7 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
 #[derive(Clone, Default)]
 pub struct TodoTool {
     sources: Option<std::sync::Arc<dyn super::todo_sources::TodoSourceAccess>>,
+    list: Option<std::sync::Arc<dyn TodoListAccess>>,
 }
 
 impl TodoTool {
@@ -430,7 +437,15 @@ impl TodoTool {
     ) -> Self {
         Self {
             sources: Some(sources),
+            list: None,
         }
+    }
+
+    /// Host hook for the current list length so `update` can refuse a stale id.
+    /// Embeds that do not wire it keep the historical echo behaviour.
+    pub fn with_list(mut self, list: std::sync::Arc<dyn TodoListAccess>) -> Self {
+        self.list = Some(list);
+        self
     }
 }
 
@@ -447,7 +462,8 @@ the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new p
 set it `in_progress`; the MOMENT it is actually done (verified) set it `completed`.\n\
 Each task is ONE specific, verifiable action with a concrete outcome a later turn can execute without re-planning — write `add error handling to load_config`, not `handle errors`, `task 1`, or `处理功能`. Keep \
 EXACTLY ONE task `in_progress` at a time (enforced automatically). Mark a task `completed` ONLY after the work is \
-actually done, never on intent. When planning from detailed user guidance, use todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch into a task title or guess the most recent message as its source. Incremental updates preserve these batch references.";
+actually done, never on intent. When planning from detailed user guidance, use todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch into a task title or guess the most recent message as its source. Incremental updates preserve these batch references. \
+Batch this update with the next substantive tool call in the SAME response whenever you are about to use one; do not spend a whole model round on a todo update by itself.";
 
 #[async_trait]
 impl Tool for TodoTool {
@@ -534,13 +550,63 @@ impl Tool for TodoTool {
                 return err(error);
             }
         }
-        // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
-        // into the transcript; the renderer draws the pretty version separately). The
-        // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
-        // id=N` rows show task names.
+        // Full-list (re)plan shape. The model's own call arguments already
+        // carry the full list, so the receipt need not repeat it. The ids are
+        // 1-based in list order (the tool description and the coding reminder
+        // already say so, and how to update one), and the TUI seeds task
+        // titles from the transcript-derived plan (`named_todo_update` →
+        // `plan.title_as_of`). The receipt is therefore adaptive: a concise
+        // summary (status counts plus the in-progress ids) or the normalized
+        // numbered list, whichever is shorter — a short plan keeps its titles,
+        // a long one stops echoing them into every later resend.
         if v.get("todos").is_some() && !is_incremental_action(&v) {
             return match validate_new_todo_plan(args) {
-                Ok(todos) => ok(render_todos_numbered(&todos, false)),
+                Ok(todos) if todos.is_empty() => ok("Plan cleared: no tasks.".to_string()),
+                Ok(todos) => {
+                    let mut pending = 0usize;
+                    let mut in_progress = Vec::new();
+                    let mut completed = 0usize;
+                    for (i, t) in todos.iter().enumerate() {
+                        match t.status {
+                            TodoStatus::Pending => pending += 1,
+                            TodoStatus::InProgress => in_progress.push(i + 1),
+                            TodoStatus::Completed => completed += 1,
+                        }
+                    }
+                    let ids = |v: &[usize]| {
+                        v.iter()
+                            .map(|i| format!("#{i}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let mut parts = Vec::new();
+                    if !in_progress.is_empty() {
+                        parts.push(format!(
+                            "{} in_progress ({})",
+                            in_progress.len(),
+                            ids(&in_progress)
+                        ));
+                    }
+                    parts.push(format!("{} pending", pending));
+                    if completed > 0 {
+                        parts.push(format!("{} completed", completed));
+                    }
+                    let items = if todos.len() == 1 { "item" } else { "items" };
+                    let summary = format!(
+                        "Plan updated: {} {} — {}.",
+                        todos.len(),
+                        items,
+                        parts.join(", ")
+                    );
+                    // Byte length, not tokens: a cheap, deterministic proxy.
+                    // Ties keep the numbered list (it carries the titles).
+                    let numbered = render_todos_numbered(&todos, false);
+                    ok(if summary.len() < numbered.len() {
+                        summary
+                    } else {
+                        numbered
+                    })
+                }
                 Err(e) => err(e),
             };
         }
@@ -561,7 +627,22 @@ impl Tool for TodoTool {
                     match (id, status.and_then(TodoStatus::parse_lenient)) {
                         // `#<id> → <status>` is the base the TUI `enrich_todo_detail` splices a
                         // title into; keep this exact shape.
-                        (Some(id), Some(_)) if id >= 1 => ok(format!("#{} \u{2192} {}", id, status.unwrap())),
+                        (Some(id), Some(_)) if id >= 1 => {
+                            // The reducer ignores an out-of-range id, so echoing one back as
+                            // applied is a lie the model cannot detect. Refuse it — but only
+                            // when the host wired a list, and never when `len()` itself fails
+                            // (no session yet): planning must not be blocked by that.
+                            if let Some(list) = &self.list {
+                                if let Ok(len) = list.len() {
+                                    if id as usize > len {
+                                        return err(format!(
+                                            "todowrite: id {id} is out of range — the current plan has {len} item(s); ids are 1..={len}. Re-read the list and retry."
+                                        ));
+                                    }
+                                }
+                            }
+                            ok(format!("#{} \u{2192} {}", id, status.unwrap()))
+                        }
                         (None, _) => err("todowrite: `update` needs an `id` (the task number).".to_string()),
                         (Some(_), _) => {
                             err("todowrite: `update` needs a `status` of pending|in_progress|completed.".to_string())
@@ -582,6 +663,32 @@ mod tests {
     use atomcode_kernel::tool::ToolCall;
     use tokio_util::sync::CancellationToken;
 
+    struct FixedLen(usize);
+    impl super::TodoListAccess for FixedLen {
+        fn len(&self) -> Result<usize, String> {
+            Ok(self.0)
+        }
+    }
+
+    /// The reducer ignores an out-of-range id, so echoing it as applied is a lie the
+    /// model cannot detect. With a list accessor wired, the tool must refuse instead.
+    #[tokio::test]
+    async fn update_rejects_id_beyond_current_list() {
+        let t = TodoTool::new().with_list(std::sync::Arc::new(FixedLen(6)));
+        let r = t
+            .execute(
+                r#"{"action":"update","id":999,"status":"completed"}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(r.is_error, "out-of-range id must fail, got: {}", r.content);
+        assert!(
+            r.content.contains("999"),
+            "the error must name the id: {}",
+            r.content
+        );
+    }
+
     fn ctx() -> ToolContext {
         ToolContext {
             working_dir: std::path::PathBuf::from("."),
@@ -589,6 +696,14 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[test]
+    fn description_asks_to_batch_the_update_with_the_next_call() {
+        let tool = TodoTool::new();
+        let description = tool.description();
+        assert!(description.contains("SAME response"));
+        assert!(description.contains("do not spend a whole model round"));
     }
 
     #[tokio::test]
@@ -897,17 +1012,21 @@ mod tests {
     }
 
     #[test]
-    fn user_interruption_retires_prior_plan_but_allows_a_new_plan() {
+    fn user_interruption_preserves_prior_plan_until_explicit_replacement() {
         let mut msgs = vec![todo_call(
             "old",
-            r#"{"todos":[{"content":"old task","status":"in_progress"}]}"#,
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"old task","status":"in_progress"},{"content":"next","status":"pending"}]}"#,
         )];
         msgs.push(Message::user_interruption());
         msgs.push(Message::user("do something unrelated"));
-        assert!(
-            derive_current_todos(&msgs).is_empty(),
-            "a cancelled plan remains historical, not active"
-        );
+        let preserved = derive_current_todos(&msgs);
+        assert_eq!(preserved.len(), 3);
+        assert_eq!(preserved[0].content, "done");
+        assert_eq!(preserved[0].status, TodoStatus::Completed);
+        assert_eq!(preserved[1].content, "old task");
+        assert_eq!(preserved[1].status, TodoStatus::InProgress);
+        assert_eq!(preserved[2].content, "next");
+        assert_eq!(preserved[2].status, TodoStatus::Pending);
 
         msgs.push(todo_call(
             "new",
@@ -916,10 +1035,13 @@ mod tests {
         let active = derive_current_todos(&msgs);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].content, "new task");
+        msgs.push(Message::user_interruption());
+        msgs.push(todo_call("clear", r#"{"todos":[]}"#));
+        assert!(derive_current_todos(&msgs).is_empty());
     }
 
     #[test]
-    fn legacy_interruption_marker_also_retires_prior_plan() {
+    fn legacy_interruption_marker_preserves_prior_plan() {
         let marker = Message::synthetic_user(
             "[The previous response was interrupted by the user before completing. Reconsider.]",
         );
@@ -930,7 +1052,7 @@ mod tests {
             ),
             marker,
         ];
-        assert!(derive_current_todos(&msgs).is_empty());
+        assert_eq!(derive_current_todos(&msgs)[0].content, "old task");
     }
 
     #[test]
@@ -1018,6 +1140,93 @@ mod tests {
         let todos = derive_current_todos(&messages);
         assert_eq!(todos.len(), 3);
         assert!(todos.iter().all(|todo| todo.content != "task 4"));
+    }
+
+    #[test]
+    fn a_reused_call_id_does_not_carry_an_older_failure_forward() {
+        // Some OpenAI-compatible providers number calls per response, so the
+        // same id can name one call in each turn. A failed call in turn 1 must
+        // not drop the todo call turn 2 made under that id.
+        let messages = vec![
+            write_call("call_0", PLAN3),
+            Message::tool_result("call_0", "plan rejected", true),
+            write_call("call_0", r#"{"action":"add","content":"later"}"#),
+        ];
+        let calls = active_todo_calls(&messages);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].call.arguments.contains("later"));
+    }
+
+    #[test]
+    fn a_duplicate_result_does_not_fail_an_already_settled_call() {
+        // One call, its successful result, then a duplicated error for the same
+        // id (a replay/repair artifact). The second result must not re-answer the
+        // call the first one settled and drop the plan.
+        let messages = vec![
+            write_call("dup", PLAN3),
+            Message::tool_result("dup", "3 tasks", false),
+            Message::tool_result("dup", "spurious failure", true),
+        ];
+        let calls = active_todo_calls(&messages);
+        assert_eq!(calls.len(), 1, "the settled plan stays active");
+        assert_eq!(calls[0].call.id, "dup");
+    }
+
+    #[test]
+    fn a_duplicate_result_does_not_reach_an_older_unanswered_call() {
+        let messages = vec![
+            write_call("dup", PLAN3),
+            write_call("dup", r#"{"action":"add","content":"later"}"#),
+            Message::tool_result("dup", "added", false),
+            Message::tool_result("dup", "duplicate failure", true),
+        ];
+        assert_eq!(active_todo_calls(&messages).len(), 2);
+    }
+
+    #[test]
+    fn a_non_todo_call_shadows_an_older_todo_with_the_same_id() {
+        let messages = vec![
+            write_call("dup", PLAN3),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "dup".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("dup", "read failed", true),
+        ];
+        assert_eq!(active_todo_calls(&messages).len(), 1);
+    }
+
+    #[test]
+    fn a_same_reply_duplicate_id_result_answers_the_nearest_call() {
+        // Two todo calls in one reply share a provider-minted id; the result is
+        // the nearest (last) call's, so the plan before it stays the active
+        // baseline instead of being dropped for the later add.
+        let reply = Message::assistant(
+            "",
+            vec![
+                ToolCall {
+                    id: "dup".into(),
+                    name: "todowrite".into(),
+                    arguments: PLAN3.into(),
+                },
+                ToolCall {
+                    id: "dup".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"action":"add","content":"later"}"#.into(),
+                },
+            ],
+        );
+        let messages = vec![reply, Message::tool_result("dup", "rejected", true)];
+        let calls = active_todo_calls(&messages);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].call.arguments, PLAN3,
+            "the result answered the add, not the plan"
+        );
     }
 
     #[test]
@@ -1124,17 +1333,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_echoes_normalized_list() {
+    async fn execute_confirms_plan_without_echoing_list() {
         let t = TodoTool::new();
         let r = t
             .execute(
-                r#"{"todos":[{"content":"verify scheduler registration","status":"pending"}]}"#,
+                r#"{"todos":[{"content":"verify scheduler registration and confirm recurring job execution","status":"pending"}]}"#,
                 &ctx(),
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
+        // Same contract as above: the confirmation without the list — the
+        // names ride in the call arguments of the same round.
+        assert!(r.content.contains("1 item — 1 pending"), "{}", r.content);
         assert!(
-            r.content.contains("verify scheduler registration"),
+            !r.content
+                .contains("verify scheduler registration and confirm recurring job execution"),
+            "the echo must not repeat the list: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_confirms_cleared_plan() {
+        let t = TodoTool::new();
+        let r = t.execute(r#"{"todos":[]}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("Plan cleared: no tasks."),
             "{}",
             r.content
         );
@@ -1144,14 +1369,24 @@ mod tests {
     async fn execute_accepts_stringified_todos_from_provider() {
         let result = TodoTool::new()
             .execute(
-                r#"{"todos":"[{\"content\":\"verify scheduler registration\",\"status\":\"pending\"}]"}"#,
+                r#"{"todos":"[{\"content\":\"verify scheduler registration and confirm recurring job execution\",\"status\":\"pending\"}]"}"#,
                 &ctx(),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
+        // The echo is a confirmation, not a second copy of the list: the
+        // model's own call arguments already carry the task names in the same
+        // round.
         assert!(
-            result.content.contains("verify scheduler registration"),
+            result.content.contains("1 item — 1 pending"),
             "{}",
+            result.content
+        );
+        assert!(
+            !result
+                .content
+                .contains("verify scheduler registration and confirm recurring job execution"),
+            "the echo must not repeat the list: {}",
             result.content
         );
     }
@@ -1176,24 +1411,102 @@ mod tests {
     }
 
     #[test]
-    fn todowrite_result_is_numbered_for_title_cache() {
-        // The result must carry `<glyph> <id>. <content>` so the TUI title cache learns ids.
+    fn render_todos_numbered_lists_id_and_content() {
+        // The reminder path re-renders the live plan with ids: `<glyph> <id>. <content>`.
         let out = render_todos_numbered(&parse_todos(PLAN3).unwrap(), false);
         assert!(out.contains("] 1. a"), "{out}");
         assert!(out.contains("] 3. c"), "{out}");
     }
 
     #[tokio::test]
-    async fn todowrite_accepts_full_list_shape() {
+    async fn todowrite_short_plan_keeps_the_numbered_titles() {
         let t = TodoTool::new();
         assert_eq!(t.name(), "todowrite");
         let r = t.execute(PLAN3, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(
-            r.content.contains("1. a"),
-            "numbered list echoed: {}",
-            r.content
+        assert_eq!(
+            r.content,
+            render_todos_numbered(&parse_todos(PLAN3).unwrap(), false)
         );
+    }
+
+    #[tokio::test]
+    async fn adaptive_receipts_never_expand_the_numbered_plan() {
+        for count in [1, 3, 6, 20] {
+            for label in ["verify parser behavior", "验证解析器的边界行为和回归测试"]
+            {
+                for active in [None, Some(count)] {
+                    let tasks: Vec<_> = (1..=count).map(|id| json!({
+                        "content":format!("{label} {id}"),
+                        "status": if active == Some(id) { "in_progress" } else if id % 3 == 0 { "completed" } else { "pending" }
+                    })).collect();
+                    let args = json!({"todos":tasks}).to_string();
+                    let numbered = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+                    let result = TodoTool::new().execute(&args, &ctx()).await;
+                    assert!(!result.is_error, "{}", result.content);
+                    assert!(
+                        result.content.len() <= numbered.len(),
+                        "receipt expanded {count} tasks: {}",
+                        result.content
+                    );
+                    assert!(!result.content.contains("Ids are 1-based"));
+                    if result.content.starts_with("Plan updated:") {
+                        if let Some(id) = active {
+                            assert!(
+                                result.content.contains(&format!("in_progress (#{id})")),
+                                "{}",
+                                result.content
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_plan_reports_status_counts_without_repeating_titles() {
+        let tasks: Vec<_> = (1..=20).map(|id| json!({
+            "content":format!("verify scheduler registration and recurring job execution {id}"),
+            "status": if id == 12 { "in_progress" } else if id <= 10 { "completed" } else { "pending" }
+        })).collect();
+        let result = TodoTool::new()
+            .execute(&json!({"todos":tasks}).to_string(), &ctx())
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(
+            result.content,
+            "Plan updated: 20 items — 1 in_progress (#12), 9 pending, 10 completed."
+        );
+    }
+
+    #[tokio::test]
+    async fn equally_sized_receipts_prefer_numbered_titles() {
+        let args = json!({"todos":[{"content":"x".repeat(28),"status":"pending"}]}).to_string();
+        let numbered = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+        assert_eq!(numbered.len(), "Plan updated: 1 item — 1 pending.".len());
+        assert_eq!(
+            TodoTool::new().execute(&args, &ctx()).await.content,
+            numbered
+        );
+    }
+
+    #[tokio::test]
+    async fn measure_adaptive_receipts_for_representative_plans() {
+        for count in [1, 3, 6, 20] {
+            let tasks: Vec<_> = (1..=count).map(|id| json!({"content":format!("verify parser behavior {id}"),"status":"pending"})).collect();
+            let args = json!({"todos":tasks}).to_string();
+            let original = render_todos_numbered(&parse_todos(&args).unwrap(), false);
+            let result = TodoTool::new().execute(&args, &ctx()).await;
+            assert!(!result.is_error);
+            assert!(result.content.len() <= original.len());
+            println!(
+                "items={count} numbered_bytes={} adaptive_bytes={} receipt={}",
+                original.len(),
+                result.content.len(),
+                result.content
+            );
+        }
     }
 
     #[tokio::test]

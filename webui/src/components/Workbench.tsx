@@ -1,11 +1,11 @@
 import { lazy, Suspense } from "preact/compat";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { ApiCallError, workbenchPreview, workbenchRequest } from "../api";
+import { ApiCallError, workbenchRequest } from "../api";
 import { useSettings } from "../settings";
 import "./Workbench.css";
-import { Markdown } from "./Markdown";
 import { WorkbenchEditor } from "./WorkbenchEditor";
 import { WorkbenchGit } from "./WorkbenchGit";
+import { FileContent, FileGitDiff } from "./WorkbenchViewer";
 import { WorkbenchCache } from "../lib/workbenchCache";
 import { draftDirty, type WorkbenchDraft } from "../lib/workbenchDraft";
 const TerminalView = lazy(() =>
@@ -20,6 +20,8 @@ type Saved = {
   tab: "home" | "files" | "terminal" | "git";
   drafts: Record<string, WorkbenchDraft>;
   editing: string[];
+  /** Open files showing their current Git diff instead of content. */
+  diffing: string[];
   positions: Record<string, number>;
   width: number;
 };
@@ -31,10 +33,15 @@ const empty = (): Saved => ({
   tab: "home",
   drafts: {},
   editing: [],
+  diffing: [],
   positions: {},
   width: 420,
 });
 const memory = new WorkbenchCache<Saved>();
+/** Presentation state of read-only (historical session) panels. Kept apart
+ *  from `memory` so browsing a session never sees or touches its drafts, and
+ *  never persisted: it holds no drafts or terminals worth restoring. */
+const readOnlyMemory = new WorkbenchCache<Saved>();
 export function persistWorkbenchState() {
   for (const [session, state] of memory) {
     try {
@@ -86,92 +93,41 @@ function load(session: string): Saved {
   }
   return empty();
 }
-function FilePreview({
-  session,
-  path,
-  draftText,
-  position,
-  onPosition,
-}: {
-  session: string;
-  path: string;
-  draftText?: string;
-  position: number;
-  onPosition: (value: number) => void;
-}) {
-  const view = useRef<HTMLDivElement>(null);
-  const [text, setText] = useState("");
-  const [image, setImage] = useState("");
-  const [error, setError] = useState("");
-  useEffect(() => {
-    let cancelled = false;
-    let url = "";
-    setText("");
-    setImage("");
-    setError("");
-    if (draftText !== undefined) {
-      setText(draftText);
-      return;
-    }
-    workbenchPreview(session, path)
-      .then(async (blob) => {
-        if (cancelled) return;
-        if (blob.type.startsWith("image/")) {
-          url = URL.createObjectURL(blob);
-          setImage(url);
-        } else {
-          const content = await blob.text();
-          if (!cancelled) setText(content);
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e));
-      });
-    return () => {
-      cancelled = true;
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [session, path, draftText]);
-  useEffect(() => {
-    if (view.current) view.current.scrollTop = position;
-  }, [text, image]);
-  return (
-    <div
-      class="workbench-preview"
-      ref={view}
-      onScroll={(event) => onPosition(event.currentTarget.scrollTop)}
-    >
-      {error ? (
-        <p role="alert" class="workbench-error">
-          {error}
-        </p>
-      ) : image ? (
-        <img src={image} alt={path} />
-      ) : /\.md$/i.test(path) ? (
-        <div class="workbench-markdown">
-          <Markdown content={text} />
-        </div>
-      ) : (
-        <pre tabIndex={0}>{text}</pre>
-      )}
-    </div>
-  );
+/** Last chat git/file request seq each panel owner has applied. Seqs come
+ *  from one monotonic counter, so a single watermark covers both kinds. */
+const appliedRequests = new Map<string, number>();
+/** Claims a request once; remounts (close/reopen, session switch) must not
+ *  replay it, since the user may have moved on from that tab or file. */
+function claimRequest(owner: string, request: { sessionId: string; seq: number } | undefined, session: string) {
+  if (!request || request.sessionId !== session) return false;
+  if ((appliedRequests.get(owner) ?? 0) >= request.seq) return false;
+  appliedRequests.set(owner, request.seq);
+  return true;
 }
 export function Workbench({
   session,
   cwd,
   onClose,
-  requestedFile,
-  onFileOpened,
+  gitRequest,
+  fileRequest,
+  readOnly = false,
+  title,
 }: {
   session: string;
   cwd: string;
   onClose: () => void;
-  requestedFile?: { session: string; path: string; seq: number } | null;
-  onFileOpened?: () => void;
+  gitRequest?: { sessionId: string; path: string; seq: number };
+  fileRequest?: { sessionId: string; path: string; seq: number };
+  /** A historical session being browsed: files and current Git diffs only —
+   *  no editor, save, terminal or other mutating call, and separate state. */
+  readOnly?: boolean;
+  /** Session name shown on a read-only panel. */
+  title?: string;
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
+  const cache = readOnly ? readOnlyMemory : memory;
+  const panel = useRef<HTMLElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const [contentMaximized, setContentMaximized] = useState(false);
   useLayoutEffect(() => {
@@ -185,7 +141,9 @@ export function Workbench({
     window.addEventListener("keydown", escape);
     return () => window.removeEventListener("keydown", escape);
   }, [fullscreen, contentMaximized]);
-  const [saved, rawSetSaved] = useState<Saved>(() => load(session));
+  const [saved, rawSetSaved] = useState<Saved>(() =>
+    readOnly ? readOnlyMemory.get(session) ?? empty() : load(session),
+  );
   useEffect(() => setContentMaximized(false), [session, saved.tab]);
   useEffect(() => {
     if (saved.tab === "files" && !saved.files.includes(saved.selected)) setContentMaximized(false);
@@ -195,13 +153,13 @@ export function Workbench({
   function setSaved(update: Saved | ((old: Saved) => Saved)) {
     const next =
       typeof update === "function"
-        ? update(memory.get(session) || current.current)
+        ? update(cache.get(session) || current.current)
         : update;
     current.current = next;
-    const subscribed = memory.hasSubscribers(session);
-    memory.set(session, next);
+    const subscribed = cache.hasSubscribers(session);
+    cache.set(session, next);
     if (alive.current && !subscribed) rawSetSaved(next);
-    if (!alive.current) {
+    if (!alive.current && !readOnly) {
       try {
         sessionStorage.setItem("workbench:" + session, JSON.stringify(next));
       } catch {
@@ -210,6 +168,7 @@ export function Workbench({
     }
   }
   const [entries, setEntries] = useState<Entry[]>([]);
+  const directory = useRef<{ session: string; path: string; loaded: boolean } | null>(null);
   const [filesState, setFilesState] = useState<"loading" | "ready" | "failed">("loading");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -228,18 +187,10 @@ export function Workbench({
       document.removeEventListener("visibilitychange", refresh);
     };
   }, [session]);
-  useEffect(() => {
-    if (!requestedFile || requestedFile.session !== session) return;
-    const root = cwd.replace(/\\/g, "/").replace(/\/$/, "");
-    const candidate = requestedFile.path;
-    const path = candidate.startsWith(root + "/") ? candidate.slice(root.length + 1) : candidate;
-    openFile(path);
-    onFileOpened?.();
-  }, [requestedFile, session, cwd]);
 
   useEffect(
     () =>
-      memory.subscribe(session, (state) => {
+      cache.subscribe(session, (state) => {
         current.current = state;
         rawSetSaved(state);
       }),
@@ -250,6 +201,7 @@ export function Workbench({
     return () => {
       alive.current = false;
       dragCleanup.current?.();
+      if (readOnly) return;
       try {
         sessionStorage.setItem(
           "workbench:" + session,
@@ -261,6 +213,7 @@ export function Workbench({
     };
   }, []);
   useEffect(() => {
+    if (readOnly) return;
     const timer = setTimeout(() => {
       try {
         sessionStorage.setItem("workbench:" + session, JSON.stringify(saved));
@@ -276,15 +229,28 @@ export function Workbench({
   }, [saved, session]);
   useEffect(() => {
     let cancelled = false;
-    setError("");
-    setEntries([]);
-    setFilesState("loading");
+    if (directory.current?.session !== session || directory.current.path !== saved.path) {
+      directory.current = { session, path: saved.path, loaded: false };
+    }
+    const scope = directory.current;
+    // Polling and focus refreshes must not unmount the current rows: doing so
+    // flashes the tree and resets its scroll/focus even when nothing changed.
+    // A new directory still clears the old rows while its first load is pending.
+    if (!scope.loaded) {
+      setError("");
+      setEntries([]);
+      setFilesState("loading");
+    }
     workbenchRequest<Entry[]>(
       "files?" + new URLSearchParams({ session_id: session, path: saved.path }),
     )
       .then((data) => {
         if (!cancelled) {
-          setEntries(data);
+          scope.loaded = true;
+          setError("");
+          setEntries(old => old.length === data.length && old.every((entry, i) =>
+            entry.name === data[i].name && entry.directory === data[i].directory,
+          ) ? old : data);
           setFilesState("ready");
         }
       })
@@ -300,8 +266,22 @@ export function Workbench({
   }, [session, saved.path, version]);
   const update = (patch: Partial<Saved>) =>
     setSaved((old) => ({ ...old, ...patch }));
+  // Read-only panels claim under their own key: the same session may also
+  // have had a mutable panel, and neither should consume the other's request.
+  const requestOwner = (readOnly ? "read-only:" : "") + session;
+  useEffect(() => {
+    if (!claimRequest(requestOwner, gitRequest, session)) return;
+    update({ tab: "git" });
+    setVersion(value => value + 1);
+    panel.current?.focus({ preventScroll: true });
+  }, [session, gitRequest?.seq]);
+  useEffect(() => {
+    if (!fileRequest || !claimRequest(requestOwner, fileRequest, session)) return;
+    openFile(fileRequest.path, "content");
+    panel.current?.focus({ preventScroll: true });
+  }, [session, fileRequest?.seq]);
   async function createTerminal() {
-    if (busy) return;
+    if (busy || readOnly) return;
     setBusy(true);
     setError("");
     try {
@@ -332,6 +312,7 @@ export function Workbench({
     }
   }
   async function closeTerminal(id: string) {
+    if (readOnly) return false;
     try {
       await workbenchRequest(
         "terminals/" + id + "?" + new URLSearchParams({ session_id: session }),
@@ -351,12 +332,28 @@ export function Workbench({
     }));
     return true;
   }
-  function openFile(path: string) {
+  function openFile(path: string, view?: "content") {
     setSaved((old) => ({
       ...old,
       tab: "files",
       selected: path,
       files: old.files.includes(path) ? old.files : [...old.files, path],
+      // A chat link asks for the content even if this file last showed a diff
+      // or the editor; its draft stays and other files keep their modes.
+      editing: view === "content" ? old.editing.filter((f) => f !== path) : old.editing,
+      diffing: view === "content" ? old.diffing.filter((f) => f !== path) : old.diffing,
+    }));
+  }
+  function setFileMode(path: string, mode: "content" | "edit" | "diff") {
+    if (readOnly && mode === "edit") return;
+    setSaved((old) => ({
+      ...old,
+      editing: mode === "edit"
+        ? old.editing.includes(path) ? old.editing : [...old.editing, path]
+        : old.editing.filter((f) => f !== path),
+      diffing: mode === "diff"
+        ? old.diffing.includes(path) ? old.diffing : [...old.diffing, path]
+        : old.diffing.filter((f) => f !== path),
     }));
   }
   function closeFile(file: string) {
@@ -377,12 +374,14 @@ export function Workbench({
         drafts,
         files: old.files.filter((f) => f !== file),
         editing: old.editing.filter((f) => f !== file),
+        diffing: old.diffing.filter((f) => f !== file),
         selected: old.selected === file ? "" : old.selected,
       };
     });
   }
   function closePanel() {
     if (
+      !readOnly &&
       Object.values(current.current.drafts).some(draftDirty) &&
       !confirm(
         zh
@@ -416,11 +415,34 @@ export function Workbench({
     window.addEventListener("pointerup", stop);
     window.addEventListener("pointercancel", stop);
   }
+  // Escape closes the panel where it covers the chat (mobile full screen) or
+  // holds nothing to lose (read-only); a desktop editing panel stays open.
+  // Inputs and the terminal keep Escape for themselves.
+  function escapeToClose(event: KeyboardEvent) {
+    if (event.key !== "Escape" || event.defaultPrevented || fullscreen || contentMaximized) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("textarea, input, select, [contenteditable], .workbench-terminal")) return;
+    if (!readOnly && !window.matchMedia("(max-width: 850px)").matches) return;
+    event.preventDefault();
+    closePanel();
+  }
+  const terminalsAllowed = !readOnly;
+  const tab = !terminalsAllowed && saved.tab === "terminal" ? "home" : saved.tab;
+  const fileMode = !saved.files.includes(saved.selected)
+    ? "content"
+    : !readOnly && saved.editing.includes(saved.selected)
+      ? "edit"
+      : saved.diffing.includes(saved.selected) ? "diff" : "content";
   return (
     <aside
-      class={"workbench" + ((fullscreen || contentMaximized) ? " workbench-fullscreen" : "") + (contentMaximized ? " workbench-content-maximized" : "")}
+      ref={panel}
+      tabIndex={-1}
+      class={"workbench" + ((fullscreen || contentMaximized) ? " workbench-fullscreen" : "") + (contentMaximized ? " workbench-content-maximized" : "") + (readOnly ? " workbench-read-only" : "")}
       style={{ width: saved.width + "px" }}
-      aria-label={zh ? "工作区面板" : "Workspace panel"}
+      aria-label={readOnly
+        ? (zh ? "只读工作区面板：" : "Read-only workspace panel: ") + (title || session)
+        : zh ? "工作区面板" : "Workspace panel"}
+      onKeyDown={escapeToClose}
     >
       <div
         class="workbench-resizer"
@@ -447,7 +469,10 @@ export function Workbench({
       />
       <header>
         <div>
-          <strong>{zh ? "工作区" : "Workspace"}</strong>
+          <strong>
+            {readOnly ? (zh ? "工作区 · 只读" : "Workspace · read-only") : zh ? "工作区" : "Workspace"}
+          </strong>
+          {readOnly && title && <small class="workbench-session-name" title={title}>{title}</small>}
           <small title={cwd}>{cwd}</small>
         </div>
         <div class="workbench-header-actions">
@@ -467,23 +492,23 @@ export function Workbench({
         </div>
       </header>
       <nav aria-label={zh ? "工作区视图" : "Workspace views"}>
-        <button class={saved.tab === "home" ? "active" : ""} onClick={() => update({ tab: "home" })}>
+        <button class={tab === "home" ? "active" : ""} onClick={() => update({ tab: "home" })}>
           {zh ? "开始" : "Start"}
         </button>
         <button
-          class={saved.tab === "files" ? "active" : ""}
+          class={tab === "files" ? "active" : ""}
           onClick={() => update({ tab: "files" })}
         >
           {zh ? "文件" : "Files"}
         </button>
-        <button
-          class={saved.tab === "terminal" ? "active" : ""}
+        {terminalsAllowed && <button
+          class={tab === "terminal" ? "active" : ""}
           onClick={() => update({ tab: "terminal" })}
         >
           {zh ? "终端" : "Terminal"}
-        </button>
+        </button>}
         <button
-          class={saved.tab === "git" ? "active" : ""}
+          class={tab === "git" ? "active" : ""}
           onClick={() => update({ tab: "git" })}
         >
           Git
@@ -496,29 +521,40 @@ export function Workbench({
           ↻
         </button>
       </nav>
+      {readOnly && (
+        <p role="note" class="workbench-read-only-note">
+          {zh
+            ? "正在浏览历史会话：可查看文件与当前 Git 差异，不能编辑、保存或打开终端。内容是磁盘此刻的状态，不是当时的快照。"
+            : "Browsing a past session: view files and current Git diffs only — no editing, saving or terminals. Content is the disk as it is now, not a snapshot from then."}
+        </p>
+      )}
       {error && (
         <p role="alert" class="workbench-error">
           {error}
         </p>
       )}
-      {saved.tab === "home" ? (
+      {tab === "home" ? (
         <div class="workbench-home">
           <div class="workbench-home-heading">
             <span aria-hidden="true" class="workbench-home-symbol">⌘</span>
             <h2>{zh ? "项目工作区" : "Project workspace"}</h2>
-            <p>{zh ? "浏览文件、运行命令或检查代码变更" : "Browse files, run commands, or review changes"}</p>
+            <p>{readOnly
+              ? zh ? "浏览文件或检查当前代码变更" : "Browse files or review current changes"
+              : zh ? "浏览文件、运行命令或检查代码变更" : "Browse files, run commands, or review changes"}</p>
           </div>
           <div class="workbench-home-options">
             <button onClick={() => update({ tab: "files" })}>
               <span class="workbench-home-icon files" aria-hidden="true">▤</span>
-              <span><strong>{zh ? "文件" : "Files"}</strong><small>{zh ? "浏览、预览与编辑项目文件" : "Browse, preview, and edit project files"}</small></span>
+              <span><strong>{zh ? "文件" : "Files"}</strong><small>{readOnly
+                ? zh ? "浏览与预览项目文件" : "Browse and preview project files"
+                : zh ? "浏览、预览与编辑项目文件" : "Browse, preview, and edit project files"}</small></span>
               <span aria-hidden="true">→</span>
             </button>
-            <button disabled={busy} onClick={createTerminal}>
+            {terminalsAllowed && <button disabled={busy} onClick={createTerminal}>
               <span class="workbench-home-icon terminal" aria-hidden="true">›_</span>
               <span><strong>{zh ? "新建终端" : "New terminal"}</strong><small>{zh ? "在当前项目中打开终端" : "Open a terminal in this project"}</small></span>
               <span aria-hidden="true">＋</span>
-            </button>
+            </button>}
             <button onClick={() => update({ tab: "git" })}>
               <span class="workbench-home-icon git" aria-hidden="true">⑂</span>
               <span><strong>Git</strong><small>{zh ? "查看工作区变更与差异" : "Inspect working tree changes and diffs"}</small></span>
@@ -526,7 +562,7 @@ export function Workbench({
             </button>
           </div>
         </div>
-      ) : saved.tab === "files" ? (
+      ) : tab === "files" ? (
         <>
           <div class="workbench-path">
             <button
@@ -584,31 +620,29 @@ export function Workbench({
           </div>
           {saved.files.includes(saved.selected) ? (
             <>
-              <div class="workbench-file-mode">
+              <div class="workbench-file-mode" role="group" aria-label={zh ? "文件视图" : "File view"}>
                   <button
-                    class={
-                      !saved.editing.includes(saved.selected) ? "active" : ""
-                    }
-                    onClick={() =>
-                      update({
-                        editing: saved.editing.filter(
-                          (f) => f !== saved.selected,
-                        ),
-                      })
-                    }
+                    class={fileMode === "content" ? "active" : ""}
+                    aria-pressed={fileMode === "content"}
+                    onClick={() => setFileMode(saved.selected, "content")}
                   >
-                    {zh ? "预览" : "Preview"}
+                    {zh ? "内容" : "Content"}
                   </button>
-                  <button
+                  {!readOnly && <button
                     disabled={/\.(png|jpe?g|gif|webp)$/i.test(saved.selected)}
-                    class={
-                      saved.editing.includes(saved.selected) ? "active" : ""
-                    }
-                    onClick={() =>
-                      update({ editing: [...saved.editing, saved.selected] })
-                    }
+                    class={fileMode === "edit" ? "active" : ""}
+                    aria-pressed={fileMode === "edit"}
+                    onClick={() => setFileMode(saved.selected, "edit")}
                   >
                     {zh ? "编辑" : "Edit"}
+                  </button>}
+                  <button
+                    class={fileMode === "diff" ? "active" : ""}
+                    aria-pressed={fileMode === "diff"}
+                    title={zh ? "仓库此刻的差异，不是历史快照" : "The repository's diff now, not a historical snapshot"}
+                    onClick={() => setFileMode(saved.selected, "diff")}
+                  >
+                    {zh ? "当前 Git 差异" : "Current Git diff"}
                   </button>
                   <code title={saved.selected}>{saved.selected}</code>
                   <button
@@ -618,7 +652,10 @@ export function Workbench({
                     onClick={() => setContentMaximized(v => !v)}
                   >{contentMaximized ? "⤡" : "⤢"}</button>
               </div>
-              {saved.editing.includes(saved.selected) ? (
+              {fileMode === "diff" ? (
+                <FileGitDiff key={saved.selected} session={session}
+                  path={saved.selected} version={version} />
+              ) : fileMode === "edit" ? (
                 <WorkbenchEditor
                   key={saved.selected}
                   session={session}
@@ -649,11 +686,11 @@ export function Workbench({
                   }}
                 />
               ) : (
-                <FilePreview
+                <FileContent
                   key={saved.selected}
                   session={session}
                   path={saved.selected}
-                  draftText={saved.drafts[saved.selected]?.text}
+                  draftText={readOnly ? undefined : saved.drafts[saved.selected]?.text}
                   position={saved.positions[saved.selected] || 0}
                   onPosition={(value) =>
                     setSaved((old) => ({
@@ -668,18 +705,23 @@ export function Workbench({
             <div class="workbench-empty">
               <strong>{zh ? "浏览项目文件" : "Explore project files"}</strong>
               <p>
-                {zh
-                  ? "选择文件以预览或编辑。支持文本、代码和常见图片，最大 2 MiB。"
-                  : "Select a file to preview or edit. Text, code and common images up to 2 MiB."}
+                {readOnly
+                  ? zh
+                    ? "选择文件以查看。支持文本、代码和常见图片，最大 2 MiB。"
+                    : "Select a file to view. Text, code and common images up to 2 MiB."
+                  : zh
+                    ? "选择文件以预览或编辑。支持文本、代码和常见图片，最大 2 MiB。"
+                    : "Select a file to preview or edit. Text, code and common images up to 2 MiB."}
               </p>
             </div>
           )}
         </>
-      ) : saved.tab === "git" ? (
-        <WorkbenchGit session={session} version={version} onOpen={openFile}
+      ) : tab === "git" ? (
+        <WorkbenchGit session={session} version={version} onOpen={(path) => openFile(path, "content")}
+          requested={gitRequest?.sessionId === session ? gitRequest : undefined}
           maximized={contentMaximized} onMaximize={() => setContentMaximized(v => !v)}
           onRestore={() => setContentMaximized(false)} />
-      ) : (
+      ) : !terminalsAllowed ? null : (
         <>
           <div class="workbench-terminal-actions">
             <button disabled={busy} onClick={createTerminal}>

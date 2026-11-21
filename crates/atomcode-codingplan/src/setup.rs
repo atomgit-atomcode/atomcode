@@ -45,7 +45,7 @@ use atomcode_config::config::provider::ProviderConfig;
 use atomcode_config::config::Config;
 
 /// Resolve the LLM gateway base URL for CodingPlan-managed providers, used
-/// when the `models-v2` payload doesn't carry a per-model `base_url`.
+/// when the `models-v3` payload doesn't carry a per-model `base_url`.
 ///
 /// Resolved by [`atomcode_config::endpoints::codingplan_llm_base_url`]: the
 /// `ATOMCODE_CODINGPLAN_LLM_BASE_URL` override, else the deployment profile's
@@ -674,7 +674,7 @@ pub fn run(
         });
     }
 
-    // Decide the plan_type to send to /models-v2. Three sources:
+    // Decide the plan_type to send to /models-v3. Three sources:
     //   * Fresh `Ok` claim: use the tier the cascade landed on.
     //   * `Skipped` (server returned `duplicate=true` at one of the
     //     tiers): step_claim picked the tier it stopped at; we don't
@@ -937,12 +937,12 @@ fn step_models_and_register(
             );
         }
     };
-    let all_models = match client.list_models_v2(plan_type) {
+    let all_models = match client.list_models_v3(plan_type) {
         Ok(v) => v,
         Err(e) => {
             let auth_expired = is_auth_expired(&e);
             return (
-                StepResult::Err(format!("list models-v2: {:#}", e)),
+                StepResult::Err(format!("list models-v3: {:#}", e)),
                 auth_expired,
             );
         }
@@ -996,7 +996,38 @@ fn step_models_and_register(
         .iter()
         .map(|m| m.display_model_name.clone())
         .collect();
-    let provider_names = provider_names_for(&names);
+    // Per-entry explicit `provider_account` wins when the server sends one.
+    // The provider (selection) name is the composite `{account}-{model}` so
+    // several models can share one explicit account without id collisions;
+    // the fold layer strips the model suffix to recover the account id.
+    // Absent keeps the historical `AtomGit` / `AtomGit-{display_model_name}`
+    // naming so older payloads and existing users are unaffected.
+    let provider_names: Vec<String> = available
+        .iter()
+        .map(|m| {
+            m.provider_account
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| {
+                    format!(
+                        "{}-{}",
+                        name,
+                        sanitize_model_for_name(&m.display_model_name)
+                    )
+                })
+                .unwrap_or_else(|| {
+                    if available.len() == 1 {
+                        provider_prefix().to_string()
+                    } else {
+                        format!(
+                            "{}-{}",
+                            provider_prefix(),
+                            sanitize_model_for_name(&m.display_model_name)
+                        )
+                    }
+                })
+        })
+        .collect();
     for (pname, m) in provider_names.iter().zip(available.iter()) {
         let pc = build_codingplan_provider(m);
         config.providers.insert(pname.clone(), pc);
@@ -1404,6 +1435,7 @@ pub fn format_duration_secs(secs: i64) -> String {
 /// Decide the config-key name for each model. Single model → bare
 /// `AtomGit` (keeps the name tidy for the common case); 2+ models →
 /// `AtomGit-{name with / replaced by -}`.
+#[cfg(test)]
 fn provider_names_for(model_names: &[String]) -> Vec<String> {
     if model_names.len() == 1 {
         vec![provider_prefix().to_string()]
@@ -1425,7 +1457,7 @@ fn sanitize_model_for_name(model: &str) -> String {
 /// Build a ProviderConfig from a model-list entry. The server's
 /// per-model fields take precedence; missing fields fall back to the
 /// historical fallbacks ([`codingplan_llm_base_url`] / `PROVIDER_TYPE`), and the
-/// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v2`
+/// context window is floored at [`MIN_CONTEXT_WINDOW`], so older `models-v3`
 /// payloads without the new columns continue to work without code changes.
 ///
 /// `api_key` is carried through only when the payload supplies one, for a
@@ -1435,6 +1467,7 @@ fn sanitize_model_for_name(model: &str) -> String {
 /// login token is still never written into the user's `config.toml`.
 fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
     ProviderConfig {
+        api_key_is_resolved: false,
         headers: Default::default(),
         provider_type: entry
             .provider_type
@@ -1452,7 +1485,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         ),
         system_prompt: None,
         // Prefer the gateway's explicit per-model capability. `None` is kept
-        // for older models-v2 payloads so the existing model-name heuristic
+        // for older models-v3 payloads so the existing model-name heuristic
         // remains the backward-compatible fallback at provider resolution.
         supports_vision: entry.supports_vision,
         user_agent: None,
@@ -1467,7 +1500,16 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .filter(|n| *n > 0)
             .unwrap_or(0)
             .max(MIN_CONTEXT_WINDOW),
-        max_tokens: None,
+        // Match model discovery's output-budget precedence. Reject values that
+        // cannot be represented by the runtime's u32 instead of wrapping them.
+        max_tokens: entry
+            .max_output_tokens
+            .filter(|&n| n > 0 && u32::try_from(n).is_ok())
+            .or_else(|| {
+                entry
+                    .max_tokens
+                    .filter(|&n| n > 0 && u32::try_from(n).is_ok())
+            }),
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
@@ -1483,6 +1525,13 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
             .or_else(|| {
                 atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name)
             }),
+        // Display alias / description advertised by the gateway. An empty
+        // string is treated as "not sent" so a misconfigured row never
+        // blanks a picker label; `None` falls back to the raw model name.
+        alias: entry.alias.clone().filter(|a| !a.is_empty()),
+        desc: entry.desc.clone().filter(|d| !d.is_empty()),
+        alias_en: entry.alias_en.clone().filter(|a| !a.is_empty()),
+        desc_en: entry.desc_en.clone().filter(|d| !d.is_empty()),
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -1491,10 +1540,11 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         // participating). Threaded verbatim so re-ranking models needs no client release.
         capable_model: entry.capable_model,
         retry_max_attempts: None,
+        response_header_timeout_secs: None,
     }
 }
 
-/// Resolve the effective image-input capability advertised by models-v2.
+/// Resolve the effective image-input capability advertised by models-v3.
 /// An explicit server value is authoritative; older payloads without the field
 /// retain the historical model-name heuristic.
 fn model_entry_supports_vision(entry: &ModelEntry) -> bool {
@@ -1525,6 +1575,93 @@ mod tests {
 
     fn blank_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn model_output_budget_deserializes_and_keeps_server_values() {
+        for (fields, expected) in [
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"max_tokens": null, "max_output_tokens": null}),
+                None,
+            ),
+            (
+                serde_json::json!({"max_tokens": 0, "max_output_tokens": 0}),
+                None,
+            ),
+            (serde_json::json!({"max_tokens": 4096}), Some(4096)),
+            (
+                serde_json::json!({"max_output_tokens": 393216}),
+                Some(393216),
+            ),
+            (
+                serde_json::json!({"max_tokens": 4096, "max_output_tokens": 65536}),
+                Some(65536),
+            ),
+            (
+                serde_json::json!({"max_tokens": 4096, "max_output_tokens": 0}),
+                Some(4096),
+            ),
+            (serde_json::json!({"max_tokens": 4294967296_u64}), None),
+        ] {
+            let mut payload = serde_json::json!({
+                "display_model_name": "test-model", "context_window": 512000,
+                "plan_available": true
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let served: ModelEntry = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(
+                build_codingplan_provider(&served).max_tokens,
+                expected,
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_output_budget_survives_refresh_save_and_resolution() {
+        for policy in [
+            DefaultModelPolicy::AdoptServerDefault,
+            DefaultModelPolicy::PreservePrevious,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut latest = blank_config();
+            // Both login and background refresh must replace a stale budget,
+            // including removing it when the server no longer supplies one.
+            for budget in [Some(4096), Some(393216), None] {
+                let mut prepared = latest.clone();
+                let served: ModelEntry = serde_json::from_value(serde_json::json!({
+                    "display_model_name": "test-model", "context_window": 512000,
+                    "plan_available": true, "max_tokens": budget
+                }))
+                .unwrap();
+                let models = run_register(&mut prepared, vec![served]);
+                let report = SetupReport {
+                    login: StepResult::Skipped("test".into()),
+                    claim: StepResult::Skipped("test".into()),
+                    claim_attempts: Vec::new(),
+                    models: StepResult::Ok(models),
+                    status: StepResult::Skipped("test".into()),
+                    auth_expired: false,
+                };
+                merge_successful_config(&mut latest, &prepared, &report, policy).unwrap();
+                latest.save(&path).unwrap();
+                latest = Config::load(&path).unwrap();
+                assert_eq!(latest.models[px()].max_tokens, budget);
+                assert_eq!(latest.resolve_model(Some(px())).unwrap().max_tokens, budget);
+                assert_eq!(
+                    latest
+                        .provider_config_for_selection(px())
+                        .unwrap()
+                        .max_tokens,
+                    budget
+                );
+            }
+        }
     }
 
     /// The configured provider prefix. Expectations derive from it rather than
@@ -1692,7 +1829,7 @@ mod tests {
     fn build_provider_uses_canonical_defaults() {
         // All optional server fields missing → fall back to the
         // historical constants. Pins the back-compat path for
-        // older `models-v2` builds that don't yet emit `base_url`,
+        // older `models-v3` builds that don't yet emit `base_url`,
         // `type`, or `context_window`.
         let p = build_codingplan_provider(&entry("foo/bar"));
         assert_eq!(p.provider_type, "openai");
@@ -1722,7 +1859,7 @@ mod tests {
         assert_eq!(glm.reasoning_effort_levels, None);
     }
 
-    // models-v2 now advertises per-model `reasoning_effort_levels`. A NON-EMPTY server
+    // models-v3 now advertises per-model `reasoning_effort_levels`. A NON-EMPTY server
     // list is persisted verbatim and overrides the client builtin (deepseek -> [high,max]);
     // an EMPTY list means "no effort switching" and falls back to the builtin (which is
     // None for a non-builtin model), never persisting a bare empty vec.
@@ -1755,7 +1892,7 @@ mod tests {
         );
     }
 
-    // The exact models-v2 payload shape from the (pre-prod) gateway must deserialize,
+    // The exact models-v3 payload shape from the (pre-prod) gateway must deserialize,
     // carrying `reasoning_effort_levels` through to the `ModelEntry`.
     #[test]
     fn model_entry_deserializes_server_reasoning_effort_levels() {
@@ -1982,12 +2119,19 @@ mod tests {
             is_atomcode_exclusive: 1,
             display_model_name: "GLM-5.1".into(),
             base_url: Some("https://custom.example.com/v1".into()),
+            provider_account: None,
             provider_type: Some("claude".into()),
             context_window: Some(128_000),
+            max_tokens: Some(4096),
+            max_output_tokens: None,
             supports_vision: Some(true),
             plan_available: true,
             capable_model: None,
             reasoning_effort_levels: None,
+            alias: None,
+            desc: None,
+            alias_en: None,
+            desc_en: None,
             api_key: None,
         };
         let p = build_codingplan_provider(&e);
@@ -1995,6 +2139,7 @@ mod tests {
         assert_eq!(p.provider_type, "claude");
         assert_eq!(p.base_url.as_deref(), Some("https://custom.example.com/v1"));
         assert_eq!(p.context_window, 128_000);
+        assert_eq!(p.max_tokens, Some(4096));
         assert_eq!(p.supports_vision, Some(true));
     }
 
@@ -3232,7 +3377,7 @@ mod tests {
 
     #[test]
     fn a_payload_without_the_key_column_still_deserializes() {
-        // Older / hosted `models-v2` responses have no such field.
+        // Older / hosted `models-v3` responses have no such field.
         let e: super::super::types::ModelEntry =
             serde_json::from_value(serde_json::json!({"display_model_name": "GLM-5.2"})).unwrap();
         assert_eq!(e.api_key, None);

@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { taskSpecs, type TaskSpecView } from '../api';
 import { useT } from '../settings';
@@ -31,7 +32,7 @@ export function TaskSpecifications({sessionId, running, initial, onClose, onChan
     finally{if(request.current===controller)setLoading(false);}
   }
   const items=view?.items?.filter(item=>mode==='pin'?!item.pinned:mode==='unpin'?item.pinned:true);
-  return <div class="modal-overlay" onClick={onClose} onKeyDown={event=>{if(event.key==='Escape'){event.stopPropagation();onClose();}}}>
+  return <ModalOverlay>
     <section class="modal-card task-specifications" role="dialog" aria-modal="true" aria-label={t('spec.title')} onClick={e=>e.stopPropagation()}>
       <header><h3>{t('spec.title')}</h3><button type="button" class="btn" onClick={onClose}>{t('spec.close')}</button></header>
       <p>{t('spec.explanation')}</p>
@@ -53,5 +54,5 @@ export function TaskSpecifications({sessionId, running, initial, onClose, onChan
         {running&&<p>{t('spec.running')}</p>}
       </div>}
     </section>
-  </div>;
+  </ModalOverlay>;
 }

@@ -1,4 +1,4 @@
-# AtomCode installer for Windows — PowerShell
+# AtomCode installer for Windows - PowerShell
 #
 #   irm https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.ps1 | iex
 #
@@ -28,7 +28,7 @@ $RepoLatestManifest = "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/mai
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
-# OS — it holds the real OS arch). Fall back to PROCESSOR_ARCHITECTURE.
+# OS - it holds the real OS arch). Fall back to PROCESSOR_ARCHITECTURE.
 # Avoids RuntimeInformation::OSArchitecture which is empty on older PS 5.1/.NET.
 $RealArch = if ($env:PROCESSOR_ARCHITEW6432) {
     $env:PROCESSOR_ARCHITEW6432
@@ -146,7 +146,7 @@ if ([char]$Header[0] -eq '<') {
 
 # --- install ---
 # Move-Item -Force is unreliable on Windows PowerShell 5.1 when the destination
-# already exists (see: fails with "当文件已存在时，无法创建该文件"). Do an explicit
+# already exists (see: fails with "Cannot create a file when that file already exists"). Do an explicit
 # Remove-Item first, and surface a clear message if the old binary is locked
 # (atomcode.exe still running in another terminal).
 Write-Host "==> Installing to $Dest"
@@ -165,7 +165,7 @@ Move-Item -Path $TmpFile -Destination $Dest
 
 # --- add to PATH ---
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-# Compare COMPLETE, normalized PATH entries — never a substring of the raw string.
+# Compare COMPLETE, normalized PATH entries - never a substring of the raw string.
 # A raw `-like "*$Prefix*"` false-positives when another entry merely CONTAINS the
 # prefix (e.g. "...\AtomCodeBackup" for prefix "...\AtomCode"), silently skipping the
 # real add so atomcode isn't on PATH in a new terminal. Split on ';', trim trailing

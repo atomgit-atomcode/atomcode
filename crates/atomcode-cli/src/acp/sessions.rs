@@ -101,7 +101,7 @@ pub struct SessionState {
 /// [`handle_delete_session`]). The remaining gap: a session whose kernel agent
 /// finishes on its own (e.g. an internal stop) is not auto-pruned — it stays in
 /// the table until the client closes/deletes it or the whole connection ends
-/// (all are freed when the process exits / the client disconnects).
+/// (connection teardown drains and awaits all remaining sessions).
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 
 /// A host that says yes and remembers what it was asked.
@@ -499,6 +499,19 @@ async fn stop_and_wait(state: SessionState) {
     .await;
 }
 
+/// The connection has ended. Stop all its remaining sessions through the same
+/// runtime-owned path as explicit close, concurrently so the existing stop
+/// timeout bounds the whole batch rather than each session in sequence.
+pub(crate) async fn shutdown_sessions(sessions: &Sessions) {
+    let states: Vec<_> = sessions
+        .lock()
+        .await
+        .drain()
+        .map(|(_, state)| state)
+        .collect();
+    futures::future::join_all(states.into_iter().map(stop_and_wait)).await;
+}
+
 /// Handle a `session/close` request.
 ///
 /// Per the protocol the agent cancels any ongoing work (as if `session/cancel`
@@ -518,6 +531,24 @@ pub async fn handle_close_session(
         stop_and_wait(state).await;
     }
     CloseSessionResponse::new()
+}
+
+/// Complete a newly registered restore. A failed replay/response must not
+/// leave a live runtime behind a failed lifecycle request. Call only after
+/// registration succeeds, so a pre-existing session is never torn down.
+pub(crate) async fn finish_restore<F>(
+    sessions: &Sessions,
+    session_id: &SessionId,
+    completion: F,
+) -> Result<(), AcpError>
+where
+    F: std::future::Future<Output = Result<(), AcpError>>,
+{
+    let result = completion.await;
+    if result.is_err() {
+        handle_close_session(sessions, session_id).await;
+    }
+    result
 }
 
 /// Handle a `session/delete` request over the live table AND the native
@@ -680,6 +711,190 @@ mod tests {
         );
         // Ids this agent did not mint are never valid resume/delete targets.
         assert_eq!(native_id_from_wire(&SessionId::new("raw-uuid")), None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_restore_completion_stops_only_target_and_releases_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(root.path());
+        let lease = manager.acquire_lease("target").unwrap();
+        let sessions = sessions_with(vec![("acp-neighbor", "/neighbor")]);
+        let mut state = stub_session("target", "/work");
+        let (commands, mut received) = mpsc::unbounded_channel();
+        let (events, receiver) = mpsc::unbounded_channel();
+        state.commands = commands;
+        state.events = Arc::new(Mutex::new(receiver));
+        sessions.lock().await.insert("acp-target".into(), state);
+        let stopped = tokio::spawn(async move {
+            assert!(matches!(received.recv().await, Some(AgentCommand::Cancel)));
+            assert!(matches!(
+                received.recv().await,
+                Some(AgentCommand::Shutdown)
+            ));
+            drop(lease);
+            drop(events);
+        });
+        let expected = agent_client_protocol::util::internal_error("replay read failed");
+        let expected_json = serde_json::to_value(&expected).unwrap();
+        let error = finish_restore(&sessions, &SessionId::new("acp-target"), async {
+            Err(expected)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(serde_json::to_value(error).unwrap(), expected_json);
+        assert!(!sessions.lock().await.contains_key("acp-target"));
+        assert!(sessions.lock().await.contains_key("acp-neighbor"));
+        let reacquired = manager
+            .acquire_lease("target")
+            .expect("stop releases lease before returning");
+        stopped.await.unwrap();
+        drop(reacquired);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn replay_read_failure_releases_real_runtime_for_retry() {
+        use crate::acp::dispatch::{handle_resume_session, spawn_and_register_session};
+        use crate::acp::engine::EngineConfig;
+        use atomcode_capabilities::ProductDirs;
+        use atomcode_coding::{CodingProviderFactory, ProviderBuildError, SessionMode};
+        use atomcode_kernel::provider::LlmProvider;
+
+        struct NoRequests;
+        impl CodingProviderFactory for NoRequests {
+            fn build(
+                &self,
+                _: &CodingAgentConfig,
+                _: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+                Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(
+                    vec![],
+                )))
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let dirs = ProductDirs::new(home.path(), ".restore-test");
+        let engine = EngineConfig::from_coding_config(CodingAgentConfig::new(
+            "test-key",
+            "http://127.0.0.1:1",
+            "stub",
+            cwd.path(),
+            dirs.clone(),
+        ));
+        let provider: Arc<dyn CodingProviderFactory> = Arc::new(NoRequests);
+        let sessions = sessions_with(vec![]);
+        let id = spawn_and_register_session(
+            &engine,
+            Some(provider.clone()),
+            &sessions,
+            cwd.path().into(),
+            &[],
+            vec![],
+            vec![],
+            SessionMode::Fresh,
+        )
+        .await
+        .unwrap();
+        handle_close_session(&sessions, &id).await;
+        let native_id = native_id_from_wire(&id).unwrap();
+        let manager = SessionManager::for_project(cwd.path(), &dirs);
+        let scan = SessionManager::scan_all(&dirs);
+        handle_resume_session(
+            &engine,
+            Some(provider.clone()),
+            &sessions,
+            &id,
+            cwd.path().into(),
+            &[],
+            vec![],
+            vec![],
+            &scan,
+        )
+        .await
+        .unwrap();
+        assert!(
+            manager.acquire_lease(native_id).is_err(),
+            "resumed runtime holds lease"
+        );
+
+        // Fault only this test's event file AFTER successful runtime restore.
+        // Preserve its contents to verify retry against the same native history.
+        let events = manager.events_path(native_id).unwrap();
+        let saved = events.with_extension("fault-backup");
+        let bytes = std::fs::read(&events).unwrap();
+        std::fs::rename(&events, &saved).unwrap();
+        let result = finish_restore(&sessions, &id, async {
+            manager.load_events(native_id).map(|_| ()).map_err(|e| {
+                agent_client_protocol::util::internal_error(format!("replay read: {e}"))
+            })
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("replay read"));
+        assert!(!sessions.lock().await.contains_key(id.0.as_ref()));
+        let lease = manager
+            .acquire_lease(native_id)
+            .expect("failed replay stopped actual runtime");
+        drop(lease);
+        std::fs::rename(&saved, &events).unwrap();
+        assert_eq!(std::fs::read(&events).unwrap(), bytes);
+        handle_resume_session(
+            &engine,
+            Some(provider),
+            &sessions,
+            &id,
+            cwd.path().into(),
+            &[],
+            vec![],
+            vec![],
+            &scan,
+        )
+        .await
+        .expect("same session can retry");
+        assert!(sessions.lock().await.contains_key(id.0.as_ref()));
+        handle_close_session(&sessions, &id).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn successful_restore_completion_keeps_target_live() {
+        let sessions = sessions_with(vec![("acp-target", "/work")]);
+        finish_restore(&sessions, &SessionId::new("acp-target"), async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(sessions.lock().await.contains_key("acp-target"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn disconnected_sessions_stop_concurrently_with_a_bounded_wait() {
+        let sessions = sessions_with(vec![]);
+        let mut receivers = Vec::new();
+        let mut held_senders = Vec::new();
+        for id in ["one", "two"] {
+            let mut state = stub_session(id, "/work");
+            let (commands, receiver) = mpsc::unbounded_channel();
+            let (events, event_receiver) = mpsc::unbounded_channel();
+            state.commands = commands;
+            state.events = Arc::new(Mutex::new(event_receiver));
+            receivers.push(receiver);
+            held_senders.push(events);
+            sessions.lock().await.insert(format!("acp-{id}"), state);
+        }
+        let started = tokio::time::Instant::now();
+        shutdown_sessions(&sessions).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(5),
+            "must await teardown"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "must not multiply timeout per session: {elapsed:?}"
+        );
+        assert!(sessions.lock().await.is_empty());
+        for mut receiver in receivers {
+            assert!(matches!(receiver.try_recv(), Ok(AgentCommand::Cancel)));
+            assert!(matches!(receiver.try_recv(), Ok(AgentCommand::Shutdown)));
+        }
+        drop(held_senders);
     }
 
     #[tokio::test]

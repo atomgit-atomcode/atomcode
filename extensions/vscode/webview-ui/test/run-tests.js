@@ -8,6 +8,8 @@ async function main() {
   const root = path.join(__dirname, '..', '..');
   const tempDir = mkdtempSync(path.join(tmpdir(), 'atomcode-vscode-webview-tests-'));
   const tests = [
+    'chat-font-size.test.ts',
+    'chat-font-host.test.ts',
     'language-bridge.test.ts',
     'language-bridge-lifecycle.test.ts',
     'rendering-regression.test.ts',

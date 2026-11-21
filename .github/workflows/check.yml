@@ -92,8 +92,54 @@ jobs:
         continue-on-error: true
         run: cargo test --workspace --doc
 
+  webui:
+    name: webui unit + e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install webui dependencies
+        run: npm ci --prefix webui
+
+      # BLOCKING. The webui unit tests are pure node — no browser, no daemon —
+      # so they are cheap enough to gate every PR on. They include the
+      # composer-collapse guards that keep the mobile toolbar reachable.
+      - name: webui unit tests
+        run: npm test --prefix webui
+
+      - name: Typecheck webui
+        run: npm run typecheck --prefix webui
+
+      # The browser e2e runs against the built bundle, so it needs the build
+      # first. The script picks Playwright's bundled chromium off a non-darwin
+      # runner, and MOBILE_COLLAPSE_BROWSER overrides the local Chrome.
+      - name: Build webui
+        run: npm run build --prefix webui
+
+      - name: Install Playwright chromium
+        run: npx --prefix webui playwright install --with-deps chromium
+
+      # Report-only for now, on the same contract as the nextest and clippy
+      # steps above: the suite has not yet run on a Linux runner, and a gate
+      # that has never been green should not be able to fail a PR.
+      # PROMOTE THIS: once a run is green here, delete the
+      # `continue-on-error` line below — a test gate that cannot fail a PR is
+      # not a gate.
+      - name: mobile composer collapse e2e
+        continue-on-error: true
+        run: npm run test:mobile-model-collapse --prefix webui
+
   native-plugins:
-    name: C plugin self tests + webui tests
+    name: C plugin self tests + lock gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -101,10 +147,10 @@ jobs:
         uses: actions/checkout@v4
 
       # The Android runtime plugins are C, compiled to `.so` and dlopened by
-      # `pluginhost` INTO the host process. Every Rust gate above — check,
-      # nextest, fmt — is blind to them: a heap overflow in one of these files
-      # is a memory-safety bug in the agent process, and no Rust toolchain in
-      # this repo can see it.
+      # `pluginhost` INTO the host process. Every Rust gate — check, nextest,
+      # fmt — is blind to them: a heap overflow in one of these files is a
+      # memory-safety bug in the agent process, and no Rust toolchain in this
+      # repo can see it.
       #
       # That is not hypothetical. The `repeat` tool in `example_server.c`
       # allocated `text_len * times` bytes and wrote `text_len * times +
@@ -123,21 +169,6 @@ jobs:
           bash scripts/mcp-example/selftest.sh
           bash scripts/mcp-filesystem/selftest.sh
           bash scripts/text-plugin/selftest.sh
-
-      # The webui's own unit tests are not in the Rust workspace, so
-      # `cargo nextest --workspace` never ran them either.
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install webui dependencies
-        working-directory: webui
-        run: npm ci
-
-      - name: webui unit tests
-        working-directory: webui
-        run: npm test
 
       # The lock must not carry the private overlay's dependencies. On a
       # checkout there is no overlay, so this only fires when someone committed
@@ -183,3 +214,48 @@ jobs:
       - name: cargo clippy
         continue-on-error: true
         run: cargo clippy --workspace --all-targets
+
+  windows-path-encoding:
+    name: Windows Unicode input and path roundtrip
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-path-encoding
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      # One crate's library target only: exercise actual Windows APIs/cmd/PS,
+      # including when Git Bash would otherwise hide the cmd fallback.
+      - name: Run Windows path regressions
+        run: >-
+          cargo nextest run -p atomcode-capabilities --lib
+          -E 'test(windows_encoding_tests) | test(windows_powershell_versions) | test(chinese_workspace_paths) | test(encoded_command_preserves) | test(windows_diagnostics)'
+
+      # The vendored dependency is outside the workspace, so use its manifest
+      # to include its own test dependencies and exercise the native parser.
+      - name: Preserve Windows Alt-release Unicode text commits
+        run: >-
+          cargo nextest run --manifest-path vendor/crossterm/Cargo.toml --lib
+          -E 'test(windows_alt_unicode)'
+
+      - name: Preserve Unicode paste through the TUI input buffer
+        run: >-
+          cargo nextest run -p atomcode-tui --lib
+          -E 'test(windows_paste) | test(console_utf8_setup)'
+
+      # The source is ASCII so Windows PowerShell 5.1 can read the probe itself.
+      # Deliberately BOM-less script cases are diagnostic contrasts, not proof
+      # of a historical AtomCode failure. All writes stay under system temp.
+      - name: Compare native arguments and script-file encodings
+        shell: powershell
+        run: .\scripts\probe-windows-path-encoding.ps1

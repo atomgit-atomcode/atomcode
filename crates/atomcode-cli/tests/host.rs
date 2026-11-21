@@ -103,6 +103,28 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text.starts_with("打开网页 ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "mcp__browser-use__browser_navigate".into(),
+                    arguments: serde_json::json!({"url":m.text.strip_prefix("打开网页 ").unwrap()})
+                        .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text.starts_with("browser navigate ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "mcp__browser-use__browser_navigate".into(),
+                    arguments: serde_json::json!({"url": &m.text[17..]}).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text.starts_with("browser download ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "mcp__browser-use__browser_download".into(),
+                    arguments: serde_json::json!({"url": &m.text[17..]}).to_string(),
+                })
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -318,6 +340,7 @@ async fn started_with_vision(
             skill_dirs: Some(skill_dirs),
             plugin_skill_dirs: Vec::new(),
             mcp,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -575,6 +598,7 @@ async fn a_finished_turn_offers_what_might_be_said_next() {
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -711,6 +735,53 @@ async fn a_new_session_is_a_session_change_and_the_rebuilt_app_feeds_the_same_ch
         user_messages(&events, &second),
         vec!["second words".to_string()],
         "the App built for the new session feeds the channel the front end holds: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_distinguishes_an_empty_session_from_a_missing_one() {
+    use atomcode_capabilities::session::{SessionManager, SessionMeta};
+    use atomcode_kernel::session::SessionHeader;
+    let env = env();
+    let mut connection = connected(&env).await;
+    let source = connection.session.clone();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let target = "empty-resume-target";
+    let lease = manager.acquire_lease(target).unwrap();
+    let mut meta = SessionMeta::new(target, env.project.path().to_string_lossy().as_ref(), 1);
+    meta.owner = atomcode_capabilities::session::manager::StorageOwner::Native;
+    manager
+        .create_event_session(&lease, &SessionHeader::new(target), &meta)
+        .unwrap();
+    drop(lease);
+    for (target, empty) in [(target, true), ("missing-resume-target", false)] {
+        let result = connection
+            .control
+            .call(HostCommand::Resume {
+                session: source.clone(),
+                target: target.into(),
+            })
+            .await;
+        if empty {
+            assert!(
+                matches!(result, Err(HostError::Failed { message }) if message.contains("no messages"))
+            );
+        } else {
+            assert_eq!(result, Err(HostError::NotFound));
+        }
+    }
+    connection.commands.send(subscribe(&source)).unwrap();
+    connection
+        .commands
+        .send(message("still on the original session"))
+        .unwrap();
+    let events = through_turn(&mut connection).await;
+    assert_eq!(
+        user_messages(&events, &source),
+        vec!["still on the original session"]
     );
 }
 
@@ -2132,7 +2203,11 @@ impl HostConfig for Models {
         }
         let mut config = CodingAgentConfig::new(
             "key",
-            "https://example.test/v1",
+            if model == "gateway-test" {
+                "https://llm-api.atomgit.com/v1"
+            } else {
+                "https://example.test/v1"
+            },
             model,
             &self.0,
             atomcode_coding::config::product_dirs_from_env(),
@@ -2142,6 +2217,70 @@ impl HostConfig for Models {
     }
     fn current(&self) -> Result<CodingAgentConfig, String> {
         self.for_model("scripted-again")
+    }
+}
+
+/// The catalog can retain its startup selection while the runtime swaps only
+/// the provider. Host control must report the live selection, even for aliases
+/// that send the very same model name to different accounts.
+#[tokio::test]
+async fn the_model_catalog_reports_the_runtime_selection_after_same_wire_switches() {
+    struct Catalog;
+    #[async_trait::async_trait]
+    impl atomcode_harness::seams::Models for Catalog {
+        fn list(&self) -> Vec<atomcode_harness::seams::ModelInfo> {
+            Vec::new()
+        }
+        fn current(&self) -> Option<String> {
+            Some("stale/startup".into())
+        }
+        async fn provider(&self, _: &str) -> Result<Arc<dyn LlmProvider>, String> {
+            Err("not needed for this catalog".into())
+        }
+    }
+    struct SameWire(std::path::PathBuf);
+    impl HostConfig for SameWire {
+        fn for_model(&self, id: &str) -> Result<CodingAgentConfig, String> {
+            let mut config = Models(self.0.clone()).for_model("deepseek-flash")?;
+            config.provider_name = id.into();
+            Ok(config)
+        }
+        fn current(&self) -> Result<CodingAgentConfig, String> {
+            self.for_model("a/ds")
+        }
+    }
+    let env = env();
+    let (connection, front_end) = connected_as(
+        &env,
+        SubagentPolicy::Disabled,
+        Some(Arc::new(SameWire(env.project.path().to_path_buf()))),
+    )
+    .await;
+    let _catalog = front_end
+        .app()
+        .unwrap()
+        .provide::<atomcode_harness::seams::ModelsSvc>(Arc::new(Catalog))
+        .unwrap();
+    for id in ["a/ds", "b/ds", "a/ds"] {
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: connection.session.clone(),
+                model: id.into(),
+            })
+            .await
+            .unwrap();
+        match connection
+            .control
+            .call(HostCommand::Models {
+                session: connection.session.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            HostReply::Models { current, .. } => assert_eq!(current.as_deref(), Some(id)),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -2160,6 +2299,16 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
     let session = connection.session.clone();
     connection.commands.send(message("hello")).unwrap();
     through_turn(&mut connection).await;
+    let last_model = || {
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .clone()
+    };
     let apps = front_end.apps_fed();
 
     assert!(matches!(
@@ -2184,15 +2333,7 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
     );
     connection.commands.send(message("which model")).unwrap();
     through_turn(&mut connection).await;
-    assert_eq!(
-        env.script
-            .requests
-            .lock()
-            .unwrap()
-            .last()
-            .map(|(m, _)| m.clone()),
-        Some("glm-5".to_string())
-    );
+    assert_eq!(last_model(), "glm-5");
 
     assert_eq!(
         connection
@@ -2203,6 +2344,52 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
             .await,
         Ok(HostReply::Done)
     );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Readiness {
+                session: session.clone(),
+            })
+            .await,
+        Ok(atomcode::host::readiness_for(None))
+    );
+    connection
+        .commands
+        .send(message("still on my external model"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(last_model(), "glm-5");
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "gateway-test".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignOut {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Readiness {
+                session: session.clone()
+            })
+            .await,
+        Ok(atomcode::host::readiness_for(Some(
+            ProviderUnavailableReason::SignedOut
+        )))
+    );
     let asked = env.script.requests.lock().unwrap().len();
     connection.commands.send(message("anyone there")).unwrap();
     let _ = quiet(&mut connection).await;
@@ -2211,6 +2398,21 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_sam
         asked,
         "signed out: nothing reached a model"
     );
+
+    // The gateway is offline, but a configured external model is still selectable.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "external".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("carry on")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(last_model(), "external");
 
     assert_eq!(
         connection
@@ -2709,7 +2911,7 @@ async fn mcp_manage_lists_servers_with_source_and_tool_count() {
     // has it — so this waits for the connection rather than sleeping past it.
     let tools = tools_on_the_model(&connection, &session, "fs").await;
 
-    let Ok(HostReply::McpRows { rows }) = connection
+    let Ok(HostReply::McpRows { rows, .. }) = connection
         .control
         .call(HostCommand::McpManage {
             session: session.clone(),
@@ -2833,7 +3035,7 @@ async fn mcp_act_disable_writes_config_and_withdraws() {
         serde_json::from_str(&std::fs::read_to_string(&defined_in).unwrap()).unwrap();
     assert_eq!(before["mcpServers"]["fs"]["disabled"].as_bool(), None);
 
-    let Ok(HostReply::McpRows { rows }) = connection
+    let Ok(HostReply::McpRows { rows, .. }) = connection
         .control
         .call(HostCommand::McpAct {
             session: session.clone(),
@@ -2864,15 +3066,9 @@ async fn mcp_act_disable_writes_config_and_withdraws() {
     );
 }
 
-/// Every reason a provider cannot serve has an answer for the person, and only
-/// a cause this build can actually fix names a command.
-///
-/// The table exists so a new reason cannot be added without deciding what the
-/// screen says about it — the same rule the error table above follows. The
-/// `None` arms are the point: a command named here is one the person will run,
-/// so naming one that cannot help is worse than saying nothing.
+/// Reason text should help users recover without launching a sign-in flow on their behalf.
 #[test]
-fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix() {
+fn provider_readiness_explains_recovery_without_automatically_signing_in() {
     use atomcode::host::readiness_for;
 
     assert_eq!(
@@ -2884,28 +3080,20 @@ fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix(
         }
     );
 
-    let cases = [
-        // Nothing is run on its own: the sentence names /login and /provider.
-        (ProviderUnavailableReason::NotConfigured, None),
-        (
-            ProviderUnavailableReason::AuthenticationRequired,
-            Some("login"),
-        ),
-        (ProviderUnavailableReason::UnsupportedBuild, None),
-    ];
-    for (reason, fix) in cases {
+    for reason in [
+        ProviderUnavailableReason::NotConfigured,
+        ProviderUnavailableReason::AuthenticationRequired,
+        ProviderUnavailableReason::UnsupportedBuild,
+    ] {
         match readiness_for(Some(reason.clone())) {
-            HostReply::Readiness {
-                ready,
-                why,
-                fix: named,
-            } => {
+            HostReply::Readiness { ready, why, fix } => {
                 assert!(!ready, "{reason:?}");
-                assert!(
-                    why.is_some_and(|w| !w.trim().is_empty()),
-                    "{reason:?} owes the person a reason"
-                );
-                assert_eq!(named.as_deref(), fix, "{reason:?}");
+                let why = why.expect("an unavailable provider owes the user a reason");
+                assert!(!why.trim().is_empty(), "{reason:?}");
+                assert!(fix.is_none(), "{reason:?}");
+                if reason != ProviderUnavailableReason::UnsupportedBuild {
+                    assert!(why.contains("/login") && why.contains("/provider"), "{why}");
+                }
             }
             other => panic!("{reason:?} answered with {other:?}"),
         }
@@ -3459,6 +3647,7 @@ async fn started_without_a_provider_on(
             skill_dirs: Some(Vec::new()),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
+            mcp_paused: false,
             extra_mcp_servers: Vec::new(),
             mcp_user_config: None,
             mcp_tokens: None,
@@ -3879,4 +4068,552 @@ async fn cancelling_an_image_skill_does_not_wait_for_the_vision_helper() {
     assert!(!seen.iter().any(|event| matches!(event, AgentEvent::Fact(fact) if matches!(fact.event, SessionEvent::UserMessage { .. }))));
     assert!(env.script.requests.lock().unwrap().is_empty());
     connection.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+/// Browser setup uses the host's configured product tree and rejects stale
+/// sessions before resolving or launching any executable. No GUI is involved.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn browser_setup_is_addressed_and_does_not_mutate_the_live_runtime() {
+    use atomcode_host_api::BrowserAction;
+    let env = env();
+    let connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Browser {
+                session: "not-this-session".into(),
+                action: BrowserAction::Enable,
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+    let before = env.script.built.lock().unwrap().len();
+    for action in [BrowserAction::Status, BrowserAction::Disable] {
+        let reply = connection
+            .control
+            .call(HostCommand::Browser {
+                session: session.clone(),
+                action,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, HostReply::DoneWithNote { note } if note.contains("Browser Use")));
+    }
+    assert!(!env._home.path().join("mcp.json").exists());
+    assert_eq!(
+        env.script.built.lock().unwrap().len(),
+        before,
+        "no implicit runtime rebuild"
+    );
+}
+
+/// A real browser MCP mutation goes through the actual runtime approval seam.
+/// Denial must prevent even the first local HTTP request.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires an explicitly installed browser backend; local controlled acceptance"]
+async fn a_real_browser_navigation_can_be_denied_before_external_effects() {
+    browser_navigation_denial(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires ATOMCODE_BROWSER_ORIGIN_TEST_ROOT, pinned runtime and Chrome; controlled runtime approval"]
+async fn a_scoped_browser_navigation_can_be_denied_before_external_effects() {
+    tokio::time::resume();
+    browser_navigation_denial(true).await;
+}
+
+#[cfg(unix)]
+async fn browser_navigation_denial(scoped: bool) {
+    let env = env();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let command = if scoped {
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: None,
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../integrations/browser-origin-scope/backend.cjs")
+                        .canonicalize()
+                        .unwrap(),
+                ),
+                backend_root: Some(
+                    std::env::var_os("ATOMCODE_BROWSER_ORIGIN_TEST_ROOT")
+                        .expect("explicit installed package root")
+                        .into(),
+                ),
+                allowed_origins: vec![format!("http://{address}")],
+                ..Default::default()
+            },
+        }
+    } else {
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: Some(
+                std::env::var_os("ATOMCODE_BROWSER_TEST_SERVER")
+                    .expect("explicit installed cli.js")
+                    .into(),
+            ),
+            node: None,
+            scope: Default::default(),
+        }
+    };
+    atomcode::browser_cmd::execute(&dirs, command)
+        .await
+        .unwrap();
+    let (mut connection, _) = started(
+        &env,
+        SubagentPolicy::Disabled,
+        None,
+        vec![dirs.user().join("skills")],
+        true,
+    )
+    .await;
+    let session = connection.session.clone();
+    assert!(tools_on_the_model(&connection, &session, "browser-use")
+        .await
+        .iter()
+        .any(|name| name.contains("browser_navigate")));
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session,
+            mode: atomcode_host_api::Mode::Ask,
+        })
+        .await
+        .unwrap();
+    connection
+        .commands
+        .send(message(&format!("打开网页 http://{address}/")))
+        .unwrap();
+    let (id, kind) = loop {
+        match tokio::time::timeout(Duration::from_secs(15), connection.events.recv()).await {
+            Ok(Some(AgentEvent::Request { id, kind, .. })) => break (id, kind),
+            Ok(Some(_)) => continue,
+            other => panic!("no browser approval: {other:?}"),
+        }
+    };
+    assert_eq!(kind, "approval");
+    assert!(
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, messages)| messages.iter().any(|message| message
+                .text
+                .contains("Use only the configured `browser-use` MCP tools"))),
+        "ordinary webpage request automatically loads installed browser guidance"
+    );
+    connection
+        .commands
+        .send(AgentCommand::Respond {
+            id,
+            value: serde_json::json!({"decision":"deny"}),
+        })
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "denied browser navigation reached the web server"
+    );
+    // The same ordinary-language task can execute after a normal Allow once.
+    // A local fixture independently witnesses the browser request.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let served = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = socket.read(&mut request).await.unwrap();
+        assert!(request[..n].starts_with(b"GET / HTTP/1.1"));
+        let page = b"<html><title>Automatic browser acceptance</title><body>Local browser fixture</body></html>";
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", page.len());
+        socket.write_all(header.as_bytes()).await.unwrap();
+        socket.write_all(page).await.unwrap();
+    });
+    connection
+        .commands
+        .send(message(&format!("打开网页 http://{address}/")))
+        .unwrap();
+    let id = loop {
+        match tokio::time::timeout(Duration::from_secs(15), connection.events.recv()).await {
+            Ok(Some(AgentEvent::Request { id, kind, .. })) => {
+                assert_eq!(kind, "approval");
+                break id;
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("no browser approval for allowed task: {other:?}"),
+        }
+    };
+    connection
+        .commands
+        .send(AgentCommand::Respond {
+            id,
+            value: serde_json::json!({"decision":"allow"}),
+        })
+        .unwrap();
+    let ended = through_turn(&mut connection).await;
+    assert!(ended.iter().any(|event| matches!(event, AgentEvent::ToolStarted { call } if call.name == "mcp__browser-use__browser_navigate")));
+    assert!(
+        ended
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolResult { result } if !result.is_error)),
+        "allowed ordinary-language task completes through real browser tools"
+    );
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .unwrap()
+        .unwrap();
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn browser_origin_setup_is_host_local_and_never_implicitly_reloads() {
+    use atomcode_host_api::BrowserAction;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::resume();
+    let env = env();
+    let connection = connected(&env).await;
+    let before = env.script.built.lock().unwrap().len();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let script = env._home.path().join("scope backend.cjs");
+    std::fs::write(&script, "fixture").unwrap();
+    let package = env._home.path().join("installed package");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("cli.js"), "fixture").unwrap();
+    let node = env._home.path().join("scope node");
+    let put_node = |count: usize| {
+        let report = serde_json::json!({"version":1,"kind":"doctor","browser_launched":false,"capability":"atomcode/browser-origin-scope","mcp":"0.0.85","playwright":"1.66.0-alpha-2026-11-09","allowed_origin_count":count,"downloads":"deny-artifacts","uploads":"deny","full_cdp_access":"deny"});
+        std::fs::write(&node,format!("#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then echo v22.0.0; exit 0; fi\nfor arg do if [ \"$arg\" = --doctor ]; then printf '%s' '{report}'; exit 0; fi; done\necho 'Version 0.0.85'\n")).unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    put_node(1);
+    atomcode::browser_cmd::execute(
+        &dirs,
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: Some(node.clone()),
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(script),
+                backend_root: Some(package),
+                allowed_origins: vec!["https://initial.test".into()],
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let policy_file = env._home.path().join("trusted browser policy.json");
+    std::fs::write(&policy_file, r#"{"version":2,"origins":{"https://download.test":{"access":"allow","downloads":"allow"}}}"#).unwrap();
+    let report = serde_json::json!({"version":2,"kind":"doctor","browser_launched":false,"capability":"atomcode/browser-origin-scope","mcp":"0.0.85","playwright":"1.66.0-alpha-2026-11-09","allowed_origin_count":1,"downloads":"controlled-http-unauthenticated","uploads":"deny","full_cdp_access":"deny"});
+    std::fs::write(&node, format!("#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then echo v22.0.0; exit 0; fi\nprintf '%s' '{report}'\n")).unwrap();
+    let reply = connection
+        .control
+        .call(HostCommand::Browser {
+            session: connection.session.clone(),
+            action: BrowserAction::EnablePolicyFile {
+                path: policy_file.to_str().unwrap().into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(reply, HostReply::DoneWithNote { .. }));
+    let source: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dirs.user().join("mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(source["mcpServers"]["browser-use"]["originScope"], 2);
+    assert_eq!(
+        source["mcpServers"]["browser-use"]["requiredExperimentalCapabilities"]
+            ["atomcode/browser-origin-scope"],
+        2
+    );
+    assert_eq!(
+        env.script.built.lock().unwrap().len(),
+        before,
+        "policy setup must not reload the runtime"
+    );
+    // The same host/slash path accepts v3 without widening an existing filter.
+    std::fs::write(
+        &policy_file,
+        r#"{"version":3,"origins":{"https://upload.test":{"access":"allow","uploads":"allow"}}}"#,
+    )
+    .unwrap();
+    let report = serde_json::json!({"version":3,"kind":"doctor","browser_launched":false,"capability":"atomcode/browser-origin-scope","mcp":"0.0.85","playwright":"1.66.0-alpha-2026-11-09","allowed_origin_count":1,"downloads":"deny-artifacts","uploads":"controlled-staged-http-unauthenticated","full_cdp_access":"deny"});
+    std::fs::write(&node, format!("#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then echo v22.0.0; exit 0; fi\nprintf '%s' '{report}'\n")).unwrap();
+    let reply = connection
+        .control
+        .call(HostCommand::Browser {
+            session: connection.session.clone(),
+            action: BrowserAction::EnablePolicyFile {
+                path: policy_file.to_str().unwrap().into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(reply, HostReply::DoneWithNote { .. }));
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dirs.user().join("mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["mcpServers"]["browser-use"]["originScope"], 3);
+    assert_eq!(
+        saved["mcpServers"]["browser-use"]["requiredExperimentalCapabilities"]
+            ["atomcode/browser-origin-scope"],
+        3
+    );
+    assert_eq!(
+        saved["mcpServers"]["browser-use"]["allowedTools"],
+        source["mcpServers"]["browser-use"]["allowedTools"]
+    );
+    assert_eq!(env.script.built.lock().unwrap().len(), before);
+    for (action, count, expected) in [
+        (
+            BrowserAction::EnableScoped {
+                origins: vec!["https://next.test".into()],
+            },
+            1,
+            Some(serde_json::json!(["https://next.test"])),
+        ),
+        (
+            BrowserAction::Enable,
+            1,
+            Some(serde_json::json!(["https://next.test"])),
+        ),
+        (
+            BrowserAction::EnableScoped { origins: vec![] },
+            0,
+            Some(serde_json::json!([])),
+        ),
+        (BrowserAction::EnableUnrestricted, 0, None),
+    ] {
+        put_node(count);
+        let reply = connection
+            .control
+            .call(HostCommand::Browser {
+                session: connection.session.clone(),
+                action,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, HostReply::DoneWithNote { .. }));
+        let source: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dirs.user().join("mcp.json")).unwrap())
+                .unwrap();
+        let actual = source["mcpServers"]["browser-use"]["env"]["ATOMCODE_BROWSER_ORIGIN_POLICY"]
+            .as_str()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap()["origins"].clone());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            env.script.built.lock().unwrap().len(),
+            before,
+            "no implicit runtime rebuild"
+        );
+    }
+}
+
+/// Download acceptance at the real runtime boundary, with a scripted provider
+/// and an independently observed local HTTP effect. No credentials or GUI.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+#[ignore = "requires ATOMCODE_BROWSER_ORIGIN_TEST_ROOT and pinned Node backend; actual runtime download cancellation"]
+async fn a_scoped_download_is_denied_before_dispatch_and_cancelled_without_publication() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::resume(); // Actual subprocess and socket I/O.
+    let env = env();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let held = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = {
+        let hits = hits.clone();
+        let held = held.clone();
+        let release = release.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(bytes[..n].starts_with(b"GET /held "));
+            hits.fetch_add(1, Ordering::SeqCst);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+            held.notify_one();
+            release.notified().await;
+            // Cancellation may already have closed the socket. Never retry it.
+            let _ = socket.write_all(b"-late").await;
+            drop(socket);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "automatic download replay"
+            );
+        })
+    };
+    let policy_file = env._home.path().join("download-policy.json");
+    std::fs::write(&policy_file, serde_json::json!({"version":2,"origins":{origin.clone():{"access":"allow","downloads":"allow"}}}).to_string()).unwrap();
+    atomcode::browser_cmd::execute(
+        &dirs,
+        atomcode::browser_cmd::BrowserCli::Enable {
+            server: None,
+            node: None,
+            scope: atomcode::browser_cmd::OriginArgs {
+                origin_backend: Some(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../integrations/browser-origin-scope/backend.cjs")
+                        .canonicalize()
+                        .unwrap(),
+                ),
+                backend_root: Some(
+                    std::env::var_os("ATOMCODE_BROWSER_ORIGIN_TEST_ROOT")
+                        .expect("explicit pinned backend")
+                        .into(),
+                ),
+                origin_policy_file: Some(policy_file),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let (mut connection, _) = started(&env, SubagentPolicy::Disabled, None, vec![], true).await;
+    let session = connection.session.clone();
+    assert!(tools_on_the_model(&connection, &session, "browser-use")
+        .await
+        .iter()
+        .any(|name| name.contains("browser_download")));
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session,
+            mode: atomcode_host_api::Mode::Ask,
+        })
+        .await
+        .unwrap();
+    for decision in ["deny", "allow"] {
+        connection
+            .commands
+            .send(message(&format!("browser download {origin}/held")))
+            .unwrap();
+        let id = loop {
+            match tokio::time::timeout(Duration::from_secs(15), connection.events.recv()).await {
+                Ok(Some(AgentEvent::Request { id, kind, .. })) => {
+                    assert_eq!(kind, "approval");
+                    break id;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("no download approval: {other:?}"),
+            }
+        };
+        connection
+            .commands
+            .send(AgentCommand::Respond {
+                id,
+                value: serde_json::json!({"decision":decision}),
+            })
+            .unwrap();
+        if decision == "deny" {
+            let ended = through_turn(&mut connection).await;
+            assert!(!ended
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolStarted { .. })));
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        tokio::time::timeout(Duration::from_secs(10), held.notified())
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        connection.commands.send(AgentCommand::Cancel).unwrap();
+        let ended = through_turn(&mut connection).await;
+        assert!(
+            ended
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled)),
+            "{ended:#?}"
+        );
+        assert_eq!(
+            ended
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnComplete { .. }))
+                .count(),
+            1
+        );
+        release.notify_one();
+        server.await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let artifacts = dirs
+            .user()
+            .join("integrations/browser-use/origin-artifacts");
+        assert_eq!(
+            std::fs::read_dir(artifacts.join("files")).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(artifacts.join("download-staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        break;
+    }
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+#[tokio::test]
+async fn an_explicit_fork_changes_the_host_session_and_keeps_source_addressing_strict() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let source = connection.session.clone();
+    connection
+        .commands
+        .send(message("remember this before forking"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let mut watching = connection.control.subscribe();
+    let result = connection
+        .control
+        .call(HostCommand::ForkSession {
+            session: source.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, HostReply::DoneWithNote { .. }));
+    let Some(HostEvent::SessionChanged {
+        session: branch,
+        previous,
+    }) = tokio::time::timeout(Duration::from_secs(5), watching.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected session change");
+    };
+    assert_ne!(branch, source);
+    assert_eq!(previous, Some(source.clone()));
+    assert!(connection
+        .control
+        .call(HostCommand::ForkSession { session: source })
+        .await
+        .is_err());
+    connection
+        .commands
+        .send(message("continue the branch"))
+        .unwrap();
+    through_turn(&mut connection).await;
 }

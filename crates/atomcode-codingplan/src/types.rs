@@ -50,7 +50,7 @@ impl PlanType {
     /// Best-effort map of a `StatusResponse.codingplan_free.plan_name`
     /// (e.g. `"CodingPlan Lite"` / `"CodingPlan Pro"` / `"CodingPlan Max"`)
     /// back to the tier. Used so the drift monitor can query
-    /// `models-v2?plan_type=` with the user's **actual** tier — `plan_available`
+    /// `models-v3?plan_type=` with the user's **actual** tier — `plan_available`
     /// is computed relative to the requested tier (see `ModelEntry`), so
     /// querying `Max` for a Lite user wrongly marks higher-tier models
     /// available and fires a permanent "list updated" false positive.
@@ -88,7 +88,7 @@ pub struct ClaimResponse {
     pub plan_name: String,
 }
 
-/// `GET /api/v5/coding-plan/models-v2` element. Wire shape:
+/// `GET /api/v5/coding-plan/models-v3` element. Wire shape:
 ///
 /// ```json
 /// {
@@ -133,6 +133,13 @@ pub struct ModelEntry {
     /// builds) falls back to `coding_plan::setup::LLM_BASE_URL`.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional explicit `provider_accounts` key for this entry. When
+    /// present and non-empty, `/login` writes the entry under exactly
+    /// this key instead of the derived `AtomGit-{display_model_name}`
+    /// name. Absent keeps the historical naming, so older payloads
+    /// (and existing users) are unaffected.
+    #[serde(default)]
+    pub provider_account: Option<String>,
     /// Provider type — `"openai"` / `"claude"` / `"ollama"`. Renamed
     /// via serde because `type` is a Rust keyword. `None` falls
     /// back to `coding_plan::setup::PROVIDER_TYPE` (`"openai"` — the
@@ -146,7 +153,14 @@ pub struct ModelEntry {
     /// silently truncated.
     #[serde(default)]
     pub context_window: Option<usize>,
-    /// Explicit vision capability advertised by `models-v2`. `None` keeps
+    /// Per-request output budget advertised by the gateway. Missing/null/zero
+    /// values keep the client's default; valid values are not context-derived.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// Alternate output-budget spelling, preferred over `max_tokens` when valid.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    /// Explicit vision capability advertised by `models-v3`. `None` keeps
     /// compatibility with older servers and lets `ProviderConfig` fall back
     /// to its existing model-name heuristic; `Some(false)` must remain an
     /// authoritative opt-out even when the model name looks vision-capable.
@@ -165,13 +179,31 @@ pub struct ModelEntry {
     #[serde(default)]
     pub capable_model: Option<i64>,
     /// Ordered reasoning-effort levels this model supports (e.g. `["low","medium",
-    /// "xhigh"]`), advertised by `models-v2`. A NON-EMPTY list is authoritative and is
+    /// "xhigh"]`), advertised by `models-v3`. A NON-EMPTY list is authoritative and is
     /// persisted verbatim into `ProviderConfig::reasoning_effort_levels`, overriding the
     /// client-side `codingplan_builtin_effort_levels` table. An EMPTY list means "no
     /// effort switching". `None` (field omitted on older / production servers) keeps the
     /// builtin fallback so effort switching still works before the server ships this field.
     #[serde(default)]
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Display alias advertised by `models-v3` (e.g. `"智速模式"` for
+    /// `smart-speed`). `None` (field omitted on older / production servers)
+    /// keeps today's behaviour: pickers show the raw `display_model_name`.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Human-readable marketing / usage description advertised by
+    /// `models-v3`. Persisted verbatim so UI surfaces can show it without a
+    /// second round-trip; `None` means the server sent nothing.
+    #[serde(default)]
+    pub desc: Option<String>,
+    /// English display alias advertised by `models-v3`. Shown when the
+    /// interface language is English; `None` falls back to [`Self::alias`].
+    #[serde(default)]
+    pub alias_en: Option<String>,
+    /// English description advertised by `models-v3`, selected the same way
+    /// as [`Self::alias_en`].
+    #[serde(default)]
+    pub desc_en: Option<String>,
     /// Credential for gateways that authenticate with an API key rather than
     /// the OAuth bearer. `None` ⇒ the model keeps today's behaviour: no key is
     /// persisted and the gateway is reached with the login token.
@@ -385,7 +417,7 @@ mod tests {
     }
 
     /// Drift monitor maps the status plan_name back to the tier so it can
-    /// query models-v2 with the user's ACTUAL tier (not Max), avoiding the
+    /// query models-v3 with the user's ACTUAL tier (not Max), avoiding the
     /// permanent "list updated" false positive on Lite/Pro.
     #[test]
     fn plan_type_from_plan_name() {

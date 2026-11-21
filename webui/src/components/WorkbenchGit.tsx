@@ -1,12 +1,6 @@
-import { useEffect, useState } from "preact/hooks";
-import { workbenchRequest } from "../api";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { useSettings } from "../settings";
-type Change = {
-  path: string;
-  original?: string;
-  index: string;
-  worktree: string;
-};
+import { GitDiff, isDeleted, isNotRepository, readChanges, type Change } from "./WorkbenchViewer";
 export function WorkbenchGit({
   session,
   version,
@@ -14,6 +8,7 @@ export function WorkbenchGit({
   maximized,
   onMaximize,
   onRestore,
+  requested,
 }: {
   session: string;
   version: number;
@@ -21,6 +16,7 @@ export function WorkbenchGit({
   maximized: boolean;
   onMaximize: () => void;
   onRestore: () => void;
+  requested?: { path: string; seq: number };
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
@@ -28,27 +24,34 @@ export function WorkbenchGit({
   const [selected, setSelected] = useState<Change | null>(null);
   useEffect(() => { if (!selected) onRestore(); }, [selected]);
   const [staged, setStaged] = useState(false);
-  const [diff, setDiff] = useState("");
   const [error, setError] = useState("");
+  const [notRepository, setNotRepository] = useState(false);
   const [loading, setLoading] = useState(true);
+  const appliedRequest = useRef<number>();
   useEffect(() => {
     let cancelled = false;
     setError("");
     setLoading(true);
-    workbenchRequest<Change[]>(
-      "git?" + new URLSearchParams({ session_id: session }),
-    )
+    setNotRepository(false);
+    readChanges(session)
       .then((rows) => {
         if (!cancelled) {
           setChanges(rows);
-          setSelected((old) =>
-            old ? rows.find((r) => r.path === old.path) || null : null,
-          );
+          if (requested && appliedRequest.current !== requested.seq) {
+            appliedRequest.current = requested.seq;
+            const target = rows.find(row => row.path === requested.path) ?? null;
+            setSelected(target);
+            setStaged(target?.worktree === " ");
+          } else {
+            setSelected((old) => old ? rows.find((r) => r.path === old.path) || null : null);
+          }
         }
       })
       .catch((e) => {
         if (!cancelled) {
-          setError(String(e));
+          const absent = isNotRepository(e);
+          setNotRepository(absent);
+          setError(absent ? "" : String(e));
           setChanges([]);
           setSelected(null);
         }
@@ -59,41 +62,13 @@ export function WorkbenchGit({
     return () => {
       cancelled = true;
     };
-  }, [session, version]);
-  useEffect(() => {
-    if (!selected) {
-      setDiff("");
-      return;
-    }
-    let cancelled = false;
-    setError("");
-    setDiff("");
-    const useIndex = staged && selected.index !== " " && selected.index !== "?";
-    workbenchRequest<{ diff: string }>(
-      "diff?" +
-        new URLSearchParams({
-          session_id: session,
-          path: selected.path,
-          staged: String(useIndex),
-          untracked: String(selected.index === "?"),
-        }),
-    )
-      .then((result) => {
-        if (!cancelled) setDiff(result.diff);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [session, selected, staged, version]);
+  }, [session, version, requested?.seq]);
   return (
     <div class="workbench-git">
       <div class="workbench-git-caption">
         {zh
-          ? "只读变更 · 不执行 Git 写操作"
-          : "Read-only changes · no Git write actions"}
+          ? "当前 Git 变更（只读）· 仓库此刻的状态，不执行 Git 写操作"
+          : "Current Git changes (read-only) · the repository as it is now; no Git write actions"}
       </div>
       {error && (
         <p role="alert" class="workbench-error">
@@ -127,68 +102,30 @@ export function WorkbenchGit({
             ? zh
               ? "正在读取变更…"
               : "Loading changes…"
+            : notRepository
+              ? zh
+                ? "当前目录尚未初始化 Git，暂无版本变更"
+                : "This directory is not a Git repository. No version changes to show."
             : zh
               ? "工作区没有文件变更"
               : "No changed files"}
         </div>
       )}
       {selected && (
-        <>
-          <div class="workbench-diff-actions">
-            <button
-              class={!staged ? "active" : ""}
-              onClick={() => setStaged(false)}
-            >
-              {zh ? "工作区" : "Working tree"}
+        <GitDiff session={session} change={selected} version={version}
+          staged={staged} onStaged={setStaged}>
+          <button
+            aria-label={zh ? (maximized ? "恢复差异布局" : "最大化差异") : (maximized ? "Restore diff layout" : "Maximize diff")}
+            title={zh ? "最大化 / 恢复（Esc）" : "Maximize / restore (Esc)"}
+            aria-pressed={maximized}
+            onClick={onMaximize}
+          >{maximized ? "⤡" : "⤢"}</button>
+          {!isDeleted(selected) && (
+            <button onClick={() => onOpen(selected.path)}>
+              {zh ? "打开文件" : "Open file"}
             </button>
-            {selected.index !== " " && selected.index !== "?" && (
-              <button
-                class={staged ? "active" : ""}
-                onClick={() => setStaged(true)}
-              >
-                {zh ? "暂存区" : "Staged"}
-              </button>
-            )}
-            <span title={selected.path}>{selected.path}</span>
-            <button
-              aria-label={zh ? (maximized ? "恢复差异布局" : "最大化差异") : (maximized ? "Restore diff layout" : "Maximize diff")}
-              title={zh ? "最大化 / 恢复（Esc）" : "Maximize / restore (Esc)"}
-              aria-pressed={maximized}
-              onClick={onMaximize}
-            >{maximized ? "⤡" : "⤢"}</button>
-            {selected.worktree !== "D" && selected.index !== "D" && (
-              <button onClick={() => onOpen(selected.path)}>
-                {zh ? "打开文件" : "Open file"}
-              </button>
-            )}
-          </div>
-          <pre
-            class="workbench-diff"
-            aria-label={zh ? "Git 差异" : "Git diff"}
-            tabIndex={0}
-          >
-            {diff
-              ? diff.split("\n").map((line, index) => (
-                  <span
-                    key={index}
-                    class={
-                      line.startsWith("+")
-                        ? "diff-added"
-                        : line.startsWith("-")
-                          ? "diff-removed"
-                          : line.startsWith("@@")
-                            ? "diff-hunk"
-                            : ""
-                    }
-                  >
-                    {line || " "}
-                  </span>
-                ))
-              : zh
-                ? "此视图没有差异"
-                : "No diff in this view"}
-          </pre>
-        </>
+          )}
+        </GitDiff>
       )}
     </div>
   );
