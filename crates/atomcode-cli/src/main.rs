@@ -5109,6 +5109,9 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             Ok(())
         }
         Ok(Err(e)) => {
+            if let Some(message) = atomcode::tui_upgrade::manifest_connection_message(&e) {
+                return Err(anyhow::Error::msg(message));
+            }
             let msg = format!("{:#}", e);
             if msg.contains(atomcode_updater::PACKAGE_MANAGED) {
                 println!(

@@ -446,6 +446,23 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
     }
 }
 
+#[derive(Debug)]
+struct ManifestRequestFailed;
+
+impl std::fmt::Display for ManifestRequestFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to fetch latest.json")
+    }
+}
+
+/// Whether the manifest request failed to connect or timed out before receiving headers.
+pub fn is_manifest_connection_failure(error: &anyhow::Error) -> bool {
+    error.is::<ManifestRequestFailed>()
+        && error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|cause| cause.is_connect() || cause.is_timeout())
+}
+
 /// Fetch and parse `latest.json`.
 ///
 /// Longer timeout than the passive `version_check` (which must fail
@@ -456,11 +473,25 @@ pub async fn fetch_manifest() -> Result<Manifest> {
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(ATOMCODE_USER_AGENT)
         .build()?;
+    fetch_manifest_at(&client, manifest_url()).await
+}
+
+async fn fetch_manifest_at(client: &reqwest::Client, url: &str) -> Result<Manifest> {
     let resp = client
-        .get(manifest_url())
+        .get(url)
         .send()
         .await
-        .context("failed to fetch latest.json")?;
+        .map_err(|mut error| {
+            // A custom manifest URL may carry credentials or a signed query.
+            if let Some(url) = error.url_mut() {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+            }
+            error
+        })
+        .context(ManifestRequestFailed)?;
     if !resp.status().is_success() {
         return Err(anyhow!(
             "fetching latest.json returned HTTP {}",
@@ -1638,6 +1669,28 @@ fn write_marker(marker: &Path) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_closed_tls_handshake_is_a_manifest_connection_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("https://user:private-password@{addr}/latest.json?key=private-token");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = fetch_manifest_at(&client, &url).await.unwrap_err();
+
+        assert!(is_manifest_connection_failure(&error), "{error:#}");
+        let details = format!("{error:#}");
+        assert!(details.contains(&format!("https://{addr}/latest.json")));
+        assert!(!details.contains("private-password"));
+        assert!(!details.contains("private-token"));
+
+        let error = fetch_manifest_at(&client, "invalid URL").await.unwrap_err();
+        assert!(!is_manifest_connection_failure(&error), "{error:#}");
+    }
 
     /// Both front ends read the versions out of the same error, with or without
     /// its tag, and get `None` rather than garbage if the shape drifts.

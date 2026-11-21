@@ -800,6 +800,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::UpgradeFailed { error } =>
             format!("升级失败: {}", error).into(),
+        Msg::UpgradeManifestConnectionFailed =>
+            "暂时无法连接更新服务器，升级尚未开始。请检查网络或代理设置后重试。".into(),
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  正在重启回滚版本...\n", exe, backup).into(),
         Msg::RollbackUpdatesPaused =>

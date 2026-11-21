@@ -992,6 +992,7 @@ pub enum Msg<'a> {
     UpgradeFailed {
         error: &'a str,
     },
+    UpgradeManifestConnectionFailed,
     UpgradeRolledBack {
         exe: &'a str,
         backup: &'a str,
