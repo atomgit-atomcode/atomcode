@@ -455,6 +455,9 @@ struct ProductDirsPatch<'a> {
     user: &'a std::path::Path,
     project_dir_name: &'a str,
     home_dir_name: &'a str,
+    /// The host's override for the sessions root, when it set one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions_root: Option<&'a std::path::Path>,
 }
 
 #[derive(serde::Serialize)]
@@ -1965,6 +1968,11 @@ fn compose_hosted(
                 user: dirs.user(),
                 project_dir_name: dirs.project_dir_name(),
                 home_dir_name: dirs.home_dir_name(),
+                // The host's *choice* about where sessions live, not the
+                // resolved path: without it the rows fall back to
+                // `<user>/sessions` and the catalogue and the session contents
+                // end up in two different trees.
+                sessions_root: dirs.sessions_root_override(),
             },
         )
         .map_err(|e| e.to_string())?

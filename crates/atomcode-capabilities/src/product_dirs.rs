@@ -67,6 +67,17 @@ impl ProductDirs {
             .unwrap_or_else(|| self.user.join("sessions"))
     }
 
+    /// The host's override, if it set one.
+    ///
+    /// `None` means "no choice", which is not the same as "the default": a seam
+    /// that hands these dirs to another component has to pass the *choice*
+    /// along, and a component that only receives the resolved path cannot tell
+    /// a deliberate choice from the fallback. So the override travels
+    /// separately from the resolved path.
+    pub fn sessions_root_override(&self) -> Option<&Path> {
+        self.sessions_root.as_deref()
+    }
+
     /// The user tree's default name under a person's home, when it differs from
     /// the project dir's name (by default they are the same). Only matched on:
     /// it is how a model spells the tree from habit (`~/<name>/auth.toml`), which

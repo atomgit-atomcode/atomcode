@@ -37,6 +37,16 @@ struct ProductDirsRow {
     /// dir's. Absent: `distribution::HOME_DIR_NAME`.
     #[serde(default)]
     home_dir_name: Option<String>,
+    /// Where session history lives, when the host wants it somewhere other than
+    /// `<user>/sessions`. Absent: that default.
+    ///
+    /// This is a *choice*, not a resolved path, so it has to survive the trip
+    /// through this row: a host that points sessions at a shared directory (the
+    /// Android build does, so an externally started daemon and the app read one
+    /// history) would otherwise have the rows fall back to `<user>/sessions`
+    /// and the catalogue and the session contents would live in two trees.
+    #[serde(default)]
+    sessions_root: Option<String>,
 }
 
 /// The `product-dirs` row. First in the tree: every row that reads its seam
@@ -86,6 +96,11 @@ fn resolve(row: ProductDirsRow) -> ProductDirs {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| HOME_DIR_NAME.to_string()),
     )
+    .with_sessions_root(
+        row.sessions_root
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from),
+    )
 }
 
 #[cfg(test)]
@@ -98,9 +113,51 @@ mod tests {
             user: Some("/elsewhere/fork-tree".into()),
             project_dir_name: Some(".fork".into()),
             home_dir_name: Some(".fork".into()),
+            sessions_root: None,
         });
         assert_eq!(dirs.user(), std::path::Path::new("/elsewhere/fork-tree"));
         assert_eq!(dirs.project_dir_name(), ".fork");
         assert_eq!(dirs.home_dir_name(), ".fork");
+    }
+
+    /// The host's choice about where sessions live has to survive this row.
+    ///
+    /// It used to be dropped here: the row carried only the user tree, so every
+    /// row that reads the dirs fell back to `<user>/sessions` while the daemon
+    /// (which resolves the dirs from the environment) used the host's path. The
+    /// catalogue and the session contents then lived in two trees — the exact
+    /// split this row exists to prevent.
+    #[test]
+    fn the_hosts_choice_about_sessions_survives_the_row() {
+        let shared = "/storage/emulated/0/AtomCode/.sessions";
+        let dirs = resolve(ProductDirsRow {
+            user: Some("/data/user/0/com.atomcode.app/files/atomcode".into()),
+            project_dir_name: None,
+            home_dir_name: None,
+            sessions_root: Some(shared.into()),
+        });
+        assert_eq!(
+            dirs.sessions_root(),
+            std::path::PathBuf::from(shared),
+            "the row's choice is the sessions root"
+        );
+        assert_eq!(
+            dirs.sessions_root_override(),
+            Some(std::path::Path::new(shared))
+        );
+
+        // No choice: the default stands, and the override stays `None` so a
+        // component can tell "not chosen" from "chosen to be the default".
+        let plain = resolve(ProductDirsRow {
+            user: Some("/data/user/0/com.atomcode.app/files/atomcode".into()),
+            project_dir_name: None,
+            home_dir_name: None,
+            sessions_root: None,
+        });
+        assert_eq!(
+            plain.sessions_root(),
+            std::path::PathBuf::from("/data/user/0/com.atomcode.app/files/atomcode/sessions")
+        );
+        assert!(plain.sessions_root_override().is_none());
     }
 }
