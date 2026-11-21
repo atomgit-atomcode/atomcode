@@ -619,12 +619,46 @@ pub(crate) async fn market_index(Query(query): Query<MarketQuery>) -> Response {
     .into_response()
 }
 
+/// Escape a value for a TOML basic string.
+///
+/// A basic string cannot contain a raw newline (or any other control
+/// character): the line would end and the rest of the value would be read as
+/// TOML source. A market base carrying one produced a `config.toml` that no
+/// longer parsed — and `Config::load` only warns on a parse failure and falls
+/// back to the defaults, so the person's models, providers and permissions were
+/// dropped without a word.
+///
+/// TOML's own escapes cover exactly these characters: `\b \t \n \f \r \" \\`
+/// and `\uXXXX`.
+fn escape_toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            // Any other control character has no short escape, so it gets the
+            // Unicode one. Without this it would be written raw and break the
+            // document just as a newline does.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// 在 TOML 文本里设置 `[market] base`，**其余内容逐字保留**。
 ///
 /// 没有现成的配置合并库可用（`toml` 的 writer 会重排并丢掉注释），而 config.toml 是
 /// 人写的、注释有意义，所以只做最小手术：定位 `[market]` 段，替换或插入一行。
 fn with_market_base(text: &str, base: &str) -> String {
-    let escaped = base.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped = escape_toml_basic_string(base);
     let assignment = format!("base = \"{escaped}\"");
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
@@ -1053,6 +1087,27 @@ package = \"com.atomcode.tools.zig\"
         // 写出来的东西必须能被 TOML 解析回来。
         let parsed: toml::Value = toml::from_str(&updated).expect("valid toml");
         assert_eq!(parsed["market"]["base"].as_str(), Some("C:\\repo\\\"x"));
+    }
+
+    /// A base carrying a control character must not break the document.
+    ///
+    /// A newline in the value ended the TOML line, and the rest of the value was
+    /// read as TOML source: the file no longer parsed. `Config::load` only warns
+    /// on a parse failure and falls back to the defaults, so the person's
+    /// models, providers and permissions were dropped without a word.
+    #[test]
+    fn a_base_with_control_characters_still_produces_a_readable_config() {
+        let cases = [
+            "https://x.test/\n[evil]\nkey = 1",
+            "https://x.test/\r\n",
+            "https://x.test/\u{7}\u{1b}",
+        ];
+        for base in cases {
+            let updated = with_market_base("", base);
+            let parsed: toml::Value = toml::from_str(&updated)
+                .unwrap_or_else(|error| panic!("{base:?}: {error}\n{updated}"));
+            assert_eq!(parsed["market"]["base"].as_str(), Some(base));
+        }
     }
 
     #[test]
