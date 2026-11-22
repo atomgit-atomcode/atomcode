@@ -1710,6 +1710,10 @@ pub struct Tui {
     /// [`ALLOWANCE_EVERY`]. `None` until the first ask — the end of a turn, or
     /// the first idle beat while a badge is on the row.
     allowance_checked: Mutex<Option<std::time::Instant>>,
+    /// The idle beat's own throttle stamp, kept apart from the turn-end one
+    /// ([`Self::allowance_checked`]): the two asks must not contend for a
+    /// single [`ALLOWANCE_EVERY`] slot.
+    allowance_idle_checked: Mutex<Option<std::time::Instant>>,
     /// Invalidates quota requests issued before the active model was replaced.
     allowance_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
@@ -6507,15 +6511,27 @@ impl Tui {
             crate::modules::status::row_showing(m.allowance.as_ref(), m.now)
         };
         if reask {
-            self.check_allowance();
+            self.reask_allowance_on_idle();
         }
         true
     }
 
     fn check_allowance(&self) {
+        self.ask_allowance(&self.allowance_checked);
+    }
+
+    /// The idle beat's re-ask, throttled on its OWN stamp: an idle beat must
+    /// not eat the turn-end slot — a turn ending right after one would have
+    /// its refresh swallowed, and that is the moment the figure actually
+    /// changed.
+    fn reask_allowance_on_idle(&self) {
+        self.ask_allowance(&self.allowance_idle_checked);
+    }
+
+    fn ask_allowance(&self, slot: &Mutex<Option<std::time::Instant>>) {
         let now = std::time::Instant::now();
         {
-            let mut last = self.allowance_checked.lock().expect("allowance poisoned");
+            let mut last = slot.lock().expect("allowance poisoned");
             if last.is_some_and(|at| now.duration_since(at) < ALLOWANCE_EVERY) {
                 return;
             }
@@ -12151,6 +12167,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
+            allowance_idle_checked: Mutex::new(None),
             allowance_generation: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
