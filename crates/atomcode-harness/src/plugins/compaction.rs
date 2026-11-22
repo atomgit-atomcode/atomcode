@@ -223,11 +223,6 @@ pub fn stub_on_overflow(log: &SessionLog, ask: &CompactionAsk) -> Option<Compact
     let rewrites: Vec<RewrittenText> = traced
         .iter()
         .filter(|t| t.message.role == Role::Tool && t.message.text.len() > WORTH_STUBBING)
-        // An already-stubbed result is not raw output worth stubbing: skip it
-        // up front instead of paying the builder to return it unchanged. The
-        // structural guard against stub-of-stub is the builder's own tool-name
-        // fallback; this is the same predicate, taken early.
-        .filter(|t| !atomcode_kernel::session::text_is_compact_stub(&t.message.text))
         .filter_map(|t| {
             let Provenance::Event(seq) = t.source else {
                 return None;
