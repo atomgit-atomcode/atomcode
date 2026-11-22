@@ -24,11 +24,8 @@ import {
  *    therefore tagged, and an answer is only shown when its tag is still the
  *    current one for that document.
  *
- * 3. **The suggestion is INSERTED, never pasted over.** The daemon already
- *    measures what the cursor's line shares with the model's answer and
- *    returns only the part that is new, so the editor appends it at the
- *    cursor. Deciding that twice — here and on the daemon — is how the two
- *    sides drift apart.
+ * 3. **The suggestion is INSERTED, never pasted over.** The daemon returns
+ *    the text to insert at the cursor.
  *
  * The debounce is VS Code's own (`editor.inlineSuggest.delay`): the editor
  * asks for a completion after the user stops typing, and cancels the request
@@ -48,7 +45,7 @@ import {
  * in a shape that would have to be re-derived on every change.
  */
 interface PendingRequest {
-  cancel: vscode.CancellationTokenSource;
+  controller: AbortController;
   /** Disposed when the request finishes, so the listener stops firing. */
   subscription: vscode.Disposable;
 }
@@ -60,10 +57,7 @@ export class CueCompletionProvider implements vscode.InlineCompletionItemProvide
   private active = new Set<PendingRequest>();
   private enabled = true;
 
-  constructor(
-    private readonly client: DaemonClient,
-    private readonly timeoutMs: number,
-  ) {}
+  constructor(private readonly client: DaemonClient) {}
 
   /** Turn CUE on or off in this window. */
   setEnabled(enabled: boolean): void {
@@ -78,7 +72,7 @@ export class CueCompletionProvider implements vscode.InlineCompletionItemProvide
   /** Drop every request in flight — their answers no longer match a cursor. */
   private cancelAll(): void {
     for (const request of this.active) {
-      request.cancel.cancel();
+      request.controller.abort();
     }
   }
 
@@ -88,26 +82,27 @@ export class CueCompletionProvider implements vscode.InlineCompletionItemProvide
     _context: vscode.InlineCompletionContext,
     token: vscode.CancellationToken,
   ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | undefined> {
-    if (!this.enabled) return undefined;
-    if (!isCompletableDocument(document.languageId, document.uri.scheme, document.getText())) {
+    if (!this.enabled || token.isCancellationRequested) return undefined;
+    const text = document.getText();
+    if (!isCompletableDocument(document.languageId, document.uri.scheme, text)) {
       return undefined;
     }
 
     // A completion request is a POST: the daemon sees the client go away when
     // the editor cancels it.
-    const cancel = new vscode.CancellationTokenSource();
+    const controller = new AbortController();
     const request: PendingRequest = {
-      cancel,
-      subscription: token.onCancellationRequested(() => cancel.cancel()),
+      controller,
+      subscription: token.onCancellationRequested(() => controller.abort()),
     };
     // The newest request wins: the one before it can no longer be shown.
-    this.pending.get(document)?.cancel.cancel();
+    this.pending.get(document)?.controller.abort();
     this.pending.set(document, request);
     this.active.add(request);
 
     try {
       const offset = document.offsetAt(position);
-      const context = trimContext(buildCompletionContext(document.getText(), offset));
+      const context = trimContext(buildCompletionContext(text, offset));
       if (!context.prefix && !context.suffix) return undefined;
 
       const response = await this.client.requestCueCompletion(
@@ -117,11 +112,11 @@ export class CueCompletionProvider implements vscode.InlineCompletionItemProvide
           prefix: context.prefix,
           suffix: context.suffix,
         },
-        this.timeoutMs,
+        controller.signal,
       );
 
       // The answer belongs to a cursor position that no longer exists.
-      if (cancel.token.isCancellationRequested) return undefined;
+      if (controller.signal.aborted) return undefined;
       if (token.isCancellationRequested) return undefined;
       if (this.pending.get(document) !== request) return undefined;
 
@@ -142,7 +137,6 @@ export class CueCompletionProvider implements vscode.InlineCompletionItemProvide
       if (this.pending.get(document) === request) {
         this.pending.delete(document);
       }
-      cancel.dispose();
     }
   }
 }
@@ -157,7 +151,7 @@ export function registerCueCompletion(
   context: vscode.ExtensionContext,
   client: DaemonClient,
 ): CueCompletionProvider {
-  const provider = new CueCompletionProvider(client, 8000);
+  const provider = new CueCompletionProvider(client);
   context.subscriptions.push(
     vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, provider),
   );
