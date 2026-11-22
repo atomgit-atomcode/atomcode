@@ -10228,7 +10228,7 @@ impl Tui {
                 .flatten();
             match range {
                 Some((at, end)) => {
-                    let last = self
+                    let mut last = self
                         .mention_declined
                         .lock()
                         .expect("mention declined poisoned");
@@ -10248,11 +10248,7 @@ impl Tui {
                         // Either the record was gone or it went stale (the
                         // caret moved to a different token, or this token was
                         // replaced): the old decline must not suppress.
-                        drop(last);
-                        *self
-                            .mention_declined
-                            .lock()
-                            .expect("mention declined poisoned") = None;
+                        *last = None;
                     }
                     suppressed
                 }
