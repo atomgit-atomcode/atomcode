@@ -135,6 +135,7 @@ const zh = {
   'stream.idleNotice': '仍在等待模型响应…',
   'stream.incomplete': '本轮未完成（{reason}）。已保留当前结果，可在新一轮中继续。',
 
+  'permission.expired': '此审批请求已失效',
   'permission.deny': '拒绝',
   'permission.allow': '允许',
   'permission.alwaysAllow': '始终允许',
@@ -317,6 +318,7 @@ const en: Record<MsgKey, string> = {
   'stream.idleNotice': 'Still waiting for the model...',
   'stream.incomplete': 'Turn incomplete ({reason}). Partial results were preserved; continue in a new turn.',
 
+  'permission.expired': 'This approval request has expired.',
   'permission.deny': 'Deny',
   'permission.allow': 'Allow',
   'permission.alwaysAllow': 'Always Allow',

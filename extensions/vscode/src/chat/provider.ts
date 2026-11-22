@@ -1639,6 +1639,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         id: msg.id,
         ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: result.success,
+        ...(result.success === false ? { expired: true } : {}),
         message: result.error,
       });
     } catch (e) {

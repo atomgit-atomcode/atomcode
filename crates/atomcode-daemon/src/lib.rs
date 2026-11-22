@@ -4722,6 +4722,12 @@ mod chat_event_type_tests {
             }),
             snapshot: None,
         };
+        assert!(projector
+            .project_runtime(
+                atomcode_coding::CodingRuntimeEvent::Request(request.clone()),
+                "session-without-responder",
+            )
+            .is_empty());
         let events = projector.project_runtime(
             atomcode_coding::CodingRuntimeEvent::Request(request),
             "session-1",
@@ -5306,12 +5312,14 @@ impl ChatRuntimeProjector {
                 else {
                     return Vec::new();
                 };
-                let approval_id = self.permission_routes.as_ref().and_then(|routes| {
+                let Some(approval_id) = self.permission_routes.as_ref().and_then(|routes| {
                     routes.approval_id(permission_session_id, &approval.call_id)
-                });
+                }) else {
+                    return Vec::new();
+                };
                 vec![ChatEvent::PermissionRequest {
                     session_id: permission_session_id.to_string(),
-                    approval_id,
+                    approval_id: Some(approval_id),
                     tool_name: approval.tool,
                     reason: approval
                         .reason

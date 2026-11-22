@@ -4396,7 +4396,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       key={`live:${livePending.approval_id}`}
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments, allow_all_bash: livePending.allow_all_bash, project_rule: livePending.project_rule }}
       onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id, livePending.approval_id))}
-      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); if (!result.accepted) throw new Error(t('perm.requestExpired')); }}
+      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); return result.accepted; }}
     />
   );
 
