@@ -9881,6 +9881,12 @@ impl Tui {
                         m.history_at = None;
                         m.input.clear();
                         m.caret = 0;
+                        // The line the declined token lived on is gone: a
+                        // record keyed to it has nothing left to suppress.
+                        *self
+                            .mention_declined
+                            .lock()
+                            .expect("mention declined poisoned") = None;
                         return false;
                     }
                     drop(m);
@@ -10219,51 +10225,55 @@ impl Tui {
         // guards against.
         let mention_declined = {
             let m = self.host.moment.read().expect("moment poisoned");
-            // Browsing (reverse search / history) leaves the record alone: the
-            // input is not being edited, so nothing here can go stale.
-            let range = (!browsing)
-                .then(|| {
-                    atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
-                })
-                .flatten();
-            match range {
-                Some((at, end)) => {
-                    let mut last = self
-                        .mention_declined
-                        .lock()
-                        .expect("mention declined poisoned");
-                    let suppressed = match *last {
-                        // The very token that was dismissed, identified by
-                        // offset AND text: keep it held down while it merely
-                        // grows. A different text at the same offset is a
-                        // REPLACED token, not the dismissed one.
-                        Some((declined_at, ref declined_text))
-                            if declined_at == at && m.input[at..end].starts_with(declined_text) =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    };
-                    if !suppressed {
-                        // Either the record was gone or it went stale (the
-                        // caret moved to a different token, or this token was
-                        // replaced): the old decline must not suppress.
-                        *last = None;
+            let record = self
+                .mention_declined
+                .lock()
+                .expect("mention declined poisoned")
+                .clone();
+            // Browsing (reverse search / history) owns the keys while it
+            // lasts; the input is not being edited, so the record is left
+            // exactly as it was.
+            if browsing {
+                false
+            } else {
+                match atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                {
+                    Some((at, end)) => {
+                        // The very token that was dismissed, by offset AND
+                        // text: keep it held down while it stays the same
+                        // token — longer (typing) or shorter (backspace). A
+                        // different text at the same offset is a REPLACED
+                        // token, not the dismissed one.
+                        let suppressed = match record {
+                            Some((declined_at, ref declined_text))
+                                if declined_at == at
+                                    && (m.input[at..end].starts_with(declined_text)
+                                        || declined_text.starts_with(&m.input[at..end])) =>
+                            {
+                                true
+                            }
+                            _ => {
+                                // No record, a different token, or a replaced
+                                // token: the old decline must not suppress —
+                                // the record expires.
+                                *self
+                                    .mention_declined
+                                    .lock()
+                                    .expect("mention declined poisoned") = None;
+                                false
+                            }
+                        };
+                        suppressed
                     }
-                    suppressed
-                }
-                // Browsing (reverse search / history) owns the keys while it
-                // lasts; the input is not being edited, so the record is left
-                // exactly as it was.
-                None if browsing => false,
-                // No token at the caret: the caret has left any declined one,
-                // so the record expires.
-                None => {
-                    *self
-                        .mention_declined
-                        .lock()
-                        .expect("mention declined poisoned") = None;
-                    false
+                    // No token at the caret: the caret has left any declined
+                    // one, so the record expires.
+                    None => {
+                        *self
+                            .mention_declined
+                            .lock()
+                            .expect("mention declined poisoned") = None;
+                        false
+                    }
                 }
             }
         };
@@ -18171,7 +18181,8 @@ mod session_mention_tests {
             "an explicitly declined token does not reopen the menu"
         );
 
-        // Typing more of the token keeps it declined.
+        // Typing more of the token keeps it declined — and so does backspacing
+        // it shorter: it is still the same token the caret sits on.
         {
             let mut moment = host.moment.write().unwrap();
             moment.input = "@atomcode-notes".into();
@@ -18179,6 +18190,16 @@ mod session_mention_tests {
         }
         tui.refresh_menu();
         assert!(!host.menu_open(), "still the declined token");
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "backspacing the same token stays declined"
+        );
 
         // The caret leaves the token: the decline is stale and the next `@`
         // may ask again.
@@ -18191,6 +18212,10 @@ mod session_mention_tests {
         assert!(
             host.menu_open(),
             "a new token at a different position asks again"
+        );
+        assert!(
+            tui.mention_declined.lock().unwrap().is_none(),
+            "the stale decline record expires once the caret leaves the token"
         );
 
         // And back on the first token the decline is stale too: it was
