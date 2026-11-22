@@ -1724,7 +1724,7 @@ const STUB_OMISSION_END: &str = " chars] … ";
 /// as "folded far enough" in a single pass.
 const STUB_PREVIEW_HEAD: usize = 1_400;
 const STUB_PREVIEW_TAIL: usize = 400;
-/// The preview only fires when the cut middle is at least 896 chars — well
+/// The preview only fires when the cut middle exceeds 896 chars — well
 /// over half the 1,400-char head: a near-threshold rewrite would bust the
 /// prefix cache for almost no saving, and the corpus's mean tool result sits
 /// right in that dead zone.
