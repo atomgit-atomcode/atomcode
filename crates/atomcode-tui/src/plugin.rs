@@ -1740,9 +1740,10 @@ pub struct Tui {
     /// re-points it rather than silently answering from the old tree.
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     mention_kind: Mutex<u8>,
-    /// The `@` token the person dismissed with Esc, by its byte offset: the
-    /// menu stays away from it until the caret leaves the token.
-    mention_declined: Mutex<Option<usize>>,
+    /// The `@` token the person dismissed with Esc, by its byte offset and
+    /// text: the menu stays away from that token — including as more of its
+    /// text is typed — until the caret leaves it or the token is replaced.
+    mention_declined: Mutex<Option<(usize, String)>>,
     session_references: Arc<Mutex<SessionSuggestions>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
@@ -10226,22 +10227,34 @@ impl Tui {
                 })
                 .flatten();
             match range {
-                Some((at, _)) => {
-                    let mut last = self
+                Some((at, end)) => {
+                    let last = self
                         .mention_declined
                         .lock()
                         .expect("mention declined poisoned");
-                    match *last {
-                        // The very token that was dismissed: keep it held down.
-                        Some(declined) if declined == at => true,
-                        // The caret moved to a different token: the old decline
-                        // is stale and must not suppress the new token.
-                        Some(_) => {
-                            *last = None;
-                            false
+                    let suppressed = match *last {
+                        // The very token that was dismissed, identified by
+                        // offset AND text: keep it held down while it merely
+                        // grows. A different text at the same offset is a
+                        // REPLACED token, not the dismissed one.
+                        Some((declined_at, ref declined_text))
+                            if declined_at == at && m.input[at..end].starts_with(declined_text) =>
+                        {
+                            true
                         }
-                        None => false,
+                        _ => false,
+                    };
+                    if !suppressed {
+                        // Either the record was gone or it went stale (the
+                        // caret moved to a different token, or this token was
+                        // replaced): the old decline must not suppress.
+                        drop(last);
+                        *self
+                            .mention_declined
+                            .lock()
+                            .expect("mention declined poisoned") = None;
                     }
+                    suppressed
                 }
                 // Browsing (reverse search / history) owns the keys while it
                 // lasts; the input is not being edited, so the record is left
@@ -10641,7 +10654,7 @@ impl Tui {
             .lock()
             .expect("mention declined poisoned") =
             atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
-                .map(|(at, _)| at);
+                .map(|(at, end)| (at, m.input[at..end].to_string()));
     }
 
     /// Put a path picked from the `@` menu on the line, in place of the `@…`
@@ -18196,6 +18209,25 @@ mod session_mention_tests {
             host.menu_open(),
             "the caret returned to the old token: the stale decline must not suppress it"
         );
+
+        // Esc again, then REPLACE the token's text at the same offset: a new
+        // token that is not an extension of the dismissed one must ask again.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the re-declined token is suppressed");
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@完全不同 into".into();
+            moment.caret = "@完全不同".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a replaced token at the same offset is not the dismissed one"
+        );
     }
 
     /// Entering reverse search / history browsing must not wipe the decline:
@@ -18213,14 +18245,13 @@ mod session_mention_tests {
         tui.refresh_menu();
         assert!(!host.menu_open(), "the declined token holds the menu down");
 
-        // Browsing starts: the menu is suppressed anyway, but the record
-        // must survive it.
+        // Browsing starts: the menu is suppressed while it lasts, and the
+        // record must survive it — observable once browsing ends.
         {
             let mut moment = host.moment.write().unwrap();
             moment.history_at = Some(1);
         }
         tui.refresh_menu();
-        assert!(!host.menu_open(), "browsing shows no mention menu");
 
         // Browsing ends on the same token: the decline still holds.
         {
