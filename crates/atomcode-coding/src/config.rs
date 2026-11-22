@@ -591,7 +591,7 @@ pub fn describe_config_file_for(
          0 = no cap).\n\
          - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 0 = unbounded) for \
          delegated execution; `[team]` `max_members` (default 6) limits the persistent \
-         roster, including idle members; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
+         roster, including idle members. `[team.role_request_budgets]` maps role names to provider calls per member turn (omitted or 0 = unlimited, plus at most one text-only closing call); `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
          `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \
          `claude-code` | `grok` | `opencode`, `model`, `permission`, `timeout_secs`, `enabled`), add \
          an external CLI as a delegate. Grok and OpenCode support only `read-only`.\n\

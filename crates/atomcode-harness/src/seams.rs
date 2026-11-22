@@ -23,6 +23,77 @@ pub use atomcode_capabilities::tools::Opener;
 pub use atomcode_capabilities::world::{FileSystem, Shell};
 
 plexus_service!(ProductDirsSvc => atomcode_capabilities::ProductDirs, "product-dirs", Core, "Where the product keeps its data: the user tree and the per-project dir");
+plexus_service!(TurnRequestsSvc => TurnRequests, "turn-requests", Core, "Per-turn provider invocation accounting for the owning agent");
+
+/// Counts calls at the chat_stream boundary, including harness retries. Transport
+/// retries internal to an adapter and side calls such as compaction are separate.
+pub struct TurnRequests {
+    pub session: String,
+    pub limit: u32,
+    state: std::sync::Mutex<RequestCount>,
+}
+
+#[derive(Default)]
+struct RequestCount {
+    turn: u64,
+    calls: u64,
+    closing_round: Option<u32>,
+    limited: bool,
+}
+
+impl TurnRequests {
+    pub fn new(session: String, limit: u32) -> Self {
+        Self {
+            session,
+            limit,
+            state: Default::default(),
+        }
+    }
+
+    pub fn count(&self, turn: u64) -> u64 {
+        let state = self.state.lock().expect("turn requests poisoned");
+        if state.turn == turn {
+            state.calls
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn exhausted(&self, turn: u64) -> bool {
+        self.limit > 0 && self.count(turn) >= u64::from(self.limit)
+    }
+
+    pub(crate) fn limited(&self, turn: u64) -> bool {
+        let state = self.state.lock().expect("turn requests poisoned");
+        state.turn == turn && state.limited
+    }
+
+    pub(crate) fn allow_closing(&self, turn: u64, round: u32, budget_closing: bool) {
+        let mut state = self.state.lock().expect("turn requests poisoned");
+        if state.turn == turn {
+            state.closing_round = Some(round);
+            state.limited |= budget_closing;
+        }
+    }
+
+    pub(crate) fn admit(&self, turn: u64, round: u32) -> bool {
+        let mut state = self.state.lock().expect("turn requests poisoned");
+        if state.turn != turn {
+            *state = RequestCount {
+                turn,
+                ..Default::default()
+            };
+        }
+        let closing = state.closing_round == Some(round);
+        if self.limit > 0 && state.calls >= u64::from(self.limit) + u64::from(closing) {
+            state.limited = true;
+            return false;
+        }
+        state.calls += 1;
+        true
+    }
+}
+
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The model for side calls whose result a program consumes — titles, summaries, suggestions — not the conversation");
 plexus_service!(ModelsSvc => dyn Models, "models", Seam, "Every model this host can build a provider for, so a row can run a child on a different one");

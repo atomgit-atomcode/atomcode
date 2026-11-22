@@ -421,6 +421,12 @@ pub enum MessageOrigin {
     Internal,
     /// Another agent, by registry id. Logged with the sender's session id.
     Peer(AgentId),
+    /// Capture provenance at enqueue time, before the sender advances or is removed.
+    TeamMessage {
+        sender: AgentId,
+        session: String,
+        turn: Option<u64>,
+    },
     /// Another session, by its own session id — one this tree's registry has
     /// never held: a job this conversation started elsewhere, reporting back.
     ///
@@ -430,6 +436,31 @@ pub enum MessageOrigin {
     /// fact is the same either way — `InjectionOrigin::Peer { from }` — because
     /// it has always been keyed by session id rather than by registry id.
     PeerSession(String),
+}
+
+impl MessageOrigin {
+    pub(crate) fn peer_fact(&self, ctx: &Context, claimed: bool) -> Option<InjectionOrigin> {
+        let (from, outside, source_turn) = match self {
+            Self::TeamMessage { session, turn, .. } => {
+                (session.clone(), false, turn.filter(|&t| claimed && t > 0))
+            }
+            Self::Peer(id) => (
+                ctx.service::<crate::seams::AgentsSvc>()
+                    .and_then(|a| a.get(*id))
+                    .map(|a| a.session_id().to_owned())
+                    .unwrap_or_else(|| format!("agent-{id}")),
+                false,
+                None,
+            ),
+            Self::PeerSession(from) => (from.clone(), true, None),
+            _ => return None,
+        };
+        Some(InjectionOrigin::Peer {
+            from,
+            outside,
+            source_turn,
+        })
+    }
 }
 
 /// One item waiting for an agent.
@@ -649,7 +680,17 @@ impl Inbox {
             .lock()
             .expect("inbox poisoned")
             .iter()
-            .any(|i| matches!(i, InboxItem::Message { origin: o, .. } if *o == origin))
+            .any(|item| {
+                let InboxItem::Message { origin: queued, .. } = item else {
+                    return false;
+                };
+                match (queued, &origin) {
+                    (MessageOrigin::TeamMessage { sender, .. }, MessageOrigin::Peer(id)) => {
+                        sender == id
+                    }
+                    _ => queued == &origin,
+                }
+            })
     }
 
     pub fn has_waking_input(&self) -> bool {
@@ -736,6 +777,15 @@ impl Agent {
     /// as the next step rather than starting a second turn.
     pub fn send(&self, text: impl Into<String>) {
         self.send_full(text, MessageOrigin::User, Vec::new());
+    }
+
+    /// Capture the sending session and turn before the peer receives the message.
+    pub fn team_message_origin(&self) -> MessageOrigin {
+        MessageOrigin::TeamMessage {
+            sender: self.id(),
+            session: self.session_id().into(),
+            turn: Some(self.session().current_turn()),
+        }
     }
 
     /// Queue work the harness asked itself for. See [`MessageOrigin`].
@@ -1019,32 +1069,8 @@ impl Agent {
             // has not seen. A job reporting from outside this tree is the same
             // thing by that measure — and a stop is exactly when nobody is
             // watching for it, so dropping it here loses it for good.
-            match origin {
-                MessageOrigin::Peer(sender) => {
-                    let from = self
-                        .ctx
-                        .service::<crate::seams::AgentsSvc>()
-                        .and_then(|agents| agents.get(sender))
-                        .map(|agent| agent.session_id().to_string())
-                        .unwrap_or_else(|| format!("agent-{sender}"));
-                    self.note(
-                        text,
-                        InjectionOrigin::Peer {
-                            from,
-                            outside: false,
-                        },
-                    );
-                }
-                MessageOrigin::PeerSession(from) => {
-                    self.note(
-                        text,
-                        InjectionOrigin::Peer {
-                            from,
-                            outside: true,
-                        },
-                    );
-                }
-                _ => {}
+            if let Some(origin) = origin.peer_fact(&self.ctx, false) {
+                self.note(text, origin);
             }
         }
         stood

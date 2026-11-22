@@ -374,6 +374,12 @@ pub enum TeamEventPayload {
         success: bool,
         stop: String,
         summary: String,
+        /// Calls to the member's conversation provider, including harness retries and closing calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_requests: Option<u64>,
+        /// Sum of prompt tokens reported by the provider for this turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
         #[serde(default)]
         output_tokens: u64,
     },

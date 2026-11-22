@@ -51,6 +51,9 @@ pub enum InjectionOrigin {
     /// still says who spoke, whether or not that agent is alive.
     Peer {
         from: String,
+        /// Sender turn of a claimed in-tree message. Absent for old logs and passive notes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_turn: Option<u64>,
         /// The sender is not a session of this tree: a job this conversation
         /// started elsewhere, reporting back.
         ///
@@ -195,6 +198,9 @@ pub enum SessionEvent {
         text: String,
         reasoning: String,
         reset: bool,
+        /// True only at admission to the conversation provider, including failed attempts.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provider_call: bool,
     },
     /// Transient UI boundary, never written to a session file.
     ReasoningDiscarded {

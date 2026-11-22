@@ -135,6 +135,7 @@ pub fn facts() -> Vec<SessionEvent> {
             origin: InjectionOrigin::Peer {
                 from: "lead-1/scout".into(),
                 outside: false,
+                source_turn: None,
             },
         },
         SessionEvent::AssistantMessage {

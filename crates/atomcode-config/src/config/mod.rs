@@ -499,11 +499,17 @@ impl Default for SubAgentConfig {
 pub struct TeamConfig {
     /// Maximum members retained by one lead, including idle members. Default 6.
     pub max_members: usize,
+    /// Per-role provider calls per member turn, plus at most one text-only closing call.
+    /// An omitted role or zero has no request limit of its own.
+    pub role_request_budgets: std::collections::BTreeMap<String, u32>,
 }
 
 impl Default for TeamConfig {
     fn default() -> Self {
-        Self { max_members: 6 }
+        Self {
+            max_members: 6,
+            role_request_budgets: Default::default(),
+        }
     }
 }
 

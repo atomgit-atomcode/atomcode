@@ -1432,6 +1432,56 @@ async fn a_person_cancels_and_compacts_a_member() {
     );
 }
 
+/// A stop can overtake a queued delegation after an earlier turn has finished.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stopping_unclaimed_work_does_not_bill_the_members_previous_turn() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+    let dir = scratch("stop-unclaimed");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "noted" }, { text = "noted stop" }"#,
+        r#"{ text = "old result" }"#,
+    ))
+    .await;
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"first task"}"#,
+    )
+    .await;
+    let scout_id = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .require::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_id)
+        .unwrap();
+    settled(&scout, 1).await;
+    settled(&lead, 1).await;
+    // Queue directly to exercise the interval before the member pump is notified.
+    scout
+        .inbox()
+        .send_from("next task", lead.team_message_origin());
+    handle
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "stop".into(),
+            session: scout_id.clone(),
+            name: "stop".into(),
+            args: String::new(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
+    settled(&lead, 2).await;
+    assert!(lead.session().events().iter().any(|e| matches!(
+        &e.event,
+        SessionEvent::Injected { text, origin: InjectionOrigin::Peer { from, source_turn: None, .. }, .. }
+            if from == &scout_id && text.contains("was stopped by the person") && !text.contains("old result")
+    )));
+}
+
 /// A person stopping a member tells the lead in proportion (`docs/adr/0023`
 /// §8): a member with nothing of the lead's outstanding is a note; one still
 /// working on what the lead asked wakes the lead, which is waiting on it.
@@ -1531,8 +1581,8 @@ async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_repor
     assert!(
         lead.session().events().iter().any(|e| matches!(
             &e.event,
-            SessionEvent::Injected { text, origin: InjectionOrigin::Peer { .. }, .. }
-                if text.contains("stopped by the person before it reported back")
+            SessionEvent::Injected { text, origin: InjectionOrigin::Peer { from, source_turn: Some(1), .. }, .. }
+                if from == &scout_session && text.contains("stopped by the person before it reported back")
         )),
         "woken with a message: {:#?}",
         lead.session()
@@ -2784,3 +2834,57 @@ async fn scope_refusals_on_person_started_member_turns_are_notes_not_lead_wakeup
     assert!(!dir.join("outside.txt").exists());
     as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn member_budget_closes_once_and_a_failed_followup_does_not_report_old_text() {
+    let dir = scratch("request-budget");
+    let app = start(tree_with(&dir, r#"{ text = "noted" }"#,
+        r#"{ calls = [{ name = "read_file", args = {file_path = "missing"} }] }, { text = "only partly done" }, { fail = "offline" }"#,
+        "role_request_budgets = { explorer = 1 }")).await;
+    let lead = create_agent(&app).await.unwrap();
+    let delegated = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"check"}"#,
+    )
+    .await;
+    assert!(!delegated.is_error, "{}", delegated.content);
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    let meter = scout
+        .ctx()
+        .service::<atomcode_harness::seams::TurnRequestsSvc>()
+        .unwrap();
+    assert_eq!(meter.count(1), 2);
+    let first = heard_by(&app, &lead).await;
+    assert!(
+        first
+            .iter()
+            .any(|(_, text)| text.contains("request budget") && text.contains("only partly done")),
+        "{first:?}"
+    );
+    let told = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"tell","name":"scout","text":"try again"}"#,
+    )
+    .await;
+    assert!(!told.is_error);
+    until_idle(&scout).await;
+    assert_eq!(meter.count(2), 1);
+    let heard = heard_by(&app, &lead).await;
+    let (_, report) = heard.last().unwrap();
+    assert!(
+        report.contains("turn 2") && report.contains("(nothing)"),
+        "{report}"
+    );
+    assert!(!report.contains("partly done"));
+}
+
+#[path = "team_cost/replay.rs"]
+mod cost_replay;

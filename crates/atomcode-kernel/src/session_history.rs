@@ -226,6 +226,7 @@ mod tests {
                 text: "stream prefix".into(),
                 reasoning: String::new(),
                 reset: false,
+                provider_call: false,
             },
         });
         let (_, page) = range("one", bootstrap_events(&events), None, 8).unwrap();
