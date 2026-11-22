@@ -10243,6 +10243,10 @@ impl Tui {
                         None => false,
                     }
                 }
+                // Browsing (reverse search / history) owns the keys while it
+                // lasts; the input is not being edited, so the record is left
+                // exactly as it was.
+                None if browsing => false,
                 // No token at the caret: the caret has left any declined one,
                 // so the record expires.
                 None => {
@@ -18191,6 +18195,42 @@ mod session_mention_tests {
         assert!(
             host.menu_open(),
             "the caret returned to the old token: the stale decline must not suppress it"
+        );
+    }
+
+    /// Entering reverse search / history browsing must not wipe the decline:
+    /// the input is untouched while browsing, so the record has not gone
+    /// stale — and when browsing ends on the same token, the menu stays away.
+    #[test]
+    fn browsing_leaves_the_declined_token_alone() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.decline_current_mention();
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the declined token holds the menu down");
+
+        // Browsing starts: the menu is suppressed anyway, but the record
+        // must survive it.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history_at = Some(1);
+        }
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "browsing shows no mention menu");
+
+        // Browsing ends on the same token: the decline still holds.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history_at = None;
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "browsing must not wipe the decline: the same token stays declined"
         );
     }
 
