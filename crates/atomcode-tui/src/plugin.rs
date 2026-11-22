@@ -10211,6 +10211,34 @@ impl Tui {
             skill_prefix(&input).map(str::to_string)
         };
         let mention_context = prefix.is_none() && skill.is_none();
+        // Whether the caret sits on an `@` token the person explicitly
+        // dismissed with Esc. Decided BEFORE the menu rows are built: a
+        // declined token must yield no rows at all, or the else branch below
+        // would plant them as a plain (tabless) menu — the misfire this
+        // guards against.
+        let mention_declined = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let range = (!browsing && mention_context)
+                .then(|| {
+                    atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                })
+                .flatten();
+            match range {
+                Some((at, _)) => self
+                    .mention_declined
+                    .lock()
+                    .expect("mention declined poisoned")
+                    .map(|declined| declined == at)
+                    .unwrap_or(false),
+                None => {
+                    *self
+                        .mention_declined
+                        .lock()
+                        .expect("mention declined poisoned") = None;
+                    false
+                }
+            }
+        };
         let menu = match prefix {
             Some(rest) => {
                 let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
@@ -10325,37 +10353,16 @@ impl Tui {
                 // the middle of a sentence is a mention too. The classic
                 // screen's rule, from the same place.
                 match atomcode_capabilities::file_index::detect_at_mention(&typed, caret) {
-                    Some(token) => self.mention_rows(&cwd, &token),
-                    None => Vec::new(),
+                    Some(token) if !mention_declined => self.mention_rows(&cwd, &token),
+                    _ => Vec::new(),
                 }
             }
         };
-        let is_mention = {
+        let is_mention = !mention_declined && {
             let m = self.host.moment.read().expect("moment poisoned");
-            let range = (!browsing && mention_context)
-                .then(|| {
-                    atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
-                })
-                .flatten();
-            match range {
-                // The token was explicitly dismissed with Esc and the caret is
-                // still on it: reopening would fight the person typing plain
-                // text. Typing more of the token keeps it declined; leaving the
-                // token clears it.
-                Some((at, _)) => self
-                    .mention_declined
-                    .lock()
-                    .expect("mention declined poisoned")
-                    .map(|declined| declined != at)
-                    .unwrap_or(true),
-                None => {
-                    *self
-                        .mention_declined
-                        .lock()
-                        .expect("mention declined poisoned") = None;
-                    false
-                }
-            }
+            !browsing
+                && mention_context
+                && atomcode_capabilities::file_index::detect_at_mention(&m.input, m.caret).is_some()
         };
         if is_mention {
             let kind = *self.mention_kind.lock().expect("mention kind poisoned");
