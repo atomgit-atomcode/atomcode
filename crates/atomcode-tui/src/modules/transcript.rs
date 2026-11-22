@@ -170,6 +170,7 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         InjectionOrigin::Peer {
             outside: true,
             from,
+            ..
         } => t(Msg::InjectedFromSession { from }).into_owned(),
         // On a member's screen this is its lead assigning or steering the work.
         // Reports in the other direction use the result presentation below,
@@ -1104,6 +1105,7 @@ mod tests {
         let label = origin_label(&InjectionOrigin::Peer {
             from: "other-instance:session".into(),
             outside: true,
+            source_turn: None,
         });
         assert!(label.contains("other-instance:session"));
         assert_eq!(
@@ -1119,6 +1121,7 @@ mod tests {
         let label = origin_label(&InjectionOrigin::Peer {
             from: "lead-1".into(),
             outside: false,
+            source_turn: None,
         });
         assert_eq!(label, t(Msg::InjectedFromLead));
         assert_ne!(

@@ -6596,6 +6596,7 @@ mod tests {
             InjectionOrigin::Peer {
                 from: "lead-1/scout".into(),
                 outside: false,
+                source_turn: None,
             },
         ];
         for origin in &every {

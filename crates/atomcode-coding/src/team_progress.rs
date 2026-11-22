@@ -22,7 +22,7 @@ use atomcode_capabilities::team::{
     TeamEvent, TeamEventPayload, TeamMemberId, TeamRoleId, TeamRunId,
 };
 use atomcode_harness::events::SessionEventCommitted;
-use atomcode_harness::seams::AgentsSvc;
+use atomcode_harness::seams::{AgentsSvc, TurnRequestsSvc};
 use atomcode_harness::session::{Committed, InjectionOrigin, SessionEvent};
 use atomcode_plexus::{Context, Plugin};
 use serde_json::Value;
@@ -36,6 +36,7 @@ struct Run {
     member: TeamMemberId,
     started: bool,
     tool_uses: u64,
+    input_tokens: Option<u64>,
     output_tokens: u64,
     last_said: String,
 }
@@ -96,6 +97,7 @@ impl Plugin for TeamProgressPlugin {
                             member: TeamMemberId::new(member),
                             started: false,
                             tool_uses: 0,
+                            input_tokens: None,
                             output_tokens: 0,
                             last_said: String::new(),
                         },
@@ -157,6 +159,7 @@ impl Plugin for TeamProgressPlugin {
                 }
                 SessionEvent::Usage { usage, .. } => {
                     if let Some(run) = runs.get_mut(&committed.session) {
+                        *run.input_tokens.get_or_insert(0) += u64::from(usage.prompt);
                         run.output_tokens += u64::from(usage.completion);
                     }
                 }
@@ -165,7 +168,7 @@ impl Plugin for TeamProgressPlugin {
                         run.last_said = text.clone();
                     }
                 }
-                SessionEvent::TurnEnd { stop, error, .. } => {
+                SessionEvent::TurnEnd { turn, stop, error } => {
                     let Some(mut run) = runs.remove(&committed.session).filter(|r| r.started)
                     else {
                         return;
@@ -175,7 +178,21 @@ impl Plugin for TeamProgressPlugin {
                     let summary = error.clone().unwrap_or_else(|| {
                         run.last_said.lines().next().unwrap_or_default().to_string()
                     });
+                    let provider_requests = agent
+                        .ctx()
+                        .service::<TurnRequestsSvc>()
+                        .filter(|requests| requests.session == committed.session)
+                        .map(|requests| requests.count(*turn));
+                    let session = agent.session();
+                    tracing::info!(
+                        session = %committed.session,
+                        role = session.header().member.as_ref().map(|member| member.role.as_str()),
+                        turn, ?stop, provider_requests, input_tokens = run.input_tokens,
+                        output_tokens = run.output_tokens, "delegated turn finished"
+                    );
                     let payload = TeamEventPayload::MemberFinished {
+                        provider_requests,
+                        input_tokens: run.input_tokens,
                         member_id: run.member.clone(),
                         success,
                         stop: format!("{stop:?}").to_lowercase(),

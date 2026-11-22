@@ -355,6 +355,7 @@ impl<'a> ReplyCheckpointBuffer<'a> {
                 text: String::new(),
                 reasoning: String::new(),
                 reset: true,
+                provider_call: true,
             },
         );
         Self {
@@ -394,6 +395,7 @@ impl<'a> ReplyCheckpointBuffer<'a> {
                     text: std::mem::take(&mut self.text),
                     reasoning: std::mem::take(&mut self.reasoning),
                     reset: false,
+                    provider_call: false,
                 },
             );
         }
@@ -461,6 +463,7 @@ async fn stream_once(
                 text: String::new(),
                 reasoning: String::new(),
                 reset: true,
+                provider_call: false,
             },
         );
         if let Some(usage) = discarded.usage {
@@ -538,6 +541,19 @@ async fn stream_attempt(
     }
     let mut options = options;
     options.rate_limit_retry_owner = atomcode_kernel::provider::RateLimitRetryOwner::Kernel;
+    if let Some(requests) = ctx
+        .service::<crate::seams::TurnRequestsSvc>()
+        .filter(|requests| requests.session == session.id())
+    {
+        if !requests.admit(turn, round) {
+            return Err(RequestError {
+                policy_denied: true,
+                code: Some("turn_request_budget".into()),
+                ..RequestError::message("Member provider request budget exhausted")
+            }
+            .into());
+        }
+    }
     let mut checkpoint = ReplyCheckpointBuffer::new(ctx, session, turn, round);
     let mut stream = provider
         .chat_stream(messages, tools, &options)
@@ -767,6 +783,9 @@ impl PluginAgentLoop {
         let mut used_tokens = 0u32;
         let mut step: u32 = 0;
         let mut closing: Option<StopReason> = None;
+        let requests = ctx
+            .service::<crate::seams::TurnRequestsSvc>()
+            .filter(|r| r.session == session.id());
 
         loop {
             // Claim one message plus whatever context queued alongside it. On
@@ -829,34 +848,8 @@ impl PluginAgentLoop {
                 for (context, from) in std::mem::take(&mut decision.injections) {
                     agent.note(context, from);
                 }
-                match origin {
-                    MessageOrigin::Peer(sender) => {
-                        let from = self
-                            .ctx
-                            .service::<crate::seams::AgentsSvc>()
-                            .and_then(|a| a.get(*sender))
-                            .map(|a| a.session_id().to_string())
-                            .unwrap_or_else(|| format!("agent-{sender}"));
-                        agent.note(
-                            text.clone(),
-                            InjectionOrigin::Peer {
-                                from,
-                                outside: false,
-                            },
-                        );
-                    }
-                    // The same rule for a report from outside this tree: a stop
-                    // must not be the thing that loses the result.
-                    MessageOrigin::PeerSession(from) => {
-                        agent.note(
-                            text.clone(),
-                            InjectionOrigin::Peer {
-                                from: from.clone(),
-                                outside: true,
-                            },
-                        );
-                    }
-                    _ => {}
+                if let Some(peer) = origin.peer_fact(&ctx, false) {
+                    agent.note(text.clone(), peer);
                 }
                 outcome.stop = StopReason::Cancelled;
                 break;
@@ -936,32 +929,12 @@ impl PluginAgentLoop {
                         text: text.clone(),
                         origin: InjectionOrigin::InternalNudge,
                     },
-                    // Logged under the sender's session id, not its registry
-                    // id: the log outlives both agents.
-                    MessageOrigin::Peer(sender) => SessionEvent::Injected {
+                    peer @ (MessageOrigin::Peer(_)
+                    | MessageOrigin::TeamMessage { .. }
+                    | MessageOrigin::PeerSession(_)) => SessionEvent::Injected {
                         turn,
                         text: text.clone(),
-                        origin: InjectionOrigin::Peer {
-                            from: self
-                                .ctx
-                                .service::<crate::seams::AgentsSvc>()
-                                .and_then(|a| a.get(sender))
-                                .map(|a| a.session_id().to_string())
-                                .unwrap_or_else(|| format!("agent-{sender}")),
-                            outside: false,
-                        },
-                    },
-                    // A sender from outside the registry, already named by its
-                    // session id — nothing to resolve, and the same fact either
-                    // way: the log says which session spoke, not which slot it
-                    // held in a tree that may be gone by the time this is read.
-                    MessageOrigin::PeerSession(from) => SessionEvent::Injected {
-                        turn,
-                        text: text.clone(),
-                        origin: InjectionOrigin::Peer {
-                            from,
-                            outside: true,
-                        },
+                        origin: peer.peer_fact(&ctx, true).expect("peer message"),
                     },
                 };
                 self.commit(&session, event);
@@ -972,12 +945,23 @@ impl PluginAgentLoop {
             outcome.rounds = step;
             self.commit(&session, SessionEvent::StepStart { turn, step });
 
-            if closing.is_some() {
-                self.commit(&session, SessionEvent::Injected {
-                    turn,
-                    text: format!("The configured round budget has been reached after {} rounds. Tools are disabled for this closing request only; a later user request may resume work. Respond with text only: explain that the round limit was reached, summarize verified progress, list unfinished work and suggest next steps. Do not claim unfinished work is complete.", step - 1),
-                    origin: InjectionOrigin::InternalNudge,
-                });
+            if let Some(stop) = closing {
+                if let Some(meter) = &requests {
+                    meter.allow_closing(turn, step, stop == StopReason::StoppedByPolicy);
+                }
+                let notice = if stop == StopReason::StoppedByPolicy {
+                    "The provider request budget for this member turn was reached. Tools are disabled for this closing request. Summarize verified progress and identify unfinished work.".to_owned()
+                } else {
+                    format!("The configured round budget has been reached after {} rounds. Tools are disabled for this closing request only; a later user request may resume work. Respond with text only: explain that the round limit was reached, summarize verified progress, list unfinished work and suggest next steps. Do not claim unfinished work is complete.", step - 1)
+                };
+                self.commit(
+                    &session,
+                    SessionEvent::Injected {
+                        turn,
+                        text: notice,
+                        origin: InjectionOrigin::InternalNudge,
+                    },
+                );
             }
             let (messages, mut tools) = self.assemble(&session, &ctx);
             let mut options = ChatOptions::default();
@@ -1055,6 +1039,11 @@ impl PluginAgentLoop {
                     break;
                 }
                 Err(error) => {
+                    if error.policy_denied && error.code.as_deref() == Some("turn_request_budget") {
+                        outcome.stop = StopReason::StoppedByPolicy;
+                        outcome.error = Some(error.message);
+                        break;
+                    }
                     if error.policy_denied {
                         outcome.stop = StopReason::PolicyDenied;
                         outcome.error = Some(error.message);
@@ -1197,7 +1186,7 @@ impl PluginAgentLoop {
             // listener on its realm, which the tree cannot see — asked on the
             // tree, a child's round cap never answered. Visibility runs upward,
             // so the tree's own listeners still do.
-            if let Some(stop) = agent
+            let policy_stop = agent
                 .ctx()
                 .serial::<TurnStopping>(&TurnProgress {
                     turn,
@@ -1207,13 +1196,22 @@ impl PluginAgentLoop {
                     elapsed: started_at.elapsed(),
                     continuing: owes_a_request || agent.inbox().has_waking_input(),
                 })
-                .await
-            {
+                .await;
+            if let Some(stop) = policy_stop {
                 if stop == StopReason::MaxRounds && owes_a_request {
                     closing = Some(stop);
                     continue;
                 }
                 outcome.stop = stop;
+                break;
+            }
+            if requests.as_ref().is_some_and(|r| r.exhausted(turn)) {
+                if owes_a_request {
+                    closing = Some(StopReason::StoppedByPolicy);
+                    continue;
+                }
+                // Leave newly arrived work in the inbox for a fresh turn.
+                outcome.stop = StopReason::Stopped;
                 break;
             }
 
@@ -1934,6 +1932,43 @@ mod content_deadline_tests {
             "a failed response is never model-visible"
         );
     }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn member_resampling_uses_the_same_turn_allowance() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let log = SessionLog::new("member");
+        let meter = Arc::new(crate::seams::TurnRequests::new(log.id().into(), 1));
+        let ctx = app.context();
+        let _held = ctx
+            .provide::<crate::seams::TurnRequestsSvc>(meter.clone())
+            .unwrap();
+        let provider =
+            atomcode_kernel::testkit::RecordingProvider::new(vec![repeating_reasoning()]);
+        let calls = provider.calls();
+        let outcome = stream_once(
+            &provider,
+            &ctx,
+            &log,
+            1,
+            1,
+            &[],
+            &[],
+            ChatOptions::default(),
+            None,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(
+            outcome.unwrap_err().code.as_deref(),
+            Some("turn_request_budget")
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(meter.count(1), 1);
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn loop_exhaustion_is_not_generic_partial_recovery() {
         let provider = atomcode_kernel::testkit::RecordingProvider::new(vec![

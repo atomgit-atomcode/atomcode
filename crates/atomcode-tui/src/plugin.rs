@@ -16684,10 +16684,12 @@ mod opening_line_tests {
         let from_background = injected(InjectionOrigin::Peer {
             from: "bg-1".into(),
             outside: true,
+            source_turn: None,
         });
         let from_a_member = injected(InjectionOrigin::Peer {
             from: "lead/scout".into(),
             outside: false,
+            source_turn: None,
         });
         let typed = SessionEvent::UserMessage {
             turn: 3,
@@ -16707,6 +16709,7 @@ mod opening_line_tests {
         let report = injected(InjectionOrigin::Peer {
             from: "lead/scout".into(),
             outside: false,
+            source_turn: None,
         });
         assert!(!opens_a_turn_on_screen(&report, |turn| turn == 3));
         assert!(

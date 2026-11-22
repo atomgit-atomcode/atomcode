@@ -267,6 +267,24 @@ impl SessionLog {
         (seq, at)
     }
 
+    /// Most recent assistant text from the specified turn, even if it ended in failure.
+    pub fn latest_assistant_text(&self, turn: u64) -> Option<String> {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .take_while(|e| !matches!(e.event, SessionEvent::TurnStart { turn: t } if t == turn))
+            .find_map(|e| match &e.event {
+                SessionEvent::AssistantMessage { turn: t, text, .. }
+                    if *t == turn && !text.trim().is_empty() =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+    }
+
     /// Latest durable human message for a turn, without cloning tool payloads
     /// or the rest of the log. Peer/internal injections are deliberately absent.
     pub fn latest_user_text(&self, turn: u64) -> Option<String> {

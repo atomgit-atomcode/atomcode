@@ -1155,7 +1155,7 @@ async fn a_note_from_another_session_is_logged_as_that_sessions_and_runs_a_turn(
             &e.event,
             atomcode_harness::session::SessionEvent::Injected {
                 text,
-                origin: atomcode_harness::session::InjectionOrigin::Peer { from, outside },
+                origin: atomcode_harness::session::InjectionOrigin::Peer { from, outside, .. },
                 ..
             } if text == "the review came back" && from == "bg-7" && *outside
         )),

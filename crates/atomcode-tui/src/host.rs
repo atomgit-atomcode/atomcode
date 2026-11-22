@@ -16248,6 +16248,7 @@ mod tests {
             origin: atomcode_kernel::session::InjectionOrigin::Peer {
                 from: "elsewhere".into(),
                 outside: true,
+                source_turn: None,
             },
         });
 
