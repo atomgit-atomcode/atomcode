@@ -34,6 +34,12 @@ fn _isolate_atomcode_home() {
 /// is always available regardless of which capability features are enabled.
 pub mod hooks;
 
+/// CUE — the provider-agnostic core of AI inline completion: it builds the
+/// completion prompt and reads the model's answer back. Kernel-only, so it is
+/// always available; the transport and the model choice belong to the driver
+/// (the daemon owns the credentials).
+pub mod cue;
+
 /// Best-effort native-runtime datalog writer. It observes the final kernel request and
 /// records the historical per-turn Markdown + per-round JSONL layout.
 #[cfg(feature = "session")]
