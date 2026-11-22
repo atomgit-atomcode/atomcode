@@ -1,6 +1,7 @@
 //! Cache-friendly history compaction — the v2 port of core's `collapse_committed`.
 //!
-//! Stubs OLD tool results in place (full output → a one-line summary), keeping the
+//! Stubs OLD tool results in place (full output → a bounded one-line or head+tail
+//! preview stub), keeping the
 //! ACTIVE turn full and exempting `read_file`. It is the POLICY only: the kernel owns
 //! every invariant (sacred floor, net-loss guard, tool-call/result pairing repair,
 //! `cache_epoch` bump, and turn-boundary-only triggering) in
@@ -2082,6 +2083,23 @@ mod tests {
     }
 
     #[test]
+    fn stubs_built_here_are_recognized_as_stubs() {
+        // Every stub the builder produces must round-trip through the
+        // predicate: a name with whitespace (or an empty one) would parse as
+        // a different envelope shape and the next pass would re-stub the
+        // stub — a stub of a stub that drops what the first stub kept.
+        for tool_name in ["my tool", "", "grep\t", "chat (会话 同名)"] {
+            for output in ["line1\nline2\nline3", &"x".repeat(3_000)] {
+                let stub = build_compact_stub(tool_name, output, true);
+                assert!(
+                    text_is_compact_stub(&stub),
+                    "`{tool_name}` built an unrecognized stub: {stub}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stub_of_oversized_output_keeps_head_tail_and_omission_marker() {
         // The oversized result keeps a bounded head (what ran) and tail (how
         // it ended) with the omission marker — measured on the real corpus:
@@ -2345,6 +2363,20 @@ mod tests {
         );
         // And the envelope guard recognizes its own output.
         assert!(text_is_compact_stub(&stub));
+        // The preview branch must be what fired: the assertion above is only
+        // meaningful if the head+tail shape (not the first-line fallback) is
+        // what the near-threshold input produced.
+        assert!(
+            stub.contains("head: ") && stub.contains("[omitted "),
+            "a past-threshold input takes the preview path: {stub}"
+        );
+        // And far past the threshold the same shape holds — a constant tweak
+        // cannot silently swap the branch under a test that never looked.
+        let far = build_compact_stub(tool, &"y".repeat(9_000), false);
+        assert!(
+            far.contains("head: ") && far.contains("[omitted "),
+            "an oversized input takes the preview path: {far}"
+        );
     }
 
     #[test]
