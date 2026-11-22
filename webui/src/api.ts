@@ -13,6 +13,18 @@ function authHeaders(): Record<string, string> {
   return h;
 }
 
+// Mirrors CHAT_REQUEST_BODY_LIMIT_BYTES in the daemon. Check the serialized
+// UTF-8 payload because base64, JSON escaping, and non-ASCII text affect its size.
+const CHAT_REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
+
+function encodeChatBody(body: StreamChatBody | { message: string; images?: ImageData[] }): string {
+  const json = JSON.stringify(body);
+  if (new Blob([json]).size > CHAT_REQUEST_BODY_LIMIT_BYTES) {
+    throw new ApiCallError('Chat request exceeds 32 MiB', 413);
+  }
+  return json;
+}
+
 /** Current session token (from the page URL). */
 export function getToken(): string {
   return token;
@@ -234,7 +246,7 @@ export async function streamChat(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify(body),
+    body: encodeChatBody(body),
     signal,
   });
 
@@ -1218,7 +1230,7 @@ export async function postLiveMessage(
   const resp = await apiFetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({
+    body: encodeChatBody({
       message,
       ...(images && images.length ? { images } : {}),
       ...(provider ? { provider } : {}),

@@ -159,6 +159,19 @@ use atomcode_telemetry::{
 
 const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
+fn chat_message_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/chat",
+            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/live/message",
+            post(live_api::live_message)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+}
+
 // ============================================================================
 // Shared DTOs for P0 API endpoints
 // ============================================================================
@@ -8327,10 +8340,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             get(|| async { Json(atomcode_capabilities::model_cards::catalog()) }),
         )
         // Chat API
-        .route(
-            "/chat",
-            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
-        )
+        .merge(chat_message_routes())
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
@@ -8344,7 +8354,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/tunnel/start", post(start_webui_relay))
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
-        .route("/live/message", post(live_api::live_message))
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/release", post(live_api::live_release))
         .route("/live/permission", post(live_api::live_permission))
@@ -9899,6 +9908,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn live_message_accepts_large_image_bodies_up_to_the_chat_limit() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let app = chat_message_routes()
+            .layer(axum::Extension(SessionMode::Webui))
+            .with_state(chat_test_state(&home));
+        // Omit the required message so an admitted body fails at JSON validation,
+        // without creating a session or calling a model.
+        let prefix = r#"{"images":[{"media_type":"image/png","data":""#;
+        let suffix = r#""}]}"#;
+        for (size, expected) in [
+            (2_365_600, StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                CHAT_REQUEST_BODY_LIMIT_BYTES,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                CHAT_REQUEST_BODY_LIMIT_BYTES + 1,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let mut body = Vec::with_capacity(size);
+            body.extend_from_slice(prefix.as_bytes());
+            body.resize(size - suffix.len(), b'A');
+            body.extend_from_slice(suffix.as_bytes());
+            let request = axum::http::Request::post("/live/message")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "request size: {size}");
+        }
     }
 
     fn chat_test_state(home: &ScopedChatHome) -> AppState {

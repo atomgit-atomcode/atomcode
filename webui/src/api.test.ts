@@ -89,6 +89,34 @@ test('postLiveMessage does not send approval_mode because live mode is global', 
   }
 });
 
+test('chat sends image bodies over 2 MiB and rejects bodies over 32 MiB before fetch', async () => {
+  const requests: Array<{ url: string; bytes: number }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), bytes: new Blob([String(init?.body)]).size });
+    return new Response(
+      String(url) === '/live/message' ? '{"accepted":true}' : 'data: {"type":"done"}\n\n',
+    );
+  }) as typeof fetch;
+  try {
+    const { ApiCallError, postLiveMessage, streamChat } = await import('./api.ts');
+    const send = (data: string) => {
+      const message = '图片';
+      const images = [{ media_type: 'image/png', data }];
+      return [postLiveMessage(message, images), streamChat({ message, images }, () => {})];
+    };
+    await Promise.all(send('A'.repeat(2_365_524)));
+    assert.deepEqual(requests.map(({ url }) => url), ['/live/message', '/chat']);
+    assert.ok(requests.every(({ bytes }) => bytes > 2 * 1024 * 1024));
+    await Promise.all(send('A'.repeat(32 * 1024 * 1024)).map(request => assert.rejects(
+      request, error => error instanceof ApiCallError && error.status === 413,
+    )));
+    assert.equal(requests.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveMessage accepts the legacy accepted-only receipt without retrying', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{"accepted":true}', { status: 200 })) as typeof fetch;
