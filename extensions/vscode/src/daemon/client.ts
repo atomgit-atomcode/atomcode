@@ -50,6 +50,9 @@ export function readDaemonToken(port: number): string | undefined {
 }
 
 const REST_TIMEOUT = 30000;
+// The daemon owns the CUE deadline (up to 120 s). Allow time for its response
+// to reach the editor, but keep a backstop for an unresponsive daemon.
+const CUE_TRANSPORT_TIMEOUT = 125000;
 
 const REQUEST_BODY_TOO_LARGE_MESSAGE =
   '消息内容过大，发送失败。请压缩图片、减少附件数量，或缩短消息后重试。';
@@ -150,9 +153,10 @@ export class DaemonClient {
 
   // ── REST helpers ──────────────────────────────────────────────
 
-  private request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<T> {
+  private request<T>(method: string, path: string, body?: unknown, timeout?: number, signal?: AbortSignal): Promise<T> {
     const revision = this.connectionRevision;
-    return this.requestOnce<T>(method, path, body, timeout).catch(async (err) => {
+    return this.requestOnce<T>(method, path, body, timeout, signal).catch(async (err) => {
+      if (signal?.aborted) throw err;
       if (revision !== this.connectionRevision) {
         throw new Error('AtomCode daemon endpoint changed; retry the operation.');
       }
@@ -161,7 +165,7 @@ export class DaemonClient {
       // is safe for any method. Invalidate the cache and retry once.
       if (err instanceof DaemonHttpError && err.statusCode === 401) {
         this.invalidateToken();
-        return this.requestOnce<T>(method, path, body, timeout);
+        return this.requestOnce<T>(method, path, body, timeout, signal);
       }
       // Restart/retry only idempotent reads. Replaying POST/PATCH/DELETE after
       // process replacement can duplicate work or reuse daemon-owned stale IDs.
@@ -171,15 +175,16 @@ export class DaemonClient {
           && path !== '/health' && path !== '/shutdown') {
         const restarted = await this.onConnectionLost();
         if (restarted) {
-          return this.requestOnce<T>(method, path, body);
+          return this.requestOnce<T>(method, path, body, timeout, signal);
         }
       }
       throw err;
     });
   }
 
-  private requestOnce<T>(method: string, path: string, body?: unknown, timeout = REST_TIMEOUT): Promise<T> {
+  private requestOnce<T>(method: string, path: string, body?: unknown, timeout = REST_TIMEOUT, signal?: AbortSignal): Promise<T> {
     return new Promise((resolve, reject) => {
+      signal?.throwIfAborted();
       const payload = body ? JSON.stringify(body) : undefined;
       const token = this.token();
       const options: http.RequestOptions = {
@@ -194,11 +199,12 @@ export class DaemonClient {
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
         },
         timeout,
-        ...(path === '/health' ? { signal: AbortSignal.timeout(timeout) } : {}),
+        signal: path === '/health' ? AbortSignal.timeout(timeout) : signal,
       };
 
       const req = http.request(options, (res) => {
         const chunks: Buffer[] = [];
+        res.on('error', reject);
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
@@ -250,8 +256,8 @@ export class DaemonClient {
     return this.request<T>('GET', path);
   }
 
-  private post<T>(path: string, body?: unknown, timeout?: number): Promise<T> {
-    return this.request<T>('POST', path, body, timeout);
+  private post<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>('POST', path, body);
   }
 
   private patch<T>(path: string, body?: unknown): Promise<T> {
@@ -712,13 +718,12 @@ export class DaemonClient {
    * Ask the daemon for the completion at the cursor.
    *
    * The daemon owns the credential and the model, so this carries code — never
-   * a key. The timeout is shorter than the REST default on purpose: a
-   * suggestion that arrives after the user kept typing is worse than none.
+   * a key. The editor can abort the POST as soon as its suggestion is stale.
    */
   requestCueCompletion(
     request: CueCompletionRequest,
-    timeoutMs = 8000,
+    signal: AbortSignal,
   ): Promise<CueCompletionResponse> {
-    return this.post<CueCompletionResponse>('/cue/complete', request, timeoutMs);
+    return this.request<CueCompletionResponse>('POST', '/cue/complete', request, CUE_TRANSPORT_TIMEOUT, signal);
   }
 }

@@ -35,6 +35,7 @@ async function main() {
     'daemon-client-token-retry.test.ts',
     'effort-levels.test.ts',
     'cue-context.test.ts',
+    'cue-transport.test.ts',
   ];
 
   // Keep going after the first failure: stopping there hides the real state of every file

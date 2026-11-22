@@ -34,8 +34,8 @@
 //! assert_eq!(messages.len(), 2);
 //! assert!(messages[1].text.contains("fn main()"));
 //!
-//! assert_eq!(extract_completion("ntln!(\"hi\");", "").as_deref(), Some("ntln!(\"hi\");"));
-//! assert_eq!(extract_completion("<<<NO_COMPLETION>>>", ""), None);
+//! assert_eq!(extract_completion("ntln!(\"hi\");").as_deref(), Some("ntln!(\"hi\");"));
+//! assert_eq!(extract_completion("<<<NO_COMPLETION>>>"), None);
 //! ```
 
 mod extract;
