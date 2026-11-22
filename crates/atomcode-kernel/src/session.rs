@@ -1757,8 +1757,8 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
         return output.to_string();
     }
     let line_count = output.lines().count();
-    // The preview fires only when the cut middle is at least half the head
-    // (a near-threshold rewrite busts the prefix cache for almost no
+    // The preview fires only when the cut middle exceeds 896 chars (a
+    // near-threshold rewrite busts the prefix cache for almost no
     // saving), and the candidate is compared against the original: one that
     // is not strictly shorter falls back to the first-line shape, so no
     // fixed overhead approximation can ever let a stub grow past the text

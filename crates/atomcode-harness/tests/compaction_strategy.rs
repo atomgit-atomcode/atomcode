@@ -256,8 +256,9 @@ fn harness_overflow_compresses_raw_output_with_stub_like_headers() {
     );
 }
 
-/// An already-stubbed result is not raw output worth stubbing: it is skipped
-/// up front, so a second overflow pass yields nothing for it and the rung
+/// An already-stubbed result is not raw output worth stubbing: the builder
+/// returns it unchanged (idempotent early exit) and the strict-shrink check
+/// drops it, so a second overflow pass yields nothing for it and the rung
 /// stands down (`None`) to let the compactor fold the settled history.
 #[test]
 fn harness_overflow_skips_already_stubbed_results() {
