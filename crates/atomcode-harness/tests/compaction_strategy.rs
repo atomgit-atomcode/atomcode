@@ -264,12 +264,12 @@ fn harness_overflow_skips_already_stubbed_results() {
     let mut writer = Writer::new();
     writer.ask("inspect output");
     // A kernel-shaped head+tail stub (~1.9KB) — well over `WORTH_STUBBING`,
-    // so the old size-only filter kept selecting it every pass.
-    let stub_text = format!(
-        "[bash ok: 4000 lines, head: {}{}{}]",
-        "x".repeat(1_400),
-        " … [omitted 2200 chars] … ",
-        "y".repeat(400),
+    // so the old size-only filter kept selecting it every pass. Built by the
+    // real generator, so kernel budget changes cannot drift the fixture.
+    let stub_text = atomcode_kernel::session::build_compact_stub(
+        "bash",
+        &format!("{}TAIL-MARKER exit: 0", "x".repeat(3_000)),
+        true,
     );
     assert!(stub_text.len() > 500, "the stub clears the size filter");
     let _stubbed = writer.call("bash", &stub_text);
