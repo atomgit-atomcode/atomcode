@@ -681,17 +681,17 @@ impl crate::commands::CatalogCommand for StopMember {
         // Whether it has the lead's work in hand and has not reported on it: a
         // lead waiting on that result must hear, or it waits for good
         // (`docs/adr/0023` §8).
-        let owes = {
-            let turn = agent.session().current_turn();
-            let working_for_the_lead = agent.status() != crate::agent::AgentStatus::Idle
-                && agent
-                    .session()
-                    .events()
-                    .iter()
-                    .any(|e| from_lead_in(&e.event, turn, &lead_session));
-            working_for_the_lead || agent.inbox().waiting_from(MessageOrigin::Peer(lead.id()))
-        };
-        let said = last_said(&agent.session());
+        let session = agent.session();
+        let turn = session.current_turn();
+        let working_for_lead = agent.status() != crate::agent::AgentStatus::Idle
+            && session
+                .events()
+                .iter()
+                .any(|e| from_lead_in(&e.event, turn, &lead_session));
+        let owes = working_for_lead || agent.inbox().waiting_from(MessageOrigin::Peer(lead.id()));
+        let said = working_for_lead
+            .then(|| session.latest_assistant_text(turn))
+            .flatten();
         let stopped = self.team.stop(&lead, Some(&name)).await?;
         if owes {
             lead.send_from(
@@ -699,7 +699,12 @@ impl crate::commands::CatalogCommand for StopMember {
                     "[{name} was stopped by the person before it reported back]\n{}",
                     said.unwrap_or_else(|| "(it had said nothing yet)".into())
                 ),
-                MessageOrigin::Peer(agent.id()),
+                MessageOrigin::TeamMessage {
+                    sender: agent.id(),
+                    session: agent.session_id().into(),
+                    // Work still in the inbox has no member turn to attribute.
+                    turn: working_for_lead.then_some(turn),
+                },
             );
         } else {
             lead.note(
@@ -768,7 +773,10 @@ impl Tool for TellParent {
         *self.told.lock().expect("told poisoned") = true;
         lead.send_from(
             format!("[{}] {text}", self.name),
-            MessageOrigin::Peer(self.me),
+            self.agents
+                .get(self.me)
+                .map(|agent| agent.team_message_origin())
+                .unwrap_or(MessageOrigin::Peer(self.me)),
         );
         ok("delivered to the lead")
     }
@@ -802,6 +810,7 @@ struct TeamTool {
     /// named when someone delegates to one.
     skipped_roles: Vec<(String, String)>,
     max_members: usize,
+    role_request_budgets: BTreeMap<String, u32>,
     max_rounds: u32,
     /// Give every writing member a git worktree of its own. Two members
     /// editing one checkout is the failure this prevents; a branch per member
@@ -1276,6 +1285,11 @@ impl TeamTool {
         let told_for_tool = told.clone();
         let agents_for_tool = agents.clone();
         let max_rounds = self.max_rounds;
+        let request_limit = self
+            .role_request_budgets
+            .get(&role.id)
+            .copied()
+            .unwrap_or(0);
         let tools_for_realm = restricted.clone();
         // Kept like any session, under the lead (`docs/adr/0024` §11, §13): what
         // it was created with goes in its header, so a resume can bring it back.
@@ -1315,6 +1329,15 @@ impl TeamTool {
                     if let Some(model) = utility.clone() {
                         held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
                     }
+                    let requests = Arc::new(crate::seams::TurnRequests::new(
+                        member_session.clone(),
+                        request_limit,
+                    ));
+                    held.push(
+                        realm
+                            .provide::<crate::seams::TurnRequestsSvc>(requests)
+                            .map_err(|e| e.to_string())?,
+                    );
                     held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
                         max_steps: max_rounds,
                     })));
@@ -1384,7 +1407,7 @@ impl TeamTool {
                 },
             );
         if !resuming {
-            child.send_from(task, MessageOrigin::Peer(lead_id));
+            child.send_from(task, lead.team_message_origin());
         }
         Ok(())
     }
@@ -1605,8 +1628,9 @@ impl TeamTool {
             if member.status() == crate::agent::AgentStatus::Idle
                 && !member.inbox().has_waking_input()
             {
-                let said = last_said(&member.session())
-                    .filter(|text| !text.trim().is_empty())
+                let said = member
+                    .session()
+                    .latest_assistant_text(member.session().current_turn())
                     .unwrap_or_else(|| "(no report yet)".into());
                 return Ok(format!("`{name}` is idle. Its latest report: {said}"));
             }
@@ -1651,14 +1675,6 @@ async fn git(
     } else {
         Err(format!("`{command}` failed: {}", out.trim()))
     }
-}
-
-/// The member's last words, from its own log.
-fn last_said(log: &crate::session::SessionLog) -> Option<String> {
-    log.events().into_iter().rev().find_map(|e| match e.event {
-        SessionEvent::AssistantMessage { text, .. } if !text.trim().is_empty() => Some(text),
-        _ => None,
-    })
 }
 
 #[async_trait]
@@ -1772,7 +1788,7 @@ impl Tool for TeamTool {
                 } else {
                     self.with_member(&lead, name, |m| {
                         *m.told.lock().expect("told poisoned") = false;
-                        m.agent.send_from(text, MessageOrigin::Peer(lead.id()));
+                        m.agent.send_from(text, lead.team_message_origin());
                     })
                     .map(|_| format!("told `{name}`"))
                 }
@@ -1803,6 +1819,8 @@ impl Tool for TeamTool {
 struct TeamRow {
     #[serde(default = "default_members")]
     max_members: usize,
+    #[serde(default)]
+    role_request_budgets: BTreeMap<String, u32>,
     #[serde(default = "default_rounds")]
     max_rounds: u32,
     /// Where `.atomcode/agents/*.md` role files are looked for. Defaults to
@@ -1840,6 +1858,7 @@ impl Default for TeamRow {
     fn default() -> Self {
         Self {
             max_members: default_members(),
+            role_request_budgets: Default::default(),
             max_rounds: default_rounds(),
             project_root: None,
             home: None,
@@ -1915,6 +1934,7 @@ impl Plugin for TeamPlugin {
             roles,
             skipped_roles,
             max_members: row.max_members,
+            role_request_budgets: row.role_request_budgets,
             max_rounds: row.max_rounds,
             worktrees: row.worktrees,
             worktrees_dir: row.worktrees_dir.map(PathBuf::from),
@@ -2066,7 +2086,7 @@ impl Plugin for TeamPlugin {
                 let lead_asked = member.session().events().iter()
                     .any(|e| from_lead_in(&e.event, refusal.turn, &lead_session));
                 if lead_asked {
-                    lead.send_from(report, MessageOrigin::Peer(member.id()));
+                    lead.send_from(report, member.team_message_origin());
                 } else {
                     lead.note(report, crate::session::InjectionOrigin::TeamNote { member: name });
                 }
@@ -2158,21 +2178,33 @@ impl Plugin for TeamPlugin {
                 let told = std::mem::replace(&mut *m.told.lock().expect("told poisoned"), false);
                 (m.agent.clone(), told)
             };
-            if told {
+            let budget_stop = *stop == atomcode_kernel::event::StopReason::StoppedByPolicy
+                && member
+                    .ctx()
+                    .service::<crate::seams::TurnRequestsSvc>()
+                    .is_some_and(|r| r.limited(*turn));
+            if told && !budget_stop {
                 return;
             }
             let Some(lead) = agents.by_session(&lead_session) else {
                 return;
             };
-            let said = last_said(&member.session()).unwrap_or_else(|| "(nothing)".into());
-            let report = format!("[{name} finished turn {turn}: {stop:?}]\n{said}");
+            let said = member
+                .session()
+                .latest_assistant_text(*turn)
+                .unwrap_or_else(|| "(nothing)".into());
+            let report = if budget_stop {
+                format!("[{name} reached its provider request budget in turn {turn}]\n{said}")
+            } else {
+                format!("[{name} finished turn {turn}: {stop:?}]\n{said}")
+            };
             let lead_asked = member
                 .session()
                 .events()
                 .iter()
                 .any(|e| from_lead_in(&e.event, *turn, &lead_session));
             if lead_asked {
-                lead.send_from(report, MessageOrigin::Peer(member.id()));
+                lead.send_from(report, member.team_message_origin());
             } else {
                 lead.note(
                     report,

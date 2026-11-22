@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { registerLanguageBridge } from './languageBridge/vscode';
+import { registerCueCompletion } from './cue/provider';
 import { DaemonClient } from './daemon/client';
 import { DaemonProcess } from './daemon/process';
 import { ChatViewProvider } from './chat/provider';
@@ -7,7 +8,7 @@ import { StatusBarManager } from './status';
 import { AtomCodeActionProvider } from './editor/actions';
 import { DiffContentProvider } from './editor/diff';
 import { getEditorContext, buildContextualPrompt } from './editor/context';
-import { getConfig, DEFAULT_PORT } from './config';
+import { getConfig, getConf, DEFAULT_PORT } from './config';
 import { getQuickActionPrompt } from './chat/quickActions';
 
 class ExtensionState {
@@ -68,6 +69,11 @@ export async function activate(context: vscode.ExtensionContext) {
       providedCodeActionKinds: AtomCodeActionProvider.providedCodeActionKinds,
     })
   );
+
+  // 5.5 Register CUE — AI inline completion. The daemon holds the
+  // credential, so the extension only ever carries code.
+  const cueProvider = registerCueCompletion(context, extensionState.client);
+  cueProvider.setEnabled(getConf<boolean>('cue.enabled', true));
 
   // 6. Register commands before daemon startup. Command handlers surface daemon errors in the chat UI.
   const cmds = [
@@ -175,6 +181,11 @@ export async function activate(context: vscode.ExtensionContext) {
         const newPort = newConfig.get<number>('daemon.port', 13456);
         if (newPort !== config.daemonPort) {
           vscode.window.showInformationMessage(vscode.l10n.t('AtomCode: Restart VS Code to apply port change.'));
+        }
+        if (e.affectsConfiguration('atomcode.cue.enabled')) {
+          // Takes effect at once: an in-flight completion is cancelled so a
+          // suggestion cannot appear after CUE was turned off.
+          cueProvider.setEnabled(newConfig.get<boolean>('cue.enabled', true));
         }
       }
     })

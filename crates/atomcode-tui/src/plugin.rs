@@ -1072,6 +1072,23 @@ fn put_path(m: &mut crate::moment::Moment, picked: &str) -> bool {
     true
 }
 
+/// A contiguous insertion or deletion can edit the middle of a mention just
+/// like its end. Compare at character boundaries so paths can contain Unicode.
+fn same_mention_after_edit(previous: &str, current: &str) -> bool {
+    let (shorter, longer) = if previous.len() <= current.len() {
+        (previous, current)
+    } else {
+        (current, previous)
+    };
+    let edit_start = shorter
+        .char_indices()
+        .zip(longer.chars())
+        .find_map(|((index, left), right)| (left != right).then_some(index))
+        .unwrap_or(shorter.len());
+    let edit_len = longer.len() - shorter.len();
+    longer.get(edit_start + edit_len..) == Some(&shorter[edit_start..])
+}
+
 /// What follows a leading `$` or `¥` while a skill is being named.
 ///
 /// Only the first character has this meaning. Once whitespace appears the
@@ -1934,6 +1951,10 @@ pub struct Tui {
     /// re-points it rather than silently answering from the old tree.
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     mention_kind: Mutex<u8>,
+    /// The `@` token the person dismissed with Esc, by its byte offset and
+    /// text: the menu stays away from that token — including as more of its
+    /// text is typed — until the caret leaves it or the token is replaced.
+    mention_declined: Mutex<Option<(usize, String)>>,
     session_references: Arc<Mutex<SessionSuggestions>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
@@ -8974,6 +8995,8 @@ impl Tui {
                     m.caret = at;
                     m.history_at = None;
                     m.suggestion = None;
+                    drop(m);
+                    self.refresh_menu();
                     return false;
                 }
                 // A recap of the last turn landing now would go under this new
@@ -9401,11 +9424,6 @@ impl Tui {
                 } else {
                     recall_forward(&mut m);
                 }
-                if !inside {
-                    drop(m);
-                    self.refresh_menu();
-                }
-                return false;
             }
             Action::Paste(text) => {
                 // Release the moment lock before probing the paste as a file path:
@@ -9667,6 +9685,8 @@ impl Tui {
                             }
                         }
                         m.caret = at;
+                        drop(m);
+                        self.refresh_menu();
                         return false;
                     }
                 }
@@ -10277,6 +10297,12 @@ impl Tui {
                         m.history_at = None;
                         m.input.clear();
                         m.caret = 0;
+                        // The line the declined token lived on is gone: a
+                        // record keyed to it has nothing left to suppress.
+                        *self
+                            .mention_declined
+                            .lock()
+                            .expect("mention declined poisoned") = None;
                         return false;
                     }
                     drop(m);
@@ -10291,7 +10317,6 @@ impl Tui {
                 m.input.insert(at, '\n');
                 m.caret = at + 1;
                 m.history_at = None;
-                return false;
             }
             Action::Redraw => {
                 drop(m);
@@ -10608,6 +10633,36 @@ impl Tui {
             skill_prefix(&input).map(str::to_string)
         };
         let mention_context = prefix.is_none() && skill.is_none();
+        // Whether the caret sits on an `@` token the person explicitly
+        // dismissed with Esc. Decided BEFORE the menu rows are built: a
+        // declined token must yield no rows at all, or the else branch below
+        // would plant them as a plain (tabless) menu — the misfire this
+        // guards against.
+        let mention_declined = if browsing {
+            // History temporarily replaces the input and owns the menu.
+            false
+        } else {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let mut record = self
+                .mention_declined
+                .lock()
+                .expect("mention declined poisoned");
+            *record = record.take().and_then(|(declined_at, mut previous)| {
+                let (at, end) =
+                    atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)?;
+                let current = &m.input[at..end];
+                if at != declined_at || !same_mention_after_edit(&previous, current) {
+                    return None;
+                }
+                // Carry the latest spelling into the next edit.
+                if previous != current {
+                    previous.clear();
+                    previous.push_str(current);
+                }
+                Some((at, previous))
+            });
+            record.is_some()
+        };
         let menu = match prefix {
             Some(rest) => {
                 let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
@@ -10713,6 +10768,7 @@ impl Tui {
                     })
                     .unwrap_or_default()
             }
+            None if browsing || mention_declined => Vec::new(),
             None => {
                 let (typed, caret, cwd) = {
                     let m = self.host.moment.read().expect("moment poisoned");
@@ -10727,7 +10783,7 @@ impl Tui {
                 }
             }
         };
-        let is_mention = {
+        let is_mention = !mention_declined && {
             let m = self.host.moment.read().expect("moment poisoned");
             !browsing
                 && mention_context
@@ -10782,10 +10838,13 @@ impl Tui {
                 let _ = self.host.menu_move_by(1);
             }
             // Esc puts the list away and leaves what is typed alone. It is not
-            // "clear the line" — the slash is still there, and the menu comes
-            // back on the next keystroke that changes it. The one way to say
-            // "not that list, this line" without losing the line.
+            // "clear the line" — the slash is still there, and a slash or
+            // skill menu comes back on the next keystroke that changes it. An
+            // `@` mention menu does NOT come back while the caret stays on the
+            // dismissed token (`decline_current_mention`); it asks again once
+            // the caret moves to another token.
             Key::Esc => {
+                self.decline_current_mention();
                 self.host.close_menu();
             }
             Key::Tab => {
@@ -10977,6 +11036,18 @@ impl Tui {
         m.history_at = None;
         drop(m);
         self.refresh_menu();
+    }
+
+    /// Record the `@` token at the caret as dismissed: the mention menu stays
+    /// away from it until the caret leaves the token (`refresh_menu`).
+    fn decline_current_mention(&self) {
+        let m = self.host.moment.read().expect("moment poisoned");
+        *self
+            .mention_declined
+            .lock()
+            .expect("mention declined poisoned") =
+            atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                .map(|(at, end)| (at, m.input[at..end].to_string()));
     }
 
     /// Put a path picked from the `@` menu on the line, in place of the `@…`
@@ -12544,6 +12615,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             mention_kind: Mutex::new(0),
+            mention_declined: Mutex::new(None),
             session_references: Arc::new(Mutex::new(SessionSuggestions::default())),
             pressed_at: Mutex::new(None),
             scroll_drag: Mutex::new(None),
@@ -16650,10 +16722,12 @@ mod opening_line_tests {
         let from_background = injected(InjectionOrigin::Peer {
             from: "bg-1".into(),
             outside: true,
+            source_turn: None,
         });
         let from_a_member = injected(InjectionOrigin::Peer {
             from: "lead/scout".into(),
             outside: false,
+            source_turn: None,
         });
         let typed = SessionEvent::UserMessage {
             turn: 3,
@@ -16673,6 +16747,7 @@ mod opening_line_tests {
         let report = injected(InjectionOrigin::Peer {
             from: "lead/scout".into(),
             outside: false,
+            source_turn: None,
         });
         assert!(!opens_a_turn_on_screen(&report, |turn| turn == 3));
         assert!(
@@ -18933,6 +19008,67 @@ mod newline_settings_tests {
 
 #[cfg(test)]
 mod session_mention_tests {
+    fn dismiss_mention(tui: &super::Tui, input: &str, caret: usize) {
+        {
+            let mut moment = tui.host.moment.write().unwrap();
+            moment.input = input.into();
+            moment.caret = caret;
+        }
+        tui.refresh_menu();
+        assert!(tui.host.menu_open());
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        assert!(!tui.host.menu_open());
+    }
+
+    #[test]
+    fn editing_inside_a_dismissed_mention_keeps_the_menu_closed() {
+        use super::Action;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        dismiss_mention(&tui, "@src", "@sr".len());
+        tui.act(Action::Insert('中'), &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "@sr中c");
+        assert!(!host.menu_open());
+        tui.act(Action::DeleteForward, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "@sr中");
+        assert!(!host.menu_open());
+        tui.act(Action::Backspace, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "@sr");
+        assert!(!host.menu_open());
+    }
+
+    #[test]
+    fn a_line_break_expires_the_dismissal_before_backspace() {
+        use super::Action;
+
+        for (input, newline) in [("@src", Action::Newline), ("@src\\", Action::Submit)] {
+            let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+            dismiss_mention(&tui, input, input.len());
+            tui.act(newline, &tui.client);
+            assert_eq!(host.moment.read().unwrap().input, "@src\n");
+            assert!(!host.menu_open());
+            tui.act(Action::Backspace, &tui.client);
+            assert_eq!(host.moment.read().unwrap().input, "@src");
+            assert!(host.menu_open());
+        }
+    }
+
+    #[test]
+    fn moving_to_another_input_row_expires_the_dismissal() {
+        use super::Action;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        dismiss_mention(&tui, "@src\nnotes", "@src".len());
+        tui.act(Action::CaretDown, &tui.client);
+        assert!(!host.menu_open());
+        tui.act(Action::CaretUp, &tui.client);
+        assert_eq!(host.moment.read().unwrap().caret, "@src".len());
+        assert!(host.menu_open());
+    }
+
     #[test]
     fn picking_a_session_keeps_surrounding_text_and_closes_completion() {
         let mut moment = crate::moment::Moment::default();
@@ -18972,6 +19108,136 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
         tui.complete_path("@\0mention-filter:workspace");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 3);
+    }
+
+    /// Esc on an `@` token declines it: the mention menu stays closed while
+    /// the caret stays on the token — even as more of the token is typed —
+    /// and the decline clears once the caret leaves the token.
+    #[test]
+    fn an_escaped_at_token_keeps_the_menu_closed_until_the_caret_leaves() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(host.menu_open(), "the mention menu is up");
+
+        // Esc through the real key path: the token at the caret is declined.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "an explicitly declined token does not reopen the menu"
+        );
+
+        // Typing more of the token keeps it declined — and so does backspacing
+        // it shorter: it is still the same token the caret sits on.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode-notes".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "still the declined token");
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "backspacing the same token stays declined"
+        );
+
+        // The caret leaves the token: the decline is stale and the next `@`
+        // may ask again.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "说 @atomcode-notes".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a new token at a different position asks again"
+        );
+        assert!(
+            tui.mention_declined.lock().unwrap().is_none(),
+            "the stale decline record expires once the caret leaves the token"
+        );
+
+        // And back on the first token the decline is stale too: it was
+        // cleared the moment the caret moved to a different token.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode-notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "the caret returned to the old token: the stale decline must not suppress it"
+        );
+
+        // Esc again, then REPLACE the token's text at the same offset: a new
+        // token that is not an extension of the dismissed one must ask again.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the re-declined token is suppressed");
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@完全不同 into".into();
+            moment.caret = "@完全不同".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a replaced token at the same offset is not the dismissed one"
+        );
+    }
+
+    /// Entering reverse search / history browsing must not wipe the decline:
+    /// the input is untouched while browsing, so the record has not gone
+    /// stale — and when browsing ends on the same token, the menu stays away.
+    #[test]
+    fn browsing_leaves_the_declined_token_alone() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.decline_current_mention();
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the declined token holds the menu down");
+
+        // Browsing starts: the menu is suppressed while it lasts, and the
+        // record must survive it — observable once browsing ends.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history_at = Some(1);
+        }
+        tui.refresh_menu();
+
+        // Browsing ends on the same token: the decline still holds.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history_at = None;
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "browsing must not wipe the decline: the same token stays declined"
+        );
     }
 
     #[test]

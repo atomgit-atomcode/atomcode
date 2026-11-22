@@ -256,6 +256,43 @@ fn harness_overflow_compresses_raw_output_with_stub_like_headers() {
     );
 }
 
+/// An already-stubbed result is not raw output worth stubbing: the builder
+/// returns it unchanged (idempotent early exit) and the strict-shrink check
+/// drops it, so a second overflow pass yields nothing for it and the rung
+/// stands down (`None`) to let the compactor fold the settled history.
+#[test]
+fn harness_overflow_skips_already_stubbed_results() {
+    let mut writer = Writer::new();
+    writer.ask("inspect output");
+    // A kernel-shaped head+tail stub (~1.9KB) — well over `WORTH_STUBBING`,
+    // so the old size-only filter kept selecting it every pass. Built by the
+    // real generator, so kernel budget changes cannot drift the fixture.
+    let stub_text = atomcode_kernel::session::build_compact_stub(
+        "bash",
+        &format!("{}TAIL-MARKER exit: 0", "x".repeat(3_000)),
+        true,
+    );
+    assert!(stub_text.len() > 500, "the stub clears the size filter");
+    let _stubbed = writer.call("bash", &stub_text);
+    let overflow = ask(CompactTrigger::Overflow { attempt: 1 }, 1_000, 0);
+    assert!(
+        stub_on_overflow(&writer.log, &overflow).is_none(),
+        "a log of only stubs has nothing for this rung"
+    );
+
+    // Mixed log: only the raw result is rewritten, the stub is left alone.
+    let raw = writer.call("grep", &"z".repeat(2_000));
+    let rewrites = stub_on_overflow(&writer.log, &overflow).unwrap().rewrites;
+    assert_eq!(
+        rewrites
+            .iter()
+            .map(|rewrite| rewrite.seq)
+            .collect::<Vec<_>>(),
+        vec![raw],
+        "only the not-yet-stubbed result is rewritten"
+    );
+}
+
 fn no_orphan_results(messages: &[Message]) -> Result<(), String> {
     let mut called = std::collections::HashSet::new();
     for message in messages {

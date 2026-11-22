@@ -12702,6 +12702,7 @@ struct SubagentRowPatch {
 struct TeamRowPatch<'a> {
     project_root: &'a std::path::Path,
     max_members: usize,
+    role_request_budgets: std::collections::BTreeMap<String, u32>,
     max_rounds: u32,
     headless_wait: bool,
 }
@@ -12808,6 +12809,11 @@ fn harness_option_rows(
                 TeamRowPatch {
                     project_root: wd,
                     max_members,
+                    role_request_budgets: config
+                        .subagent_config
+                        .as_ref()
+                        .map(|cfg| cfg.team.role_request_budgets.clone())
+                        .unwrap_or_default(),
                     max_rounds,
                     headless_wait: !config.is_attended(),
                 },

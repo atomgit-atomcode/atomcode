@@ -241,6 +241,7 @@ mod tests {
             text: text.into(),
             reasoning: String::new(),
             reset,
+            provider_call: false,
         }
     }
 
