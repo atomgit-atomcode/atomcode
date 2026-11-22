@@ -217,7 +217,7 @@ fn wrap(lines: Vec<String>, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{key, Panel, Step, Tab};
+    use crate::providers::{key, Panel, Screen, Step};
     fn fixture(wire: &str) -> (ProvidersView, ModelRow) {
         let model = ModelRow {
             id: "configured".into(),
@@ -245,7 +245,7 @@ mod tests {
     fn card_keys_are_read_only_and_escape_returns_to_model_list() {
         let (view, _) = fixture("glm-5.3-flash");
         let mut panel = Panel {
-            tab: Tab::Models,
+            screen: Screen::Models,
             ..Default::default()
         };
         view.settle_cursor(&mut panel);

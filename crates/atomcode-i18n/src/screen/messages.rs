@@ -535,49 +535,21 @@ pub enum Msg<'a> {
     CmdAboutErrors,
     CmdAboutShowInject,
     CmdAboutMouse,
-    /// `/provider`'s model picker: the listing had nothing the account lacks.
-    ProviderDiscoverNothingNew,
     ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
     ProviderDiscovering,
-    /// …beside an empty model field: the key that opens it.
-    ProviderDiscoverHint,
-    ProviderAdvanced,
     ProviderManualAdd,
-    ProviderBatchCount {
-        n: usize,
-    },
-    ProviderWillUse,
-    ProviderSetUse,
-    ProviderBatchChoose,
     ProviderNotProvided,
-    ProviderEdit,
-    ProviderContinue,
-    ProviderConnectUse,
-    ProviderSaveOnly,
     ProviderConnected,
     ProviderAvailable,
     ProviderCapabilitiesUnknown,
     ProviderOutputLimit,
-    ProviderSavedSwitchFailed {
-        id: &'a str,
-        error: &'a str,
-    },
-    ProviderSavedSwitching {
-        id: &'a str,
-    },
     ProviderConnectTitle {
         id: &'a str,
     },
 
-    /// …its keys.
-    ProviderPickKeys,
-    /// …its filter line.
-    ProviderPickFilter {
-        query: &'a str,
-    },
     /// …the listing could not be had, and why.
     ProviderDiscoverFailed {
         why: &'a str,
@@ -1978,16 +1950,13 @@ pub enum Msg<'a> {
     ProviderFormAddModelTo {
         account: &'a str,
     },
-    ProviderFormAddModel,
     ProviderModelCount {
         n: usize,
     },
     ProviderHasKey,
     ProviderNoKey,
     ProviderManaged,
-    ProviderUnconfigured,
     ProviderVision,
-    ArmedDelete,
     FieldName,
     FieldProtocol,
     FieldKey,
@@ -1999,7 +1968,6 @@ pub enum Msg<'a> {
     ContextBudgetSource,
     /// Routed responses do not guarantee the next request uses the same model.
     AutoContextBudgetNote,
-    FieldUseAfterSaving,
     VisionYes,
     VisionNo,
     EffortUnsupported,
@@ -2025,9 +1993,59 @@ pub enum Msg<'a> {
     /// The arrows on the custom window field: leave it for the presets.
     LegendBackToPresets,
     LegendPressAgainToDelete,
-    LegendSeeItsModels,
-    LegendSwitchToIt,
     LegendChange,
+
+    // ── the providers panel: list → detail (2026-11 redesign) ──
+    /// The detail page's heading over the models the account already has.
+    ProviderSectionAdded,
+    /// …over the models the endpoint lists that it does not have yet.
+    ProviderSectionServer,
+    /// The detail page's first row: the account's connection.
+    ProviderConnectionRow,
+    /// The pinned last row of the provider list.
+    ProviderAddProviderRow,
+    /// The pinned last row of `/model`: opens the provider list.
+    ProviderAddModelRow,
+    /// The pinned last row of a detail page.
+    ProviderManualRow,
+    /// …the same row while a filter is typed: adds what was typed.
+    ProviderManualRowWith {
+        query: &'a str,
+    },
+    /// A server row whose write is in flight.
+    ProviderAdding,
+    /// The server section while the listing is on its way.
+    ProviderDiscoveryLoading,
+    /// A managed account's connection row: how to sign in or out instead.
+    ProviderManagedHint,
+    /// An add that was dropped because the connection changed under it.
+    ProviderConnectionChanged,
+    /// The row a second Ctrl+D would delete.
+    ProviderArmedDelete,
+    LegendEditIt,
+    LegendDelete,
+    LegendRemove,
+    LegendSwitch,
+    LegendAddIt,
+    LegendEditThenAdd,
+    LegendRetry,
+    /// Enter on a server row while the person has no model: add it and use it.
+    LegendAddAndUse,
+    /// The last row of a short connection form: Enter shows every field.
+    ProviderMoreSettings,
+    /// The level was refused after the switch went through: said under what
+    /// the switch said.
+    ProviderEffortFailed {
+        why: &'a str,
+    },
+    /// The 「更多设置 ▸」 row's Enter: show every field.
+    LegendShowAll,
+    /// An added model whose add-and-use switch is on its way.
+    ProviderSwitching,
+    /// An added model whose switch was refused: Enter tries again.
+    ProviderSwitchFailedOnRow {
+        why: &'a str,
+    },
 
     // ── the host side of the screen (`atomcode-cli`) ──
     HostConfigNotEditable,

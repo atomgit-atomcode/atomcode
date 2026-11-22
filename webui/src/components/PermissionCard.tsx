@@ -25,7 +25,7 @@ interface PermissionCardProps {
   /** Optional override for the decision action. When provided, replaces the
    *  default respondPermission call. Used by live-session approval (POST /live/permission)
    *  so the non-sync /chat path is unchanged. */
-  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project', toolName?: string) => Promise<void>;
+  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project', toolName?: string) => Promise<boolean>;
 }
 
 function formatArgs(args: unknown): string {
@@ -47,6 +47,7 @@ function formatArgs(args: unknown): string {
 
 export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
   const t = useT();
+  const [expired, setExpired] = useState(false);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
 
@@ -55,11 +56,13 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
     setLoading(true);
     setFailed(null);
     try {
-      if (onDecide) {
-        await onDecide(decision, req.tool_name);
-      } else {
-        const result = await respondPermission(req.session_id, decision, req.tool_name, req.call_id, req.approval_id);
-        if (!result.success) throw new Error(t('perm.requestExpired'));
+      const accepted = onDecide
+        ? await onDecide(decision, req.tool_name)
+        : (await respondPermission(req.session_id, decision, req.tool_name, req.call_id, req.approval_id)).success;
+      if (typeof accepted !== 'boolean') throw new Error(t('perm.invalidResponse'));
+      if (!accepted) {
+        setExpired(true);
+        return;
       }
     } catch (error) {
       // The answer never reached the daemon. Closing here used to read as
@@ -69,10 +72,17 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
       setFailed(String(error instanceof Error ? error.message : error));
       return;
     }
-    // Delivered, or the question was already gone (answered elsewhere, timed
-    // out): either way there is nothing left here to answer.
     setLoading(false);
     onDone();
+  }
+
+  if (expired) {
+    return (
+      <div role="status">
+        {t('perm.requestExpired')}
+        <button class="btn" onClick={onDone} aria-label={t('attach.dismissError')}>×</button>
+      </div>
+    );
   }
 
   const argsDisplay = formatArgs(req.arguments);

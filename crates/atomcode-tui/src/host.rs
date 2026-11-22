@@ -1525,6 +1525,21 @@ pub struct Host {
     /// `crate::providers::key` for one press and emptied whenever a form is
     /// left — see [`Host::providers_key`].
     providers_secret: Mutex<String>,
+    /// How many times each provider account's connection has been changed or
+    /// deleted while this screen ran.
+    ///
+    /// On the host rather than on the panel: an add written after the panel
+    /// closed is still checked against it, so an add aimed at a connection that
+    /// has since been replaced — or an account since deleted, which the port
+    /// would quietly re-create — is dropped instead of written.
+    provider_generations: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// How many times the providers panel has been opened: each opening gets
+    /// its own number (`Panel::instance`).
+    provider_openings: std::sync::atomic::AtomicU64,
+    /// Server rows whose add is in flight, by (account, model) — kept here
+    /// rather than only on the panel, so a panel closed and opened again while
+    /// a write is on its way still says 添加中… and does not send it twice.
+    provider_adding: Mutex<std::collections::BTreeSet<(String, String)>>,
     /// The next token a pick out of the bottom sheet is stamped with
     /// ([`Host::sheet_key`], [`Host::settle_sheet_pick`]).
     sheet_picks: std::sync::atomic::AtomicU64,
@@ -1812,6 +1827,9 @@ impl Host {
             asks: crate::ask::Asks::new(),
             secrets: crate::secret::Secrets::new(),
             providers_secret: Mutex::new(String::new()),
+            provider_generations: Mutex::new(std::collections::BTreeMap::new()),
+            provider_openings: std::sync::atomic::AtomicU64::new(0),
+            provider_adding: Mutex::new(std::collections::BTreeSet::new()),
             sheet_picks: std::sync::atomic::AtomicU64::new(1),
             rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
@@ -3472,7 +3490,12 @@ impl Host {
                 m.mcp_panel = None;
                 m.bg_panel = None;
                 m.sheet = None;
-                m.providers_panel = Some(crate::providers::Panel::new());
+                let mut panel = crate::providers::Panel::new();
+                panel.instance = self
+                    .provider_openings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                m.providers_panel = Some(panel);
                 true
             }
         }
@@ -3489,7 +3512,19 @@ impl Host {
         if !self.providers_open() && !self.toggle_providers() {
             return false;
         }
-        self.show_providers_tab(crate::providers::Tab::Models);
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        if let Some(panel) = m.providers_panel.as_mut() {
+            if panel.form.take().is_some() {
+                self.providers_secret
+                    .lock()
+                    .expect("provider secret poisoned")
+                    .clear();
+            }
+            panel.from_models = false;
+            panel.show(crate::providers::Screen::Models);
+            view.settle_cursor(panel);
+        }
         true
     }
 
@@ -3512,7 +3547,7 @@ impl Host {
         // 页签先落到模型页:`show` 会顺手清掉挑强度那一层,所以它必须在
         // `efforts` 之前跑 —— 否则手打 `/model <id>` 进来时页签停在账号页,
         // Esc 退一层会落到账号列表上。
-        panel.show(crate::providers::Tab::Models);
+        panel.show(crate::providers::Screen::Models);
         panel.efforts = Some(crate::providers::EffortPick { model, levels });
         panel.query.clear();
         panel.cursor = 0;
@@ -3558,39 +3593,20 @@ impl Host {
         true
     }
 
-    /// Start model selection immediately after saving a new connection.
-    pub fn connect_provider_models(&self, account: &str) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        let view = m.providers.clone();
-        if !view
-            .account(account)
-            .is_some_and(|row| row.configured && !row.managed)
-        {
-            return false;
-        }
-        let Some(panel) = m.providers_panel.as_mut() else {
-            return false;
-        };
-        let Some(mut form) = crate::providers::ModelForm::add(&view, Some(account)) else {
-            return false;
-        };
-        form.connecting = true;
-        form.advanced = false;
-        form.focus = crate::providers::ModelField::Model;
-        form.start_discovery();
-        panel.form = Some(crate::providers::Form::Model(form));
-        true
-    }
-
+    /// The request an unsaved Ollama connection's listing has to answer.
     pub fn provider_discovery_id(&self) -> Option<u64> {
         let m = self.moment.read().expect("moment poisoned");
         match m.providers_panel.as_ref()?.form.as_ref()? {
             crate::providers::Form::Account(form) => form.discovery.as_ref().map(|d| d.id),
-            crate::providers::Form::Model(form) if form.picking.is_some() => {
-                Some(form.discovery_id)
-            }
-            _ => None,
+            crate::providers::Form::Model(_) => None,
         }
+    }
+
+    /// The request `account`'s listing has to answer, while the panel waits
+    /// for one.
+    pub fn provider_listing_request(&self, account: &str) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        m.providers_panel.as_ref()?.discovery_request(account)
     }
 
     pub fn provider_draft_discovered(
@@ -3609,21 +3625,259 @@ impl Host {
         }
     }
 
-    /// A cancelled request cannot fill a replacement picker, even for the same account.
+    /// A listing for `account` came back. Taken only when it answers the
+    /// request the panel is waiting on: one asked for a connection since
+    /// replaced must not fill the page of the new one. True when taken.
     pub fn providers_discovered(
         &self,
         account: &str,
         request: u64,
         listed: Result<Vec<crate::providers::Discovered>, String>,
-    ) -> Option<String> {
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        panel.discovered(&view, account, request, listed)
+    }
+
+    /// Walk into a just-added account's page. The listing the connect form
+    /// already fetched fills it when there is one; else the page asks, and the
+    /// step to send for that is returned.
+    pub fn enter_provider_detail(
+        &self,
+        account: &str,
+        listed: Option<Vec<crate::providers::Discovered>>,
+    ) -> Option<crate::providers::Step> {
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let panel = m.providers_panel.as_mut()?;
-        if !matches!(&panel.form, Some(crate::providers::Form::Model(form)) if form.discovery_id == request)
+        panel.show(crate::providers::Screen::Detail(account.to_string()));
+        let step = panel.start_discovery(account);
+        let request = panel.discovery_request(account)?;
+        let step = match listed {
+            Some(listed) => {
+                panel.discovered(&view, account, request, Ok(listed));
+                None
+            }
+            None => Some(step),
+        };
+        view.settle_cursor(panel);
+        // On a fresh page the first model to add is the row to be on.
+        let listed = view.listed(panel);
+        if let Some(at) = listed
+            .iter()
+            .position(|row| matches!(row, crate::providers::Listed::Available(_)))
         {
+            panel.cursor = at;
+        }
+        step
+    }
+
+    /// The account's connection was saved (`deleted: false`) or it was deleted.
+    /// Either way what was listed for it and every add in flight against it
+    /// belong to the old connection: the generation moves, so a late add is
+    /// dropped. A page left on a deleted account goes back to the list; a page
+    /// on an edited one asks its endpoint again, and that step is returned.
+    pub fn provider_account_changed(
+        &self,
+        account: &str,
+        deleted: bool,
+    ) -> Option<crate::providers::Step> {
+        *self
+            .provider_generations
+            .lock()
+            .expect("provider generations poisoned")
+            .entry(account.to_string())
+            .or_insert(0) += 1;
+        // Adds in flight against the old connection are dropped when they land
+        // (the generation moved): nothing of them is still on its way.
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .retain(|(a, _)| a != account);
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let panel = m.providers_panel.as_mut()?;
+        panel.forget_account(account);
+        if panel.screen != crate::providers::Screen::Detail(account.to_string()) {
             return None;
         }
-        crate::providers::discovered(&view, panel, account, listed)
+        if deleted {
+            panel.show(crate::providers::Screen::Providers);
+            view.settle_cursor(panel);
+            return None;
+        }
+        Some(panel.start_discovery(account))
+    }
+
+    /// How many times `account`'s connection has changed: an add records it
+    /// when it is sent and is dropped if it moved before the write.
+    pub fn provider_generation(&self, account: &str) -> u64 {
+        self.provider_generations
+            .lock()
+            .expect("provider generations poisoned")
+            .get(account)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// An add from a server row came back: clear its in-flight mark and, on a
+    /// failure, leave why on the row. True when the panel had marked it.
+    pub fn provider_add_settled(
+        &self,
+        account: &str,
+        model: &str,
+        outcome: Result<(), String>,
+    ) -> bool {
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .remove(&(account.to_string(), model.to_string()));
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        panel.add_settled(account, model, outcome)
+    }
+
+    /// Keep the panel's 「添加并使用」 in step: the person has no model to talk
+    /// to — first run, or the one they had stopped answering after a sign-out —
+    /// and no add holds the claim (`claim_free`). The host decides both; the
+    /// panel only draws and keys by the answer.
+    ///
+    /// The adds in flight are put back on it too: a panel opened again while
+    /// one is still being written has to say so, and refuse it a second time.
+    pub fn sync_provider_auto_use(&self, claim_free: bool) -> bool {
+        let adding = self
+            .provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .clone();
+        let mut m = self.moment.write().expect("moment poisoned");
+        let recovering = m.model_setup_required || m.unready.is_some();
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        let want = recovering && claim_free;
+        let moved = panel.auto_use != want || panel.adding != adding;
+        panel.auto_use = want;
+        panel.adding = adding;
+        moved
+    }
+
+    /// Whether the person has no model to talk to: first run, or the one they
+    /// had stopped answering (signed out, say).
+    pub fn provider_recovering(&self) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        m.model_setup_required || m.unready.is_some()
+    }
+
+    /// A server row's add was sent.
+    pub fn provider_add_started(&self, account: &str, model: &str) {
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .insert((account.to_string(), model.to_string()));
+    }
+
+    /// The panel's opening number, while it is up.
+    pub fn provider_instance(&self) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        m.providers_panel.as_ref().map(|panel| panel.instance)
+    }
+
+    /// The panel is now waiting on this add-and-use.
+    pub fn await_provider_switch(&self, request: u64, account: &str, model: &str) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.providers_panel.as_mut() {
+            panel.awaiting_switch = Some((request, account.to_string(), model.to_string()));
+            panel.switch_error = None;
+        }
+    }
+
+    /// The add-and-use `request` ended without a switch to wait for.
+    pub fn clear_provider_switch(&self, request: u64) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.providers_panel.as_mut() {
+            if panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request) {
+                panel.awaiting_switch = None;
+            }
+        }
+    }
+
+    /// The answer to add-and-use `request` came back. It may close the panel
+    /// (switched) or put the cursor on the added row with why (refused) only
+    /// when the panel up is the very opening that sent it, still on that
+    /// account's page and still waiting on it — any other panel, form or
+    /// draft is left exactly as it is, and the answer is only said. True when
+    /// the panel was the one.
+    pub fn provider_switch_answer(
+        &self,
+        request: u64,
+        instance: u64,
+        account: &str,
+        id: &str,
+        refused: Option<&str>,
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let waiting = m.providers_panel.as_ref().is_some_and(|panel| {
+            panel.instance == instance
+                && panel.screen == crate::providers::Screen::Detail(account.to_string())
+                && panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request)
+        });
+        if !waiting {
+            return false;
+        }
+        // Something opened on the page while it waited is the person at work —
+        // a form, the reasoning levels of another model, a model card: the
+        // answer stops being waited on and is only said, and what they are in
+        // the middle of (half-typed fields and key included) stays as it is.
+        let busy = |p: &crate::providers::Panel| {
+            p.form.is_some() || p.efforts.is_some() || p.card.is_some()
+        };
+        if let Some(panel) = m.providers_panel.as_mut().filter(|p| busy(p)) {
+            panel.awaiting_switch = None;
+            if let Some(why) = refused {
+                panel.switch_error = Some((id.to_string(), why.to_string()));
+            }
+            return false;
+        }
+        match refused {
+            None => {
+                m.providers_panel = None;
+                self.providers_secret
+                    .lock()
+                    .expect("provider secret poisoned")
+                    .clear();
+            }
+            Some(why) => {
+                let Some(panel) = m.providers_panel.as_mut() else {
+                    return false;
+                };
+                panel.awaiting_switch = None;
+                panel.switch_error = Some((id.to_string(), why.to_string()));
+                if let Some(at) = view.listed(panel).iter().position(|row| {
+                    matches!(row, crate::providers::Listed::Configured(i)
+                        if view.models().get(*i).is_some_and(|m| m.id == id))
+                }) {
+                    panel.cursor = at;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a form is up over the providers panel.
+    pub fn provider_form_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .providers_panel
+            .as_ref()
+            .is_some_and(|panel| panel.form.is_some())
     }
 
     /// Restore an unsuccessful write without asking the person to type again.
@@ -3631,8 +3885,7 @@ impl Host {
         let count = key.as_deref().unwrap_or_default().chars().count();
         match panel.form.as_mut() {
             Some(crate::providers::Form::Account(form)) => form.key_len = count,
-            Some(crate::providers::Form::Model(form)) => form.key_len = count,
-            None => {}
+            Some(crate::providers::Form::Model(_)) | None => {}
         }
         let mut m = self.moment.write().expect("moment poisoned");
         if m.providers_panel.is_some() {
@@ -3736,27 +3989,6 @@ impl Host {
             return true;
         }
 
-        if let Some(crate::providers::Form::Model(form)) = m
-            .providers_panel
-            .as_mut()
-            .and_then(|panel| panel.form.as_mut())
-        {
-            if let Some(crate::providers::Picking::Ready {
-                items,
-                query,
-                cursor,
-            }) = form.picking.as_mut()
-            {
-                let rows = crate::providers::picked_rows(items, query).len();
-                *cursor = if by < 0 {
-                    cursor.saturating_sub(by.unsigned_abs() as usize)
-                } else {
-                    cursor.saturating_add(by as usize)
-                }
-                .min(rows.saturating_sub(1));
-                return true;
-            }
-        }
         let rows = match m.providers_panel.as_ref() {
             // A form has no list to walk, and a wheel over it must not scroll
             // the conversation behind it either — it is still the panel's.
@@ -3775,23 +4007,6 @@ impl Host {
         true
     }
 
-    /// Show one account's models, as walking into it from the account list does.
-    ///
-    /// Used after an account is added: an account with no model under it cannot
-    /// be talked to, so the panel answers "what now" by standing where the one
-    /// thing left to do is.
-    pub fn walk_into_provider(&self, account: &str) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        let view = m.providers.clone();
-        let Some(panel) = m.providers_panel.as_mut() else {
-            return false;
-        };
-        panel.show(crate::providers::Tab::Models);
-        panel.drill = Some(account.to_string());
-        view.settle_cursor(panel);
-        true
-    }
-
     /// Put a paste into whatever the providers panel has the keyboard on.
     ///
     /// The composer is not on screen while the panel is up, so a paste that fell
@@ -3807,53 +4022,6 @@ impl Host {
             return false;
         };
         crate::providers::paste(panel, &mut secret, text)
-    }
-
-    /// Show a list, by index. True when it moved.
-    pub fn show_providers_tab(&self, tab: crate::providers::Tab) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        // The view first: the models list opens on an account's heading, which
-        // is not a row the cursor may rest on.
-        let view = m.providers.clone();
-        match m.providers_panel.as_mut() {
-            Some(panel) => {
-                let closed_form = panel.form.take().is_some();
-                if closed_form {
-                    self.providers_secret
-                        .lock()
-                        .expect("provider secret poisoned")
-                        .clear();
-                }
-                let moved = panel.show(tab) || closed_form;
-                view.settle_cursor(panel);
-                moved
-            }
-            None => false,
-        }
-    }
-
-    /// Which list is under the pointer, when it is on the header row.
-    pub fn providers_tab_at(&self, x: u16, y: u16) -> Option<crate::providers::Tab> {
-        let rect = *self
-            .hits
-            .lock()
-            .expect("hits poisoned")
-            .providers
-            .as_ref()?;
-        if !rect.contains(x, y) {
-            return None;
-        }
-        // Which row the tabs are on is a fact about the layout that was drawn.
-        // This panel opens with a rule, so they are **not** on its first row —
-        // the assumption that they were is why a click on a tab did nothing at
-        // all until the first real run of the panel found it.
-        let m = self.moment.read().expect("moment poisoned");
-        let vp = crate::moment::Viewport::new(rect, &m);
-        let header = crate::modules::providers::geometry(&m, &vp).header_row()?;
-        if (y - rect.y) as usize != header {
-            return None;
-        }
-        crate::modules::providers::tab_at((x - rect.x) as usize)
     }
 
     /// Action buttons share the panel's rendered geometry and keyboard dispatch.
@@ -3888,48 +4056,18 @@ impl Host {
         crate::modules::providers::geometry(&m, &vp).listed_at((y - rect.y) as usize)
     }
 
-    /// Clicking a discovered model checks it; list rows keep their Enter action.
-    pub(crate) fn provider_row_key(&self) -> crate::surface::KeyPress {
+    /// The listed row the panel's cursor is on, while no form is up.
+    pub fn providers_cursor(&self) -> Option<usize> {
         let m = self.moment.read().expect("moment poisoned");
-        let select = matches!(m.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
-            Some(crate::providers::Form::Model(form)) if form.is_batch() || matches!(form.picking, Some(crate::providers::Picking::Ready { .. })));
-        crate::surface::KeyPress::plain(if select {
-            crate::surface::Key::Char(' ')
-        } else {
-            crate::surface::Key::Enter
-        })
+        m.providers_panel
+            .as_ref()
+            .filter(|panel| panel.form.is_none())
+            .map(|panel| panel.cursor)
     }
 
     /// Point the panel at a listed row. True when it moved.
     pub fn point_providers_at(&self, row: usize) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        if let Some(crate::providers::Form::Model(form)) = m
-            .providers_panel
-            .as_mut()
-            .and_then(|panel| panel.form.as_mut())
-        {
-            if form.is_batch() {
-                let want = row.min(form.selected.len() - 1);
-                let changed = form.batch_cursor != want;
-                form.batch_cursor = want;
-                return changed;
-            }
-            if let Some(crate::providers::Picking::Ready {
-                items,
-                query,
-                cursor,
-            }) = form.picking.as_mut()
-            {
-                let want = row.min(
-                    crate::providers::picked_rows(items, query)
-                        .len()
-                        .saturating_sub(1),
-                );
-                let changed = *cursor != want;
-                *cursor = want;
-                return changed;
-            }
-        }
+        let m = &mut *self.moment.write().expect("moment poisoned");
         let rows = match m.providers_panel.as_ref() {
             Some(panel) => m.providers.listed(panel).len(),
             None => return false,
