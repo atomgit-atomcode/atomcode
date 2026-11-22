@@ -1072,6 +1072,23 @@ fn put_path(m: &mut crate::moment::Moment, picked: &str) -> bool {
     true
 }
 
+/// A contiguous insertion or deletion can edit the middle of a mention just
+/// like its end. Compare at character boundaries so paths can contain Unicode.
+fn same_mention_after_edit(previous: &str, current: &str) -> bool {
+    let (shorter, longer) = if previous.len() <= current.len() {
+        (previous, current)
+    } else {
+        (current, previous)
+    };
+    let edit_start = shorter
+        .char_indices()
+        .zip(longer.chars())
+        .find_map(|((index, left), right)| (left != right).then_some(index))
+        .unwrap_or(shorter.len());
+    let edit_len = longer.len() - shorter.len();
+    longer.get(edit_start + edit_len..) == Some(&shorter[edit_start..])
+}
+
 /// What follows a leading `$` or `¥` while a skill is being named.
 ///
 /// Only the first character has this meaning. Once whitespace appears the
@@ -8941,6 +8958,8 @@ impl Tui {
                     m.caret = at;
                     m.history_at = None;
                     m.suggestion = None;
+                    drop(m);
+                    self.refresh_menu();
                     return false;
                 }
                 // A recap of the last turn landing now would go under this new
@@ -9368,11 +9387,6 @@ impl Tui {
                 } else {
                     recall_forward(&mut m);
                 }
-                if !inside {
-                    drop(m);
-                    self.refresh_menu();
-                }
-                return false;
             }
             Action::Paste(text) => {
                 // Release the moment lock before probing the paste as a file path:
@@ -9634,6 +9648,8 @@ impl Tui {
                             }
                         }
                         m.caret = at;
+                        drop(m);
+                        self.refresh_menu();
                         return false;
                     }
                 }
@@ -10264,7 +10280,6 @@ impl Tui {
                 m.input.insert(at, '\n');
                 m.caret = at + 1;
                 m.history_at = None;
-                return false;
             }
             Action::Redraw => {
                 drop(m);
@@ -10586,59 +10601,30 @@ impl Tui {
         // declined token must yield no rows at all, or the else branch below
         // would plant them as a plain (tabless) menu — the misfire this
         // guards against.
-        let mention_declined = {
+        let mention_declined = if browsing {
+            // History temporarily replaces the input and owns the menu.
+            false
+        } else {
             let m = self.host.moment.read().expect("moment poisoned");
-            let record = self
+            let mut record = self
                 .mention_declined
                 .lock()
-                .expect("mention declined poisoned")
-                .clone();
-            // Browsing (reverse search / history) owns the keys while it
-            // lasts; the input is not being edited, so the record is left
-            // exactly as it was.
-            if browsing {
-                false
-            } else {
-                match atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
-                {
-                    Some((at, end)) => {
-                        // The very token that was dismissed, by offset AND
-                        // text: keep it held down while it stays the same
-                        // token — longer (typing) or shorter (backspace). A
-                        // different text at the same offset is a REPLACED
-                        // token, not the dismissed one.
-                        let suppressed = match record {
-                            Some((declined_at, ref declined_text))
-                                if declined_at == at
-                                    && (m.input[at..end].starts_with(declined_text)
-                                        || declined_text.starts_with(&m.input[at..end])) =>
-                            {
-                                true
-                            }
-                            _ => {
-                                // No record, a different token, or a replaced
-                                // token: the old decline must not suppress —
-                                // the record expires.
-                                *self
-                                    .mention_declined
-                                    .lock()
-                                    .expect("mention declined poisoned") = None;
-                                false
-                            }
-                        };
-                        suppressed
-                    }
-                    // No token at the caret: the caret has left any declined
-                    // one, so the record expires.
-                    None => {
-                        *self
-                            .mention_declined
-                            .lock()
-                            .expect("mention declined poisoned") = None;
-                        false
-                    }
+                .expect("mention declined poisoned");
+            *record = record.take().and_then(|(declined_at, mut previous)| {
+                let (at, end) =
+                    atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)?;
+                let current = &m.input[at..end];
+                if at != declined_at || !same_mention_after_edit(&previous, current) {
+                    return None;
                 }
-            }
+                // Carry the latest spelling into the next edit.
+                if previous != current {
+                    previous.clear();
+                    previous.push_str(current);
+                }
+                Some((at, previous))
+            });
+            record.is_some()
         };
         let menu = match prefix {
             Some(rest) => {
@@ -10745,6 +10731,7 @@ impl Tui {
                     })
                     .unwrap_or_default()
             }
+            None if browsing || mention_declined => Vec::new(),
             None => {
                 let (typed, caret, cwd) = {
                     let m = self.host.moment.read().expect("moment poisoned");
@@ -10754,8 +10741,8 @@ impl Tui {
                 // the middle of a sentence is a mention too. The classic
                 // screen's rule, from the same place.
                 match atomcode_capabilities::file_index::detect_at_mention(&typed, caret) {
-                    Some(token) if !mention_declined => self.mention_rows(&cwd, &token),
-                    _ => Vec::new(),
+                    Some(token) => self.mention_rows(&cwd, &token),
+                    None => Vec::new(),
                 }
             }
         };
@@ -18980,6 +18967,67 @@ mod newline_settings_tests {
 
 #[cfg(test)]
 mod session_mention_tests {
+    fn dismiss_mention(tui: &super::Tui, input: &str, caret: usize) {
+        {
+            let mut moment = tui.host.moment.write().unwrap();
+            moment.input = input.into();
+            moment.caret = caret;
+        }
+        tui.refresh_menu();
+        assert!(tui.host.menu_open());
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        assert!(!tui.host.menu_open());
+    }
+
+    #[test]
+    fn editing_inside_a_dismissed_mention_keeps_the_menu_closed() {
+        use super::Action;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        dismiss_mention(&tui, "@src", "@sr".len());
+        tui.act(Action::Insert('中'), &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "@sr中c");
+        assert!(!host.menu_open());
+        tui.act(Action::DeleteForward, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "@sr中");
+        assert!(!host.menu_open());
+        tui.act(Action::Backspace, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "@sr");
+        assert!(!host.menu_open());
+    }
+
+    #[test]
+    fn a_line_break_expires_the_dismissal_before_backspace() {
+        use super::Action;
+
+        for (input, newline) in [("@src", Action::Newline), ("@src\\", Action::Submit)] {
+            let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+            dismiss_mention(&tui, input, input.len());
+            tui.act(newline, &tui.client);
+            assert_eq!(host.moment.read().unwrap().input, "@src\n");
+            assert!(!host.menu_open());
+            tui.act(Action::Backspace, &tui.client);
+            assert_eq!(host.moment.read().unwrap().input, "@src");
+            assert!(host.menu_open());
+        }
+    }
+
+    #[test]
+    fn moving_to_another_input_row_expires_the_dismissal() {
+        use super::Action;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        dismiss_mention(&tui, "@src\nnotes", "@src".len());
+        tui.act(Action::CaretDown, &tui.client);
+        assert!(!host.menu_open());
+        tui.act(Action::CaretUp, &tui.client);
+        assert_eq!(host.moment.read().unwrap().caret, "@src".len());
+        assert!(host.menu_open());
+    }
+
     #[test]
     fn picking_a_session_keeps_surrounding_text_and_closes_completion() {
         let mut moment = crate::moment::Moment::default();
