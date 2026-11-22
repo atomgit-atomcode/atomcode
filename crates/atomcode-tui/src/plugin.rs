@@ -1203,12 +1203,15 @@ async fn answer_prompts(
     }
 }
 
-/// The least time between two questions about the allowance.
+/// The least time between two questions about the allowance — per asker.
 ///
 /// The figure only moves when a turn spends something, and the question costs a
 /// round trip on the account — so it is asked after a turn, on the idle beat
 /// while a badge is actually on the row (`tick_beat`), and then held off for
-/// this long. The number is the one `atomcode-tuix` settled on.
+/// this long. The turn-end ask and the idle-beat re-ask keep separate stamps
+/// (`check_allowance` / `reask_allowance_on_idle`): an idle beat must not
+/// consume the slot a turn's own refresh needs. The number is the one
+/// `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
@@ -18441,6 +18444,38 @@ mod allowance_switch_tests {
             .clone()
             .expect("the badge stays after a refresh");
         assert_eq!(now.percent, 10, "the row follows a mid-window refresh");
+        // A refresh that KEEPS the figure near spent must keep the badge on
+        // the row — the visible-badge path, not only the disappear path.
+        // The second ask rides the turn-end slot: the idle one is spent.
+        let still_visible = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "23:24".into(),
+            resets_in_seconds: 8_000,
+            window_seconds: 18_000,
+            used_percent: Some(85),
+            calls_used: None,
+            call_limit: None,
+        }];
+        tui.check_allowance();
+        let ask = pending.recv().await.unwrap();
+        ask.send(reply(still_visible)).unwrap();
+        tokio::task::yield_now().await;
+        let now = host
+            .moment
+            .read()
+            .unwrap()
+            .allowance
+            .clone()
+            .expect("a near-spent refresh keeps the badge");
+        assert_eq!(
+            now.percent, 85,
+            "the row follows a refresh that stays visible"
+        );
+        assert!(crate::modules::status::row_showing(
+            Some(&now),
+            host.moment.read().unwrap().now
+        ));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

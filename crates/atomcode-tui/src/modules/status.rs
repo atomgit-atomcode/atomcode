@@ -1063,6 +1063,12 @@ mod tests {
         assert!(row_showing(Some(&left(99, None)), now));
         assert!(row_showing(Some(&left(80, None)), now));
         assert!(!row_showing(Some(&left(79, None)), now));
+        // The boundary lands on the hidden side: a window that resets THIS
+        // instant is no longer alive, so the row says nothing.
+        assert!(!row_showing(
+            Some(&left(99, Some(crate::moment::Timestamp::millis(1_000)))),
+            now
+        ));
         assert!(!row_showing(None, now));
         // The window has turned over: the row says nothing, and the idle beat
         // must not keep asking about a badge that is no longer on it.
