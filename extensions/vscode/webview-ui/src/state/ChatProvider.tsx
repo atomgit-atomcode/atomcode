@@ -327,6 +327,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             type: 'PERMISSION_RESPONSE_RESULT',
             id: msg.id,
             approvalId: msg.approvalId,
+            expired: msg.expired,
             success: msg.success,
             message: msg.message,
           });

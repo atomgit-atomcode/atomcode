@@ -395,11 +395,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Manage providers: add, edit, delete, or set the global default. Press Esc to cancel.\n".into(),
         Msg::ProviderWizardCancelled =>
             "(cancelled)".into(),
-        Msg::ProviderMenuAdd => "Add".into(),
         Msg::ProviderMenuAddDesc => "Create a provider configuration".into(),
         Msg::ProviderMenuEdit => "Edit".into(),
         Msg::ProviderMenuEditDesc => "Modify an existing provider configuration".into(),
-        Msg::ProviderMenuDelete => "Delete".into(),
         Msg::ProviderMenuDeleteDesc => "Delete an existing provider configuration".into(),
         Msg::ProviderMenuSetDefault => "Set global default".into(),
         Msg::ProviderMenuSetDefaultDesc =>

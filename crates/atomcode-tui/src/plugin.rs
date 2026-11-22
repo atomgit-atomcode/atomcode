@@ -206,6 +206,29 @@ pub struct AgentClient {
     receipts: AtomicU64,
     history_sink: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     history_enabled: AtomicBool,
+    /// The one add that may also take the session to its model, while the
+    /// person has no model to talk to: the request that claimed it, by number.
+    ///
+    /// Here rather than on the providers panel, which can be closed and opened
+    /// again while that add is still on its way: the claim has to outlive the
+    /// panel, and a later explicit switch has to be able to take it back.
+    auto_use: Mutex<AutoUse>,
+    auto_use_requests: AtomicU64,
+}
+
+/// Where the one add-and-use stands ([`AgentClient::claim_auto_use`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AutoUse {
+    /// An add may claim it.
+    #[default]
+    Free,
+    /// This request claimed it when it was sent; its write is on its way.
+    Held(u64),
+    /// This request's write landed and its switch is running.
+    Switching(u64),
+    /// A switch went through (this one, or one the person made): no other
+    /// add claims one until the person is without a model again.
+    Spent,
 }
 
 struct Link {
@@ -374,6 +397,64 @@ impl AgentClient {
                 view.selection = selection;
                 views.remark = true;
             }
+        }
+    }
+
+    /// Whether an add may still claim the switch: nothing holds it, and no
+    /// switch since the person last had no model has used it up.
+    pub(crate) fn auto_use_free(&self) -> bool {
+        *self.auto_use.lock().expect("client poisoned") == AutoUse::Free
+    }
+
+    /// Claim the switch for a new request, answering with its number.
+    pub(crate) fn claim_auto_use(&self) -> u64 {
+        let request = self.auto_use_requests.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.auto_use.lock().expect("client poisoned") = AutoUse::Held(request);
+        request
+    }
+
+    /// Take the claim for `request`'s switch: true only when it still holds
+    /// it. Taken is not free — while the switch runs, and after it succeeds,
+    /// no other add may claim one.
+    pub(crate) fn take_auto_use(&self, request: u64) -> bool {
+        let mut claim = self.auto_use.lock().expect("client poisoned");
+        if *claim == AutoUse::Held(request) {
+            *claim = AutoUse::Switching(request);
+            return true;
+        }
+        false
+    }
+
+    /// `request`'s switch went through: the claim is used up.
+    pub(crate) fn auto_use_switched(&self, request: u64) {
+        let mut claim = self.auto_use.lock().expect("client poisoned");
+        if *claim == AutoUse::Switching(request) {
+            *claim = AutoUse::Spent;
+        }
+    }
+
+    /// `request` failed — its write or its switch: let go of the claim if it is
+    /// still its own, never another request's, so the person can try again.
+    pub(crate) fn release_auto_use(&self, request: u64) {
+        let mut claim = self.auto_use.lock().expect("client poisoned");
+        if matches!(*claim, AutoUse::Held(r) | AutoUse::Switching(r) if r == request) {
+            *claim = AutoUse::Free;
+        }
+    }
+
+    /// The person chose a model themselves: no add still on its way may switch
+    /// the session away from it afterwards. The add still lands, and the claim
+    /// is used up — they have a model now.
+    pub(crate) fn revoke_auto_use(&self) {
+        *self.auto_use.lock().expect("client poisoned") = AutoUse::Spent;
+    }
+
+    /// The person has a model to talk to again: a used-up claim is free for
+    /// the next time they have none.
+    pub(crate) fn settle_auto_use(&self) {
+        let mut claim = self.auto_use.lock().expect("client poisoned");
+        if *claim == AutoUse::Spent {
+            *claim = AutoUse::Free;
         }
     }
 
@@ -1311,6 +1392,98 @@ impl ApprovalInput {
     }
 }
 
+/// Switch the session to `id`, then set the reasoning level — the same two
+/// commands a person would type, each answered on its own.
+///
+/// Two dispatches rather than one `/model <id> <level>`: that command answers
+/// for both halves at once, so a refused level reads as a refused switch while
+/// the session is already on the new model. The level is the draft's, else
+/// `default` — explicit either way, so switching never asks a second time.
+async fn switch_and_set_level(
+    commands: &crate::command::Commands,
+    ctx: &Context,
+    id: &str,
+    effort: Option<&str>,
+) -> SwitchResult {
+    use crate::command::Outcome;
+    let model = match commands.dispatch(&format!("/model {id}"), ctx).await {
+        Outcome::Refused(why) => Err(why),
+        Outcome::Said(said) => Ok(said),
+        // The switch went through and the command offered the model's levels:
+        // the level is set below, so only its words are kept — the host's note
+        // with them, which would otherwise be lost.
+        Outcome::Do(Action::PickEffort { note, .. }) => Ok(match note {
+            Some(note) => format!("{}\n{note}", t(Msg::ModelSet { wanted: id })),
+            None => t(Msg::ModelSet { wanted: id }).into_owned(),
+        }),
+        _ => Ok(t(Msg::ModelSet { wanted: id }).into_owned()),
+    };
+    if model.is_err() {
+        return SwitchResult {
+            model,
+            effort: None,
+        };
+    }
+    let level = effort.unwrap_or("default");
+    let effort = match commands.dispatch(&format!("/effort {level}"), ctx).await {
+        Outcome::Refused(why) => Err(why),
+        Outcome::Said(said) => Ok(said),
+        _ => Ok(String::new()),
+    };
+    SwitchResult {
+        model,
+        effort: Some(effort),
+    }
+}
+
+/// What to say about a switch: both halves, and whether it is a refusal.
+///
+/// A refused level after a good switch is said after what the switch said —
+/// its words left as they are, alias and host note included — as one more
+/// line about the level alone, so the two never name the model twice.
+pub(crate) fn switch_said(result: &SwitchResult) -> (String, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut refused = false;
+    match &result.model {
+        Ok(said) => lines.push(said.clone()),
+        Err(why) => {
+            lines.push(why.clone());
+            refused = true;
+        }
+    }
+    match &result.effort {
+        Some(Ok(said)) => lines.push(said.clone()),
+        Some(Err(why)) => {
+            lines.push(t(Msg::ProviderEffortFailed { why }).into_owned());
+            refused = true;
+        }
+        None => {}
+    }
+    lines.retain(|line| !line.is_empty());
+    (lines.join("\n"), refused)
+}
+
+/// The add-and-use an add carries: which claim it took, from which opening of
+/// the panel, for which session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderClaim {
+    request: u64,
+    instance: u64,
+    session: String,
+}
+
+/// What switching to a just-added model said, in its two halves: the switch,
+/// and the reasoning level set after it. Kept apart because a refused level
+/// is not a refused switch — the session is on the new model either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SwitchResult {
+    /// What switching said (the host's note included), or why it was refused.
+    pub model: Result<String, String>,
+    /// What setting the level said (its note included), or why it was refused.
+    /// `None` when the switch itself was refused.
+    pub effort: Option<Result<String, String>>,
+}
+
 enum Wake {
     History {
         session: String,
@@ -1330,6 +1503,17 @@ enum Wake {
         before: Option<crate::providers::Panel>,
         after: Option<crate::providers::Panel>,
         session: String,
+        /// The account's generation when the add was sent
+        /// (`Host::provider_generation`).
+        generation: u64,
+        claim: Option<ProviderClaim>,
+    },
+    /// An add-and-use's switch came back.
+    ProviderSwitched {
+        claim: ProviderClaim,
+        account: String,
+        id: String,
+        result: SwitchResult,
     },
     SessionReferences,
     Foreground {
@@ -1805,6 +1989,10 @@ pub struct Tui {
     /// How many provider checks have been started, so one that lands after a
     /// later save is dropped rather than said (see [`Tui::say_when_probed`]).
     probes: Arc<std::sync::atomic::AtomicU64>,
+    /// The selection id the last model write landed under, for the switch an
+    /// add-and-use makes after it: the id the port answered with, never one
+    /// looked up again by account and name.
+    last_added: Mutex<Option<String>>,
     /// A foreground switch chosen through Team → background panel, until the host
     /// confirms which session replaced the current one.
     pending_background_switch: Mutex<Option<PendingBackgroundSwitch>>,
@@ -2626,34 +2814,25 @@ impl UserInterface for Tui {
                 }
                 Wake::ProviderModelsEnriched {
                     original,
-                    mut drafts,
+                    drafts,
                     before,
                     after,
                     session,
+                    generation,
+                    claim,
                 } => {
-                    use crate::providers::Step;
-                    let still_here = self.client.session() == session
-                        && self
-                            .host
-                            .moment
-                            .read()
-                            .expect("moment poisoned")
-                            .providers_panel
-                            == after;
-                    if !still_here {
-                        for draft in &mut drafts {
-                            draft.use_now = false;
-                        }
-                    }
-                    let step = match original {
-                        Step::SaveModel { id: None, draft } => Step::SaveModel {
-                            id: None,
-                            draft: drafts.pop().unwrap_or(draft),
-                        },
-                        Step::SaveModels { .. } => Step::SaveModels { drafts },
-                        step => step,
-                    };
-                    self.finish_provider_step(step, before.filter(|_| still_here));
+                    self.models_enriched(
+                        original, drafts, before, after, session, generation, claim,
+                    );
+                    stale = true;
+                }
+                Wake::ProviderSwitched {
+                    claim,
+                    account,
+                    id,
+                    result,
+                } => {
+                    self.provider_switched(&claim, &account, &id, result);
                     stale = true;
                 }
                 // Most of what arrives here moves nothing on the screen: a
@@ -3341,16 +3520,18 @@ impl UserInterface for Tui {
                                     stale = true;
                                     continue;
                                 }
-                                if let Some(tab) = self.host.providers_tab_at(x, y) {
-                                    let _ = self.host.show_providers_tab(tab);
-                                    stale = true;
-                                    continue;
-                                }
-                                // Discovery rows toggle their checkboxes; other
-                                // rows use the same Enter path as the keyboard.
+                                // A press on a row selects it; a press on the
+                                // row already selected is its Enter — the same
+                                // path as the keyboard's, so a click and a key
+                                // cannot come to mean different things.
                                 if let Some(row) = self.host.providers_row_at(x, y) {
-                                    let _ = self.host.point_providers_at(row);
-                                    self.run_providers_key(self.host.provider_row_key());
+                                    if self.host.providers_cursor() == Some(row) {
+                                        self.run_providers_key(crate::surface::KeyPress::plain(
+                                            crate::surface::Key::Enter,
+                                        ));
+                                    } else {
+                                        let _ = self.host.point_providers_at(row);
+                                    }
                                     stale = true;
                                     continue;
                                 }
@@ -4567,16 +4748,19 @@ impl Tui {
             })
             .or(wire);
         let view = rows.with_current(live.as_deref());
-        self.host.show_providers(view)
+        let moved = self.sync_provider_panel();
+        self.host.show_providers(view) || moved
     }
 
     /// Run one key against the providers panel, and act on what it asked for.
     ///
     /// **True when a frame is owed.**
     fn run_providers_key(&self, press: crate::surface::KeyPress) -> bool {
-        let before = if press.key == crate::surface::Key::Enter
-            || press == crate::surface::KeyPress::ctrl('s')
-        {
+        // Only a form's write is put back when it fails, so the person need not
+        // type it again. An add from a detail page keeps its failure on its own
+        // row instead: putting back the panel as it stood before the press
+        // would undo every cursor move made while the write was on its way.
+        let before = if press.key == crate::surface::Key::Enter && self.host.provider_form_open() {
             self.host
                 .moment
                 .read()
@@ -4594,6 +4778,10 @@ impl Tui {
                     Some(crate::providers::Form::Account(form)) if form.editing.is_none()
                 )
         };
+        // Whether this Enter is the add-and-use is the host's to say: the
+        // person may have signed in, or another add claimed it, since the
+        // panel last looked.
+        self.sync_provider_panel();
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
             if returns_to_setup {
@@ -4602,6 +4790,30 @@ impl Tui {
             return changed;
         };
         use crate::providers::Step;
+        // The add-and-use claims the switch the moment it is sent — not when its
+        // write lands — so which model ends up in use does not hang on which of
+        // two adds' metadata came back first.
+        let claim = match &step {
+            Step::SaveModels { drafts } if drafts.len() == 1 && drafts[0].use_now => {
+                let draft = &drafts[0];
+                let request = self.client.claim_auto_use();
+                self.host
+                    .await_provider_switch(request, &draft.account, &draft.model);
+                Some(ProviderClaim {
+                    request,
+                    instance: self.host.provider_instance().unwrap_or_default(),
+                    session: self.client.session(),
+                })
+            }
+            _ => None,
+        };
+        // A server row's add is in flight from here: recorded on the host, so a
+        // panel closed and opened again still says 添加中… and refuses a second.
+        if let Step::SaveModels { drafts } = &step {
+            for draft in drafts {
+                self.host.provider_add_started(&draft.account, &draft.model);
+            }
+        }
         let drafts = match &step {
             Step::SaveModel { id: None, draft } => std::slice::from_ref(draft),
             Step::SaveModels { drafts } => drafts.as_slice(),
@@ -4623,6 +4835,7 @@ impl Tui {
                     .providers_panel
                     .clone();
                 let session = self.client.session();
+                let generation = self.host.provider_generation(&drafts[0].account);
                 tokio::spawn(async move {
                     let drafts = job.await;
                     let _ = wake.send(Wake::ProviderModelsEnriched {
@@ -4631,20 +4844,165 @@ impl Tui {
                         before,
                         after,
                         session,
+                        generation,
+                        claim,
                     });
                 });
                 return true;
             }
         }
-        self.finish_provider_step(step, before);
+        self.finish_provider_step(step, before, claim);
         true
+    }
+
+    /// An add-and-use was written: switch to it — when the claim it took is
+    /// still its own and the session is the one it was sent for. A claim taken
+    /// back by an explicit switch since leaves the model saved and the session
+    /// where the person put it.
+    fn auto_use_after_add(
+        &self,
+        claim: ProviderClaim,
+        account: String,
+        id: String,
+        effort: Option<String>,
+    ) {
+        self.refresh_providers();
+        let switch = Some(id).filter(|_| {
+            self.client.session() == claim.session && self.client.take_auto_use(claim.request)
+        });
+        let (Some(id), Some(ctx), Some(keys)) = (
+            switch,
+            self.ctx.lock().expect("ctx poisoned").clone(),
+            self.wake.lock().expect("wake poisoned").clone(),
+        ) else {
+            self.client.release_auto_use(claim.request);
+            self.host.clear_provider_switch(claim.request);
+            return;
+        };
+        let commands = self.host.commands.clone();
+        tokio::spawn(async move {
+            let result = switch_and_set_level(&commands, &ctx, &id, effort.as_deref()).await;
+            let _ = keys.send(Wake::ProviderSwitched {
+                claim,
+                account,
+                id,
+                result,
+            });
+        });
+    }
+
+    /// Put what the host knows back on the panel: whether Enter is the
+    /// add-and-use, and which adds are in flight. A claim used up while the
+    /// person had no model is free again once they have one.
+    fn sync_provider_panel(&self) -> bool {
+        if !self.host.provider_recovering() {
+            self.client.settle_auto_use();
+        }
+        self.host
+            .sync_provider_auto_use(self.client.auto_use_free())
+    }
+
+    /// An add-and-use's switch came back: say both halves, and — only for the
+    /// very panel that is waiting on it — close it (switched) or rest on the
+    /// added row with why (refused), where Enter tries the switch once more.
+    fn provider_switched(
+        &self,
+        claim: &ProviderClaim,
+        account: &str,
+        id: &str,
+        result: SwitchResult,
+    ) {
+        let refused = result.model.as_ref().err().map(String::as_str);
+        // The claim's terminal state: used up when the switch went through,
+        // free again when it was refused — and only if it is still this one's.
+        match refused {
+            None => self.client.auto_use_switched(claim.request),
+            Some(_) => self.client.release_auto_use(claim.request),
+        }
+        self.host
+            .provider_switch_answer(claim.request, claim.instance, account, id, refused);
+        let (said, refused) = switch_said(&result);
+        if !said.is_empty() {
+            self.host.say(said, refused);
+        }
+        self.refresh_providers();
+    }
+
+    /// An add's metadata came back off the frame: write it — unless what it
+    /// was aimed at has changed since.
+    fn models_enriched(
+        &self,
+        original: crate::providers::Step,
+        mut drafts: Vec<crate::providers::ModelDraft>,
+        before: Option<crate::providers::Panel>,
+        after: Option<crate::providers::Panel>,
+        session: String,
+        generation: u64,
+        claim: Option<ProviderClaim>,
+    ) {
+        use crate::providers::Step;
+        // The connection was saved again or the account deleted while the
+        // metadata was on its way: the add was aimed at a connection that no
+        // longer exists — and the port would re-create a deleted account to
+        // hold it. Dropped, not written. Closing the panel is not a change: an
+        // add the person confirmed still lands.
+        let account = drafts
+            .first()
+            .map(|d| d.account.clone())
+            .unwrap_or_default();
+        if self.host.provider_generation(&account) != generation {
+            if let Some(claim) = &claim {
+                self.client.release_auto_use(claim.request);
+                self.host.clear_provider_switch(claim.request);
+            }
+            self.host
+                .say(t(Msg::ProviderConnectionChanged).into_owned(), true);
+            return;
+        }
+        // Another session on screen: the write still lands, but it does not
+        // take that session to the model.
+        if self.client.session() != session {
+            for draft in &mut drafts {
+                draft.use_now = false;
+            }
+        }
+        // A form is put back on failure only when the panel is still the one
+        // that sent it.
+        let still_here = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .providers_panel
+            == after;
+        let step = match original {
+            Step::SaveModel { id: None, draft } => Step::SaveModel {
+                id: None,
+                draft: drafts.pop().unwrap_or(draft),
+            },
+            Step::SaveModels { .. } => Step::SaveModels { drafts },
+            step => step,
+        };
+        self.finish_provider_step(step, before.filter(|_| still_here), claim);
     }
 
     fn finish_provider_step(
         &self,
         step: crate::providers::Step,
         before: Option<crate::providers::Panel>,
+        claim: Option<ProviderClaim>,
     ) {
+        // An add-and-use writes like any add; the switch after it is decided by
+        // the claim (`auto_use_after_add`), not by the draft.
+        let (step, switch_to) = match (step, &claim) {
+            (crate::providers::Step::SaveModels { mut drafts }, Some(_)) if drafts.len() == 1 => {
+                let draft = &mut drafts[0];
+                let wanted = (draft.account.clone(), draft.effort.clone());
+                draft.use_now = false;
+                (crate::providers::Step::SaveModels { drafts }, Some(wanted))
+            }
+            (step, _) => (step, None),
+        };
         let key = match &step {
             crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
             crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
@@ -4659,7 +5017,38 @@ impl Tui {
                 | crate::providers::Step::SaveModel { .. }
                 | crate::providers::Step::SaveModels { .. }
         );
-        match self.apply_provider_step(step) {
+        // An add from a server row: its in-flight mark is cleared however the
+        // write ends, and a failure stays on the row to be tried again.
+        let added = match &step {
+            crate::providers::Step::SaveModels { drafts } if drafts.len() == 1 => {
+                Some((drafts[0].account.clone(), drafts[0].model.clone()))
+            }
+            _ => None,
+        };
+        self.last_added.lock().expect("last added poisoned").take();
+        let outcome = self.apply_provider_step(step);
+        if let Some((account, model)) = &added {
+            let settled = match &outcome {
+                Ok(_) => Ok(()),
+                Err(why) => Err(why.clone()),
+            };
+            self.host.provider_add_settled(account, model, settled);
+        }
+        if let (Some(claim), Some((account, effort))) = (claim, switch_to) {
+            // The id the write answered with — not one looked up again by
+            // account and name, which a hand-edited file could make ambiguous.
+            let id = self.last_added.lock().expect("last added poisoned").take();
+            match (&outcome, id) {
+                (Ok(_), Some(id)) => self.auto_use_after_add(claim, account, id, effort),
+                // Not written, so nothing to switch to: let go of the claim,
+                // and only if it is still this add's.
+                _ => {
+                    self.client.release_auto_use(claim.request);
+                    self.host.clear_provider_switch(claim.request);
+                }
+            }
+        }
+        match outcome {
             Ok(Some(said)) => self.host.say(&said, false),
             Ok(None) => {}
             Err(why) => {
@@ -4738,24 +5127,23 @@ impl Tui {
         // Listing an endpoint's models writes nothing, so it is not followed by
         // a reload: the answer fills the picker the form put up, off the frame.
         if let Step::Discover { account } = step {
-            let Some(request) = self.host.provider_discovery_id() else {
+            let Some(request) = self.host.provider_listing_request(&account) else {
                 return Ok(None);
             };
             let Some(listing) = port.discover(&account) else {
-                let said = self.host.providers_discovered(
+                self.host.providers_discovered(
                     &account,
                     request,
                     Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
                 );
-                return said.map_or(Ok(None), Err);
+                return Ok(None);
             };
             let host = self.host.clone();
             let keys = self.wake.lock().expect("wake poisoned").clone();
             tokio::spawn(async move {
                 let listed = listing.await;
-                if let Some(said) = host.providers_discovered(&account, request, listed) {
-                    host.say(&said, true);
-                }
+                // A failure is drawn on the page, where the person is looking.
+                host.providers_discovered(&account, request, listed);
                 if let Some(keys) = keys {
                     let _ = keys.send(Wake::Fact);
                 }
@@ -4778,6 +5166,11 @@ impl Tui {
             } => {
                 port.edit_account(&id, &draft)?;
                 check = Some((id.clone(), None));
+                if let Some(step) = self.host.provider_account_changed(&id, false) {
+                    if let Err(why) = self.apply_provider_step(step) {
+                        self.host.say(&why, true);
+                    }
+                }
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveAccount {
@@ -4787,28 +5180,14 @@ impl Tui {
             } => {
                 let id = port.add_account(&draft)?;
                 check = Some((id.clone(), None));
-                // Straight into its model list: an account with no model under
-                // it cannot be talked to, so "what now" is answered by showing
-                // the one thing left to do.
+                // Straight into its page: an account with no model under it
+                // cannot be talked to, so "what now" is answered by standing
+                // where the models to add are listed.
                 self.host.show_providers(port.rows());
-                self.host.walk_into_provider(&id);
-                if self.host.connect_provider_models(&id) {
-                    if let Some(listed) = listed {
-                        if let Some(request) = self.host.provider_discovery_id() {
-                            if let Some(why) =
-                                self.host.providers_discovered(&id, request, Ok(listed))
-                            {
-                                self.host.say(&why, true);
-                            }
-                        }
-                    } else if let Err(why) = self.apply_provider_step(Step::Discover {
-                        account: id.clone(),
-                    }) {
+                if let Some(step) = self.host.enter_provider_detail(&id, listed) {
+                    if let Err(why) = self.apply_provider_step(step) {
                         self.host.say(&why, true);
                     }
-                    // Saving a new credential does not change the live model.
-                    // The selected model is activated through /model below.
-                    return Ok(Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned()));
                 }
                 Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned())
             }
@@ -4821,51 +5200,34 @@ impl Tui {
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveModel { id: None, draft } => {
+                let first = !port
+                    .rows()
+                    .models()
+                    .iter()
+                    .any(|m| m.account == draft.account);
                 let id = port.add_model(&draft)?;
-                if draft.use_now {
-                    self.refresh_providers();
-                    // Supply an explicit effort (or default) so /model does not
-                    // ask the person to choose a second time.
-                    if let Err(error) = self.apply_provider_step(Step::Use {
-                        id: id.clone(),
-                        effort: Some(draft.effort.clone().unwrap_or_else(|| "default".into())),
-                    }) {
-                        // The model is already saved. Keep it available to pick
-                        // again instead of restoring an add form that would duplicate it.
-                        self.host.say(
-                            t(Msg::ProviderSavedSwitchFailed {
-                                id: &id,
-                                error: &error,
-                            })
-                            .into_owned(),
-                            true,
-                        );
-                        return Ok(None);
-                    }
-                    return Ok(Some(
-                        t(Msg::ProviderSavedSwitching { id: &id }).into_owned(),
-                    ));
+                // Only an account's first model is checked: the account itself
+                // was checked when it was saved, and a run of adds on its page
+                // would otherwise send one probe per model.
+                if first {
+                    check = Some((draft.account.clone(), Some(id.clone())));
                 }
-                check = Some((draft.account.clone(), Some(id.clone())));
+                *self.last_added.lock().expect("last added poisoned") = Some(id.clone());
                 Some(t(Msg::ProviderAdded { id: &id }).into_owned())
             }
+            // A server row's add: through the write that refuses a model the
+            // account already has, so the same row sent twice — from a panel
+            // closed and opened again while the first was on its way — cannot
+            // leave two entries for one model.
             Step::SaveModels { drafts } => {
+                let first = drafts
+                    .first()
+                    .is_some_and(|d| !port.rows().models().iter().any(|m| m.account == d.account));
                 let ids = port.add_models(&drafts)?;
-                self.refresh_providers();
-                if let Some((draft, id)) = drafts.iter().zip(&ids).find(|(draft, _)| draft.use_now)
-                {
-                    if let Err(error) = self.apply_provider_step(Step::Use {
-                        id: id.clone(),
-                        effort: Some(draft.effort.clone().unwrap_or_else(|| "default".into())),
-                    }) {
-                        self.host.say(
-                            t(Msg::ProviderSavedSwitchFailed { id, error: &error }).into_owned(),
-                            true,
-                        );
-                        return Ok(None);
-                    }
-                    return Ok(Some(t(Msg::ProviderSavedSwitching { id }).into_owned()));
+                if let (true, Some(draft), Some(id)) = (first, drafts.first(), ids.first()) {
+                    check = Some((draft.account.clone(), Some(id.clone())));
                 }
+                *self.last_added.lock().expect("last added poisoned") = ids.first().cloned();
                 Some(
                     t(Msg::ProviderAdded {
                         id: &ids.join(", "),
@@ -4875,6 +5237,7 @@ impl Tui {
             }
             Step::DeleteAccount { id } => {
                 port.delete_account(&id)?;
+                self.host.provider_account_changed(&id, true);
                 Some(t(Msg::ProviderDeletedWithModels { id: &id }).into_owned())
             }
             Step::DeleteModel { id } => {
@@ -12247,6 +12610,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             opener: Arc::new(atomcode_capabilities::tools::LocalOpener),
             presses: Arc::default(),
             probes: Arc::default(),
+            last_added: Mutex::new(None),
             pending_background_switch: Mutex::new(None),
             background_switching: AtomicU64::new(0),
             background_switch_requests: AtomicU64::new(0),
@@ -14683,6 +15047,11 @@ mod provider_probe_tests {
         saved: std::sync::atomic::AtomicBool,
         fail: std::sync::atomic::AtomicBool,
         models: std::sync::Mutex<Vec<ModelDraft>>,
+        /// Fill in model metadata off the frame, the way a port that asks a
+        /// catalog does — so an add is still on its way when the test acts.
+        slow: std::sync::atomic::AtomicBool,
+        /// How many checks the screen asked for.
+        probes: std::sync::atomic::AtomicUsize,
     }
 
     impl Providers for Connects {
@@ -14700,7 +15069,28 @@ mod provider_probe_tests {
                     has_key: configured,
                     managed: false,
                 }],
-                vec![],
+                // What it was given, so an added model is on the page.
+                self.models
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|draft| crate::providers::ModelRow {
+                        id: format!("deepseek/{}", draft.model),
+                        account: "deepseek".into(),
+                        model: draft.model.clone(),
+                        window: draft.window.unwrap_or(128_000),
+                        max_tokens: draft.max_tokens,
+                        vision: draft.vision,
+                        effort: draft.effort.clone(),
+                        levels: draft.levels.clone().unwrap_or_default(),
+                        current: false,
+                        managed: false,
+                        alias: None,
+                        desc: None,
+                        alias_en: None,
+                        desc_en: None,
+                    })
+                    .collect(),
                 vec![Protocol {
                     id: "openai-compatible".into(),
                     label: "OpenAI".into(),
@@ -14744,6 +15134,24 @@ mod provider_probe_tests {
         fn delete_model(&self, _: &str) -> Result<(), String> {
             Ok(())
         }
+        fn probe(&self, _: &str, _: Option<&str>) -> Option<ProbeFuture> {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Box::pin(async { (String::new(), true) }))
+        }
+        fn enrich_models(
+            &self,
+            drafts: &[ModelDraft],
+        ) -> Option<crate::providers::EnrichModelsFuture> {
+            if !self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            let drafts = drafts.to_vec();
+            Some(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                drafts
+            }))
+        }
         fn discover(&self, _: &str) -> Option<crate::providers::DiscoverFuture> {
             Some(Box::pin(async {
                 Ok(vec![crate::providers::Discovered {
@@ -14765,86 +15173,650 @@ mod provider_probe_tests {
         m.providers_panel = Some(crate::providers::Panel::new());
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_connection_only_needs_a_key_and_a_model_and_sends_one_switch() {
-        let port = Arc::new(Connects::default());
-        let (host, tui, mut woken) = screen_with(port.clone());
-        open_connect(&host, &port);
-        tui.run_providers_key(KeyPress::plain(Key::Enter));
-        assert!(host.providers_paste("sk-private"));
-        tui.run_providers_key(KeyPress::plain(Key::Enter));
-        checked(&mut woken).await;
-        tui.run_providers_key(KeyPress::plain(Key::Enter)); // pick
-        tui.run_providers_key(KeyPress::plain(Key::Enter)); // connect and use
-        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
-            panic!("switch");
-        };
-        assert_eq!(line, "/model deepseek/flash high");
-        assert!(!host.providers_open());
-        let models = port.models.lock().unwrap();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].vision, Some(true));
-        assert_eq!(models[0].window, Some(1048576));
-        assert_eq!(models[0].max_tokens, Some(393216));
-        assert_eq!(
-            models[0].levels.as_deref(),
-            Some(["low".into(), "high".into(), "max".into()].as_slice())
-        );
-        assert!(woken.try_recv().is_err());
+    fn flash() -> crate::providers::Discovered {
+        crate::providers::Discovered {
+            id: "flash".into(),
+            window: Some(1048576),
+            ..Default::default()
+        }
     }
 
+    fn panel(host: &Host) -> crate::providers::Panel {
+        host.moment
+            .read()
+            .unwrap()
+            .providers_panel
+            .clone()
+            .expect("the panel is up")
+    }
+
+    /// The row the cursor is on, as the panel lists it.
+    fn pointed(host: &Host) -> Option<crate::providers::Listed> {
+        let m = host.moment.read().unwrap();
+        let panel = m.providers_panel.as_ref()?;
+        m.providers.listed(panel).get(panel.cursor).copied()
+    }
+
+    /// Wait until the screen's own channel says `until` happened, handing
+    /// back what else woke it on the way.
+    async fn wait_for(
+        woken: &mut mpsc::UnboundedReceiver<Wake>,
+        mut until: impl FnMut(&Wake) -> bool,
+    ) -> Wake {
+        loop {
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv())
+                .await
+                .expect("woken in time")
+                .expect("channel open");
+            if until(&woke) {
+                return woke;
+            }
+        }
+    }
+
+    /// Wait for an add's metadata and hand it to the screen, the way its loop
+    /// does.
+    async fn enriched(tui: &Tui, woken: &mut mpsc::UnboundedReceiver<Wake>) {
+        let Wake::ProviderModelsEnriched {
+            original,
+            drafts,
+            before,
+            after,
+            session,
+            generation,
+            claim,
+        } = wait_for(woken, |w| matches!(w, Wake::ProviderModelsEnriched { .. })).await
+        else {
+            unreachable!()
+        };
+        tui.models_enriched(original, drafts, before, after, session, generation, claim);
+    }
+
+    async fn switched(
+        woken: &mut mpsc::UnboundedReceiver<Wake>,
+    ) -> (ProviderClaim, String, String, SwitchResult) {
+        let Wake::ProviderSwitched {
+            claim,
+            account,
+            id,
+            result,
+        } = wait_for(woken, |w| matches!(w, Wake::ProviderSwitched { .. })).await
+        else {
+            unreachable!()
+        };
+        (claim, account, id, result)
+    }
+
+    /// Open the panel again: a new opening, with its own number. (The test
+    /// screen mounts no providers view, so it is put up the way `open_connect`
+    /// puts it up.)
+    fn reopen(host: &Host) {
+        let mut m = host.moment.write().unwrap();
+        m.providers_panel = Some(crate::providers::Panel {
+            instance: 99,
+            ..crate::providers::Panel::new()
+        });
+    }
+
+    fn pro() -> crate::providers::Discovered {
+        crate::providers::Discovered {
+            id: "pro".into(),
+            ..Default::default()
+        }
+    }
+
+    /// No model to talk to: the first Enter on a server row is 「添加并使用」,
+    /// and it takes the only claim — the next row only adds, and the switch is
+    /// the first one's whichever write lands first.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_batch_can_be_retried_without_partial_writes_and_switches_once() {
+    async fn a_page_without_a_model_offers_add_and_use_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash(), pro()]));
+        tui.refresh_providers();
+        assert!(panel(&host).auto_use, "the footer can say 添加并使用");
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // flash: add and use
+        assert!(!tui.client.auto_use_free(), "claimed when sent");
+        let p = panel(&host);
+        assert!(!p.auto_use, "the next row only adds");
+        assert_eq!(
+            p.awaiting_switch.as_ref().map(|a| a.2.as_str()),
+            Some("flash")
+        );
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // pro: only adds
+        enriched(&tui, &mut woken).await;
+        enriched(&tui, &mut woken).await;
+        assert_eq!(port.models.lock().unwrap().len(), 2);
+        let (_, _, id, _) = switched(&mut woken).await;
+        assert_eq!(id, "deepseek/flash");
+    }
+
+    /// A switch refused after its model was saved leaves the page up, on the
+    /// added row, saying why; Enter there switches once and adds nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_refused_switch_rests_on_the_added_row_and_enter_only_switches() {
         let port = Arc::new(Connects::default());
         port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
         let (host, tui, mut woken) = screen_with(port.clone());
         open_connect(&host, &port);
-        host.connect_provider_models("deepseek");
-        let request = host.provider_discovery_id().unwrap();
-        host.providers_discovered(
-            "deepseek",
-            request,
-            Ok(vec![
-                crate::providers::Discovered {
-                    id: "flash".into(),
-                    ..Default::default()
-                },
-                crate::providers::Discovered {
-                    id: "pro".into(),
-                    effort: Some("high".into()),
-                    ..Default::default()
-                },
-            ]),
-        );
-        for key in [Key::Char(' '), Key::Down, Key::Char(' '), Key::Enter] {
-            tui.run_providers_key(KeyPress::plain(key));
-        }
-        assert!(host.point_providers_at(1));
-        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
-        tui.run_providers_key(host.provider_row_key());
-        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
         tui.run_providers_key(KeyPress::plain(Key::Enter));
-        assert!(port.models.lock().unwrap().is_empty());
-        {
-            let m = host.moment.read().unwrap();
-            let Some(crate::providers::Form::Model(form)) =
-                &m.providers_panel.as_ref().unwrap().form
-            else {
-                panic!("restored");
-            };
-            assert_eq!(form.selected.len(), 2);
-            assert_eq!(form.batch_cursor, 1);
-            assert_eq!(form.model, "pro");
-        }
-        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
-        tui.run_providers_key(KeyPress::plain(Key::Enter));
-        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
-            panic!("switch");
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        let (claim, account, id, _) = switched(&mut woken).await;
+        // The command was queued and the host then refused it.
+        let refused = SwitchResult {
+            model: Err("the host refused".into()),
+            effort: None,
         };
-        assert_eq!(line, "/model deepseek/pro high");
+        tui.provider_switched(&claim, &account, &id, refused);
+        assert!(host.providers_open(), "refused: the page stays");
+        assert_eq!(
+            panel(&host).switch_error,
+            Some(("deepseek/flash".into(), "the host refused".into()))
+        );
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Configured(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let Wake::Chose(Some(line)) = wait_for(&mut woken, |w| matches!(w, Wake::Chose(_))).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(line, "/model deepseek/flash");
+        assert_eq!(port.models.lock().unwrap().len(), 1, "nothing added again");
+    }
+
+    /// 添加并使用 A → close → reopen: the claim is still A's, so B only adds;
+    /// then the person switches to B themselves, and A, landing last, is saved
+    /// but does not take the session back.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_explicit_switch_takes_back_a_claim_that_outlived_its_panel() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // ① A: add and use
+        let first = panel(&host).instance;
+        host.close_providers(); // ②
+        reopen(&host); // ③
+        assert_ne!(panel(&host).instance, first);
+        host.enter_provider_detail("deepseek", Some(vec![pro()]));
+        tui.refresh_providers();
+        assert!(
+            !panel(&host).auto_use,
+            "the claim is still A's: B only adds"
+        );
+        // ④ The person switches themselves — what `/model` does on success.
+        tui.client.revoke_auto_use();
+        // ⑤ A lands.
+        enriched(&tui, &mut woken).await;
+        assert_eq!(port.models.lock().unwrap().len(), 1, "A is saved");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderSwitched { .. } | Wake::Chose(_)),
+                "A did not take the session back"
+            );
+        }
+    }
+
+    /// A late answer for an earlier opening of the panel never closes or moves
+    /// the one up now: a half-typed form survives, keystrokes and all.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_switch_answer_leaves_another_panel_alone() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let (claim, account, id, result) = switched(&mut woken).await;
+        // The person left while it was switching and is now editing the
+        // connection in a new opening of the panel.
+        host.close_providers();
+        reopen(&host);
+        host.enter_provider_detail("deepseek", Some(vec![]));
+        tui.run_providers_key(KeyPress::ctrl('e'));
+        assert!(host.provider_form_open());
+        host.providers_paste("sk-half");
+        let before = panel(&host);
+        for result in [
+            result,
+            SwitchResult {
+                model: Ok("switched".into()),
+                effort: Some(Ok(String::new())),
+            },
+        ] {
+            tui.provider_switched(&claim, &account, &id, result);
+            assert!(host.providers_open());
+            let after = panel(&host);
+            assert_eq!(
+                (&after.form, after.cursor, &after.query, &after.screen),
+                (&before.form, before.cursor, &before.query, &before.screen),
+                "form, cursor and draft untouched"
+            );
+        }
+    }
+
+    /// Review: the claim must stay used while its switch runs. A's write
+    /// landed and its switch is on its way; the panel refreshes; B still only
+    /// adds — and stays so once A switched, until the person has a model.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_running_switch_keeps_the_claim_used() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash(), pro()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // A: written, switching
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        tui.refresh_providers();
+        assert!(!panel(&host).auto_use, "A's switch is running: not free");
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // B
+        let (claim, account, id, _) = switched(&mut woken).await;
+        assert_eq!(id, "deepseek/flash", "the only switch is A's");
+        tui.provider_switched(
+            &claim,
+            &account,
+            &id,
+            SwitchResult {
+                model: Ok("switched".into()),
+                effort: Some(Ok(String::new())),
+            },
+        );
+        assert!(!host.providers_open(), "switched: the waiting panel closes");
+        reopen(&host);
+        tui.refresh_providers();
+        assert!(!tui.client.auto_use_free(), "used up");
+        assert!(!panel(&host).auto_use, "used up while still recovering");
+        // The person has a model again: the next time they lose it, it is free.
+        host.moment.write().unwrap().model_setup_required = false;
+        tui.refresh_providers();
+        assert!(tui.client.auto_use_free());
+    }
+
+    /// Review (reproduced by the other reviewer): waiting on A's switch, the
+    /// person opens the connection form on the same page and types; A's
+    /// success then leaves the form, its fields and its key alone.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_switch_answer_never_closes_a_form_opened_while_it_waited() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let (claim, account, id, _) = switched(&mut woken).await;
+        // Same opening, same page: walk to the connection row and edit it.
+        tui.run_providers_key(KeyPress::plain(Key::Home));
+        tui.run_providers_key(KeyPress::ctrl('e'));
+        assert!(host.provider_form_open());
+        host.providers_paste("sk-half");
+        let before = panel(&host);
+        tui.provider_switched(
+            &claim,
+            &account,
+            &id,
+            SwitchResult {
+                model: Ok("switched".into()),
+                effort: Some(Ok(String::new())),
+            },
+        );
+        assert!(
+            host.providers_open() && host.provider_form_open(),
+            "the form stays"
+        );
+        let after = panel(&host);
+        assert_eq!(after.form, before.form, "fields and key length untouched");
+        assert_eq!(after.awaiting_switch, None, "no longer waited on");
+    }
+
+    /// Review: the in-flight guard has to outlive the panel. A's write is on
+    /// its way; the panel is closed and opened again; A still says 添加中… and
+    /// a second Enter on it sends nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reopened_panel_still_refuses_a_row_being_added() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        host.close_providers();
+        reopen(&host);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        assert!(panel(&host)
+            .adding
+            .contains(&("deepseek".into(), "flash".into())));
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        enriched(&tui, &mut woken).await;
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderModelsEnriched { .. }),
+                "no second add was sent"
+            );
+        }
+        assert!(panel(&host).adding.is_empty(), "settled once it landed");
+    }
+
+    /// Review: a run of adds on a page checks the account once — for its
+    /// first model — not once per model.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_run_of_adds_checks_the_account_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, _woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash(), pro()]));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
         assert_eq!(port.models.lock().unwrap().len(), 2);
-        assert!(woken.try_recv().is_err());
-        assert!(!host.providers_open());
+        assert_eq!(port.probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Review (reproduced): waiting on A's switch, the person picks the
+    /// reasoning level of another added model on the same page; A's success
+    /// leaves that picker — and the panel — where they are.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_switch_answer_never_closes_another_models_level_picker() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.models.lock().unwrap().push(ModelDraft {
+            account: "deepseek".into(),
+            model: "reasoner".into(),
+            levels: Some(vec!["low".into(), "high".into()]),
+            ..Default::default()
+        });
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.moment.write().unwrap().model_setup_required = true;
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::plain(Key::End));
+        tui.run_providers_key(KeyPress::plain(Key::Up));
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // A: add and use
+        let (claim, account, id, _) = switched(&mut woken).await;
+        // To the added reasoner, and into its levels.
+        tui.run_providers_key(KeyPress::plain(Key::Home));
+        tui.run_providers_key(KeyPress::plain(Key::Down));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(panel(&host).efforts.is_some(), "choosing a level");
+        tui.provider_switched(
+            &claim,
+            &account,
+            &id,
+            SwitchResult {
+                model: Ok("switched".into()),
+                effort: Some(Ok(String::new())),
+            },
+        );
+        assert!(host.providers_open(), "the panel stays");
+        assert!(panel(&host).efforts.is_some(), "and so does the picker");
+    }
+
+    /// Review (reproduced): A's add is on its way; the panel is closed and
+    /// opened again; Ctrl+E on A opens nothing, so no second write is sent.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ctrl_e_on_a_row_being_added_sends_nothing_after_a_reopen() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        host.close_providers();
+        reopen(&host);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.refresh_providers();
+        tui.run_providers_key(KeyPress::ctrl('e'));
+        assert!(!host.provider_form_open(), "no form for a row on its way");
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        enriched(&tui, &mut woken).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderModelsEnriched { .. }),
+                "no second add was sent"
+            );
+        }
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_level_after_a_good_switch_says_the_switch_happened() {
+        // What `/model` said, alias and host note included, stays as it was;
+        // the refused level is one more line about the level alone.
+        let switched = "模型 → DeepSeek Flash\nnot kept after restart".to_string();
+        let (said, refused) = switch_said(&SwitchResult {
+            model: Ok(switched.clone()),
+            effort: Some(Err("max is not offered".into())),
+        });
+        assert!(refused);
+        assert_eq!(
+            said,
+            format!(
+                "{switched}\n{}",
+                t(Msg::ProviderEffortFailed {
+                    why: "max is not offered"
+                })
+            )
+        );
+        assert_eq!(
+            said.matches("DeepSeek Flash").count(),
+            1,
+            "named once: {said}"
+        );
+        // A level set with the host's note keeps the note.
+        let (said, refused) = switch_said(&SwitchResult {
+            model: Ok("model set".into()),
+            effort: Some(Ok("effort set\nnot kept after restart".into())),
+        });
+        assert!(!refused);
+        assert!(said.contains("model set") && said.contains("not kept after restart"));
+    }
+
+    /// Connecting an account lands on its page with what its endpoint lists,
+    /// and one Enter there adds one model — saved, not switched to.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_connection_lands_on_its_page_and_one_enter_adds_one_model() {
+        let port = Arc::new(Connects::default());
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // the unconfigured offer
+        assert!(host.providers_paste("sk-private"));
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // save the connection
+        assert!(port.saved.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            panel(&host).screen,
+            crate::providers::Screen::Detail("deepseek".into())
+        );
+        // The listing arrives off the frame; the page then rests on the first
+        // model to add.
+        for _ in 0..4 {
+            if matches!(pointed(&host), Some(crate::providers::Listed::Available(_))) {
+                break;
+            }
+            wait_for(&mut woken, |w| matches!(w, Wake::Fact)).await;
+        }
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let models = port.models.lock().unwrap().clone();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "flash");
+        assert_eq!(models[0].window, Some(1048576));
+        assert_eq!(models[0].max_tokens, Some(393216));
+        assert!(
+            !models[0].use_now && !models[0].default,
+            "added, not switched to"
+        );
+        assert!(host.providers_open(), "the page stays up for the next one");
+        assert!(panel(&host).adding.is_empty());
+        while let Ok(woke) = woken.try_recv() {
+            assert!(!matches!(woke, Wake::Chose(_)), "no switch was sent");
+        }
+    }
+
+    /// A listing asked for a connection that has since been saved again is
+    /// not the new connection's: it cannot fill its page.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_listing_for_a_replaced_connection_is_dropped() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        assert!(host.enter_provider_detail("deepseek", None).is_some());
+        let old = host.provider_listing_request("deepseek").unwrap();
+        let again = host.provider_account_changed("deepseek", false);
+        assert!(
+            matches!(again, Some(Step::Discover { .. })),
+            "the page asks again"
+        );
+        let new = host.provider_listing_request("deepseek").unwrap();
+        assert_ne!(old, new);
+        assert!(!host.providers_discovered("deepseek", old, Ok(vec![flash()])));
+        assert!(host.providers_discovered("deepseek", new, Ok(vec![])));
+        let panel = panel(&host);
+        assert_eq!(
+            panel.discovery["deepseek"].state,
+            crate::providers::DiscoveryState::Ready(vec![])
+        );
+    }
+
+    /// Deleting an account takes its page back to the list and asks nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deleting_an_account_leaves_its_page_without_asking_again() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        assert_eq!(host.provider_account_changed("deepseek", true), None);
+        let panel = panel(&host);
+        assert_eq!(panel.screen, crate::providers::Screen::Providers);
+        assert!(panel.discovery.is_empty());
+    }
+
+    /// An add whose connection was saved again, or whose account was deleted,
+    /// while its metadata was on its way is dropped — never written, so a
+    /// deleted account is not re-created to hold it. Only closing the panel is
+    /// no change: a confirmed add still lands.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_add_is_dropped_when_its_connection_changed() {
+        for (change, written) in [(Some(true), false), (Some(false), false), (None, true)] {
+            let port = Arc::new(Connects::default());
+            port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+            port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (host, tui, mut woken) = screen_with(port.clone());
+            open_connect(&host, &port);
+            host.enter_provider_detail("deepseek", Some(vec![flash()]));
+            tui.run_providers_key(KeyPress::plain(Key::Enter));
+            assert!(port.models.lock().unwrap().is_empty(), "still on its way");
+            match change {
+                Some(deleted) => {
+                    host.provider_account_changed("deepseek", deleted);
+                }
+                None => {
+                    host.close_providers();
+                }
+            }
+            let Wake::ProviderModelsEnriched {
+                original,
+                drafts,
+                before,
+                after,
+                session,
+                generation,
+                claim,
+            } = wait_for(&mut woken, |w| {
+                matches!(w, Wake::ProviderModelsEnriched { .. })
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            tui.models_enriched(original, drafts, before, after, session, generation, claim);
+            assert_eq!(
+                port.models.lock().unwrap().len(),
+                usize::from(written),
+                "{change:?}"
+            );
+        }
+    }
+
+    /// A second Enter on a row whose add is on its way is not a second write.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_row_being_added_is_written_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        port.slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.enter_provider_detail("deepseek", Some(vec![flash()]));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        // The cursor moved on to the manual row; walk back and press again.
+        tui.run_providers_key(KeyPress::plain(Key::Up));
+        assert!(matches!(
+            pointed(&host),
+            Some(crate::providers::Listed::Available(_))
+        ));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let Wake::ProviderModelsEnriched {
+            original,
+            drafts,
+            before,
+            after,
+            session,
+            generation,
+            claim,
+        } = wait_for(&mut woken, |w| {
+            matches!(w, Wake::ProviderModelsEnriched { .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        tui.models_enriched(original, drafts, before, after, session, generation, claim);
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        while let Ok(woke) = woken.try_recv() {
+            assert!(
+                !matches!(woke, Wake::ProviderModelsEnriched { .. }),
+                "no second add was sent"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -14871,113 +15843,6 @@ mod provider_probe_tests {
         tui.run_providers_key(KeyPress::plain(Key::Enter));
         checked(&mut woken).await;
         assert!(port.saved.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn an_old_listing_cannot_fill_a_new_picker_for_the_same_account() {
-        let port = Arc::new(Connects::default());
-        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (host, _, _) = screen_with(port.clone());
-        open_connect(&host, &port);
-        assert!(host.connect_provider_models("deepseek"));
-        let old = host.provider_discovery_id().unwrap();
-        assert!(host.connect_provider_models("deepseek"));
-        let new = host.provider_discovery_id().unwrap();
-        assert_ne!(old, new);
-        host.providers_discovered("deepseek", old, Err("stale".into()));
-        let m = host.moment.read().unwrap();
-        let Some(crate::providers::Form::Model(form)) = &m.providers_panel.as_ref().unwrap().form
-        else {
-            panic!("model");
-        };
-        assert!(matches!(
-            form.picking,
-            Some(crate::providers::Picking::Loading { .. })
-        ));
-        assert_eq!(form.discovery_error, None);
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_saved_model_is_kept_when_the_switch_cannot_be_dispatched() {
-        let port = Arc::new(Connects::default());
-        let (host, tui, woken) = screen_with(port.clone());
-        open_connect(&host, &port);
-        drop(woken);
-        assert_eq!(
-            tui.apply_provider_step(Step::SaveModel {
-                id: None,
-                draft: ModelDraft {
-                    account: "deepseek".into(),
-                    model: "flash".into(),
-                    use_now: true,
-                    ..Default::default()
-                }
-            })
-            .unwrap(),
-            None
-        );
-        assert_eq!(port.models.lock().unwrap().len(), 1);
-        assert!(host.providers_open());
-        let m = host.moment.read().unwrap();
-        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
-        assert!(m.notice.as_ref().unwrap().refused);
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn clicking_a_discovered_model_picks_that_row_and_changing_tabs_cancels_discovery() {
-        let port = Arc::new(Connects::default());
-        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (host, _, _) = screen_with(port.clone());
-        open_connect(&host, &port);
-        assert!(!host.connect_provider_models("missing"));
-        host.connect_provider_models("deepseek");
-        let request = host.provider_discovery_id().unwrap();
-        host.providers_discovered(
-            "deepseek",
-            request,
-            Ok(vec![
-                crate::providers::Discovered {
-                    id: "first".into(),
-                    ..Default::default()
-                },
-                crate::providers::Discovered {
-                    id: "second".into(),
-                    ..Default::default()
-                },
-            ]),
-        );
-        assert!(host.point_providers_at(1));
-        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
-        host.providers_key(host.provider_row_key());
-        {
-            let m = host.moment.read().unwrap();
-            let Some(crate::providers::Form::Model(form)) =
-                &m.providers_panel.as_ref().unwrap().form
-            else {
-                panic!("picker");
-            };
-            assert_eq!(form.selected[0].id, "second");
-            assert!(
-                form.picking.is_some(),
-                "clicks leave the list available for more checks"
-            );
-        }
-        host.providers_key(KeyPress::plain(Key::Enter));
-        {
-            let m = host.moment.read().unwrap();
-            let Some(crate::providers::Form::Model(form)) =
-                &m.providers_panel.as_ref().unwrap().form
-            else {
-                panic!("model");
-            };
-            assert_eq!(form.model, "second");
-        }
-        host.connect_provider_models("deepseek");
-        let request = host.provider_discovery_id().unwrap();
-        host.show_providers_tab(crate::providers::Tab::Accounts);
-        host.providers_discovered("deepseek", request, Err("cancelled".into()));
-        let m = host.moment.read().unwrap();
-        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
     }
 
     /// A port that takes every write and answers every check with what it was

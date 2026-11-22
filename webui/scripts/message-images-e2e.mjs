@@ -71,8 +71,50 @@ try {
   await page.keyboard.press('Escape'); await modal.waitFor({state:'detached'});
   await page.reload(); await first.waitFor();
   assert.equal((await page.locator('.user-message-bubble').first().innerText()).trim(),'Compare these');
+  for (const sync of [true, false]) {
+    const endpoint=sync?'/live/message':'/chat';
+    const submissions=[];
+    await page.route(`**${endpoint}`, async route=>{
+      const request=route.request();
+      submissions.push({bytes:Buffer.byteLength(request.postData()),body:request.postDataJSON()});
+      if(submissions.length===1){
+        await route.fulfill({status:413,body:'Failed to buffer the request body: length limit exceeded'});
+      }else if(sync){
+        await route.fulfill({json:{accepted:true}});
+      }else{
+        await route.fulfill({contentType:'text/event-stream',body:'data: {"type":"stopped"}\n\n'});
+      }
+    });
+    if(!sync){
+      await page.goto(`http://127.0.0.1:${server.address().port}/?sync=0&session=${id}`);
+      await first.waitFor();
+    }
+    const composer=page.locator('.message-input');
+    await composer.fill('Describe this image');
+    await composer.evaluate((input,{data,size})=>{
+      const clipboardData=new DataTransfer();
+      const png=Uint8Array.from(atob(data),value=>value.charCodeAt(0));
+      clipboardData.items.add(new File([png,new Uint8Array(size-png.length)],'large.png',{type:'image/png'}));
+      input.dispatchEvent(new ClipboardEvent('paste',{clipboardData,bubbles:true,cancelable:true}));
+    },{data:png,size:1_774_142});
+    await page.locator('.input-thumb').waitFor();
+    await composer.press('Enter');
+    await page.getByRole('alert').filter({hasText:'Compress the images'}).waitFor();
+    assert.equal(await composer.inputValue(),'Describe this image');
+    assert.equal(await page.locator('.input-thumb').count(),1);
+    assert.equal(await bubbles.filter({hasText:'Describe this image'}).count(),0);
+    assert.ok(submissions[0].bytes>2*1024*1024);
+    assert.equal(submissions[0].body.images[0].data.length,4*Math.ceil(1_774_142/3));
+    assert.equal(await page.getByText('length limit exceeded',{exact:false}).count(),0);
+    const retry=page.waitForResponse(response=>response.url().endsWith(endpoint)&&response.ok());
+    await composer.press('Enter');
+    await retry;
+    assert.equal(submissions.length,2);
+    assert.equal(submissions[1].body.message,'Describe this image');
+    assert.equal(await page.locator('.input-thumb').count(),0);
+  }
   assert.deepEqual(errors,[]);
-  console.log('PASS: redundant markers hidden, missing markers retained, image preview, Esc/backdrop/button close, focus restoration and mobile bounds');
+  console.log('PASS: image previews, large clipboard upload, localized 413, and draft retry');
 } finally {
   for(const client of clients)client.end(); await browser.close(); server.closeAllConnections(); server.close();
 }

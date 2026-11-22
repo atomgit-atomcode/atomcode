@@ -427,11 +427,9 @@ pub enum Msg<'a> {
     // ── Provider wizard ──
     ProviderWizardHeader,
     ProviderWizardCancelled,
-    ProviderMenuAdd,
     ProviderMenuAddDesc,
     ProviderMenuEdit,
     ProviderMenuEditDesc,
-    ProviderMenuDelete,
     ProviderMenuDeleteDesc,
     ProviderMenuSetDefault,
     ProviderMenuSetDefaultDesc,

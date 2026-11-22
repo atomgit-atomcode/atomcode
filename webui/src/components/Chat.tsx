@@ -166,6 +166,8 @@ interface Message {
   ts?: number;
   /** Browser-local correlation for an optimistic /live submission. Never persisted. */
   pendingSteerId?: string;
+  /** Correlates the optimistic messages for a /chat request through timeline archiving. */
+  chatRequestId?: string;
   /** Local viewport anchor; never part of session persistence. */
   turnAnchorId?: string;
 }
@@ -245,7 +247,7 @@ function messageHasTools(m: Message): boolean {
 
 /** Max attached images per message and per-image byte cap (raw file size). */
 const MAX_IMAGES = 6;
-const MAX_IMAGE_MB = 2;
+const MAX_IMAGE_MB = 5;
 const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
 
 /** Read a File into an ImageData (base64, no data-URL prefix). */
@@ -2302,6 +2304,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     pushCommandNotice(text);
   }
 
+  function restoreDraft(text: string, images: ImageData[]) {
+    setInput((current) => [text, current].filter(Boolean).join('\n'));
+    setPendingImages((current) => [...images, ...current]);
+  }
+
+  function showOversizedDraft(text: string, images: ImageData[]) {
+    restoreDraft(text, images);
+    setAttachError(t(images.length ? 'attach.requestTooLarge' : 'chat.requestTooLarge'));
+  }
+
   function pushCommandNotice(text: string, contextSummary = false) {
     setMessages((prev) => {
       const last = prev[prev.length - 1];
@@ -3117,6 +3129,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // Register before the HTTP round-trip. A very fast round boundary can
       // emit `steered` on SSE before the submit response reaches this tab.
       setPendingSteers((pending) => [...pending, pendingSteer]);
+      const requestGeneration = sessionGenerationRef.current;
       try {
         const submittedProvider = provider;
         const receipt = await postLiveMessage(
@@ -3157,6 +3170,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
           setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
         }
       } catch (error) {
+        if (requestGeneration !== sessionGenerationRef.current) return false;
         // Roll back the optimistic append — the send never reached the server.
         const echoIndex = pendingSelfEchoRef.current.findIndex(
           (pending) => pending.id === pendingSteer.id,
@@ -3164,14 +3178,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         if (echoIndex >= 0) pendingSelfEchoRef.current.splice(echoIndex, 1);
         setMessages((prev) => prev.filter((message) => message.pendingSteerId !== pendingSteer.id));
         setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
-        if (steering) {
-          setInput((current) => [text, current].filter(Boolean).join('\n'));
-          setPendingImages((current) => [...images, ...current]);
-        } else {
+        if (!steering) {
           setBusy(false);
           notificationTurnActiveRef.current = false;
           turnStartedAtRef.current = null;
         }
+        if (error instanceof ApiCallError && error.status === 413) {
+          showOversizedDraft(text, images);
+          return false;
+        }
+        if (steering) restoreDraft(text, images);
         setQueued([]);
         reportFailure(t('chat.connError', { msg: String(error) }));
         return false;
@@ -3192,16 +3208,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
-    const now = Date.now();
+    const requestId = randomId();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, turnAnchorId },
-      { role: 'assistant', parts: [] },
+      {
+        role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined,
+        ts: Date.now(), turnAnchorId, chatRequestId: requestId,
+      },
+      { role: 'assistant', parts: [], chatRequestId: requestId },
     ]);
 
     const controller = new AbortController();
     abortRef.current = controller;
-    const requestId = randomId();
     requestIdRef.current = requestId;
     const requestGeneration = sessionGenerationRef.current;
     let keepStopAlias = false;
@@ -3244,6 +3262,14 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         controller.signal.aborted,
       );
       const aborted = err instanceof Error && err.name === 'AbortError';
+      if (stillCurrent && err instanceof ApiCallError && err.status === 413) {
+        setMessages((prev) => prev.filter((message) => message.chatRequestId !== requestId));
+        setBusy(false);
+        notificationTurnActiveRef.current = false;
+        turnStartedAtRef.current = null;
+        showOversizedDraft(text, images);
+        return false;
+      }
       if (!aborted && stillCurrent) {
         // Transport loss is not a turn terminal. Keep the request alias so the
         // user can retry the existing stop protocol, but release the visual
@@ -3314,6 +3340,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // 清空输入框（无论立即发送还是排队）。
     setInput('');
     setPendingImages([]);
+    setAttachError(null);
     // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
@@ -3693,7 +3720,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   async function addImageFiles(files: File[] | FileList) {
     const arr = Array.from(files).filter((f) => f.type.startsWith('image/'));
     if (arr.length === 0) return;
-    // 严格拦截超过 2M 的图片，并提示用户（其余正常入列）。
+    // 提示超限图片，其余正常入列。
     const oversized = arr.filter((f) => f.size > MAX_IMAGE_BYTES);
     if (oversized.length > 0) {
       setAttachError(t('attach.tooLarge', { mb: String(MAX_IMAGE_MB) }));
@@ -4369,7 +4396,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       key={`live:${livePending.approval_id}`}
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments, allow_all_bash: livePending.allow_all_bash, project_rule: livePending.project_rule }}
       onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id, livePending.approval_id))}
-      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); if (!result.accepted) throw new Error(t('perm.requestExpired')); }}
+      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); return result.accepted; }}
     />
   );
 
