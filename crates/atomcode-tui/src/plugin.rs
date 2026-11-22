@@ -1893,9 +1893,6 @@ pub struct Tui {
     /// is not known until then.
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
-    /// When the allowance was last asked about, so it is not asked again for
-    /// [`ALLOWANCE_EVERY`]. `None` until the first ask — the end of a turn, or
-    /// the first idle beat while a badge is on the row.
     /// When a turn-end ask last went out. The figure only moves when a turn
     /// spends something, so the turn-end ask is the authoritative one: it
     /// also moves the idle slot ([`Self::allowance_idle_checked`]) so the
@@ -6780,11 +6777,6 @@ impl Tui {
         });
     }
 
-    /// Ask how much allowance is left, at most this often.
-    ///
-    /// Tied to a turn ending rather than to a timer, and then held to this
-    /// interval: a turn is when the figure can have moved, and the question
-    /// costs a round trip on the account. Idle, nothing is asked at all.
     /// Bring in what was typed into this project's other sessions, once.
     ///
     /// **Older than everything this session has**, so it goes in front: the
