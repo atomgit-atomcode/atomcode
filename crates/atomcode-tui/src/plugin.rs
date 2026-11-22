@@ -1896,6 +1896,10 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first ask — the end of a turn, or
     /// the first idle beat while a badge is on the row.
+    /// When a turn-end ask last went out. The figure only moves when a turn
+    /// spends something, so the turn-end ask is the authoritative one: it
+    /// also moves the idle slot ([`Self::allowance_idle_checked`]) so the
+    /// pair cannot double-fire within one [`ALLOWANCE_EVERY`] window.
     allowance_checked: Mutex<Option<std::time::Instant>>,
     /// The idle beat's own throttle stamp, kept apart from the turn-end one
     /// ([`Self::allowance_checked`]): the two asks must not contend for a
@@ -6884,6 +6888,13 @@ impl Tui {
 
     fn check_allowance(&self) {
         self.ask_allowance(&self.allowance_checked);
+        // The turn-end ask is the authoritative one — the figure just changed —
+        // so the idle slot moves with it: the idle beat cannot fire a
+        // duplicate within the same window.
+        *self
+            .allowance_idle_checked
+            .lock()
+            .expect("allowance poisoned") = Some(std::time::Instant::now());
     }
 
     /// The idle beat's re-ask, throttled on its OWN stamp: an idle beat must
@@ -19284,7 +19295,7 @@ mod allowance_switch_tests {
         }
         // Through the idle beat — the contract this PR adds is "Tick re-asks a
         // visible badge", so the test must drive that path, not the bare ask.
-        *tui.allowance_checked.lock().unwrap() = None;
+        *tui.allowance_idle_checked.lock().unwrap() = None;
         tui.tick_beat();
         let ask = pending.recv().await.unwrap();
         // The account was refreshed underneath the window: the row must
@@ -19363,7 +19374,7 @@ mod allowance_switch_tests {
                 resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
             });
         }
-        *tui.allowance_checked.lock().unwrap() = None;
+        *tui.allowance_idle_checked.lock().unwrap() = None;
         tui.tick_beat();
         pending.recv().await.unwrap().send(reply(vec![])).unwrap();
         tokio::task::yield_now().await;
@@ -19380,7 +19391,7 @@ mod allowance_switch_tests {
                 )),
             });
         }
-        *tui.allowance_checked.lock().unwrap() = None;
+        *tui.allowance_idle_checked.lock().unwrap() = None;
         tui.tick_beat();
         tokio::task::yield_now().await;
         assert!(
@@ -19397,7 +19408,7 @@ mod allowance_switch_tests {
                 resets_by: None,
             });
         }
-        *tui.allowance_checked.lock().unwrap() = None;
+        *tui.allowance_idle_checked.lock().unwrap() = None;
         tui.tick_beat();
         tokio::task::yield_now().await;
         assert!(pending.try_recv().is_err(), "a quiet row is not re-asked");
