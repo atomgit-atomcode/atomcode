@@ -43,9 +43,8 @@ belongs exactly at the cursor, and nothing else.
 Rules:
 - Reply with the completion text only. No markdown fences, no explanation, no
   commentary, and no repetition of the code around the cursor.
-- The cursor is already positioned exactly where your text will be inserted, so
-  do not begin with a newline. When the last line of the \"before\" block is
-  incomplete, your text starts with the missing remainder of that line.
+- Preserve the exact whitespace the insertion needs. When the last line of
+  the \"before\" block is incomplete, start with the missing remainder of that line.
 - The text may span several lines when the code needs it.
 - If nothing belongs at the cursor, reply with exactly <<<NO_COMPLETION>>>.";
 

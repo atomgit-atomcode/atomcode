@@ -29,11 +29,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// How much text one request may carry (prefix + suffix).
+/// How many bytes of prompt input one request may carry.
 ///
 /// The extension already trims its context, but the daemon does not trust the
 /// caller: a body that carries a whole repository would be billed as one.
-const MAX_REQUEST_CHARS: usize = 64 * 1024;
+const MAX_PROMPT_INPUT_BYTES: usize = 64 * 1024;
 
 /// The most completion text the daemon will return, in characters.
 ///
@@ -165,7 +165,11 @@ async fn complete(
     State(state): State<AppState>,
     Json(request): Json<CueCompletionRequest>,
 ) -> Response {
-    if request.prefix.len() + request.suffix.len() > MAX_REQUEST_CHARS {
+    let input_bytes = request.prefix.len()
+        + request.suffix.len()
+        + request.file_path.len()
+        + request.language_id.len();
+    if input_bytes > MAX_PROMPT_INPUT_BYTES {
         return json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Completion request is too large",
@@ -203,16 +207,28 @@ async fn complete(
         .into_response();
     }
 
-    let working_dir = state.project.read().await.working_dir.clone();
-    let provider = match state
-        .cue_providers
-        .get(&config, &selection, &working_dir, state.telemetry.clone())
-        .await
-    {
-        Ok(provider) => provider,
-        Err(error) => {
+    let timeout = std::time::Duration::from_secs(config.cue.timeout_secs.clamp(1, 120));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let resolve_provider = async {
+        let working_dir = state.project.read().await.working_dir.clone();
+        state
+            .cue_providers
+            .get(&config, &selection, &working_dir, state.telemetry.clone())
+            .await
+    };
+    let provider = match tokio::time::timeout_at(deadline, resolve_provider).await {
+        Ok(Ok(provider)) => provider,
+        Ok(Err(error)) => {
             tracing::warn!(error = %error, "cue provider unavailable");
             return json_error(StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+        }
+        Err(_) => {
+            tracing::debug!("cue request timed out while resolving the provider");
+            return Json(CueCompletionResponse {
+                completion: None,
+                model: String::new(),
+            })
+            .into_response();
         }
     };
 
@@ -224,7 +240,7 @@ async fn complete(
     };
     let messages = build_completion_messages(&context);
 
-    let timeout = std::time::Duration::from_secs(config.cue.timeout_secs.clamp(1, 120));
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     // The model that answered, captured BEFORE the call: the IDE shows it so
     // a user can tell which model produced a suggestion.
     let model = provider.model_name().to_string();
@@ -235,9 +251,12 @@ async fn complete(
     // a completion is a cap a reasoning model spends on THINKING, and the
     // answer comes back empty. It also means a half-answered completion is
     // never inserted into a file.
-    let sample =
-        atomcode_coding::sample_side_call_messages(provider, messages, timeout, "cue completion")
-            .await;
+    let sample = if remaining.is_zero() {
+        None
+    } else {
+        atomcode_coding::sample_side_call_messages(provider, messages, remaining, "cue completion")
+            .await
+    };
     let Some(sample) = sample else {
         // A failure or a timeout is not the user's problem to solve
         // mid-keystroke: report "no suggestion" and keep the detail in the log.
@@ -258,7 +277,7 @@ async fn complete(
         .into_response();
     }
 
-    let completion = extract_completion(&sample.raw, &context.prefix);
+    let completion = extract_completion(&sample.raw);
     let completion = match completion {
         Some(text) if text.chars().count() > MAX_COMPLETION_CHARS => {
             // A completion this long is not a completion — it is a model that

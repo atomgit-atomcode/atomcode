@@ -12589,9 +12589,7 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
         use tower::ServiceExt;
 
         let home = ScopedChatHome::new();
-        // The model answers with the whole line, the way a model echoes the
-        // line the cursor is on.
-        let (url, request, task) = spawn_openai_sse("let x = println!();").await;
+        let (url, request, task) = spawn_openai_sse("+counter").await;
 
         let mut config = Config::with_default_provider("p");
         config
@@ -12606,9 +12604,9 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
         let app = api_cue::routes().with_state(state);
 
         let body = serde_json::json!({
-            "file_path": "src/main.rs",
-            "language_id": "rust",
-            "prefix": "fn main() {\n    let x = ",
+            "file_path": "src/main.ts",
+            "language_id": "typescript",
+            "prefix": "function main() {\n    let x = +",
             "suffix": ";\n}",
         });
         let response = app
@@ -12630,12 +12628,12 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
                 .unwrap(),
         )
         .unwrap();
-        // The model echoed the line; the echo is removed, so only the NEW
-        // text is returned for the cursor to insert.
+        // The second plus is part of the insertion, even though the prefix
+        // ends with the first one.
         assert_eq!(
             payload["completion"].as_str(),
-            Some("println!();"),
-            "the echoed line must not come back: {payload}"
+            Some("+counter"),
+            "the insertion must be preserved: {payload}"
         );
         assert_eq!(payload["model"].as_str(), Some("test-model"));
 
@@ -12644,7 +12642,7 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             .expect("the provider must be called")
             .expect("provider request captured");
         assert!(
-            sent.contains("let x = "),
+            sent.contains("let x = +"),
             "the request must carry the code before the cursor: {sent}"
         );
         assert!(
@@ -12652,6 +12650,75 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             "the request must carry the code after the cursor: {sent}"
         );
         task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_disconnect_drops_the_upstream_request() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::Notify;
+
+        struct NotifyOnDrop(Arc<Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let home = ScopedChatHome::new();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let (started, dropped) = (started.clone(), dropped.clone());
+                move |Json(_): Json<serde_json::Value>| {
+                    let (started, dropped) = (started.clone(), dropped.clone());
+                    async move {
+                        let _on_drop = NotifyOnDrop(dropped);
+                        started.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let mut config = Config::with_default_provider("p");
+        config.providers.insert(
+            "p".into(),
+            test_provider("test-model", format!("http://{upstream_addr}/v1")),
+        );
+        config.cue.enabled = true;
+        config.cue.timeout_secs = 120;
+        config.save(&Config::default_path()).unwrap();
+
+        let app = api_cue::routes().with_state(chat_test_state(&home));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = r#"{"prefix":"const n = +"}"#;
+        let request = format!(
+            "POST /cue/complete HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .expect("daemon dispatched the provider request");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(3), dropped.notified())
+            .await
+            .expect("disconnect cancelled the provider request before the CUE deadline");
+
+        task.abort();
+        upstream_task.abort();
     }
 
     /// CUE is opt-in: a disabled configuration answers "no suggestion" rather
