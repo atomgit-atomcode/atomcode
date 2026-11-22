@@ -10218,18 +10218,33 @@ impl Tui {
         // guards against.
         let mention_declined = {
             let m = self.host.moment.read().expect("moment poisoned");
-            let range = (!browsing && mention_context)
+            // Browsing (reverse search / history) leaves the record alone: the
+            // input is not being edited, so nothing here can go stale.
+            let range = (!browsing)
                 .then(|| {
                     atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
                 })
                 .flatten();
             match range {
-                Some((at, _)) => self
-                    .mention_declined
-                    .lock()
-                    .expect("mention declined poisoned")
-                    .map(|declined| declined == at)
-                    .unwrap_or(false),
+                Some((at, _)) => {
+                    let mut last = self
+                        .mention_declined
+                        .lock()
+                        .expect("mention declined poisoned");
+                    match *last {
+                        // The very token that was dismissed: keep it held down.
+                        Some(declined) if declined == at => true,
+                        // The caret moved to a different token: the old decline
+                        // is stale and must not suppress the new token.
+                        Some(_) => {
+                            *last = None;
+                            false
+                        }
+                        None => false,
+                    }
+                }
+                // No token at the caret: the caret has left any declined one,
+                // so the record expires.
                 None => {
                     *self
                         .mention_declined
@@ -10413,9 +10428,11 @@ impl Tui {
                 let _ = self.host.menu_move_by(1);
             }
             // Esc puts the list away and leaves what is typed alone. It is not
-            // "clear the line" — the slash is still there, and the menu comes
-            // back on the next keystroke that changes it. The one way to say
-            // "not that list, this line" without losing the line.
+            // "clear the line" — the slash is still there, and a slash or
+            // skill menu comes back on the next keystroke that changes it. An
+            // `@` mention menu does NOT come back while the caret stays on the
+            // dismissed token (`decline_current_mention`); it asks again once
+            // the caret moves to another token.
             Key::Esc => {
                 self.decline_current_mention();
                 self.host.close_menu();
@@ -18128,12 +18145,16 @@ mod session_mention_tests {
             moment.caret = "@atomcode".len();
         }
         tui.refresh_menu();
-        assert!(!host.menu_is_empty(), "the mention menu is up");
+        assert!(host.menu_open(), "the mention menu is up");
 
-        tui.decline_current_mention();
+        // Esc through the real key path: the token at the caret is declined.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
         tui.refresh_menu();
         assert!(
-            host.menu_is_empty(),
+            !host.menu_open(),
             "an explicitly declined token does not reopen the menu"
         );
 
@@ -18144,7 +18165,7 @@ mod session_mention_tests {
             moment.caret = moment.input.len();
         }
         tui.refresh_menu();
-        assert!(host.menu_is_empty(), "still the declined token");
+        assert!(!host.menu_open(), "still the declined token");
 
         // The caret leaves the token: the decline is stale and the next `@`
         // may ask again.
@@ -18155,8 +18176,21 @@ mod session_mention_tests {
         }
         tui.refresh_menu();
         assert!(
-            !host.menu_is_empty(),
+            host.menu_open(),
             "a new token at a different position asks again"
+        );
+
+        // And back on the first token the decline is stale too: it was
+        // cleared the moment the caret moved to a different token.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode-notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "the caret returned to the old token: the stale decline must not suppress it"
         );
     }
 
