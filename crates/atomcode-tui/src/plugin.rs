@@ -1924,6 +1924,10 @@ pub struct Tui {
     /// re-points it rather than silently answering from the old tree.
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     mention_kind: Mutex<u8>,
+    /// The `@` token the person dismissed with Esc, by its byte offset and
+    /// text: the menu stays away from that token — including as more of its
+    /// text is typed — until the caret leaves it or the token is replaced.
+    mention_declined: Mutex<Option<(usize, String)>>,
     session_references: Arc<Mutex<SessionSuggestions>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
@@ -10240,6 +10244,12 @@ impl Tui {
                         m.history_at = None;
                         m.input.clear();
                         m.caret = 0;
+                        // The line the declined token lived on is gone: a
+                        // record keyed to it has nothing left to suppress.
+                        *self
+                            .mention_declined
+                            .lock()
+                            .expect("mention declined poisoned") = None;
                         return false;
                     }
                     drop(m);
@@ -10571,6 +10581,65 @@ impl Tui {
             skill_prefix(&input).map(str::to_string)
         };
         let mention_context = prefix.is_none() && skill.is_none();
+        // Whether the caret sits on an `@` token the person explicitly
+        // dismissed with Esc. Decided BEFORE the menu rows are built: a
+        // declined token must yield no rows at all, or the else branch below
+        // would plant them as a plain (tabless) menu — the misfire this
+        // guards against.
+        let mention_declined = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let record = self
+                .mention_declined
+                .lock()
+                .expect("mention declined poisoned")
+                .clone();
+            // Browsing (reverse search / history) owns the keys while it
+            // lasts; the input is not being edited, so the record is left
+            // exactly as it was.
+            if browsing {
+                false
+            } else {
+                match atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                {
+                    Some((at, end)) => {
+                        // The very token that was dismissed, by offset AND
+                        // text: keep it held down while it stays the same
+                        // token — longer (typing) or shorter (backspace). A
+                        // different text at the same offset is a REPLACED
+                        // token, not the dismissed one.
+                        let suppressed = match record {
+                            Some((declined_at, ref declined_text))
+                                if declined_at == at
+                                    && (m.input[at..end].starts_with(declined_text)
+                                        || declined_text.starts_with(&m.input[at..end])) =>
+                            {
+                                true
+                            }
+                            _ => {
+                                // No record, a different token, or a replaced
+                                // token: the old decline must not suppress —
+                                // the record expires.
+                                *self
+                                    .mention_declined
+                                    .lock()
+                                    .expect("mention declined poisoned") = None;
+                                false
+                            }
+                        };
+                        suppressed
+                    }
+                    // No token at the caret: the caret has left any declined
+                    // one, so the record expires.
+                    None => {
+                        *self
+                            .mention_declined
+                            .lock()
+                            .expect("mention declined poisoned") = None;
+                        false
+                    }
+                }
+            }
+        };
         let menu = match prefix {
             Some(rest) => {
                 let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
@@ -10685,12 +10754,12 @@ impl Tui {
                 // the middle of a sentence is a mention too. The classic
                 // screen's rule, from the same place.
                 match atomcode_capabilities::file_index::detect_at_mention(&typed, caret) {
-                    Some(token) => self.mention_rows(&cwd, &token),
-                    None => Vec::new(),
+                    Some(token) if !mention_declined => self.mention_rows(&cwd, &token),
+                    _ => Vec::new(),
                 }
             }
         };
-        let is_mention = {
+        let is_mention = !mention_declined && {
             let m = self.host.moment.read().expect("moment poisoned");
             !browsing
                 && mention_context
@@ -10745,10 +10814,13 @@ impl Tui {
                 let _ = self.host.menu_move_by(1);
             }
             // Esc puts the list away and leaves what is typed alone. It is not
-            // "clear the line" — the slash is still there, and the menu comes
-            // back on the next keystroke that changes it. The one way to say
-            // "not that list, this line" without losing the line.
+            // "clear the line" — the slash is still there, and a slash or
+            // skill menu comes back on the next keystroke that changes it. An
+            // `@` mention menu does NOT come back while the caret stays on the
+            // dismissed token (`decline_current_mention`); it asks again once
+            // the caret moves to another token.
             Key::Esc => {
+                self.decline_current_mention();
                 self.host.close_menu();
             }
             Key::Tab => {
@@ -10940,6 +11012,18 @@ impl Tui {
         m.history_at = None;
         drop(m);
         self.refresh_menu();
+    }
+
+    /// Record the `@` token at the caret as dismissed: the mention menu stays
+    /// away from it until the caret leaves the token (`refresh_menu`).
+    fn decline_current_mention(&self) {
+        let m = self.host.moment.read().expect("moment poisoned");
+        *self
+            .mention_declined
+            .lock()
+            .expect("mention declined poisoned") =
+            atomcode_capabilities::file_index::detect_at_mention_range(&m.input, m.caret)
+                .map(|(at, end)| (at, m.input[at..end].to_string()));
     }
 
     /// Put a path picked from the `@` menu on the line, in place of the `@…`
@@ -12506,6 +12590,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             mention_kind: Mutex::new(0),
+            mention_declined: Mutex::new(None),
             session_references: Arc::new(Mutex::new(SessionSuggestions::default())),
             pressed_at: Mutex::new(None),
             scroll_drag: Mutex::new(None),
@@ -18934,6 +19019,136 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
         tui.complete_path("@\0mention-filter:workspace");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 3);
+    }
+
+    /// Esc on an `@` token declines it: the mention menu stays closed while
+    /// the caret stays on the token — even as more of the token is typed —
+    /// and the decline clears once the caret leaves the token.
+    #[test]
+    fn an_escaped_at_token_keeps_the_menu_closed_until_the_caret_leaves() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(host.menu_open(), "the mention menu is up");
+
+        // Esc through the real key path: the token at the caret is declined.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "an explicitly declined token does not reopen the menu"
+        );
+
+        // Typing more of the token keeps it declined — and so does backspacing
+        // it shorter: it is still the same token the caret sits on.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode-notes".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "still the declined token");
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "backspacing the same token stays declined"
+        );
+
+        // The caret leaves the token: the decline is stale and the next `@`
+        // may ask again.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "说 @atomcode-notes".into();
+            moment.caret = moment.input.len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a new token at a different position asks again"
+        );
+        assert!(
+            tui.mention_declined.lock().unwrap().is_none(),
+            "the stale decline record expires once the caret leaves the token"
+        );
+
+        // And back on the first token the decline is stale too: it was
+        // cleared the moment the caret moved to a different token.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode-notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "the caret returned to the old token: the stale decline must not suppress it"
+        );
+
+        // Esc again, then REPLACE the token's text at the same offset: a new
+        // token that is not an extension of the dismissed one must ask again.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the re-declined token is suppressed");
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@完全不同 into".into();
+            moment.caret = "@完全不同".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a replaced token at the same offset is not the dismissed one"
+        );
+    }
+
+    /// Entering reverse search / history browsing must not wipe the decline:
+    /// the input is untouched while browsing, so the record has not gone
+    /// stale — and when browsing ends on the same token, the menu stays away.
+    #[test]
+    fn browsing_leaves_the_declined_token_alone() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.decline_current_mention();
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the declined token holds the menu down");
+
+        // Browsing starts: the menu is suppressed while it lasts, and the
+        // record must survive it — observable once browsing ends.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history_at = Some(1);
+        }
+        tui.refresh_menu();
+
+        // Browsing ends on the same token: the decline still holds.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history_at = None;
+        }
+        tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "browsing must not wipe the decline: the same token stays declined"
+        );
     }
 
     #[test]
