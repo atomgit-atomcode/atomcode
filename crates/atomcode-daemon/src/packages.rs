@@ -92,6 +92,16 @@ pub struct Manifest {
     /// confirmation in the system installer).
     #[serde(default)]
     pub requires: Vec<String>,
+    /// This package turns an audio file into text: run it with the recording's
+    /// path and it prints the transcript on stdout.
+    ///
+    /// It exists because a phone can have no speech recogniser at all — measured
+    /// on PLT140 (OPLUS/Android 16), where `query-services -a
+    /// android.speech.RecognitionService` answers "No services found" while the
+    /// installed keyboard dictates fine into any text field. Voice input then has
+    /// to bring its own engine, and a local one keeps the audio on the device.
+    #[serde(default)]
+    pub transcribe: bool,
 }
 
 fn default_symbol() -> String {
@@ -407,6 +417,69 @@ fn installed_names() -> std::collections::BTreeSet<String> {
         .filter_map(|entry| read_manifest(&entry.path()).ok())
         .map(|manifest| manifest.name)
         .collect()
+}
+
+/// The installed package that turns audio into text, by its command name.
+///
+/// Deterministic (alphabetical) so two transcription packages cannot make the
+/// answer flap between requests. `None` means voice input has no local engine —
+/// the page then offers the model fallback, or a link to the plugin page.
+pub fn transcription_package() -> Option<String> {
+    transcription_package_under(&packages_root())
+}
+
+/// The same scan against an explicit packages root, so it can be tested without
+/// a product directory.
+fn transcription_package_under(root: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        // A package that declares transcription but ships no `entry` cannot be
+        // loaded at all, so offering it would produce a button that always fails.
+        .filter_map(|entry| read_manifest(&entry.path()).ok())
+        .filter(|manifest| manifest.transcribe && !manifest.entry.is_empty())
+        .map(|manifest| manifest.name)
+        .collect();
+    names.sort();
+    names.into_iter().next()
+}
+
+/// Run the transcription package on `wav`, returning what it printed.
+///
+/// The contract is deliberately the smallest one that can work: the plugin gets
+/// the recording's path and writes the transcript to stdout. Anything richer
+/// (a protocol, a socket, a codec list) would have to be re-implemented by every
+/// such package, and the point of a local engine is that it audibly either works
+/// or does not.
+pub fn transcribe_audio(package: &str, wav: &std::path::Path) -> Result<String, String> {
+    if !is_package_name(package) {
+        return Err(format!("invalid package name: {package:?}"));
+    }
+    let command = bin_dir().join(package);
+    if !command.exists() {
+        return Err(format!(
+            "`{package}` has no command in this build (is pluginhost installed?)"
+        ));
+    }
+    let output = std::process::Command::new(&command)
+        .arg(wav)
+        .output()
+        .map_err(|error| format!("cannot run `{package}`: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        return if text.is_empty() {
+            Err("it printed no transcript".to_string())
+        } else {
+            Ok(text)
+        };
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("it exited with {}", output.status)
+    } else {
+        stderr
+    })
 }
 
 /// A declared data directory whose owning package is gone.
@@ -2034,6 +2107,76 @@ mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
+    /// The seam voice input uses for a local engine: a package declares
+    /// `"transcribe": true` and becomes the thing audio is handed to.
+    ///
+    /// Three properties matter and none of them are visible from the manifest
+    /// alone, so they are pinned here: a package that does not declare it must not
+    /// be mistaken for an engine (every compiler plugin would otherwise qualify),
+    /// a package that declares it but ships no `entry` cannot run at all, and two
+    /// engines must not make the answer flap between requests.
+    #[test]
+    fn a_package_that_declares_transcription_is_the_local_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |name: &str, body: &str| {
+            let package = root.join(name);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("package.json"), body).unwrap();
+        };
+
+        assert_eq!(
+            transcription_package_under(root),
+            None,
+            "an empty root has no engine"
+        );
+
+        // A compiler plugin is a package too, and must not answer here.
+        write(
+            "clang",
+            r#"{"name":"clang","version":"1.0","entry":"lib/clang.so"}"#,
+        );
+        assert_eq!(transcription_package_under(root), None);
+
+        write(
+            "whisper-b",
+            r#"{"name":"whisper-b","version":"1.0","entry":"lib/wb.so","transcribe":true}"#,
+        );
+        assert_eq!(
+            transcription_package_under(root).as_deref(),
+            Some("whisper-b")
+        );
+
+        // Declared but unloadable (no entry): offering it would be a button that
+        // always fails, so it is skipped even though it claims the capability.
+        write(
+            "whisper-a",
+            r#"{"name":"whisper-a","version":"1.0","entry":"","transcribe":true}"#,
+        );
+        assert_eq!(
+            transcription_package_under(root).as_deref(),
+            Some("whisper-b")
+        );
+
+        // Two usable engines: the alphabetically first answers, always.
+        write(
+            "whisper-c",
+            r#"{"name":"whisper-c","version":"1.0","entry":"lib/wc.so","transcribe":true}"#,
+        );
+        assert_eq!(
+            transcription_package_under(root).as_deref(),
+            Some("whisper-b")
+        );
+        write(
+            "whisper-b",
+            r#"{"name":"whisper-b","version":"1.1","entry":"lib/wb.so","transcribe":true}"#,
+        );
+        assert_eq!(
+            transcription_package_under(root).as_deref(),
+            Some("whisper-b")
+        );
+    }
+
     /// `packages_root()` reads the product dir from the environment, which is
     /// process-global. Tests that point it at a temp tree must not overlap, or
     /// one test's tree is silently used by another.
@@ -2263,6 +2406,7 @@ mod tests {
             python_packages: String::new(),
             links: std::collections::BTreeMap::new(),
             requires,
+            transcribe: false,
         }
     }
 

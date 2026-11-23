@@ -209,12 +209,17 @@ pub(crate) async fn init(State(state): State<AppState>) -> impl IntoResponse {
         .into_response();
     }
     match run_git(&cwd, &["init"], LOCAL_TIMEOUT).await {
-        Ok(output) => Json(serde_json::json!({
-            "success": true,
-            "output": trim_output(&output),
-            "root": cwd.to_string_lossy(),
-        }))
-        .into_response(),
+        Ok(output) => {
+            // A repository created in the project directory also contains the
+            // session log, which is ours and not the person's work.
+            ensure_sessions_excluded(&cwd, &sessions_root()).await;
+            Json(serde_json::json!({
+                "success": true,
+                "output": trim_output(&output),
+                "root": cwd.to_string_lossy(),
+            }))
+            .into_response()
+        }
         Err(error) => json_error(StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
@@ -391,13 +396,18 @@ pub(crate) async fn clone(
         dir.to_string_lossy().to_string(),
     ];
     match run_git(&cwd, &args, NETWORK_TIMEOUT).await {
-        Ok(output) => Json(serde_json::json!({
-            "success": true,
-            "output": trim_output(&output),
-            "dir": dir.to_string_lossy(),
-            "root": target.to_string_lossy(),
-        }))
-        .into_response(),
+        Ok(output) => {
+            // Same reason as `init`: cloning *into* the project directory can put
+            // the session log inside the new repository.
+            ensure_sessions_excluded(&target, &sessions_root()).await;
+            Json(serde_json::json!({
+                "success": true,
+                "output": trim_output(&output),
+                "dir": dir.to_string_lossy(),
+                "root": target.to_string_lossy(),
+            }))
+            .into_response()
+        }
         Err(error) => json_error(StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
@@ -436,7 +446,79 @@ async fn repo_root(dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(line))
 }
 
+/// The session log's root, as this process resolved it.
+fn sessions_root() -> PathBuf {
+    atomcode_coding::config::product_dirs_from_env().sessions_root()
+}
+
+/// The part of the session root that sits inside `root`, if any.
+///
+/// Both sides go through `canonicalize` before the comparison: on Android the
+/// same directory is reachable as `/data/data/…` and `/data/user/0/…`, and the two
+/// spellings do not compare equal. That is not hypothetical — a pinned session
+/// root and git's answer for `--show-toplevel` disagreed exactly this way on
+/// device, and the exclusion silently did nothing.
+///
+/// Split from the process-wide lookup so the rule is testable: the tests run in
+/// parallel and cannot set a process environment variable without racing.
+fn sessions_relative_to(root: &Path, sessions: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let sessions = std::fs::canonicalize(sessions).unwrap_or_else(|_| sessions.to_path_buf());
+    let relative = sessions.strip_prefix(&root).ok()?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+}
+
+/// Keep the session log out of a repository it happens to live in.
+///
+/// `.git/info/exclude`, not `.gitignore`: it belongs to this clone only, so the
+/// person's tree is never edited, and `git` itself honours it — an `add -A` from
+/// the agent's `bash` tool skips the sessions too, which a status-side filter
+/// could not achieve. Best effort: a repository we cannot write to is no reason
+/// to fail a request.
+async fn ensure_sessions_excluded(root: &Path, sessions: &Path) {
+    let Some(relative) = sessions_relative_to(root, sessions) else {
+        // Outside the repository: nothing to exclude. Say which roots were compared
+        // at debug level — on a device this is the only way to see that the host's
+        // pinned root and git's repository root differ (they can, through
+        // `/data/user/0` vs `/data/data` symlinks).
+        tracing::debug!(
+            root = %root.display(),
+            sessions = %sessions.display(),
+            "session root is not inside this repository"
+        );
+        return;
+    };
+    let pattern = format!("/{}/", relative.to_string_lossy().replace('\\', "/"));
+    let exclude = root.join(".git/info/exclude");
+    let current = tokio::fs::read_to_string(&exclude)
+        .await
+        .unwrap_or_default();
+    if current.lines().any(|line| line.trim() == pattern) {
+        return;
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&pattern);
+    next.push('\n');
+    if let Some(parent) = exclude.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            tracing::debug!(%error, "cannot create .git/info for the session exclusion");
+            return;
+        }
+    }
+    if let Err(error) = tokio::fs::write(&exclude, next).await {
+        tracing::debug!(%error, "cannot write .git/info/exclude for the session exclusion");
+    }
+}
+
 async fn status_at(root: &Path) -> Result<RepoStatus, String> {
+    // The session log may live inside this repository — the Android host pins it
+    // to `<workspace>/.sessions` so a hand-started daemon reads one history. It is
+    // never the person's work: a repository created in that workspace saw every
+    // session as an untracked file (verified on device, 2026-11-21).
+    ensure_sessions_excluded(root, &sessions_root()).await;
     // One process for the whole panel: the `##` header carries branch, upstream
     // and ahead/behind; the records carry every path. `-z` keeps paths verbatim
     // (no quoting), so non-ASCII names need no decoding.
@@ -1277,6 +1359,35 @@ mod tests {
         assert!(redacted.contains("then a plain line"));
     }
 
+    /// The whole path as the daemon runs it: the host pins the session root in
+    /// `$ATOMCODE_SESSIONS_DIR`, and `status_at` must pick it up from there.
+    ///
+    /// nextest gives every test its own process, so setting the variable here
+    /// cannot race another test.
+    #[tokio::test]
+    async fn status_uses_the_pinned_session_root_from_the_environment() {
+        let Some((_guard, root)) = temp_repo().await else {
+            return;
+        };
+        let sessions = root.join(".sessions");
+        std::fs::create_dir_all(sessions.join("bucket")).expect("mkdir");
+        std::fs::write(sessions.join("bucket/one.events"), b"{}").expect("write");
+        std::fs::write(root.join("a.txt"), b"hello").expect("write");
+        std::env::set_var("ATOMCODE_SESSIONS_DIR", &sessions);
+
+        let status = status_at(&root).await.expect("status");
+        std::env::remove_var("ATOMCODE_SESSIONS_DIR");
+
+        assert!(
+            !status
+                .changes
+                .iter()
+                .any(|c| c.path.starts_with(".sessions/")),
+            "the pinned session root must be excluded: {:?}",
+            status.changes
+        );
+    }
+
     async fn temp_repo() -> Option<(tempfile::TempDir, PathBuf)> {
         if !git_available().await {
             return None;
@@ -1295,6 +1406,103 @@ mod tests {
             .await
             .ok()?;
         Some((dir, root))
+    }
+
+    /// Android reaches the app's tree as both `/data/data/…` and `/data/user/0/…`.
+    /// A pinned session root and git's `--show-toplevel` disagreed exactly this
+    /// way on device and the exclusion silently did nothing, so the comparison has
+    /// to survive two spellings of one directory.
+    #[test]
+    fn an_aliased_directory_still_matches_its_session_root() {
+        let Some(dir) = tempfile::tempdir().ok() else {
+            return;
+        };
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join(".sessions")).expect("mkdir");
+        let link = dir.path().join("alias");
+        if !alias_dir(&root, &link) {
+            // No privilege to make an alias here (a non-admin Windows without
+            // developer mode). The rule itself is std behaviour; skip rather than
+            // fail on the machine, not on the code.
+            return;
+        }
+        assert_eq!(
+            sessions_relative_to(&link, &root.join(".sessions")),
+            Some(PathBuf::from(".sessions")),
+            "the two names must resolve to the same directory"
+        );
+    }
+
+    #[cfg(unix)]
+    fn alias_dir(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn alias_dir(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[test]
+    fn only_a_session_root_inside_the_repository_is_excluded() {
+        let root = Path::new("/work");
+        assert_eq!(
+            sessions_relative_to(root, Path::new("/work/.sessions")),
+            Some(PathBuf::from(".sessions"))
+        );
+        assert_eq!(
+            sessions_relative_to(root, Path::new("/work/sub/.sessions")),
+            Some(PathBuf::from("sub/.sessions"))
+        );
+        assert_eq!(
+            sessions_relative_to(root, Path::new("/elsewhere/.sessions")),
+            None
+        );
+        assert_eq!(sessions_relative_to(root, root), None);
+    }
+
+    /// The device state on 2026-11-21: a repository created in the project
+    /// directory reported every session file as an untracked change.
+    #[tokio::test]
+    async fn the_session_log_inside_a_repository_is_excluded() {
+        let Some((_guard, root)) = temp_repo().await else {
+            return;
+        };
+        let sessions = root.join(".sessions");
+        std::fs::create_dir_all(sessions.join("c3ab6296c1b711d0")).expect("mkdir");
+        std::fs::write(sessions.join("c3ab6296c1b711d0/one.events"), b"{}").expect("write");
+        std::fs::write(root.join("a.txt"), b"hello").expect("write");
+
+        let before = status_at(&root).await.expect("status");
+        assert!(
+            before
+                .changes
+                .iter()
+                .any(|c| c.path.starts_with(".sessions/")),
+            "the fixture must show the pollution first: {:?}",
+            before.changes
+        );
+
+        ensure_sessions_excluded(&root, &sessions).await;
+        let after = status_at(&root).await.expect("status");
+        assert!(
+            !after
+                .changes
+                .iter()
+                .any(|c| c.path.starts_with(".sessions/")),
+            "the session log must not appear as a change: {:?}",
+            after.changes
+        );
+        assert!(
+            after.changes.iter().any(|c| c.path == "a.txt"),
+            "the person's own file must still be reported: {:?}",
+            after.changes
+        );
+
+        // Idempotent: a second status must not append a second entry.
+        ensure_sessions_excluded(&root, &sessions).await;
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).expect("exclude");
+        assert_eq!(exclude.matches("/.sessions/").count(), 1, "{exclude}");
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ import { GoalRecoveryStatus } from './GoalRecoveryStatus';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
-import { ApiCallError, importPatchFile, taskSpecs } from '../api';
+import { ApiCallError, importPatchFile, taskSpecs, transcribeRecording, voiceCapabilities } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
 import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
@@ -24,7 +24,7 @@ import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { detectSlashMenuQuery } from '../lib/slashCommands';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
-import type { LiveGoalProgress, LiveLoopProgress, SessionActivity } from '../api';
+import type { LiveGoalProgress, LiveLoopProgress, SessionActivity, VoiceCapabilities } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -88,9 +88,12 @@ import {
   hasAndroidHost,
   openWithHost,
   startVoiceInput,
+  startVoiceRecording,
+  stopVoiceRecording,
   takeShares,
   takeVoiceText,
 } from '../lib/androidHost';
+import { VoiceFallbackDialog } from './VoiceFallbackDialog';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -3721,6 +3724,68 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 语音输入的三条路径：系统识别器 → 本地转写插件 → 模型 API。
+  //
+  // 顺序按代价排：系统识别器最省（不要权限、不要联网、不要装东西），本地插件次之
+  // （私密且免费），模型 API 最后（能用，但花一次请求，音频也离开设备）。宿主说没有
+  // 识别器时才往下走；那两项能力只有 daemon 看得见，所以点下去先问它一次再决定说什么。
+  const [voicePhase, setVoicePhase] = useState<'idle' | 'recording' | 'transcribing'>('idle');
+  const [voiceChoices, setVoiceChoices] = useState<VoiceCapabilities | null>(null);
+
+  async function handleVoiceClick() {
+    // 录第二下是「结束」，不是「重新开始」：一句话有多长没人预先知道。
+    if (voicePhase === 'recording') {
+      void finishVoiceRecording();
+      return;
+    }
+    if (voicePhase !== 'idle') return;
+    // 1) 系统识别器：结果通过 atomcode:voice 事件异步回来，这里不等。
+    if (startVoiceInput()) return;
+    // 2) 没有识别器：问 daemon 能降级到什么，再让用户挑。
+    try {
+      setVoiceChoices(await voiceCapabilities());
+    } catch (error) {
+      pushCommandNotice(
+        t('chat.voiceFailed', { error: error instanceof Error ? error.message : String(error) }),
+      );
+    }
+  }
+
+  function beginVoiceRecording() {
+    setVoiceChoices(null);
+    const started = startVoiceRecording();
+    if (!started.ok) {
+      // permission 不是失败：宿主刚弹了系统对话框，再点一次就好。
+      pushCommandNotice(
+        started.reason === 'permission'
+          ? t('chat.voiceNeedsPermission')
+          : t('chat.voiceFailed', { error: started.reason ?? 'unknown' }),
+      );
+      return;
+    }
+    setVoicePhase('recording');
+  }
+
+  async function finishVoiceRecording() {
+    const path = stopVoiceRecording();
+    if (!path) {
+      setVoicePhase('idle');
+      pushCommandNotice(t('chat.voiceEmpty'));
+      return;
+    }
+    setVoicePhase('transcribing');
+    try {
+      const transcript = await transcribeRecording(path);
+      insertAtCursor(transcript.text + ' ');
+    } catch (error) {
+      pushCommandNotice(
+        t('chat.voiceFailed', { error: error instanceof Error ? error.message : String(error) }),
+      );
+    } finally {
+      setVoicePhase('idle');
+    }
+  }
+
   // 追加图片（上传或粘贴）：压缩到长边 1568px 后入列，限制总数。
   //
   // 以前这里按 2MB 直接拒绝——手机上拍照的图通常 3–8MB，等于附件功能在
@@ -4147,6 +4212,17 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError || currentTurnModel || (!sync && busy && provider !== runtimeModel?.provider) ? ' has-input-detail' : '')}>
       {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
+      {/* 宿主没有识别器才走到这里：录音交给本地插件或模型 API，而不是假装在听。 */}
+      {voiceChoices && createPortal(
+        <VoiceFallbackDialog
+          plugin={voiceChoices.plugin}
+          model={voiceChoices.model}
+          onRecord={beginVoiceRecording}
+          onOpenPlugins={() => { setVoiceChoices(null); onOpenPackages?.(); }}
+          onClose={() => setVoiceChoices(null)}
+        />,
+        document.body,
+      )}
       {patchUploading && <div class="input-attach-error" role="status">{t('patch.importing')}</div>}
       {attachError && (
         <div class="input-attach-error" role="alert">
@@ -4303,13 +4379,24 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
           {/* 只有在安卓宿主里才有识别器可借；桌面隐藏，而不是放个点了没反应的按钮。 */}
           {hasAndroidHost() && (
             <button
-              class="btn-voice"
-              onClick={() => {
-                // 宿主回来 false：这台设备没有识别器（或不是安卓）。说出来，别装作在听。
-                if (!startVoiceInput()) pushCommandNotice(t('chat.voiceUnavailable'));
-              }}
-              title={t('chat.voice')}
-              aria-label={t('chat.voice')}
+              class={'btn-voice' + (voicePhase === 'recording' ? ' active' : '')}
+              disabled={voicePhase === 'transcribing'}
+              // 1) 有识别器就借它（最省）；没有就展开降级选项；录音中则这一下是「结束」。
+              onClick={() => { void handleVoiceClick(); }}
+              title={
+                voicePhase === 'recording'
+                  ? t('chat.voiceRecording')
+                  : voicePhase === 'transcribing'
+                    ? t('chat.voiceTranscribing')
+                    : t('chat.voice')
+              }
+              aria-label={
+                voicePhase === 'recording'
+                  ? t('chat.voiceRecording')
+                  : voicePhase === 'transcribing'
+                    ? t('chat.voiceTranscribing')
+                    : t('chat.voice')
+              }
             >
               {/* lucide `mic` */}
               <svg

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -40,6 +42,69 @@ fun versionCodeOf(version: String): Int {
 val productVersion = workspaceVersion()
 val productVersionCode = versionCodeOf(productVersion)
 
+/// Release signing material, resolved from the machine — never from the repo.
+///
+/// Four settings, each with an environment variable that wins over
+/// `local.properties` so CI can keep the material out of any checked-in file:
+///
+/// | local.properties | environment |
+/// |---|---|
+/// | `atomcode.keystore` | `ATOMCODE_ANDROID_KEYSTORE` |
+/// | `atomcode.keystore.password` | `ATOMCODE_ANDROID_KEYSTORE_PASSWORD` |
+/// | `atomcode.key.alias` | `ATOMCODE_ANDROID_KEY_ALIAS` |
+/// | `atomcode.key.password` | `ATOMCODE_ANDROID_KEY_PASSWORD` |
+///
+/// Nothing is defaulted and no key is generated here: a release key identifies
+/// the app for its whole life, so producing one is a person's decision, not a
+/// build step's. Absent the material `assembleRelease` still runs and stays
+/// unsigned; `scripts/verify-android-release.sh` refuses that output instead of
+/// letting an unsigned artifact reach a store upload.
+data class ReleaseSigning(
+    val keystore: File,
+    val storePassword: String,
+    val keyAlias: String,
+    val keyPassword: String,
+)
+
+fun machineProperties(): Properties {
+    val file = rootProject.file("local.properties")
+    return Properties().apply { if (file.isFile) file.inputStream().use { load(it) } }
+}
+
+val localProperties = machineProperties()
+
+fun signingSetting(key: String, env: String): String? =
+    System.getenv(env)?.trim()?.takeIf { it.isNotEmpty() }
+        ?: localProperties.getProperty(key)?.trim()?.takeIf { it.isNotEmpty() }
+
+val releaseSigning: ReleaseSigning? = run {
+    val keystore = signingSetting("atomcode.keystore", "ATOMCODE_ANDROID_KEYSTORE") ?: return@run null
+    val storePassword = signingSetting("atomcode.keystore.password", "ATOMCODE_ANDROID_KEYSTORE_PASSWORD")
+    val alias = signingSetting("atomcode.key.alias", "ATOMCODE_ANDROID_KEY_ALIAS")
+    val keyPassword = signingSetting("atomcode.key.password", "ATOMCODE_ANDROID_KEY_PASSWORD")
+    // Half-configured is worse than absent: without this the build fails deep
+    // inside `apksigner` with a stack trace that never names the missing key.
+    val missing = buildList {
+        if (storePassword == null) add("atomcode.keystore.password")
+        if (alias == null) add("atomcode.key.alias")
+        if (keyPassword == null) add("atomcode.key.password")
+    }
+    require(missing.isEmpty()) {
+        "release keystore is set but ${missing.joinToString(", ")} is missing " +
+            "(local.properties, or the ATOMCODE_ANDROID_KEYSTORE* environment variables)"
+    }
+    val file = rootProject.file(keystore)
+    require(file.isFile) { "release keystore not found: ${file.absolutePath}" }
+    ReleaseSigning(file, storePassword!!, alias!!, keyPassword!!)
+}
+
+if (releaseSigning == null) {
+    logger.warn(
+        "release signing is not configured (atomcode.keystore in local.properties or " +
+            "ATOMCODE_ANDROID_KEYSTORE* in the environment): assembleRelease will produce an UNSIGNED apk",
+    )
+}
+
 android {
     namespace = "com.atomcode.app"
     compileSdk = 36
@@ -68,12 +133,31 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseSigning != null) {
+            create("release") {
+                storeFile = releaseSigning.keystore
+                storePassword = releaseSigning.storePassword
+                keyAlias = releaseSigning.keyAlias
+                keyPassword = releaseSigning.keyPassword
+                // v1 too: minSdk is 26 and a sideloaded APK still goes through the
+                // JAR signature on some installers. v2/v3 are what a store checks.
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             // The Rust library is prebuilt by `scripts/build-android.sh`; Gradle
             // packages whatever is in `jniLibs/arm64-v8a/`.
             ndk { debugSymbolLevel = "none" }
+            // Machine-local, see `releaseSigning` above. Without it this is an
+            // unsigned release apk — installable nowhere, uploadable nowhere.
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

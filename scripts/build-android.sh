@@ -3,6 +3,14 @@
 #
 #   bash scripts/build-android.sh          # cargo build only, no APK
 #   bash scripts/build-android.sh --apk    # also run gradle assembleDebug
+#   bash scripts/build-android.sh --release # signed apk, needs the material below
+#   bash scripts/build-android.sh --bundle  # signed AAB for the store
+#
+# Release signing material is machine-local (never in the repo):
+#   atomcode.keystore / atomcode.keystore.password / atomcode.key.alias /
+#   atomcode.key.password in android/local.properties, or the matching
+#   ATOMCODE_ANDROID_KEYSTORE* environment variables. Without it the release
+#   build is unsigned and `scripts/verify-android-release.sh` refuses it.
 #
 # Requires:
 #   - rustup target add aarch64-linux-android
@@ -137,10 +145,35 @@ cp "$so" "$dest/libatomcode_android.so"
 cp "$launcher" "$dest/libpluginhost.so"
 echo "→ copied $(du -h "$dest/libatomcode_android.so" | cut -f1) to $dest/ (+ libpluginhost.so)"
 
-if [ "${1:-}" = "--apk" ]; then
+# Which gradle task to run, if any. `--release` implies "package it": asking for
+# a signed apk and getting only a .so would be surprising.
+GRADLE_TASK=""
+for arg in "$@"; do
+  case "$arg" in
+    --apk)     [ -n "$GRADLE_TASK" ] || GRADLE_TASK="assembleDebug" ;;
+    --release) GRADLE_TASK="assembleRelease" ;;
+    --bundle)  GRADLE_TASK="bundleRelease" ;;
+    *)
+      echo "error: unknown argument: $arg" >&2
+      echo "  usage: bash scripts/build-android.sh [--apk|--release|--bundle]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -n "$GRADLE_TASK" ]; then
   if [ ! -f android/local.properties ] && [ -n "${ANDROID_HOME:-}" ]; then
     printf 'sdk.dir=%s\n' "${ANDROID_HOME//\\/\\\\}" > android/local.properties
   fi
-  ( cd android && ./gradlew assembleDebug )
-  echo "→ APK: android/app/build/outputs/apk/debug/app-debug.apk"
+  ( cd android && ./gradlew "$GRADLE_TASK" )
+  case "$GRADLE_TASK" in
+    assembleDebug)
+      echo "→ APK: android/app/build/outputs/apk/debug/app-debug.apk" ;;
+    assembleRelease)
+      echo "→ APK: android/app/build/outputs/apk/release/app-release.apk"
+      echo "  verify: bash scripts/verify-android-release.sh" ;;
+    bundleRelease)
+      echo "→ AAB: android/app/build/outputs/bundle/release/app-release.aab"
+      echo "  verify: bash scripts/verify-android-release.sh android/app/build/outputs/bundle/release/app-release.aab" ;;
+  esac
 fi

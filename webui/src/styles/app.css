@@ -1272,6 +1272,10 @@ body {
 /* Active = brand-tinted square (matches the design's #d977572e fill + brand icon). */
 .btn-sync.active { background: rgba(128, 128, 128, 0.11); background: color-mix(in srgb, var(--app-brand) 18%, transparent); color: var(--app-brand); }
 .btn-sync.active:hover { background: rgba(128, 128, 128, 0.14); background: color-mix(in srgb, var(--app-brand) 24%, transparent); color: var(--app-brand); }
+/* 无识别器时的应用内录音：这一下是「结束」，按钮必须看得出麦克风正开着，
+   否则一句话录到哪、要不要再点一下，全靠猜。 */
+.btn-voice.active { background: rgba(128, 128, 128, 0.11); background: color-mix(in srgb, var(--app-brand) 18%, transparent); color: var(--app-brand); }
+.btn-voice.active:hover { background: rgba(128, 128, 128, 0.14); background: color-mix(in srgb, var(--app-brand) 24%, transparent); color: var(--app-brand); }
 
 /* === Sidebar / session list === */
 .session-list {
@@ -4806,6 +4810,7 @@ body {
   border-radius: var(--corner-radius-medium);
   background: var(--app-menu-background);
   padding: 0 12px;
+}
 .session-browse-summary { flex: 1 1 280px; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
 .session-browse-label { flex: none; color: var(--app-brand); font-size: 12px; font-weight: 600; }
 .session-browse-title { min-width: 0; overflow-wrap: anywhere; color: var(--app-primary-foreground); }

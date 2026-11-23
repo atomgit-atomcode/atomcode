@@ -59,6 +59,26 @@ pub fn due_at(entry: &Entry, now: i64) -> bool {
     due_occurrence(entry, now).is_some()
 }
 
+/// The earliest instant some enabled entry is next due, in unix seconds.
+///
+/// A phone kills a background process whenever it wants to, so the runtime cannot
+/// be the only thing that knows a task is coming: the host sets a system alarm for
+/// this instant and the alarm brings the process back. `None` means nothing is
+/// scheduled, and an alarm should be cancelled rather than left to wake the phone
+/// for a task that no longer exists.
+///
+/// Same placement rule as [`due_occurrence`]: the caller is the Android-only
+/// runner, so the arithmetic lives here where any machine can test it. `timing::next`
+/// is the same function the panel's "next run" uses, so the alarm and the displayed
+/// time cannot disagree.
+pub fn next_occurrence(entries: &[Entry], now: i64) -> Option<i64> {
+    entries
+        .iter()
+        .filter(|entry| entry.definition.task.enabled)
+        .filter_map(|entry| crate::timing::next(&entry.definition.task, now).map(|next| next.at))
+        .min()
+}
+
 /// When the recorded run event happened, whatever kind it is.
 fn last_run_at(event: &RunEvent) -> Option<i64> {
     match event {
@@ -312,6 +332,55 @@ mod tests {
         // A run that already covered this occurrence is not due again.
         let covered = entry(true, false, created, Some(created + 121));
         assert_eq!(due_occurrence(&covered, first), None);
+    }
+
+    /// An entry whose only interesting property is its interval.
+    fn entry_every(every_minutes: u32, enabled: bool, created_at: i64) -> Entry {
+        let task = serde_json::from_value(serde_json::json!({
+            "id": format!("t{every_minutes}"),
+            "title": "T",
+            "prompt": "p",
+            "cwd": std::env::temp_dir(),
+            "schedule": {"kind": "interval", "every_minutes": every_minutes},
+            "created_at": created_at,
+            "enabled": enabled
+        }))
+        .unwrap();
+        Entry {
+            definition: crate::Definition {
+                task,
+                revision: "rev".into(),
+            },
+            registration: "unknown".into(),
+            registration_error: None,
+            next_run: None,
+            last_run: None,
+            running: false,
+        }
+    }
+
+    /// The alarm has to ring for the earliest enabled task, and only for one that
+    /// can actually run — a disabled task must not keep waking the phone, and an
+    /// empty list has to clear the alarm rather than leave a stale one.
+    #[test]
+    fn the_next_wake_is_the_earliest_enabled_task() {
+        let created = 1_800_000_000;
+        let now = created + 30;
+
+        let entries = vec![entry_every(5, true, created), entry_every(1, true, created)];
+        assert_eq!(next_occurrence(&entries, now), Some(created + 60));
+
+        let entries = vec![
+            entry_every(1, false, created),
+            entry_every(5, true, created),
+        ];
+        assert_eq!(
+            next_occurrence(&entries, now),
+            Some(created + 300),
+            "a disabled task cannot arm the alarm, however soon it would be"
+        );
+
+        assert_eq!(next_occurrence(&[], now), None);
     }
 
     #[test]

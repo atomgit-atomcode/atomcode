@@ -109,6 +109,10 @@ class AgentService : Service() {
         Log.i(TAG, "agent service created")
         NativeAgent.nativeInit(Log.INFO)
         AgentPower.bind(this)
+        // The daemon arms the alarm for the next scheduled task after every sweep;
+        // this is the context it needs, and it has to be here rather than in an
+        // Activity: the alarm can start the service with no UI in the process.
+        ScheduleAlarm.attach(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

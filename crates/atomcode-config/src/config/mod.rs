@@ -619,6 +619,45 @@ impl CompactionConfig {
     }
 }
 
+/// Speech input that cannot borrow the phone's recogniser.
+///
+/// A phone whose only speech engine is private to its keyboard (measured: OPLUS +
+/// Baidu IME exposes no `RecognitionService`) has no
+/// `ACTION_RECOGNIZE_SPEECH` handler at all, so the transcript has to come from
+/// somewhere else. Two routes: a locally installed transcription plugin, or a
+/// model provider's audio endpoint. This section configures the second one;
+/// omitting it means "use the provider the current model already points at",
+/// which is what a single-provider setup wants.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceConfig {
+    /// Model selection whose provider sends the audio. Omitted uses the default
+    /// model's provider (the same selection the agent talks to).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Transcription model name at that provider. Omitted means `whisper-1` —
+    /// the name every OpenAI-compatible endpoint uses for `/audio/transcriptions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl VoiceConfig {
+    fn is_default(&self) -> bool {
+        self.provider.is_none() && self.model.is_none()
+    }
+
+    /// The transcription model to ask for.
+    pub fn transcription_model(&self) -> &str {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DEFAULT_TRANSCRIPTION_MODEL)
+    }
+}
+
+/// The name OpenAI-compatible `/audio/transcriptions` endpoints answer to.
+pub const DEFAULT_TRANSCRIPTION_MODEL: &str = "whisper-1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(
@@ -628,6 +667,9 @@ pub struct Config {
     pub modes: crate::mode_models::ModeModels,
     #[serde(default, skip_serializing_if = "CompactionConfig::is_default")]
     pub compaction: CompactionConfig,
+    /// Where speech-to-text comes from when the phone has no recogniser.
+    #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
+    pub voice: VoiceConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
     /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
@@ -1220,6 +1262,7 @@ impl Default for Config {
             evaluator_provider: None,
             goal: GoalConfig::default(),
             compaction: CompactionConfig::default(),
+            voice: VoiceConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -4160,6 +4203,7 @@ model = "missing-type"
             evaluator_provider: None,
             goal: GoalConfig::default(),
             compaction: CompactionConfig::default(),
+            voice: VoiceConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),

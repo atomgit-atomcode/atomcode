@@ -1739,6 +1739,47 @@ export async function listPackages(): Promise<PackageRecord[]> {
   return body.packages ?? [];
 }
 
+/** What transcription can fall back to when the phone has no recogniser. */
+export interface VoiceCapabilities {
+  /** Installed package that turns audio into text, by command name. */
+  plugin: string | null;
+  /** A provider that offers `/audio/transcriptions`. */
+  model: { provider: string; model: string } | null;
+}
+
+export async function voiceCapabilities(): Promise<VoiceCapabilities> {
+  const resp = await apiFetch('/voice/capabilities', { headers: authHeaders() });
+  const body = await readJson<Partial<VoiceCapabilities>>(resp);
+  return { plugin: body.plugin ?? null, model: body.model ?? null };
+}
+
+export interface VoiceTranscript {
+  text: string;
+  engine: 'plugin' | 'model';
+}
+
+/**
+ * Transcribe a recording the app just made.
+ *
+ * The daemon picks the engine — an installed local package first, a model
+ * provider second — because only it knows what is available, and because a local
+ * engine is free and private where a network call is neither. Throws the
+ * daemon's own words on failure: "no transcription engine" and "the provider
+ * answered 404" call for different fixes.
+ */
+export async function transcribeRecording(path: string): Promise<VoiceTranscript> {
+  const body = await postJson<{
+    success?: boolean;
+    text?: string;
+    engine?: string;
+    error?: string;
+  }>('/voice/transcribe', { path });
+  if (body.success !== true || !body.text) {
+    throw new Error(body.error || 'the transcription returned no text');
+  }
+  return { text: body.text, engine: body.engine === 'plugin' ? 'plugin' : 'model' };
+}
+
 /** Install from a URL or a local bundle path. `sha256` is verified when given. */
 export async function installPackage(source: {
   url?: string;

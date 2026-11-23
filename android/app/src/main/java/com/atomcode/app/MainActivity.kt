@@ -76,6 +76,15 @@ class MainActivity : ComponentActivity() {
     /** Text another app shared (`EXTRA_TEXT`), drained with the files. */
     @Volatile private var pendingShareText: String? = null
     /**
+     * The in-app recorder used when the phone has no recogniser to borrow.
+     *
+     * Lazy: it wants `cacheDir`, and constructing it during `onCreate` would be the
+     * one moment the directory is guaranteed not to be asked for. It also must not
+     * be created for a session that never records — holding a microphone handle
+     * open is not something an idle app should do.
+     */
+    private val voice by lazy { VoiceRecorder(this) }
+    /**
      * What the system speech recogniser heard, waiting for the page to collect it.
      *
      * A field rather than a direct call for the same reason as [pendingShares]: the
@@ -650,6 +659,26 @@ class MainActivity : ComponentActivity() {
         }
 
         /**
+         * What speech input can borrow on this phone, as JSON.
+         *
+         * One field today, `recognizer`: whether any app answers
+         * `ACTION_RECOGNIZE_SPEECH`. It is a probe rather than a guess because the
+         * answer is not derivable from the platform: a phone can carry a keyboard
+         * with its own private speech engine (measured: OPLUS + Baidu IME) and
+         * still expose no `RecognitionService`, which is exactly the case where
+         * the mic button used to fail with no explanation.
+         *
+         * The other two sources — a locally installed transcription plugin, and a
+         * model provider — live behind the daemon, so the page asks there and
+         * combines the answers. This method deliberately reports only what the
+         * host itself can see.
+         */
+        @android.webkit.JavascriptInterface
+        fun voiceCapabilities(): String = JSONObject()
+            .put("recognizer", recognizerIntent().resolveActivity(packageManager) != null)
+            .toString()
+
+        /**
          * Hand the microphone to the phone's own speech recogniser.
          *
          * `ACTION_RECOGNIZE_SPEECH` is an Intent, not a permission: the recogniser
@@ -657,18 +686,12 @@ class MainActivity : ComponentActivity() {
          * audio enters the agent process — only the transcript does, through
          * [takeVoiceText].
          *
-         * Returns `false` when the phone has no recogniser, so the page can hide the
-         * button instead of offering one that does nothing.
+         * Returns `false` when the phone has no recogniser, so the page can offer
+         * the fallbacks instead of a button that does nothing.
          */
         @android.webkit.JavascriptInterface
         fun startVoiceInput(): Boolean {
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(
-                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-                )
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            }
+            val intent = recognizerIntent()
             if (intent.resolveActivity(packageManager) == null) {
                 Log.i(TAG, "no speech recogniser installed")
                 return false
@@ -683,6 +706,69 @@ class MainActivity : ComponentActivity() {
                 }
             }
             return true
+        }
+
+        /** The recogniser request. Free-form, one result: the page wants a sentence. */
+        private fun recognizerIntent(): Intent =
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                )
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            }
+
+        /**
+         * Start recording a sentence for a transcription engine that is not the
+         * phone's recogniser.
+         *
+         * Answers `{"ok":true}` or `{"ok":false,"reason":"permission"|"busy"|
+         * "unavailable"|"failed"}`. A reason, not a false: "you have not allowed the
+         * microphone yet" and "this device cannot record at all" need different
+         * sentences, and only the host knows which one it is.
+         *
+         * Asking for the permission here rather than at launch matches the
+         * notification prompt: the app has no use for the microphone until the
+         * person presses the button.
+         */
+        @android.webkit.JavascriptInterface
+        fun startVoiceRecording(): String {
+            if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                runOnUiThread {
+                    requestPermissions(
+                        arrayOf(android.Manifest.permission.RECORD_AUDIO),
+                        MICROPHONE_REQUEST,
+                    )
+                }
+                return JSONObject().put("ok", false).put("reason", "permission").toString()
+            }
+            val refusal = voice.start()
+            return if (refusal == null) {
+                JSONObject().put("ok", true).toString()
+            } else {
+                JSONObject().put("ok", false).put("reason", refusal).toString()
+            }
+        }
+
+        /**
+         * Stop recording and hand back the finished WAV.
+         *
+         * Answers `{"path":"…"}`; an empty path means the take was too short to
+         * contain anything, which is a normal way to change your mind rather than
+         * an error.
+         */
+        @android.webkit.JavascriptInterface
+        fun stopVoiceRecording(): String {
+            val file = voice.stop()
+            return JSONObject().put("path", file?.absolutePath.orEmpty()).toString()
+        }
+
+        /** Throw the current take away (the page cancelled the recording). */
+        @android.webkit.JavascriptInterface
+        fun discardVoiceRecording() {
+            voice.discard()
         }
 
         /**
@@ -1308,6 +1394,14 @@ class MainActivity : ComponentActivity() {
          * audio ever enters the agent process — only the text does.
          */
         private const val VOICE_REQUEST = 0x54
+        /**
+         * The microphone, asked for at the moment the fallback is used.
+         *
+         * The recogniser route never needs it — another app owns the microphone —
+         * so this only appears when the phone has no recogniser and the person
+         * picks "record and transcribe".
+         */
+        private const val MICROPHONE_REQUEST = 0x55
         /**
          * Set by a notification tap: which conversation to open.
          *

@@ -31,6 +31,7 @@ mod api_config;
 mod api_provider;
 mod api_provider_accounts;
 mod api_schedule;
+mod api_voice;
 pub mod approval_mode;
 mod commands;
 mod display_history;
@@ -6968,6 +6969,13 @@ pub fn set_turn_hook(hook: Box<dyn Fn(bool) + Send + Sync>) {
     let _ = TURN_HOOK.set(hook);
 }
 
+/// Install the scheduled-task alarm hook (`Option<i64>`: the next due instant in
+/// unix seconds, or `None` when nothing is scheduled). Same shape and reason as
+/// [`set_turn_hook`]: the platform needs a fact only the runtime knows, and this
+/// crate stays free of Android/JNI knowledge.
+#[cfg(target_os = "android")]
+pub use schedule_runner::set_wake_hook;
+
 fn fire_turn(active: bool) {
     if let Some(hook) = TURN_HOOK.get() {
         hook(active);
@@ -8518,6 +8526,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             get(live_api::live_mcp_session_get).post(live_api::live_mcp_session_post),
         )
         .route("/command", post(commands::run_command))
+        // Speech input for phones with no recogniser: what is available, and the
+        // transcription itself. The audio is capped at a few minutes of speech.
+        .route("/voice/capabilities", get(api_voice::capabilities))
+        .route(
+            "/voice/transcribe",
+            post(api_voice::transcribe).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route(
             "/live/followup",
             post(live_api::live_follow_up).layer(DefaultBodyLimit::max(128 * 1024)),

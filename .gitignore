@@ -149,6 +149,16 @@ android*/app/build/
 android*/local.properties
 android*/app/src/main/jniLibs/*/*.so
 
+# release 签名私钥。丢了就没法再发同一个包的更新，泄露了别人就能冒充本应用；
+# 两件事都不可逆，所以它只能待在本机（local.properties 指过去或环境变量给路径）。
+# 正规仓库里连「临时试签」的 keystore 也不该留。
+*.jks
+*.keystore
+android*/*.jks
+android*/*.keystore
+android*/app/*.jks
+android*/app/*.keystore
+
 # 本地 Android SDK/NDK 安装(scripts/build-android.sh 的查找目标之一)。
 # 只为让本机构建可复现,体积以 GB 计,不入库。
 .android-sdk/

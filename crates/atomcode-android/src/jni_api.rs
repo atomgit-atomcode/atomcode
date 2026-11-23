@@ -46,6 +46,37 @@ pub fn notify_turn_active(active: bool) {
     let _ = env.call_static_method(class, "turnActive", "(Z)V", &[JValue::Bool(active as u8)]);
 }
 
+/// The JVM and `ScheduleAlarm`, captured on the same Java thread as [`POWER`] and
+/// for the same reason: an attached native thread has no application class loader.
+static ALARM: std::sync::OnceLock<(JavaVM, GlobalRef)> = std::sync::OnceLock::new();
+
+/// Ask Kotlin to set (or clear) the one system alarm for the next due task.
+///
+/// `None` means nothing is scheduled and the alarm is cancelled — leaving a stale
+/// alarm behind would wake the phone for a task that no longer exists.
+pub fn notify_schedule_wakeup(at: Option<i64>) {
+    let Some((vm, class)) = ALARM.get() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread_as_daemon() else {
+        return;
+    };
+    match at {
+        // Seconds on this side, milliseconds in the platform API.
+        Some(at) => {
+            let _ = env.call_static_method(
+                class,
+                "wakeAt",
+                "(J)V",
+                &[JValue::Long(at.saturating_mul(1000))],
+            );
+        }
+        None => {
+            let _ = env.call_static_method(class, "clear", "()V", &[]);
+        }
+    };
+}
+
 fn lock<T>(slot: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     // A panic in a previous JNI call must not turn every later call into a
     // poisoned-mutex abort: the data is a single Option/String and stays valid.
@@ -183,6 +214,18 @@ pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativeStart(
         if let (Ok(vm), Ok(class)) = (vm, class) {
             if let Ok(class) = env.new_global_ref(&class) {
                 let _ = POWER.set((vm, class));
+            }
+        }
+    }
+
+    // Same reason, same thread: the alarm setter is called from the runtime's
+    // sweep loop, which is not attached to the JVM.
+    if ALARM.get().is_none() {
+        let vm = env.get_java_vm();
+        let class = env.find_class("com/atomcode/app/ScheduleAlarm");
+        if let (Ok(vm), Ok(class)) = (vm, class) {
+            if let Ok(class) = env.new_global_ref(&class) {
+                let _ = ALARM.set((vm, class));
             }
         }
     }

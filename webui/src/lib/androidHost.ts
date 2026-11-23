@@ -27,8 +27,16 @@ interface HostBridge {
   openPath?(path: string): boolean;
   /** Hand the microphone to the system recogniser; false when there is none. */
   startVoiceInput?(): boolean;
+  /** What the host itself can see about speech, as JSON. */
+  voiceCapabilities?(): string;
   /** The transcript the recogniser produced; draining on read. */
   takeVoiceText?(): string;
+  /** Begin recording in-app; JSON, because a refusal has a reason. */
+  startVoiceRecording?(): string;
+  /** Finish recording; JSON carrying the WAV path (empty when nothing was said). */
+  stopVoiceRecording?(): string;
+  /** Throw the current take away. */
+  discardVoiceRecording?(): void;
 }
 
 /** What another app sent us: real paths plus any text that came with them. */
@@ -137,6 +145,37 @@ export function startVoiceInput(): boolean {
   }
 }
 
+/** What the Android host itself can see about speech. */
+export interface HostVoiceCapabilities {
+  /** An app answers `ACTION_RECOGNIZE_SPEECH`. */
+  recognizer: boolean;
+}
+
+/**
+ * Ask the host whether the phone's own recogniser is reachable.
+ *
+ * This is only one of the three sources a transcript can come from, and the
+ * distinction matters on a phone whose speech engine is private to its keyboard:
+ * that device reports `recognizer: false` while the user can still dictate into
+ * any text field, which is exactly why the fallbacks exist. The other two
+ * (an installed transcription plugin, a model provider) are the daemon's to
+ * report — the host cannot see either.
+ *
+ * `null` means "not the Android app", so a desktop browser shows neither the mic
+ * nor any of the fallback prompts.
+ */
+export function hostVoiceCapabilities(): HostVoiceCapabilities | null {
+  const bridge = host();
+  if (!bridge?.voiceCapabilities) return null;
+  try {
+    const raw = bridge.voiceCapabilities();
+    const parsed = JSON.parse(raw) as { recognizer?: unknown };
+    return { recognizer: parsed.recognizer === true };
+  } catch {
+    return null;
+  }
+}
+
 /** The transcript the recogniser produced, drained like a share. */
 export function takeVoiceText(): string {
   const bridge = host();
@@ -145,6 +184,69 @@ export function takeVoiceText(): string {
     return bridge.takeVoiceText();
   } catch {
     return '';
+  }
+}
+
+/** Why the host would not start recording. */
+export type VoiceRecordRefusal = 'permission' | 'busy' | 'unavailable' | 'failed' | 'unsupported';
+
+export interface VoiceRecordStart {
+  ok: boolean;
+  reason?: VoiceRecordRefusal;
+}
+
+/**
+ * Start recording in-app, for a transcription engine that is not the phone's
+ * recogniser.
+ *
+ * Only reached when the recogniser route is unavailable, so this is the moment
+ * the microphone permission is asked for: an app that has no use for the
+ * microphone until the button is pressed should not ask at launch, and a
+ * permission prompt nobody asked for is the kind people refuse out of principle.
+ *
+ * `reason: 'permission'` is special — the host has just shown the system dialog,
+ * so the caller's job is to tell the person to press again once they allow it,
+ * not to treat it as a failure.
+ */
+export function startVoiceRecording(): VoiceRecordStart {
+  const bridge = host();
+  if (!bridge?.startVoiceRecording) return { ok: false, reason: 'unsupported' };
+  try {
+    const raw = bridge.startVoiceRecording();
+    const parsed = JSON.parse(raw) as { ok?: unknown; reason?: unknown };
+    if (parsed.ok === true) return { ok: true };
+    const reason = typeof parsed.reason === 'string' ? parsed.reason : 'failed';
+    return { ok: false, reason: reason as VoiceRecordRefusal };
+  } catch {
+    return { ok: false, reason: 'failed' };
+  }
+}
+
+/**
+ * Stop recording and return the finished WAV's path.
+ *
+ * An empty string means the take contained nothing — a normal way to change your
+ * mind, not an error worth a sentence of its own.
+ */
+export function stopVoiceRecording(): string {
+  const bridge = host();
+  if (!bridge?.stopVoiceRecording) return '';
+  try {
+    const raw = bridge.stopVoiceRecording();
+    const parsed = JSON.parse(raw) as { path?: unknown };
+    return typeof parsed.path === 'string' ? parsed.path : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Drop a take the page decided not to send. */
+export function discardVoiceRecording(): void {
+  const bridge = host();
+  try {
+    bridge?.discardVoiceRecording?.();
+  } catch {
+    // Nothing to recover: the file is in the cache directory and gets pruned.
   }
 }
 

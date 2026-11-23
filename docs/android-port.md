@@ -198,9 +198,10 @@ $ llvm-readelf -d ... | grep NEEDED
 - ✓ 会话与配置落在 app 私有目录（`ATOMCODE_HOME`）。
 - ✓ 长回合保活：前台服务 + `PARTIAL_WAKE_LOCK`；`idle_timeout_secs = 0` 关掉空闲自杀。
 - ✓ `bash` 工具走 mksh；模型被告知没有 bash 专有语法。
-- ✓ 打开真实目录：`MANAGE_EXTERNAL_STORAGE`，授权后 workspace 落在
-  `/storage/emulated/0/AtomCode`；未授权则回退到 app 私有目录，并在首屏说明原因。
-- ✓ 目录浏览与切换：`GET /fs/list?path=…` 能列出共享存储（DCIM / Download / …），
+- ✓ 工作目录：应用私有目录（`<data>/projects/default`）。共享存储上的真实路径需要
+  `MANAGE_EXTERNAL_STORAGE`，而那条权限会让包被 Play 拒绝，所以**已移除**（提交
+  `153c94e62`）；授权文件夹改走 SAF，见下面「SAF 世界」。`bash`/`git`/LSP 只认私有目录。
+- ✓ 目录浏览与切换：`GET /fs/list?path=…` 能列出当前世界（私有目录，或授权树）里的目录，
   `POST /cd` 切换后 `GET /project` 立即反映新 `working_dir` —— 即 webui 的 CwdPicker 在手机上可用。
 - ✓ telemetry 关闭（见下），`open_file` 明确拒绝。
 
@@ -2820,6 +2821,8 @@ POST /schedules/t-android-probe/run
 
 **这是边界，不是缺陷**：手机上要真正定时跑，需要把 `launch` 从 spawn CLI 改成进程内触发
 （或走 `AlarmManager`），那是功能而不是修复，没在本轮做。
+（后续：P10 换成了进程内执行，2026-11-21 又补上了 `AlarmManager` 唤醒，见 P10 小节的
+「唤醒」一段。）
 
 #### 二、默认市场基址：新装不再是一台空手机
 
@@ -2918,8 +2921,34 @@ P9 里 Android 只能显式拒绝，因为执行端是「spawn 一个 `atomcode`
 
 同时把 Android 的注册文案改了：以前是「不可用」，现在是「由应用自己运行、应用关闭即停止」。
 
-**边界（不是缺陷）**：只在应用进程活着时触发；没有唤醒机制能让被杀掉的 App 自己起来跑，
-那需要 `AlarmManager` + 广播接收器，是另一个功能。
+**唤醒（2026-11-21 实现并真机验证）**：进程活着才有扫描，而手机随时会回收后台进程，所以
+现在多了系统闹钟这条线——每次扫描把「最早的下次到期时刻」交给宿主（`set_wake_hook` →
+`jni_api::notify_schedule_wakeup` → `ScheduleAlarm.wakeAt`），Kotlin 用
+`AlarmManager` 布防（有「闹钟与提醒」授权时用 `setExactAndAllowWhileIdle`，没有就退到
+`setAndAllowWhileIdle` 并在日志里说明）。到点后 `ScheduleWakeReceiver` 只做一件事：
+`AgentService.start`，daemon 起来后自己扫、自己跑、再布下一次。没有任务时传 `None`，
+闹钟被取消而不是留着空转。
+
+真机证据（PLT140 / Android 16，2026-11-21）：
+
+```text
+21:50:15.821 AtomCode: schedule alarm fired; starting the agent service
+21:50:15.951 atomcode: schedule_run::sweep: scheduled run failed error=no provider is configured
+21:50:16.014 atomcode: schedule_runner: schedule alarm re-armed at=Some(1795269054)
+21:50:16.022 AtomCode: schedule alarm set for 1795269054000
+```
+
+那三条 `no provider is configured` 是设备上没配模型（`providers: []`）时的如实失败，不是
+唤醒的问题——日志里没出现 `schedule alarm is inexact`，说明这台设备走了精确闹钟那条路。
+
+**剩下的边界（都是平台行为，不是缺口）**：
+
+- `force-stop`（用户在设置里「强行停止」）与**重启**会清掉已布防的闹钟，要等 App 再被打开
+  一次才重新布防。要跨重启就得再加一个 `BOOT_COMPLETED` 接收器，本轮没做。
+- 「进程彻底死着、到点被闹钟叫起来」这一条**没能在本机隔离验证**：前台服务是粘性的，
+  用 `run-as … kill -9` 杀掉后系统约 5 秒就把进程重新拉起（实测 pid 10721 → 10959），
+  所以到点时进程往往已经活着了。已验证的是接收器 → `AgentService.start` 这条路径在真机上
+  执行过，以及布防/触发/重布防的完整日志。
 
 #### 二、`/fs/search` 在 SAF 世界下可用
 
@@ -2982,6 +3011,101 @@ APK 不带运行时，市场页是一张长列表，新装的人没有任何线�
   只有文本进来。
 - webui：composer 里一个麦克风按钮（仅安卓宿主可见），拿不到识别器时明确提示，而不是装作在听。
 
+**2026-11-21 复核（PLT140 / Android 16）**
+
+- **修掉一个真 bug：`<queries>` 里没有 `RECOGNIZE_SPEECH`**。`startVoiceInput` 用
+  `resolveActivity` 判断有没有识别器，而 Android 11+ 的包可见性只让应用看见 manifest
+  `<queries>` 里声明过的包——没声明时，**装了识别器的手机也会被判定为"没有"**，按钮永远
+  提示「设备没有可用的语音识别器」。这跟相机那条 `IMAGE_CAPTURE` 是同一个坑，当时只补
+  了相机。现已补上同名 intent 声明。
+- 本机确实没有识别器：`adb shell cmd package query-activities -a
+  android.speech.action.RECOGNIZE_SPEECH` 返回空（`pm list packages` 里也没有
+  Google 搜索/语音搜索一类），所以点麦克风得到的那句提示是**诚实且正确**的失败路径
+  ——按钮不会假装在听。
+- 前端那一半已实测通过（WebView devtools + CDP，`adb forward tcp:9300
+  localabstract:webview_devtools_remote_<pid>`）：把 `window.AtomCodeHost` 整体换成
+  Proxy（注入的 Java 对象改不了自己的方法，只能换整个全局），派发 `atomcode:voice` 后
+  宿主 `takeVoiceText` 被读一次、`.message-input` 的 value 变成探针句
+  `{"before":"","after":"语音探针：这句话应当出现在输入框 ","drained":1}`。
+- **仍不可达的一段**：识别器真的返回一句话 → 插进输入框。本机没有识别器，装一个也超出
+  这一步的范围，所以这段只能留给有识别器的设备。上面两条把它拆成了「宿主这边发得出去」与
+  「页面这边收得下」两半。
+
+**2026-11-23：三层降级（识别器 → 本地转写插件 → 模型 API）**
+
+上一节那条「本机确实没有识别器」不是临时状态：PLT140 上
+`cmd package query-services -a android.speech.RecognitionService` 返回 `No services
+found`，唯一带语音的只有百度输入法（`com.baidu.input_oppo`），而它的语音是私有实现、
+不走公开接口。也就是说**在这台机器上，系统识别器这条路永远走不通**，但用户明明可以在任何
+输入框里嘴上打字。于是语音输入改成三层，按代价从低到高：
+
+| 层 | 来源 | 代价 | 本机可用 |
+|---|---|---|---|
+| 1 | 系统识别器（`ACTION_RECOGNIZE_SPEECH`） | 不要权限、不要联网、不要装东西 | ✗ 没有 `RecognitionService` |
+| 2 | 已装的本地转写包（市场插件） | 要装一个包，音频不出设备、免费 | ✗ 市场暂无此类包（见下） |
+| 3 | 模型 API（`/audio/transcriptions`） | 一次请求，音频离开设备 | ✓ 需配置支持该端点的供应商 |
+
+- **宿主探测**：`HostBridge.voiceCapabilities()` 返回 `{"recognizer":bool}`，问的是
+  `resolveActivity` 能不能解析识别器 intent。只报宿主自己看得见的那一项——插件与模型
+  只有 daemon 知道，分开问，不猜。
+- **录音只在降级时用**：`VoiceRecorder`（`AudioRecord` → 16 kHz 单声道 16-bit WAV，
+  落在 `cacheDir/voice/`）。`RECORD_AUDIO` 也是这时才申请，不在启动时弹——一个在用户按
+  按钮之前用不到麦克风的应用，不该先要权限。录音只有 `startVoiceRecording()` /
+  `stopVoiceRecording()` 一对，没有自己的计时器：一句话有多长没人预先知道，第二下点击才是
+  「结束」。
+- **daemon 出能力**：`GET /voice/capabilities` → `{"plugin":名字|null,"model":{provider,
+  model}|null}`。两者都 `null` 时页面对话框直接说「现在没有可用的转写引擎」，而不是给一个
+  必然失败的按钮。
+- **daemon 挑引擎**：`POST /voice/transcribe` 收 `{"path":"…"}`（路径而不是字节：录音在
+  应用进程里做，daemon 与其同进程共享文件系统，2 MB 的 loopback 上传只是两边都有的文件的
+  副本）。**本地包优先于模型**——它免费、私密、不会被限流。只接受真 WAV（校验 `RIFF`/
+  `WAVE` 头、44 字节下限、16 MB 上限）：把「页面随口给的一个路径」转发给模型供应商不是一次
+  笔误该能做到的事。
+- **模型通道**：`{base_url}/audio/transcriptions`，模型名默认 `whisper-1`，可用
+  `[voice] model` 覆盖；`[voice] provider` 省略时用当前模型选择所在的供应商（单供应商不必
+  自报名字）。凭据走 `provider_config_for_selection` + `resolved_api_key`，绝不进配置树。
+  multipart 体是手写的——一个音频 part 加一个 model part 不值得给 reqwest 加 `multipart`
+  feature，这个仓库的 `Cargo.lock` 盯得很紧。
+- **本地插件契约**（`package.json`）：
+
+  ```json
+  { "name": "whisper", "version": "1.0", "entry": "lib/whisper.so", "transcribe": true }
+  ```
+
+  运行时 `pluginhost` 把 `<包名> <wav 路径>` 交给 `plugin_main(argc, argv)`，**stdout 就是
+  转写结果**，退出码非 0 视为失败、stderr 直接回给页面。选择是确定的：多个包都声明
+  `transcribe` 时取字典序第一个，声明了但没有 `entry` 的包被跳过（它加载不起来，选中等于
+  给一个必然失败的按钮）。判据：`packages.rs` 的
+  `a_package_that_declares_transcription_is_the_local_engine`、`api_voice.rs` 的
+  `only_a_real_wav_recording_is_accepted` 等 7 项。
+
+- **诚实缺口**：第 2 层只有**契约和实现**，市场里**还没有** whisper 类包。真机上它现在
+  是 `plugin: null`，能用的降级只有第 3 层。要让第 2 层真正可用还差三件事：交叉编译
+  whisper.cpp（NDK）、随包携带模型权重（几十 MB）、发布到市场。这三件都不在本轮范围内，
+  所以文档不写「已支持本地转写」，只写契约已经就位、缺的是那个包。
+
+**2026-11-24 真机复核（PLT140 / Android 16，本分支构建的 APK）**
+
+三层都在真机上跑过一遍。宿主侧用一次性 `ATOMCODE_HOME` 起一个 mock
+`/audio/transcriptions`，经 `adb reverse` 回连，全程没接触任何真实供应商：
+
+- 宿主探测：页面里 `AtomCodeHost.voiceCapabilities()` → `{"recognizer":false}`。
+- 能力上报：`GET /voice/capabilities` → `{"model":{"provider":"mock","model":"whisper-1"},"plugin":null}`
+  ——供应商解析对，插件如实为 `null`。
+- 对话框：点麦克风弹出「这台设备没有语音识别器」，正文给出当前引擎，底栏 `[去插件页] [录音并转写]`，
+  并附「装一个带语音识别的输入法或识别器应用，装好后这里会自动改走系统识别」的指引。
+- 录音：`[录音并转写]` → 麦克风按钮进入 `btn-voice active` 态、对话框关闭 → 再点一次结束，
+  产出 `cache/voice/voice-*.wav`，pulled 下来用 `wave` 校验为 16 kHz 单声道 16-bit、2.52 s、
+  40318 帧、含 61066 个非零字节 —— 是真实音频，不是静音占位。
+- 转写：daemon 读该 WAV → 组 multipart → mock → 文案「语音转写测试：你好世界」回到输入框。
+
+这一步还踩到一个打包坑，值得留档：`android/app/src/main/jniLibs` 若是指向另一个工作区的
+junction，AGP 的增量检查看不见目标文件的变化，`mergeDebugJniLibFolders` 会一直复用旧产物，
+打出来的 APK 便没有嵌入 webui（页面显示 “webui assets are not embedded in this binary”）。
+改成真实目录并清掉 `merged_jni_libs` 等中间产物后，APK 内 `.so` 的 md5 才与 `jniLibs` 一致
+（`6d2da175…`）。另外 ColorOS 不允许 `adb shell pm grant`/`appops set` 授予 `RECORD_AUDIO`，
+麦克风只能由系统弹窗点一次，这也是上面录音一项必须人工授权后才能验的原因。
+
 #### 真机实测（PLT140 / Android 16，2026-11-03）
 
 三项都在设备上跑过了，而且**抓到两个构建机测不出来的真 bug**——这正是这一步的价值。
@@ -3024,6 +3148,10 @@ APK 不带运行时，市场页是一张长列表，新装的人没有任何线�
    `uiautomator` 的 dump 读不到 WebView 内容，无障碍树这条路走不通。
    **识别器本身没有实跑**：拉起它需要真手指点一下按钮（`input tap` 得先知道坐标），所以
    「点下去会不会把转录插进输入框」这一段仍是未验证的。
+
+   （2026-11-21 更新：这一段已经拆开验证，见上面「五、语音输入」的复核小节——前端那一半
+   用 CDP 实测通过；本机没有识别器，宿主那一半只验证到「诚实报缺识别器」，并因此修掉了
+   `<queries>` 缺 `RECOGNIZE_SPEECH` 的可见性 bug。）
 
 （上面的探针全部清理：临时 provider、任务、端口映射、临时脚本都删了，`providers: []`、
 `schedules: []`，被卸载的 ninja 已装回。）
@@ -3100,23 +3228,24 @@ merge v5.2.6 时整份 `app.css` 取了上游版本，把本分支 769 行手机
 | 阶段 | 内容 |
 |---|---|
 | ~~P1~~ | ~~真机跑通：WebView + 内嵌 webui + 本地 daemon~~ **已完成**（页面/资源/health/cookie 均实测） |
-| ~~P2~~ | ~~打开真实目录~~ **已完成**（`MANAGE_EXTERNAL_STORAGE` + `/fs/list` + `/cd` 实测） |
+| ~~P2~~ | ~~打开真实目录~~ **已完成后又退役**：当年用 `MANAGE_EXTERNAL_STORAGE` + `/fs/list` + `/cd` 实测通过；该权限会让包被 Play 拒绝，已由 `153c94e62` 移除，授权文件夹改走 P8 的 SAF 世界 |
 | ~~P2.5~~ | ~~登录链路~~ **已完成**（`/auth/login/start` → `poll` → 取消 全链路实测；webui 自带登录入口，无需 `/login` 命令） |
 | ~~P3~~ | ~~provider 打通~~ **已完成**（官方 overlay 接入 + 真机真实模型回复 + 工具调用 + 写文件 + bash 全通） |
 | ~~P4~~ | ~~Git 互通~~ **已完成**：打包 git 2.47.1 进 `jniLibs`，clone / commit / push 真机实测通过；token 经 `POST /git/credentials` 落进 `~/.git-credentials`，git 自己的 `store` helper 实测读得到；webui Git 面板已实现（`git_ops.rs` 八个路由 + `SourceControl.tsx`），真机复核待做 |
 | P5 | 审批 UI 的移动端适配（webui 已有 `PermissionCard`，需在窄屏复核）；**窄屏排版已修**（顶部安全区、下拉框溢出、composer 控件重排，见上面 P5 小节） |
 | ~~P6~~ | ~~后台长任务的通知与进度~~ **已完成**：回合开始/结束驱动唤醒锁与通知，结束时报告最后一轮的成败（见 P5.11）；多会话按会话 id 分组为独立子通知并可点击直达该会话（真机验证 2026-11-01，见上面 P5 小节末尾） |
 | ~~P7~~ | ~~量内存与 Doze 下的存活；长回合的压力测试~~ **已实测（2026-11-02，PLT140 / Android 16）**：`scripts/verify-android-doze.sh` 在回合进行中强制进 Doze（`mState=IDLE`），回合仍以 `ok` 结束、进程 PID 未变（14687 → 14687）、PSS 基线/峰值/结束 = 138916 / 148613 / 136484 KB（峰值比基线高约 9.5 MB，结束后回落到基线以下）。脚本在设备拒绝 `force-idle` 时明确报"没测成"，不假装通过 |
-| ~~P8~~ | ~~若要上架：SAF + `content://` 的 world 实现，替换全盘访问~~ **已实现（真机验证 2026-11-02）**：`capabilities::saf` 是 content:// 上的 `FileSystem`（后端为 trait，8 项单测在构建机跑），`SafTree.kt` 提供 DocumentsContract 后端，`fs-saf` 行 + `swap("fs","fs-saf")` 完成装配切换。规则是**全盘访问优先**：拿得到就用真实磁盘（bash/git/LSP 都认路径），拿不到才落到授权文件夹 |
+| ~~P8~~ | ~~若要上架：SAF + `content://` 的 world 实现，替换全盘访问~~ **已实现（真机验证 2026-11-02），并在 2026-11-21 收口为唯一形态**：`capabilities::saf` 是 content:// 上的 `FileSystem`（后端为 trait，8 项单测在构建机跑），`SafTree.kt` 提供 DocumentsContract 后端，`fs-saf` 行 + `swap("fs","fs-saf")` 完成装配切换。`MANAGE_EXTERNAL_STORAGE` 已从 manifest 移除（`153c94e62`），所以工作是**应用私有目录**、授权文件夹走 SAF——没有「优先用真实磁盘」这条分支了 |
 | P9 | 定时任务在 Android 上显式拒绝（不再落到 systemd）、首启播种默认市场基址、`/health` 报 `pending_approvals` 并让通知说「等你批准」——见上面 P9 小节 |
 | P10 | 定时任务改为 daemon 进程内执行、`/fs/search` 走 SAF、C/C++ 接 clangd、首启推荐运行时、语音输入——见上面 P10 小节 |
 | P11 | 上架缺件：应用图标、版本号跟随 workspace、包依赖 `requires`、落地区首启引导——真机验证 2026-11-21，见上面 P11 小节 |
 
 ### SAF 世界：没有路径时的文件系统（真机验证 2026-11-02）
 
-上架 Google Play 的构建不能带 `MANAGE_EXTERNAL_STORAGE`。拿不到全盘访问时，应用目录
-之外的文件只剩 `content://` 文档——**没有路径**。`world` 接缝让这件事可以是换一行，
-而不是给每个工具加一个模式：
+上架 Google Play 的构建不能带 `MANAGE_EXTERNAL_STORAGE`，而这个包**已经不再带**它
+（`153c94e62` 移除，manifest 里留了一段注释说明为什么）。于是应用目录之外的文件只剩
+`content://` 文档——**没有路径**。`world` 接缝让这件事可以是换一行，而不是给每个工具
+加一个模式：
 
 | 位置 | 作用 |
 |---|---|
@@ -3132,11 +3261,13 @@ merge v5.2.6 时整份 `app.css` 取了上游版本，把本分支 769 行手机
   解析，所以 `canonicalize` 是精确的，也不存在"检查完到使用之间"的竞态。
 - **这个世界不能执行命令**。`content://` 文档没法 `exec`，编译器也读不了它。只有 SAF
   权限的构建把 shell 留在应用私有目录，授权树里的文件可读写、不可运行。
-- **全盘访问优先**。拿得到真实存储就用真实磁盘（`bash`/`git`/LSP 都认路径）；拿不到才
-  落到授权文件夹。授权本身是持久的，所以两种形态之间来回切换只需在系统设置里改那条
-  权限，不需要重新授权。
+- **只有两种世界，没有第三条路**。应用私有目录是真实磁盘（`bash`/`git`/LSP 都能用），
+  授权的文件夹是 SAF（可读写、不可执行）。以前还有「拿到全盘权限就用共享存储」这条优先
+  分支，权限移除后那条分支不会再成立——`AgentService.chooseWorkspace` 里的
+  `isExternalStorageManager()` 检查现在恒为 false，是留给「侧载构建把权限加回来」的入口，
+  不是当前构建的行为。授权本身是持久的，不需要每次重启重新授权。
 
-真机验证（PLT140 / Android 16，全盘访问 `deny`）：
+真机验证（PLT140 / Android 16，构建里没有 `MANAGE_EXTERNAL_STORAGE`，因此必然是 SAF 世界）：
 
 ```
 SAF tree granted: primary:AtomCode     ← 选择器授权

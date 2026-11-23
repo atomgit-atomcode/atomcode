@@ -15,6 +15,22 @@
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      Only for the fallback: when the phone has no recognition service to borrow,
+      the app records the sentence itself and hands the file to a local
+      transcription package or a model provider. The primary route
+      (`ACTION_RECOGNIZE_SPEECH`) needs no permission at all — another app owns the
+      microphone and only the transcript comes back.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+      A scheduled task has nobody waiting for it, so the alarm is the only thing that
+      can bring the process back after the phone kills it. From Android 12 this is a
+      user-grantable special access ("alarms & reminders"); without it
+      `ScheduleAlarm` falls back to an inexact alarm, which may be late but still
+      fires, and says so in the log.
+    -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!--
@@ -88,6 +104,16 @@
         <intent>
             <action android:name="android.media.action.IMAGE_CAPTURE" />
         </intent>
+        <!--
+          The composer's microphone button. Same visibility rule as the camera above,
+          and the same failure shape: `startVoiceInput` decides with
+          `resolveActivity`, which on Android 11+ only sees packages declared here —
+          so without this line every phone looked like it had no recogniser, and the
+          page said "设备没有可用的语音识别器" on hardware that has one.
+        -->
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
     </queries>
 
     <application
@@ -146,6 +172,14 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="coding-agent-turn" />
         </service>
+
+        <!--
+          Delivers the schedule alarm. Not exported: the only sender is this app's
+          own AlarmManager alarm, and the PendingIntent identifies it.
+        -->
+        <receiver
+            android:name=".ScheduleWakeReceiver"
+            android:exported="false" />
 
         <!--
           The helper APK is downloaded into the app's own storage; the system

@@ -233,6 +233,17 @@ impl AgentServer {
             crate::jni_api::notify_turn_active(active);
         }));
 
+        // A scheduled task is the one thing nobody is waiting for, so the runtime
+        // being alive is not enough: the phone kills this process whenever it likes.
+        // Each sweep hands over the next due instant and Kotlin sets a system alarm;
+        // when it fires, the alarm starts this service again and the sweep picks the
+        // task up. Registered here, beside the turn hook, because both are "the
+        // runtime knows a fact the platform needs".
+        #[cfg(target_os = "android")]
+        atomcode_daemon::set_wake_hook(Box::new(|at| {
+            crate::jni_api::notify_schedule_wakeup(at);
+        }));
+
         // The bundled git, before anything can ask for it. Android forbids
         // executing binaries from the data dir, so the real executable is in
         // `nativeLibraryDir` and the wrappers that `PATH` finds are shims

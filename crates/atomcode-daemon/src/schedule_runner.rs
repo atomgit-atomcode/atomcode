@@ -35,6 +35,28 @@ use crate::AppState;
 /// half a minute is precise enough, and a sweep only reads the store.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Told the next instant some task is due, or `None` when nothing is scheduled.
+///
+/// The loop below only runs while this process is alive, and a phone kills a
+/// background process whenever it wants to. The host turns each of these into a
+/// system alarm, so the due task can wake the process it needs instead of waiting
+/// for a person to open the app — see `ScheduleAlarm.kt`.
+pub type WakeHook = Box<dyn Fn(Option<i64>) + Send + Sync>;
+
+static WAKE_HOOK: std::sync::OnceLock<WakeHook> = std::sync::OnceLock::new();
+
+/// Register the host's alarm setter. Android only; other platforms have an OS
+/// scheduler and never start this loop.
+pub fn set_wake_hook(hook: WakeHook) {
+    let _ = WAKE_HOOK.set(hook);
+}
+
+fn fire_wake(at: Option<i64>) {
+    if let Some(hook) = WAKE_HOOK.get() {
+        hook(at);
+    }
+}
+
 /// Start the sweep loop. Android only: elsewhere the OS scheduler owns this.
 pub(crate) fn spawn(state: AppState) {
     tokio::spawn(async move {
@@ -43,13 +65,36 @@ pub(crate) fn spawn(state: AppState) {
         // The first tick is immediate; skipping it avoids a sweep while the app is
         // still starting, before any runtime could have a provider.
         ticker.tick().await;
+        // Logged only when the answer changes: this loop runs every 30 s, and a
+        // line per tick would bury everything else.
+        let mut armed: Option<i64> = None;
         loop {
             ticker.tick().await;
             if let Err(error) = sweep(&state).await {
                 tracing::warn!(%error, "scheduled task sweep failed");
             }
+            // Re-armed on every sweep, not once at startup: a task can be created,
+            // edited or removed at any time, and this is the only place that reads
+            // the list. Cheap — one alarm, replaced in place.
+            let now = unix_seconds();
+            let next = next_wake(&crate::api_schedule::system_service(), now);
+            if next != armed {
+                tracing::info!(at = ?next, "schedule alarm re-armed");
+                armed = next;
+            }
+            fire_wake(next);
         }
     });
+}
+
+/// The earliest instant an enabled task is next due, in unix seconds.
+///
+/// The arithmetic lives in `atomcode_schedule::service::next_occurrence`, beside
+/// `due_occurrence`, because this module only compiles for Android — a rule that
+/// can only be tested on a phone is a rule that gets tested by nobody.
+fn next_wake(service: &Service, now: i64) -> Option<i64> {
+    let entries = service.catalog().ok()?;
+    atomcode_schedule::service::next_occurrence(&entries, now)
 }
 
 /// Run every task that is due and not already running.
