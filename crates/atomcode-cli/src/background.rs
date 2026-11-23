@@ -1580,7 +1580,7 @@ impl Background {
                     .ok_or(HostError::NotFound)?;
                 use atomcode_capabilities::session::SessionManager;
                 let dirs = atomcode_coding::config::product_dirs_from_env();
-                let scan = SessionManager::scan_all(dirs.user());
+                let scan = crate::host::scan_session_catalog().await?;
                 let entry = crate::host::unique_stored_entry(&scan.entries, &target)?;
                 let cwd = control.working_dir_now().await;
                 if !cwd.is_dir()
@@ -1607,10 +1607,8 @@ impl Background {
             }
         }
         let mut working_dir = front.working_dir_now().await;
-        if project_navigation {
-            use atomcode_capabilities::session::SessionManager;
-            let dirs = atomcode_coding::config::product_dirs_from_env();
-            let scan = SessionManager::scan_all(dirs.user());
+        let entry = if project_navigation {
+            let scan = crate::host::scan_session_catalog().await?;
             let entry = find_switchable_entry(&scan.entries, &target)?;
             if entry.needs_newer_version {
                 return Err(HostError::Failed {
@@ -1618,16 +1616,30 @@ impl Background {
                 });
             }
             working_dir = crate::host::resume_working_dir(entry, working_dir, true)?;
-        }
-        let (mut incoming, mut pumps) = self.prepare_at(working_dir).await?;
-        let reply = match incoming
-            .control
-            .call(HostCommand::Resume {
-                session: incoming.control.session_id(),
-                target,
-            })
-            .await
-        {
+            Some(entry.clone())
+        } else {
+            None
+        };
+        let (mut incoming, mut pumps) = self.prepare_at(working_dir.clone()).await?;
+        let candidate = incoming.control.session_id();
+        let reply = match entry {
+            Some(entry) => {
+                incoming
+                    .control
+                    .resume_catalog_entry(&candidate, &entry, working_dir)
+                    .await
+            }
+            None => {
+                incoming
+                    .control
+                    .call(HostCommand::Resume {
+                        session: candidate,
+                        target,
+                    })
+                    .await
+            }
+        };
+        let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
                 stop(incoming).await;

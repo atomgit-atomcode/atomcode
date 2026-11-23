@@ -1479,7 +1479,7 @@ pub(crate) fn prepare_catalog_session_resume_in_project_root(
     fork_on_busy: bool,
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
     validate_project_bucket(project_bucket)?;
-    let scan = SessionManager::scan_catalog(sessions_root);
+    let scan = SessionManager::scan_catalog_bucket(sessions_root, project_bucket);
     report_catalog_diagnostics(&scan.diagnostics);
     let Some(entry) = scan
         .entries
