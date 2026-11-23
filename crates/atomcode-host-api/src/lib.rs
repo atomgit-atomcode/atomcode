@@ -68,6 +68,8 @@ pub enum HostCommand {
     ForkSession { session: String },
     /// Put the stored session `target` in place of `session`.
     Resume { session: String, target: String },
+    /// Open an explicitly selected global result in its owning project.
+    ResumeAcrossProjects { session: String, target: String },
     /// The thinking level `session`'s requests carry from now on. `None` is no
     /// opinion: the endpoint's own default stands.
     SetReasoningEffort {
@@ -393,6 +395,7 @@ impl HostCommand {
             | Self::NewSession { session }
             | Self::ForkSession { session }
             | Self::Resume { session, .. }
+            | Self::ResumeAcrossProjects { session, .. }
             | Self::TaskSpecs { session, .. }
             | Self::FollowUp { session, .. }
             | Self::Hooks { session, .. }
@@ -510,6 +513,8 @@ pub enum HostReply {
     },
     Sessions {
         sessions: Vec<StoredSession>,
+        #[serde(default, skip_serializing_if = "SessionListHints::is_empty")]
+        hints: SessionListHints,
     },
     /// What a stored session last talked about: a few lines, newest last,
     /// already in the order a person reads them.
@@ -1332,6 +1337,21 @@ pub enum McpAction {
     Disable,
 }
 
+/// Context for an empty project picker, computed during the same catalog scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionListHints {
+    pub other_projects_have_history: bool,
+    /// One path from a diagnostic for this bucket or the catalog root.
+    pub scan_issue_path: Option<String>,
+}
+
+impl SessionListHints {
+    fn is_empty(&self) -> bool {
+        !self.other_projects_have_history && self.scan_issue_path.is_none()
+    }
+}
+
 /// One stored session, as a picker shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSession {
@@ -1656,6 +1676,13 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn session_list_hints_are_optional_on_existing_wire_replies() {
+        let old = serde_json::json!({"Sessions":{"sessions":[]}});
+        let reply: HostReply = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reply).unwrap(), old);
+    }
+
     /// Each command, reply, event and error exactly once. The matches are
     /// exhaustive on purpose: a new variant does not compile until it is
     /// sampled here.
@@ -1726,6 +1753,10 @@ mod tests {
                 session: "a".into(),
             },
             HostCommand::Resume {
+                session: "a".into(),
+                target: "b".into(),
+            },
+            HostCommand::ResumeAcrossProjects {
                 session: "a".into(),
                 target: "b".into(),
             },
@@ -1900,6 +1931,7 @@ mod tests {
                 | HostCommand::NewSession { .. }
                 | HostCommand::ForkSession { .. }
                 | HostCommand::Resume { .. }
+                | HostCommand::ResumeAcrossProjects { .. }
                 | HostCommand::SetReasoningEffort { .. }
                 | HostCommand::ListSessions { .. }
                 | HostCommand::PreviewSession { .. }
@@ -1988,6 +2020,10 @@ mod tests {
                 session: "b".into(),
             },
             HostReply::Sessions {
+                hints: SessionListHints {
+                    other_projects_have_history: true,
+                    scan_issue_path: Some("/sessions/broken.index".into()),
+                },
                 sessions: vec![StoredSession {
                     id: "b".into(),
                     title: Some("fix the parser".into()),

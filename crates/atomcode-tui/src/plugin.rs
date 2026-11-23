@@ -1502,6 +1502,11 @@ pub(crate) struct SwitchResult {
 }
 
 enum Wake {
+    ResumeList {
+        request: u64,
+        session: String,
+        result: Result<crate::resume::ResumeView, String>,
+    },
     History {
         session: String,
         request: u64,
@@ -2822,6 +2827,18 @@ impl UserInterface for Tui {
                     result,
                 } => {
                     stale |= self.accept_history(&session, request, initial, cursor, result);
+                }
+                Wake::ResumeList {
+                    request,
+                    session,
+                    result,
+                } => {
+                    if session == self.client.session()
+                        && self.host.finish_resume_list(request, result)
+                    {
+                        self.fetch_resume_preview();
+                        stale = true;
+                    }
                 }
                 Wake::Fact => {
                     stale = true;
@@ -5761,18 +5778,41 @@ impl Tui {
     /// typed command cannot come to mean different things.
     fn run_resume_key(&self, press: crate::surface::KeyPress) -> bool {
         let (changed, asked) = self.host.resume_key(press);
+        if let Some(crate::resume::Step::LoadAll(request)) = asked {
+            let keys = self.wake.lock().expect("wake poisoned").clone();
+            let session = self.client.session();
+            let control = self.client.control();
+            tokio::spawn(async move {
+                let result = match control {
+                    Some(control) => {
+                        crate::commands::load_resume_list(&*control, None, &session).await
+                    }
+                    None => Err(t(Msg::NoHost).into_owned()),
+                };
+                if let Some(keys) = keys {
+                    let _ = keys.send(Wake::ResumeList {
+                        request,
+                        session,
+                        result,
+                    });
+                }
+            });
+            return true;
+        }
         if let Some(crate::resume::Step::Delete { id }) = asked {
             self.delete_session(id);
             return true;
         }
         // 走到哪一行,就去问那一行最后聊了什么。
         self.fetch_resume_preview();
-        let Some(crate::resume::Step::Resume { id }) = asked else {
-            return changed;
+        let command = match asked {
+            Some(crate::resume::Step::Resume { id }) => format!("/resume {id}"),
+            Some(crate::resume::Step::ResumeAcrossProjects { id }) => format!("/resume --all {id}"),
+            _ => return changed,
         };
         let keys = self.wake.lock().expect("wake poisoned").clone();
         if let Some(keys) = keys {
-            let _ = keys.send(Wake::Chose(Some(format!("/resume {id}"))));
+            let _ = keys.send(Wake::Chose(Some(command)));
         }
         self.host.close_resume();
         true

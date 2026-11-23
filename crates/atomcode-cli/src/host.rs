@@ -1651,14 +1651,10 @@ impl RuntimeControl {
         // directory, and the one being deleted is usually not this session's.
         let scan =
             SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
-        let entry = scan
-            .entries
-            .into_iter()
-            .find(|entry| entry.id == session)
-            .ok_or(HostError::NotFound)?;
-        let manager = SessionManager::for_project(
-            &entry.working_dir,
-            &atomcode_coding::config::product_dirs_from_env(),
+        let entry = unique_stored_entry(&scan.entries, session)?;
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let manager = SessionManager::with_root(
+            SessionManager::sessions_root(dirs.user()).join(&entry.project_bucket),
         );
         // The lease is the other runtime's answer to "is anyone using this?":
         // one held elsewhere fails here rather than deleting under it.
@@ -1672,7 +1668,76 @@ impl RuntimeControl {
         })
     }
 
-    fn list(&self, working_dir: Option<String>) -> Vec<StoredSession> {
+    async fn resume_stored(
+        &self,
+        session: String,
+        target: String,
+        across_projects: bool,
+    ) -> Result<HostReply, HostError> {
+        use atomcode_capabilities::session::SessionManager;
+        self.addressed(&session)?;
+        if target == session {
+            return Err(HostError::SessionInUse { id: target });
+        }
+        // ONE catalog scan serves both the existence/version check and the
+        // cross-bucket pin decision below — a resume walks every project's
+        // sessions once, not twice. `message_count > 0` matches what the
+        // picker offers (a 0-message phantom is not resumable).
+        let scan =
+            SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
+        let entry = find_switchable_entry(&scan.entries, &target)?;
+        if entry.needs_newer_version {
+            return Err(HostError::Failed {
+                message: format!(
+                    "session {target} was written by a newer AtomCode; update to resume it"
+                ),
+            });
+        }
+        // Resolve the runtime's current project before any fork or disk
+        // mutation. A foreign lease cannot be mounted in this project;
+        // adopting its bucket would also redirect future persistence.
+        let here = self
+            .handle
+            .context_stats()
+            .await
+            .map_err(refused)?
+            .working_dir;
+        let working_dir = resume_working_dir(entry, here, across_projects)?;
+        // Interactive resume has the same busy-session semantics as
+        // `atomcode-tuix`: the original runtime keeps its lease and we
+        // continue from its last committed state in a native fork. The
+        // prepared lease is handed straight to the runtime, so there is
+        // no acquire/drop race between deciding and switching.
+        let prepared =
+            atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
+                &entry.project_bucket,
+                &target,
+            )
+            .map_err(|error| HostError::Failed {
+                message: error.to_string(),
+            })?
+            .ok_or(HostError::NotFound)?;
+        let resumed_id = prepared.view.meta.id.clone();
+        let forked_from = prepared.forked_from;
+        let changed = self
+            .handle
+            .resume_session_with_lease(resumed_id.clone(), working_dir, prepared.lease)
+            .await
+            .map_err(refused)?;
+        let reply = self.changed(changed.session_id)?;
+        match forked_from {
+            Some(source_id) => Ok(HostReply::DoneWithNote {
+                note: atomcode_config::i18n::t(atomcode_config::i18n::Msg::SessionBusyForked {
+                    source_id: &source_id,
+                    fork_id: &resumed_id,
+                })
+                .into_owned(),
+            }),
+            None => Ok(reply),
+        }
+    }
+
+    fn list(&self, working_dir: Option<String>) -> HostReply {
         use atomcode_capabilities::session::SessionManager;
         let scan =
             SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
@@ -1719,6 +1784,20 @@ impl RuntimeControl {
                 &atomcode_coding::config::product_dirs_from_env(),
             )
         });
+        let hints = atomcode_host_api::SessionListHints {
+            other_projects_have_history: here_bucket
+                .as_ref()
+                .is_some_and(|here| all.iter().any(|(bucket, _)| bucket != here)),
+            scan_issue_path: scan
+                .diagnostics
+                .iter()
+                .find(|issue| {
+                    here_bucket.is_none()
+                        || issue.project_bucket.is_none()
+                        || issue.project_bucket == here_bucket
+                })
+                .map(|issue| issue.path.to_string_lossy().replace(char::is_control, "�")),
+        };
         let mut sessions = scope_sessions(all, working_dir.as_deref(), here_bucket.as_deref());
         // Only the rows the picker shows are probed: a lease and a log tail each.
         for session in &mut sessions {
@@ -1730,7 +1809,7 @@ impl RuntimeControl {
             }
         }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        sessions
+        HostReply::Sessions { sessions, hints }
     }
 }
 
@@ -1905,14 +1984,10 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     const WIDE: usize = 160;
 
     let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
-    let entry = scan
-        .entries
-        .into_iter()
-        .find(|entry| entry.id == session)
-        .ok_or(HostError::NotFound)?;
-    let manager = SessionManager::for_project(
-        &entry.working_dir,
-        &atomcode_coding::config::product_dirs_from_env(),
+    let entry = unique_stored_entry(&scan.entries, session)?;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let manager = SessionManager::with_root(
+        SessionManager::sessions_root(dirs.user()).join(&entry.project_bucket),
     );
     let logged = manager
         .load_events(session)
@@ -2151,78 +2226,10 @@ impl HostControl for RuntimeControl {
                 })
             }
             HostCommand::Resume { session, target } => {
-                use atomcode_capabilities::session::SessionManager;
-                self.addressed(&session)?;
-                if target == session {
-                    return Err(HostError::SessionInUse { id: target });
-                }
-                // ONE catalog scan serves both the existence/version check and the
-                // cross-bucket pin decision below — a resume walks every project's
-                // sessions once, not twice. `message_count > 0` matches what the
-                // picker offers (a 0-message phantom is not resumable).
-                let scan = SessionManager::scan_all(
-                    atomcode_coding::config::product_dirs_from_env().user(),
-                );
-                let entry = find_switchable_entry(&scan.entries, &target)?;
-                if entry.needs_newer_version {
-                    return Err(HostError::Failed {
-                        message: format!(
-                            "session {target} was written by a newer AtomCode; update to resume it"
-                        ),
-                    });
-                }
-                // Resolve the runtime's current project before any fork or disk
-                // mutation. A foreign lease cannot be mounted in this project;
-                // adopting its bucket would also redirect future persistence.
-                let here = self
-                    .handle
-                    .context_stats()
-                    .await
-                    .map_err(refused)?
-                    .working_dir;
-                let current_bucket = SessionManager::project_hash(
-                    &here,
-                    &atomcode_coding::config::product_dirs_from_env(),
-                );
-                if entry.project_bucket != current_bucket {
-                    return Err(HostError::Failed {
-                        message: "Cannot resume a session from another project.".into(),
-                    });
-                }
-                // Interactive resume has the same busy-session semantics as
-                // `atomcode-tuix`: the original runtime keeps its lease and we
-                // continue from its last committed state in a native fork. The
-                // prepared lease is handed straight to the runtime, so there is
-                // no acquire/drop race between deciding and switching.
-                let prepared = atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
-                    &entry.project_bucket,
-                    &target,
-                )
-                .map_err(|error| HostError::Failed {
-                    message: error.to_string(),
-                })?
-                .ok_or(HostError::NotFound)?;
-                let resumed_id = prepared.view.meta.id.clone();
-                let working_dir = here;
-                let forked_from = prepared.forked_from;
-                let changed = self
-                    .handle
-                    .resume_session_with_lease(resumed_id.clone(), working_dir, prepared.lease)
-                    .await
-                    .map_err(refused)?;
-                let reply = self.changed(changed.session_id)?;
-                match forked_from {
-                    Some(source_id) => Ok(HostReply::DoneWithNote {
-                        note: atomcode_config::i18n::t(
-                            atomcode_config::i18n::Msg::SessionBusyForked {
-                                source_id: &source_id,
-                                fork_id: &resumed_id,
-                            },
-                        )
-                        .into_owned(),
-                    }),
-                    None => Ok(reply),
-                }
+                self.resume_stored(session, target, false).await
+            }
+            HostCommand::ResumeAcrossProjects { session, target } => {
+                self.resume_stored(session, target, true).await
             }
             HostCommand::SetReasoningEffort { session, level } => {
                 self.addressed(&session)?;
@@ -2254,9 +2261,7 @@ impl HostControl for RuntimeControl {
                     groups: source_groups(&now.working_dir, &now.assets.unwrap_or_default()),
                 })
             }
-            HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
-                sessions: self.list(working_dir),
-            }),
+            HostCommand::ListSessions { working_dir } => Ok(self.list(working_dir)),
             HostCommand::DeleteSession { session } => {
                 self.delete_stored(&session)?;
                 Ok(HostReply::Done)
@@ -3348,6 +3353,31 @@ fn file_change(
     }
 }
 
+/// A foreign selection must still map to the bucket that supplied the row before
+/// the host takes a lease, forks a busy session, or changes the foreground.
+pub(crate) fn resume_working_dir(
+    entry: &atomcode_capabilities::session::CatalogEntry,
+    here: std::path::PathBuf,
+    across_projects: bool,
+) -> Result<std::path::PathBuf, HostError> {
+    use atomcode_capabilities::session::SessionManager;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    if entry.project_bucket == SessionManager::project_hash(&here, &dirs) {
+        return Ok(here);
+    }
+    if !across_projects {
+        return Err(HostError::Failed {
+            message: "Cannot resume a session from another project.".into(),
+        });
+    }
+    if !entry.working_dir.is_dir()
+        || SessionManager::project_hash(&entry.working_dir, &dirs) != entry.project_bucket
+    {
+        return Err(HostError::Failed { message: "The session's project directory is unavailable or belongs to another storage bucket.".into() });
+    }
+    Ok(entry.working_dir.clone())
+}
+
 /// The destination of a session switch, looked up in the catalog. A
 /// session with no messages is found but not switchable: say so, instead of
 /// answering "not found" for a session that exists.
@@ -3355,13 +3385,28 @@ pub(crate) fn find_switchable_entry<'a>(
     entries: &'a [atomcode_capabilities::session::CatalogEntry],
     target: &str,
 ) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
-    match entries.iter().find(|entry| entry.id == target) {
-        Some(entry) if entry.message_count > 0 => Ok(entry),
-        Some(_) => Err(HostError::Failed {
+    let entry = unique_stored_entry(entries, target)?;
+    if entry.message_count > 0 {
+        Ok(entry)
+    } else {
+        Err(HostError::Failed {
             message: "That session has no messages yet, so there is nothing to switch to.".into(),
-        }),
-        None => Err(HostError::NotFound),
+        })
     }
+}
+
+pub(crate) fn unique_stored_entry<'a>(
+    entries: &'a [atomcode_capabilities::session::CatalogEntry],
+    id: &str,
+) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
+    let mut matches = entries.iter().filter(|entry| entry.id == id);
+    let entry = matches.next().ok_or(HostError::NotFound)?;
+    if matches.next().is_some() {
+        return Err(HostError::Failed {
+            message: format!("Session {id} exists in multiple project stores."),
+        });
+    }
+    Ok(entry)
 }
 
 pub fn refused(error: RuntimeError) -> HostError {

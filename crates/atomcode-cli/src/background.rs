@@ -1550,9 +1550,14 @@ impl Background {
 
     /// A running foreground keeps its runtime and lease while another session
     /// is prepared privately. Failed preparation never changes the slot table.
-    async fn resume(&self, session: String, target: String) -> Result<HostReply, HostError> {
+    async fn resume(
+        &self,
+        session: String,
+        target: String,
+        across_projects: bool,
+    ) -> Result<HostReply, HostError> {
         let _op = self.op.lock().await;
-        self.resume_locked(session, target, false).await
+        self.resume_locked(session, target, across_projects).await
     }
 
     async fn resume_locked(
@@ -1580,11 +1585,16 @@ impl Background {
                     .find(|slot| slot.control.session_id() == target)
                     .map(|slot| slot.control.clone())
                     .ok_or(HostError::NotFound)?;
-                // A retained runtime must satisfy the same project check as a
-                // newly prepared destination before publishing a shared switch.
-                if !control.working_dir_now().await.is_dir() {
+                use atomcode_capabilities::session::SessionManager;
+                let dirs = atomcode_coding::config::product_dirs_from_env();
+                let scan = SessionManager::scan_all(dirs.user());
+                let entry = crate::host::unique_stored_entry(&scan.entries, &target)?;
+                let cwd = control.working_dir_now().await;
+                if !cwd.is_dir()
+                    || SessionManager::project_hash(&cwd, &dirs) != entry.project_bucket
+                {
                     return Err(HostError::Failed {
-                        message: "The session's project directory is unavailable.".into(),
+                        message: "The session's project directory is unavailable or belongs to another storage bucket.".into(),
                     });
                 }
             }
@@ -1614,18 +1624,7 @@ impl Background {
                     message: "Update AtomCode before opening this session.".into(),
                 });
             }
-            if entry.project_bucket != SessionManager::project_hash(&working_dir, &dirs) {
-                // Shared project navigation prepares the destination first. The
-                // ordinary /resume guard then validates its lease in that project.
-                // Never repin the old directory to another storage bucket.
-                if !entry.working_directory_available()
-                    || SessionManager::project_hash(&entry.working_dir, &dirs)
-                        != entry.project_bucket
-                {
-                    return Err(HostError::Failed { message: "The session's project directory is unavailable or belongs to another storage bucket.".into() });
-                }
-                working_dir = entry.working_dir.clone();
-            }
+            working_dir = crate::host::resume_working_dir(entry, working_dir, true)?;
         }
         let (mut incoming, mut pumps) = self.prepare_at(working_dir).await?;
         let reply = match incoming
@@ -1989,7 +1988,7 @@ impl HostControl for Background {
                     .front_control()
                     .call(HostCommand::ListSessions { working_dir })
                     .await?;
-                if let HostReply::Sessions { sessions } = &mut reply {
+                if let HostReply::Sessions { sessions, .. } = &mut reply {
                     sessions.retain(|session| !self.hidden(&session.id));
                 }
                 Ok(reply)
@@ -2004,7 +2003,10 @@ impl HostControl for Background {
             HostCommand::DropBackground { target } => self.drop_one(target).await,
             HostCommand::BackgroundQuestion { target } => self.question(target),
             HostCommand::AnswerBackground { target, id, value } => self.answer(target, id, value),
-            HostCommand::Resume { session, target } => self.resume(session, target).await,
+            HostCommand::Resume { session, target } => self.resume(session, target, false).await,
+            HostCommand::ResumeAcrossProjects { session, target } => {
+                self.resume(session, target, true).await
+            }
             other => {
                 let front = self.front_control();
                 front.call(other).await

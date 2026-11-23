@@ -255,10 +255,12 @@ impl TreeHost {
         let Some(store) = ctx.service::<SessionPersistenceSvc>() else {
             return Ok(HostReply::Sessions {
                 sessions: Vec::new(),
+                hints: Default::default(),
             });
         };
         let failed = |message: String| HostError::Failed { message };
         let mut sessions = Vec::new();
+        let mut hints = atomcode_host_api::SessionListHints::default();
         for id in store.list().await.map_err(failed)? {
             let Some(summary) = store.describe(&id).await.map_err(failed)? else {
                 continue;
@@ -266,6 +268,7 @@ impl TreeHost {
             let header = summary.header;
             let dir = header.as_ref().and_then(|h| h.cwd.clone());
             if working_dir.is_some() && dir != working_dir {
+                hints.other_projects_have_history |= dir.is_some() && summary.turns > 0;
                 continue;
             }
             sessions.push(StoredSession {
@@ -282,7 +285,7 @@ impl TreeHost {
                     .is_some_and(|h| h.version > atomcode_harness::session::SESSION_FORMAT_VERSION),
             });
         }
-        Ok(HostReply::Sessions { sessions })
+        Ok(HostReply::Sessions { sessions, hints })
     }
 }
 
@@ -307,7 +310,8 @@ impl HostControl for TreeHost {
     async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
         match command {
             HostCommand::NewSession { session } => self.replace(&session, Opening::Fresh).await,
-            HostCommand::Resume { session, target } => {
+            HostCommand::Resume { session, target }
+            | HostCommand::ResumeAcrossProjects { session, target } => {
                 self.replace(&session, Opening::Resume(target)).await
             }
             HostCommand::SetReasoningEffort { session, level } => {

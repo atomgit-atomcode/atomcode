@@ -642,7 +642,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionNeedsNewerVersion { id } => format!("a newer version is needed to open it · {id}").into(),
         Msg::SessionTurnsWhenWhere { turns, when, dir } => format!("{turns} turns · {when} · {dir}").into(),
         Msg::SessionTurnsWhen { turns, when } => format!("{turns} turns · {when}").into(),
-        Msg::ResumeNoOthers => "there is no other stored session".into(),
+        Msg::ResumeNoOthers => "No other session was listed for this project.".into(),
+        Msg::ResumeAllProjects => "All projects".into(),
+        Msg::ResumeThisProject => "This project".into(),
+        Msg::ResumeLoadingAll => "Loading all projects…".into(),
+        Msg::ResumeNoneAll => "No other sessions found across projects.".into(),
+        Msg::ResumeHistoryElsewhere => "No other session here. Other projects have history.".into(),
+        Msg::ResumeScanIssue { path } => format!("The session scan reported a problem at {path}. The list may be incomplete.").into(),
         Msg::ResumePickerHint => "back to which session · enter opens it · ctrl+d throws it away (press twice)".into(),
 
         // ── background sessions ──
