@@ -44,6 +44,7 @@ export function WorkbenchGit({
   onMaximize,
   onRestore,
   requested,
+  readOnly = false,
 }: {
   session: string;
   version: number;
@@ -52,6 +53,8 @@ export function WorkbenchGit({
   onMaximize: () => void;
   onRestore: () => void;
   requested?: { path: string; seq: number };
+  /** A historical session's panel: diffs, history and branch state only. */
+  readOnly?: boolean;
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
@@ -100,7 +103,19 @@ export function WorkbenchGit({
           if (old.kind === "commit") {
             return commits.some((commit) => commit.hash === old.hash) ? old : null;
           }
-          return rows.some((row) => row.path === old.path) ? old : null;
+          const row = rows.find((candidate) => candidate.path === old.path);
+          if (!row) return null;
+          // Staging moves a row between sections: follow the side that still
+          // exists so the highlight and the diff pane cannot disagree.
+          const stagedSide = row.index !== " " && row.index !== "?";
+          const worktreeSide = row.worktree !== " ";
+          const staged =
+            stagedSide && !worktreeSide
+              ? true
+              : worktreeSide && !stagedSide
+                ? false
+                : old.staged;
+          return { kind: "file", path: row.path, staged };
         });
       })
       .catch((e) => {
@@ -223,25 +238,39 @@ export function WorkbenchGit({
 
   const now = Math.floor(Date.now() / 1000);
   const nothingToShow = !changes.length && !history.length && !error;
+  // `branches === null` means "not loaded yet" or "not a repository", which is
+  // not the same thing as a detached HEAD.
+  const branchLabel = branches
+    ? branches.detached
+      ? text("游离 HEAD", "Detached HEAD")
+      : (branches.current ?? text("未命名分支", "Unnamed branch"))
+    : loading
+      ? text("读取中…", "Loading…")
+      : text("不在仓库中", "Not a repository");
 
   return (
     <div class="workbench-git">
       <div class="workbench-git-toolbar">
         <button
           class="git-branch-button"
-          aria-expanded={branchMenu}
-          title={text("切换或创建分支", "Switch or create a branch")}
+          aria-expanded={readOnly ? undefined : branchMenu}
+          title={
+            readOnly
+              ? text("当前分支（只读）", "Current branch (read-only)")
+              : text("切换或创建分支", "Switch or create a branch")
+          }
+          disabled={readOnly || !branches}
           onClick={() => setBranchMenu((open) => !open)}
         >
           <span class="git-branch-icon" aria-hidden="true">
             ⑂
           </span>
-          <span class="git-branch-name">
-            {branches?.current ?? text("游离 HEAD", "Detached HEAD")}
-          </span>
-          <span class="git-branch-caret" aria-hidden="true">
-            ▾
-          </span>
+          <span class="git-branch-name">{branchLabel}</span>
+          {!readOnly && (
+            <span class="git-branch-caret" aria-hidden="true">
+              ▾
+            </span>
+          )}
         </button>
         <span class="git-toolbar-count">
           {changes.length ? text(`${changes.length} 个变更`, `${changes.length} changed`) : ""}
@@ -257,7 +286,7 @@ export function WorkbenchGit({
         </button>
       </div>
 
-      {branchMenu && (
+      {branchMenu && !readOnly && (
         <div class="workbench-git-branches" role="group" aria-label={text("分支", "Branches")}>
           <div class="git-branch-create">
             <input
@@ -313,56 +342,58 @@ export function WorkbenchGit({
 
       <div class="workbench-git-body">
         <div class="workbench-git-list" aria-label={text("源控制", "Source control")}>
-          <section class="git-commit-box">
-            <textarea
-              rows={3}
-              value={message}
-              disabled={busy}
-              placeholder={text("提交信息（Ctrl+Enter 提交）", "Commit message (Ctrl+Enter to commit)")}
-              aria-label={text("提交信息", "Commit message")}
-              onInput={(event) => setMessage((event.target as HTMLTextAreaElement).value)}
-              onKeyDown={(event) => {
-                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                  event.preventDefault();
-                  submitCommit();
-                }
-              }}
-            />
-            <div class="git-commit-actions">
-              <button class="git-commit-button" disabled={!canCommit} onClick={submitCommit}>
-                {busy
-                  ? text("提交中…", "Committing…")
-                  : amend
-                    ? text("修补提交", "Amend")
-                    : text("提交", "Commit")}
-              </button>
-              <label class="git-amend" title={text("替换上一次提交", "Replace the last commit")}>
-                <input
-                  type="checkbox"
-                  checked={amend}
-                  disabled={busy || !history.length}
-                  onChange={(event) => setAmend((event.target as HTMLInputElement).checked)}
-                />
-                {text("修补", "Amend")}
-              </label>
-              <span class="git-commit-hint">
-                {problem === "empty"
-                  ? text("需要提交信息", "Message required")
-                  : problem === "too-long"
-                    ? text("提交信息过长", "Message too long")
-                    : staged.length
-                      ? text(`将提交 ${staged.length} 个文件`, `${staged.length} staged`)
-                      : text("先暂存再提交", "Stage files to commit")}
-              </span>
-            </div>
-          </section>
-
+          {!readOnly && (
+            <section class="git-commit-box">
+              <textarea
+                rows={3}
+                value={message}
+                disabled={busy}
+                placeholder={text("提交信息（Ctrl+Enter 提交）", "Commit message (Ctrl+Enter to commit)")}
+                aria-label={text("提交信息", "Commit message")}
+                onInput={(event) => setMessage((event.target as HTMLTextAreaElement).value)}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    submitCommit();
+                  }
+                }}
+              />
+              <div class="git-commit-actions">
+                <button class="git-commit-button" disabled={!canCommit} onClick={submitCommit}>
+                  {busy
+                    ? text("提交中…", "Committing…")
+                    : amend
+                      ? text("修补提交", "Amend")
+                      : text("提交", "Commit")}
+                </button>
+                <label class="git-amend" title={text("替换上一次提交", "Replace the last commit")}>
+                  <input
+                    type="checkbox"
+                    checked={amend}
+                    disabled={busy || !history.length}
+                    onChange={(event) => setAmend((event.target as HTMLInputElement).checked)}
+                  />
+                  {text("修补", "Amend")}
+                </label>
+                <span class="git-commit-hint">
+                  {problem === "empty"
+                    ? text("需要提交信息", "Message required")
+                    : problem === "too-long"
+                      ? text("提交信息过长", "Message too long")
+                      : staged.length
+                        ? text(`将提交 ${staged.length} 个文件`, `${staged.length} staged`)
+                        : text("先暂存再提交", "Stage files to commit")}
+                </span>
+              </div>
+            </section>
+          )}
           <ChangeSection
             title={text("已暂存", "Staged")}
             entries={staged}
             staged
             busy={busy}
             zh={zh}
+            readOnly={readOnly}
             selected={selection}
             onSelect={(entry) =>
               setSelection({ kind: "file", path: entry.path, staged: true })
@@ -381,6 +412,7 @@ export function WorkbenchGit({
             staged={false}
             busy={busy}
             zh={zh}
+            readOnly={readOnly}
             selected={selection}
             onSelect={(entry) =>
               setSelection({ kind: "file", path: entry.path, staged: false })
@@ -392,7 +424,7 @@ export function WorkbenchGit({
             onAll={stageEverything}
             allLabel={text("全部暂存", "Stage all")}
             footer={
-              unstaged.length > 1 ? (
+              !readOnly && unstaged.length > 1 ? (
                 <button class="git-danger-link" disabled={busy} onClick={() => setDiscarding(unstaged)}>
                   {text("丢弃全部更改", "Discard all changes")}
                 </button>
@@ -416,7 +448,9 @@ export function WorkbenchGit({
                   title={`${commit.hash}\n${commit.author}`}
                   onClick={() => setSelection({ kind: "commit", hash: commit.hash })}
                 >
-                  <span class="git-history-subject">{commitSubject(commit.subject)}</span>
+                  <span class="git-history-subject">
+                    {commitSubject(commit.subject) || text("（无提交信息）", "(no commit message)")}
+                  </span>
                   <span class="git-history-meta">
                     <code>{commit.short}</code>
                     <span>{commit.author}</span>
@@ -521,6 +555,7 @@ function ChangeSection({
   staged,
   busy,
   zh,
+  readOnly,
   selected,
   onSelect,
   onOpen,
@@ -536,6 +571,7 @@ function ChangeSection({
   staged: boolean;
   busy: boolean;
   zh: boolean;
+  readOnly: boolean;
   selected: Selection | null;
   onSelect: (entry: GitEntry) => void;
   onOpen: (path: string) => void;
@@ -558,9 +594,11 @@ function ChangeSection({
               <span class="git-add">+{additions}</span>
               <span class="git-del">−{deletions}</span>
             </span>
-            <button class="git-section-action" disabled={busy} onClick={onAll}>
-              {allLabel}
-            </button>
+            {!readOnly && (
+              <button class="git-section-action" disabled={busy} onClick={onAll}>
+                {allLabel}
+              </button>
+            )}
           </>
         )}
       </header>
@@ -602,34 +640,38 @@ function ChangeSection({
                   )}
                 </button>
                 <span class="git-row-actions">
-                  {staged ? (
-                    <button
-                      disabled={busy}
-                      title={zh ? "取消暂存" : "Unstage"}
-                      aria-label={zh ? `取消暂存 ${entry.name}` : `Unstage ${entry.name}`}
-                      onClick={() => onUnstage(entry)}
-                    >
-                      −
-                    </button>
-                  ) : (
-                    <button
-                      disabled={busy}
-                      title={zh ? "暂存" : "Stage"}
-                      aria-label={zh ? `暂存 ${entry.name}` : `Stage ${entry.name}`}
-                      onClick={() => onStage(entry)}
-                    >
-                      ＋
-                    </button>
-                  )}
-                  {!staged && entry.kind !== "deleted" && (
-                    <button
-                      disabled={busy}
-                      title={zh ? "丢弃更改" : "Discard changes"}
-                      aria-label={zh ? `丢弃 ${entry.name} 的更改` : `Discard changes in ${entry.name}`}
-                      onClick={() => onDiscard(entry)}
-                    >
-                      ⟲
-                    </button>
+                  {!readOnly && (
+                    <>
+                      {staged ? (
+                        <button
+                          disabled={busy}
+                          title={zh ? "取消暂存" : "Unstage"}
+                          aria-label={zh ? `取消暂存 ${entry.name}` : `Unstage ${entry.name}`}
+                          onClick={() => onUnstage(entry)}
+                        >
+                          −
+                        </button>
+                      ) : (
+                        <button
+                          disabled={busy}
+                          title={zh ? "暂存" : "Stage"}
+                          aria-label={zh ? `暂存 ${entry.name}` : `Stage ${entry.name}`}
+                          onClick={() => onStage(entry)}
+                        >
+                          ＋
+                        </button>
+                      )}
+                      {!staged && entry.kind !== "deleted" && (
+                        <button
+                          disabled={busy}
+                          title={zh ? "丢弃更改" : "Discard changes"}
+                          aria-label={zh ? `丢弃 ${entry.name} 的更改` : `Discard changes in ${entry.name}`}
+                          onClick={() => onDiscard(entry)}
+                        >
+                          ⟲
+                        </button>
+                      )}
+                    </>
                   )}
                   {entry.kind !== "deleted" && (
                     <button

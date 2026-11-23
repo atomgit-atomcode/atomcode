@@ -1,21 +1,12 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { ApiCallError, workbenchPreview, workbenchRequest } from "../api";
+import { ApiCallError, workbenchPreview, workbenchRequest, type Change } from "../api";
 import { useSettings, useT } from "../settings";
 import { Markdown } from "./Markdown";
 
-/** One `git status --porcelain` row as the daemon reports it. */
-export type Change = {
-  path: string;
-  original?: string;
-  index: string;
-  worktree: string;
-  /** Net line counts from `git diff --numstat`; absent unless asked for. */
-  stats?: { additions: number; deletions: number } | null;
-};
-
-/** The repository's current changes. A workspace without Git rejects with an
- *  error `isNotRepository` recognizes, so callers can tell it from a failure. */
+/** One `git status --porcelain` row, as the daemon reports it. Defined once in
+ *  `api.ts` so the panel, the viewer and the commit view cannot drift apart. */
+export type { Change } from "../api";
 export async function readChanges(session: string, withStats = false): Promise<Change[]> {
   return workbenchRequest<Change[]>(
     "git?" +

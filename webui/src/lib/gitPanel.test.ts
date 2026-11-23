@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { GitFileChange } from '../api.ts';
+import type { Change } from '../api.ts';
 import {
   commitMessageProblem,
   commitSubject,
@@ -15,7 +15,7 @@ import {
   sumStats,
 } from './gitPanel.ts';
 
-const change = (over: Partial<GitFileChange>): GitFileChange => ({
+const change = (over: Partial<Change>): Change => ({
   path: 'a.txt',
   index: ' ',
   worktree: 'M',
@@ -60,15 +60,35 @@ test('rename rows keep the original path so a Git action can address both sides'
   assert.equal(entry.kind, 'renamed');
   assert.deepEqual(splitPath(entry.path), { dir: 'src', name: 'new name.txt' });
   assert.deepEqual(selectionsOf([entry]), [
-    { path: 'src/new name.txt', original: 'src/old name.txt', untracked: false },
+    { path: 'src/new name.txt', original: 'src/old name.txt', untracked: false, staged_new: false },
   ]);
 });
 
 test('untracked rows are marked so discarding removes the file', () => {
   const { unstaged } = partitionChanges([change({ path: 'draft.md', index: '?', worktree: '?' })]);
   assert.deepEqual(selectionsOf(unstaged), [
-    { path: 'draft.md', original: null, untracked: true },
+    { path: 'draft.md', original: null, untracked: true, staged_new: false },
   ]);
+});
+
+test('a staged-new row is marked so discarding drops the index entry and the file', () => {
+  const { staged } = partitionChanges([change({ path: 'added.txt', index: 'A', worktree: ' ' })]);
+  assert.deepEqual(selectionsOf(staged), [
+    { path: 'added.txt', original: null, untracked: false, staged_new: true },
+  ]);
+});
+
+test('the line stats of an MM row are counted once, on the unstaged side', () => {
+  const { staged, unstaged } = partitionChanges([
+    change({ path: 'both.txt', index: 'M', worktree: 'M', stats: { additions: 4, deletions: 2 } }),
+  ]);
+  assert.deepEqual(sumStats(staged), { additions: 0, deletions: 0 });
+  assert.deepEqual(sumStats(unstaged), { additions: 4, deletions: 2 });
+  // A file that exists only in the index still carries its own numbers.
+  const { staged: onlyStaged } = partitionChanges([
+    change({ path: 'staged.txt', index: 'A', worktree: ' ', stats: { additions: 3, deletions: 0 } }),
+  ]);
+  assert.deepEqual(sumStats(onlyStaged), { additions: 3, deletions: 0 });
 });
 
 test('groups follow the first directory segment with root files last', () => {
@@ -115,5 +135,7 @@ test('relative history time stays readable and dates far commits', () => {
 
 test('a commit subject stays one line', () => {
   assert.equal(commitSubject('  fix: panel  \nsecond line'), 'fix: panel');
-  assert.equal(commitSubject(''), '(no message)');
+  // Wording for an empty subject belongs to the localized panel, not here.
+  assert.equal(commitSubject(''), '');
+  assert.equal(commitSubject('   \n  '), '');
 });

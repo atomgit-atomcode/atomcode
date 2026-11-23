@@ -88,6 +88,7 @@ daemon.stdout.on("data", (b) => (log += b));
 daemon.stderr.on("data", (b) => (log += b));
 
 let browser;
+let failed = false;
 async function api(path, body, method) {
   return fetch(base + path, {
     method: method || (body ? "POST" : "GET"),
@@ -239,10 +240,15 @@ try {
     (await panel.locator(".git-branch-name").textContent()).includes("panel-test"),
   "the toolbar branch name");
 
-  await page.screenshot({ path: resolve(temp, "git-panel.png"), fullPage: true });
+  // The screenshot is the only visual evidence of this run: keep it outside the
+  // fixture directory, which the cleanup below removes.
+  const shot = resolve(tmpdir(), "atomcode-git-panel.png");
+  await page.screenshot({ path: shot, fullPage: true });
+  console.log("screenshot:", shot);
   assert.deepEqual(errors, [], "no page errors");
   console.log("git-panel e2e passed");
 } catch (e) {
+  failed = true;
   console.error("git-panel e2e failed:", e.message);
   console.error(log.slice(-3000));
   process.exitCode = 1;
@@ -254,13 +260,18 @@ try {
     daemon.once("exit", done);
     setTimeout(done, 5000);
   });
-  // Windows keeps a handle on the daemon's cwd for a moment after exit.
-  for (let attempt = 0; attempt < 10; attempt++) {
-    try {
-      await rm(temp, { recursive: true, force: true });
-      break;
-    } catch {
-      await new Promise((r) => setTimeout(r, 200));
+  if (failed) {
+    // Keep the repository as it was left, so the failing state can be inspected.
+    console.error("fixture kept at:", temp);
+  } else {
+    // Windows keeps a handle on the daemon's cwd for a moment after exit.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await rm(temp, { recursive: true, force: true });
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 200));
+      }
     }
   }
 }

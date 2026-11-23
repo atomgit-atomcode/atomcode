@@ -1,4 +1,4 @@
-import type { GitFileChange, GitPathSelection } from '../api';
+import type { Change, GitPathSelection } from '../api';
 
 /** What a file's status row means on the side being shown. */
 export type StatusKind =
@@ -24,7 +24,7 @@ export type GitEntry = {
 const CONFLICT_LETTERS = new Set(['U']);
 
 /** Unmerged rows: either side says U, or both sides say A/D. */
-export function isConflicted(change: GitFileChange): boolean {
+export function isConflicted(change: Change): boolean {
   if (CONFLICT_LETTERS.has(change.index) || CONFLICT_LETTERS.has(change.worktree)) {
     return true;
   }
@@ -35,7 +35,7 @@ export function isConflicted(change: GitFileChange): boolean {
 }
 
 /** `??` is the only status letter that means "not tracked yet". */
-export function isUntracked(change: GitFileChange): boolean {
+export function isUntracked(change: Change): boolean {
   return change.index === '?';
 }
 
@@ -80,7 +80,12 @@ export function splitPath(path: string): { dir: string; name: string } {
   return at < 0 ? { dir: '', name: path } : { dir: path.slice(0, at), name: path.slice(at + 1) };
 }
 
-export function entryOf(change: GitFileChange, side: 'index' | 'worktree'): GitEntry {
+/**
+ * One row of a section. `carryStats` is false when the same `git status` row is
+ * shown in both sections: the numstat the daemon returns covers HEAD → worktree
+ * as a whole, so it belongs to the unstaged side only.
+ */
+export function entryOf(change: Change, side: 'index' | 'worktree', carryStats = true): GitEntry {
   const { dir, name } = splitPath(change.path);
   const letter = side === 'index' ? change.index : change.worktree;
   return {
@@ -91,8 +96,8 @@ export function entryOf(change: GitFileChange, side: 'index' | 'worktree'): GitE
       ? 'conflicted'
       : statusKind(letter, side === 'worktree' && isUntracked(change)),
     original: change.original ?? undefined,
-    additions: change.stats?.additions ?? 0,
-    deletions: change.stats?.deletions ?? 0,
+    additions: carryStats ? change.stats?.additions ?? 0 : 0,
+    deletions: carryStats ? change.stats?.deletions ?? 0 : 0,
   };
 }
 
@@ -101,10 +106,11 @@ export type GitPartition = { staged: GitEntry[]; unstaged: GitEntry[] };
 /**
  * Split `git status` rows into the two source-control sections. A file can
  * appear in both (`MM`): the index side is what a commit would take, the
- * worktree side is what is still unstaged. Conflicted rows stay in one place
- * so the user never sees the same conflict twice.
+ * worktree side is what is still unstaged. Its line stats are counted once, on
+ * the worktree side. Conflicted rows stay in one place so the user never sees
+ * the same conflict twice.
  */
-export function partitionChanges(changes: GitFileChange[]): GitPartition {
+export function partitionChanges(changes: Change[]): GitPartition {
   const staged: GitEntry[] = [];
   const unstaged: GitEntry[] = [];
   for (const change of changes) {
@@ -112,10 +118,12 @@ export function partitionChanges(changes: GitFileChange[]): GitPartition {
       unstaged.push(entryOf(change, 'worktree'));
       continue;
     }
-    if (change.index !== ' ' && change.index !== '?') {
-      staged.push(entryOf(change, 'index'));
+    const stagedSide = change.index !== ' ' && change.index !== '?';
+    const worktreeSide = change.worktree !== ' ';
+    if (stagedSide) {
+      staged.push(entryOf(change, 'index', !worktreeSide));
     }
-    if (change.worktree !== ' ') {
+    if (worktreeSide) {
       unstaged.push(entryOf(change, 'worktree'));
     }
   }
@@ -162,6 +170,9 @@ export function selectionsOf(entries: GitEntry[]): GitPathSelection[] {
     path: entry.path,
     original: entry.original ?? null,
     untracked: entry.kind === 'untracked',
+    // An `A` row has no HEAD copy either; the daemon discards it by dropping
+    // the index entry and the file rather than restoring.
+    staged_new: entry.kind === 'added',
   }));
 }
 
@@ -192,8 +203,8 @@ export function relativeTime(at: number, now: number, zh: boolean): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-/** A commit subject is one line: anything the history row can show unwrapped. */
+/** A commit subject is one line: anything the history row can show unwrapped.
+ *  An empty subject comes back empty; the caller supplies its own wording. */
 export function commitSubject(subject: string): string {
-  const line = subject.split('\n')[0].trim();
-  return line || '(no message)';
+  return subject.split('\n')[0].trim();
 }

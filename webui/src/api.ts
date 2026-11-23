@@ -1572,8 +1572,9 @@ export async function workbenchPreview(session: string, path: string, signal?: A
   return response.blob();
 }
 
-/** One `git status` row as the daemon reports it (line stats are optional). */
-export type GitFileChange = {
+/** One `git status` row as the daemon reports it; the single wire shape shared
+ *  by the Git panel, the file viewer and the commit-detail view. */
+export type Change = {
   path: string;
   original?: string | null;
   index: string;
@@ -1581,8 +1582,15 @@ export type GitFileChange = {
   stats?: { additions: number; deletions: number } | null;
 };
 
-/** A file a Git action should touch; `original` carries a rename source. */
-export type GitPathSelection = { path: string; original?: string | null; untracked?: boolean };
+/** A file a Git action should touch. `original` carries a rename source;
+ *  `untracked` (`??`) and `staged_new` (index `A`) have no HEAD copy, so
+ *  discarding removes them instead of restoring. */
+export type GitPathSelection = {
+  path: string;
+  original?: string | null;
+  untracked?: boolean;
+  staged_new?: boolean;
+};
 
 export type GitBranchList = {
   current: string | null;
@@ -1599,7 +1607,7 @@ export type GitLogEntry = {
   subject: string;
 };
 
-export type GitCommitDetail = { files: GitFileChange[]; diff: string };
+export type GitCommitDetail = { files: Change[]; diff: string };
 
 function gitAction(session: string, action: string, body: Record<string, unknown>) {
   return workbenchRequest<{ ok: boolean }>(`git/${action}`, { session_id: session, ...body });
@@ -1624,7 +1632,10 @@ export function switchGitBranch(session: string, name: string, create = false) {
   return gitAction(session, 'branch', { name, create });
 }
 export async function readGitLog(session: string, limit = 30): Promise<GitLogEntry[]> {
-  return workbenchRequest<GitLogEntry[]>('git/log?' + new URLSearchParams({ session_id: session, limit: String(limit) }));
+  // The daemon rejects anything outside 1–100; clamp here so a caller asking
+  // for "everything" degrades to the maximum page instead of failing the panel.
+  const bounded = Math.min(100, Math.max(1, Math.trunc(limit) || 30));
+  return workbenchRequest<GitLogEntry[]>('git/log?' + new URLSearchParams({ session_id: session, limit: String(bounded) }));
 }
 export async function readGitCommit(session: string, rev: string): Promise<GitCommitDetail> {
   return workbenchRequest<GitCommitDetail>('git/commit-diff?' + new URLSearchParams({ session_id: session, rev }));

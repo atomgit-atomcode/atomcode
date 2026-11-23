@@ -593,8 +593,8 @@
   line-height: 1;
 }
 .git-kind-modified {
-  color: #b7791f;
-  background: rgba(183, 121, 31, 0.14);
+  color: var(--app-warning-accent, #b7791f);
+  background: color-mix(in srgb, var(--app-warning-accent, #b7791f) 14%, transparent);
 }
 .git-kind-added,
 .git-kind-untracked {
@@ -611,7 +611,7 @@
   background: rgba(77, 170, 252, 0.16);
 }
 .git-kind-conflicted {
-  color: #fff;
+  color: var(--app-primary-foreground, #fff);
   background: var(--app-error-foreground, #bd4a51);
 }
 .git-file-name {
@@ -623,8 +623,9 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  direction: rtl;
-  text-align: left;
+  /* No `direction: rtl` here: it would reorder `v1.2`-style segments. The
+     directory simply truncates at its end, in reading order. */
+  unicode-bidi: plaintext;
   font-size: 0.68rem;
   opacity: 0.45;
   flex-shrink: 1;
