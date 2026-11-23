@@ -1934,7 +1934,7 @@ fn typed_words(user: &str) -> String {
 }
 
 fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String> {
-    use atomcode_capabilities::session::{events, SessionManager};
+    use atomcode_capabilities::session::SessionManager;
     let manager =
         SessionManager::for_project(here, &atomcode_coding::config::product_dirs_from_env());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1950,15 +1950,12 @@ fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String>
         if meta.id == skip {
             continue;
         }
-        let Ok(logged) = manager.load_events(&meta.id) else {
+        let Ok(history) = manager.read_history_text(&meta.id) else {
             continue;
         };
-        for record in events::turn_records(&meta.id, &logged).into_iter().rev() {
+        for record in history.turns.into_iter().rev() {
             if out.len() >= limit {
                 break;
-            }
-            if record.undone {
-                continue;
             }
             let typed = typed_words(&record.user);
             let said = typed.trim();
@@ -2025,7 +2022,7 @@ mod recall_tests {
 /// Undone turns are left out: they were taken back, and a preview that shows
 /// them describes a conversation that no longer exists.
 fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
-    use atomcode_capabilities::session::{events, SessionManager};
+    use atomcode_capabilities::session::SessionManager;
     /// How many exchanges. Enough to recognise a conversation, few enough to
     /// read at a glance while walking the list.
     const TURNS: usize = 3;
@@ -2039,8 +2036,8 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     let manager = SessionManager::with_root(
         SessionManager::sessions_root(dirs.user()).join(&entry.project_bucket),
     );
-    let logged = manager
-        .load_events(session)
+    let history = manager
+        .read_history_text(session)
         .map_err(|error| HostError::Failed {
             message: error.to_string(),
         })?;
@@ -2055,19 +2052,9 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     //
     // The LAST header, because a session that switched models ended on the one
     // it would resume from.
-    let model = logged.iter().rev().find_map(|entry| match &entry.event {
-        atomcode_kernel::session::SessionEvent::RequestHeader { model, .. } => Some(model.clone()),
-        _ => None,
-    });
-    let records = events::turn_records(session, &logged);
-    let kept: Vec<_> = records
-        .iter()
-        .filter(|record| !record.undone)
-        .rev()
-        .take(TURNS)
-        .collect();
+    let kept: Vec<_> = history.turns.iter().rev().take(TURNS).collect();
     let mut lines = Vec::new();
-    if let Some(model) = &model {
+    if let Some(model) = &history.model {
         lines.push(
             atomcode_i18n::product::t(atomcode_i18n::product::Msg::PreviewModel { model })
                 .into_owned(),

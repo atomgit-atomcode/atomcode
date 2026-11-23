@@ -4774,18 +4774,16 @@ impl Host {
         m.mcp_panel = None;
         m.bg_panel = None;
         m.sheet = None;
+        m.resume_preview = None;
         m.resume_panel = Some(crate::resume::Panel::new());
         true
     }
 
     /// Put the resume panel away. True when it was up.
     pub fn close_resume(&self) -> bool {
-        self.moment
-            .write()
-            .expect("moment poisoned")
-            .resume_panel
-            .take()
-            .is_some()
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.resume_preview = None;
+        m.resume_panel.take().is_some()
     }
 
     /// Put the sessions the host answered into the moment, and rest the cursor at
@@ -4795,6 +4793,7 @@ impl Host {
         let mut changed = false;
         if m.resume != view {
             m.resume = view;
+            m.resume_preview = None;
             changed = true;
         }
         if let Some(panel) = m.resume_panel.as_mut() {
@@ -4809,43 +4808,66 @@ impl Host {
     /// The session the arrows are on, if the panel is up.
     pub fn resume_selected(&self) -> Option<String> {
         let m = self.moment.read().expect("moment poisoned");
-        let panel = m.resume_panel.as_ref()?;
-        let listed = m.resume.listed(panel);
-        let at = listed.get(panel.cursor)?;
-        m.resume.sessions().get(*at).map(|s| s.id.clone())
+        m.resume
+            .selected(m.resume_panel.as_ref()?)
+            .map(|s| s.id.clone())
     }
 
     /// Which session still needs its last words fetched, and mark it as being
     /// fetched.
     ///
-    /// Answered once per session: walking the list with the arrow held down
-    /// would otherwise ask for the same one on every repeat, and each answer
-    /// would arrive to overwrite the last.
-    pub fn resume_preview_wanted(&self) -> Option<String> {
-        let selected = self.resume_selected()?;
+    /// While the same row stays selected, key repeats reuse its pending
+    /// request or answer.
+    pub(crate) fn resume_preview_wanted(&self) -> Option<(String, u64)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         let mut m = self.moment.write().expect("moment poisoned");
+        let Some(selected) = m
+            .resume_panel
+            .as_ref()
+            .and_then(|panel| m.resume.selected(panel))
+        else {
+            m.resume_preview = None;
+            return None;
+        };
         if m.resume_preview
             .as_ref()
-            .is_some_and(|(shown, _)| shown == &selected)
+            .is_some_and(|preview| preview.session == selected.id)
         {
             return None;
         }
-        m.resume_preview = Some((selected.clone(), None));
-        Some(selected)
+        let id = selected.id.clone();
+        let request = NEXT.fetch_add(1, Ordering::Relaxed);
+        m.resume_preview = Some(crate::resume::Preview {
+            session: id.clone(),
+            request,
+            lines: None,
+        });
+        Some((id, request))
     }
 
-    /// The words came back. Kept only while the arrows are still on that
-    /// session — an answer for a row a person has already walked past is an
-    /// answer to a question they are no longer asking.
-    pub fn show_resume_preview(&self, id: &str, lines: Vec<String>) -> bool {
+    fn current_resume_preview(m: &Moment, id: &str, request: u64) -> bool {
+        m.resume_preview
+            .as_ref()
+            .is_some_and(|preview| preview.request == request && preview.session == id)
+            && m.resume_panel
+                .as_ref()
+                .and_then(|panel| m.resume.selected(panel))
+                .is_some_and(|selected| selected.id == id)
+    }
+
+    pub(crate) fn resume_preview_is_current(&self, id: &str, request: u64) -> bool {
+        Self::current_resume_preview(&self.moment.read().expect("moment poisoned"), id, request)
+    }
+
+    /// An older request for the same row is stale too after leaving and returning.
+    pub(crate) fn show_resume_preview(&self, id: &str, request: u64, lines: Vec<String>) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        match m.resume_preview.as_mut() {
-            Some((shown, slot)) if shown == id => {
-                *slot = Some(lines);
-                true
-            }
-            _ => false,
+        if !Self::current_resume_preview(&m, id, request) {
+            return false;
         }
+        m.resume_preview.as_mut().expect("current preview").lines = Some(lines);
+        true
     }
 
     /// Take a session out of the list the panel is showing.

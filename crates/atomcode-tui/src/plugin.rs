@@ -1201,6 +1201,7 @@ const CONVERSATION_WHEEL_LINES: i32 = if cfg!(any(windows, target_env = "ohos"))
 const OPENING_NOTICE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+const RESUME_PREVIEW_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// The ways out of a policy intervention, as a person reads them.
 ///
@@ -3305,6 +3306,7 @@ impl UserInterface for Tui {
                             continue;
                         }
                         if self.host.resume_wheel(x, y, by) {
+                            self.fetch_resume_preview();
                             stale = true;
                             continue;
                         }
@@ -3767,7 +3769,10 @@ impl UserInterface for Tui {
                             }
                             if self.host.resume_open() {
                                 if let Some(row) = self.host.resume_row_at(x, y) {
-                                    stale |= self.host.point_resume_at(row);
+                                    if self.host.point_resume_at(row) {
+                                        self.fetch_resume_preview();
+                                        stale = true;
+                                    }
                                 }
                             }
                             if self.host.sheet_open() {
@@ -5803,12 +5808,13 @@ impl Tui {
             self.delete_session(id);
             return true;
         }
-        // 走到哪一行,就去问那一行最后聊了什么。
-        self.fetch_resume_preview();
         let command = match asked {
             Some(crate::resume::Step::Resume { id }) => format!("/resume {id}"),
             Some(crate::resume::Step::ResumeAcrossProjects { id }) => format!("/resume --all {id}"),
-            _ => return changed,
+            _ => {
+                self.fetch_resume_preview();
+                return changed;
+            }
         };
         let keys = self.wake.lock().expect("wake poisoned").clone();
         if let Some(keys) = keys {
@@ -5818,25 +5824,27 @@ impl Tui {
         true
     }
 
-    /// Ask what the selected session last talked about.
-    ///
-    /// 每行只问一次(`resume_preview_wanted` 认这件事),答案回来时人若已经走到
-    /// 别的行上就作废——按住方向键翻一遍列表不该让屏幕上闪过一串别人的对话。
+    /// Wait for the cursor to settle before asking the store.
     fn fetch_resume_preview(&self) {
-        let Some(id) = self.host.resume_preview_wanted() else {
-            return;
-        };
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return;
         };
         let Some(port) = ctx.service::<crate::plugin::ResumeSvc>() else {
             return;
         };
+        let Some((id, request)) = self.host.resume_preview_wanted() else {
+            return;
+        };
+        let ready = tokio::time::Instant::now() + RESUME_PREVIEW_DELAY;
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
+            tokio::time::sleep_until(ready).await;
+            if !host.resume_preview_is_current(&id, request) {
+                return;
+            }
             let lines = port.preview(&id).await.unwrap_or_default();
-            if host.show_resume_preview(&id, lines) {
+            if host.show_resume_preview(&id, request, lines) {
                 if let Some(keys) = keys {
                     let _ = keys.send(Wake::Fact);
                 }
@@ -13941,6 +13949,97 @@ mod at_menu_tests {
         assert!(
             labels(&paths_under(&index, &there, "only", ".ours")).is_empty(),
             "the directory that was left behind is no longer offered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_preview_tests {
+    use super::*;
+    use crate::module::Mounted;
+    use crate::surface::{Key, KeyPress};
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    #[derive(Default)]
+    struct Store(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl crate::resume::Resume for Store {
+        async fn delete(&self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn preview(&self, session: &str) -> Result<Vec<String>, String> {
+            self.0.lock().unwrap().push(session.to_owned());
+            Ok(vec![session.to_owned()])
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn resume_previews_read_only_the_row_where_the_cursor_settles() {
+        let (host, tui) = assemble(Headless::new(80, 24));
+        host.modules
+            .add_view(Arc::new(Mounted::<crate::modules::resume::Resume>::new()))
+            .unwrap();
+        let store = Arc::new(Store::default());
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<ResumeSvc>(store.clone());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        let view = crate::resume::ResumeView::new(
+            ["first", "second", "third"]
+                .into_iter()
+                .map(|id| crate::resume::Session {
+                    id: id.to_owned(),
+                    title: None,
+                    working_dir: None,
+                    updated_at: 0,
+                    turns: 2,
+                    needs_newer_version: false,
+                    scheduled: false,
+                    held: None,
+                })
+                .collect(),
+        );
+
+        tui.act(Action::OpenResume(view.clone()), &tui.client);
+        tui.run_resume_key(KeyPress::plain(Key::Down));
+        tokio::time::advance(RESUME_PREVIEW_DELAY / 2).await;
+        tui.run_resume_key(KeyPress::plain(Key::Down));
+        tokio::time::advance(RESUME_PREVIEW_DELAY / 2).await;
+        tokio::task::yield_now().await;
+        assert!(store.0.lock().unwrap().is_empty());
+
+        tokio::time::advance(RESUME_PREVIEW_DELAY).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*store.0.lock().unwrap(), ["third"]);
+        let third = host
+            .moment
+            .read()
+            .unwrap()
+            .resume_preview
+            .as_ref()
+            .unwrap()
+            .request;
+
+        tui.run_resume_key(KeyPress::plain(Key::Up));
+        tui.run_resume_key(KeyPress::plain(Key::Esc));
+        tui.act(Action::OpenResume(view), &tui.client);
+        tui.run_resume_key(KeyPress::plain(Key::Down));
+        tui.run_resume_key(KeyPress::plain(Key::Down));
+        assert!(!host.show_resume_preview("third", third, vec!["stale".into()]));
+        tokio::time::advance(RESUME_PREVIEW_DELAY * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*store.0.lock().unwrap(), ["third", "third"]);
+        assert_eq!(
+            host.moment
+                .read()
+                .unwrap()
+                .resume_preview
+                .as_ref()
+                .unwrap()
+                .lines
+                .as_deref(),
+            Some(&["third".to_owned()][..]),
         );
     }
 }
