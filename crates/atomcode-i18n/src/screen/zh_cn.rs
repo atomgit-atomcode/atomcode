@@ -1128,6 +1128,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "模型服务身份验证失败".into(),
         Msg::ProviderRateLimitError => "模型服务限流".into(),
         Msg::ProviderConnectionError => "无法连接模型服务".into(),
+        Msg::ProviderSystemProxyReadFailed => "无法读取系统代理设置。".into(),
+        Msg::ProviderCheckSystemProxy => "请检查系统代理的地址和端口。如果当前网络允许直连，可输入 /proxy no_proxy 后重试。".into(),
         Msg::ProviderResponseTimeout => "模型服务未及时响应".into(),
         Msg::ProviderConnectionTimeout => "连接模型服务超时".into(),
         Msg::ProviderTlsInterrupted => "TLS 连接异常中断".into(),

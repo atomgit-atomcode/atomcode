@@ -16216,6 +16216,29 @@ mod tests {
     }
 
     #[test]
+    fn a_system_proxy_failure_shows_recovery_before_expanding_details() {
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::ProviderError,
+            error: Some("could not refresh system proxy settings: ProxyServer: settings are incomplete or changing (OS error 2).".into()),
+        });
+        let size = (160, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(folded.contains("/proxy no_proxy"), "{folded}");
+        assert!(!folded.contains("OS error 2"), "{folded}");
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "provider_diagnostic")
+            .expect("the proxy failure has expandable diagnostics");
+        h.toggle_block(id, kind);
+        assert!(h.compose(size).rows().join("\n").contains("OS error 2"));
+    }
+
+    #[test]
     fn clicking_a_vl_caption_opens_the_recognition() {
         let h = host();
         let caption = "一层是登录界面\n二层是报错弹窗\n三层是网络面板";

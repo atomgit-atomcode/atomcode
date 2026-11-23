@@ -1804,6 +1804,8 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderSystemProxyReadFailed,
+    ProviderCheckSystemProxy,
     ProviderResponseTimeout,
     ProviderConnectionTimeout,
     ProviderTlsInterrupted,

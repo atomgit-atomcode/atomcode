@@ -37,6 +37,17 @@ fn status(error: &str) -> Option<u16> {
         .filter(|n| (400..600).contains(n))
 }
 
+fn system_proxy_refresh_failed(error: &str) -> bool {
+    // Turn history stores the diagnostic text. Match the local transport's
+    // headline so older sessions get the hint without changing their format.
+    let detail = error
+        .trim()
+        .trim_start_matches("provider error: ")
+        .trim_start_matches("open failed: ");
+    detail.starts_with("could not refresh system proxy settings: ")
+        || detail == "system proxy refresh timed out"
+}
+
 pub(crate) fn reason(error: &str) -> String {
     if authentication_expired(error) {
         return atomcode_i18n::product::t(atomcode_i18n::product::Msg::ChatAuthExpired)
@@ -57,6 +68,7 @@ pub(crate) fn reason(error: &str) -> String {
             }
         }
         None if partial_reply_preserved(error) => Msg::ProviderPartialReply,
+        None if system_proxy_refresh_failed(error) => Msg::ProviderSystemProxyReadFailed,
         None if lower.contains("without sending tls close_notify") => Msg::ProviderTlsInterrupted,
         None if error.contains("等待模型服务响应头") => Msg::ProviderResponseTimeout,
         None if lower.contains("connection timed out") || error.contains("等待首字节超过") => {
@@ -104,6 +116,7 @@ pub(crate) fn advice(error: &str) -> String {
         Some(401) => Msg::ProviderCheckCredentials,
         Some(403) => Msg::ProviderCheckAccess,
         None if partial_reply_preserved(error) => Msg::ProviderContinueReply,
+        None if system_proxy_refresh_failed(error) => Msg::ProviderCheckSystemProxy,
         None if reason(error) == t(Msg::ProviderConnectionTimeout)
             || reason(error) == t(Msg::ProviderTlsInterrupted) =>
         {
@@ -238,6 +251,22 @@ mod tests {
         assert!(plain(block.summary_lines(&RenderCtx::bare(100)))
             .contains(&*t(Msg::ProviderContinueReply)));
         assert_eq!(block.detail, partial);
+    }
+
+    #[test]
+    fn system_proxy_read_errors_have_a_specific_recovery_hint() {
+        for error in [
+            "could not refresh system proxy settings: ProxyServer: settings are incomplete or changing (OS error 2).",
+            "provider error: open failed: system proxy refresh timed out",
+        ] {
+            assert_eq!(reason(error), t(Msg::ProviderSystemProxyReadFailed));
+            assert!(advice(error).contains("/proxy no_proxy"));
+            assert!(!advice(error).contains("ProxyServer"));
+        }
+        assert!(
+            !advice("HTTP 503: could not refresh system proxy settings: upstream")
+                .contains("/proxy no_proxy")
+        );
     }
 
     #[test]

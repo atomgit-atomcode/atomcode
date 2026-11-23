@@ -1189,6 +1189,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "Model service authentication failed".into(),
         Msg::ProviderRateLimitError => "Model service rate limit reached".into(),
         Msg::ProviderConnectionError => "Cannot connect to the model service".into(),
+        Msg::ProviderSystemProxyReadFailed => "Could not read the system proxy settings.".into(),
+        Msg::ProviderCheckSystemProxy => "Check the system proxy address and port. If your network allows direct connections, run /proxy no_proxy and try again.".into(),
         Msg::ProviderResponseTimeout => "The model service did not respond in time".into(),
         Msg::ProviderConnectionTimeout => "Connection to the model service timed out".into(),
         Msg::ProviderTlsInterrupted => "The TLS connection was interrupted".into(),
