@@ -144,7 +144,17 @@ pub(super) async fn save(State(state): State<AppState>, Json(q): Json<Save>) -> 
 }
 
 const GIT_LIMIT: u64 = 1024 * 1024;
-async fn git(root: &Path, configs: &[String], args: &[&str]) -> Result<(bool, Vec<u8>), String> {
+struct GitOutput {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+impl GitOutput {
+    fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+async fn git_raw(root: &Path, configs: &[String], args: &[&str]) -> Result<GitOutput, String> {
     let mut command = tokio::process::Command::new("git");
     command.args([
         "--no-pager",
@@ -190,14 +200,15 @@ async fn git(root: &Path, configs: &[String], args: &[&str]) -> Result<(bool, Ve
     })
     .await;
     match result {
-        Ok(Ok((out, errors, status))) => {
-            if out.len() as u64 > GIT_LIMIT || errors.len() > 8192 {
+        Ok(Ok((stdout, stderr, status))) => {
+            if stdout.len() as u64 > GIT_LIMIT || stderr.len() > 8192 {
                 return Err("Git output exceeded its size limit; narrow the changes".into());
             }
-            if !status.success() && status.code() != Some(1) {
-                return Err(String::from_utf8_lossy(&errors).trim().to_owned());
-            }
-            Ok((status.success(), out))
+            Ok(GitOutput {
+                code: status.code(),
+                stdout,
+                stderr,
+            })
         }
         _ => {
             let _ = child.kill().await;
@@ -205,6 +216,30 @@ async fn git(root: &Path, configs: &[String], args: &[&str]) -> Result<(bool, Ve
             Err("Git query failed or timed out".into())
         }
     }
+}
+/// Read-only query: exit code 1 is a normal "no result" answer for `git diff
+/// --quiet`-style probes, and its stderr is not a failure worth reporting.
+async fn git(root: &Path, configs: &[String], args: &[&str]) -> Result<(bool, Vec<u8>), String> {
+    let output = git_raw(root, configs, args).await?;
+    if !output.success() && output.code != Some(1) {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok((output.success(), output.stdout))
+}
+/// A Git action the user asked for: any non-zero exit is a failure and Git's
+/// own message is what the caller shows.
+async fn git_action(root: &Path, configs: &[String], args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = git_raw(root, configs, args).await?;
+    if !output.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        let message = message.trim();
+        return Err(if message.is_empty() {
+            "Git action failed".to_owned()
+        } else {
+            message.to_owned()
+        });
+    }
+    Ok(output.stdout)
 }
 struct GitWorkspace {
     root: PathBuf,
@@ -577,6 +612,581 @@ pub(super) async fn git_diff(
     match result {
         Ok(diff) => Json(serde_json::json!({"diff":diff})).into_response(),
         Err(e) => bad(e),
+    }
+}
+
+// User-driven Git actions. The workbench panel is the only caller: these run
+// `git` on the host workspace, never through an agent tool.
+
+const GIT_PATH_LIMIT: usize = 500;
+const COMMIT_MESSAGE_LIMIT: usize = 4000;
+const LOG_DEFAULT: usize = 30;
+const LOG_LIMIT: usize = 100;
+
+fn git_bad(message: String) -> Response {
+    if message == NOT_GIT_REPOSITORY {
+        return crate::coded_json_error(
+            StatusCode::BAD_REQUEST,
+            NOT_GIT_REPOSITORY,
+            "This workspace is not a Git repository",
+            false,
+        )
+        .into_response();
+    }
+    bad(message)
+}
+
+async fn git_context(state: &AppState, session_id: &str) -> Result<GitWorkspace, String> {
+    let (_, root) = workspace(state, session_id).await?;
+    git_workspace(root).await
+}
+
+async fn git_has_head(context: &GitWorkspace) -> Result<bool, String> {
+    let (ok, _) = git(
+        &context.root,
+        &context.configs,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    )
+    .await?;
+    Ok(ok)
+}
+
+async fn git_on_paths(
+    context: &GitWorkspace,
+    command: &[&str],
+    paths: &[String],
+) -> Result<(), String> {
+    let mut args: Vec<&str> = command.to_vec();
+    args.push("--");
+    for path in paths {
+        args.push(path.as_str());
+    }
+    git_action(&context.root, &context.configs, &args)
+        .await
+        .map(|_| ())
+}
+
+fn ok_json() -> Response {
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct ChangePath {
+    path: String,
+    #[serde(default)]
+    original: Option<String>,
+    /// `??` in `git status`: the file is untracked, so discarding removes it.
+    #[serde(default)]
+    untracked: bool,
+}
+
+impl ChangePath {
+    /// Every path a Git action may touch, with the rename source first so `git`
+    /// sees the pair the status row described.
+    fn paths(&self) -> Result<Vec<String>, String> {
+        if !relative_file(&self.path) {
+            return Err("Git action paths must stay inside the workspace".into());
+        }
+        match &self.original {
+            Some(original) if !relative_file(original) => {
+                Err("Git action paths must stay inside the workspace".into())
+            }
+            Some(original) => Ok(vec![original.clone(), self.path.clone()]),
+            None => Ok(vec![self.path.clone()]),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChangesRequest {
+    session_id: String,
+    #[serde(default)]
+    paths: Vec<ChangePath>,
+    #[serde(default)]
+    all: bool,
+}
+
+impl ChangesRequest {
+    fn selection(&self) -> Result<Vec<String>, String> {
+        if self.all {
+            return Ok(vec![".".to_owned()]);
+        }
+        if self.paths.is_empty() {
+            return Err("Select at least one changed file".into());
+        }
+        if self.paths.len() > GIT_PATH_LIMIT {
+            return Err("Too many files in one Git action".into());
+        }
+        let mut paths = Vec::new();
+        for entry in &self.paths {
+            paths.extend(entry.paths()?);
+        }
+        Ok(paths)
+    }
+}
+
+pub(super) async fn git_stage(
+    State(state): State<AppState>,
+    Json(q): Json<ChangesRequest>,
+) -> Response {
+    let paths = match q.selection() {
+        Ok(paths) => paths,
+        Err(e) => return bad(e),
+    };
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    match git_on_paths(&context, &["add", "-A"], &paths).await {
+        Ok(()) => ok_json(),
+        Err(e) => git_bad(e),
+    }
+}
+
+pub(super) async fn git_unstage(
+    State(state): State<AppState>,
+    Json(q): Json<ChangesRequest>,
+) -> Response {
+    let paths = match q.selection() {
+        Ok(paths) => paths,
+        Err(e) => return bad(e),
+    };
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    let has_head = match git_has_head(&context).await {
+        Ok(value) => value,
+        Err(e) => return git_bad(e),
+    };
+    // Before the first commit there is no HEAD to reset against; dropping the
+    // index entry is the equivalent "unstage".
+    let result = if has_head {
+        git_on_paths(&context, &["reset", "-q"], &paths).await
+    } else {
+        git_on_paths(&context, &["rm", "-r", "--cached", "-q"], &paths).await
+    };
+    match result {
+        Ok(()) => ok_json(),
+        Err(e) => git_bad(e),
+    }
+}
+
+pub(super) async fn git_discard(
+    State(state): State<AppState>,
+    Json(q): Json<ChangesRequest>,
+) -> Response {
+    if q.paths.len() > GIT_PATH_LIMIT {
+        return bad("Too many files in one Git action");
+    }
+    let mut selected = Vec::new();
+    for entry in &q.paths {
+        match entry.paths() {
+            Ok(paths) => selected.push((paths, entry.untracked)),
+            Err(e) => return bad(e),
+        }
+    }
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    let has_head = match git_has_head(&context).await {
+        Ok(value) => value,
+        Err(e) => return git_bad(e),
+    };
+    if q.all {
+        if !has_head {
+            return bad("Discarding everything needs an initial commit");
+        }
+        let restored = git_action(
+            &context.root,
+            &context.configs,
+            &[
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                ".",
+            ],
+        )
+        .await;
+        if let Err(e) = restored {
+            return git_bad(e);
+        }
+        return match git_action(
+            &context.root,
+            &context.configs,
+            &["clean", "-f", "-d", "-q", "--", "."],
+        )
+        .await
+        {
+            Ok(_) => ok_json(),
+            Err(e) => git_bad(e),
+        };
+    }
+    if selected.is_empty() {
+        return bad("Select at least one changed file");
+    }
+    for (paths, untracked) in selected {
+        if untracked || !has_head {
+            // An untracked file has no history to restore; a file in an
+            // uncommitted repository has no HEAD. Either way the change is
+            // dropped from the index and removed from disk.
+            if let Err(e) = git_on_paths(&context, &["rm", "-r", "--cached", "-q"], &paths).await {
+                if !untracked {
+                    return git_bad(e);
+                }
+            }
+            let root = context.root.clone();
+            let path = paths.last().cloned().unwrap_or_default();
+            let removed = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let file = target(&root, &path).map_err(|e| e.to_string())?;
+                if !file.is_file() {
+                    return Err("Only existing files can be discarded".into());
+                }
+                std::fs::remove_file(&file).map_err(|e| e.to_string())
+            })
+            .await;
+            match removed {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return bad(e),
+                Err(e) => return bad(e),
+            }
+            continue;
+        }
+        let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+        for path in &paths {
+            args.push(path.as_str());
+        }
+        if let Err(e) = git_action(&context.root, &context.configs, &args).await {
+            return git_bad(e);
+        }
+    }
+    ok_json()
+}
+
+#[derive(Deserialize)]
+pub(super) struct CommitRequest {
+    session_id: String,
+    message: String,
+    #[serde(default)]
+    amend: bool,
+}
+
+pub(super) async fn git_commit(
+    State(state): State<AppState>,
+    Json(q): Json<CommitRequest>,
+) -> Response {
+    let message = q.message.trim();
+    if message.is_empty() {
+        return bad("Write a commit message first");
+    }
+    if message.chars().count() > COMMIT_MESSAGE_LIMIT {
+        return bad("Commit message exceeds its length limit");
+    }
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    let mut args = vec!["commit"];
+    if q.amend {
+        args.push("--amend");
+    }
+    args.extend(["-m", message]);
+    if let Err(e) = git_action(&context.root, &context.configs, &args).await {
+        return git_bad(e);
+    }
+    let hash = git(
+        &context.root,
+        &context.configs,
+        &["rev-parse", "--short", "HEAD"],
+    )
+    .await
+    .ok()
+    .map(|(_, bytes)| String::from_utf8_lossy(&bytes).trim().to_owned())
+    .filter(|hash| !hash.is_empty());
+    Json(serde_json::json!({ "ok": true, "hash": hash })).into_response()
+}
+
+#[derive(Serialize)]
+struct Branch {
+    name: String,
+    current: bool,
+}
+
+pub(super) async fn git_branches(
+    State(state): State<AppState>,
+    Query(q): Query<WorkspaceQuery>,
+) -> Response {
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    let (_, bytes) = match git(
+        &context.root,
+        &context.configs,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(e) => return git_bad(e),
+    };
+    let current = git(
+        &context.root,
+        &context.configs,
+        &["symbolic-ref", "--short", "-q", "HEAD"],
+    )
+    .await
+    .ok()
+    .filter(|(ok, _)| *ok)
+    .map(|(_, bytes)| String::from_utf8_lossy(&bytes).trim().to_owned())
+    .filter(|name| !name.is_empty());
+    let mut branches: Vec<Branch> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .take(GIT_PATH_LIMIT)
+        .map(|name| Branch {
+            name: name.to_owned(),
+            current: current.as_deref() == Some(name),
+        })
+        .collect();
+    branches.sort_by(|a, b| b.current.cmp(&a.current).then(a.name.cmp(&b.name)));
+    Json(serde_json::json!({
+        "current": current,
+        "branches": branches,
+        "detached": current.is_none(),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct BranchRequest {
+    session_id: String,
+    name: String,
+    #[serde(default)]
+    create: bool,
+}
+
+fn safe_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && !name.starts_with('-')
+        && !name.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(c, ':' | '?' | '*' | '[' | '\\' | '~' | '^' | '@' | '{')
+        })
+}
+
+pub(super) async fn git_switch(
+    State(state): State<AppState>,
+    Json(q): Json<BranchRequest>,
+) -> Response {
+    if !safe_ref_name(&q.name) {
+        return bad("That branch name is not valid");
+    }
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    let args = if q.create {
+        vec!["switch", "-c", q.name.as_str()]
+    } else {
+        vec!["switch", q.name.as_str()]
+    };
+    match git_action(&context.root, &context.configs, &args).await {
+        Ok(_) => ok_json(),
+        Err(e) => git_bad(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct LogQuery {
+    session_id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct LogEntry {
+    hash: String,
+    short: String,
+    author: String,
+    /// Unix seconds, as Git records them.
+    at: u64,
+    subject: String,
+}
+
+pub(super) async fn git_log(State(state): State<AppState>, Query(q): Query<LogQuery>) -> Response {
+    let limit = q.limit.unwrap_or(LOG_DEFAULT).clamp(1, LOG_LIMIT);
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    if !matches!(git_has_head(&context).await, Ok(true)) {
+        return Json(Vec::<LogEntry>::new()).into_response();
+    }
+    let count = format!("--max-count={limit}");
+    let (ok, bytes) = match git(
+        &context.root,
+        &context.configs,
+        &[
+            "log",
+            &count,
+            "--no-color",
+            "--no-show-signature",
+            "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s%x1e",
+        ],
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(e) => return git_bad(e),
+    };
+    if !ok {
+        return bad("Unable to read Git history");
+    }
+    let mut commits = Vec::new();
+    for record in bytes.split(|&b| b == 0x1e) {
+        let record = record.strip_suffix(&b"\n"[..]).unwrap_or(record);
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<&[u8]> = record.split(|&b| b == 0x1f).collect();
+        if fields.len() != 5 {
+            continue;
+        }
+        let text = |field: &[u8]| String::from_utf8_lossy(field).trim().to_owned();
+        commits.push(LogEntry {
+            hash: text(fields[0]),
+            short: text(fields[1]),
+            author: text(fields[2]),
+            at: text(fields[3]).parse().unwrap_or_default(),
+            subject: text(fields[4]),
+        });
+    }
+    Json(commits).into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct CommitQuery {
+    session_id: String,
+    rev: String,
+}
+
+fn commit_rev(rev: &str) -> bool {
+    (4..=64).contains(&rev.len()) && rev.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn parse_name_status(bytes: &[u8], context: &GitWorkspace) -> Result<Vec<Change>, String> {
+    let mut parts = bytes.split(|&b| b == 0).filter(|p| !p.is_empty());
+    let mut changes = Vec::new();
+    while let Some(status) = parts.next() {
+        let status = std::str::from_utf8(status).map_err(|_| "Invalid Git status output")?;
+        let kind = status.chars().next().ok_or("Invalid Git status output")?;
+        let first = parts.next().ok_or("Missing Git status path")?;
+        let first = std::str::from_utf8(first).map_err(|_| "A Git filename is not UTF-8")?;
+        let (original, path) = if kind == 'R' || kind == 'C' {
+            let second = parts.next().ok_or("Missing rename destination")?;
+            let second = std::str::from_utf8(second).map_err(|_| "A Git filename is not UTF-8")?;
+            (Some(first.to_owned()), second.to_owned())
+        } else {
+            (None, first.to_owned())
+        };
+        let absolute = context.repo.join(&path);
+        let Ok(relative) = absolute.strip_prefix(&context.root) else {
+            continue;
+        };
+        changes.push(Change {
+            path: browser_path(relative)?,
+            original: original.and_then(|original| {
+                context
+                    .repo
+                    .join(original)
+                    .strip_prefix(&context.root)
+                    .ok()
+                    .and_then(|p| browser_path(p).ok())
+            }),
+            index: kind.to_string(),
+            worktree: " ".to_owned(),
+            stats: None,
+        });
+        if changes.len() > 1000 {
+            return Err("This commit exceeds 1000 files".into());
+        }
+    }
+    Ok(changes)
+}
+
+pub(super) async fn git_commit_detail(
+    State(state): State<AppState>,
+    Query(q): Query<CommitQuery>,
+) -> Response {
+    if !commit_rev(&q.rev) {
+        return bad("Commit revisions must be a hexadecimal hash");
+    }
+    let context = match git_context(&state, &q.session_id).await {
+        Ok(context) => context,
+        Err(e) => return git_bad(e),
+    };
+    let result = async {
+        let (ok, bytes) = git(
+            &context.root,
+            &context.configs,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-z",
+                &q.rev,
+            ],
+        )
+        .await?;
+        if !ok {
+            return Err("Unable to read this commit".into());
+        }
+        let mut changes = parse_name_status(&bytes, &context)?;
+        if let Ok((ok, numstat)) = git(
+            &context.root,
+            &context.configs,
+            &["show", "--numstat", "-z", "--format=", &q.rev],
+        )
+        .await
+        {
+            if ok {
+                if let Ok(mut stats) = parse_numstat(&numstat, &context) {
+                    for change in changes.iter_mut() {
+                        change.stats = stats.remove(&change.path);
+                    }
+                }
+            }
+        }
+        let (_, diff) = git(
+            &context.root,
+            &context.configs,
+            &[
+                "show",
+                "--format=",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--ignore-submodules=all",
+                &q.rev,
+            ],
+        )
+        .await?;
+        Ok::<_, String>((changes, String::from_utf8_lossy(&diff).into_owned()))
+    }
+    .await;
+    match result {
+        Ok((files, diff)) => {
+            Json(serde_json::json!({"files": files, "diff": diff})).into_response()
+        }
+        Err(e) => git_bad(e),
     }
 }
 
@@ -961,5 +1571,213 @@ mod tests {
         ] {
             assert!(!root.join(name).exists(), "{name} helper ran");
         }
+    }
+
+    fn git_context_at(path: &str) -> GitWorkspace {
+        GitWorkspace {
+            root: PathBuf::from(path),
+            repo: PathBuf::from(path),
+            configs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn git_actions_reject_paths_outside_the_workspace() {
+        let entry = |path: &str, original: Option<&str>| ChangePath {
+            path: path.to_owned(),
+            original: original.map(str::to_owned),
+            untracked: false,
+        };
+        let request = |paths: Vec<ChangePath>| ChangesRequest {
+            session_id: "s".into(),
+            paths,
+            all: false,
+        };
+        assert!(request(vec![entry("../escape.txt", None)])
+            .selection()
+            .is_err());
+        assert!(request(vec![entry("/etc/passwd", None)])
+            .selection()
+            .is_err());
+        assert!(request(vec![entry("a.txt", Some("../b.txt"))])
+            .selection()
+            .is_err());
+        assert!(request(Vec::new()).selection().is_err());
+        assert_eq!(
+            request(vec![entry("a.txt", None)]).selection().unwrap(),
+            vec!["a.txt".to_owned()]
+        );
+        assert_eq!(
+            request(vec![entry("new.txt", Some("old.txt"))])
+                .selection()
+                .unwrap(),
+            vec!["old.txt".to_owned(), "new.txt".to_owned()]
+        );
+        let all = ChangesRequest {
+            session_id: "s".into(),
+            paths: Vec::new(),
+            all: true,
+        };
+        assert_eq!(all.selection().unwrap(), vec![".".to_owned()]);
+        let too_many = ChangesRequest {
+            session_id: "s".into(),
+            paths: (0..=GIT_PATH_LIMIT)
+                .map(|index| entry(&format!("f{index}.txt"), None))
+                .collect(),
+            all: false,
+        };
+        assert!(too_many.selection().is_err());
+    }
+
+    #[test]
+    fn branch_names_cannot_become_git_options() {
+        assert!(safe_ref_name("feat/git-panel"));
+        assert!(safe_ref_name("v5.2.8"));
+        assert!(!safe_ref_name(""));
+        assert!(!safe_ref_name("-D"));
+        assert!(!safe_ref_name("--force"));
+        assert!(!safe_ref_name("has space"));
+        assert!(!safe_ref_name("tab\there"));
+        assert!(!safe_ref_name("tilde~1"));
+        assert!(!safe_ref_name("caret^"));
+        assert!(!safe_ref_name("a".repeat(201).as_str()));
+    }
+
+    #[test]
+    fn commit_revisions_are_hexadecimal_hashes_only() {
+        assert!(commit_rev("9f2c1a3b"));
+        assert!(commit_rev(&"a".repeat(40)));
+        assert!(!commit_rev("--amend"));
+        assert!(!commit_rev("HEAD~1"));
+        assert!(!commit_rev("abc"));
+        assert!(!commit_rev(&"a".repeat(65)));
+        assert!(!commit_rev("9f2c1a3g"));
+    }
+
+    #[test]
+    fn name_status_reads_renames_and_plain_edits() {
+        let context = git_context_at("/repo");
+        let bytes = b"M\0src/a.txt\0R100\0old.txt\0new.txt\0";
+        let changes = parse_name_status(bytes, &context).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].path, "src/a.txt");
+        assert_eq!(changes[0].index, "M");
+        assert_eq!(changes[0].worktree, " ");
+        assert!(changes[0].original.is_none());
+        assert_eq!(changes[1].path, "new.txt");
+        assert_eq!(changes[1].original.as_deref(), Some("old.txt"));
+    }
+
+    #[tokio::test]
+    async fn git_actions_stage_commit_unstage_and_discard_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let root_text = root.to_str().unwrap().to_owned();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        for (key, value) in [
+            ("user.email", "panel@example.com"),
+            ("user.name", "Panel"),
+            ("commit.gpgsign", "false"),
+            // Restore must put back the bytes Git stored, not a platform
+            // translation of them.
+            ("core.autocrlf", "false"),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(["-C", &root_text, "config", key, value])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let path = "a.txt".to_owned();
+        std::fs::write(root.join(&path), "one\n").unwrap();
+        let context = git_workspace(root.clone()).await.unwrap();
+        assert!(!git_has_head(&context).await.unwrap());
+
+        git_on_paths(&context, &["add", "-A"], std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        let (_, bytes) = git(
+            &context.root,
+            &context.configs,
+            &["status", "--porcelain=v1", "-z", "--", "."],
+        )
+        .await
+        .unwrap();
+        let staged = parse_status(&bytes, &context).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].index, "A");
+
+        // Unstaging before the first commit drops the index entry instead of
+        // resetting against a HEAD that does not exist yet.
+        git_on_paths(
+            &context,
+            &["rm", "-r", "--cached", "-q"],
+            std::slice::from_ref(&path),
+        )
+        .await
+        .unwrap();
+        assert!(!git_has_head(&context).await.unwrap());
+        git_on_paths(&context, &["add", "-A"], std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        git_action(&context.root, &context.configs, &["commit", "-m", "first"])
+            .await
+            .unwrap();
+        assert!(git_has_head(&context).await.unwrap());
+
+        std::fs::write(root.join(&path), "two\n").unwrap();
+        git_action(
+            &context.root,
+            &context.configs,
+            &[
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                &path,
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(&path)).unwrap(), "one\n");
+
+        std::fs::write(root.join(&path), "three\n").unwrap();
+        git_on_paths(&context, &["add", "-A"], std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        git_on_paths(&context, &["reset", "-q"], std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        let (_, bytes) = git(
+            &context.root,
+            &context.configs,
+            &["status", "--porcelain=v1", "-z", "--", "."],
+        )
+        .await
+        .unwrap();
+        let rows = parse_status(&bytes, &context).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, " ");
+        assert_eq!(rows[0].worktree, "M");
+    }
+
+    #[tokio::test]
+    async fn a_failed_git_action_reports_gits_own_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = GitWorkspace {
+            root: dir.path().canonicalize().unwrap(),
+            repo: dir.path().canonicalize().unwrap(),
+            configs: Vec::new(),
+        };
+        let error = git_action(&context.root, &context.configs, &["status"])
+            .await
+            .unwrap_err();
+        assert!(error.contains("not a git repository"), "{error}");
     }
 }

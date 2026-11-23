@@ -10,13 +10,19 @@ export type Change = {
   original?: string;
   index: string;
   worktree: string;
+  /** Net line counts from `git diff --numstat`; absent unless asked for. */
+  stats?: { additions: number; deletions: number } | null;
 };
 
 /** The repository's current changes. A workspace without Git rejects with an
  *  error `isNotRepository` recognizes, so callers can tell it from a failure. */
-export async function readChanges(session: string): Promise<Change[]> {
+export async function readChanges(session: string, withStats = false): Promise<Change[]> {
   return workbenchRequest<Change[]>(
-    "git?" + new URLSearchParams({ session_id: session }),
+    "git?" +
+      new URLSearchParams({
+        session_id: session,
+        ...(withStats ? { stats: "true" } : {}),
+      }),
   );
 }
 export function isNotRepository(error: unknown): boolean {
