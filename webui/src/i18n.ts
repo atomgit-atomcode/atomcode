@@ -170,6 +170,12 @@ const zh = {
   'goal.recovery.evaluator': '工作进度已保留：等待重新评估 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
   'goal.recovery.running': '目标仍在进行：正在请求模型或评估目标，可随时停止。',
   'goal.recovery.paused': '目标已保留并暂停，请处理原因后发送消息继续。',
+  'goal.bar.running': '目标进行中',
+  'goal.bar.paused': '目标已暂停',
+  'goal.bar.pause': '暂停',
+  'goal.bar.remove': '删除',
+  'goal.bar.resumeHint': '发送消息可继续目标',
+  'goal.bar.actionFailed': '目标操作失败：{message}',
 
   // Header
   'header.menu': '菜单',
@@ -1031,6 +1037,12 @@ const en: Record<MsgKey, string> = {
   'goal.recovery.evaluator': 'Progress retained: waiting to reassess · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
   'goal.recovery.running': 'Goal in progress: requesting the model or evaluating the goal. You can stop at any time.',
   'goal.recovery.paused': 'Goal retained and paused. Resolve the cause, then send a message to continue.',
+  'goal.bar.running': 'Goal active',
+  'goal.bar.paused': 'Goal paused',
+  'goal.bar.pause': 'Pause',
+  'goal.bar.remove': 'Delete',
+  'goal.bar.resumeHint': 'Send a message to resume the goal',
+  'goal.bar.actionFailed': 'Goal action failed: {message}',
 
   'compat.oldBrowser': 'This browser engine is older than this page was built for, so parts of it may look wrong. Chrome / Edge {version} or newer is recommended.',
   'compat.dismiss': "Don't show again",

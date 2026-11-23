@@ -40,6 +40,7 @@ static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::
 
 #[derive(Serialize)]
 pub(crate) struct LiveGoalSnapshot {
+    control_id: String,
     active: bool,
     round: u32,
     elapsed_secs: u64,
@@ -789,14 +790,8 @@ pub(crate) enum LiveWireEvent {
     /// clients can distinguish completion, failure and user cancellation.
     #[serde(rename = "goal_changed")]
     GoalChanged {
-        active: bool,
-        round: u32,
-        elapsed_secs: u64,
-        condition: String,
-        terminal: Option<String>,
-        phase: String,
-        last_reason: Option<String>,
-        recovery: Option<atomcode_coding::GoalRecoveryProgress>,
+        #[serde(flatten)]
+        progress: LiveGoalSnapshot,
     },
     #[serde(rename = "loop_changed")]
     LoopChanged {
@@ -1264,31 +1259,8 @@ impl NativeLiveWireProjector {
                 LiveWireEvent::LoopChanged { progress }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
-                use atomcode_coding::{GoalPhase, GoalTerminal};
                 LiveWireEvent::GoalChanged {
-                    active: progress.active,
-                    round: progress.round,
-                    elapsed_secs: progress.elapsed_secs,
-                    condition: progress.condition,
-                    terminal: progress.terminal.map(|terminal| {
-                        match terminal {
-                            GoalTerminal::Met => "met",
-                            GoalTerminal::Stopped => "stopped",
-                            GoalTerminal::Failed => "failed",
-                            GoalTerminal::Cancelled => "cancelled",
-                        }
-                        .into()
-                    }),
-                    phase: match progress.phase {
-                        GoalPhase::Pursuing => "pursuing",
-                        GoalPhase::Paused => "paused",
-                        GoalPhase::PausedAtCap => "paused_at_cap",
-                        GoalPhase::Satisfied => "satisfied",
-                        GoalPhase::Ended => "ended",
-                    }
-                    .into(),
-                    last_reason: progress.last_reason,
-                    recovery: progress.recovery,
+                    progress: goal_snapshot(&progress),
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
@@ -1400,6 +1372,7 @@ impl NativeLiveWireProjector {
 fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
     use atomcode_coding::{GoalPhase, GoalTerminal};
     LiveGoalSnapshot {
+        control_id: progress.control_id.to_string(),
         active: progress.active,
         round: progress.round,
         elapsed_secs: progress.elapsed_secs,
@@ -3032,6 +3005,31 @@ pub(crate) async fn live_goal_stop(State(_state): State<AppState>) -> impl IntoR
     }
     let accepted = crate::native_live::dispatch(atomcode_coding::DriverCommand::StopGoal).is_ok();
     Json(serde_json::json!({"accepted": accepted}))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveGoalActionReq {
+    session_id: String,
+    control_id: String,
+    action: crate::live_hub::LiveGoalAction,
+}
+
+/// Controls the goal belonging to the displayed live session.
+pub(crate) async fn live_goal_action(Json(req): Json<LiveGoalActionReq>) -> impl IntoResponse {
+    use crate::live_hub::HubError;
+    let Ok(control_id) = uuid::Uuid::parse_str(&req.control_id) else {
+        return Json(serde_json::json!({ "accepted": false, "error": "Invalid goal ID" }));
+    };
+    let error =
+        match crate::native_live::control_goal(&req.session_id, control_id, req.action).await {
+            Ok(()) => return Json(serde_json::json!({ "accepted": true })),
+            Err(HubError::RuntimeRejected(message)) => message,
+            Err(HubError::StaleBinding | HubError::RuntimeGenerationChanged { .. }) => {
+                "The live session has changed".into()
+            }
+            Err(_) => "The live runtime is unavailable".into(),
+        };
+    Json(serde_json::json!({ "accepted": false, "error": error }))
 }
 
 /// POST /live/goal/arm — synchronize the mobile composer's pre-send Goal mode

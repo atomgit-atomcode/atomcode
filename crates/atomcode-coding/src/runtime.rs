@@ -2305,7 +2305,11 @@ impl CodingRuntimeHandle {
             }
             DriverCommand::PauseGoal => {
                 let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::PauseGoal { generation, done }
+                CodingRuntimeControl::PauseGoal {
+                    generation,
+                    control_id: None,
+                    done,
+                }
             }
             DriverCommand::Compact(focus) => CodingRuntimeControl::Compact { generation, focus },
             DriverCommand::SetMode(mode) => {
@@ -2381,7 +2385,11 @@ impl CodingRuntimeHandle {
             }
             DriverCommand::StopGoal => {
                 let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::StopGoal { generation, done }
+                CodingRuntimeControl::StopGoal {
+                    generation,
+                    control_id: None,
+                    done,
+                }
             }
             DriverCommand::StartLoop(prompt) => {
                 let (done, _result) = oneshot::channel();
@@ -2690,11 +2698,20 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn pause_goal(&self) -> Result<(), RuntimeError> {
-        let state = self.state.load(Ordering::Acquire);
+        self.pause_goal_at_generation(self.status().generation, None)
+            .await
+    }
+
+    pub async fn pause_goal_at_generation(
+        &self,
+        generation: u64,
+        control_id: Option<uuid::Uuid>,
+    ) -> Result<(), RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::PauseGoal {
-                generation: runtime_state_generation(state),
+                generation,
+                control_id,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -3638,11 +3655,20 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn stop_goal(&self) -> Result<(), RuntimeError> {
-        let state = self.state.load(Ordering::Acquire);
+        self.stop_goal_at_generation(self.status().generation, None)
+            .await
+    }
+
+    pub async fn stop_goal_at_generation(
+        &self,
+        generation: u64,
+        control_id: Option<uuid::Uuid>,
+    ) -> Result<(), RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::StopGoal {
-                generation: runtime_state_generation(state),
+                generation,
+                control_id,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -4194,6 +4220,7 @@ pub enum CodingRuntimeControl {
     },
     PauseGoal {
         generation: u64,
+        control_id: Option<uuid::Uuid>,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     Quality {
@@ -4462,6 +4489,7 @@ pub enum CodingRuntimeControl {
     },
     StopGoal {
         generation: u64,
+        control_id: Option<uuid::Uuid>,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     StartLoop {
@@ -7322,6 +7350,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::PauseGoal {
                         generation: request_generation,
+                        control_id,
                         done,
                     }) => {
                         if !native_protocol || request_generation != generation || !agent_available {
@@ -7332,6 +7361,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if control_id.is_some_and(|id| id != state.control_id || !state.active) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("The active goal has changed".into())));
+                            continue;
+                        }
                         state.pause("paused by user; continue the conversation to resume");
                         let _ = runtime_event_tx
                             .send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -9994,19 +10027,29 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
-                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
-                        if request_generation == generation {
-                            goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
-                        }
+                    Some(CodingRuntimeControl::StopGoal { generation: request_generation, control_id, done }) => {
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         }
+                        if control_id.is_some_and(|id| goal.as_ref().is_none_or(|goal| goal.control_id != id)) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("The goal has changed".into())));
+                            continue;
+                        }
+                        let clear_only = control_id.is_some() && goal.as_ref().is_some_and(|goal| !goal.active);
+                        if !clear_only {
+                            background_jobs.reset(generation);
+                            follow_up = None;
+                        }
+                        goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         if let Some(mut current) = goal.take() {
                             current.cancel.cancel();
                             current.finish(GoalTerminal::Cancelled, "cleared by user");
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
+                        }
+                        if clear_only {
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
+                            continue;
                         }
                         if let Some((turn_id, _, snapshot, stats)) =
                             held_turn.take_if(|_| !kernel_turn_open)
@@ -16742,6 +16785,92 @@ mod tests {
             Some(AgentCommand::PeerNote { from, text })
                 if from == "bg-7" && text == "the review came back"
         ));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn scoped_goal_controls_reject_stale_ids_and_clear_only_the_paused_goal() {
+        let (handle, mut kernel_commands, kernel_events, mut events, _wakeup, _active, _adapter) =
+            controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        let Some(CodingRuntimeEvent::GoalChanged(progress)) = events.recv().await else {
+            panic!("expected initial goal progress");
+        };
+        let generation = handle.status().generation;
+        let goal_id = Some(progress.control_id);
+        let stale_id = Some(uuid::Uuid::nil());
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        assert!(handle
+            .pause_goal_at_generation(generation, stale_id)
+            .await
+            .is_err());
+        assert!(handle
+            .stop_goal_at_generation(generation, stale_id)
+            .await
+            .is_err());
+        assert!(kernel_commands.try_recv().is_err());
+
+        handle
+            .pause_goal_at_generation(generation, goal_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                phase: GoalPhase::Paused,
+                ..
+            }))
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::user("finish the task")]),
+            })
+            .unwrap();
+        while !matches!(
+            events.recv().await.unwrap(),
+            CodingRuntimeEvent::TurnFinished(_)
+        ) {}
+
+        handle
+            .note("bg-7".into(), "independent result".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::PeerNote { .. })
+        ));
+        handle
+            .stop_goal_at_generation(generation, goal_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                phase: GoalPhase::Ended,
+                ..
+            }))
+        ));
+        assert!(handle
+            .stop_goal_at_generation(generation, goal_id)
+            .await
+            .is_err());
+        assert!(
+            kernel_commands.try_recv().is_err(),
+            "an unrelated turn was cancelled"
+        );
         handle.shutdown().await.unwrap();
     }
 

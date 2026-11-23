@@ -3935,6 +3935,7 @@ mod tests {
     fn goal_recovery_is_not_a_pause_in_the_host_projection() {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress};
         let mut goal = GoalProgress {
+            control_id: uuid::Uuid::nil(),
             active: true,
             terminal: None,
             phase: GoalPhase::Pursuing,
@@ -4029,6 +4030,7 @@ mod tests {
     #[test]
     fn goal_projection_keeps_cumulative_usage_and_unknown_checkpoint_history() {
         let mut progress = atomcode_coding::GoalProgress {
+            control_id: uuid::Uuid::nil(),
             active: true,
             terminal: None,
             phase: atomcode_coding::GoalPhase::Pursuing,
@@ -4067,6 +4069,7 @@ mod tests {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalTerminal};
         let ended = |terminal, last_reason| {
             goal_ending(&GoalProgress {
+                control_id: uuid::Uuid::nil(),
                 report: Default::default(),
                 evaluation_ready: false,
                 recovery: None,
