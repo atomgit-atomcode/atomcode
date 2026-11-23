@@ -25,6 +25,7 @@ use atomcode_coding::runtime::{RuntimePhase, UserInput};
 use atomcode_coding::{CodingAgentConfig, CodingRuntime};
 use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
+use atomcode_harness::session::SessionLog;
 use atomcode_host_api::{
     BackgroundSession, BackgroundState, BackgroundStats, HostCommand, HostConnection, HostControl,
     HostError, HostEvent, HostReply, LoggedFact, ProviderUnavailableReason,
@@ -164,25 +165,58 @@ struct Live {
     /// 交给它的那件事的第一行。日志里还没有它说的第一句话时(刚起、还没落盘),
     /// 面板那一列靠它认,而不是一串 id。
     task: Option<String>,
-    /// 上一次描述它时的样子,和那时日志有几条、它在什么状态。见 [`describe`]。
-    described: Arc<Mutex<Option<Described>>>,
+    projection: Mutex<LogProjection>,
 }
 
-/// 一个后台会话上一次被描述成的样子。
-///
-/// 列表在有会话在跑时每秒报一次,而描述一个会话要把它整份日志拷出来读 —— 一次审查
-/// 的日志带着工具输出,动辄几 MB,每秒乘以槽位数。日志条数和状态都没变,上次那份
-/// 就还是对的,只有在跑的那个用时要量到此刻。
-#[derive(Clone)]
-struct Described {
-    len: usize,
-    state: BackgroundState,
-    /// 在等的那个请求:换了一个问题而日志一条没多(不是每种问法都先记一条),
-    /// 那一行要说的话也换了。
-    pending: Option<u64>,
-    session: BackgroundSession,
-    /// 日志第一条的时刻:在跑的用时从它量起。
+/// An offset in one live log. A replacement App can rebuild the same
+/// session id with an equal or longer history, so length alone is insufficient.
+#[derive(Default)]
+struct LogCursor {
+    log: Weak<SessionLog>,
+    seen: usize,
+}
+
+impl LogCursor {
+    fn read_new<R>(
+        &mut self,
+        log: &Arc<SessionLog>,
+        read: impl FnOnce(bool, &[LoggedEvent]) -> R,
+    ) -> R {
+        log.read_events(|events| {
+            let reset = self.log.as_ptr() != Arc::as_ptr(log) || self.seen > events.len();
+            let start = if reset {
+                self.log = Arc::downgrade(log);
+                0
+            } else {
+                self.seen
+            };
+            let result = read(reset, &events[start..]);
+            self.seen = events.len();
+            result
+        })
+    }
+}
+
+#[derive(Default)]
+struct LogProjection {
+    cursor: LogCursor,
+    summary: LogSummary,
+}
+
+#[derive(Default)]
+struct LogSummary {
+    title: Option<String>,
+    first_words: Option<String>,
+    asked: Option<String>,
+    said: Option<String>,
     first_at: Option<u64>,
+    last_at: u64,
+    steps: u32,
+    tools: u32,
+    completion: u32,
+    sent: u64,
+    sent_cached: u64,
+    usage: Option<atomcode_kernel::stream::TokenUsage>,
 }
 
 /// 一个替别的对话干活的后台会话,在盘上怎么记。
@@ -524,7 +558,7 @@ fn attach(
             mark: Arc::new(Mutex::new(Mark::Own)),
             name: None,
             task: None,
-            described: Arc::new(Mutex::new(None)),
+            projection: Mutex::new(LogProjection::default()),
         },
         Pumps {
             id,
@@ -578,41 +612,17 @@ fn in_turn(live: &Live) -> bool {
     )
 }
 
-/// 这个会话的日志,从它自己的 App 里读。
-///
-/// 连每条事实的提交时刻一起带回来(`LoggedEvent::at`):面板那一行摘要只看事件本身,
-/// 但「这次活干多久」要看首尾两个时刻 —— 而那是**这次活**的跨度,不是这个槽位开了
-/// 多久(它可能先空着,也可能中途在等一个回答)。
-fn log_of(live: &Live) -> Vec<LoggedEvent> {
-    log_of_control(&live.control)
-}
-
-/// 它在等的那个请求的 id。
-fn pending_id(live: &Live) -> Option<u64> {
-    match live.track.lock().expect("track poisoned").pending.as_ref() {
-        Some(AgentEvent::Request { id, .. }) => Some(*id),
-        _ => None,
-    }
-}
-
-/// 这个会话的日志有几条 —— 不拷日志。
-fn log_len(live: &Live) -> usize {
-    let session = live.control.session_id();
-    live.control
-        .front_end()
-        .app()
-        .and_then(|app| Feed::find(&app, &session))
-        .map_or(0, |agent| agent.session().len())
-}
-
-fn log_of_control(control: &RuntimeControl) -> Vec<LoggedEvent> {
+fn session_log(control: &RuntimeControl) -> Option<Arc<SessionLog>> {
     let session = control.session_id();
-    control
-        .front_end()
-        .app()
-        .and_then(|app| Feed::find(&app, &session))
-        .map(|agent| agent.session().events())
-        .unwrap_or_default()
+    let app = control.front_end().app()?;
+    Feed::find(&app, &session).map(|agent| agent.session())
+}
+
+fn read_log<R>(control: &RuntimeControl, read: impl FnOnce(&[LoggedEvent]) -> R) -> R {
+    match session_log(control) {
+        Some(log) => log.read_events(read),
+        None => read(&[]),
+    }
 }
 
 fn review_task(request: Option<&str>, task: &str) -> String {
@@ -708,118 +718,89 @@ fn one_line(text: &str) -> Option<String> {
 ///
 /// `running_at`:还在跑时的此刻(unix 毫秒)。那时用时量到此刻,而不是最后一条事实 ——
 /// 模型安静地想一分钟,面板上的用时不该停在一分钟前。
-fn stats_of(log: &[LoggedEvent], running_at: Option<u64>) -> Option<BackgroundStats> {
-    let mut steps = 0u32;
-    let mut tools = 0u32;
-    let mut completion = 0u32;
-    let mut sent = 0u64;
-    let mut sent_cached = 0u64;
-    let mut last: Option<atomcode_kernel::stream::TokenUsage> = None;
-    for logged in log {
-        match &logged.event {
-            SessionEvent::StepEnd { tool_calls, .. } => {
-                steps += 1;
-                tools = tools.saturating_add(*tool_calls);
+impl LogSummary {
+    fn absorb(&mut self, events: &[LoggedEvent]) {
+        for logged in events {
+            self.first_at.get_or_insert(logged.at);
+            self.last_at = logged.at;
+            match &logged.event {
+                SessionEvent::StepEnd { tool_calls, .. } => {
+                    self.steps += 1;
+                    self.tools = self.tools.saturating_add(*tool_calls);
+                }
+                SessionEvent::Usage { usage, .. } => {
+                    self.completion = self.completion.saturating_add(usage.completion);
+                    self.sent += u64::from(usage.prompt);
+                    self.sent_cached += u64::from(usage.cached);
+                    self.usage = Some(*usage);
+                }
+                SessionEvent::Titled { title, .. } if !title.trim().is_empty() => {
+                    self.title = Some(title.clone());
+                }
+                SessionEvent::UserMessage { text, .. } if self.first_words.is_none() => {
+                    self.first_words = one_line(text);
+                }
+                SessionEvent::Asked { question, .. } => {
+                    if let Some(words) = one_line(&question.prompt) {
+                        self.asked = Some(words);
+                    }
+                }
+                SessionEvent::AssistantMessage { text, .. }
+                | SessionEvent::PartialReply { text, .. } => {
+                    if let Some(words) = one_line(text) {
+                        self.said = Some(words);
+                    }
+                }
+                _ => {}
             }
-            SessionEvent::Usage { usage, .. } => {
-                completion = completion.saturating_add(usage.completion);
-                sent += u64::from(usage.prompt);
-                sent_cached += u64::from(usage.cached);
-                last = Some(*usage);
-            }
-            _ => {}
         }
     }
-    let elapsed_ms = match (log.first(), running_at.or(log.last().map(|last| last.at))) {
-        (Some(first), Some(end)) => end.saturating_sub(first.at),
-        _ => 0,
-    };
-    // 还在跑、第一个回答还没来(一次审查的第一个请求就可能要几十秒):没有可说的
-    // token,但用时是有的 —— 面板那一行不该在这几十秒里什么都不说。
-    let usage = match (last, running_at) {
-        (Some(usage), _) => usage,
-        (None, Some(_)) if elapsed_ms > 0 => atomcode_kernel::stream::TokenUsage::default(),
-        (None, _) => return None,
-    };
-    Some(BackgroundStats {
-        steps,
-        tools,
-        prompt: usage.prompt,
-        cached: usage.cached,
-        completion,
-        elapsed_ms,
-        sent,
-        sent_cached,
-    })
+
+    fn stats(&self, running_at: Option<u64>) -> Option<BackgroundStats> {
+        let elapsed_ms = self.first_at.map_or(0, |first| {
+            running_at.unwrap_or(self.last_at).saturating_sub(first)
+        });
+        let usage = match (self.usage, running_at) {
+            (Some(usage), _) => usage,
+            (None, Some(_)) if elapsed_ms > 0 => atomcode_kernel::stream::TokenUsage::default(),
+            (None, _) => return None,
+        };
+        Some(BackgroundStats {
+            steps: self.steps,
+            tools: self.tools,
+            prompt: usage.prompt,
+            cached: usage.cached,
+            completion: self.completion,
+            elapsed_ms,
+            sent: self.sent,
+            sent_cached: self.sent_cached,
+        })
+    }
+}
+
+impl LogProjection {
+    fn update(&mut self, log: Option<Arc<SessionLog>>) {
+        let Some(log) = log else {
+            *self = Self::default();
+            return;
+        };
+        self.cursor.read_new(&log, |reset, events| {
+            if reset {
+                self.summary = LogSummary::default();
+            }
+            self.summary.absorb(events);
+        });
+    }
 }
 
 fn describe(live: &Live) -> BackgroundSession {
     let state = state_of(live);
-    let len = log_len(live);
-    let running = matches!(state, BackgroundState::Running | BackgroundState::Waiting);
-    let pending = pending_id(live);
-    let cached = live.described.lock().expect("described poisoned").clone();
-    if let Some(cached) =
-        cached.filter(|c| c.len == len && c.state == state && c.pending == pending)
-    {
-        let mut session = cached.session;
-        if let (true, Some(first)) = (running, cached.first_at) {
-            let elapsed_ms = now_ms().saturating_sub(first);
-            match session.stats.as_mut() {
-                Some(stats) => stats.elapsed_ms = elapsed_ms,
-                None if elapsed_ms > 0 => {
-                    session.stats = Some(BackgroundStats {
-                        elapsed_ms,
-                        ..BackgroundStats::default()
-                    })
-                }
-                None => {}
-            }
-        }
-        return session;
-    }
-    let log = log_of(live);
-    let session = describe_from_log(live, state, &log);
-    *live.described.lock().expect("described poisoned") = Some(Described {
-        // What was read, not what `len` said a moment ago: a fact that landed in
-        // between is in this description, and the next tick must not skip it.
-        len: log.len(),
-        state,
-        pending,
-        session: session.clone(),
-        first_at: log.first().map(|first| first.at),
-    });
-    session
-}
-
-fn describe_from_log(
-    live: &Live,
-    state: BackgroundState,
-    log: &[LoggedEvent],
-) -> BackgroundSession {
-    let title = log.iter().rev().find_map(|logged| match &logged.event {
-        SessionEvent::Titled { title, .. } if !title.trim().is_empty() => Some(title.clone()),
-        _ => None,
-    });
-    let asked = || {
-        log.iter().rev().find_map(|logged| match &logged.event {
-            SessionEvent::Asked { question, .. } => one_line(&question.prompt),
-            _ => None,
-        })
-    };
-    let said = || {
-        log.iter().rev().find_map(|logged| match &logged.event {
-            SessionEvent::AssistantMessage { text, .. }
-            | SessionEvent::PartialReply { text, .. } => one_line(text),
-            _ => None,
-        })
-    };
-    let first_words = || {
-        log.iter().find_map(|logged| match &logged.event {
-            SessionEvent::UserMessage { text, .. } => one_line(text),
-            _ => None,
-        })
-    };
+    let mut projection = live
+        .projection
+        .lock()
+        .expect("background projection poisoned");
+    projection.update(session_log(&live.control));
+    let summary = &projection.summary;
     // 在等的那个请求本身说了什么:不是每种问法都先在日志里记一条 `Asked`。
     let waiting_on = || {
         let track = live.track.lock().expect("track poisoned");
@@ -835,7 +816,11 @@ fn describe_from_log(
         })
     };
     let last = match state {
-        BackgroundState::Waiting => asked().or_else(waiting_on).or_else(said),
+        BackgroundState::Waiting => summary
+            .asked
+            .clone()
+            .or_else(waiting_on)
+            .or_else(|| summary.said.clone()),
         BackgroundState::Failed => live
             .track
             .lock()
@@ -843,8 +828,8 @@ fn describe_from_log(
             .error
             .clone()
             .and_then(|error| one_line(&error))
-            .or_else(said),
-        _ => said(),
+            .or_else(|| summary.said.clone()),
+        _ => summary.said.clone(),
     };
     BackgroundSession {
         session: live.control.session_id(),
@@ -854,14 +839,13 @@ fn describe_from_log(
         title: live
             .name
             .clone()
-            .or(title)
-            .or_else(first_words)
+            .or_else(|| summary.title.clone())
+            .or_else(|| summary.first_words.clone())
             .or_else(|| live.task.clone()),
         state,
         created_at: live.since,
         last,
-        stats: stats_of(
-            &log,
+        stats: summary.stats(
             matches!(state, BackgroundState::Running | BackgroundState::Waiting).then(now_ms),
         ),
         // 替谁干活:等于它自己(`/bg` 把那段对话挪过来的)就是没有别的读者。
@@ -897,9 +881,9 @@ fn take_up(mark: &Mutex<Mark>, session: &str) {
 }
 
 /// The result of `session` is in `home`'s log: `home` took the note in.
-fn holds_note_from(home: &RuntimeControl, session: &str) -> bool {
+fn holds_note_from(events: &[LoggedEvent], session: &str) -> bool {
     use atomcode_kernel::session::InjectionOrigin;
-    log_of_control(home).iter().any(|logged| {
+    events.iter().rev().any(|logged| {
         matches!(
             &logged.event,
             SessionEvent::Injected {
@@ -941,9 +925,11 @@ const SETTLE_TRIES: u32 = 1_200;
 
 /// 一个会话里有没有人说过话。没有的话它不值得占一个槽位。
 fn has_conversation(live: &Live) -> bool {
-    log_of(live)
-        .iter()
-        .any(|logged| matches!(logged.event, SessionEvent::UserMessage { .. }))
+    read_log(&live.control, |events| {
+        events
+            .iter()
+            .any(|logged| matches!(logged.event, SessionEvent::UserMessage { .. }))
+    })
 }
 
 async fn stop(live: Live) {
@@ -1012,7 +998,7 @@ impl Background {
     /// 指令不跟着投:核实与否由那段对话自己定(`Msg::BackgroundResult`)。
     fn deliver_home(&self, id: u64, reason: &StopReason) {
         use atomcode_i18n::screen::{t as tr, Msg as SMsg};
-        let (origin, sender, frame, mark) = {
+        let (origin, sender, log, mark) = {
             let state = self.state.lock().expect("background poisoned");
             let Some(live) = state.slots.iter().find(|slot| slot.id == id) else {
                 return;
@@ -1020,21 +1006,24 @@ impl Background {
             if live.origin.is_empty() || live.origin == live.control.session_id() {
                 return;
             }
-            let log = log_of(live);
-            let answer = completion_report(&log, reason);
-            let title = name_of(&log);
-            let frame = tr(SMsg::BackgroundResult {
-                title: &title,
-                answer: &answer,
-            })
-            .into_owned();
             (
                 live.origin.clone(),
                 live.control.session_id(),
-                frame,
+                session_log(&live.control),
                 live.mark.clone(),
             )
         };
+        let summarize =
+            |events: &[LoggedEvent]| (name_of(events), completion_report(events, reason));
+        let (title, answer) = match log {
+            Some(log) => log.read_events(summarize),
+            None => summarize(&[]),
+        };
+        let frame = tr(SMsg::BackgroundResult {
+            title: &title,
+            answer: &answer,
+        })
+        .into_owned();
         // 发起它的那个会话可能已经被丢了、或被换掉了:那就不投 —— 面板里还有它。
         let handle = {
             let state = self.state.lock().expect("background poisoned");
@@ -1068,8 +1057,12 @@ impl Background {
                         // 排上队不等于收下了:那段对话正忙时这是一次 steer。等它真进了
                         // 那段对话的日志再标。等不到(退出了、那段对话没了)就不标 ——
                         // 退出前 `shutdown_all` 还会再看一眼。
+                        let mut cursor = LogCursor::default();
                         for _ in 0..SETTLE_TRIES {
-                            if holds_note_from(&home, &sender) {
+                            let received = session_log(&home).is_some_and(|log| {
+                                cursor.read_new(&log, |_, events| holds_note_from(events, &sender))
+                            });
+                            if received {
                                 came_home_now(&mark, &sender);
                                 return;
                             }
@@ -1123,7 +1116,7 @@ impl Background {
                 .collect()
         };
         for (mark, session, home) in pending {
-            if holds_note_from(&home, &session) {
+            if read_log(&home, |events| holds_note_from(events, &session)) {
                 came_home_now(&mark, &session);
             }
         }
@@ -1741,11 +1734,7 @@ impl Background {
         }
         // Only the input of the turn that delegated this job is its request.
         // An automatic turn must not borrow an unrelated earlier user message.
-        let request = {
-            let state = self.state.lock().expect("background poisoned");
-            let log = log_of(&state.front);
-            current_request(&log)
-        };
+        let request = read_log(&self.front_control(), current_request);
         // The parent's request is context, not another assignment. In
         // particular, its authorized edits/commit/PR remain the parent's job.
         let text = review_task(request.as_deref(), &text);
@@ -1919,7 +1908,7 @@ impl Background {
             id,
             kind,
             payload,
-            facts: tail_of(&log_of(live)),
+            facts: read_log(&live.control, tail_of),
         })
     }
 
@@ -2325,6 +2314,66 @@ mod tests {
             track.saw(&ended(reason.clone()));
             assert_eq!(track.ended, Some(BackgroundState::Failed), "{reason:?}");
         }
+    }
+
+    fn stats_of(log: &[LoggedEvent], running_at: Option<u64>) -> Option<BackgroundStats> {
+        let mut summary = LogSummary::default();
+        summary.absorb(log);
+        summary.stats(running_at)
+    }
+
+    #[test]
+    fn background_projection_reads_new_facts_once_and_resets_on_log_replacement() {
+        let usage = |prompt, cached| SessionEvent::Usage {
+            turn: 1,
+            round: 1,
+            usage: atomcode_kernel::stream::TokenUsage {
+                prompt,
+                completion: 10,
+                cached,
+            },
+        };
+        let log = Arc::new(SessionLog::new("same-session"));
+        log.append(SessionEvent::Titled {
+            turn: 1,
+            title: "Previous title".into(),
+            user_set: false,
+        });
+        log.append(usage(100, 0));
+        let mut projection = LogProjection::default();
+        projection.update(Some(log.clone()));
+        assert_eq!(projection.summary.stats(None).unwrap().sent, 100);
+
+        log.append(SessionEvent::PartialReply {
+            turn: 1,
+            round: 1,
+            text: "\n  Last reply  \nMore details".into(),
+            reasoning: String::new(),
+        });
+        log.append(usage(250, 100));
+        projection.update(Some(log.clone()));
+        projection.update(Some(log.clone()));
+
+        let stats = projection.summary.stats(None).unwrap();
+        assert_eq!(
+            (stats.sent, stats.sent_cached, stats.completion),
+            (350, 100, 20)
+        );
+        assert_eq!(Some(stats), stats_of(&log.events(), None));
+        assert_eq!(projection.summary.said.as_deref(), Some("Last reply"));
+        assert_eq!(projection.summary.title.as_deref(), Some("Previous title"));
+
+        let replacement = Arc::new(SessionLog::new("same-session"));
+        for _ in 0..log.len() {
+            replacement.append(usage(10, 0));
+        }
+        projection.update(Some(replacement.clone()));
+        assert_eq!(
+            projection.summary.stats(None),
+            stats_of(&replacement.events(), None)
+        );
+        assert!(projection.summary.said.is_none());
+        assert!(projection.summary.title.is_none());
     }
 
     /// 后台会话的花费按每次请求累加(`sent` / `sent_cached`),`prompt` / `cached`
