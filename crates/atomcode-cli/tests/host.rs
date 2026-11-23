@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use atomcode::host::{connect, connect_screen, HostConfig};
+use atomcode::host::{connect, connect_screen, ConfigFingerprintChange, HostConfig};
 use atomcode_coding::front_end::FrontEnd;
 use atomcode_coding::{
     CodingAgentConfig, CodingProviderFactory, CodingRuntime, CodingRuntimeStart, PrepareOptions,
@@ -786,6 +786,45 @@ async fn resume_distinguishes_an_empty_session_from_a_missing_one() {
 }
 
 #[tokio::test]
+async fn an_empty_project_listing_explains_other_history_and_local_scan_issues() {
+    use atomcode_capabilities::session::SessionManager;
+    let env = env();
+    let mut connection = connected(&env).await;
+    connection
+        .commands
+        .send(message("stored elsewhere"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let project = tempfile::tempdir().unwrap();
+    let here = SessionManager::for_project(project.path(), &dirs);
+    let elsewhere = SessionManager::for_project(env.project.path(), &dirs);
+    std::fs::write(elsewhere.root().join("foreign.index"), b"{").unwrap();
+    std::fs::create_dir_all(here.root()).unwrap();
+    let bad_index = here.root().join("broken.index");
+    for local_issue in [false, true] {
+        if local_issue {
+            std::fs::write(&bad_index, b"{").unwrap();
+        }
+        let Ok(HostReply::Sessions { sessions, hints }) = connection
+            .control
+            .call(HostCommand::ListSessions {
+                working_dir: Some(project.path().display().to_string()),
+            })
+            .await
+        else {
+            panic!("expected a listing")
+        };
+        assert!(sessions.is_empty());
+        assert!(hints.other_projects_have_history);
+        assert_eq!(
+            hints.scan_issue_path,
+            local_issue.then(|| bad_index.display().to_string())
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_stored_session_is_listed_and_resumed_with_its_history() {
     let env = env();
     let mut connection = connected(&env).await;
@@ -796,7 +835,7 @@ async fn a_stored_session_is_listed_and_resumed_with_its_history() {
         .unwrap();
     through_turn(&mut connection).await;
 
-    let Ok(HostReply::Sessions { sessions }) = connection
+    let Ok(HostReply::Sessions { sessions, .. }) = connection
         .control
         .call(HostCommand::ListSessions { working_dir: None })
         .await
@@ -1038,7 +1077,7 @@ async fn a_session_a_newer_build_wrote_is_listed_and_refused() {
     })
     .unwrap();
 
-    let Ok(HostReply::Sessions { sessions }) = connection
+    let Ok(HostReply::Sessions { sessions, .. }) = connection
         .control
         .call(HostCommand::ListSessions { working_dir: None })
         .await
@@ -1112,35 +1151,47 @@ async fn reasoning_changes_reach_the_config_owner_and_report_write_failures() {
         fail: bool,
         efforts: Mutex<Vec<Option<ReasoningEffort>>>,
         thinking: Mutex<Vec<bool>>,
+        revision: AtomicUsize,
+    }
+    impl Source {
+        fn save(&self) -> Result<Option<ConfigFingerprintChange>, String> {
+            if self.fail {
+                return Err("WRITE-FAILED".into());
+            }
+            let before = self.revision.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(ConfigFingerprintChange {
+                before: before.to_string(),
+                after: (before + 1).to_string(),
+            }))
+        }
     }
     impl HostConfig for Source {
         fn for_model(&self, _: &str) -> Result<CodingAgentConfig, String> {
             Err("unused".into())
         }
         fn current(&self) -> Result<CodingAgentConfig, String> {
-            Err("unused".into())
+            Err("FULL-RELOAD".into())
+        }
+        fn fingerprint(&self) -> Option<String> {
+            Some(self.revision.load(Ordering::Relaxed).to_string())
         }
         fn set_reasoning_effort(
             &self,
             selection: &str,
             effort: Option<ReasoningEffort>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<ConfigFingerprintChange>, String> {
             assert_eq!(selection, "scripted");
             self.efforts.lock().unwrap().push(effort);
-            if self.fail {
-                Err("WRITE-FAILED".into())
-            } else {
-                Ok(())
-            }
+            self.save()
         }
-        fn set_thinking_enabled(&self, selection: &str, on: bool) -> Result<(), String> {
+        fn set_thinking_enabled(
+            &self,
+            selection: &str,
+            on: bool,
+        ) -> Result<Option<ConfigFingerprintChange>, String> {
             assert_eq!(selection, "scripted");
             self.thinking.lock().unwrap().push(on);
-            if self.fail {
-                Err("WRITE-FAILED".into())
-            } else {
-                Ok(())
-            }
+            self.save()
         }
     }
     for fail in [false, true] {
@@ -1149,6 +1200,7 @@ async fn reasoning_changes_reach_the_config_owner_and_report_write_failures() {
             fail,
             efforts: Mutex::new(Vec::new()),
             thinking: Mutex::new(Vec::new()),
+            revision: AtomicUsize::new(0),
         });
         let (mut connection, _) = started(
             &env,
@@ -1192,9 +1244,63 @@ async fn reasoning_changes_reach_the_config_owner_and_report_write_failures() {
             [Some(ReasoningEffort::High), None]
         );
         assert_eq!(*source.thinking.lock().unwrap(), [true, false]);
+        assert_eq!(
+            connection
+                .control
+                .call(HostCommand::Reload {
+                    session: session.clone()
+                })
+                .await,
+            Ok(HostReply::Done),
+            "our own settings writes must not cause a full reload"
+        );
+        source.revision.fetch_add(1, Ordering::Relaxed);
+        connection
+            .control
+            .call(HostCommand::SetThinking {
+                session: session.clone(),
+                on: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            connection
+                .control
+                .call(HostCommand::Reload { session })
+                .await,
+            Err(HostError::Failed {
+                message: "FULL-RELOAD".into()
+            }),
+            "saving a reasoning preference must not hide a preceding external change"
+        );
         connection.commands.send(message("still works")).unwrap();
         through_turn(&mut connection).await;
     }
+}
+
+#[tokio::test]
+async fn cost_follows_the_live_session_after_changing_directory() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let other = tempfile::tempdir().unwrap();
+    let changed = connection
+        .control
+        .call(HostCommand::ChangeDirectory {
+            session: connection.session.clone(),
+            directory: other.path().display().to_string(),
+        })
+        .await;
+    let Ok(HostReply::SessionChanged { session }) = changed else {
+        panic!("expected a new session in the other project: {changed:?}");
+    };
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection
+        .commands
+        .send(message("after changing project"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let cost = connection.control.call(HostCommand::Cost { session }).await;
+    assert!(matches!(cost, Ok(HostReply::Cost { .. })), "{cost:?}");
 }
 
 #[tokio::test]
@@ -3216,7 +3322,7 @@ async fn a_stored_session_is_deleted_but_never_the_live_one() {
         Ok(HostReply::Done),
         "the one that is only on disk goes"
     );
-    let Ok(HostReply::Sessions { sessions }) = connection
+    let Ok(HostReply::Sessions { sessions, .. }) = connection
         .control
         .call(HostCommand::ListSessions { working_dir: None })
         .await

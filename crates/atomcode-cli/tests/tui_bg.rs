@@ -1128,6 +1128,51 @@ async fn failed_running_resume_leaves_the_foreground_and_slots_unchanged() {
     rig.quit().await;
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn global_resume_rejects_a_duplicate_even_if_one_session_is_retained() {
+    use atomcode_capabilities::session::SessionManager;
+    let rig = Rig::new().await;
+    let retained = rig.client.root();
+    rig.term.type_line("slow task");
+    rig.until("turn started", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/bg");
+    rig.until("foreground changed", |rig| rig.client.root() != retained)
+        .await;
+    rig.release();
+    rig.until_background("retained turn finished", |slots| {
+        slots
+            .iter()
+            .any(|s| s.session == retained && s.state == BackgroundState::Done)
+    })
+    .await;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let original = SessionManager::for_project(rig.project.path(), &dirs);
+    let other = tempfile::tempdir().unwrap();
+    let duplicate = SessionManager::for_project(other.path(), &dirs);
+    std::fs::create_dir_all(duplicate.root()).unwrap();
+    for ext in ["events", "index"] {
+        let name = format!("{retained}.{ext}");
+        std::fs::copy(original.root().join(&name), duplicate.root().join(&name)).unwrap();
+    }
+    let live = rig.client.root();
+    let result = rig
+        .control()
+        .call(HostCommand::ResumeAcrossProjects {
+            session: live.clone(),
+            target: retained,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(HostError::Failed { message }) if message.contains("multiple project stores"))
+    );
+    assert_eq!(rig.client.root(), live);
+    rig.quit().await;
+}
+
 /// Even a stale/manual target must be rejected before a busy foreign session
 /// is forked. Its recorded working directory deliberately matches this project:
 /// storage identity, rather than that display field, governs the lease.
@@ -1628,7 +1673,7 @@ async fn listed(rig: &Rig) -> Vec<String> {
         .call(HostCommand::ListSessions { working_dir: None })
         .await
     {
-        Ok(HostReply::Sessions { sessions }) => sessions.into_iter().map(|s| s.id).collect(),
+        Ok(HostReply::Sessions { sessions, .. }) => sessions.into_iter().map(|s| s.id).collect(),
         other => panic!("the session list: {other:?}"),
     }
 }
@@ -1903,9 +1948,7 @@ model = "scripted"
 
 /// A stored conversation belonging to another project: its own working
 /// directory and its own storage bucket, leased while it is written and
-/// released before the caller navigates to it. Shared WebUI/App navigation is
-/// the only path allowed to prepare such a target — an ordinary `/resume` stays
-/// project-scoped (`2026-10-27-resume-project-scope.md`).
+/// released before the caller navigates to it.
 async fn a_foreign_project_session() -> (tempfile::TempDir, &'static str) {
     use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
     use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
@@ -1950,6 +1993,64 @@ async fn a_foreign_project_session() -> (tempfile::TempDir, &'static str) {
         .unwrap();
     drop(lease);
     (project, target)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_tab_can_browse_an_empty_global_catalog_and_escape() {
+    use atomcode_i18n::screen::{t, Msg};
+    let rig = Rig::new().await;
+    let original = rig.client.root();
+    rig.term.type_line("/resume");
+    rig.until_screen(&t(Msg::ResumeNoOthers)).await;
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen(&t(Msg::ResumeNoneAll)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.term.press(KeyPress::plain(Key::Esc));
+    rig.until_screen_lacks(&t(Msg::ResumeNoneAll)).await;
+    assert_eq!(rig.client.root(), original);
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_tab_browses_other_projects_before_enter_switches_the_runtime() {
+    let rig = Rig::new().await;
+    let (project, target) = a_foreign_project_session().await;
+    let live = rig.client.root();
+    rig.term.type_line("/resume");
+    rig.until_screen("Tab").await;
+    assert!(!rig.term.text().contains(target));
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen(target).await;
+    assert_eq!(rig.client.root(), live);
+
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen_lacks(target).await;
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen(target).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("the global selection is foreground", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    rig.until_screen("FOREIGN PROJECT HISTORY").await;
+    let HostReply::Context { working_dir, .. } = rig
+        .control()
+        .call(HostCommand::Context {
+            session: target.into(),
+            prompt: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected context")
+    };
+    assert_eq!(
+        std::fs::canonicalize(working_dir).unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+    rig.quit().await;
 }
 
 /// Navigating back is the same navigation in reverse: the destination project

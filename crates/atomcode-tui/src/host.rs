@@ -4857,19 +4857,14 @@ impl Host {
     /// at the row that moved up — which is why arming is cleared here too.
     pub fn forget_resume(&self, id: &str) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        let left: Vec<crate::resume::Session> = m
-            .resume
-            .sessions()
-            .iter()
-            .filter(|session| session.id != id)
-            .cloned()
-            .collect();
-        if left.len() == m.resume.sessions().len() {
-            return false;
-        }
-        m.resume = crate::resume::ResumeView::new(left);
+        m.resume.remove(id);
         m.resume_preview = None;
+        let rows = m.resume_panel.as_ref().map_or(0, |p| m.resume.rows(p));
         if let Some(panel) = m.resume_panel.as_mut() {
+            if let Some(other) = panel.other_scope.as_mut() {
+                other.remove(id);
+            }
+            panel.cursor = panel.cursor.min(rows.saturating_sub(1));
             panel.armed = None;
         }
         true
@@ -4890,6 +4885,25 @@ impl Host {
         let step = crate::resume::key(&view, panel, press);
         let changed = *panel != before;
         match step {
+            crate::resume::Step::ToggleScope => {
+                let mut panel = m.resume_panel.take().expect("open picker");
+                let needs_load = !panel.all_projects && panel.other_scope.is_none();
+                let old =
+                    std::mem::replace(&mut m.resume, panel.other_scope.take().unwrap_or_default());
+                let cacheable = panel.loading.take().is_none() && panel.load_error.take().is_none();
+                panel.other_scope = cacheable.then_some(old);
+                panel.all_projects = !panel.all_projects;
+                panel.cursor = 0;
+                let request = needs_load.then(|| {
+                    static NEXT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                });
+                panel.loading = request;
+                m.resume_panel = Some(panel);
+                m.resume_preview = None;
+                (true, request.map(crate::resume::Step::LoadAll))
+            }
             crate::resume::Step::Stay => (changed, None),
             crate::resume::Step::Close => {
                 m.resume_panel = None;
@@ -4898,6 +4912,28 @@ impl Host {
             }
             step => (true, Some(step)),
         }
+    }
+
+    pub fn finish_resume_list(
+        &self,
+        request: u64,
+        result: Result<crate::resume::ResumeView, String>,
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.resume_panel.as_mut() else {
+            return false;
+        };
+        if panel.loading != Some(request) {
+            return false;
+        }
+        panel.loading = None;
+        match result {
+            Ok(view) => {
+                m.resume = view;
+            }
+            Err(error) => panel.load_error = Some(error),
+        }
+        true
     }
 
     /// The wheel over the resume panel walks its list.
@@ -8745,6 +8781,42 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    #[test]
+    fn resume_scope_load_retries_and_discards_late_results() {
+        use crate::resume::{Panel, ResumeView, Session, Step};
+        let h = host();
+        h.moment.write().unwrap().resume_panel = Some(Panel::new());
+        let tab = || {
+            h.resume_key(crate::surface::KeyPress::plain(crate::surface::Key::Tab))
+                .1
+        };
+        let Some(Step::LoadAll(first)) = tab() else {
+            panic!("first request")
+        };
+        assert_eq!(tab(), None);
+        let Some(Step::LoadAll(second)) = tab() else {
+            panic!("second request")
+        };
+        assert!(!h.finish_resume_list(first, Ok(ResumeView::default())));
+        assert!(h.finish_resume_list(second, Err("read failed".into())));
+        assert_eq!(tab(), None);
+        let Some(Step::LoadAll(third)) = tab() else {
+            panic!("retry")
+        };
+        assert!(h.finish_resume_list(
+            third,
+            Ok(ResumeView::new(vec![Session {
+                id: "remote".into(),
+                ..Default::default()
+            }]))
+        ));
+        assert_eq!(h.resume_selected().as_deref(), Some("remote"));
+        assert_eq!(tab(), None);
+        assert_eq!(h.resume_selected(), None);
+        assert_eq!(tab(), None);
+        assert_eq!(h.resume_selected().as_deref(), Some("remote"));
     }
 
     #[test]
@@ -16141,6 +16213,29 @@ mod tests {
             .contains("litellm.original-diagnostic"));
         h.toggle_block(id, kind);
         assert_eq!(h.compose(size).rows().join("\n"), folded);
+    }
+
+    #[test]
+    fn a_system_proxy_failure_shows_recovery_before_expanding_details() {
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::ProviderError,
+            error: Some("could not refresh system proxy settings: ProxyServer: settings are incomplete or changing (OS error 2).".into()),
+        });
+        let size = (160, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(folded.contains("/proxy no_proxy"), "{folded}");
+        assert!(!folded.contains("OS error 2"), "{folded}");
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "provider_diagnostic")
+            .expect("the proxy failure has expandable diagnostics");
+        h.toggle_block(id, kind);
+        assert!(h.compose(size).rows().join("\n").contains("OS error 2"));
     }
 
     #[test]

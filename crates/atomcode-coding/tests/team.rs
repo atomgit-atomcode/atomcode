@@ -2888,3 +2888,244 @@ async fn member_budget_closes_once_and_a_failed_followup_does_not_report_old_tex
 
 #[path = "team_cost/replay.rs"]
 mod cost_replay;
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_shell_less_member_hands_unverified_edits_to_the_lead_in_its_report() {
+    let write = r#"{ calls = [{ name = "write_file", args = {file_path = "main.rs", content = "fn main() {}" } }] }"#;
+    let tell = r#"{ calls = [{name = "tell_parent", args = {text = "status"} }] }"#;
+    for (tag, script, budget, prompt, expected_notes, expected_reports) in [
+        ("automatic", write.to_owned(), 0, "Make the edit", 1, 1),
+        (
+            "explicit",
+            format!("{write}, {tell}"),
+            0,
+            "Make the edit",
+            1,
+            1,
+        ),
+        (
+            "early",
+            format!("{tell}, {write}"),
+            0,
+            "Make the edit",
+            1,
+            2,
+        ),
+        (
+            "repeated",
+            format!("{write}, {tell}, {tell}"),
+            0,
+            "Make the edit",
+            1,
+            2,
+        ),
+        ("closing", write.to_owned(), 1, "Make the edit", 1, 1),
+        (
+            "skip",
+            write.to_owned(),
+            0,
+            "Make the edit; do not run tests",
+            0,
+            1,
+        ),
+    ] {
+        let dir = scratch(tag);
+        write_role(
+            &dir,
+            "scribe",
+            "---\npermission: worker\ndifficulty: simple\n---\nWrite code.\n",
+        );
+        let mut layers = layers_with(
+            &dir,
+            r#"{ calls = [{ name = "team", args = {action = "delegate", name = "s", role = "scribe", task = "edit main.rs", scope = ["main.rs"]} }] }, { text = "waiting" }, {text = "ack"}, {text = "ack again"}"#,
+            &format!(r#"{script}, {{text = "done"}}"#),
+            &format!("role_request_budgets = {{ scribe = {budget} }}"),
+        );
+        let cadence = format!(
+            "[[insert]]\nname = 'verify-cadence'\nconfig = {{force = true, working_dir = {root:?}}}",
+            root = dir.to_string_lossy(),
+        );
+        layers.push(Layer::from_toml(&cadence).unwrap());
+        let app = start(ConfigTree::from_layers(layers).unwrap()).await;
+        let lead = create_agent(&app).await.unwrap();
+        run_turn(&app, prompt).await.unwrap();
+        let member = app
+            .context()
+            .require::<AgentsSvc>()
+            .unwrap()
+            .by_session(&format!("{}/s", lead.session_id()))
+            .unwrap();
+        until_idle(&member).await;
+        while lead.inbox().has_waking_input() {
+            drive(&app, &lead).await.unwrap();
+        }
+        let reports = peers(&lead);
+        assert_eq!(reports.len(), expected_reports, "{tag}: {reports:?}");
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|(_, s)| s.contains("Run the relevant check") && s.contains("main.rs"))
+                .count(),
+            expected_notes,
+            "{tag}: {reports:?}"
+        );
+        assert!(dir.join("main.rs").exists(), "{tag}");
+        assert_eq!(turns_ended(&member), 1, "{tag}");
+        assert!(!member.session().events().iter().any(|e| matches!(&e.event, SessionEvent::Injected {text, ..} if text == atomcode_coding::discipline::NUDGE)), "{tag}");
+    }
+}
+
+/// A real MCP transport and member turn. The lead can reopen an immutable
+/// result from a fresh runtime without sending the original query again.
+#[cfg(unix)]
+#[tokio::test]
+async fn team_query_evidence_survives_resume() {
+    use serde_json::json;
+    let dir = scratch("team-evidence");
+    let home = scratch("team-evidence-user");
+    let sessions = scratch("team-evidence-sessions");
+    let server = home.join("server.sh");
+    std::fs::write(&server, r#"while IFS= read -r line; do
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+case "$line" in
+*'"method":"initialize"'*) result='{"protocolVersion":"2025-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"docs","version":"1"}}';;
+*'"method":"tools/list"'*) result='{"tools":[{"name":"search_docs","inputSchema":{"type":"object","properties":{"query":{"type":"string"}}},"annotations":{"readOnlyHint":true}}]}';;
+*'"method":"tools/call"'*) result='{"content":[{"type":"text","text":"contract from docs"}]}';;
+*'"id":'*) result='{}';;
+*) continue;;
+esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done"#).unwrap();
+    let config = json!({"mcpServers":{"docs":{"command":"sh","args":[server],
+        "teamReadOnlyTools":{"research":["search_docs"]}}}});
+    std::fs::write(home.join("mcp.json"), config.to_string()).unwrap();
+    let role = "---\npermission: explore\ndifficulty: simple\ntools: mcp__docs__search_docs\n---\nLook up the contract.";
+    write_role(&dir, "research", role);
+    write_role(&dir, "other", role);
+    let build = |resume: bool| {
+        let mut layers = layers_with(
+            &dir,
+            r#"{ text = "ok" }"#,
+            r#"{ text = "checking", calls = [{name = "mcp__docs__search_docs", args = {query = "contract"}}]}, { text = "query complete" }"#,
+            "",
+        );
+        let settings = format!(
+            "[[patch]]\nid='product-dirs'\nconfig={{user={home:?}}}\n[[patch]]\nid='mcp'\ndisabled=false\nconfig={{project_root={dir:?}}}\n[[insert]]\nname='tool-output-artifact'\nconfig={{dir={artifacts:?}}}\n[[patch]]\nid='session-persistence-jsonl'\ndisabled=false\nconfig={{root={sessions:?}, project_root={dir:?}}}\n[[patch]]\nid='session'\nconfig={{id='lead', resume={resume}}}",
+            artifacts = dir.join("artifacts")
+        );
+        layers.push(Layer::from_toml(&settings).unwrap());
+        ConfigTree::from_layers(layers).unwrap()
+    };
+    let reference = {
+        let app = start(build(false)).await;
+        let lead = create_agent(&app).await.unwrap();
+        run_turn(&app, "research").await.unwrap();
+        let denied = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"other","role":"other","task":"query"}"#,
+        )
+        .await;
+        assert!(
+            denied.is_error && denied.content.contains("teamReadOnlyTools"),
+            "{}",
+            denied.content
+        );
+        let delegated = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"scout","role":"research","task":"query"}"#,
+        )
+        .await;
+        assert!(!delegated.is_error, "{}", delegated.content);
+        let member = app
+            .context()
+            .service::<AgentsSvc>()
+            .unwrap()
+            .by_session("lead/scout")
+            .unwrap();
+        until_idle(&member).await;
+        let result = member
+            .session()
+            .events()
+            .into_iter()
+            .find_map(|e| match e.event {
+                SessionEvent::ToolResultLogged {
+                    content,
+                    is_error: false,
+                    ..
+                } if content.contains("contract from docs") => Some(content),
+                _ => None,
+            })
+            .expect("member received the real query result");
+        assert!(!peers(&lead)
+            .iter()
+            .any(|(_, text)| text.contains("contract from docs")));
+        let name = "mcp__docs__search_docs";
+        let held = member
+            .ctx()
+            .service::<ToolsSvc>()
+            .unwrap()
+            .get(name)
+            .unwrap();
+        app.context().service::<ToolsSvc>().unwrap().turn_off(name);
+        let denied = held
+            .execute(
+                r#"{"query":"after withdrawal"}"#,
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    cancel: Default::default(),
+                    progress: ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await;
+        assert!(
+            denied.is_error && denied.content.contains("unavailable"),
+            "{}",
+            denied.content
+        );
+        result
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Team evidence ")
+            .unwrap()
+            .to_owned()
+    };
+    let mut revoked = config;
+    revoked["mcpServers"]["docs"]["teamReadOnlyTools"] = json!({});
+    std::fs::write(home.join("mcp.json"), revoked.to_string()).unwrap();
+    let app = start(build(true)).await;
+    let lead = create_agent(&app).await.unwrap();
+    assert!(lead.seed_len() > 0);
+    assert!(lead.session().events().iter().any(|e| matches!(&e.event,
+        SessionEvent::Injected { origin: InjectionOrigin::TeamNote { member }, text, .. }
+            if member == "scout" && text.contains(&reference) && !text.contains("contract from docs"))),
+        "the lead retains a reference without receiving the query result");
+    let evidence =
+        |member: &str| json!({"action":"evidence","name":member,"reference":reference}).to_string();
+    assert!(as_lead(&app, &lead, &evidence("other")).await.is_error);
+    let forged = app
+        .context()
+        .service::<atomcode_harness::seams::OutputArtifactsSvc>()
+        .unwrap()
+        .team_evidence("lead", "scout")
+        .put_input(b"unissued record")
+        .unwrap();
+    assert!(
+        as_lead(
+            &app,
+            &lead,
+            &json!({"action":"evidence","name":"scout","reference":forged}).to_string()
+        )
+        .await
+        .is_error
+    );
+    let result = as_lead(&app, &lead, &evidence("scout")).await;
+    assert!(!result.is_error, "{}", result.content);
+    let record: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(record["arguments"]["query"], "contract");
+    assert_eq!(record["content"], "contract from docs");
+    assert_eq!(record["is_error"], false);
+}

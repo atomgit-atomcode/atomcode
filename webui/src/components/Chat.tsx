@@ -5,6 +5,7 @@ import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
 import { GoalRecoveryStatus } from './GoalRecoveryStatus';
+import { LiveGoalBar } from './LiveGoalBar';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
@@ -1976,6 +1977,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
       liveSessionObservationRef.current++;
+      if (liveSessionIdRef.current !== e.session_id) setGoalProgress(null);
       if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) {
         noticeAfterSwitchRef.current = null;
       }
@@ -4127,6 +4129,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) || Boolean(loopProgress?.recovery);
+  const goalBarSession = sync && sessionId === liveSessionIdRef.current ? sessionId : null;
+  const goalControlId = goalProgress?.control_id;
+  const showGoalBar = goalBarSession && goalControlId !== undefined && goalProgress?.condition?.trim()
+    && (goalProgress.active || goalProgress.phase === 'paused' || goalProgress.phase === 'paused_at_cap');
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError || currentTurnModel || (!sync && busy && provider !== runtimeModel?.provider) ? ' has-input-detail' : '')}>
       {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
@@ -4882,6 +4888,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         </div>
       )}
       <div class="input-container">
+        {showGoalBar && goalProgress && (
+          <LiveGoalBar
+            key={`${goalBarSession}:${goalControlId}`}
+            goal={goalProgress}
+            controlId={goalControlId}
+            sampledAt={goalSampledAt}
+            sessionId={goalBarSession}
+          />
+        )}
         {goalProgress?.recovery && (
           <GoalRecoveryStatus recovery={goalProgress.recovery} sampledAt={goalSampledAt} />
         )}

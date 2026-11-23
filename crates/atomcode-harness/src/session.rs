@@ -329,6 +329,22 @@ impl SessionLog {
         self.events.read().expect("session log poisoned").clone()
     }
 
+    /// Read the committed facts in place. Keep the callback synchronous and
+    /// short, and avoid calling other methods that lock this log from it.
+    pub fn read_events<R>(&self, read: impl FnOnce(&[LoggedEvent]) -> R) -> R {
+        read(&self.events.read().expect("session log poisoned"))
+    }
+
+    /// Inspect committed facts without cloning message and tool payloads.
+    pub(crate) fn contains_event(&self, predicate: impl Fn(&SessionEvent) -> bool) -> bool {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .any(|entry| predicate(&entry.event))
+    }
+
     /// Last committed fact, without copying the event payloads.
     pub fn last_seq(&self) -> SeqNo {
         self.events

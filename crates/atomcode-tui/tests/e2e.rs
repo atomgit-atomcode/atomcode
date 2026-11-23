@@ -3978,7 +3978,7 @@ async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
     s.quiet().await;
     assert!(
         s.term.last().unwrap().part("resume").is_some()
-            || s.screen().contains("没有别的存下的会话")
+            || s.screen().contains(&t_resume_no_others())
             || s.screen().contains("this host does not do that"),
         "the press did not take the row it landed on:\n{}",
         s.screen()
@@ -9165,13 +9165,17 @@ impl atomcode_host_api::HostControl for ResumeFixtureControl {
                 .inner
                 .call(HostCommand::ListSessions { working_dir: None })
                 .await?;
-            if let HostReply::Sessions { mut sessions } = reply {
+            if let HostReply::Sessions {
+                mut sessions,
+                hints,
+            } = reply
+            {
                 for session in &mut sessions {
                     session.working_dir = Some(self.here.clone());
                 }
                 sessions
                     .retain(|session| working_dir.is_none() || session.working_dir == working_dir);
-                return Ok(HostReply::Sessions { sessions });
+                return Ok(HostReply::Sessions { sessions, hints });
             }
             return Ok(reply);
         }

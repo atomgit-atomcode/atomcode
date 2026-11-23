@@ -18,6 +18,8 @@
 //! deepseek-harness and the old runtime both hide the tier behind the role
 //! for the same reason: the model knows what the job is, not what it costs.
 
+mod query;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -405,7 +407,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     if !permission_said {
         problems.push(
             "`permission` is required: explore (looks, changes nothing) or worker (may edit \
-             files and run commands)"
+             files inside its scope)"
                 .to_string(),
         );
     }
@@ -423,9 +425,12 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     // a role file in a cloned repository must not hand a member a shell.
     if let Some(listed) = &tools {
         let allowed = default_tools(permission);
-        if let Some(extra) = listed.iter().find(|tool| !allowed.contains(tool)) {
+        if let Some(extra) = listed
+            .iter()
+            .find(|tool| !allowed.contains(tool) && !query::is_query_name(tool))
+        {
             return Err(format!(
-                "{}: a {} member may not have `{extra}`; choose from: {}",
+                "{}: a {} member may not have `{extra}`; tools can only narrow its permissions. tell_parent is provided automatically; omit it from tools. Choose a granted read-only MCP query or one of: {}",
                 path.display(),
                 match permission {
                     Permission::Explore => "explore",
@@ -588,6 +593,25 @@ fn tools_for(role: &Role) -> Vec<String> {
 
 // ---- the members ----------------------------------------------------------
 
+#[derive(Default)]
+struct ReportReceipt {
+    sent: bool,
+    note_key: Option<String>,
+}
+
+fn report_note(member: &Agent, lead: &Agent) -> Option<crate::seams::MemberReportNote> {
+    member
+        .ctx()
+        .service::<crate::seams::MemberReportNoteSvc>()?(member, lead)
+}
+
+fn append_report_note(report: &mut String, note: Option<&crate::seams::MemberReportNote>) {
+    if let Some(note) = note {
+        report.push_str("\n\n");
+        report.push_str(&note.text);
+    }
+}
+
 struct Member {
     role: String,
     agent: Arc<Agent>,
@@ -598,7 +622,7 @@ struct Member {
     /// Whether this member said something to the lead during its current
     /// turn. A member that ends a turn silently is reported on by the team,
     /// so the lead is never left waiting on a member that forgot to speak.
-    told: Arc<Mutex<bool>>,
+    told: Arc<Mutex<ReportReceipt>>,
     /// Ephemeral notification dedup only; not task/completion state.
     last_write_refusal_turn: Option<u64>,
     /// The files it may write, for a writing member sharing the lead's
@@ -734,7 +758,7 @@ struct TellParent {
     lead: AgentId,
     me: AgentId,
     name: String,
-    told: Arc<Mutex<bool>>,
+    told: Arc<Mutex<ReportReceipt>>,
 }
 
 #[async_trait]
@@ -770,11 +794,20 @@ impl Tool for TellParent {
         let Some(lead) = self.agents.get(self.lead) else {
             return fail("the lead agent is gone");
         };
-        *self.told.lock().expect("told poisoned") = true;
+        let member = self.agents.get(self.me);
+        let note = member.as_ref().and_then(|m| report_note(m, &lead));
+        let mut report = format!("[{}] {text}", self.name);
+        {
+            let mut receipt = self.told.lock().expect("told poisoned");
+            receipt.sent = true;
+            if let Some(note) = note.filter(|n| Some(&n.key) != receipt.note_key.as_ref()) {
+                append_report_note(&mut report, Some(&note));
+                receipt.note_key = Some(note.key);
+            }
+        }
         lead.send_from(
-            format!("[{}] {text}", self.name),
-            self.agents
-                .get(self.me)
+            report,
+            member
                 .map(|agent| agent.team_message_origin())
                 .unwrap_or(MessageOrigin::Peer(self.me)),
         );
@@ -837,6 +870,8 @@ struct TeamArgs {
     text: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    reference: Option<String>,
     /// A selection id for this member, overriding whatever the role says.
     #[serde(default)]
     model: Option<String>,
@@ -911,6 +946,26 @@ impl TeamTool {
                         .join(", ")
                 )
             })?;
+        for query in tools_for(&role)
+            .iter()
+            .filter(|name| query::is_query_name(name))
+        {
+            if !lead
+                .ctx()
+                .service::<ToolsSvc>()
+                .is_some_and(|tools| tools.get(query).is_some())
+                || !lead
+                    .ctx()
+                    .service::<crate::seams::McpSvc>()
+                    .is_some_and(|registry| registry.team_query_info(query, &role.id).is_some())
+                || lead
+                    .ctx()
+                    .service::<crate::seams::OutputArtifactsSvc>()
+                    .is_none()
+            {
+                return Err(format!("Query `{query}` for role `{}` needs a connected, published MCP tool with readOnlyHint, a user/driver teamReadOnlyTools grant for this role, and output storage.", role.id));
+            }
+        }
         let task = args
             .task
             .filter(|t| !t.trim().is_empty())
@@ -1216,11 +1271,33 @@ impl TeamTool {
             .ok_or("the lead has no tool catalog")?;
         let restricted = Arc::new(ToolBox::new());
         for tool_name in tools_for(&role) {
-            if let Some(tool) = parent_tools.get(&tool_name) {
+            if query::is_query_name(&tool_name) {
+                let registry = lead
+                    .ctx()
+                    .require::<crate::seams::McpSvc>()
+                    .map_err(|e| e.to_string())?;
+                let store = lead
+                    .ctx()
+                    .require::<crate::seams::OutputArtifactsSvc>()
+                    .map_err(|e| e.to_string())?;
+                restricted.register(Arc::new(query::MemberQuery {
+                    lead: Arc::downgrade(lead),
+                    description: parent_tools
+                        .get(&tool_name)
+                        .map(|tool| tool.description().to_owned())
+                        .unwrap_or_else(|| format!("Read-only query {tool_name}")),
+                    name: tool_name,
+                    role: role.id.clone(),
+                    member: name.clone(),
+                    registry,
+                    catalog: Arc::downgrade(&parent_tools),
+                    evidence: Arc::new(store.team_evidence(&lead_session, &name)),
+                }))?;
+            } else if let Some(tool) = parent_tools.get(&tool_name) {
                 restricted.register(tool)?;
             }
         }
-        let told = Arc::new(Mutex::new(false));
+        let told = Arc::new(Mutex::new(ReportReceipt::default()));
         let prompts = Arc::new(crate::seams::PromptRegistry::new());
         prompts.contribute(
             "team-member",
@@ -1274,6 +1351,12 @@ impl TeamTool {
         // Captured out of `role` before the realm closure takes `tools_for_realm`
         // and friends; the closure is `move` and `role` is not otherwise kept.
         let role_effort = effort_override.or(role.effort);
+        if tools_for(&role)
+            .iter()
+            .any(|name| query::is_query_name(name))
+        {
+            prompts.contribute("team-query-evidence", 0, "Include the Team evidence reference in your report so the lead can inspect the original query and result.".to_owned());
+        }
         let member_id = format!("{lead_session}/{name}");
         let member_session = member_id.clone();
         let identity = atomcode_kernel::agent::MemberIdentity {
@@ -1721,7 +1804,7 @@ impl Tool for TeamTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": if self.headless_wait { vec!["delegate", "tell", "status", "stop", "wait"] } else { vec!["delegate", "tell", "status", "stop"] },
+                    "enum": if self.headless_wait { vec!["delegate", "tell", "status", "stop", "wait", "evidence"] } else { vec!["delegate", "tell", "status", "stop", "evidence"] },
                     "description": if self.headless_wait { "delegate needs name, role, task; tell needs name, text; stop takes name or none for all; status takes nothing; wait needs name and optional timeout_secs" } else { "delegate needs name, role, task; tell needs name, text; stop takes name or none for all; status takes nothing" }
                 },
                 "name": { "type": "string", "description": "The member's name (delegate, tell, stop)" },
@@ -1735,6 +1818,7 @@ impl Tool for TeamTool {
                 "task": { "type": "string", "description": "The complete task (delegate)" },
                 "scope": { "type": "array", "items": { "type": "string" }, "description": "For a role that writes: the files this member may change, as globs relative to the workspace (e.g. `src/auth/**`). Required unless members get checkouts of their own; two writers' scopes may not overlap." },
                 "text": { "type": "string", "description": "What to tell the member (tell)" },
+                "reference": { "type": "string", "description": "For action=evidence, pass name and the query reference from the member report to read the original arguments, result, and error status." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "description": "Maximum time to wait for one member (wait; default 30)" }
             },
             "required": ["action"]
@@ -1756,9 +1840,9 @@ impl Tool for TeamTool {
             .and_then(|id| self.roles.iter().find(|role| role.id == id))
             .is_some_and(|role| {
                 role.permission == Permission::Explore
-                    && tools_for(role)
-                        .iter()
-                        .all(|tool| EXPLORE_TOOLS.contains(&tool.as_str()))
+                    && tools_for(role).iter().all(|tool| {
+                        EXPLORE_TOOLS.contains(&tool.as_str()) || query::is_query_name(tool)
+                    })
             });
         if reads {
             RiskLevel::Safe
@@ -1787,11 +1871,14 @@ impl Tool for TeamTool {
                     Err("`text` is required".to_string())
                 } else {
                     self.with_member(&lead, name, |m| {
-                        *m.told.lock().expect("told poisoned") = false;
+                        *m.told.lock().expect("told poisoned") = ReportReceipt::default();
                         m.agent.send_from(text, lead.team_message_origin());
                     })
                     .map(|_| format!("told `{name}`"))
                 }
+            }
+            "evidence" => {
+                query::read_evidence(&lead, args.name.as_deref(), args.reference.as_deref()).await
             }
             "status" => Ok(self.status(&lead)),
             "wait" => {
@@ -2175,7 +2262,7 @@ impl Plugin for TeamPlugin {
                 let Some(m) = all.get(&lead_session).and_then(|m| m.get(&name)) else {
                     return;
                 };
-                let told = std::mem::replace(&mut *m.told.lock().expect("told poisoned"), false);
+                let told = std::mem::take(&mut *m.told.lock().expect("told poisoned"));
                 (m.agent.clone(), told)
             };
             let budget_stop = *stop == atomcode_kernel::event::StopReason::StoppedByPolicy
@@ -2183,21 +2270,32 @@ impl Plugin for TeamPlugin {
                     .ctx()
                     .service::<crate::seams::TurnRequestsSvc>()
                     .is_some_and(|r| r.limited(*turn));
-            if told && !budget_stop {
-                return;
-            }
             let Some(lead) = agents.by_session(&lead_session) else {
                 return;
             };
+            let note = report_note(&member, &lead);
+            if told.sent
+                && !budget_stop
+                && note
+                    .as_ref()
+                    .is_none_or(|n| Some(&n.key) == told.note_key.as_ref())
+            {
+                return;
+            }
             let said = member
                 .session()
                 .latest_assistant_text(*turn)
                 .unwrap_or_else(|| "(nothing)".into());
-            let report = if budget_stop {
+            let mut report = if budget_stop {
                 format!("[{name} reached its provider request budget in turn {turn}]\n{said}")
             } else {
                 format!("[{name} finished turn {turn}: {stop:?}]\n{said}")
             };
+            append_report_note(
+                &mut report,
+                note.as_ref()
+                    .filter(|n| Some(&n.key) != told.note_key.as_ref()),
+            );
             let lead_asked = member
                 .session()
                 .events()

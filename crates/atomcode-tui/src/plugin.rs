@@ -1506,6 +1506,11 @@ pub(crate) struct SwitchResult {
 }
 
 enum Wake {
+    ResumeList {
+        request: u64,
+        session: String,
+        result: Result<crate::resume::ResumeView, String>,
+    },
     History {
         session: String,
         request: u64,
@@ -1912,8 +1917,11 @@ pub struct Tui {
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// When a turn-end ask last went out. The figure only moves when a turn
     /// spends something, so the turn-end ask is the authoritative one: it
-    /// also moves the idle slot ([`Self::allowance_idle_checked`]) so the
-    /// pair cannot double-fire within one [`ALLOWANCE_EVERY`] window.
+    /// also moves the idle slot ([`Self::allowance_idle_checked`]), so a
+    /// turn-end ask suppresses the idle beat for one [`ALLOWANCE_EVERY`]
+    /// window. The suppression is one-way by design — an idle ask never
+    /// moves this slot, because a turn ending right after one has actually
+    /// changed the figure and must still ask.
     allowance_checked: Mutex<Option<std::time::Instant>>,
     /// The idle beat's own throttle stamp, kept apart from the turn-end one
     /// ([`Self::allowance_checked`]): the two asks must not contend for a
@@ -2832,6 +2840,18 @@ impl UserInterface for Tui {
                     result,
                 } => {
                     stale |= self.accept_history(&session, request, initial, cursor, result);
+                }
+                Wake::ResumeList {
+                    request,
+                    session,
+                    result,
+                } => {
+                    if session == self.client.session()
+                        && self.host.finish_resume_list(request, result)
+                    {
+                        self.fetch_resume_preview();
+                        stale = true;
+                    }
                 }
                 Wake::Fact => {
                     stale = true;
@@ -5762,18 +5782,41 @@ impl Tui {
     /// typed command cannot come to mean different things.
     fn run_resume_key(&self, press: crate::surface::KeyPress) -> bool {
         let (changed, asked) = self.host.resume_key(press);
+        if let Some(crate::resume::Step::LoadAll(request)) = asked {
+            let keys = self.wake.lock().expect("wake poisoned").clone();
+            let session = self.client.session();
+            let control = self.client.control();
+            tokio::spawn(async move {
+                let result = match control {
+                    Some(control) => {
+                        crate::commands::load_resume_list(&*control, None, &session).await
+                    }
+                    None => Err(t(Msg::NoHost).into_owned()),
+                };
+                if let Some(keys) = keys {
+                    let _ = keys.send(Wake::ResumeList {
+                        request,
+                        session,
+                        result,
+                    });
+                }
+            });
+            return true;
+        }
         if let Some(crate::resume::Step::Delete { id }) = asked {
             self.delete_session(id);
             return true;
         }
         // 走到哪一行,就去问那一行最后聊了什么。
         self.fetch_resume_preview();
-        let Some(crate::resume::Step::Resume { id }) = asked else {
-            return changed;
+        let command = match asked {
+            Some(crate::resume::Step::Resume { id }) => format!("/resume {id}"),
+            Some(crate::resume::Step::ResumeAcrossProjects { id }) => format!("/resume --all {id}"),
+            _ => return changed,
         };
         let keys = self.wake.lock().expect("wake poisoned").clone();
         if let Some(keys) = keys {
-            let _ = keys.send(Wake::Chose(Some(format!("/resume {id}"))));
+            let _ = keys.send(Wake::Chose(Some(command)));
         }
         self.host.close_resume();
         true
@@ -6941,7 +6984,12 @@ impl Tui {
         let nudged = self.allowance_nudged.clone();
         let client = self.client.clone();
         let allowance_generation = self.allowance_generation.clone();
-        let generation = allowance_generation.load(Ordering::SeqCst);
+        // Bumping here, not just at session switch: the two throttle slots
+        // can each have a question in flight (an idle beat asking, then a
+        // turn ending past its slot's window), and the replies may arrive out
+        // of order — the newer question must retire the older one's answer,
+        // or the stale figures overwrite the fresh ones.
+        let generation = allowance_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
@@ -19210,12 +19258,29 @@ mod session_mention_tests {
     /// stale — and when browsing ends on the same token, the menu stays away.
     #[test]
     fn browsing_leaves_the_declined_token_alone() {
+        use atomcode_capabilities::file_index::Entry;
+
         let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        let cwd = std::path::PathBuf::from("workspace");
         {
             let mut moment = host.moment.write().unwrap();
+            moment.cwd = cwd.to_string_lossy().into_owned();
             moment.input = "@atomcode notes".into();
             moment.caret = "@atomcode".len();
         }
+        *tui.files.lock().unwrap() = Some((
+            cwd.clone(),
+            super::FileIndex::from_entries(
+                cwd,
+                vec![Entry {
+                    rel_path: "atomcode.rs".into(),
+                    is_dir: false,
+                    depth: 1,
+                }],
+            ),
+        ));
+        tui.refresh_menu();
+        assert_eq!(host.menu_selected().as_deref(), Some("@atomcode.rs"));
         tui.decline_current_mention();
         tui.refresh_menu();
         assert!(!host.menu_open(), "the declined token holds the menu down");
@@ -19227,6 +19292,10 @@ mod session_mention_tests {
             moment.history_at = Some(1);
         }
         tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "browsing shows no mention menu while it lasts"
+        );
 
         // Browsing ends on the same token: the decline still holds.
         {
@@ -19237,6 +19306,56 @@ mod session_mention_tests {
         assert!(
             !host.menu_open(),
             "browsing must not wipe the decline: the same token stays declined"
+        );
+    }
+
+    /// The double-Esc that clears the line drops the declined token's record
+    /// with it: the line is gone, so a fresh token on the cleared line asks
+    /// again instead of inheriting a decline keyed to a token that no longer
+    /// exists.
+    #[test]
+    fn a_double_esc_that_clears_the_line_drops_the_decline_record() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(host.menu_open(), "the mention menu is up");
+
+        // First Esc declines the token through the menu path.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the declined token holds the menu down");
+        assert!(tui.mention_declined.lock().unwrap().is_some());
+
+        // The next two Esc presses reach the composer. The first arms the
+        // double tap, and the second clears the line and the decline record.
+        tui.act(crate::keymap::Action::Escape, &tui.client);
+        tui.act(crate::keymap::Action::Escape, &tui.client);
+        {
+            let moment = host.moment.read().unwrap();
+            assert!(moment.input.is_empty(), "the line is cleared");
+        }
+        assert!(
+            tui.mention_declined.lock().unwrap().is_none(),
+            "the decline record goes with the line"
+        );
+
+        // A fresh token on the cleared line asks again.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a fresh token on the cleared line asks again"
         );
     }
 
@@ -19670,6 +19789,105 @@ mod allowance_switch_tests {
         tui.tick_beat();
         tokio::task::yield_now().await;
         assert!(pending.try_recv().is_err(), "a quiet row is not re-asked");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_turn_end_ask_holds_the_idle_beat_down_for_one_window() {
+        // 回合结束的问询盖了两个槽：窗口之内，空闲拍不得再问——
+        // turn-end → idle 的那向压制是双槽契约的正文。
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let now = host.moment.read().unwrap().now;
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = Some(crate::moment::Allowance {
+                label: "5h".into(),
+                percent: 99,
+                resets_at: String::new(),
+                resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
+            });
+        }
+        tui.check_allowance();
+        pending
+            .recv()
+            .await
+            .unwrap()
+            .send(reply(vec![atomcode_host_api::UsageWindow {
+                label: "5h".into(),
+                exhausted: false,
+                resets_at: String::new(),
+                resets_in_seconds: 100,
+                window_seconds: 18_000,
+                used_percent: Some(10),
+                calls_used: None,
+                call_limit: None,
+            }]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        // 窗口之内，空闲拍被顶住：不再发第二笔。
+        tui.tick_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "the idle beat is suppressed for one window after a turn-end ask"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_answer_from_the_older_question_never_overwrites_fresh_figures() {
+        // 双槽都可能有一笔在飞（空闲拍先问、回合后结束）：后发问询递增
+        // 代数，先发的落地必须被当作过期丢弃——旧数字不得覆盖新数字。
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let now = host.moment.read().unwrap().now;
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = Some(crate::moment::Allowance {
+                label: "5h".into(),
+                percent: 99,
+                resets_at: String::new(),
+                resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
+            });
+        }
+        // 空闲拍先问：第一笔在飞，不答。
+        *tui.allowance_idle_checked.lock().unwrap() = None;
+        tui.tick_beat();
+        let first = pending.recv().await.unwrap();
+        // 回合后结束：turn-end 问询后发，第二笔。
+        tui.check_allowance();
+        let second = pending.recv().await.unwrap();
+        // 第二笔先落地（exhausted 行），第一笔后落地（安静行）。
+        second
+            .send(reply(vec![atomcode_host_api::UsageWindow {
+                label: "5h".into(),
+                exhausted: true,
+                resets_at: String::new(),
+                resets_in_seconds: 100,
+                window_seconds: 18_000,
+                used_percent: Some(99),
+                calls_used: None,
+                call_limit: None,
+            }]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        let after_second = host.moment.read().unwrap().allowance.clone();
+        first.send(reply(vec![])).unwrap();
+        tokio::task::yield_now().await;
+        let after_first = host.moment.read().unwrap().allowance.clone();
+        assert_eq!(
+            after_second, after_first,
+            "the older question's late answer is retired, not rendered"
+        );
     }
 }
 

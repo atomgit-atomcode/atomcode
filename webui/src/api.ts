@@ -1149,8 +1149,11 @@ export interface GoalRecoveryProgress {
   retry_in_secs: number;
 }
 export interface LiveGoalProgress {
+  control_id?: string;
   active: boolean;
   phase: string;
+  condition?: string;
+  elapsed_secs?: number;
   last_reason: string | null;
   recovery?: GoalRecoveryProgress | null;
 }
@@ -1279,6 +1282,16 @@ export async function postLiveStop(): Promise<void> {
   });
   const body = await readJson(resp) as { accepted?: boolean };
   if (!body.accepted) throw new Error('live runtime rejected the stop request');
+}
+
+export async function postLiveGoalAction(sessionId: string, controlId: string, action: 'pause' | 'remove'): Promise<void> {
+  const resp = await apiFetch('/live/goal/action', {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, control_id: controlId, action }),
+  });
+  const body = await readJson<{ accepted?: boolean; error?: string }>(resp);
+  if (body.accepted !== true) throw new Error(body.error ?? 'Goal action rejected');
 }
 
 /** Sync-mode manual compaction: dispatch a compaction against the shared live

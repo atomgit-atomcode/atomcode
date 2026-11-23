@@ -604,7 +604,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionNeedsNewerVersion { id } => format!("需要更新版本才能打开 · {id}").into(),
         Msg::SessionTurnsWhenWhere { turns, when, dir } => format!("{turns} 轮 · {when} · {dir}").into(),
         Msg::SessionTurnsWhen { turns, when } => format!("{turns} 轮 · {when}").into(),
-        Msg::ResumeNoOthers => "没有别的存下的会话".into(),
+        Msg::ResumeNoOthers => "当前项目没有列出其他会话。".into(),
+        Msg::ResumeAllProjects => "所有项目".into(),
+        Msg::ResumeThisProject => "当前项目".into(),
+        Msg::ResumeLoadingAll => "正在加载所有项目…".into(),
+        Msg::ResumeNoneAll => "所有项目中都没有列出其他会话。".into(),
+        Msg::ResumeHistoryElsewhere => "当前项目没有其他会话，其他项目有历史会话。".into(),
+        Msg::ResumeScanIssue { path } => format!("扫描会话目录时发现异常，列表可能不完整。请检查 {path}").into(),
         Msg::ResumePickerHint => "回到哪个会话 · enter 打开 · ctrl+d 删掉(按两次)".into(),
 
         // ── background sessions ──
@@ -1122,6 +1128,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "模型服务身份验证失败".into(),
         Msg::ProviderRateLimitError => "模型服务限流".into(),
         Msg::ProviderConnectionError => "无法连接模型服务".into(),
+        Msg::ProviderSystemProxyReadFailed => "无法读取系统代理设置。".into(),
+        Msg::ProviderCheckSystemProxy => "请检查系统代理的地址和端口。如果当前网络允许直连，可输入 /proxy no_proxy 后重试。".into(),
         Msg::ProviderResponseTimeout => "模型服务未及时响应".into(),
         Msg::ProviderConnectionTimeout => "连接模型服务超时".into(),
         Msg::ProviderTlsInterrupted => "TLS 连接异常中断".into(),

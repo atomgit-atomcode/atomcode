@@ -8385,6 +8385,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/goal/start", post(live_api::live_goal_start))
         .route("/live/goal/arm", post(live_api::live_goal_arm))
         .route("/live/goal/stop", post(live_api::live_goal_stop))
+        .route("/live/goal/action", post(live_api::live_goal_action))
         .route("/live/compact", post(live_api::live_compact))
         .route("/live/command", post(live_api::live_command))
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))

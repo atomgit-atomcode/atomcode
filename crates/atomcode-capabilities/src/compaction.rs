@@ -2097,6 +2097,20 @@ mod tests {
                 );
             }
         }
+        // Outputs ending in `]` are the predicate's own envelope terminator:
+        // the round-trip must survive them in both shapes.
+        let long_output = format!("{}TAIL]", "x".repeat(3_000));
+        for (output, expected_tail) in [("abc]", "abc]]"), (long_output.as_str(), "TAIL]]")] {
+            let stub = build_compact_stub("bash", output, true);
+            assert!(
+                text_is_compact_stub(&stub),
+                "an output ending in `]` built an unrecognized stub: {stub}"
+            );
+            assert!(
+                stub.ends_with(expected_tail),
+                "the stub must retain the output's closing bracket: {stub}"
+            );
+        }
     }
 
     #[test]

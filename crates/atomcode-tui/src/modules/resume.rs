@@ -102,6 +102,7 @@ enum Row {
     Session(usize),
     /// 一个也没有,或筛掉了。
     Nothing,
+    Diagnostic,
     /// 上下各有多少条不在视野里。
     Scroll {
         above: usize,
@@ -144,6 +145,9 @@ fn layout(
     let listed = view.listed(panel);
     if listed.is_empty() {
         rows.push(Row::Nothing);
+        if view.hints.scan_issue_path.is_some() {
+            rows.push(Row::Diagnostic);
+        }
     } else {
         // 上面 chrome、下面空行加提示各占了地方之后,列表还剩多少行。`h == usize::MAX`
         // 是 `height` 在问「要多少行」,答案是整张列表,仍夹在一块面板能占的上限里。
@@ -207,15 +211,53 @@ fn draw(
 ) -> Line {
     match row {
         Row::Rule => panel_edge(w, caps),
-        Row::Header => Line::from_spans(chrome::header_parts(NAME, &[], usize::MAX).0).truncate(w),
+        Row::Header => Line::from_spans(
+            chrome::header_parts(
+                &format!(
+                    "{NAME} · {}",
+                    t(if panel.all_projects {
+                        Msg::ResumeAllProjects
+                    } else {
+                        Msg::ResumeThisProject
+                    })
+                ),
+                &[],
+                usize::MAX,
+            )
+            .0,
+        )
+        .truncate(w),
         Row::BoxTop => box_edge(w, caps, true),
         Row::Search => search_line(&panel.query, Some(panel.query.len()), w, caps),
         Row::BoxBottom => box_edge(w, caps, false),
         Row::Blank => Line::empty(),
         Row::Nothing => Line::styled(
-            width::take_width(&t(Msg::ResumeNoOthers), w),
+            width::take_width(
+                &if panel.loading.is_some() {
+                    t(Msg::ResumeLoadingAll).into_owned()
+                } else if let Some(error) = &panel.load_error {
+                    error.clone()
+                } else if !panel.query.is_empty() && !view.is_empty() {
+                    t(Msg::OverlayNoMatch).into_owned()
+                } else if panel.all_projects {
+                    t(Msg::ResumeNoneAll).into_owned()
+                } else if view.hints.other_projects_have_history {
+                    t(Msg::ResumeHistoryElsewhere).into_owned()
+                } else {
+                    t(Msg::ResumeNoOthers).into_owned()
+                },
+                w,
+            ),
             theme::fg(Role::Muted),
         ),
+        Row::Diagnostic => Line::styled(
+            t(Msg::ResumeScanIssue {
+                path: view.hints.scan_issue_path.as_deref().unwrap_or_default(),
+            })
+            .into_owned(),
+            theme::fg(Role::Error),
+        )
+        .truncate(w),
         Row::Scroll { above, below } => Line::styled(
             width::take_width(&format!("  ↑{above} ↓{below}"), w),
             theme::fg(Role::Muted),
@@ -235,7 +277,15 @@ fn draw(
             Line::styled(format!("  {said}"), theme::fg(Role::Muted)).truncate(w)
         }
         Row::Legend => Line::styled(
-            format!("  {}", t(Msg::ResumePickerHint)),
+            format!(
+                "  Tab {} · {}",
+                t(if panel.all_projects {
+                    Msg::ResumeThisProject
+                } else {
+                    Msg::ResumeAllProjects
+                }),
+                t(Msg::ResumePickerHint)
+            ),
             theme::fg(Role::Muted),
         )
         .truncate(w),

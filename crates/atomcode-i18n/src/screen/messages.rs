@@ -847,7 +847,15 @@ pub enum Msg<'a> {
         turns: u32,
         when: &'a str,
     },
+    ResumeAllProjects,
+    ResumeThisProject,
+    ResumeLoadingAll,
+    ResumeNoneAll,
     ResumeNoOthers,
+    ResumeHistoryElsewhere,
+    ResumeScanIssue {
+        path: &'a str,
+    },
     ResumePickerHint,
 
     // ── background sessions (`bg.rs`, `modules/bg.rs`, the host's `background`) ──
@@ -1796,6 +1804,8 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderSystemProxyReadFailed,
+    ProviderCheckSystemProxy,
     ProviderResponseTimeout,
     ProviderConnectionTimeout,
     ProviderTlsInterrupted,
