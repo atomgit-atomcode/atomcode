@@ -2561,6 +2561,126 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
     records
 }
 
+/// What the session picker and input history need from a completed turn.
+pub struct HistoryTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// Text from completed, non-withdrawn turns, ordered oldest first.
+pub struct HistoryText {
+    pub model: Option<String>,
+    pub turns: Vec<HistoryTurn>,
+}
+
+impl SessionManager {
+    /// Validate all committed facts, without keeping tool payloads, images, or
+    /// reasoning from the full log. Use the same turn and rewind rules as the
+    /// transcript projection.
+    pub fn read_history_text(&self, id: &str) -> SessionResult<HistoryText> {
+        let path = self.events_path(id)?;
+        let size = regular_file_len(&path)?;
+        let too_large = |actual| SessionStoreError::TooLarge {
+            kind: "session events",
+            limit: MAX_JSONL_BYTES,
+            actual,
+        };
+        if size > MAX_JSONL_BYTES {
+            return Err(too_large(size));
+        }
+        let file = open_read_file(&path)?;
+        let mut reader = BufReader::new(file.take(MAX_JSONL_BYTES as u64 + 1));
+        let mut line = Vec::new();
+        let mut total = 0;
+        let mut header = None;
+        let mut model = None;
+        let mut events = Vec::new();
+        for index in 0.. {
+            line.clear();
+            total += reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| io_at(&path, error))?;
+            if total > MAX_JSONL_BYTES {
+                return Err(too_large(total));
+            }
+            // As in the full reader, a failed append without a newline is not
+            // a committed fact.
+            if line.pop() != Some(b'\n') {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let record: Line =
+                serde_json::from_slice(&line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}:{}: {error}", path.display(), index + 1),
+                })?;
+            if let Some(found) = record.header {
+                if found.version > SESSION_FORMAT_VERSION {
+                    return Err(SessionStoreError::FutureSchema {
+                        kind: "session events",
+                        found: found.version,
+                        supported: SESSION_FORMAT_VERSION,
+                    });
+                }
+                header = Some(found);
+                continue;
+            }
+            let (Some(seq), Some(value)) = (record.seq, record.event) else {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}:{}: not a record", path.display(), index + 1),
+                });
+            };
+            let mut event = event_of(value, &path, index, header.as_ref())?;
+            match &mut event {
+                SessionEvent::TurnStart { .. }
+                | SessionEvent::TurnEnd { .. }
+                | SessionEvent::Rewound { .. }
+                | SessionEvent::Interrupted { .. } => {}
+                SessionEvent::UserMessage { images, .. } => *images = Vec::new(),
+                SessionEvent::AssistantMessage {
+                    reasoning,
+                    tool_calls,
+                    reasoning_blocks,
+                    meta,
+                    ..
+                } => {
+                    *reasoning = String::new();
+                    *reasoning_blocks = Vec::new();
+                    *meta = None;
+                    // Only the presence of a call matters for a text preview.
+                    tool_calls.truncate(1);
+                    if let Some(call) = tool_calls.first_mut() {
+                        call.arguments = String::new();
+                    }
+                }
+                SessionEvent::PartialReply { reasoning, .. } => *reasoning = String::new(),
+                SessionEvent::RequestHeader { model: name, .. } => {
+                    model = Some(std::mem::take(name));
+                    continue;
+                }
+                _ => continue,
+            }
+            events.push(LoggedEvent {
+                seq,
+                at: record.at,
+                event,
+            });
+        }
+        let turns = turn_records(id, &events)
+            .into_iter()
+            .filter(|record| !record.undone)
+            .map(|record| HistoryTurn {
+                user: record.user,
+                assistant: record.assistant,
+            })
+            .collect();
+        Ok(HistoryText { model, turns })
+    }
+}
+
 /// A snapshot of what `events` project to.
 pub fn snapshot_of(events: &[LoggedEvent]) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot::new(derive_messages_with_meta(events));
@@ -3115,6 +3235,101 @@ mod tests {
     }
 
     #[test]
+    fn text_history_matches_full_projection_on_older_rewound_logs_with_a_torn_tail() {
+        let (_dir, manager) = store();
+        let id = "history";
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut header = SessionHeader::new(id);
+        header.version = SESSION_FORMAT_VERSION - 1;
+        manager
+            .create_event_session(&lease, &header, &meta(id))
+            .unwrap();
+        let mut facts = Vec::new();
+        for turn in 1..=4 {
+            for mut fact in a_turn() {
+                match &mut fact.event {
+                    SessionEvent::TurnStart { turn: slot }
+                    | SessionEvent::AssistantChunk { turn: slot, .. }
+                    | SessionEvent::TurnEnd { turn: slot, .. } => *slot = turn,
+                    SessionEvent::UserMessage {
+                        turn: slot, text, ..
+                    } => {
+                        *slot = turn;
+                        *text = format!("question {turn}");
+                    }
+                    SessionEvent::AssistantMessage {
+                        turn: slot,
+                        text,
+                        tool_calls,
+                        ..
+                    } => {
+                        *slot = turn;
+                        if turn == 1 {
+                            text.clear();
+                            tool_calls.push(atomcode_kernel::tool::ToolCall {
+                                id: "call".into(),
+                                name: "read".into(),
+                                arguments: "large".repeat(30_000),
+                            });
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                fact.seq += (turn - 1) * 5;
+                facts.push(fact);
+            }
+        }
+        facts.extend([
+            logged(
+                21,
+                20,
+                SessionEvent::Rewound {
+                    turn: 4,
+                    to: 16,
+                    scope: RewindScope::Conversation,
+                },
+            ),
+            logged(
+                22,
+                21,
+                SessionEvent::Interrupted {
+                    turn: 3,
+                    undone: true,
+                },
+            ),
+            logged(
+                23,
+                22,
+                SessionEvent::RequestHeader {
+                    turn: 5,
+                    round: 1,
+                    model: "latest-model".into(),
+                    reason: atomcode_kernel::session::HeaderReason::Series,
+                },
+            ),
+        ]);
+        manager.append_events(&lease, &facts).unwrap();
+        let mut file = open_append_file(&manager.events_path(id).unwrap()).unwrap();
+        file.write_all(b"{\"event\":{\"kind\":\"rewound\"").unwrap();
+
+        let full = turn_records(id, &manager.load_events(id).unwrap());
+        let history = manager.read_history_text(id).unwrap();
+        assert_eq!(history.model.as_deref(), Some("latest-model"));
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(
+            history
+                .turns
+                .iter()
+                .map(|turn| (&turn.user, &turn.assistant))
+                .collect::<Vec<_>>(),
+            full.iter()
+                .filter(|turn| !turn.undone)
+                .map(|turn| (&turn.user, &turn.assistant))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn a_running_turn_has_no_completion_timestamp_until_turn_end() {
         let (_dir, manager) = store();
         let lease = created(&manager, "s1");
@@ -3552,6 +3767,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             manager.load_events("s1"),
+            Err(SessionStoreError::FutureSchema { .. })
+        ));
+        assert!(matches!(
+            manager.read_history_text("s1"),
             Err(SessionStoreError::FutureSchema { .. })
         ));
     }

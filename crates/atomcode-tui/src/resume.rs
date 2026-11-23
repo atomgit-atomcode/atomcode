@@ -104,10 +104,25 @@ impl ResumeView {
                 .is_some_and(|dir| dir.to_lowercase().contains(needle))
     }
 
+    pub(crate) fn selected(&self, panel: &Panel) -> Option<&Session> {
+        let needle = panel.query.trim().to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|session| Self::hit(session, &needle))
+            .nth(panel.cursor)
+    }
+
     /// 当前筛出多少行。
     pub fn rows(&self, panel: &Panel) -> usize {
         self.listed(panel).len()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub(crate) session: String,
+    pub(crate) request: u64,
+    pub(crate) lines: Option<Vec<String>>,
 }
 
 /// 恢复面板升着的时候。

@@ -122,11 +122,9 @@ fn preview_of<'a>(
     view: &ResumeView,
     panel: &Panel,
 ) -> Option<Option<&'a Vec<String>>> {
-    let (asked, lines) = moment.resume_preview.as_ref()?;
-    let listed = view.listed(panel);
-    let at = listed.get(panel.cursor)?;
-    let selected = view.sessions().get(*at)?;
-    (&selected.id == asked).then_some(lines.as_ref())
+    let preview = moment.resume_preview.as_ref()?;
+    let selected = view.selected(panel)?;
+    (selected.id == preview.session).then_some(preview.lines.as_ref())
 }
 
 fn layout(

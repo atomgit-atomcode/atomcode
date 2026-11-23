@@ -963,18 +963,14 @@ pub struct Moment {
     /// The resume panel, while it is up: which session row the arrows are on and
     /// what is typed in its search box.
     pub resume_panel: Option<crate::resume::Panel>,
-    /// 选中那个会话最后聊了什么。`None` 是还没问到(或问不出来),
-    /// `Some(id, None)` 是正在问,`Some(id, Some(lines))` 是答案。
-    ///
-    /// 放在这儿而不是面板里:面板是纯数据、每一键重算一次,而这个是异步回来的,
-    /// 且要能认出「答案回来时人已经走到别的行上了」——那时它作废。
-    pub resume_preview: Option<(String, Option<Vec<String>>)>,
+    /// 选中会话的预览。预览请求等待或读取时，内容为空。
+    pub resume_preview: Option<crate::resume::Preview>,
     /// 从后台提上来的那条问询：哪个会话问的，以及它在 `Asks` 里的 id。
     ///
     /// `Some((session, None))` 是**正在取**（事实还在路上），`Some((session, Some((ask,
     /// request))))` 是已经在屏幕上：`ask` 是它在 `Asks` 里的 id，`request` 是那个后台
     /// 会话自己那个请求的 id。两件事共用一条状态，就没有「在屏幕上但不知道是哪一条」
-    /// 的中间态 —— 形状与 `resume_preview` 一样。
+    /// 的中间态。
     pub bg_asked: Option<(String, Option<(u64, atomcode_kernel::event::RequestId)>)>,
     /// 最近一条在这块屏幕上答掉的后台问询：哪个会话、它那个请求的 id。
     ///
