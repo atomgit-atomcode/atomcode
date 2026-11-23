@@ -68,6 +68,9 @@ export function WorkbenchGit({
   const [message, setMessage] = useState("");
   const [amend, setAmend] = useState(false);
   const [busy, setBusy] = useState(false);
+  // `busy` covers every write; the commit button must only say "committing"
+  // when a commit is actually in flight.
+  const [committing, setCommitting] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [notRepository, setNotRepository] = useState(false);
@@ -84,12 +87,29 @@ export function WorkbenchGit({
     setError("");
     setLoading(true);
     setNotRepository(false);
-    Promise.all([readChanges(session, true), readGitBranches(session), readGitLog(session)])
-      .then(([rows, list, commits]) => {
+    Promise.allSettled([readChanges(session, true), readGitBranches(session), readGitLog(session)])
+      .then(([changesResult, branchesResult, commitsResult]) => {
         if (cancelled) return;
-        setChanges(Array.isArray(rows) ? rows : []);
-        setBranches(list);
-        setHistory(Array.isArray(commits) ? commits : []);
+        if (changesResult.status === "rejected") {
+          const absent = isNotRepository(changesResult.reason);
+          setNotRepository(absent);
+          setError(absent ? "" : String(changesResult.reason));
+          setChanges([]);
+          setBranches(null);
+          setHistory([]);
+          setSelection(null);
+          return;
+        }
+        const rows = Array.isArray(changesResult.value) ? changesResult.value : [];
+        // History and branches are supporting data: an empty repository makes
+        // `git log` fail, and that must not hide changes that do exist.
+        const commits =
+          commitsResult.status === "fulfilled" && Array.isArray(commitsResult.value)
+            ? commitsResult.value
+            : [];
+        setChanges(rows);
+        setBranches(branchesResult.status === "fulfilled" ? branchesResult.value : null);
+        setHistory(commits);
         if (requested && appliedRequest.current !== requested.seq) {
           appliedRequest.current = requested.seq;
           const target = rows.find((row) => row.path === requested.path);
@@ -117,16 +137,6 @@ export function WorkbenchGit({
                 : old.staged;
           return { kind: "file", path: row.path, staged };
         });
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        const absent = isNotRepository(e);
-        setNotRepository(absent);
-        setError(absent ? "" : String(e));
-        setChanges([]);
-        setBranches(null);
-        setHistory([]);
-        setSelection(null);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -185,6 +195,7 @@ export function WorkbenchGit({
   function submitCommit() {
     if (!canCommit) return;
     setBusy(true);
+    setCommitting(true);
     setError("");
     setNotice("");
     commitGitStaged(session, message, amend)
@@ -199,7 +210,10 @@ export function WorkbenchGit({
         setRefresh((value) => value + 1);
       })
       .catch((e) => setError(String(e)))
-      .finally(() => setBusy(false));
+      .finally(() => {
+        setBusy(false);
+        setCommitting(false);
+      });
   }
 
   function switchTo(name: string, create: boolean) {
@@ -360,7 +374,7 @@ export function WorkbenchGit({
               />
               <div class="git-commit-actions">
                 <button class="git-commit-button" disabled={!canCommit} onClick={submitCommit}>
-                  {busy
+                  {committing
                     ? text("提交中…", "Committing…")
                     : amend
                       ? text("修补提交", "Amend")
@@ -614,7 +628,7 @@ function ChangeSection({
         </p>
       )}
       {groupByDirectory(entries).map((group) => (
-        <div class="git-group" key={group.id || "root"}>
+        <div class="git-group" key={`group:${group.id}`}>
           <div class="git-group-head">
             <code>{group.label === "." ? "/" : `${group.label}/`}</code>
             <span>{group.entries.length}</span>
@@ -726,11 +740,19 @@ function CommitDetail({
       </div>
       <div class="git-commit-files">
         {detail.files.map((file) => {
-          const letter = statusLetter(statusKind(file.index));
+          const kind = statusKind(file.index);
+          const deleted = kind === "deleted";
           return (
-            <button key={file.path} title={file.path} onClick={() => onOpen(file.path)}>
-              <span class={`git-badge git-kind-${statusKind(file.index)}`} aria-hidden="true">
-                {letter}
+            <button
+              key={file.path}
+              title={deleted ? (zh ? `${file.path}（已删除）` : `${file.path} (deleted)`) : file.path}
+              disabled={deleted}
+              // There is no current content for a file this commit deleted;
+              // opening it would fail on disk.
+              onClick={deleted ? undefined : () => onOpen(file.path)}
+            >
+              <span class={`git-badge git-kind-${kind}`} aria-hidden="true">
+                {statusLetter(kind)}
               </span>
               <span class="git-file-name">{file.path}</span>
               {file.stats && (

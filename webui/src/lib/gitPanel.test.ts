@@ -78,6 +78,19 @@ test('a staged-new row is marked so discarding drops the index entry and the fil
   ]);
 });
 
+test('an edited or deleted-after-staging new file still discards as staged-new', () => {
+  for (const worktree of ['M', 'D']) {
+    const { unstaged } = partitionChanges([change({ path: 'n.txt', index: 'A', worktree })]);
+    // The display kind is derived from the worktree letter...
+    assert.notEqual(unstaged[0].kind, 'added');
+    // ...but the discard request must still say HEAD has no copy of it.
+    assert.equal(unstaged[0].stagedNew, true);
+    assert.deepEqual(selectionsOf(unstaged), [
+      { path: 'n.txt', original: null, untracked: false, staged_new: true },
+    ]);
+  }
+});
+
 test('the line stats of an MM row are counted once, on the unstaged side', () => {
   const { staged, unstaged } = partitionChanges([
     change({ path: 'both.txt', index: 'M', worktree: 'M', stats: { additions: 4, deletions: 2 } }),

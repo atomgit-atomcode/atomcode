@@ -778,6 +778,15 @@ impl ChangesRequest {
         }
         self.paths.iter().map(ChangePath::discard).collect()
     }
+    /// Per-path entries for a discard. "Discard everything" addresses the whole
+    /// workspace, so it legitimately arrives with no paths and needs none.
+    fn discard_entries(&self) -> Result<Vec<DiscardEntry>, String> {
+        if self.all {
+            Ok(Vec::new())
+        } else {
+            self.discards()
+        }
+    }
 }
 
 async fn stage_paths(context: &GitWorkspace, paths: &[String]) -> Result<(), String> {
@@ -786,18 +795,33 @@ async fn stage_paths(context: &GitWorkspace, paths: &[String]) -> Result<(), Str
 
 async fn unstage_paths(context: &GitWorkspace, paths: &[String]) -> Result<(), String> {
     // Before the first commit there is no HEAD to reset against; dropping the
-    // index entry is the equivalent "unstage".
+    // index entry is the equivalent "unstage". `-f` is required because the
+    // staged copy and the file on disk legitimately differ (staged, then edited).
     if git_has_head(context).await? {
         git_on_paths(context, &["reset", "-q"], paths).await
     } else {
-        git_on_paths(context, &["rm", "-r", "--cached", "-q"], paths).await
+        git_on_paths(context, &["rm", "-r", "-f", "--cached", "-q"], paths).await
     }
 }
 
-/// Remove one workspace-relative file without following a symlink: a link is
-/// refused rather than resolved, so discarding never deletes its target.
+/// Remove one workspace-relative file without following a symlink: the parent
+/// directory is resolved so a symlinked directory cannot carry the delete out
+/// of the workspace, the final component is inspected unresolved, and a link is
+/// refused instead of being resolved to its target.
 fn remove_discarded_file(root: &Path, path: &str) -> Result<(), String> {
     let file = root.join(path);
+    let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
+        return Err("Only files can be discarded".into());
+    };
+    let parent = match parent.canonicalize() {
+        Ok(parent) => parent,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !parent.starts_with(root) {
+        return Err("Discarding cannot leave the workspace".into());
+    }
+    let file = parent.join(name);
     match std::fs::symlink_metadata(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -813,19 +837,10 @@ async fn discard_all_paths(context: &GitWorkspace, has_head: bool) -> Result<(),
     if !has_head {
         return Err("Discarding everything needs an initial commit".into());
     }
-    git_action(
-        &context.root,
-        &context.configs,
-        &[
-            "restore",
-            "--source=HEAD",
-            "--staged",
-            "--worktree",
-            "--",
-            ".",
-        ],
-    )
-    .await?;
+    // `reset --hard` also drops index entries for paths HEAD never had (the
+    // staged-new case), which `restore --source=HEAD` cannot describe; the
+    // `clean` that follows then removes those files from disk.
+    git_action(&context.root, &context.configs, &["reset", "--hard", "-q"]).await?;
     git_action(
         &context.root,
         &context.configs,
@@ -843,9 +858,14 @@ async fn discard_selected(
     for entry in entries {
         if entry.untracked || entry.staged_new || !has_head {
             // Nothing in HEAD to restore: drop the index entry (only a
-            // staged-new row has one) and remove the file itself.
-            if !entry.untracked {
-                let _ = git_on_paths(context, &["rm", "-r", "--cached", "-q"], &entry.paths).await;
+            // staged-new row has one) and remove the file itself. For a
+            // staged-new row the index entry must really go, so a failure is
+            // reported instead of leaving a half-discarded row behind.
+            if entry.staged_new {
+                git_on_paths(context, &["rm", "-r", "-f", "--cached", "-q"], &entry.paths).await?;
+            } else if !entry.untracked {
+                let _ = git_on_paths(context, &["rm", "-r", "-f", "--cached", "-q"], &entry.paths)
+                    .await;
             }
             let root = context.root.clone();
             let path = entry.paths.last().cloned().unwrap_or_default();
@@ -931,7 +951,9 @@ pub(super) async fn git_discard(
     if q.paths.len() > GIT_PATH_LIMIT {
         return bad("Too many files in one Git action");
     }
-    let entries = match q.discards() {
+    // Only per-path discards need entries; "discard everything" addresses the
+    // whole workspace and legitimately arrives with no paths.
+    let entries = match q.discard_entries() {
         Ok(entries) => entries,
         Err(e) => return bad(e),
     };
@@ -2131,5 +2153,130 @@ mod tests {
         assert_eq!(names, ["a.txt", "b.txt"]);
         assert!(diff.contains("+feature"), "{diff}");
         assert!(!files.is_empty(), "a merge commit must list its files");
+    }
+
+    #[test]
+    fn a_discard_everything_request_needs_no_paths() {
+        let all = ChangesRequest {
+            session_id: "s".into(),
+            paths: Vec::new(),
+            all: true,
+        };
+        assert!(all.discard_entries().unwrap().is_empty());
+        // The same request without `all` is still a mistake.
+        let nothing = ChangesRequest {
+            session_id: "s".into(),
+            paths: Vec::new(),
+            all: false,
+        };
+        assert!(nothing.discard_entries().is_err());
+    }
+
+    #[tokio::test]
+    async fn discarding_everything_drops_staged_new_files_too() {
+        let dir = fixture_repo();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "-qm", "baseline"]);
+        let context = git_workspace(root.clone()).await.unwrap();
+
+        std::fs::write(root.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(root.join("staged-new.txt"), "new\n").unwrap();
+        stage_paths(&context, &["staged-new.txt".to_owned()])
+            .await
+            .unwrap();
+        std::fs::write(root.join("untracked.txt"), "loose\n").unwrap();
+        assert_eq!(status_rows(&root).await.len(), 3);
+
+        discard_all_paths(&context, true).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "one\n"
+        );
+        assert!(!root.join("staged-new.txt").exists());
+        assert!(!root.join("untracked.txt").exists());
+        assert!(status_rows(&root).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unstaging_before_the_first_commit_survives_a_later_edit() {
+        let dir = fixture_repo();
+        let root = dir.path().canonicalize().unwrap();
+        let path = "draft.txt".to_owned();
+        std::fs::write(root.join(&path), "staged version\n").unwrap();
+        let context = git_workspace(root.clone()).await.unwrap();
+        stage_paths(&context, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        // Editing after staging makes the index and the file differ, which is
+        // the case plain `git rm --cached` refuses to drop.
+        std::fs::write(root.join(&path), "edited after staging\n").unwrap();
+
+        unstage_paths(&context, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+
+        let rows = status_rows(&root).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, "?");
+        assert_eq!(rows[0].worktree, "?");
+    }
+
+    #[tokio::test]
+    async fn discarding_refuses_a_path_reached_through_a_linked_directory() {
+        let dir = fixture_repo();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), "keep me\n").unwrap();
+        // Point a workspace entry at a directory outside the workspace root.
+        let linked_root = tempfile::tempdir().unwrap();
+        let linked = linked_root.path().canonicalize().unwrap();
+        std::fs::create_dir(linked.join("nested")).unwrap();
+        std::fs::write(linked.join("nested").join("victim.txt"), "keep me\n").unwrap();
+        let link = root.join("linkdir");
+        if !link_directory(&linked, &link) {
+            return; // needs developer mode or elevation on Windows
+        }
+
+        let error = remove_discarded_file(&root, "linkdir/nested/victim.txt").unwrap_err();
+        assert!(error.contains("leave the workspace"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(linked.join("nested").join("victim.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_staged_new_discard_reports_a_failed_index_removal() {
+        let dir = fixture_repo();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("kept.txt"), "kept\n").unwrap();
+        let context = git_workspace(root.clone()).await.unwrap();
+        // The row claims a staged-new entry that the index does not have: the
+        // failure must surface rather than leaving a half-discarded state.
+        let error = discard_selected(
+            &context,
+            &[DiscardEntry {
+                paths: vec!["missing.txt".to_owned()],
+                untracked: false,
+                staged_new: true,
+            }],
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is_empty());
     }
 }

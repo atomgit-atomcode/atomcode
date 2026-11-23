@@ -599,16 +599,16 @@
 .git-kind-added,
 .git-kind-untracked {
   color: var(--app-success-foreground, #2f7d55);
-  background: rgba(60, 150, 100, 0.16);
+  background: color-mix(in srgb, var(--app-success-foreground, #2f7d55) 16%, transparent);
 }
 .git-kind-deleted {
   color: var(--app-error-foreground, #bd4a51);
-  background: rgba(190, 60, 70, 0.14);
+  background: color-mix(in srgb, var(--app-error-foreground, #bd4a51) 14%, transparent);
 }
 .git-kind-renamed,
 .git-kind-copied {
   color: var(--app-link-color, #4daafc);
-  background: rgba(77, 170, 252, 0.16);
+  background: color-mix(in srgb, var(--app-link-color, #4daafc) 16%, transparent);
 }
 .git-kind-conflicted {
   color: var(--app-primary-foreground, #fff);
