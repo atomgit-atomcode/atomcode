@@ -1089,24 +1089,20 @@ fn same_mention_after_edit(previous: &str, current: &str) -> bool {
     longer.get(edit_start + edit_len..) == Some(&shorter[edit_start..])
 }
 
-/// What follows a leading `$` or `¥` while a skill is being named.
+/// What follows a leading skill marker while a skill is being named.
 ///
 /// Only the first character has this meaning. Once whitespace appears the
 /// skill has been named and the rest is its task, so the discovery menu closes.
 fn skill_prefix(input: &str) -> Option<&str> {
-    let rest = input
-        .strip_prefix('$')
-        .or_else(|| input.strip_prefix('¥'))?;
+    let rest = atomcode_capabilities::skills::strip_skill_marker(input)?;
     (!rest.chars().any(char::is_whitespace)).then_some(rest)
 }
 
 /// Turn the composer spelling into the existing `/skills` gateway command.
-/// Preserve secondary $/¥ references: the shared gateway validates them all
+/// Preserve secondary marked references: the shared gateway validates them all
 /// before queuing, rather than silently treating an unknown name as task text.
 fn skill_command(input: &str, known: impl FnOnce(&str) -> bool) -> Option<String> {
-    let rest = input
-        .strip_prefix('$')
-        .or_else(|| input.strip_prefix('¥'))?;
+    let rest = atomcode_capabilities::skills::strip_skill_marker(input)?;
     let rest = rest.trim();
     let name = rest.split_whitespace().next()?;
     known(name).then(|| format!("/skills {rest}"))
@@ -9061,9 +9057,8 @@ impl Tui {
                     }
                 }
                 // `$name [task]` is the compact spelling of `/skills name
-                // [task]`. `¥` is accepted only as a keyboard/input alias; a
-                // menu pick has already normalised it to `$`, while a fully
-                // typed `¥name` reaches the same gateway here. The marker must
+                // [task]`. A menu pick normalises either yen sign to `$`, and
+                // a fully typed shortcut reaches the same gateway. The marker must
                 // be the first character (see `skill_prefix`), so currency and
                 // shell variables in ordinary prose remain ordinary prose.
                 let described = self.client.described();
@@ -11089,9 +11084,8 @@ impl Tui {
         self.refresh_menu();
     }
 
-    /// Replace either leading skill-picker spelling with the canonical `$name`
-    /// form and leave room for the task. Selection never preserves `¥`: it is
-    /// an input alias for keyboards that produce it, not a second wire syntax.
+    /// Replace the leading skill-picker spelling with the canonical `$name`
+    /// form and leave room for the task.
     fn complete_skill(&self, picked: &str) {
         let name = picked.trim_start_matches('$');
         let text = format!("${name} ");
@@ -18385,7 +18379,11 @@ mod skills_menu_tests {
     #[test]
     fn a_leading_dollar_or_yen_opens_the_same_fuzzy_skill_menu() {
         let (host, tui) = screen();
-        for typed in ["$od", "¥od"] {
+        type_line(&host, "￥");
+        tui.refresh_menu();
+        assert!(host.menu_open());
+
+        for typed in ["$od", "¥od", "￥od"] {
             type_line(&host, typed);
             tui.refresh_menu();
             assert_eq!(
@@ -18395,7 +18393,14 @@ mod skills_menu_tests {
             );
         }
 
-        for typed in ["use $od", "use ¥od", "$code task", "¥code task"] {
+        for typed in [
+            "use $od",
+            "use ¥od",
+            "use ￥od",
+            "$code task",
+            "¥code task",
+            "￥code task",
+        ] {
             type_line(&host, typed);
             tui.refresh_menu();
             assert!(
@@ -18408,14 +18413,16 @@ mod skills_menu_tests {
     #[test]
     fn taking_a_yen_skill_match_normalises_it_to_dollar() {
         let (host, tui) = screen();
-        type_line(&host, "¥od");
-        tui.refresh_menu();
-        assert!(!tui.take_command("$code", &tui.client));
-        let m = host.moment.read().expect("moment poisoned");
-        assert_eq!(m.input, "$code ");
-        assert_eq!(m.caret, m.input.len());
-        drop(m);
-        assert!(!host.menu_open(), "the following words are the skill task");
+        for typed in ["¥od", "￥od"] {
+            type_line(&host, typed);
+            tui.refresh_menu();
+            assert!(!tui.take_command("$code", &tui.client));
+            let m = host.moment.read().expect("moment poisoned");
+            assert_eq!(m.input, "$code ");
+            assert_eq!(m.caret, m.input.len());
+            drop(m);
+            assert!(!host.menu_open(), "the following words are the skill task");
+        }
     }
 
     #[test]
@@ -18439,6 +18446,10 @@ mod skills_menu_tests {
         assert_eq!(
             skill_command("¥code ¥review task", known),
             Some("/skills code ¥review task".into())
+        );
+        assert_eq!(
+            skill_command("￥code ￥review task", known),
+            Some("/skills code ￥review task".into())
         );
         assert_eq!(
             skill_command("$code $unknown task", known),

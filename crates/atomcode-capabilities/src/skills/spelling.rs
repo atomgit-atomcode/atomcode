@@ -11,7 +11,7 @@ pub struct Boundary<'a> {
 pub fn invocation_boundary(args: &str, known: impl Fn(&str) -> bool) -> Option<Boundary<'_>> {
     let mut after_skill = false;
     for token in args.split_whitespace() {
-        let explicit = token.strip_prefix('$').or_else(|| token.strip_prefix('¥'));
+        let explicit = super::strip_skill_marker(token);
         let word = explicit.unwrap_or(token);
         if !known(word) {
             return Some(Boundary {
@@ -165,5 +165,9 @@ mod tests {
         assert!(boundary.explicit);
         assert!(task_candidates(&boundary, ["review"]).is_empty());
         assert!(invocation_boundary("plan $review", known).is_none());
+        assert!(invocation_boundary("plan ￥review", known).is_none());
+        let boundary = invocation_boundary("plan ￥reveiw task", known).unwrap();
+        assert_eq!(boundary.word, "reveiw");
+        assert!(boundary.explicit);
     }
 }
