@@ -19172,12 +19172,29 @@ mod session_mention_tests {
     /// stale — and when browsing ends on the same token, the menu stays away.
     #[test]
     fn browsing_leaves_the_declined_token_alone() {
+        use atomcode_capabilities::file_index::Entry;
+
         let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        let cwd = std::path::PathBuf::from("workspace");
         {
             let mut moment = host.moment.write().unwrap();
+            moment.cwd = cwd.to_string_lossy().into_owned();
             moment.input = "@atomcode notes".into();
             moment.caret = "@atomcode".len();
         }
+        *tui.files.lock().unwrap() = Some((
+            cwd.clone(),
+            super::FileIndex::from_entries(
+                cwd,
+                vec![Entry {
+                    rel_path: "atomcode.rs".into(),
+                    is_dir: false,
+                    depth: 1,
+                }],
+            ),
+        ));
+        tui.refresh_menu();
+        assert_eq!(host.menu_selected().as_deref(), Some("@atomcode.rs"));
         tui.decline_current_mention();
         tui.refresh_menu();
         assert!(!host.menu_open(), "the declined token holds the menu down");
@@ -19230,8 +19247,8 @@ mod session_mention_tests {
         assert!(!host.menu_open(), "the declined token holds the menu down");
         assert!(tui.mention_declined.lock().unwrap().is_some());
 
-        // Second Esc (no menu up now) rides the action path and clears the
-        // line; the record goes with it.
+        // The next two Esc presses reach the composer. The first arms the
+        // double tap, and the second clears the line and the decline record.
         tui.act(crate::keymap::Action::Escape, &tui.client);
         tui.act(crate::keymap::Action::Escape, &tui.client);
         {
