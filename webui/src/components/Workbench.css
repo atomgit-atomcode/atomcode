@@ -911,7 +911,8 @@ html[data-theme="dark"] .workbench {
 /* Keep content mounted so drafts, selections and scroll positions survive. */
 .workbench-content-maximized .workbench-path,
 .workbench-content-maximized .workbench-tree,
-.workbench-content-maximized .workbench-git-list {
+.workbench-content-maximized .workbench-git-list,
+.workbench-content-maximized .workbench-git-caption {
   display: none;
 }
 .workbench-diff-actions > span {

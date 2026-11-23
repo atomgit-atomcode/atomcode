@@ -61,6 +61,9 @@ export function WorkbenchGit({
   const text = (zhText: string, enText: string) => (zh ? zhText : enText);
   const [changes, setChanges] = useState<Change[]>([]);
   const [branches, setBranches] = useState<GitBranchList | null>(null);
+  // The branch list can fail on its own (a broken HEAD, for instance) while the
+  // change list is perfectly fine; that is not "not a repository".
+  const [branchesFailed, setBranchesFailed] = useState(false);
   const [history, setHistory] = useState<GitLogEntry[]>([]);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [detail, setDetail] = useState<GitCommitDetail | null>(null);
@@ -96,6 +99,7 @@ export function WorkbenchGit({
           setError(absent ? "" : String(changesResult.reason));
           setChanges([]);
           setBranches(null);
+          setBranchesFailed(branchesResult.status === "rejected");
           setHistory([]);
           setSelection(null);
           return;
@@ -109,6 +113,7 @@ export function WorkbenchGit({
             : [];
         setChanges(rows);
         setBranches(branchesResult.status === "fulfilled" ? branchesResult.value : null);
+        setBranchesFailed(branchesResult.status === "rejected");
         setHistory(commits);
         if (requested && appliedRequest.current !== requested.seq) {
           appliedRequest.current = requested.seq;
@@ -252,15 +257,17 @@ export function WorkbenchGit({
 
   const now = Math.floor(Date.now() / 1000);
   const nothingToShow = !changes.length && !history.length && !error;
-  // `branches === null` means "not loaded yet" or "not a repository", which is
-  // not the same thing as a detached HEAD.
+  // `branches === null` covers three different situations: not loaded yet, not
+  // a repository, and "the branch list failed on its own".
   const branchLabel = branches
     ? branches.detached
       ? text("游离 HEAD", "Detached HEAD")
       : (branches.current ?? text("未命名分支", "Unnamed branch"))
     : loading
       ? text("读取中…", "Loading…")
-      : text("不在仓库中", "Not a repository");
+      : branchesFailed
+        ? text("分支未知", "Branch unknown")
+        : text("不在仓库中", "Not a repository");
 
   return (
     <div class="workbench-git">
@@ -675,7 +682,7 @@ function ChangeSection({
                           ＋
                         </button>
                       )}
-                      {!staged && entry.kind !== "deleted" && (
+                      {!staged && entry.kind !== "conflicted" && (
                         <button
                           disabled={busy}
                           title={zh ? "丢弃更改" : "Discard changes"}

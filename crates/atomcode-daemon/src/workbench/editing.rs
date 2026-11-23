@@ -144,6 +144,11 @@ pub(super) async fn save(State(state): State<AppState>, Json(q): Json<Save>) -> 
 }
 
 const GIT_LIMIT: u64 = 1024 * 1024;
+/// One commit's patch can legitimately exceed the per-query cap, so it gets its
+/// own bound and its own explanation instead of a "narrow the changes" hint.
+const GIT_COMMIT_LIMIT: u64 = 8 * 1024 * 1024;
+const GIT_OVERFLOW_MESSAGE: &str = "Git output exceeded its size limit; narrow the changes";
+const GIT_COMMIT_OVERFLOW_MESSAGE: &str = "This commit is too large to show in the panel";
 /// Queries answer or fail quickly; a user action may legitimately take longer
 /// (hooks, large restores, a slow filesystem).
 const GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -167,6 +172,8 @@ async fn git_raw(
     args: &[&str],
     timeout: Duration,
     timeout_message: &str,
+    limit: u64,
+    overflow_message: &str,
 ) -> Result<GitOutput, String> {
     let mut command = tokio::process::Command::new("git");
     command.args([
@@ -201,7 +208,7 @@ async fn git_raw(
     let result = tokio::time::timeout(timeout, async {
         let collect = async {
             let mut bytes = Vec::new();
-            stdout.take(GIT_LIMIT + 1).read_to_end(&mut bytes).await?;
+            stdout.take(limit + 1).read_to_end(&mut bytes).await?;
             Ok::<_, std::io::Error>(bytes)
         };
         let errors = async {
@@ -214,8 +221,8 @@ async fn git_raw(
     .await;
     match result {
         Ok(Ok((stdout, stderr, status))) => {
-            if stdout.len() as u64 > GIT_LIMIT || stderr.len() > 8192 {
-                return Err("Git output exceeded its size limit; narrow the changes".into());
+            if stdout.len() as u64 > limit || stderr.len() > 8192 {
+                return Err(overflow_message.to_owned());
             }
             Ok(GitOutput {
                 code: status.code(),
@@ -233,12 +240,51 @@ async fn git_raw(
 /// Read-only query: exit code 1 is a normal "no result" answer for `git diff
 /// --quiet`-style probes, and its stderr is not a failure worth reporting.
 async fn git(root: &Path, configs: &[String], args: &[&str]) -> Result<(bool, Vec<u8>), String> {
+    git_bounded(
+        root,
+        configs,
+        args,
+        GIT_LIMIT,
+        GIT_OVERFLOW_MESSAGE,
+        GIT_QUERY_TIMEOUT,
+        GIT_QUERY_TIMEOUT_MESSAGE,
+    )
+    .await
+}
+/// A read-only query whose output is legitimately large (one commit's patch).
+async fn git_commit_output(
+    root: &Path,
+    configs: &[String],
+    args: &[&str],
+) -> Result<(bool, Vec<u8>), String> {
+    git_bounded(
+        root,
+        configs,
+        args,
+        GIT_COMMIT_LIMIT,
+        GIT_COMMIT_OVERFLOW_MESSAGE,
+        GIT_ACTION_TIMEOUT,
+        GIT_QUERY_TIMEOUT_MESSAGE,
+    )
+    .await
+}
+async fn git_bounded(
+    root: &Path,
+    configs: &[String],
+    args: &[&str],
+    limit: u64,
+    overflow_message: &str,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<(bool, Vec<u8>), String> {
     let output = git_raw(
         root,
         configs,
         args,
-        GIT_QUERY_TIMEOUT,
-        GIT_QUERY_TIMEOUT_MESSAGE,
+        timeout,
+        timeout_message,
+        limit,
+        overflow_message,
     )
     .await?;
     if !output.success() && output.code != Some(1) {
@@ -255,6 +301,8 @@ async fn git_action(root: &Path, configs: &[String], args: &[&str]) -> Result<Ve
         args,
         GIT_ACTION_TIMEOUT,
         GIT_ACTION_TIMEOUT_MESSAGE,
+        GIT_LIMIT,
+        GIT_OVERFLOW_MESSAGE,
     )
     .await?;
     if !output.success() {
@@ -837,17 +885,44 @@ async fn discard_all_paths(context: &GitWorkspace, has_head: bool) -> Result<(),
     if !has_head {
         return Err("Discarding everything needs an initial commit".into());
     }
-    // `reset --hard` also drops index entries for paths HEAD never had (the
-    // staged-new case), which `restore --source=HEAD` cannot describe; the
-    // `clean` that follows then removes those files from disk.
-    git_action(&context.root, &context.configs, &["reset", "--hard", "-q"]).await?;
-    git_action(
+    // The workspace may be a subdirectory of a larger repository, so a bare
+    // `reset --hard` would also clear changes outside it. Discard exactly the
+    // rows `git status` reports for this workspace instead.
+    let (ok, bytes) = git(
         &context.root,
         &context.configs,
-        &["clean", "-f", "-d", "-q", "--", "."],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+            "--",
+            ".",
+        ],
     )
     .await?;
-    Ok(())
+    if !ok {
+        return Err("Unable to read Git status".into());
+    }
+    let entries = discard_entries_from_status(parse_status(&bytes, context)?);
+    discard_selected(context, &entries, has_head).await
+}
+
+/// `A` and `C` put a path in the index that HEAD never held; untracked rows
+/// have no index entry at all. Both need the delete path rather than a restore.
+fn discard_entries_from_status(changes: Vec<Change>) -> Vec<DiscardEntry> {
+    changes
+        .into_iter()
+        .map(|change| DiscardEntry {
+            paths: match change.original.clone() {
+                Some(original) => vec![original, change.path],
+                None => vec![change.path],
+            },
+            untracked: change.index == "?",
+            staged_new: matches!(change.index.as_str(), "A" | "C"),
+        })
+        .collect()
 }
 
 async fn discard_selected(
@@ -857,15 +932,11 @@ async fn discard_selected(
 ) -> Result<(), String> {
     for entry in entries {
         if entry.untracked || entry.staged_new || !has_head {
-            // Nothing in HEAD to restore: drop the index entry (only a
-            // staged-new row has one) and remove the file itself. For a
-            // staged-new row the index entry must really go, so a failure is
-            // reported instead of leaving a half-discarded row behind.
-            if entry.staged_new {
+            // Nothing in HEAD to restore: drop the index entry (untracked rows
+            // have none) and remove the file itself. A failure here would leave
+            // a half-discarded row, so it is reported rather than swallowed.
+            if !entry.untracked {
                 git_on_paths(context, &["rm", "-r", "-f", "--cached", "-q"], &entry.paths).await?;
-            } else if !entry.untracked {
-                let _ = git_on_paths(context, &["rm", "-r", "-f", "--cached", "-q"], &entry.paths)
-                    .await;
             }
             let root = context.root.clone();
             let path = entry.paths.last().cloned().unwrap_or_default();
@@ -1223,7 +1294,7 @@ async fn commit_detail(context: &GitWorkspace, rev: &str) -> Result<(Vec<Change>
     // One command family for list, stats and patch, so they always cover the
     // same revision range: `show` renders the root commit in full and, with
     // `--first-parent`, diffs a merge against its first parent only.
-    let (ok, bytes) = git(
+    let (ok, bytes) = git_commit_output(
         &context.root,
         &context.configs,
         &[
@@ -1243,7 +1314,7 @@ async fn commit_detail(context: &GitWorkspace, rev: &str) -> Result<(Vec<Change>
         return Err("Unable to read this commit".into());
     }
     let mut changes = parse_name_status(&bytes, context)?;
-    if let Ok((ok, numstat)) = git(
+    if let Ok((ok, numstat)) = git_commit_output(
         &context.root,
         &context.configs,
         &[
@@ -1268,7 +1339,7 @@ async fn commit_detail(context: &GitWorkspace, rev: &str) -> Result<(Vec<Change>
             }
         }
     }
-    let (_, diff) = git(
+    let (_, diff) = git_commit_output(
         &context.root,
         &context.configs,
         &[
@@ -2278,5 +2349,60 @@ mod tests {
         .await
         .unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn status_rows_map_to_discard_entries() {
+        let row = |path: &str, original: Option<&str>, index: &str, worktree: &str| Change {
+            path: path.to_owned(),
+            original: original.map(str::to_owned),
+            index: index.to_owned(),
+            worktree: worktree.to_owned(),
+            stats: None,
+        };
+        let entries = discard_entries_from_status(vec![
+            row("new.txt", None, "A", " "),
+            row("copied.txt", None, "C", " "),
+            row("new name.txt", Some("old name.txt"), "R", " "),
+            row("loose.txt", None, "?", "?"),
+            row("tracked.txt", None, " ", "M"),
+        ]);
+        assert!(entries[0].staged_new, "A has no HEAD copy");
+        assert!(entries[1].staged_new, "C has no HEAD copy either");
+        assert_eq!(
+            entries[2].paths,
+            vec!["old name.txt".to_owned(), "new name.txt".to_owned()]
+        );
+        assert!(!entries[2].staged_new);
+        assert!(entries[3].untracked);
+        assert!(!entries[4].untracked && !entries[4].staged_new);
+    }
+
+    #[tokio::test]
+    async fn discarding_everything_stays_inside_the_workspace_subdirectory() {
+        let dir = fixture_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        std::fs::write(repo.join("outside.txt"), "outside one\n").unwrap();
+        std::fs::create_dir(repo.join("workspace")).unwrap();
+        std::fs::write(repo.join("workspace").join("inside.txt"), "inside one\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "baseline"]);
+
+        // Both files change, but only the workspace subdirectory is in scope.
+        std::fs::write(repo.join("outside.txt"), "outside two\n").unwrap();
+        std::fs::write(repo.join("workspace").join("inside.txt"), "inside two\n").unwrap();
+        let context = git_workspace(repo.join("workspace")).await.unwrap();
+
+        discard_all_paths(&context, true).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("outside.txt")).unwrap(),
+            "outside two\n",
+            "the rest of the repository must keep its changes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("workspace").join("inside.txt")).unwrap(),
+            "inside one\n"
+        );
     }
 }

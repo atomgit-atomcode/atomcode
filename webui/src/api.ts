@@ -1632,9 +1632,10 @@ export function switchGitBranch(session: string, name: string, create = false) {
   return gitAction(session, 'branch', { name, create });
 }
 export async function readGitLog(session: string, limit = 30): Promise<GitLogEntry[]> {
-  // The daemon rejects anything outside 1–100; clamp here so a caller asking
-  // for "everything" degrades to the maximum page instead of failing the panel.
-  const bounded = Math.min(100, Math.max(1, Math.trunc(limit) || 30));
+  // The daemon rejects anything outside 1–100. A finite override is clamped
+  // into that window (0 becomes 1, not the default page); only a non-finite
+  // value falls back to the default.
+  const bounded = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.trunc(limit))) : 30;
   return workbenchRequest<GitLogEntry[]>('git/log?' + new URLSearchParams({ session_id: session, limit: String(bounded) }));
 }
 export async function readGitCommit(session: string, rev: string): Promise<GitCommitDetail> {

@@ -72,6 +72,7 @@ const binary =
   process.platform === "win32" && !daemonBinary.endsWith(".exe") && existsSync(daemonBinary + ".exe")
     ? daemonBinary + ".exe"
     : daemonBinary;
+let failed = false;
 const daemon = spawn(binary, ["--port", String(port), "--no-telemetry"], {
   cwd: root,
   env: {
@@ -86,9 +87,14 @@ const daemon = spawn(binary, ["--port", String(port), "--no-telemetry"], {
 let log = "";
 daemon.stdout.on("data", (b) => (log += b));
 daemon.stderr.on("data", (b) => (log += b));
+// Without this listener a missing binary emits an unhandled 'error' event,
+// which skips the try/catch (and the cleanup) entirely.
+daemon.on("error", (e) => {
+  failed = true;
+  log += `daemon did not start (${e.message}); build it with \`cargo build -p atomcode-daemon\` or point WORKBENCH_DAEMON at the binary\n`;
+});
 
 let browser;
-let failed = false;
 async function api(path, body, method) {
   return fetch(base + path, {
     method: method || (body ? "POST" : "GET"),

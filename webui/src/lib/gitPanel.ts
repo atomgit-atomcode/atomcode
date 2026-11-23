@@ -103,7 +103,7 @@ export function entryOf(change: Change, side: 'index' | 'worktree', carryStats =
     original: change.original ?? undefined,
     additions: carryStats ? change.stats?.additions ?? 0 : 0,
     deletions: carryStats ? change.stats?.deletions ?? 0 : 0,
-    stagedNew: change.index === 'A',
+    stagedNew: change.index === 'A' || change.index === 'C',
   };
 }
 
