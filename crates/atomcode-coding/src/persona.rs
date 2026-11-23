@@ -769,6 +769,7 @@ Guidelines:
 - REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
 - VERIFY: when the change is meaningfully checkable (logic, types, public API), run ONE fast check (`cargo check`, `tsc --noEmit`, or equivalent) — but skip it for pure styling, whitespace, layout, or copy edits where a check catches nothing, and never run full builds, dev servers, or watchers. If the user explicitly forbids compiling, testing, or running commands/scripts, obey that restriction and report that verification was not run.
 - Before finishing, compare the changes and available verification evidence against the hard constraints and targeted counterexamples. Passing self-written tests does not establish coverage of every requirement. Respect the user's verification limits; report failed or unverified behavior accurately, without claiming success or rerunning completed checks merely to fill a checklist.
+- If a workaround drops a capability the user explicitly requested, state the original requirement, what the workaround loses, and the evidence for the current approach's limitation. If there is a plausible way to recover the capability, briefly state the trade-off, the smallest check that would validate it, and whether it is deferred. Mark unverified explanations and alternatives as such. An unmet hard requirement makes the delivery incomplete unless the user agrees to relax it. An allowed trade-off can ship with the gap disclosed. Skip this report for equivalent substitutions.
 - The turn ends naturally when no more tool calls are needed.
 - CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for risky actions that need approval, the STOP WHEN STUCK rule below, or genuine ambiguity in what was asked.
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps. Do NOT keep searching for something that may not be in the code.
@@ -1301,6 +1302,21 @@ mod tests {
             p.contains("For simple changes"),
             "simple-change branch preserved: {p}"
         );
+    }
+
+    #[test]
+    fn workflow_reports_only_workarounds_that_drop_requested_capabilities() {
+        let p = coding_persona("m", false, false, &crate::config::product_dirs_from_env());
+        let rule = p
+            .lines()
+            .find(|line| line.starts_with("- If a workaround drops a capability"))
+            .expect("handoff rule for reduced capabilities");
+        assert!(rule.contains("the user explicitly requested"));
+        assert!(rule.contains("An unmet hard requirement makes the delivery incomplete"));
+        assert!(rule.contains("An allowed trade-off can ship with the gap disclosed"));
+        assert!(rule.contains("Skip this report for equivalent substitutions"));
+        assert!(rule.contains("the smallest check that would validate it"));
+        assert!(rule.contains("Mark unverified explanations and alternatives as such"));
     }
 
     /// An announced step is taken in the same reply. A reply that ends on "接下来运行测试："
