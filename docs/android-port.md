@@ -3084,6 +3084,42 @@ found`，唯一带语音的只有百度输入法（`com.baidu.input_oppo`），�
   whisper.cpp（NDK）、随包携带模型权重（几十 MB）、发布到市场。这三件都不在本轮范围内，
   所以文档不写「已支持本地转写」，只写契约已经就位、缺的是那个包。
 
+**2026-11-24 安全复核与修复（评审提出 5 条，复核后确认 5 条成立）**
+
+对 `e115a2fbb` 做了只读安全评审。评审工具本身只完成 0/4 批次，其 7 条候选发现里有 2 条经手工
+复核与代码实际不符（命令注入、包名来自请求体——实际来自已装插件清单且有 `is_package_name`
+校验），其余 5 条成立并已修：
+
+- **录音线程 use-after-release（会崩进程）**：`stop()` 原先先 `recorder.release()` 再
+  `join` 录音线程，而线程阻塞在 `recorder.read()` 上——release 会让它抛
+  `IllegalStateException`，线程没有 handler，异常直接杀掉进程。改为：先 `stop()`（让
+  `read` 返回错误）、等线程退出、再 `release()`；`read()` 另加异常保护。
+- **`discard()` 恒删不掉文件**：`stop()` 内部已把 `output` 置空，`discard()` 回来读
+  `output` 必为 null，`file?.delete()` 恒 false。改为持有 `lastTake`，并在页面转写结束
+  （成功或失败）时真正调用 `discardVoiceRecording()`——此前该方法在 webui 里**没有任何
+  调用点**。
+- **转写路径未收敛（任意文件可被外发）**：路由只校验绝对路径 + `RIFF`/`WAVE` 头 + 大小
+  上限。但 `RIFF….WAVE` 是谁都能写的四个字节，头部校验拦不住「把机器上任意文件发给模型
+  供应商」。改为：`canonicalize` 两侧后要求录音**必须位于产品目录的 `voice/` 下**（与
+  `/workbench/preview` 的工作区收敛同一形状）。录音目录因此从 `cacheDir/voice` 移到
+  `filesDir/atomcode/voice`——daemon 已通过 `ATOMCODE_HOME` 知道产品目录，两侧无需新增
+  通道即可对上。
+- **麦克风音频无限期残留**：转写成功后 daemon 不删文件、页面不删文件、`discard()` 是死
+  代码。现在转写结束即删；另有按龄清扫兜底（超过 24 小时的录音在能力探测时被清掉），
+  覆盖「app 在录音中被杀」这类走不到正常收尾的情况。
+- **`startRecording()` 无异常保护**：构造器与 `stop()` 都包了异常，唯独它没包——异常会
+  逃进 JS 桥接线程；且此时 `isRecording` 已置 true 而录音器永不释放，之后每次 `start()`
+  恒返回 `busy`。改为捕获后复位状态、释放资源、删除空文件。
+
+判据：`a_recording_outside_the_voice_directory_is_refused`（含目录外文件与 `..` 穿越两例）、
+`a_stale_recording_is_swept_and_a_fresh_one_is_kept`、`only_a_real_wav_recording_is_accepted`
+（改用可注入根目录的版本）等，语音单测 9/9。
+
+顺带记一条环境事实：共享 `target/` 会因两个分支先后构建而串味——另一分支的
+`atomcode-i18n` 产物被覆盖后，本分支的 `atomcode-tui` 会报
+`TranscriptInitAcknowledgement` 不存在（源文件里它是有的）。`touch` 一下
+`crates/atomcode-i18n/src/screen/messages.rs` 强制重建即恢复，不是代码问题。
+
 **2026-11-24 真机复核（PLT140 / Android 16，本分支构建的 APK）**
 
 三层都在真机上跑过一遍。宿主侧用一次性 `ATOMCODE_HOME` 起一个 mock

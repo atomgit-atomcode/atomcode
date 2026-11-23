@@ -85,6 +85,7 @@ import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
 import { PolicyInterventionCard } from './PolicyInterventionCard';
 import {
+  discardVoiceRecording,
   hasAndroidHost,
   openWithHost,
   startVoiceInput,
@@ -3782,6 +3783,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         t('chat.voiceFailed', { error: error instanceof Error ? error.message : String(error) }),
       );
     } finally {
+      // The take has served its purpose either way. Leaving it in the app's
+      // cache would keep raw microphone audio around indefinitely for a
+      // transcript that already exists — so it goes now, not "later".
+      discardVoiceRecording();
       setVoicePhase('idle');
     }
   }

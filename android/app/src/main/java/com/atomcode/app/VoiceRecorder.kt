@@ -1,7 +1,6 @@
 package com.atomcode.app
 
 import android.annotation.SuppressLint
-import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -27,11 +26,20 @@ import java.io.RandomAccessFile
  * recording that stops on its own cuts the person off mid-sentence and there is no
  * way to know how long a sentence is.
  */
-class VoiceRecorder(private val context: Context) {
+class VoiceRecorder(private val directory: File) {
     private var record: AudioRecord? = null
     private var pump: Thread? = null
     private var sink: RandomAccessFile? = null
     private var output: File? = null
+    /**
+     * The last finished take, kept after [stop] handed it out.
+     *
+     * `stop()` clears `output` because the file is no longer being written — but
+     * the recording is not gone: the page still has to transcribe it, and if it
+     * changes its mind the file must be removable. Holding it here is what lets
+     * [discard] actually delete something.
+     */
+    private var lastTake: File? = null
 
     /** Whether audio is being captured right now. */
     @Volatile
@@ -70,7 +78,7 @@ class VoiceRecorder(private val context: Context) {
             return "unavailable"
         }
 
-        val dir = File(context.cacheDir, RECORDINGS_DIR).apply { mkdirs() }
+        val dir = File(directory, RECORDINGS_DIR).apply { mkdirs() }
         val file = File(dir, "voice-${System.currentTimeMillis()}.wav")
         val handle = try {
             RandomAccessFile(file, "rw").apply {
@@ -88,7 +96,24 @@ class VoiceRecorder(private val context: Context) {
         sink = handle
         output = file
         isRecording = true
-        recorder.startRecording()
+        try {
+            recorder.startRecording()
+        } catch (error: Exception) {
+            // The recorder opened but could not begin: the microphone may be
+            // held by another app, or the device may refuse the source. Leaving
+            // the state half-set would make every later `start()` answer
+            // "busy" forever, and the exception would otherwise escape into the
+            // JavaScript bridge thread and take the process with it.
+            Log.w(TAG, "cannot start recording", error)
+            isRecording = false
+            record = null
+            sink = null
+            output = null
+            runCatching { recorder.release() }
+            runCatching { handle.close() }
+            file.delete()
+            return "unavailable"
+        }
         pump = Thread({ pumpAudio(recorder, handle) }, "atomcode-voice").apply {
             isDaemon = true
             start()
@@ -101,6 +126,11 @@ class VoiceRecorder(private val context: Context) {
     fun stop(): File? {
         if (!isRecording) return null
         isRecording = false
+        // Order matters: the pump thread is blocked in `recorder.read()`. Releasing
+        // the recorder first makes that call throw `IllegalStateException` on a
+        // thread with no handler — the exception kills the process, not just the
+        // recording. So: stop the recorder (which unblocks `read` with an error
+        // return), let the thread notice and exit, and only then release.
         record?.let { recorder ->
             try {
                 recorder.stop()
@@ -109,11 +139,13 @@ class VoiceRecorder(private val context: Context) {
                 // throws in practice on some devices; the file still stands.
                 Log.w(TAG, "the recorder had already stopped", error)
             }
-            recorder.release()
         }
-        record = null
-        pump?.join(1_000)
+        // The thread checks `isRecording` between reads, so it exits promptly; the
+        // join is bounded in case a read is stuck in the driver.
+        pump?.join(2_000)
         pump = null
+        record?.release()
+        record = null
         val handle = sink
         sink = null
         val file = output
@@ -132,15 +164,26 @@ class VoiceRecorder(private val context: Context) {
         if (length <= WAV_HEADER_BYTES) {
             file.delete()
             Log.i(TAG, "the take was empty, so there is nothing to transcribe")
+            lastTake = null
             return null
         }
+        // Remember it: the page may still change its mind and discard it.
+        lastTake = file
         return file
     }
 
     private fun pumpAudio(recorder: AudioRecord, handle: RandomAccessFile) {
         val buffer = ByteArray(SAMPLE_RATE / 4)
         while (isRecording) {
-            val read = recorder.read(buffer, 0, buffer.size)
+            val read = try {
+                recorder.read(buffer, 0, buffer.size)
+            } catch (error: IllegalStateException) {
+                // The recorder was released while this read was in flight. That is
+                // how `stop()` ends the take; it is not a failure to report, and
+                // letting it escape would kill the process.
+                Log.w(TAG, "the microphone was closed while reading", error)
+                return
+            }
             if (read <= 0) {
                 if (read < 0) Log.w(TAG, "the microphone returned $read")
                 continue
@@ -187,8 +230,16 @@ class VoiceRecorder(private val context: Context) {
 
     /** Drop a take that the page never collected (a cancelled recording). */
     fun discard(): Boolean {
-        if (isRecording) stop()
-        val file = output
+        // `stop()` clears `output` (the file is no longer being written) and hands
+        // the finished file back. The file to delete is therefore `lastTake` —
+        // reading `output` here would find null and silently delete nothing.
+        val file = if (isRecording) {
+            stop()
+            lastTake
+        } else {
+            output ?: lastTake
+        }
+        lastTake = null
         output = null
         return file?.delete() ?: false
     }

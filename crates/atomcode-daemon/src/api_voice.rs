@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use atomcode_config::config::Config;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 
 use crate::json_error;
@@ -43,6 +43,9 @@ pub(crate) struct ModelVoiceSource {
 /// has nothing to fall back to, and the page says so instead of offering a
 /// button that fails.
 pub(crate) async fn capabilities() -> impl IntoResponse {
+    // Cheap and idempotent: the sweep is what keeps a recording that was never
+    // transcribed from living forever.
+    sweep_stale_recordings();
     let config = crate::api_config::load_config().unwrap_or_default();
     Json(serde_json::json!({
         "success": true,
@@ -56,6 +59,13 @@ pub(crate) async fn capabilities() -> impl IntoResponse {
 /// The path rather than the bytes: the app records in its own process and the
 /// daemon shares that filesystem, so a 2 MB upload over loopback would be copies
 /// of a file both sides already have.
+///
+/// The path is nevertheless **constrained**: it has to resolve inside the
+/// product tree's `voice/` directory. Without that, the route would read any
+/// file the daemon can see and hand it to a model provider — and a `RIFF` header
+/// is not a permission, it is four bytes anybody can write. The constraint is
+/// the same shape as the workspace route's (`/workbench/preview`): canonicalize
+/// both sides, then require containment.
 ///
 /// The engine is picked here rather than by the page, because only this side
 /// knows what is installed and configured: a local package wins over a network
@@ -78,8 +88,19 @@ pub(crate) async fn transcribe(Json(request): Json<TranscribeRequest>) -> impl I
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
     };
 
+    // The recording has served its purpose once it has been transcribed, so it
+    // goes either way. Keeping raw microphone audio around after the transcript
+    // exists is a privacy liability with no upside: the transcript is what the
+    // person wanted, and the WAV is a second copy of their voice.
+    let response = transcribe_audio(&path, &audio).await;
+    let _ = std::fs::remove_file(&path);
+    response
+}
+
+/// Read the audio once, then hand it to whichever engine is available.
+async fn transcribe_audio(path: &std::path::Path, audio: &[u8]) -> Response {
     if let Some(package) = crate::packages::transcription_package() {
-        return match run_plugin(&package, &path).await {
+        return match run_plugin(&package, path).await {
             Ok(text) => Json(serde_json::json!({
                 "success": true,
                 "text": text,
@@ -104,7 +125,7 @@ pub(crate) async fn transcribe(Json(request): Json<TranscribeRequest>) -> impl I
         )
         .into_response();
     };
-    match call_model(&config, &source, &audio).await {
+    match call_model(&config, &source, audio).await {
         Ok(text) => Json(serde_json::json!({
             "success": true,
             "text": text,
@@ -125,14 +146,43 @@ pub(crate) struct TranscribeRequest {
 
 /// Read a recording, refusing anything that is not one.
 ///
-/// Size and header are both checked here rather than in the app: the route is
-/// token-protected but still reachable from the page, and forwarding an arbitrary
-/// local file to a model provider is not something a typo should be able to do.
+/// Three things are checked here rather than in the app: where the file is, how
+/// big it is, and whether it really is a WAV. The route is token-protected but
+/// still reachable from the page, and forwarding an arbitrary local file to a
+/// model provider is not something a typo — or a compromised page — should be
+/// able to do.
+///
+/// The location check is the one that matters. A `RIFF`/`WAVE` header is four
+/// bytes anybody can write, so a header check alone still lets any file on the
+/// machine be uploaded. The path must resolve **inside the product tree's
+/// `voice/` directory** — the same shape as the workspace route's containment
+/// check: canonicalize both sides, then require the recording to be under the
+/// root.
 fn read_recording(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    let metadata = std::fs::metadata(path)
+    read_recording_in(&recordings_dir(), path)
+}
+
+/// The same check against an explicit root, so it can be tested without a
+/// product directory.
+fn read_recording_in(root: &std::path::Path, path: &std::path::Path) -> Result<Vec<u8>, String> {
+    // The root is the daemon's own tree; creating it is safe and keeps the
+    // "no recordings yet" case from looking like a broken install.
+    let _ = std::fs::create_dir_all(root);
+    let root = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "the recording directory {} is not available: {error}",
+            root.display()
+        )
+    })?;
+    let resolved = std::fs::canonicalize(path)
         .map_err(|error| format!("cannot read the recording {}: {error}", path.display()))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!("the recording is outside {}", root.display()));
+    }
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
     if !metadata.is_file() {
-        return Err(format!("not a file: {}", path.display()));
+        return Err(format!("not a file: {}", resolved.display()));
     }
     if metadata.len() < 44 {
         // A WAV cannot be shorter than its own header, but "empty" is the wrong
@@ -154,13 +204,67 @@ fn read_recording(path: &std::path::Path) -> Result<Vec<u8>, String> {
             metadata.len()
         ));
     }
-    let audio = std::fs::read(path)
-        .map_err(|error| format!("cannot read the recording {}: {error}", path.display()))?;
+    let audio = std::fs::read(&resolved)
+        .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
     let is_wav = audio.len() >= 12 && &audio[0..4] == b"RIFF" && &audio[8..12] == b"WAVE";
     if !is_wav {
         return Err("the recording is not a WAV file".to_string());
     }
     Ok(audio)
+}
+
+/// Where the app parks its recordings: `<product>/voice`.
+///
+/// The product tree is what the daemon already resolves (it is the config dir
+/// on every platform), so the app and the daemon agree on it without a second
+/// channel — the app writes under `filesDir/atomcode/voice`, and the daemon
+/// reads under `ATOMCODE_HOME/voice`.
+fn recordings_dir() -> PathBuf {
+    Config::config_dir().join(RECORDINGS_DIR)
+}
+
+/// The directory the app records into, relative to the product tree.
+const RECORDINGS_DIR: &str = "voice";
+
+/// How long a recording may live before it is swept away.
+///
+/// The normal path deletes the take as soon as it is transcribed. This is the
+/// backstop for the paths that do not get that far — the app was killed
+/// mid-recording, or the page never sent it. Raw microphone audio should not
+/// outlive its purpose by more than a day.
+const RECORDING_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Delete recordings that are older than [`RECORDING_MAX_AGE_SECS`].
+///
+/// Best effort: a file that cannot be removed is left alone rather than turned
+/// into an error, because a stale recording is a hygiene problem, not a failure
+/// of the request that triggered the sweep.
+fn sweep_stale_recordings() {
+    sweep_stale_recordings_in(&recordings_dir());
+}
+
+/// The same sweep against an explicit directory, so it can be tested.
+fn sweep_stale_recordings_in(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            // A file stamped in the future (clock moved) is not stale.
+            continue;
+        };
+        if age.as_secs() > RECORDING_MAX_AGE_SECS {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// A few minutes of 16 kHz mono speech; beyond that the caller is confused.
@@ -372,38 +476,106 @@ mod tests {
     #[test]
     fn only_a_real_wav_recording_is_accepted() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("voice");
 
-        let good = dir.path().join("good.wav");
+        let good = root.join("good.wav");
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&64u32.to_le_bytes());
         wav.extend_from_slice(b"WAVEfmt ");
         wav.extend_from_slice(&[0u8; 64]);
+        std::fs::create_dir_all(&root).expect("dir");
         std::fs::write(&good, &wav).expect("write");
-        assert!(read_recording(&good).is_ok());
+        assert!(read_recording_in(&root, &good).is_ok());
 
-        let text = dir.path().join("notes.txt");
+        let text = root.join("notes.txt");
         std::fs::write(
             &text,
             "not audio at all, just some text longer than a header",
         )
         .expect("write");
-        let refused = read_recording(&text).expect_err("text must be refused");
+        let refused = read_recording_in(&root, &text).expect_err("text must be refused");
         assert!(refused.contains("not a WAV"), "{refused}");
 
-        let empty = dir.path().join("empty.wav");
+        let empty = root.join("empty.wav");
         std::fs::write(&empty, b"").expect("write");
-        let refused = read_recording(&empty).expect_err("an empty file must be refused");
+        let refused = read_recording_in(&root, &empty).expect_err("an empty file must be refused");
         assert!(refused.contains("empty"), "{refused}");
 
         // Shorter than a WAV header but not empty: say which one it is, because
         // "empty" would send the caller looking for a take that never happened.
-        let stub = dir.path().join("stub.wav");
+        let stub = root.join("stub.wav");
         std::fs::write(&stub, b"RIFF").expect("write");
-        let refused = read_recording(&stub).expect_err("a stub must be refused");
+        let refused = read_recording_in(&root, &stub).expect_err("a stub must be refused");
         assert!(refused.contains("too short"), "{refused}");
+    }
 
-        let missing = dir.path().join("missing.wav");
-        assert!(read_recording(&missing).is_err());
+    /// A file that merely *looks* like a WAV is still refused when it is not a
+    /// recording.
+    ///
+    /// This is the hole the header check alone leaves open: `RIFF….WAVE` is four
+    /// bytes anybody can write, so without the location check the route would
+    /// read any file on the machine — the user's SSH key, a database dump — and
+    /// upload it to a model provider. Both the file outside the directory and the
+    /// traversal out of it have to be refused.
+    #[test]
+    fn a_recording_outside_the_voice_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("voice");
+        std::fs::create_dir_all(&root).expect("dir");
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&64u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&[0u8; 64]);
+
+        // A perfectly valid WAV — just not in the recordings directory.
+        let outside = dir.path().join("secrets.wav");
+        std::fs::write(&outside, &wav).expect("write");
+        let refused = read_recording_in(&root, &outside)
+            .expect_err("a file outside the root must be refused");
+        assert!(refused.contains("outside"), "{refused}");
+
+        // And a traversal that points back into the directory by a longer path.
+        let traversal = root.join("..").join("secrets.wav");
+        let refused =
+            read_recording_in(&root, &traversal).expect_err("a traversal must be refused");
+        assert!(refused.contains("outside"), "{refused}");
+    }
+
+    /// A stale recording is swept away; a fresh one is left alone.
+    ///
+    /// The normal path deletes a take as soon as it is transcribed. This is the
+    /// backstop for the ones that never got that far — the app was killed
+    /// mid-recording — so raw microphone audio does not outlive its purpose.
+    #[test]
+    fn a_stale_recording_is_swept_and_a_fresh_one_is_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("voice");
+        std::fs::create_dir_all(&root).expect("dir");
+
+        let old = root.join("old.wav");
+        let fresh = root.join("fresh.wav");
+        std::fs::write(&old, b"RIFF").expect("write");
+        std::fs::write(&fresh, b"RIFF").expect("write");
+
+        // Age the first one past the limit.
+        let long_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(RECORDING_MAX_AGE_SECS + 3600);
+        set_file_age(&old, long_ago);
+
+        sweep_stale_recordings_in(&root);
+        assert!(!old.exists(), "the stale recording must be swept");
+        assert!(fresh.exists(), "a fresh recording must be kept");
+    }
+
+    /// Backdate a file, so the age-based sweep can be exercised without waiting.
+    fn set_file_age(path: &std::path::Path, when: std::time::SystemTime) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open");
+        file.set_modified(when).expect("set mtime");
     }
 }

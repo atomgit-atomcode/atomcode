@@ -78,12 +78,16 @@ class MainActivity : ComponentActivity() {
     /**
      * The in-app recorder used when the phone has no recogniser to borrow.
      *
-     * Lazy: it wants `cacheDir`, and constructing it during `onCreate` would be the
-     * one moment the directory is guaranteed not to be asked for. It also must not
-     * be created for a session that never records — holding a microphone handle
-     * open is not something an idle app should do.
+     * Lazy: it wants the product tree, and constructing it during `onCreate`
+     * would be the one moment the directory is guaranteed not to be asked for.
+     * It also must not be created for a session that never records — holding a
+     * microphone handle open is not something an idle app should do.
+     *
+     * The tree is the product dir (`filesDir/atomcode`), not `cacheDir`: the
+     * daemon resolves the product dir from `ATOMCODE_HOME`, and it has to be
+     * able to find a recording to transcribe it — and to refuse everything else.
      */
-    private val voice by lazy { VoiceRecorder(this) }
+    private val voice by lazy { VoiceRecorder(File(filesDir, "atomcode")) }
     /**
      * What the system speech recogniser heard, waiting for the page to collect it.
      *
