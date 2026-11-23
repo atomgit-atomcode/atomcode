@@ -19189,6 +19189,10 @@ mod session_mention_tests {
             moment.history_at = Some(1);
         }
         tui.refresh_menu();
+        assert!(
+            !host.menu_open(),
+            "browsing shows no mention menu while it lasts"
+        );
 
         // Browsing ends on the same token: the decline still holds.
         {
@@ -19199,6 +19203,56 @@ mod session_mention_tests {
         assert!(
             !host.menu_open(),
             "browsing must not wipe the decline: the same token stays declined"
+        );
+    }
+
+    /// The double-Esc that clears the line drops the declined token's record
+    /// with it: the line is gone, so a fresh token on the cleared line asks
+    /// again instead of inheriting a decline keyed to a token that no longer
+    /// exists.
+    #[test]
+    fn a_double_esc_that_clears_the_line_drops_the_decline_record() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(host.menu_open(), "the mention menu is up");
+
+        // First Esc declines the token through the menu path.
+        tui.slash_menu_key(
+            crate::surface::KeyPress::new(crate::surface::Key::Esc, crate::surface::Mods::NONE),
+            &tui.client,
+        );
+        tui.refresh_menu();
+        assert!(!host.menu_open(), "the declined token holds the menu down");
+        assert!(tui.mention_declined.lock().unwrap().is_some());
+
+        // Second Esc (no menu up now) rides the action path and clears the
+        // line; the record goes with it.
+        tui.act(crate::keymap::Action::Escape, &tui.client);
+        tui.act(crate::keymap::Action::Escape, &tui.client);
+        {
+            let moment = host.moment.read().unwrap();
+            assert!(moment.input.is_empty(), "the line is cleared");
+        }
+        assert!(
+            tui.mention_declined.lock().unwrap().is_none(),
+            "the decline record goes with the line"
+        );
+
+        // A fresh token on the cleared line asks again.
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "@atomcode notes".into();
+            moment.caret = "@atomcode".len();
+        }
+        tui.refresh_menu();
+        assert!(
+            host.menu_open(),
+            "a fresh token on the cleared line asks again"
         );
     }
 
