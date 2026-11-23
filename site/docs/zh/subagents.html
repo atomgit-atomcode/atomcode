@@ -100,7 +100,7 @@
       <p><code>worker</code> 子任务<strong>必须</strong>声明一个 <code>scope</code>：一组相对工作目录、允许写入的 glob，例如 <code>["src/auth/**", "Cargo.toml"]</code>。这是强制的，不是建议：</p>
       <ul>
         <li>范围之外的写入（<code>edit_file</code>、<code>write_file</code>、<code>search_replace</code>）会被 WorkerScopeGate <strong>直接拒绝</strong>——不弹审批。</li>
-        <li>读取和 <code>bash</code> 不受范围限制。</li>
+        <li>具体可用工具由运行时装配决定。Team 成员没有通用 shell。</li>
         <li>只要一次派发里含有 <code>worker</code>，就被视为 <strong>Risky</strong> 操作，会先走<a href="./approvals.html">审批</a>并展示各自的范围。</li>
         <li>多个 worker 同时跑时，给它们互不重叠的范围，避免相互覆盖。</li>
       </ul>
@@ -131,7 +131,7 @@ max_rounds     = 0     # 每个子任务的模型轮次上限（0 = 不限）</c
       <p>文件名（不含 <code>.md</code>）就是角色名。和内置角色同名的文件会替换它；两个目录有同名文件时，用户目录的生效。</p>
       <p>文件由 <code>---</code> 包住的头部字段和后面的角色说明（人设）组成：</p>
       <pre><code>---
-permission: explore      # 必填：explore（只看、不改任何东西）| worker（可以改文件、跑命令）
+permission: explore      # 必填：explore（只看、不改任何东西）| worker（可以在分配范围内改文件）
 difficulty: hard         # 必填：simple（用快模型）| hard（用强模型）
 effort: high             # 可选：思考强度，low | medium | high | xhigh | max
 model: glm-4.6           # 可选：指定模型（选择 id），优先于 difficulty
@@ -149,7 +149,7 @@ tools: read_file, grep   # 可选：限定可用工具，只能从 permission �
           <tr><td><code>effort</code></td><td>可选</td><td><code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code></td></tr>
           <tr><td><code>model</code></td><td>可选</td><td>模型选择 id；不写则按 <code>difficulty</code> 选</td></tr>
           <tr><td><code>when</code></td><td>可选</td><td>一句话：什么时候该派给这个角色</td></tr>
-          <tr><td><code>tools</code></td><td>可选</td><td>逗号分隔的工具名，只能是 <code>permission</code> 默认工具的子集</td></tr>
+          <tr><td><code>tools</code></td><td>可选</td><td>逗号分隔的工具名，选取角色允许的内置工具，或用户为该角色授权的只读 MCP 查询</td></tr>
         </tbody>
       </table>
       <p>注意两点：</p>
@@ -159,6 +159,12 @@ tools: read_file, grep   # 可选：限定可用工具，只能从 permission �
       </ul>
       <p>格式不对的角色文件会被跳过，不影响会话启动。会话里会提示一次哪个文件被跳过、缺了或写错了哪些字段（一次列全），同一个会话里不会重复提示；和内置角色同名的文件被跳过时，继续使用内置角色。</p>
 
+      <h3 id="让-team-成员直接查技能文档">让 Team 成员直接查技能文档</h3>
+      <p>在用户目录的 <code>mcp.json</code> 中，给文档服务添加按角色名授权的字段。例如，要把 <code>docs</code> 服务的 <code>search_docs</code> 授予角色 <code>research</code>，在该服务的配置里写：</p>
+      <pre><code>"teamReadOnlyTools": {"research": ["search_docs"]}</code></pre>
+      <p>在 <code>research.md</code> 写 <code>tools: read_file, mcp__docs__search_docs</code>。服务需声明该工具的 <code>readOnlyHint</code> 并已连接。用户级授权按角色名跨项目生效，请只授权可信的只读实现。项目里的 MCP 配置不能授予这项权限。<code>tell_parent</code> 自动提供。</p>
+      <p>每次查询都会给主代理留下一条包含结果引用的记录，不会唤醒主代理。主代理可用 <code>team(action="evidence", name="成员名", reference="引用")</code> 核对同一次调用的参数、返回文本和错误状态。在同一项目恢复会话后仍可读取。</p>
+      <p>技能只提供 Python 查询脚本时，仓库示例 <code>examples/mcp/skill_docs.py</code> 可将其接为 stdio MCP。在用户控制的位置保存适配器和可信技能，给服务设置 <code>command: uv</code>，<code>args</code> 依次为 <code>run</code>、<code>--script</code>、适配器绝对路径、技能的 <code>scripts/search_docs.py</code> 绝对路径。如果脚本要求 <code>--query</code>，再加 <code>--query-option=--query</code>。示例通过单个文本参数传递查询，脚本需输出 UTF-8 文本。</p>
       <h2 id="关闭该功能">关闭该功能</h2>
       <p><code>task</code> 工具默认开启。若要彻底移除它，设置：</p>
       <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>

@@ -18,6 +18,8 @@
 //! deepseek-harness and the old runtime both hide the tier behind the role
 //! for the same reason: the model knows what the job is, not what it costs.
 
+mod query;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -405,7 +407,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     if !permission_said {
         problems.push(
             "`permission` is required: explore (looks, changes nothing) or worker (may edit \
-             files and run commands)"
+             files inside its scope)"
                 .to_string(),
         );
     }
@@ -423,9 +425,12 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     // a role file in a cloned repository must not hand a member a shell.
     if let Some(listed) = &tools {
         let allowed = default_tools(permission);
-        if let Some(extra) = listed.iter().find(|tool| !allowed.contains(tool)) {
+        if let Some(extra) = listed
+            .iter()
+            .find(|tool| !allowed.contains(tool) && !query::is_query_name(tool))
+        {
             return Err(format!(
-                "{}: a {} member may not have `{extra}`; choose from: {}",
+                "{}: a {} member may not have `{extra}`; tools can only narrow its permissions. tell_parent is provided automatically; omit it from tools. Choose a granted read-only MCP query or one of: {}",
                 path.display(),
                 match permission {
                     Permission::Explore => "explore",
@@ -865,6 +870,8 @@ struct TeamArgs {
     text: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    reference: Option<String>,
     /// A selection id for this member, overriding whatever the role says.
     #[serde(default)]
     model: Option<String>,
@@ -939,6 +946,26 @@ impl TeamTool {
                         .join(", ")
                 )
             })?;
+        for query in tools_for(&role)
+            .iter()
+            .filter(|name| query::is_query_name(name))
+        {
+            if !lead
+                .ctx()
+                .service::<ToolsSvc>()
+                .is_some_and(|tools| tools.get(query).is_some())
+                || !lead
+                    .ctx()
+                    .service::<crate::seams::McpSvc>()
+                    .is_some_and(|registry| registry.team_query_info(query, &role.id).is_some())
+                || lead
+                    .ctx()
+                    .service::<crate::seams::OutputArtifactsSvc>()
+                    .is_none()
+            {
+                return Err(format!("Query `{query}` for role `{}` needs a connected, published MCP tool with readOnlyHint, a user/driver teamReadOnlyTools grant for this role, and output storage.", role.id));
+            }
+        }
         let task = args
             .task
             .filter(|t| !t.trim().is_empty())
@@ -1244,7 +1271,29 @@ impl TeamTool {
             .ok_or("the lead has no tool catalog")?;
         let restricted = Arc::new(ToolBox::new());
         for tool_name in tools_for(&role) {
-            if let Some(tool) = parent_tools.get(&tool_name) {
+            if query::is_query_name(&tool_name) {
+                let registry = lead
+                    .ctx()
+                    .require::<crate::seams::McpSvc>()
+                    .map_err(|e| e.to_string())?;
+                let store = lead
+                    .ctx()
+                    .require::<crate::seams::OutputArtifactsSvc>()
+                    .map_err(|e| e.to_string())?;
+                restricted.register(Arc::new(query::MemberQuery {
+                    lead: Arc::downgrade(lead),
+                    description: parent_tools
+                        .get(&tool_name)
+                        .map(|tool| tool.description().to_owned())
+                        .unwrap_or_else(|| format!("Read-only query {tool_name}")),
+                    name: tool_name,
+                    role: role.id.clone(),
+                    member: name.clone(),
+                    registry,
+                    catalog: Arc::downgrade(&parent_tools),
+                    evidence: Arc::new(store.team_evidence(&lead_session, &name)),
+                }))?;
+            } else if let Some(tool) = parent_tools.get(&tool_name) {
                 restricted.register(tool)?;
             }
         }
@@ -1302,6 +1351,12 @@ impl TeamTool {
         // Captured out of `role` before the realm closure takes `tools_for_realm`
         // and friends; the closure is `move` and `role` is not otherwise kept.
         let role_effort = effort_override.or(role.effort);
+        if tools_for(&role)
+            .iter()
+            .any(|name| query::is_query_name(name))
+        {
+            prompts.contribute("team-query-evidence", 0, "Include the Team evidence reference in your report so the lead can inspect the original query and result.".to_owned());
+        }
         let member_id = format!("{lead_session}/{name}");
         let member_session = member_id.clone();
         let identity = atomcode_kernel::agent::MemberIdentity {
@@ -1749,7 +1804,7 @@ impl Tool for TeamTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": if self.headless_wait { vec!["delegate", "tell", "status", "stop", "wait"] } else { vec!["delegate", "tell", "status", "stop"] },
+                    "enum": if self.headless_wait { vec!["delegate", "tell", "status", "stop", "wait", "evidence"] } else { vec!["delegate", "tell", "status", "stop", "evidence"] },
                     "description": if self.headless_wait { "delegate needs name, role, task; tell needs name, text; stop takes name or none for all; status takes nothing; wait needs name and optional timeout_secs" } else { "delegate needs name, role, task; tell needs name, text; stop takes name or none for all; status takes nothing" }
                 },
                 "name": { "type": "string", "description": "The member's name (delegate, tell, stop)" },
@@ -1763,6 +1818,7 @@ impl Tool for TeamTool {
                 "task": { "type": "string", "description": "The complete task (delegate)" },
                 "scope": { "type": "array", "items": { "type": "string" }, "description": "For a role that writes: the files this member may change, as globs relative to the workspace (e.g. `src/auth/**`). Required unless members get checkouts of their own; two writers' scopes may not overlap." },
                 "text": { "type": "string", "description": "What to tell the member (tell)" },
+                "reference": { "type": "string", "description": "For action=evidence, pass name and the query reference from the member report to read the original arguments, result, and error status." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "description": "Maximum time to wait for one member (wait; default 30)" }
             },
             "required": ["action"]
@@ -1784,9 +1840,9 @@ impl Tool for TeamTool {
             .and_then(|id| self.roles.iter().find(|role| role.id == id))
             .is_some_and(|role| {
                 role.permission == Permission::Explore
-                    && tools_for(role)
-                        .iter()
-                        .all(|tool| EXPLORE_TOOLS.contains(&tool.as_str()))
+                    && tools_for(role).iter().all(|tool| {
+                        EXPLORE_TOOLS.contains(&tool.as_str()) || query::is_query_name(tool)
+                    })
             });
         if reads {
             RiskLevel::Safe
@@ -1820,6 +1876,9 @@ impl Tool for TeamTool {
                     })
                     .map(|_| format!("told `{name}`"))
                 }
+            }
+            "evidence" => {
+                query::read_evidence(&lead, args.name.as_deref(), args.reference.as_deref()).await
             }
             "status" => Ok(self.status(&lead)),
             "wait" => {

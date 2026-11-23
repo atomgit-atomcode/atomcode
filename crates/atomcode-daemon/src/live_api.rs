@@ -3484,6 +3484,7 @@ mod tests {
             source: McpConfigSource::Project,
             trust: false,
             auto_approve: vec![],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
         };

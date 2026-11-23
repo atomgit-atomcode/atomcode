@@ -100,7 +100,7 @@
       <p>A <code>worker</code> subtask <strong>must</strong> declare a <code>scope</code>: a list of working-directory-relative globs it is allowed to write, e.g. <code>["src/auth/**", "Cargo.toml"]</code>. This is enforced, not advisory:</p>
       <ul>
         <li>Writes outside the scope (<code>edit_file</code>, <code>write_file</code>, <code>search_replace</code>) are <strong>hard-denied</strong> — not prompted — by the WorkerScopeGate.</li>
-        <li>Reads and <code>bash</code> are not restricted by scope.</li>
+        <li>Available tools depend on the runtime configuration. Team members have no general-purpose shell.</li>
         <li>A dispatch that contains any <code>worker</code> is treated as a <strong>Risky</strong> action, so it goes through <a href="./approvals.html">approval</a> first, with the scopes shown.</li>
         <li>When several workers run at once, give them non-overlapping scopes so they cannot clobber each other.</li>
       </ul>
@@ -131,7 +131,7 @@ max_rounds     = 0     # per-subtask model-round cap (0 = unbounded)</code></pre
       <p>The file name (without <code>.md</code>) is the role's name. A file named like a built-in role replaces it; when both directories have a file of the same name, the one in your home directory wins.</p>
       <p>A role file is a header of fields between <code>---</code> lines, then the role's instructions:</p>
       <pre><code>---
-permission: explore      # required: explore (looks, changes nothing) | worker (may edit files and run commands)
+permission: explore      # required: explore (looks, changes nothing) | worker (may edit files within its assigned scope)
 difficulty: hard         # required: simple (the fast model) | hard (the strong one)
 effort: high             # optional: low | medium | high | xhigh | max
 model: glm-4.6           # optional: a model selection id, overriding difficulty
@@ -149,7 +149,7 @@ You design. Read the existing code first, then propose a design and its trade-of
           <tr><td><code>effort</code></td><td>no</td><td><code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code></td></tr>
           <tr><td><code>model</code></td><td>no</td><td>A model selection id; without it, chosen by <code>difficulty</code></td></tr>
           <tr><td><code>when</code></td><td>no</td><td>One line on when to hand this role work</td></tr>
-          <tr><td><code>tools</code></td><td>no</td><td>Comma-separated tool names, a subset of what <code>permission</code> allows</td></tr>
+          <tr><td><code>tools</code></td><td>no</td><td>Comma-separated tool names, selected from permitted built-ins and read-only MCP queries granted to this role</td></tr>
         </tbody>
       </table>
       <p>Two things to note:</p>
@@ -159,6 +159,12 @@ You design. Read the existing code first, then propose a design and its trade-of
       </ul>
       <p>A role file that does not parse is skipped and the session starts anyway. You are told once per session which file was skipped and everything that is missing or wrong in it; a file named like a built-in role leaves the built-in in use.</p>
 
+      <h3 id="query-skill-documentation-from-a-team-member">Query skill documentation from a Team member</h3>
+      <p>In the user-level <code>mcp.json</code>, add a per-role grant to the documentation server. For example, on the <code>docs</code> server, grant the <code>research</code> role one tool:</p>
+      <pre><code>"teamReadOnlyTools": {"research": ["search_docs"]}</code></pre>
+      <p>Set <code>tools: read_file, mcp__docs__search_docs</code> in <code>research.md</code>. The server must be connected and advertise <code>readOnlyHint</code> for that tool. User-level grants apply across projects by role name. Grant only trusted read-only implementations. Project MCP configurations cannot issue these grants. Members receive <code>tell_parent</code> automatically.</p>
+      <p>Each query leaves a reference in the lead session without waking the lead. The lead can use <code>team(action="evidence", name="member", reference="reference")</code> to inspect the original arguments, returned text and error status, including after resuming in the same project.</p>
+      <p>For a Python-only skill, the repository example <code>examples/mcp/skill_docs.py</code> exposes a fixed lookup script over stdio MCP. Install the adapter and trusted skill in a user-controlled location. Configure the server command as <code>uv</code> with arguments <code>run</code>, <code>--script</code>, the absolute adapter path and the absolute path to the installed <code>scripts/search_docs.py</code>. Append <code>--query-option=--query</code> if the script requires a named query argument. The example passes one search string and expects UTF-8 text.</p>
       <h2 id="turning-it-off">Turning it off</h2>
       <p>The <code>task</code> tool is enabled by default. To remove it entirely, set:</p>
       <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>

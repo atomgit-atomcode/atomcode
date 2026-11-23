@@ -868,7 +868,7 @@
       {
         "id": "worker-范围与安全",
         "heading": "Worker 范围与安全",
-        "body": "worker 子任务 必须 声明一个 scope ：一组相对工作目录、允许写入的 glob，例如 [\"src/auth/**\", \"Cargo.toml\"] 。这是强制的，不是建议： 范围之外的写入（ edit_file 、 write_file 、 search_replace ）会被 WorkerScopeGate 直接拒绝 ——不弹审批。 读取和 bash 不受范围限制。 只要一次派发里含有 worker ，就被视为 Risky 操作，会先走 审批 并展示各自的范围。 多个 worker 同时跑时，给它们互不重叠的范围，避免相互覆盖。"
+        "body": "worker 子任务 必须 声明一个 scope ：一组相对工作目录、允许写入的 glob，例如 [\"src/auth/**\", \"Cargo.toml\"] 。这是强制的，不是建议： 范围之外的写入（ edit_file 、 write_file 、 search_replace ）会被 WorkerScopeGate 直接拒绝 ——不弹审批。 具体可用工具由运行时装配决定。Team 成员没有通用 shell。 只要一次派发里含有 worker ，就被视为 Risky 操作，会先走 审批 并展示各自的范围。 多个 worker 同时跑时，给它们互不重叠的范围，避免相互覆盖。"
       },
       {
         "id": "配置",
@@ -878,7 +878,12 @@
       {
         "id": "自定义团队角色",
         "heading": "自定义团队角色",
-        "body": "团队（ team ）派活时按 角色 挑成员。除了内置角色，你可以用 Markdown 文件自己定义，放在下面两个目录之一： <项目>/.atomcode/agents/<角色名>.md ——只在这个项目里生效； ~/.atomcode/agents/<角色名>.md ——所有项目通用。 文件名（不含 .md ）就是角色名。和内置角色同名的文件会替换它；两个目录有同名文件时，用户目录的生效。 文件由 --- 包住的头部字段和后面的角色说明（人设）组成： --- permission: explore # 必填：explore（只看、不改任何东西）| worker（可以改文件、跑命令） difficulty: hard # 必填：simple（用快模型）| hard（用强模型） effort: high # 可选：思考强度，low | medium | high | xhigh | max model: glm-4.6 # 可选：指定模型（选择 id），优先于 difficulty when: 需要做架构设计时 # 可选：一句话说明什么时候派给它 tools: read_file, grep # 可选：限定可用工具，只能从 permission 允许的工具里选 --- 你负责架构设计。先读现有代码，再给出方案，列出取舍。 字段 是否必填 取值 permission 必填 explore （只读调查）或 worker （受范围限制的写入执行） difficulty 必填 simple （快模型）或 hard （强模型） effort 可选 low / medium / high / xhigh / max model 可选 模型选择 id；不写则按 difficulty 选 when 可选 一句话：什么时候该派给这个角色 tools 可选 逗号分隔的工具名，只能是 permission 默认工具的子集 注意两点： 这里的 permission 和命令行的 --permission-mode （ plan / accept_edits / auto ）是两回事，只是名字相同：前者决定这个成员能不能动手，后者是整个会话的审批方式。 它不是 Claude Code 的 agent 文件格式。 name 、 description 、 allowed_tools 、 user_invocable 这些字段不会被读取：角色名取自文件名，可用工具用 tools 限定。 格式不对的角色文件会被跳过，不影响会话启动。会话里会提示一次哪个文件被跳过、缺了或写错了哪些字段（一次列全），同一个会话里不会重复提示；和内置角色同名的文件被跳过时，继续使用内置角色。"
+        "body": "团队（ team ）派活时按 角色 挑成员。除了内置角色，你可以用 Markdown 文件自己定义，放在下面两个目录之一： <项目>/.atomcode/agents/<角色名>.md ——只在这个项目里生效； ~/.atomcode/agents/<角色名>.md ——所有项目通用。 文件名（不含 .md ）就是角色名。和内置角色同名的文件会替换它；两个目录有同名文件时，用户目录的生效。 文件由 --- 包住的头部字段和后面的角色说明（人设）组成： --- permission: explore # 必填：explore（只看、不改任何东西）| worker（可以在分配范围内改文件） difficulty: hard # 必填：simple（用快模型）| hard（用强模型） effort: high # 可选：思考强度，low | medium | high | xhigh | max model: glm-4.6 # 可选：指定模型（选择 id），优先于 difficulty when: 需要做架构设计时 # 可选：一句话说明什么时候派给它 tools: read_file, grep # 可选：限定可用工具，只能从 permission 允许的工具里选 --- 你负责架构设计。先读现有代码，再给出方案，列出取舍。 字段 是否必填 取值 permission 必填 explore （只读调查）或 worker （受范围限制的写入执行） difficulty 必填 simple （快模型）或 hard （强模型） effort 可选 low / medium / high / xhigh / max model 可选 模型选择 id；不写则按 difficulty 选 when 可选 一句话：什么时候该派给这个角色 tools 可选 逗号分隔的工具名，选取角色允许的内置工具，或用户为该角色授权的只读 MCP 查询 注意两点： 这里的 permission 和命令行的 --permission-mode （ plan / accept_edits / auto ）是两回事，只是名字相同：前者决定这个成员能不能动手，后者是整个会话的审批方式。 它不是 Claude Code 的 agent 文件格式。 name 、 description 、 allowed_tools 、 user_invocable 这些字段不会被读取：角色名取自文件名，可用工具用 tools 限定。 格式不对的角色文件会被跳过，不影响会话启动。会话里会提示一次哪个文件被跳过、缺了或写错了哪些字段（一次列全），同一个会话里不会重复提示；和内置角色同名的文件被跳过时，继续使用内置角色。"
+      },
+      {
+        "id": "让-team-成员直接查技能文档",
+        "heading": "让 Team 成员直接查技能文档",
+        "body": "在用户目录的 mcp.json 中，给文档服务添加按角色名授权的字段。例如，要把 docs 服务的 search_docs 授予角色 research ，在该服务的配置里写： \"teamReadOnlyTools\": {\"research\": [\"search_docs\"]} 在 research.md 写 tools: read_file, mcp__docs__search_docs 。服务需声明该工具的 readOnlyHint 并已连接。用户级授权按角色名跨项目生效，请只授权可信的只读实现。项目里的 MCP 配置不能授予这项权限。 tell_parent 自动提供。 每次查询都会给主代理留下一条包含结果引用的记录，不会唤醒主代理。主代理可用 team(action=\"evidence\", name=\"成员名\", reference=\"引用\") 核对同一次调用的参数、返回文本和错误状态。在同一项目恢复会话后仍可读取。 技能只提供 Python 查询脚本时，仓库示例 examples/mcp/skill_docs.py 可将其接为 stdio MCP。在用户控制的位置保存适配器和可信技能，给服务设置 command: uv ， args 依次为 run 、 --script 、适配器绝对路径、技能的 scripts/search_docs.py 绝对路径。如果脚本要求 --query ，再加 --query-option=--query 。示例通过单个文本参数传递查询，脚本需输出 UTF-8 文本。"
       },
       {
         "id": "关闭该功能",

@@ -43,6 +43,7 @@ fn test_server_config_with_env_and_timeout(
         },
         trust: false,
         auto_approve: vec![],
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
     }
@@ -1204,6 +1205,7 @@ async fn cancelled_http_request_cannot_be_unpoisoned_by_a_late_response() {
         source: McpConfigSource::User,
         trust: false,
         auto_approve: vec![],
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
         config: McpTransportConfig::Http {

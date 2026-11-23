@@ -78,6 +78,7 @@ pub struct McpToolAdapter {
     /// Server-declared `annotations.readOnlyHint` — a read-only tool has no side
     /// effects, so it is `Safe` (no approval) and allowed during plan mode.
     read_only: bool,
+    team_role: Option<String>,
 }
 
 impl McpToolAdapter {
@@ -104,7 +105,16 @@ impl McpToolAdapter {
             description,
             schema: info.input_schema,
             read_only: info.read_only,
+            team_role: None,
         })
+    }
+
+    /// Construct only for an explicitly authorized, discovered read-only query.
+    pub fn for_team(registry: Arc<McpRegistry>, name: &str, role: &str) -> Option<Self> {
+        let info = registry.team_query_info(name, role)?;
+        let mut adapter = Self::new(registry, info).ok()?;
+        adapter.team_role = Some(role.to_owned());
+        Some(adapter)
     }
 
     /// The mounted name (`mcp__{server}__{tool}`).
@@ -193,7 +203,13 @@ impl Tool for McpToolAdapter {
                     ..ToolResult::default()
                 };
             }
-            response = self.registry.call_tool(&self.server, &self.tool, arguments) => response,
+            response = async {
+                if let Some(role) = &self.team_role {
+                    self.registry.call_team_query(&self.server, &self.tool, arguments, role).await
+                } else {
+                    self.registry.call_tool(&self.server, &self.tool, arguments).await
+                }
+            } => response,
         };
         match response {
             Ok(result) => {
