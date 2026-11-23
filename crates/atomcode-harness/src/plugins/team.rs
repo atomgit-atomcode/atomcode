@@ -588,6 +588,25 @@ fn tools_for(role: &Role) -> Vec<String> {
 
 // ---- the members ----------------------------------------------------------
 
+#[derive(Default)]
+struct ReportReceipt {
+    sent: bool,
+    note_key: Option<String>,
+}
+
+fn report_note(member: &Agent, lead: &Agent) -> Option<crate::seams::MemberReportNote> {
+    member
+        .ctx()
+        .service::<crate::seams::MemberReportNoteSvc>()?(member, lead)
+}
+
+fn append_report_note(report: &mut String, note: Option<&crate::seams::MemberReportNote>) {
+    if let Some(note) = note {
+        report.push_str("\n\n");
+        report.push_str(&note.text);
+    }
+}
+
 struct Member {
     role: String,
     agent: Arc<Agent>,
@@ -598,7 +617,7 @@ struct Member {
     /// Whether this member said something to the lead during its current
     /// turn. A member that ends a turn silently is reported on by the team,
     /// so the lead is never left waiting on a member that forgot to speak.
-    told: Arc<Mutex<bool>>,
+    told: Arc<Mutex<ReportReceipt>>,
     /// Ephemeral notification dedup only; not task/completion state.
     last_write_refusal_turn: Option<u64>,
     /// The files it may write, for a writing member sharing the lead's
@@ -734,7 +753,7 @@ struct TellParent {
     lead: AgentId,
     me: AgentId,
     name: String,
-    told: Arc<Mutex<bool>>,
+    told: Arc<Mutex<ReportReceipt>>,
 }
 
 #[async_trait]
@@ -770,11 +789,20 @@ impl Tool for TellParent {
         let Some(lead) = self.agents.get(self.lead) else {
             return fail("the lead agent is gone");
         };
-        *self.told.lock().expect("told poisoned") = true;
+        let member = self.agents.get(self.me);
+        let note = member.as_ref().and_then(|m| report_note(m, &lead));
+        let mut report = format!("[{}] {text}", self.name);
+        {
+            let mut receipt = self.told.lock().expect("told poisoned");
+            receipt.sent = true;
+            if let Some(note) = note.filter(|n| Some(&n.key) != receipt.note_key.as_ref()) {
+                append_report_note(&mut report, Some(&note));
+                receipt.note_key = Some(note.key);
+            }
+        }
         lead.send_from(
-            format!("[{}] {text}", self.name),
-            self.agents
-                .get(self.me)
+            report,
+            member
                 .map(|agent| agent.team_message_origin())
                 .unwrap_or(MessageOrigin::Peer(self.me)),
         );
@@ -1220,7 +1248,7 @@ impl TeamTool {
                 restricted.register(tool)?;
             }
         }
-        let told = Arc::new(Mutex::new(false));
+        let told = Arc::new(Mutex::new(ReportReceipt::default()));
         let prompts = Arc::new(crate::seams::PromptRegistry::new());
         prompts.contribute(
             "team-member",
@@ -1787,7 +1815,7 @@ impl Tool for TeamTool {
                     Err("`text` is required".to_string())
                 } else {
                     self.with_member(&lead, name, |m| {
-                        *m.told.lock().expect("told poisoned") = false;
+                        *m.told.lock().expect("told poisoned") = ReportReceipt::default();
                         m.agent.send_from(text, lead.team_message_origin());
                     })
                     .map(|_| format!("told `{name}`"))
@@ -2175,7 +2203,7 @@ impl Plugin for TeamPlugin {
                 let Some(m) = all.get(&lead_session).and_then(|m| m.get(&name)) else {
                     return;
                 };
-                let told = std::mem::replace(&mut *m.told.lock().expect("told poisoned"), false);
+                let told = std::mem::take(&mut *m.told.lock().expect("told poisoned"));
                 (m.agent.clone(), told)
             };
             let budget_stop = *stop == atomcode_kernel::event::StopReason::StoppedByPolicy
@@ -2183,21 +2211,32 @@ impl Plugin for TeamPlugin {
                     .ctx()
                     .service::<crate::seams::TurnRequestsSvc>()
                     .is_some_and(|r| r.limited(*turn));
-            if told && !budget_stop {
-                return;
-            }
             let Some(lead) = agents.by_session(&lead_session) else {
                 return;
             };
+            let note = report_note(&member, &lead);
+            if told.sent
+                && !budget_stop
+                && note
+                    .as_ref()
+                    .is_none_or(|n| Some(&n.key) == told.note_key.as_ref())
+            {
+                return;
+            }
             let said = member
                 .session()
                 .latest_assistant_text(*turn)
                 .unwrap_or_else(|| "(nothing)".into());
-            let report = if budget_stop {
+            let mut report = if budget_stop {
                 format!("[{name} reached its provider request budget in turn {turn}]\n{said}")
             } else {
                 format!("[{name} finished turn {turn}: {stop:?}]\n{said}")
             };
+            append_report_note(
+                &mut report,
+                note.as_ref()
+                    .filter(|n| Some(&n.key) != told.note_key.as_ref()),
+            );
             let lead_asked = member
                 .session()
                 .events()

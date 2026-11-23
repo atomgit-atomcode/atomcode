@@ -2888,3 +2888,89 @@ async fn member_budget_closes_once_and_a_failed_followup_does_not_report_old_tex
 
 #[path = "team_cost/replay.rs"]
 mod cost_replay;
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_shell_less_member_hands_unverified_edits_to_the_lead_in_its_report() {
+    let write = r#"{ calls = [{ name = "write_file", args = {file_path = "main.rs", content = "fn main() {}" } }] }"#;
+    let tell = r#"{ calls = [{name = "tell_parent", args = {text = "status"} }] }"#;
+    for (tag, script, budget, prompt, expected_notes, expected_reports) in [
+        ("automatic", write.to_owned(), 0, "Make the edit", 1, 1),
+        (
+            "explicit",
+            format!("{write}, {tell}"),
+            0,
+            "Make the edit",
+            1,
+            1,
+        ),
+        (
+            "early",
+            format!("{tell}, {write}"),
+            0,
+            "Make the edit",
+            1,
+            2,
+        ),
+        (
+            "repeated",
+            format!("{write}, {tell}, {tell}"),
+            0,
+            "Make the edit",
+            1,
+            2,
+        ),
+        ("closing", write.to_owned(), 1, "Make the edit", 1, 1),
+        (
+            "skip",
+            write.to_owned(),
+            0,
+            "Make the edit; do not run tests",
+            0,
+            1,
+        ),
+    ] {
+        let dir = scratch(tag);
+        write_role(
+            &dir,
+            "scribe",
+            "---\npermission: worker\ndifficulty: simple\n---\nWrite code.\n",
+        );
+        let mut layers = layers_with(
+            &dir,
+            r#"{ calls = [{ name = "team", args = {action = "delegate", name = "s", role = "scribe", task = "edit main.rs", scope = ["main.rs"]} }] }, { text = "waiting" }, {text = "ack"}, {text = "ack again"}"#,
+            &format!(r#"{script}, {{text = "done"}}"#),
+            &format!("role_request_budgets = {{ scribe = {budget} }}"),
+        );
+        let cadence = format!(
+            "[[insert]]\nname = 'verify-cadence'\nconfig = {{force = true, working_dir = {root:?}}}",
+            root = dir.to_string_lossy(),
+        );
+        layers.push(Layer::from_toml(&cadence).unwrap());
+        let app = start(ConfigTree::from_layers(layers).unwrap()).await;
+        let lead = create_agent(&app).await.unwrap();
+        run_turn(&app, prompt).await.unwrap();
+        let member = app
+            .context()
+            .require::<AgentsSvc>()
+            .unwrap()
+            .by_session(&format!("{}/s", lead.session_id()))
+            .unwrap();
+        until_idle(&member).await;
+        while lead.inbox().has_waking_input() {
+            drive(&app, &lead).await.unwrap();
+        }
+        let reports = peers(&lead);
+        assert_eq!(reports.len(), expected_reports, "{tag}: {reports:?}");
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|(_, s)| s.contains("Run the relevant check") && s.contains("main.rs"))
+                .count(),
+            expected_notes,
+            "{tag}: {reports:?}"
+        );
+        assert!(dir.join("main.rs").exists(), "{tag}");
+        assert_eq!(turns_ended(&member), 1, "{tag}");
+        assert!(!member.session().events().iter().any(|e| matches!(&e.event, SessionEvent::Injected {text, ..} if text == atomcode_coding::discipline::NUDGE)), "{tag}");
+    }
+}

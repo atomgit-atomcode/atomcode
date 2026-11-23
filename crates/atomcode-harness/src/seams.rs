@@ -25,6 +25,16 @@ pub use atomcode_capabilities::world::{FileSystem, Shell};
 plexus_service!(ProductDirsSvc => atomcode_capabilities::ProductDirs, "product-dirs", Core, "Where the product keeps its data: the user tree and the per-project dir");
 plexus_service!(TurnRequestsSvc => TurnRequests, "turn-requests", Core, "Per-turn provider invocation accounting for the owning agent");
 
+/// Optional product-owned context for an existing member report. The key identifies
+/// the work covered, so a progress report cannot suppress a later, changed handoff.
+pub struct MemberReportNote {
+    pub key: String,
+    pub text: String,
+}
+
+pub type MemberReportNoteFn = dyn Fn(&Agent, &Agent) -> Option<MemberReportNote> + Send + Sync;
+plexus_service!(MemberReportNoteSvc => MemberReportNoteFn, "member-report-note", Seam, "Product context accompanying a team member's report");
+
 /// Counts calls at the chat_stream boundary, including harness retries. Transport
 /// retries internal to an adapter and side calls such as compaction are separate.
 pub struct TurnRequests {
