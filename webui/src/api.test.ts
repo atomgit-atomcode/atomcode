@@ -1057,3 +1057,84 @@ test('live approval answers carry the one-shot request identity', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('SSE limits each UTF-8 event, cancels on overflow, and retains prior events', async () => {
+  const originalFetch = globalThis.fetch;
+  const { streamChat, streamLive, SseEventTooLargeError } = await import('./api.ts');
+  const encoder = new TextEncoder();
+  const first = encoder.encode('data: {"type":"text","content":"ok"}\n\n');
+  const limit = 32 * 1024 * 1024;
+  const prefix = encoder.encode('data: ');
+  // The event exceeds the byte budget while its UTF-16 length is much smaller.
+  const largePart = encoder.encode('界'.repeat(Math.floor(limit / 6) + 1));
+  const delimitedPart = new Uint8Array(largePart.length + 2);
+  delimitedPart.set(largePart);
+  delimitedPart.set(encoder.encode('\n\n'), largePart.length);
+  try {
+    for (const [live, terminated] of [[false, true], [true, false]]) {
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(first);
+          controller.enqueue(prefix);
+          controller.enqueue(largePart);
+          controller.enqueue(terminated ? delimitedPart : largePart);
+        },
+        cancel() { cancelled = true; },
+      });
+      globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+      const events: unknown[] = [];
+      const stream = live
+        ? streamLive(event => events.push(event))
+        : streamChat({ message: 'hi' }, event => events.push(event));
+      await assert.rejects(stream, SseEventTooLargeError);
+      assert.deepEqual(events, [{ type: 'text', content: 'ok' }]);
+      assert.equal(cancelled, true);
+      assert.equal(body.locked, false);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('SSE accepts a maximum-sized event with a split delimiter and multiple events in one chunk', async () => {
+  const originalFetch = globalThis.fetch;
+  const { streamChat } = await import('./api.ts');
+  const limit = 32 * 1024 * 1024;
+  const firstEvent = 'data: {"type":"text","content":"ok"}';
+  const secondEvent = 'data: {"type":"stopped"}';
+  const encoder = new TextEncoder();
+  const chunk = encoder.encode(firstEvent.padEnd(limit) + '\n');
+  const body = new ReadableStream<Uint8Array>({ start(controller) {
+    controller.enqueue(chunk);
+    controller.enqueue(encoder.encode('\n' + firstEvent + '\n\n' + secondEvent));
+    controller.close();
+  } });
+  globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+  try {
+    const events: unknown[] = [];
+    await streamChat({ message: 'hi' }, event => events.push(event));
+    assert.deepEqual(events, [
+      { type: 'text', content: 'ok' }, { type: 'text', content: 'ok' }, { type: 'stopped' },
+    ]);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('streamChat keeps its authoritative terminal if later SSE data exceeds the limit', async () => {
+  const originalFetch = globalThis.fetch;
+  const { streamChat } = await import('./api.ts');
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"type":"stopped"}\n\n'));
+      controller.enqueue(new Uint8Array(32 * 1024 * 1024 + 1));
+    },
+    cancel() { cancelled = true; },
+  });
+  globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+  try {
+    const events: unknown[] = [];
+    await streamChat({ message: 'hi' }, event => events.push(event));
+    assert.deepEqual(events, [{ type: 'stopped' }]);
+    assert.equal(cancelled, true);
+  } finally { globalThis.fetch = originalFetch; }
+});

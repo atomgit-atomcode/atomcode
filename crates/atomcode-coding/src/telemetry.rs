@@ -141,11 +141,7 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
 /// credential or path straddling that edge cannot survive as a prefix.
 fn safe_message(error: &str, working_dir: &std::path::Path) -> String {
     let home = atomcode_config::util::real_home_dir();
-    let scrubbed = atomcode_telemetry::scrub::scrub_path(error, home.as_deref(), Some(working_dir));
-    atomcode_telemetry::scrub::truncate_head(
-        &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
-        atomcode_telemetry::scrub::HEAD_MAX,
-    )
+    atomcode_telemetry::scrub::message_head(error, home.as_deref(), Some(working_dir))
 }
 
 /// Where in the conversation the adapters currently are.

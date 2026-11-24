@@ -737,6 +737,30 @@ mod tests {
     }
 
     #[test]
+    fn panic_message_is_redacted_before_serialization_and_truncation() {
+        use crate::scrub::{message_head, HEAD_MAX};
+        use std::path::Path;
+        let home = Path::new("/home/test-user");
+        let cwd = home.join("private-project");
+        let secret = "sk-TESTONLY012345678901234567890123456789";
+        let prefix = format!("<CWD> {}", "界".repeat(HEAD_MAX - 12));
+        let payload = format!("{} {} {secret}", cwd.display(), "界".repeat(HEAD_MAX - 12));
+        let event = Event::Panic {
+            location: "src/main.rs:1".into(),
+            message_head: message_head(&payload, Some(home), Some(&cwd)),
+            thread: "main".into(),
+            backtrace_top_5: vec![],
+            error_kind: None,
+            error_data: None,
+        };
+        let wire = serde_json::to_value(event).unwrap();
+        let message = wire["message_head"].as_str().unwrap();
+        assert_eq!(message, format!("{prefix} <REDA"));
+        assert_eq!(message.chars().count(), HEAD_MAX);
+        assert!(!wire.to_string().contains("sk-TEST"));
+    }
+
+    #[test]
     fn panic_with_error_context() {
         let r = Record {
             envelope: sample_envelope(),

@@ -70,6 +70,13 @@ pub fn scrub_path(s: &str, home: Option<&Path>, cwd: Option<&Path>) -> String {
     out
 }
 
+/// Prepare a diagnostic for telemetry. Redact before truncating so a secret
+/// that straddles the character limit cannot survive as a partial token.
+pub fn message_head(message: &str, home: Option<&Path>, cwd: Option<&Path>) -> String {
+    let scrubbed = scrub_path(message, home, cwd);
+    truncate_head(&redact_secrets(&scrubbed), HEAD_MAX)
+}
+
 pub fn truncate_head(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
