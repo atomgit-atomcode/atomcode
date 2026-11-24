@@ -97,6 +97,10 @@ export function InputArea() {
   useEffect(() => {
     function handleMessage(e: MessageEvent) {
       if (e.data?.type === 'focusInput') textareaRef.current?.focus();
+      if (e.data?.type === 'restoreChatInput'
+          && (document.activeElement === document.body || document.activeElement === textareaRef.current)) {
+        textareaRef.current?.focus();
+      }
       if (e.data?.type === 'workspaceFiles') {
         setWorkspaceFiles(e.data.files || []);
       }
@@ -118,21 +122,7 @@ export function InputArea() {
       }
     }
     window.addEventListener('message', handleMessage);
-    // Report whether this textarea held focus when the webview loses or gains
-    // document focus, so the extension host can restore focus when the VS Code
-    // window regains it (Alt+Tab back on Windows leaves the webview unfocused).
-    // Reporting on focus too keeps a stale "input had focus" state from
-    // surviving in-app focus moves.
-    const reportFocusState = () => {
-      postMessage({ type: 'chatInputFocusState', focused: document.activeElement === textareaRef.current });
-    };
-    window.addEventListener('blur', reportFocusState);
-    window.addEventListener('focus', reportFocusState);
-    return () => {
-      window.removeEventListener('message', handleMessage);
-      window.removeEventListener('blur', reportFocusState);
-      window.removeEventListener('focus', reportFocusState);
-    };
+    return () => window.removeEventListener('message', handleMessage);
   }, []);
 
   useEffect(() => {
@@ -167,31 +157,46 @@ export function InputArea() {
     };
   }, []);
 
-  // Windows: switching back with Alt+Tab lands a lone Alt keydown/keyup in the
-  // webview, which activates the workbench menu bar and steals focus. Swallow
-  // the lone Alt key (AltGr reports Ctrl+Alt, so it is excluded). Windows-only:
-  // on macOS a bare Option keydown participates in accent input.
+  // A Windows webview can lose focus before the workbench reports its window
+  // blur. Remember a bare Alt held by the textarea to correlate that ordering.
   useEffect(() => {
-    const isWindows = navigator.userAgent.includes('Windows');
-    if (!isWindows) return;
-    const swallowAlt = (e: KeyboardEvent) => {
-      if (e.key !== 'Alt' || e.ctrlKey || e.shiftKey || e.metaKey) return;
-      e.preventDefault();
-      if (e.type === 'keyup') {
-        // Only hand focus back when nothing meaningful holds it (focus fell to
-        // the document level) or the textarea itself — don't steal it from the
-        // file picker or other inputs inside the webview.
-        const active = document.activeElement;
-        if (active === document.body || active === textareaRef.current) {
-          textareaRef.current?.focus();
-        }
+    const windowsClient = /Windows/i.test(navigator.userAgent);
+    if (!windowsClient) return;
+    let altHeld = false;
+    const isInputAlt = (event: KeyboardEvent) =>
+      event.target === textareaRef.current
+      && !event.ctrlKey && !event.shiftKey && !event.metaKey
+      && !event.getModifierState('AltGraph');
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') {
+        altHeld = isInputAlt(event);
+        if (altHeld) event.preventDefault();
+      } else if (event.key !== 'Tab') {
+        altHeld = false;
       }
     };
-    window.addEventListener('keydown', swallowAlt);
-    window.addEventListener('keyup', swallowAlt);
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') {
+        if (isInputAlt(event)) event.preventDefault();
+        altHeld = false;
+      }
+    };
+    const reportBlur = () => {
+      postMessage({
+        type: 'chatInputFocusState',
+        focused: document.activeElement === textareaRef.current,
+        windowsClient,
+        altHeld,
+      });
+      altHeld = false;
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', reportBlur);
     return () => {
-      window.removeEventListener('keydown', swallowAlt);
-      window.removeEventListener('keyup', swallowAlt);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', reportBlur);
     };
   }, []);
 

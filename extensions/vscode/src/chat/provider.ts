@@ -163,10 +163,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
   private _focusedPanelId?: string;
-  private _chatInputHadFocusOnBlur = false;
-  private _chatInputBlurAt = 0;
+  private _windowFocused = vscode.window.state?.focused ?? true;
   private _windowBlurredAt = 0;
-  private _chatInputFocusWebview?: vscode.Webview;
+  private _chatInputRestore?: { webview: vscode.Webview; reportedAt: number };
   private _windowStateWatcher?: vscode.Disposable;
   private _focusRestoreTimer?: ReturnType<typeof setTimeout>;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
@@ -207,27 +206,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._broadcastChromeFont();
       }
     });
-    // Windows Alt+Tab: when the VS Code window regains focus, the webview does
-    // not get focus back (the lone Alt even activates the menu bar). If the
-    // chat input held focus before the window lost it, hand focus back.
-    this._windowStateWatcher = vscode.window.onDidChangeWindowState((state) => {
-      if (!state.focused) {
+    this._windowStateWatcher = vscode.window.onDidChangeWindowState(({ focused }) => {
+      if (this._windowFocused === focused) return;
+      this._windowFocused = focused;
+      if (this._focusRestoreTimer !== undefined) {
+        clearTimeout(this._focusRestoreTimer);
+        this._focusRestoreTimer = undefined;
+      }
+      if (!focused) {
         this._windowBlurredAt = Date.now();
+        // An Alt+Tab report can arrive just before the window-state event.
+        if (this._chatInputRestore && this._windowBlurredAt - this._chatInputRestore.reportedAt > 150) {
+          this._chatInputRestore = undefined;
+        }
         return;
       }
-      if (process.platform !== 'win32') return;
-      if (!this._chatInputHadFocusOnBlur) return;
-      // Only restore when the webview's blur report coincides with the OS
-      // window losing focus. A report long before it means focus moved
-      // elsewhere inside the app, and restoring would steal focus back.
-      const fresh = Math.abs(this._chatInputBlurAt - this._windowBlurredAt) <= 2000;
-      this._chatInputHadFocusOnBlur = false;
-      if (!fresh) return;
-      const target = this._chatInputFocusWebview;
-      // Let the workbench finish window activation (and dismiss any Alt-activated menu) first.
+      const target = this._chatInputRestore?.webview;
+      this._chatInputRestore = undefined;
+      if (!target) return;
+
+      const activeEditor = vscode.window.activeTextEditor;
+      // Let the workbench finish window activation before restoring input.
       this._focusRestoreTimer = setTimeout(() => {
-        if (target) target.postMessage({ type: 'focusInput' });
-        else this.focusInput();
+        this._focusRestoreTimer = undefined;
+        const visible = this._view?.webview === target
+          ? this._view.visible
+          : this._webviewPanels.get(target)?.active;
+        if (this._windowFocused && visible && vscode.window.activeTextEditor === activeEditor) {
+          void target.postMessage({ type: 'restoreChatInput' });
+        }
       }, 100);
     });
   }
@@ -384,8 +391,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._webviewPanels.delete(webview);
     this._sessionBindingPromises.delete(webview);
     this._panelHistoryLoads.delete(panel);
-    if (this._chatInputFocusWebview === webview) {
-      this._chatInputFocusWebview = undefined;
+    if (this._chatInputRestore?.webview === webview) {
+      this._chatInputRestore = undefined;
     }
     if (!disposedSid) return;
 
@@ -818,11 +825,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           );
           break;
         }
-        case 'chatInputFocusState':
-          this._chatInputHadFocusOnBlur = Boolean(msg.focused);
-          this._chatInputBlurAt = Date.now();
-          this._chatInputFocusWebview = webview;
+        case 'chatInputFocusState': {
+          const now = Date.now();
+          // This extension can run on a Linux workspace host for a Windows
+          // client. Only the webview knows which desktop delivered the event.
+          if (msg.windowsClient === true && msg.focused === true
+              && (this._windowFocused ? msg.altHeld === true : now - this._windowBlurredAt <= 2000)) {
+            this._chatInputRestore = { webview, reportedAt: now };
+          } else if (this._chatInputRestore?.webview === webview) {
+            this._chatInputRestore = undefined;
+          }
           break;
+        }
         case 'getSkills':
           try {
             const skills = await this._client.listSkills();

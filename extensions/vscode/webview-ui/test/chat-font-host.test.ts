@@ -7,6 +7,13 @@ import { join } from 'node:path';
 let value: unknown = 20;
 let watcher: (event: { affectsConfiguration: (key: string) => boolean }) => void;
 let windowStateCb: ((state: { focused: boolean }) => void) | undefined;
+const windowApi = {
+  activeTextEditor: undefined as object | undefined,
+  onDidChangeWindowState(callback: (state: { focused: boolean }) => void) {
+    windowStateCb = callback;
+    return { dispose() {} };
+  },
+};
 const original = (Module as any)._load;
 (Module as any)._load = function(request: string, ...args: any[]) {
   if (request === 'vscode') return {
@@ -16,7 +23,7 @@ const original = (Module as any)._load;
     },
     Uri: { joinPath: (uri: { fsPath: string }, ...parts: string[]) => ({ fsPath: join(uri.fsPath, ...parts) }) },
     env: { language: 'en' },
-    window: { onDidChangeWindowState: (cb: (state: { focused: boolean }) => void) => { windowStateCb = cb; return { dispose() {} }; } },
+    window: windowApi,
   };
   return original.call(this, request, ...args);
 };
@@ -49,60 +56,85 @@ async function main() {
   console.log('chat font host: initial HTML, live sidebar/tab broadcast and bounds passed');
 }
 
-// Covers the window-state focus restore branch: the webview reports whether the
-// chat input held focus (chatInputFocusState), and the host hands focus back to
-// that webview when the OS window regains focus on Windows.
 async function runFocusRestoreTests(provider: any) {
   const sent: unknown[] = [];
   let messageHandler: (msg: unknown) => Promise<void> = async () => {};
-  const fakeWebview = {
-    postMessage: (m: unknown) => { sent.push(m); },
-    onDidReceiveMessage: (cb: (msg: unknown) => Promise<void>) => { messageHandler = cb; return { dispose() {} }; },
-  } as any;
-  provider._setupWebviewMessageHandler(fakeWebview, 'sidebar');
-  const focusInputPosts = () => sent.filter(m => (m as any).type === 'focusInput').length;
-  const waitRestoreTimer = () => new Promise(r => setTimeout(r, 150));
+  const webview = {
+    postMessage: (message: unknown) => { sent.push(message); },
+    onDidReceiveMessage: (callback: typeof messageHandler) => {
+      messageHandler = callback;
+      return { dispose() {} };
+    },
+  };
+  const sidebar = { webview, visible: true };
+  provider._view = sidebar;
+  provider._setupWebviewMessageHandler(webview, 'sidebar');
+  const posts = () => sent.filter(message => (message as { type: string }).type === 'restoreChatInput').length;
+  const settle = () => new Promise(resolve => setTimeout(resolve, 150));
+  const windowFocus = (focused: boolean) => windowStateCb!({ focused });
+  const report = (windowsClient = true, focused = true, altHeld = false) =>
+    messageHandler({ type: 'chatInputFocusState', windowsClient, focused, altHeld });
 
-  // 1. Input held focus on window blur → restore is posted to the reporting webview.
-  windowStateCb!({ focused: false });
-  await messageHandler({ type: 'chatInputFocusState', focused: true });
-  windowStateCb!({ focused: true });
-  await waitRestoreTimer();
-  assert.equal(focusInputPosts(), 1);
-
-  // 2. Flag cleared after restore → a second window cycle does not re-post.
-  windowStateCb!({ focused: false });
-  windowStateCb!({ focused: true });
-  await waitRestoreTimer();
-  assert.equal(focusInputPosts(), 1);
-
-  // 3. Input did not hold focus on blur → no restore.
-  windowStateCb!({ focused: false });
-  await messageHandler({ type: 'chatInputFocusState', focused: false });
-  windowStateCb!({ focused: true });
-  await waitRestoreTimer();
-  assert.equal(focusInputPosts(), 1);
-
-  // 4. Blur report far older than the window blur (focus moved in-app) → no restore.
-  windowStateCb!({ focused: false });
-  await messageHandler({ type: 'chatInputFocusState', focused: true });
-  provider._chatInputBlurAt = Date.now() - 5000;
-  windowStateCb!({ focused: true });
-  await waitRestoreTimer();
-  assert.equal(focusInputPosts(), 1);
-
-  // 5. Not Windows → the restore branch stays off entirely.
-  const realPlatform = process.platform;
-  Object.defineProperty(process, 'platform', { value: 'darwin' });
+  // The browser identifies a Windows client independently of the Node host.
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { value: 'linux' });
   try {
-    windowStateCb!({ focused: false });
-    await messageHandler({ type: 'chatInputFocusState', focused: true });
-    windowStateCb!({ focused: true });
-    await waitRestoreTimer();
-    assert.equal(focusInputPosts(), 1);
+    windowFocus(false);
+    await report();
+    windowFocus(true);
+    await settle();
+    assert.equal(posts(), 1, 'a Windows client can restore through a remote Linux host');
+
+    await report(true, true, true);
+    windowFocus(false);
+    windowFocus(true);
+    await settle();
+    assert.equal(posts(), 2, 'a held Alt can identify a webview report arriving first');
   } finally {
-    Object.defineProperty(process, 'platform', { value: realPlatform });
+    Object.defineProperty(process, 'platform', platform);
   }
+
+  await report();
+  windowFocus(false);
+  windowFocus(true);
+  await settle();
+  assert.equal(posts(), 2, 'an in-app blur while the VS Code window was focused is ignored');
+
+  windowFocus(false);
+  await report(false);
+  windowFocus(true);
+  await settle();
+  assert.equal(posts(), 2, 'non-Windows clients never restore focus');
+
+  windowFocus(false);
+  await report();
+  await report(true, false);
+  windowFocus(true);
+  await settle();
+  assert.equal(posts(), 2, 'a newer report that the input was not focused cancels recovery');
+
+  windowFocus(false);
+  await report();
+  windowFocus(true);
+  windowFocus(false);
+  await settle();
+  assert.equal(posts(), 2, 'another OS blur cancels a scheduled restore');
+  windowFocus(true);
+
+  windowFocus(false);
+  await report();
+  windowFocus(true);
+  sidebar.visible = false;
+  await settle();
+  assert.equal(posts(), 2, 'a hidden view does not receive focus');
+
+  sidebar.visible = true;
+  windowFocus(false);
+  await report();
+  windowFocus(true);
+  windowApi.activeTextEditor = {};
+  await settle();
+  assert.equal(posts(), 2, 'a newly selected editor keeps focus during the restore delay');
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
