@@ -1309,9 +1309,10 @@ async fn answer_prompts(
 /// The least time between two questions about the allowance.
 ///
 /// The question costs a round trip on the account, so it is asked after a
-/// turn — a successful model turn can be the first sign of an early reset,
-/// which allows one immediate recheck — and held off for this long. The
-/// number is the one `atomcode-tuix` settled on.
+/// turn — and only then: the one immediate recheck a turn can trigger fires
+/// while the row already shows a badge that has hit 100% (the first sign of
+/// an early reset), not for a fresh or unrendered figure. Questions are held
+/// off for this long. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
@@ -1922,6 +1923,10 @@ pub struct Tui {
     allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
     /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,
+    /// The newest ask that came back empty or failed: a reply from the ask
+    /// just before it is still the freshest data the page has seen, so it is
+    /// allowed to land instead of being retired with the rest.
+    failed_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -6968,6 +6973,7 @@ impl Tui {
         let nudged = self.allowance_nudged.clone();
         let client = self.client.clone();
         let allowance_generation = self.allowance_generation.clone();
+        let failed_generation = self.failed_generation.clone();
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
@@ -6987,8 +6993,13 @@ impl Tui {
                     ..
                 }) => windows,
                 // A host that will not say leaves the row as it was. Blanking
-                // it on a failed question would read as "you are back to zero".
-                _ => return,
+                // it on a failed question would read as "you are back to zero"
+                // — but the failure is remembered: a reply the ask before this
+                // one is still the freshest figure in hand and may land.
+                _ => {
+                    failed_generation.store(generation, Ordering::SeqCst);
+                    return;
+                }
             };
             // Out of quota: the alternative is a command most people do not know
             // exists, and the other front end says the same thing on the same
@@ -7000,7 +7011,11 @@ impl Tui {
             }
             let (changed, warning) = {
                 let mut m = host.moment.write().expect("moment poisoned");
-                if generation != allowance_generation.load(Ordering::SeqCst) {
+                let current = allowance_generation.load(Ordering::SeqCst);
+                let retired = generation != current
+                    && !(generation + 1 == current
+                        && failed_generation.load(Ordering::SeqCst) == current);
+                if retired {
                     return;
                 }
                 let warning = crate::moment::Allowance::exhausted(&windows)
@@ -12649,6 +12664,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
             allowance_generation: Arc::new(AtomicU64::new(0)),
+            failed_generation: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
