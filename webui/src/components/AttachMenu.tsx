@@ -1,9 +1,7 @@
-// Input "+" attach menu: opens a popover above the button with three actions —
-// upload image (disabled / coming soon), upload file (opens FilePicker via
-// parent), and choose a user-invocable skill (inserts `/<name> ` into the
-// input). Skills refresh whenever the menu opens.
+// Attachment actions and user-invocable skills for the composer.
 
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { placeAttachPopover } from '../lib/attachPopoverPlacement';
 import { useSkills, refreshSkills } from '../skills';
 import { useT } from '../settings';
 import { useComposerToolbarHold } from '../lib/composerFocus';
@@ -63,9 +61,63 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
   const [open, setOpen] = useState(false);
   const { items: skills, loading, failed, error: skillsError } = useSkills(open);
   const rootRef = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const popover = useRef<HTMLDivElement>(null);
+  const fixedRows = useRef<HTMLDivElement>(null);
+  const skillList = useRef<HTMLDivElement>(null);
   const patchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toolbarHold = useComposerToolbarHold();
+
+  // A viewport-positioned menu can escape the welcome page's scroll clip
+  // while remaining inside the composer for focus and outside-click handling.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const button = trigger.current;
+    const panel = popover.current;
+    const fixed = fixedRows.current;
+    const list = skillList.current;
+    if (!button || !panel || !fixed || !list) return;
+    const viewport = window.visualViewport;
+
+    const position = (event?: Event) => {
+      if (event?.type === 'scroll' && event.target instanceof Node && panel.contains(event.target)) return;
+      const top = viewport?.offsetTop ?? 0;
+      const left = viewport?.offsetLeft ?? 0;
+      const bounds = {
+        top, left,
+        bottom: top + (viewport?.height ?? window.innerHeight),
+        right: left + (viewport?.width ?? window.innerWidth),
+      };
+      const panelCss = getComputedStyle(panel);
+      const chrome = [panelCss.paddingTop, panelCss.paddingBottom, panelCss.borderTopWidth, panelCss.borderBottomWidth]
+        .reduce((sum, value) => sum + parseFloat(value), 0);
+      const skillHeight = Math.min(list.scrollHeight, parseFloat(getComputedStyle(list).maxHeight));
+      const preferredHeight = fixed.offsetHeight + skillHeight + chrome;
+      const placement = placeAttachPopover(button.getBoundingClientRect(), bounds, preferredHeight);
+      panel.style.left = `${placement.left}px`;
+      panel.style.width = `${placement.width}px`;
+      panel.style.maxHeight = `${placement.maxHeight}px`;
+      panel.style.top = placement.opensBelow ? `${placement.edge}px` : 'auto';
+      panel.style.bottom = placement.opensBelow ? 'auto' : `${window.innerHeight - placement.edge}px`;
+    };
+
+    position();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => position());
+    observer?.observe(button);
+    observer?.observe(fixed);
+    window.addEventListener('resize', position);
+    window.addEventListener('scroll', position, true);
+    viewport?.addEventListener('resize', position);
+    viewport?.addEventListener('scroll', position);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', position);
+      window.removeEventListener('scroll', position, true);
+      viewport?.removeEventListener('resize', position);
+      viewport?.removeEventListener('scroll', position);
+    };
+  }, [open, skills, loading, failed, skillsError]);
 
   // Close on outside click.
   useEffect(() => {
@@ -85,8 +137,15 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
   }
 
   return (
-    <div class="attach-menu" ref={rootRef}>
+    <div class="attach-menu" ref={rootRef} onKeyDown={event => {
+      if (!open || event.key !== 'Escape') return;
+      event.stopPropagation();
+      setOpen(false);
+      trigger.current?.focus();
+    }}>
       <button
+        type="button"
+        ref={trigger}
         class="attach-btn"
         onPointerDown={toolbarHold.onPointerDown}
         onPointerUp={toolbarHold.onPointerUp}
@@ -115,40 +174,42 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
       <input ref={patchInputRef} type="file" accept=".patch,.diff" style="display:none" aria-label={t('patch.upload')}
         onChange={event => { const input = event.currentTarget; const file = input.files?.[0]; input.value = ''; if (file) onImportPatch?.(file); }} />
       {open && (
-        <div class="attach-popover">
-          <button
-            class="attach-row"
-            onClick={() => {
-              setOpen(false);
-              fileInputRef.current?.click();
-            }}
-          >
-            <ImageIcon />
-            <span class="attach-row-label">{t('attach.image')}</span>
-          </button>
+        <div class="attach-popover" ref={popover}>
+          <div class="attach-fixed-rows" ref={fixedRows}>
+            <button
+              class="attach-row"
+              onClick={() => {
+                setOpen(false);
+                fileInputRef.current?.click();
+              }}
+            >
+              <ImageIcon />
+              <span class="attach-row-label">{t('attach.image')}</span>
+            </button>
 
-          <button
-            class="attach-row"
-            onClick={() => {
-              setOpen(false);
-              onPickFile();
-            }}
-          >
-            <FileIcon />
-            <span class="attach-row-label">{t('attach.file')}</span>
-          </button>
+            <button
+              class="attach-row"
+              onClick={() => {
+                setOpen(false);
+                onPickFile();
+              }}
+            >
+              <FileIcon />
+              <span class="attach-row-label">{t('attach.file')}</span>
+            </button>
 
-          {onImportPatch && <button class="attach-row" title={patchDisabled ? t('patch.needReady') : undefined} disabled={patchDisabled} onClick={() => { setOpen(false); patchInputRef.current?.click(); }}>
-            <FileIcon /><span class="attach-row-label">{t('patch.upload')}</span>
-          </button>}
-          {onManageSpecs&&<button type="button" class="attach-row" onClick={()=>{setOpen(false);onManageSpecs();}}><FileIcon/><span class="attach-row-label">{t('spec.manage')}</span></button>}
-          <div class="attach-divider" />
+            {onImportPatch && <button class="attach-row" title={patchDisabled ? t('patch.needReady') : undefined} disabled={patchDisabled} onClick={() => { setOpen(false); patchInputRef.current?.click(); }}>
+              <FileIcon /><span class="attach-row-label">{t('patch.upload')}</span>
+            </button>}
+            {onManageSpecs&&<button type="button" class="attach-row" onClick={()=>{setOpen(false);onManageSpecs();}}><FileIcon/><span class="attach-row-label">{t('spec.manage')}</span></button>}
+            <div class="attach-divider" />
 
-          <div class="attach-section-label">
-            <SkillIcon />
-            <span>{t('attach.skill')}</span>
+            <div class="attach-section-label">
+              <SkillIcon />
+              <span>{t('attach.skill')}</span>
+            </div>
           </div>
-          <div class="attach-skill-list">
+          <div class="attach-skill-list" ref={skillList}>
             {failed && <button class="attach-row" onClick={(e) => { e.stopPropagation(); void refreshSkills(); }}>{t(skills?.length ? 'skills.refreshFailedRetry' : 'skills.loadFailedRetry')}{skillsError && <small>{skillsError}</small>}</button>}
             {loading && <div class="attach-note">{t('attach.skillsLoading')}</div>}
             {!loading && !failed && skills !== null && skills.length === 0 && (
