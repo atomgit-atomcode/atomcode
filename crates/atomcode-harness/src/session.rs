@@ -409,7 +409,7 @@ impl SessionLog {
     /// This is the single place the log becomes a prompt. A consumer that needs
     /// "what the model saw" calls this rather than keeping a parallel list.
     pub fn derive_messages(&self) -> Vec<Message> {
-        derive_messages(&self.events())
+        self.read_events(derive_messages)
     }
 }
 

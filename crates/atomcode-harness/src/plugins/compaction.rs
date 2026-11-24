@@ -214,7 +214,7 @@ pub fn stub_on_overflow(log: &SessionLog, ask: &CompactionAsk) -> Option<Compact
     if !matches!(ask.trigger, CompactTrigger::Overflow { .. }) {
         return None;
     }
-    let traced = crate::session::derive_traced(&log.events());
+    let traced = log.read_events(crate::session::derive_traced);
     let names: std::collections::HashMap<&str, &str> = traced
         .iter()
         .flat_map(|t| t.message.tool_calls.iter())
@@ -348,7 +348,7 @@ pub fn strategy_would_summarize(
     log: &SessionLog,
     ask: &CompactionAsk,
 ) -> bool {
-    StrategyView::of(&log.events(), None)
+    log.read_events(|events| StrategyView::of(events, None))
         .is_some_and(|view| strategy.will_summarize(&view.kernel_view(ask)))
 }
 

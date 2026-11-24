@@ -205,7 +205,10 @@ impl PluginAgentLoop {
                 let first_content = self.stream_first_content;
                 let loop_retried = loop_retried.clone();
                 Box::pin(async move {
-                    let retained_bytes=atomcode_kernel::session::retention::validate_request(&session.events(), &messages)
+                    let retained_bytes = session
+                        .read_events(|events| {
+                            atomcode_kernel::session::retention::validate_request(events, &messages)
+                        })
                         .map_err(RequestError::message)?;
                     if retained_bytes > super::spec::allowance(provider.context_window()) {
                         return Err(RequestError::message("Task specifications exceed the current model's context allowance. Use /spec to unpin messages or choose a larger context model."));
@@ -1238,7 +1241,7 @@ impl PluginAgentLoop {
         }
 
         if outcome.stop == StopReason::Cancelled && agent.take_interrupted() {
-            if let Some(partial) = partial_reply(&session.events(), turn) {
+            if let Some(partial) = session.read_events(|events| partial_reply(events, turn)) {
                 self.commit(&session, partial);
             }
             self.commit(
@@ -1388,8 +1391,12 @@ fn dump_request(session: &SessionLog, messages: &[Message], tools: &[ToolDef]) {
         s.hash(&mut h);
         format!("{:016x}", h.finish())
     };
-    let events = session.events();
-    let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+    let (event_count, max_seq) = session.read_events(|events| {
+        (
+            events.len(),
+            events.iter().map(|e| e.seq).max().unwrap_or(0),
+        )
+    });
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1399,7 +1406,7 @@ fn dump_request(session: &SessionLog, messages: &[Message], tools: &[ToolDef]) {
         "{{\"ts\":{ms},\"session\":{:?},\"events\":{},\"max_seq\":{},\"n_msgs\":{},\"total_chars\":{},\
          \"tool_defs\":{},\"msgs\":[",
         session.id(),
-        events.len(),
+        event_count,
         max_seq,
         messages.len(),
         messages.iter().map(|m| m.text.len()).sum::<usize>(),
