@@ -177,6 +177,7 @@ export function WorkbenchGit({
   }, [selection]);
 
   const { staged, unstaged } = partitionChanges(changes);
+  const discardable = unstaged.filter((entry) => entry.kind !== "conflicted");
   const problem = commitMessageProblem(message);
   const canCommit = !busy && staged.length > 0 && problem === null;
   const selectedRow =
@@ -445,9 +446,9 @@ export function WorkbenchGit({
             onAll={stageEverything}
             allLabel={text("全部暂存", "Stage all")}
             footer={
-              !readOnly && unstaged.length > 1 ? (
-                <button class="git-danger-link" disabled={busy} onClick={() => setDiscarding(unstaged)}>
-                  {text("丢弃全部更改", "Discard all changes")}
+              !readOnly && discardable.length > 1 ? (
+                <button class="git-danger-link" disabled={busy} onClick={() => setDiscarding(discardable)}>
+                  {text("丢弃全部未暂存更改", "Discard all unstaged changes")}
                 </button>
               ) : undefined
             }
@@ -545,12 +546,12 @@ export function WorkbenchGit({
           body={
             discarding.length === 1
               ? text(
-                  `「${discarding[0].path}」的本地修改将无法恢复。`,
-                  `Local edits to “${discarding[0].path}” cannot be recovered.`,
+                  `「${discarding[0].path}」的未暂存修改将无法恢复。`,
+                  `Unstaged edits to “${discarding[0].path}” cannot be recovered.`,
                 )
               : text(
-                  `${discarding.length} 个文件的本地修改将无法恢复。`,
-                  `Local edits to ${discarding.length} files cannot be recovered.`,
+                  `${discarding.length} 个文件的未暂存修改将无法恢复。`,
+                  `Unstaged edits to ${discarding.length} files cannot be recovered.`,
                 )
           }
           confirmLabel={text("丢弃", "Discard")}

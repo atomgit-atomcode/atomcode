@@ -750,21 +750,9 @@ struct ChangePath {
     path: String,
     #[serde(default)]
     original: Option<String>,
-    /// `??` in `git status`: untracked, so discarding removes the file.
+    /// State the browser displayed when the user confirmed a discard.
     #[serde(default)]
     untracked: bool,
-    /// `A` in the index: staged as a new file. HEAD has no copy to restore
-    /// from, so discarding drops the index entry and the file itself.
-    #[serde(default)]
-    staged_new: bool,
-}
-
-/// One row a discard request must act on, already path-validated.
-#[derive(Debug)]
-struct DiscardEntry {
-    paths: Vec<String>,
-    untracked: bool,
-    staged_new: bool,
 }
 
 impl ChangePath {
@@ -781,13 +769,6 @@ impl ChangePath {
             Some(original) => Ok(vec![original.clone(), self.path.clone()]),
             None => Ok(vec![self.path.clone()]),
         }
-    }
-    fn discard(&self) -> Result<DiscardEntry, String> {
-        Ok(DiscardEntry {
-            paths: self.paths()?,
-            untracked: self.untracked,
-            staged_new: self.staged_new,
-        })
     }
 }
 
@@ -816,24 +797,6 @@ impl ChangesRequest {
             paths.extend(entry.paths()?);
         }
         Ok(paths)
-    }
-    fn discards(&self) -> Result<Vec<DiscardEntry>, String> {
-        if self.paths.is_empty() {
-            return Err("Select at least one changed file".into());
-        }
-        if self.paths.len() > GIT_PATH_LIMIT {
-            return Err("Too many files in one Git action".into());
-        }
-        self.paths.iter().map(ChangePath::discard).collect()
-    }
-    /// Per-path entries for a discard. "Discard everything" addresses the whole
-    /// workspace, so it legitimately arrives with no paths and needs none.
-    fn discard_entries(&self) -> Result<Vec<DiscardEntry>, String> {
-        if self.all {
-            Ok(Vec::new())
-        } else {
-            self.discards()
-        }
     }
 }
 
@@ -881,13 +844,18 @@ fn remove_discarded_file(root: &Path, path: &str) -> Result<(), String> {
     }
 }
 
-async fn discard_all_paths(context: &GitWorkspace, has_head: bool) -> Result<(), String> {
-    if !has_head {
-        return Err("Discarding everything needs an initial commit".into());
-    }
-    // The workspace may be a subdirectory of a larger repository, so a bare
-    // `reset --hard` would also clear changes outside it. Discard exactly the
-    // rows `git status` reports for this workspace instead.
+fn discardable(change: &Change) -> bool {
+    matches!(change.worktree.as_str(), "M" | "D" | "T" | "?")
+        && !matches!(
+            (change.index.as_str(), change.worktree.as_str()),
+            ("U", _) | ("D", "D")
+        )
+}
+
+async fn discard_worktree_changes(
+    context: &GitWorkspace,
+    selection: Option<&[ChangePath]>,
+) -> Result<(), String> {
     let (ok, bytes) = git(
         &context.root,
         &context.configs,
@@ -895,6 +863,7 @@ async fn discard_all_paths(context: &GitWorkspace, has_head: bool) -> Result<(),
             "status",
             "--porcelain=v1",
             "-z",
+            "--no-renames",
             "--untracked-files=all",
             "--ignore-submodules=all",
             "--",
@@ -905,51 +874,45 @@ async fn discard_all_paths(context: &GitWorkspace, has_head: bool) -> Result<(),
     if !ok {
         return Err("Unable to read Git status".into());
     }
-    let entries = discard_entries_from_status(parse_status(&bytes, context)?);
-    discard_selected(context, &entries, has_head).await
-}
-
-/// `A` and `C` put a path in the index that HEAD never held; untracked rows
-/// have no index entry at all. Both need the delete path rather than a restore.
-fn discard_entries_from_status(changes: Vec<Change>) -> Vec<DiscardEntry> {
-    changes
-        .into_iter()
-        .map(|change| DiscardEntry {
-            paths: match change.original.clone() {
-                Some(original) => vec![original, change.path],
-                None => vec![change.path],
-            },
-            untracked: change.index == "?",
-            staged_new: matches!(change.index.as_str(), "A" | "C"),
-        })
-        .collect()
-}
-
-async fn discard_selected(
-    context: &GitWorkspace,
-    entries: &[DiscardEntry],
-    has_head: bool,
-) -> Result<(), String> {
-    for entry in entries {
-        if entry.untracked || entry.staged_new || !has_head {
-            // Nothing in HEAD to restore: drop the index entry (untracked rows
-            // have none) and remove the file itself. A failure here would leave
-            // a half-discarded row, so it is reported rather than swallowed.
-            if !entry.untracked {
-                git_on_paths(context, &["rm", "-r", "-f", "--cached", "-q"], &entry.paths).await?;
+    let changes = parse_status(&bytes, context)?;
+    let changes: std::collections::BTreeMap<_, _> = changes
+        .iter()
+        .filter(|change| discardable(change))
+        .map(|change| (change.path.as_str(), change.index == "?"))
+        .collect();
+    let entries = if let Some(selection) = selection {
+        let mut entries = std::collections::BTreeMap::new();
+        for entry in selection {
+            if changes.get(entry.path.as_str()) != Some(&entry.untracked) {
+                return Err(
+                    "Git changes have changed or cannot be discarded; refresh the panel".into(),
+                );
             }
+            entries.insert(entry.path.as_str(), entry.untracked);
+        }
+        entries
+    } else {
+        changes
+    };
+
+    // Restore from the index: a file staged for a commit can also have
+    // independent working-tree edits, including before the initial commit.
+    let tracked: Vec<_> = entries
+        .iter()
+        .filter(|(_, untracked)| !**untracked)
+        .map(|(path, _)| (*path).to_owned())
+        .collect();
+    for batch in tracked.chunks(64) {
+        git_on_paths(context, &["checkout"], batch).await?;
+    }
+    for (path, untracked) in entries {
+        if untracked {
             let root = context.root.clone();
-            let path = entry.paths.last().cloned().unwrap_or_default();
+            let path = path.to_owned();
             tokio::task::spawn_blocking(move || remove_discarded_file(&root, &path))
                 .await
                 .map_err(|e| e.to_string())??;
-            continue;
         }
-        let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
-        for path in &entry.paths {
-            args.push(path.as_str());
-        }
-        git_action(&context.root, &context.configs, &args).await?;
     }
     Ok(())
 }
@@ -959,6 +922,35 @@ async fn commit_staged(
     message: &str,
     amend: bool,
 ) -> Result<Option<String>, String> {
+    if context.root != context.repo {
+        let (ok, staged) = git(
+            &context.repo,
+            &context.configs,
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "-z",
+                "--",
+            ],
+        )
+        .await?;
+        if !ok {
+            return Err("Unable to check the staged files".into());
+        }
+        for path in staged
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path =
+                std::str::from_utf8(path).map_err(|_| "A staged Git filename is not UTF-8")?;
+            if !context.repo.join(path).starts_with(&context.root) {
+                return Err("The repository has staged files outside this workspace; open the repository root to commit them".into());
+            }
+        }
+    }
     let mut args = vec!["commit"];
     if amend {
         args.push("--amend");
@@ -1022,25 +1014,15 @@ pub(super) async fn git_discard(
     if q.paths.len() > GIT_PATH_LIMIT {
         return bad("Too many files in one Git action");
     }
-    // Only per-path discards need entries; "discard everything" addresses the
-    // whole workspace and legitimately arrives with no paths.
-    let entries = match q.discard_entries() {
-        Ok(entries) => entries,
-        Err(e) => return bad(e),
-    };
+    if !q.all && q.paths.iter().any(|entry| !relative_file(&entry.path)) {
+        return bad("Git action paths must stay inside the workspace");
+    }
     let context = match git_context(&state, &q.session_id).await {
         Ok(context) => context,
         Err(e) => return git_bad(e),
     };
-    let has_head = match git_has_head(&context).await {
-        Ok(value) => value,
-        Err(e) => return git_bad(e),
-    };
-    let result = if q.all {
-        discard_all_paths(&context, has_head).await
-    } else {
-        discard_selected(&context, &entries, has_head).await
-    };
+    let selection = (!q.all).then_some(q.paths.as_slice());
+    let result = discard_worktree_changes(&context, selection).await;
     match result {
         Ok(()) => ok_json(),
         Err(e) => git_bad(e),
@@ -1160,9 +1142,21 @@ pub(super) async fn git_switch(
         Err(e) => return git_bad(e),
     };
     let args = if q.create {
-        vec!["switch", "-c", q.name.as_str()]
+        vec!["checkout", "-b", q.name.as_str()]
     } else {
-        vec!["switch", q.name.as_str()]
+        let reference = format!("refs/heads/{}", q.name);
+        match git(
+            &context.root,
+            &context.configs,
+            &["show-ref", "--verify", "--quiet", &reference],
+        )
+        .await
+        {
+            Ok((true, _)) => {}
+            Ok((false, _)) => return bad("That local branch does not exist"),
+            Err(e) => return git_bad(e),
+        }
+        vec!["checkout", q.name.as_str(), "--"]
     };
     match git_action(&context.root, &context.configs, &args).await {
         Ok(_) => ok_json(),
@@ -1773,7 +1767,6 @@ mod tests {
             path: path.to_owned(),
             original: original.map(str::to_owned),
             untracked: false,
-            staged_new: false,
         };
         let request = |paths: Vec<ChangePath>| ChangesRequest {
             session_id: "s".into(),
@@ -1918,20 +1911,7 @@ mod tests {
         assert!(git_has_head(&context).await.unwrap());
 
         std::fs::write(root.join(&path), "two\n").unwrap();
-        git_action(
-            &context.root,
-            &context.configs,
-            &[
-                "restore",
-                "--source=HEAD",
-                "--staged",
-                "--worktree",
-                "--",
-                &path,
-            ],
-        )
-        .await
-        .unwrap();
+        discard_worktree_changes(&context, None).await.unwrap();
         assert_eq!(std::fs::read_to_string(root.join(&path)).unwrap(), "one\n");
 
         std::fs::write(root.join(&path), "three\n").unwrap();
@@ -2055,32 +2035,32 @@ mod tests {
             "second"
         );
 
-        // A staged-new row has no HEAD copy: discarding drops the index entry
-        // and the file rather than asking Git to restore something that never
-        // existed there.
-        std::fs::write(root.join("added.txt"), "staged content\n").unwrap();
-        stage_paths(&context, &["added.txt".to_owned()])
+        // Only the later edit is discarded. The staged addition is preserved.
+        let added = "added.txt".to_owned();
+        std::fs::write(root.join(&added), "staged content\n").unwrap();
+        stage_paths(&context, std::slice::from_ref(&added))
             .await
             .unwrap();
-        let staged_new = status_rows(&root)
-            .await
-            .into_iter()
-            .find(|row| row.path == "added.txt")
-            .expect("the staged-new row");
-        assert_eq!(staged_new.index, "A");
-        discard_selected(
+        std::fs::write(root.join(&added), "later edit\n").unwrap();
+        discard_worktree_changes(
             &context,
-            &[DiscardEntry {
-                paths: vec!["added.txt".to_owned()],
+            Some(&[ChangePath {
+                path: added.clone(),
+                original: None,
                 untracked: false,
-                staged_new: true,
-            }],
-            true,
+            }]),
         )
         .await
         .unwrap();
-        assert!(!root.join("added.txt").exists());
-        assert!(status_rows(&root).await.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join(&added)).unwrap(),
+            "staged content\n"
+        );
+        let rows = status_rows(&root).await;
+        assert_eq!(
+            (rows[0].index.as_str(), rows[0].worktree.as_str()),
+            ("A", " ")
+        );
     }
 
     #[tokio::test]
@@ -2094,14 +2074,13 @@ mod tests {
         let context = git_workspace(root.clone()).await.unwrap();
         let index = std::fs::read(root.join(".git/index")).unwrap();
 
-        discard_selected(
+        discard_worktree_changes(
             &context,
-            &[DiscardEntry {
-                paths: vec!["draft.txt".to_owned()],
+            Some(&[ChangePath {
+                path: "draft.txt".to_owned(),
+                original: None,
                 untracked: true,
-                staged_new: false,
-            }],
-            true,
+            }]),
         )
         .await
         .unwrap();
@@ -2112,35 +2091,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discarding_everything_restores_the_tree_and_needs_a_commit() {
+    async fn discarding_everything_keeps_the_index_even_before_the_initial_commit() {
         let dir = fixture_repo();
         let root = dir.path().canonicalize().unwrap();
-        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
-        run_git(&root, &["add", "-A"]);
-        run_git(&root, &["commit", "-qm", "baseline"]);
         let context = git_workspace(root.clone()).await.unwrap();
-
-        std::fs::write(root.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(root.join("tracked.txt"), "staged\n").unwrap();
         stage_paths(&context, &["tracked.txt".to_owned()])
             .await
             .unwrap();
+        std::fs::write(root.join("tracked.txt"), "later edit\n").unwrap();
         std::fs::write(root.join("draft.txt"), "draft\n").unwrap();
-        assert_eq!(status_rows(&root).await.len(), 2);
 
-        discard_all_paths(&context, true).await.unwrap();
+        discard_worktree_changes(&context, None).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
-            "one\n"
+            "staged\n"
         );
         assert!(!root.join("draft.txt").exists());
-        assert!(status_rows(&root).await.is_empty());
-
-        // With no commit there is nothing to restore from.
-        let empty = fixture_repo();
-        let empty_root = empty.path().canonicalize().unwrap();
-        let no_head = git_workspace(empty_root).await.unwrap();
-        let error = discard_all_paths(&no_head, false).await.unwrap_err();
-        assert!(error.contains("initial commit"), "{error}");
+        assert_eq!(run_git(&root, &["show", ":tracked.txt"]), "staged\n");
     }
 
     #[tokio::test]
@@ -2184,13 +2152,13 @@ mod tests {
         run_git(&root, &["commit", "-qm", "first"]);
         let first = run_git(&root, &["rev-parse", "HEAD"]).trim().to_owned();
 
-        run_git(&root, &["switch", "-q", "-c", "feature"]);
+        run_git(&root, &["checkout", "-q", "-b", "feature"]);
         std::fs::write(root.join("a.txt"), "feature\n").unwrap();
         std::fs::write(root.join("b.txt"), "b\n").unwrap();
         run_git(&root, &["add", "-A"]);
         run_git(&root, &["commit", "-qm", "feature work"]);
         let feature = run_git(&root, &["rev-parse", "HEAD"]).trim().to_owned();
-        run_git(&root, &["switch", "-q", "-"]);
+        run_git(&root, &["checkout", "-q", "-"]);
         std::fs::write(root.join("c.txt"), "c\n").unwrap();
         run_git(&root, &["add", "-A"]);
         run_git(&root, &["commit", "-qm", "main work"]);
@@ -2224,51 +2192,6 @@ mod tests {
         assert_eq!(names, ["a.txt", "b.txt"]);
         assert!(diff.contains("+feature"), "{diff}");
         assert!(!files.is_empty(), "a merge commit must list its files");
-    }
-
-    #[test]
-    fn a_discard_everything_request_needs_no_paths() {
-        let all = ChangesRequest {
-            session_id: "s".into(),
-            paths: Vec::new(),
-            all: true,
-        };
-        assert!(all.discard_entries().unwrap().is_empty());
-        // The same request without `all` is still a mistake.
-        let nothing = ChangesRequest {
-            session_id: "s".into(),
-            paths: Vec::new(),
-            all: false,
-        };
-        assert!(nothing.discard_entries().is_err());
-    }
-
-    #[tokio::test]
-    async fn discarding_everything_drops_staged_new_files_too() {
-        let dir = fixture_repo();
-        let root = dir.path().canonicalize().unwrap();
-        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
-        run_git(&root, &["add", "-A"]);
-        run_git(&root, &["commit", "-qm", "baseline"]);
-        let context = git_workspace(root.clone()).await.unwrap();
-
-        std::fs::write(root.join("tracked.txt"), "two\n").unwrap();
-        std::fs::write(root.join("staged-new.txt"), "new\n").unwrap();
-        stage_paths(&context, &["staged-new.txt".to_owned()])
-            .await
-            .unwrap();
-        std::fs::write(root.join("untracked.txt"), "loose\n").unwrap();
-        assert_eq!(status_rows(&root).await.len(), 3);
-
-        discard_all_paths(&context, true).await.unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
-            "one\n"
-        );
-        assert!(!root.join("staged-new.txt").exists());
-        assert!(!root.join("untracked.txt").exists());
-        assert!(status_rows(&root).await.is_empty());
     }
 
     #[tokio::test]
@@ -2330,52 +2253,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_staged_new_discard_reports_a_failed_index_removal() {
+    async fn discard_rejects_stale_selection_before_changing_other_files() {
         let dir = fixture_repo();
         let root = dir.path().canonicalize().unwrap();
-        std::fs::write(root.join("kept.txt"), "kept\n").unwrap();
         let context = git_workspace(root.clone()).await.unwrap();
-        // The row claims a staged-new entry that the index does not have: the
-        // failure must surface rather than leaving a half-discarded state.
-        let error = discard_selected(
-            &context,
-            &[DiscardEntry {
-                paths: vec!["missing.txt".to_owned()],
-                untracked: false,
-                staged_new: true,
-            }],
-            false,
-        )
-        .await
-        .unwrap_err();
-        assert!(!error.is_empty());
+        std::fs::write(root.join("staged.txt"), "staged\n").unwrap();
+        stage_paths(&context, &["staged.txt".to_owned()])
+            .await
+            .unwrap();
+        std::fs::write(root.join("other.txt"), "untracked\n").unwrap();
+        let entries = ["other.txt", "staged.txt"].map(|path| ChangePath {
+            path: path.to_owned(),
+            original: None,
+            untracked: true,
+        });
+        assert!(discard_worktree_changes(&context, Some(&entries))
+            .await
+            .is_err());
+        assert!(root.join("other.txt").exists());
+        assert_eq!(run_git(&root, &["show", ":staged.txt"]), "staged\n");
     }
 
-    #[test]
-    fn status_rows_map_to_discard_entries() {
-        let row = |path: &str, original: Option<&str>, index: &str, worktree: &str| Change {
-            path: path.to_owned(),
-            original: original.map(str::to_owned),
-            index: index.to_owned(),
-            worktree: worktree.to_owned(),
-            stats: None,
-        };
-        let entries = discard_entries_from_status(vec![
-            row("new.txt", None, "A", " "),
-            row("copied.txt", None, "C", " "),
-            row("new name.txt", Some("old name.txt"), "R", " "),
-            row("loose.txt", None, "?", "?"),
-            row("tracked.txt", None, " ", "M"),
-        ]);
-        assert!(entries[0].staged_new, "A has no HEAD copy");
-        assert!(entries[1].staged_new, "C has no HEAD copy either");
+    #[tokio::test]
+    async fn a_subdirectory_commit_refuses_staged_files_outside_the_workspace() {
+        let dir = fixture_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let workspace = repo.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(repo.join("outside.txt"), "outside\n").unwrap();
+        std::fs::write(workspace.join("inside.txt"), "inside\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        let context = git_workspace(workspace).await.unwrap();
+        let error = commit_staged(&context, "scope test", false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside this workspace"), "{error}");
+        assert!(!git_has_head(&context).await.unwrap());
+        assert!(run_git(&repo, &["diff", "--cached", "--name-only"]).contains("outside.txt"));
+
+        run_git(&repo, &["rm", "--cached", "--", "outside.txt"]);
+        commit_staged(&context, "inside only", false).await.unwrap();
         assert_eq!(
-            entries[2].paths,
-            vec!["old name.txt".to_owned(), "new name.txt".to_owned()]
+            run_git(&repo, &["show", "--format=", "--name-only", "HEAD"]).trim(),
+            "workspace/inside.txt"
         );
-        assert!(!entries[2].staged_new);
-        assert!(entries[3].untracked);
-        assert!(!entries[4].untracked && !entries[4].staged_new);
     }
 
     #[tokio::test]
@@ -2393,7 +2314,7 @@ mod tests {
         std::fs::write(repo.join("workspace").join("inside.txt"), "inside two\n").unwrap();
         let context = git_workspace(repo.join("workspace")).await.unwrap();
 
-        discard_all_paths(&context, true).await.unwrap();
+        discard_worktree_changes(&context, None).await.unwrap();
 
         assert_eq!(
             std::fs::read_to_string(repo.join("outside.txt")).unwrap(),

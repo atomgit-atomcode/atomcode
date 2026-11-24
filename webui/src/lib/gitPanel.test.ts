@@ -60,33 +60,31 @@ test('rename rows keep the original path so a Git action can address both sides'
   assert.equal(entry.kind, 'renamed');
   assert.deepEqual(splitPath(entry.path), { dir: 'src', name: 'new name.txt' });
   assert.deepEqual(selectionsOf([entry]), [
-    { path: 'src/new name.txt', original: 'src/old name.txt', untracked: false, staged_new: false },
+    { path: 'src/new name.txt', original: 'src/old name.txt', untracked: false },
   ]);
 });
 
 test('untracked rows are marked so discarding removes the file', () => {
   const { unstaged } = partitionChanges([change({ path: 'draft.md', index: '?', worktree: '?' })]);
   assert.deepEqual(selectionsOf(unstaged), [
-    { path: 'draft.md', original: null, untracked: true, staged_new: false },
+    { path: 'draft.md', original: null, untracked: true },
   ]);
 });
 
-test('a staged-new row is marked so discarding drops the index entry and the file', () => {
+test('a staged addition is still a tracked path', () => {
   const { staged } = partitionChanges([change({ path: 'added.txt', index: 'A', worktree: ' ' })]);
   assert.deepEqual(selectionsOf(staged), [
-    { path: 'added.txt', original: null, untracked: false, staged_new: true },
+    { path: 'added.txt', original: null, untracked: false },
   ]);
 });
 
-test('an edited or deleted-after-staging new file still discards as staged-new', () => {
+test('an edited or deleted staged addition is not untracked', () => {
   for (const worktree of ['M', 'D']) {
     const { unstaged } = partitionChanges([change({ path: 'n.txt', index: 'A', worktree })]);
     // The display kind is derived from the worktree letter...
     assert.notEqual(unstaged[0].kind, 'added');
-    // ...but the discard request must still say HEAD has no copy of it.
-    assert.equal(unstaged[0].stagedNew, true);
     assert.deepEqual(selectionsOf(unstaged), [
-      { path: 'n.txt', original: null, untracked: false, staged_new: true },
+      { path: 'n.txt', original: null, untracked: false },
     ]);
   }
 });

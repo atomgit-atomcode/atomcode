@@ -1608,13 +1608,11 @@ export type Change = {
 };
 
 /** A file a Git action should touch. `original` carries a rename source;
- *  `untracked` (`??`) and `staged_new` (index `A`) have no HEAD copy, so
- *  discarding removes them instead of restoring. */
+ *  `untracked` records the status displayed before a discard. */
 export type GitPathSelection = {
   path: string;
   original?: string | null;
   untracked?: boolean;
-  staged_new?: boolean;
 };
 
 export type GitBranchList = {

@@ -2,7 +2,7 @@
 // Run after: npm run build && cargo build -p atomcode-daemon --bin atomcode-daemon
 // WORKBENCH_BROWSER may override the browser executable; WORKBENCH_DAEMON the binary.
 import { chromium } from "playwright";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,9 +55,11 @@ git(["config", "commit.gpgSign", "false"]);
 git(["config", "core.autocrlf", "false"]);
 git(["add", "--", "."]);
 git(["commit", "-m", "baseline"]);
+const initialBranch = git(["symbolic-ref", "--short", "HEAD"]).trim();
 await writeFile(resolve(root, "tracked.txt"), "one\ntwo changed\n");
 await writeFile(resolve(root, "added.txt"), "staged content\n");
 git(["add", "--", "added.txt"]);
+await writeFile(resolve(root, "added.txt"), "later worktree edit\n");
 await writeFile(resolve(root, "fresh.txt"), "untracked content\n");
 await rm(resolve(root, "gone.txt"));
 
@@ -182,6 +184,13 @@ try {
   await changesSection.locator(".git-row").filter({ hasText: "gone.txt" }).first().waitFor();
   assert.equal(await stagedSection.locator(".git-row").filter({ hasText: "tracked.txt" }).count(), 0);
 
+  // Discard only the later worktree edit of a file that is already staged.
+  await rowIn(changesSection, "added.txt").locator('.git-row-actions button[title="Discard changes"]').click();
+  await page.getByRole("button", { name: "Discard", exact: true }).click();
+  await until(async () => (await row("added.txt"))?.worktree === " ", "only the staged addition remains");
+  assert.equal(git(["show", ":added.txt"]), "staged content\n");
+  assert.equal(await readFile(resolve(root, "added.txt"), "utf8"), "staged content\n");
+
   // Selecting a change shows its line diff in the pane beside the list.
   await rowIn(changesSection, "tracked.txt").locator(".git-row-main").click();
   await until(async () =>
@@ -241,10 +250,13 @@ try {
   await panel.locator(".git-branch-button").click();
   await panel.locator(".git-branch-create input").fill("panel-test");
   await panel.locator(".git-branch-create button").click();
-  await until(() => git(["branch", "--show-current"]).trim() === "panel-test", "the branch switch");
+  await until(() => git(["symbolic-ref", "--short", "HEAD"]).trim() === "panel-test", "the branch switch");
   await until(async () =>
     (await panel.locator(".git-branch-name").textContent()).includes("panel-test"),
   "the toolbar branch name");
+  await panel.locator(".git-branch-button").click();
+  await panel.locator(".git-branch-list button").filter({ hasText: initialBranch }).first().click();
+  await until(() => git(["symbolic-ref", "--short", "HEAD"]).trim() === initialBranch, "the existing branch to open");
 
   // The screenshot is the only visual evidence of this run: keep it outside the
   // fixture directory, which the cleanup below removes.

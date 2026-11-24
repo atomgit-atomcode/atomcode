@@ -19,11 +19,6 @@ export type GitEntry = {
   original?: string;
   additions: number;
   deletions: number;
-  /** The index holds this path as a new file (`A`), so HEAD has no copy to
-   *  restore and discarding must drop the index entry plus the file. Carried
-   *  from the raw status, not from `kind`: an `AM`/`AD` row shows as modified or
-   *  deleted on the unstaged side while still being staged-new. */
-  stagedNew: boolean;
 };
 
 const CONFLICT_LETTERS = new Set(['U']);
@@ -103,7 +98,6 @@ export function entryOf(change: Change, side: 'index' | 'worktree', carryStats =
     original: change.original ?? undefined,
     additions: carryStats ? change.stats?.additions ?? 0 : 0,
     deletions: carryStats ? change.stats?.deletions ?? 0 : 0,
-    stagedNew: change.index === 'A' || change.index === 'C',
   };
 }
 
@@ -176,10 +170,6 @@ export function selectionsOf(entries: GitEntry[]): GitPathSelection[] {
     path: entry.path,
     original: entry.original ?? null,
     untracked: entry.kind === 'untracked',
-    // From the raw status, not the display kind: an `AM`/`AD` row still has an
-    // index entry HEAD never held, so the daemon must drop it instead of
-    // restoring.
-    staged_new: entry.stagedNew,
   }));
 }
 
