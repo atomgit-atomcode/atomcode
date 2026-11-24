@@ -718,6 +718,7 @@ export function Workbench({
         </>
       ) : tab === "git" ? (
         <WorkbenchGit session={session} version={version} onOpen={(path) => openFile(path, "content")}
+          readOnly={readOnly}
           requested={gitRequest?.sessionId === session ? gitRequest : undefined}
           maximized={contentMaximized} onMaximize={() => setContentMaximized(v => !v)}
           onRestore={() => setContentMaximized(false)} />

@@ -549,7 +549,7 @@ try {
     .getByRole("button", { name: "Git", exact: true })
     .click();
   await panel
-    .locator(".workbench-changes button")
+    .locator(".git-row-main")
     .filter({ hasText: "hello.ts" })
     .click();
   await until(async () =>
@@ -558,7 +558,7 @@ try {
     ),
   );
   await panel
-    .locator(".workbench-changes button")
+    .locator(".git-row-main")
     .filter({ hasText: "data.json" })
     .click();
   await until(async () =>
@@ -567,7 +567,7 @@ try {
     ),
   );
   await panel
-    .locator(".workbench-changes button")
+    .locator(".git-row-main")
     .filter({ hasText: "new file.txt" })
     .click();
   await until(async () =>
@@ -615,7 +615,7 @@ try {
           "caret and scroll restoration",
           "mobile editor",
           "dark Git view",
-          "read-only working/staged/untracked Git diffs",
+          "source-control working/staged/untracked diffs",
         ],
       },
       null,

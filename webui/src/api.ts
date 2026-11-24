@@ -1597,6 +1597,76 @@ export async function workbenchPreview(session: string, path: string, signal?: A
   return response.blob();
 }
 
+/** One `git status` row as the daemon reports it; the single wire shape shared
+ *  by the Git panel, the file viewer and the commit-detail view. */
+export type Change = {
+  path: string;
+  original?: string | null;
+  index: string;
+  worktree: string;
+  stats?: { additions: number; deletions: number } | null;
+};
+
+/** A file a Git action should touch. `original` carries a rename source;
+ *  `untracked` (`??`) and `staged_new` (index `A`) have no HEAD copy, so
+ *  discarding removes them instead of restoring. */
+export type GitPathSelection = {
+  path: string;
+  original?: string | null;
+  untracked?: boolean;
+  staged_new?: boolean;
+};
+
+export type GitBranchList = {
+  current: string | null;
+  branches: { name: string; current: boolean }[];
+  detached: boolean;
+};
+
+export type GitLogEntry = {
+  hash: string;
+  short: string;
+  author: string;
+  /** Unix seconds. */
+  at: number;
+  subject: string;
+};
+
+export type GitCommitDetail = { files: Change[]; diff: string };
+
+function gitAction(session: string, action: string, body: Record<string, unknown>) {
+  return workbenchRequest<{ ok: boolean }>(`git/${action}`, { session_id: session, ...body });
+}
+
+export function stageGitPaths(session: string, paths: GitPathSelection[], all = false) {
+  return gitAction(session, 'stage', { paths, all });
+}
+export function unstageGitPaths(session: string, paths: GitPathSelection[], all = false) {
+  return gitAction(session, 'unstage', { paths, all });
+}
+export function discardGitPaths(session: string, paths: GitPathSelection[], all = false) {
+  return gitAction(session, 'discard', { paths, all });
+}
+export function commitGitStaged(session: string, message: string, amend = false) {
+  return workbenchRequest<{ ok: boolean; hash?: string | null }>('git/commit', { session_id: session, message, amend });
+}
+export async function readGitBranches(session: string): Promise<GitBranchList> {
+  return workbenchRequest<GitBranchList>('git/branches?' + new URLSearchParams({ session_id: session }));
+}
+export function switchGitBranch(session: string, name: string, create = false) {
+  return gitAction(session, 'branch', { name, create });
+}
+export async function readGitLog(session: string, limit = 30): Promise<GitLogEntry[]> {
+  // The daemon rejects anything outside 1–100. A finite override is clamped
+  // into that window (0 becomes 1, not the default page); only a non-finite
+  // value falls back to the default.
+  const bounded = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.trunc(limit))) : 30;
+  return workbenchRequest<GitLogEntry[]>('git/log?' + new URLSearchParams({ session_id: session, limit: String(bounded) }));
+}
+export async function readGitCommit(session: string, rev: string): Promise<GitCommitDetail> {
+  return workbenchRequest<GitCommitDetail>('git/commit-diff?' + new URLSearchParams({ session_id: session, rev }));
+}
+
 /** Explicit raw upload: no text decoding, base64 or model echo. */
 export async function importPatchFile(session: string, file: File, signal?: AbortSignal): Promise<string> {
   if (file.size > 8 * 1024 * 1024) throw new Error('Patch exceeds 8 MiB');
