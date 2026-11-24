@@ -4,7 +4,10 @@
 //! to its last, so neither the wait for that first output (prefill, queueing)
 //! nor a silence before the end frame is divided into it. Only output that
 //! arrived after the first is counted against that window: whatever came with
-//! the first output was generated before the window opened. Tokens are a local
+//! the first output was generated before the window opened, and the same holds
+//! for any later frame carrying more than its gap could have decoded: a buffered
+//! tool argument or a delayed relay delivers output generated out of sight, so
+//! that frame and its gap are left out of the window. Tokens are a local
 //! estimate of what streamed: billed output is one total per request and
 //! cannot say how much of it fell inside the window, so it only screens out
 //! requests that streamed far less than they billed. The turn's requests are
@@ -25,19 +28,45 @@ const MIN_EVIDENCE_MS: u64 = 2_000;
 /// the window is unknown, so the request contributes nothing rather than a
 /// reading the estimate cannot vouch for.
 const HIDDEN_RATIO: u64 = 3;
+/// A frame this small is ordinary streaming whatever its gap: chunk sizes and
+/// delivery jitter make short gaps meaningless as rates.
+const BURST_FLOOR_TOKENS: u64 = 64;
+/// Fastest decode a frame may imply before it counts as a burst.
+const MAX_DECODE_RATE: u64 = 1_000;
+
+/// Output stamped with one instant, judged against the gap before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame {
+    at: Timestamp,
+    tokens: u64,
+    /// Time since the previous frame; `None` for the request's first.
+    gap: Option<u64>,
+}
+
+impl Frame {
+    /// `(tokens, ms)` the frame adds to the window, if its gap could have
+    /// decoded it.
+    fn reading(&self) -> Option<(u64, u64)> {
+        let gap = self.gap?;
+        (self.tokens <= BURST_FLOOR_TOKENS
+            || self.tokens.saturating_mul(1_000) <= gap.saturating_mul(MAX_DECODE_RATE))
+        .then_some((self.tokens, gap))
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Request {
     id: (u64, u32),
-    first: Option<Timestamp>,
-    last: Option<Timestamp>,
     ended: Option<Timestamp>,
     /// Characters that tokenize roughly one apiece (CJK and full-width).
     wide: u64,
     /// Everything else, roughly four characters per token.
     narrow: u64,
-    /// Estimated tokens that arrived with the first output.
-    lead: u64,
+    /// The latest output, still open to more stamped with the same instant.
+    frame: Option<Frame>,
+    /// Summed readings of the request's closed frames.
+    counted_tokens: u64,
+    counted_ms: u64,
     /// The provider's whole-request output count; screens, never counts.
     billed: Option<u64>,
     /// The attempt was discarded; its billing, if reported, is not this one's.
@@ -56,8 +85,7 @@ impl Request {
         if text.is_empty() {
             return;
         }
-        let first = *self.first.get_or_insert(now);
-        self.last = Some(now);
+        let before = self.estimate();
         for ch in text.chars() {
             if is_wide(ch) {
                 self.wide += 1;
@@ -65,9 +93,21 @@ impl Request {
                 self.narrow += 1;
             }
         }
-        if first == now {
-            self.lead = self.estimate();
+        let tokens = self.estimate() - before;
+        if let Some(frame) = self.frame.as_mut().filter(|frame| frame.at == now) {
+            frame.tokens += tokens;
+            return;
         }
+        let closed = self.frame.take();
+        if let Some((tokens, ms)) = closed.as_ref().and_then(Frame::reading) {
+            self.counted_tokens += tokens;
+            self.counted_ms += ms;
+        }
+        self.frame = Some(Frame {
+            at: now,
+            tokens,
+            gap: closed.map(|frame| now.as_millis().saturating_sub(frame.at.as_millis())),
+        });
     }
 
     fn estimate(&self) -> u64 {
@@ -75,23 +115,24 @@ impl Request {
     }
 
     /// `(tokens, ms)` this request contributes: the output after its first
-    /// over the time from first to last output.
+    /// over the gaps that could have decoded it.
     fn reading(&self) -> Option<(u64, u64)> {
-        let ms = self
-            .last?
-            .as_millis()
-            .saturating_sub(self.first?.as_millis());
+        let (open_tokens, open_ms) = self
+            .frame
+            .as_ref()
+            .and_then(Frame::reading)
+            .unwrap_or_default();
+        let ms = self.counted_ms + open_ms;
         if ms < MIN_REQUEST_MS {
             return None;
         }
-        let estimate = self.estimate();
         if self
             .billed
-            .is_some_and(|billed| billed > estimate.max(1) * HIDDEN_RATIO)
+            .is_some_and(|billed| billed > self.estimate().max(1) * HIDDEN_RATIO)
         {
             return None;
         }
-        let tokens = estimate.saturating_sub(self.lead);
+        let tokens = self.counted_tokens + open_tokens;
         (tokens > 0).then_some((tokens, ms))
     }
 }
@@ -158,7 +199,7 @@ impl Generation {
                     .as_mut()
                     .filter(|request| request.id == (*turn, *round))
                 {
-                    if request.discarded && request.first.is_none() {
+                    if request.discarded && request.frame.is_none() {
                         request.discarded = false;
                         return;
                     }
@@ -354,6 +395,29 @@ mod tests {
         at(&mut g, chunk(2, false, &text(4_000)), 80_400);
         at(&mut g, usage(2, 2_000), 80_400);
         assert_eq!(g.rate(), None, "frames moments apart are a burst too");
+    }
+
+    #[test]
+    fn a_late_burst_after_a_small_first_frame_yields_no_reading() {
+        // A provider that buffers tool arguments streams the name, then
+        // delivers the whole argument string in one frame a moment later.
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4)), 10_000);
+        at(&mut g, chunk(1, false, &text(16_000)), 12_500);
+        assert_eq!(g.rate(), None, "not 4000 tokens over 2.5s");
+    }
+
+    #[test]
+    fn a_burst_inside_a_stream_is_left_out_of_its_window() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &text(4)), 10_000);
+        at(&mut g, chunk(1, false, &text(800)), 12_000);
+        at(&mut g, chunk(1, false, &text(16_000)), 13_000);
+        at(&mut g, chunk(1, false, &text(800)), 15_000);
+        // (200 + 200) tokens over (2s + 2s); the burst and its gap are left out.
+        assert_eq!(g.rate(), Some(100));
     }
 
     #[test]
