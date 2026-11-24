@@ -97,6 +97,10 @@ export function InputArea() {
   useEffect(() => {
     function handleMessage(e: MessageEvent) {
       if (e.data?.type === 'focusInput') textareaRef.current?.focus();
+      if (e.data?.type === 'restoreChatInput'
+          && (document.activeElement === document.body || document.activeElement === textareaRef.current)) {
+        textareaRef.current?.focus();
+      }
       if (e.data?.type === 'workspaceFiles') {
         setWorkspaceFiles(e.data.files || []);
       }
@@ -150,6 +154,49 @@ export function InputArea() {
       window.removeEventListener('resize', updateInputInset);
       document.removeEventListener('atomcode-font-size', updateFontSize);
       sessionBody.style.removeProperty('--input-inset');
+    };
+  }, []);
+
+  // A Windows webview can lose focus before the workbench reports its window
+  // blur. Remember a bare Alt held by the textarea to correlate that ordering.
+  useEffect(() => {
+    const windowsClient = /Windows/i.test(navigator.userAgent);
+    if (!windowsClient) return;
+    let altHeld = false;
+    const isInputAlt = (event: KeyboardEvent) =>
+      event.target === textareaRef.current
+      && !event.ctrlKey && !event.shiftKey && !event.metaKey
+      && !event.getModifierState('AltGraph');
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') {
+        altHeld = isInputAlt(event);
+        if (altHeld) event.preventDefault();
+      } else if (event.key !== 'Tab') {
+        altHeld = false;
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') {
+        if (isInputAlt(event)) event.preventDefault();
+        altHeld = false;
+      }
+    };
+    const reportBlur = () => {
+      postMessage({
+        type: 'chatInputFocusState',
+        focused: document.activeElement === textareaRef.current,
+        windowsClient,
+        altHeld,
+      });
+      altHeld = false;
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', reportBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', reportBlur);
     };
   }, []);
 

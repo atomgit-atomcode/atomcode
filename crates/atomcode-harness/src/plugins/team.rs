@@ -7,10 +7,8 @@
 //! [`InjectionOrigin::Peer`], so a resumed session still shows who said what
 //! to whom.
 //!
-//! Members answer the lead and only the lead. The `tell_parent` tool mounted
-//! in a member's realm holds the lead's id and nothing else; there is no tool
-//! that names a sibling. Sibling-to-sibling traffic goes through the lead,
-//! which is what makes the lead a lead.
+//! Members report to their lead through `tell_parent`. A lead can separately
+//! authorize one live member to hand off work to another with `tell_sibling`.
 //!
 //! A role fixes two things the model should not pick per call: which tools
 //! (read-only or scoped writes, never bash) and which model tier (the utility
@@ -18,6 +16,7 @@
 //! deepseek-harness and the old runtime both hide the tier behind the role
 //! for the same reason: the model knows what the job is, not what it costs.
 
+mod peer;
 mod query;
 
 use std::collections::{BTreeMap, HashMap};
@@ -430,7 +429,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
             .find(|tool| !allowed.contains(tool) && !query::is_query_name(tool))
         {
             return Err(format!(
-                "{}: a {} member may not have `{extra}`; tools can only narrow its permissions. tell_parent is provided automatically; omit it from tools. Choose a granted read-only MCP query or one of: {}",
+                "{}: a {} member may not have `{extra}`; tools can only narrow its permissions. tell_parent and tell_sibling are provided automatically; omit them from tools. Choose a granted read-only MCP query or one of: {}",
                 path.display(),
                 match permission {
                     Permission::Explore => "explore",
@@ -615,6 +614,8 @@ fn append_report_note(report: &mut String, note: Option<&crate::seams::MemberRep
 struct Member {
     role: String,
     agent: Arc<Agent>,
+    stopping: bool,
+    peer_targets: BTreeMap<String, AgentId>,
     /// A git worktree of its own, for a role that writes: the directory and
     /// the branch. Removed with the member; the branch stays for the lead to
     /// merge or drop.
@@ -752,7 +753,7 @@ fn from_lead_in(event: &SessionEvent, turn: u64, lead_session: &str) -> bool {
     )
 }
 
-/// The member's one way of talking: to the lead, and only the lead.
+/// The member's reporting channel, addressed only to its lead.
 struct TellParent {
     agents: Arc<crate::agent::Agents>,
     lead: AgentId,
@@ -872,6 +873,8 @@ struct TeamArgs {
     timeout_secs: Option<u64>,
     #[serde(default)]
     reference: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
     /// A selection id for this member, overriding whatever the role says.
     #[serde(default)]
     model: Option<String>,
@@ -894,6 +897,7 @@ struct MemberSpec {
     scope: Vec<String>,
     lane: Vec<String>,
     worktree: Option<(PathBuf, String)>,
+    peer_target: Option<(String, AgentId)>,
 }
 
 impl TeamTool {
@@ -988,7 +992,7 @@ impl TeamTool {
                  relative to the workspace (for example `src/auth/**`)"
             ));
         }
-        {
+        let peer_target = {
             let all = self.members.by_lead.lock().expect("members poisoned");
             let mine = all.get(&lead_session);
             if mine.is_some_and(|m| m.contains_key(&name)) {
@@ -1013,6 +1017,34 @@ impl TeamTool {
                      stopped, idle or not — places never free up on their own. Use `status` to \
                      see which are idle, `stop` one whose work is done, then delegate again.",
                     self.max_members
+                ));
+            }
+            args.to
+                .map(|to| {
+                    if to == name {
+                        return Err("a member cannot hand off work to itself".to_string());
+                    }
+                    let target = mine
+                        .and_then(|m| m.get(&to))
+                        .filter(|m| !m.stopping)
+                        .ok_or_else(|| format!("no live team member named `{to}`"))?;
+                    Ok((to, target.agent.id()))
+                })
+                .transpose()?
+        };
+        // Reject duplicate names above even if their stop is still unwinding.
+        // A new dispatch must keep the target instance stable until enqueue.
+        let lifecycle = self.members.lifecycle(&lead_session);
+        let _transition = lifecycle.lock().await;
+        if let Some((to, id)) = &peer_target {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            let still_live = all
+                .get(&lead_session)
+                .and_then(|mine| mine.get(to))
+                .is_some_and(|member| !member.stopping && member.agent.id() == *id);
+            if !still_live {
+                return Err(format!(
+                    "the intended peer target `{to}` has stopped or been replaced"
                 ));
             }
         }
@@ -1094,8 +1126,12 @@ impl TeamTool {
         } else {
             "Its report will wake you when you are idle; do not poll `status` while it works."
         };
+        let direct_handoff = peer_target
+            .as_ref()
+            .map(|(to, _)| format!(" It can hand off directly to `{to}` from its first turn."))
+            .unwrap_or_default();
         let report = format!(
-            "delegated to `{name}` ({}{}){}. It will report through `tell_parent`. {follow_up}",
+            "delegated to `{name}` ({}{}){}.{direct_handoff} It will report through `tell_parent`. {follow_up}",
             role.id,
             match &named {
                 Some(model) => format!(" on {model}"),
@@ -1121,6 +1157,7 @@ impl TeamTool {
                 scope,
                 lane,
                 worktree,
+                peer_target,
             },
             false,
         )
@@ -1155,6 +1192,8 @@ impl TeamTool {
         } else {
             vec!["**".to_string()]
         };
+        let lifecycle = self.members.lifecycle(lead.session_id());
+        let _transition = lifecycle.lock().await;
         self.spawn_member(
             lead,
             MemberSpec {
@@ -1168,6 +1207,7 @@ impl TeamTool {
                 scope: member.scope,
                 lane,
                 worktree,
+                peer_target: None,
             },
             true,
         )
@@ -1225,7 +1265,7 @@ impl TeamTool {
     }
 
     /// Create a member and put it to work — or, `resuming`, recreate it from
-    /// its stored log and leave it idle.
+    /// its stored log and leave it idle. The caller holds the team's lifecycle lock.
     async fn spawn_member(
         &self,
         lead: &Arc<Agent>,
@@ -1242,10 +1282,9 @@ impl TeamTool {
             scope,
             lane,
             worktree,
+            peer_target,
         } = spec;
         let lead_session = lead.session_id().to_string();
-        let lifecycle = self.members.lifecycle(&lead_session);
-        let _transition = lifecycle.lock().await;
         {
             let all = self.members.by_lead.lock().expect("members poisoned");
             if all
@@ -1465,7 +1504,16 @@ impl TeamTool {
             name: member_name,
             told: told_for_tool,
         }))?;
+        restricted.register(Arc::new(peer::TellSibling::new(
+            &self.members,
+            lead,
+            child.id(),
+            name.clone(),
+        )))?;
         let driven = super::handle::drive(&self.ctx, child.clone());
+        if let Some((to, _)) = &peer_target {
+            peer::announce_grant(&child, &name, to, true);
+        }
         self.members.leads.lock().expect("leads poisoned").insert(
             child.session_id().to_string(),
             (lead_session.clone(), name.clone()),
@@ -1481,6 +1529,8 @@ impl TeamTool {
                 Member {
                     role: role.id.clone(),
                     agent: child.clone(),
+                    stopping: false,
+                    peer_targets: peer_target.into_iter().collect(),
                     worktree: worktree.clone(),
                     told,
                     last_write_refusal_turn: None,
@@ -1581,7 +1631,7 @@ impl TeamTool {
             .map(|(name, m)| {
                 let log = m.agent.session();
                 format!(
-                    "{name} ({}): {:?}, turn {}, {} event(s){}{}",
+                    "{name} ({}): {:?}, turn {}, {} event(s){}{}{}",
                     m.role,
                     m.agent.status(),
                     log.current_turn(),
@@ -1597,7 +1647,13 @@ impl TeamTool {
                         }
                         (None, false) => format!(", writes [{}]", m.scope.join(", ")),
                         (None, true) => String::new(),
-                    }
+                    },
+                    if m.peer_targets.is_empty() {
+                        String::new()
+                    } else {
+                        let targets: Vec<_> = m.peer_targets.keys().map(String::as_str).collect();
+                        format!(", peer targets [{}]", targets.join(", "))
+                    },
                 )
             })
             .collect::<Vec<_>>()
@@ -1628,6 +1684,21 @@ impl TeamTool {
         };
         let mut stopped = Vec::new();
         for (n, agent) in taken {
+            // Retire only the member about to stop. A timeout leaves the rest
+            // of a stop-all request unprocessed and still able to communicate.
+            {
+                let mut all = self.members.by_lead.lock().expect("members poisoned");
+                let mine = all
+                    .get_mut(lead.session_id())
+                    .expect("team under lifecycle lock");
+                if let Some(member) = mine.get_mut(&n) {
+                    member.stopping = true;
+                    member.peer_targets.clear();
+                }
+                for member in mine.values_mut() {
+                    member.peer_targets.retain(|_, id| *id != agent.id());
+                }
+            }
             // Its log says it was stopped, last, before it goes: a resume of the
             // lead reads that and leaves it where it is (`docs/adr/0024` §13).
             // Last means after the turn it was cancelled out of has unwound.
@@ -1777,7 +1848,10 @@ impl Tool for TeamTool {
          inspect progress with `status` but do not poll repeatedly. In one-shot/headless runs, \
          the process exits when your turn ends, so use bounded `wait` if a member's result is \
          required before finishing. `tell` sends more instructions without losing context; \
-         `status` lists members and `stop` ends one or all members.\n\
+         `status` lists members and their peer targets. `stop` ends one or all members. Use `to` \
+         with `delegate` to authorize a first-turn handoff to an existing teammate. Use `allow_peer` / \
+         `revoke_peer` with `name` (sender) and `to` (recipient) for a one-way handoff \
+         between live members. Grants expire when either member stops or the team is restored.\n\
          \n\
          Lifecycle: a member that has finished stays on the team, idle, and keeps one of \
          the team's places until you stop it — places never free up on their own. When a \
@@ -1804,10 +1878,11 @@ impl Tool for TeamTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": if self.headless_wait { vec!["delegate", "tell", "status", "stop", "wait", "evidence"] } else { vec!["delegate", "tell", "status", "stop", "evidence"] },
+                    "enum": if self.headless_wait { vec!["delegate", "tell", "status", "stop", "wait", "evidence", "allow_peer", "revoke_peer"] } else { vec!["delegate", "tell", "status", "stop", "evidence", "allow_peer", "revoke_peer"] },
                     "description": if self.headless_wait { "delegate needs name, role, task; tell needs name, text; stop takes name or none for all; status takes nothing; wait needs name and optional timeout_secs" } else { "delegate needs name, role, task; tell needs name, text; stop takes name or none for all; status takes nothing" }
                 },
-                "name": { "type": "string", "description": "The member's name (delegate, tell, stop)" },
+                "name": { "type": "string", "description": "The member's name (delegate, tell, stop), or sender (allow_peer, revoke_peer)" },
+                "to": { "type": "string", "description": "Existing recipient member name (allow_peer, revoke_peer, or optional on delegate for a first-turn handoff)" },
                 "model": { "type": "string", "description": "Run this member on a different model: a selection id from `describe_self(aspect=\"models\")`. Omit to use the role's own choice, or this conversation's model." },
                 "effort": { "type": "string", "description": "How hard this member should think, overriding the role's own level. The levels each model accepts are in `describe_self(aspect=\"models\")`." },
                 "role": {
@@ -1864,6 +1939,13 @@ impl Tool for TeamTool {
         };
         let result = match args.action.as_str() {
             "delegate" => self.delegate(&lead, args).await,
+            "allow_peer" | "revoke_peer" => peer::set_grant(
+                &self.members,
+                &lead,
+                args.name.as_deref().unwrap_or_default(),
+                args.to.as_deref().unwrap_or_default(),
+                args.action == "allow_peer",
+            ),
             "tell" => {
                 let name = args.name.as_deref().unwrap_or_default();
                 let text = args.text.clone().unwrap_or_default();

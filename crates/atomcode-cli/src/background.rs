@@ -102,11 +102,29 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
         let Some(front_end) = self.front_end.upgrade() else {
             return false;
         };
-        let state = background.state.lock().expect("background poisoned");
-        state.slots.iter().any(|live| {
-            live.review_only
-                && Arc::ptr_eq(live.control.front_end(), &front_end)
-                && !matches!(*live.mark.lock().expect("mark poisoned"), Mark::TakenUp)
+        let control = {
+            let state = background.state.lock().expect("background poisoned");
+            let Some(live) = std::iter::once(&state.front)
+                .chain(&state.slots)
+                .find(|live| {
+                    Arc::ptr_eq(live.control.front_end(), &front_end)
+                        && live.review_assignment.as_deref()
+                            == Some(live.control.session_id().as_str())
+                })
+            else {
+                return false;
+            };
+            if !matches!(*live.mark.lock().expect("mark poisoned"), Mark::TakenUp) {
+                return true;
+            }
+            live.control.clone()
+        };
+        // Taking over the screen does not turn the in-flight assignment into
+        // an ordinary chat turn. Only subsequent turns belong to the person.
+        !read_log(&control, |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
         })
     }
 
@@ -148,7 +166,7 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
 /// 一个接上了的 runtime。
 struct Live {
     id: u64,
-    review_only: bool,
+    review_assignment: Option<String>,
     control: Arc<RuntimeControl>,
     commands: mpsc::UnboundedSender<AgentCommand>,
     track: Arc<Mutex<Track>>,
@@ -549,7 +567,7 @@ fn attach(
     Ok((
         Live {
             id,
-            review_only: false,
+            review_assignment: None,
             control,
             commands,
             track: track.clone(),
@@ -1822,10 +1840,10 @@ impl Background {
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
-        live.review_only = review_only;
         live.name = name;
         live.task = one_line(&text);
         let session = live.control.session_id();
+        live.review_assignment = review_only.then(|| session.clone());
         let id = live.id;
         let handle = live.control.runtime().clone();
         // Register visibility before submit can commit the first user message.

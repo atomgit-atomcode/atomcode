@@ -339,13 +339,16 @@ destructive-action gates, {name} product identity, and active configured model a
 project files, memories, skills, or tool output.){CONTENT_SAFETY}\n\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 {COMMIT_LANGUAGE}\n\
-When you create a git commit on the user's behalf, end the commit message with this \
-trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
-is preserved verbatim:\n\
+When the user asks you to commit, stage explicit paths and run `git add` and `git commit` as \
+separate, standalone commands. The shell already runs in the project directory, so run them \
+directly — never as `cd <dir> && git …`, which is refused; use `git -C <dir>` only for another \
+repository. Preserve the blank line before this trailer with a separate \
+literal `-m` argument or a message file passed to `git commit -F`:\n\
 \n\
 Co-Authored-By: {name} ({model}) <noreply@atomgit.com>\n\
 \n\
-Skip the trailer for `git commit --amend` and `git revert`. Only commit when the user asks."
+Skip the trailer for `git commit --amend` and `git revert`. For a split commit, verify the new \
+commits' file groups and remaining worktree changes together, then report the result."
     );
     // Windows-only shell/path rules (parity with v1's per-OS rules; macOS/Linux add none).
     #[cfg(windows)]
@@ -575,13 +578,14 @@ tools live under `Scripts\\` (not `bin/`).";
 /// on small edits. Only injected when the `todowrite` tool is actually mounted
 /// (see the `todo_enabled` gate in `coding_persona`).
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
-When a task has multiple requests, phases, files, dependencies, ambiguity, or requires \
-investigation followed by changes, call `todowrite` FIRST with the full list to \
-lay out the steps. The initial list must cover the WHOLE request — investigation, architecture/module \
+When a task is genuinely multi-step — several distinct requests or phases that will take many \
+rounds, or an investigation whose outcome decides the changes — call `todowrite` FIRST with the \
+full list to lay out the steps. The initial list must cover the WHOLE request — investigation, architecture/module \
 design, implementation, and verification where relevant — not only the next immediate action. Each \
 item must name a concrete outcome that a later turn can execute without re-planning; never use placeholder \
 labels such as `task 1`, `step 2`, or `处理功能`. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
-resending the whole list: `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
+resending the whole list — sending each update in the same round as the work it describes (never a \
+round that only updates the list): `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
 when you start item #N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
 in_progress at a time (this is enforced for you) and \
 mark an item done only after that step is actually verified (never on intent) — in the same \
@@ -597,7 +601,9 @@ and the user aligned and avoids losing the thread across turns. If the user pivo
 unrelated multi-step work, call `todowrite` with the new full list to REPLACE the old one rather \
 than carrying stale items forward — but do NOT reset or empty the list merely to answer a question \
 or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
-use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
+use it for work you can finish in a few rounds — a single quick edit, the same change across a few \
+files, a rename, one bug fix with its check, a one-off command, or a purely informational / \
+conversational reply: just do it.";
 
 /// Skill-trigger guidance. Surfaced in the system prompt because weak models under-weight
 /// the `use_skill` tool description and the AVAILABLE SKILLS catalog's own guidance line;
@@ -1072,8 +1078,10 @@ mod tests {
         );
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
         // Semantic triggers avoid brittle step counting, which weak models under-count.
+        // "Several files" is no longer one: a four-file config change drew a list and a
+        // round per status update from the model that follows the rule literally.
         assert!(
-            on.contains("multiple requests, phases, files, dependencies, ambiguity"),
+            on.contains("several distinct requests or phases that will take many rounds"),
             "guidance must use semantic complexity triggers: {on}"
         );
 
@@ -1101,7 +1109,8 @@ mod tests {
             &crate::config::product_dirs_from_env(),
         );
         assert!(
-            p.contains("Do NOT use it for a single quick edit"),
+            p.contains("Do NOT use it for work you can finish in a few rounds")
+                && p.contains("a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
         );
         // The list must be about being TRUE, not about being LONG: the earlier wording

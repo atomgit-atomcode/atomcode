@@ -342,7 +342,18 @@ impl Producer for Transcript {
                 // it back out: the person's words stay a user line, the VL
                 // recognition becomes its own block, folded to one row and opened
                 // on a click — not a wall of text under every screenshot.
-                if let Some((said, model, caption)) = crate::content::split_vl_caption(text) {
+                if let Some(title) = crate::content::review_assignment_title(text) {
+                    out.emit(
+                        at,
+                        Arc::new(crate::content::InjectedBlock {
+                            kind: "review_assignment",
+                            origin: title.to_owned(),
+                            text: text.clone(),
+                            result: false,
+                        }),
+                    );
+                } else if let Some((said, model, caption)) = crate::content::split_vl_caption(text)
+                {
                     if !said.is_empty() {
                         out.emit(at, Arc::new(UserSaid(said)));
                     }

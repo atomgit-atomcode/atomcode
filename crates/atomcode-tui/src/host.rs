@@ -228,6 +228,7 @@ impl Presentation {
             // recognition is the model's crutch for a picture it cannot see, not
             // the conversation, so it stays out of the way until a click asks.
             ("vl_caption", Showing::Folded),
+            ("review_assignment", Showing::Folded),
             ("provider_diagnostic", Showing::Folded),
             // A slash invocation is the visible request; its expanded SKILL.md
             // remains available under a compact `⎿ Skill: name` lid.
@@ -611,11 +612,12 @@ impl Presentation {
 /// by default to `● 后台「…」的结果回来了  点击展开`, with the conversation that
 /// started the job answering under it — and, left out of this list, a row that
 /// promised a click and answered none.
-const CLICKABLE: [&str; 8] = [
+const CLICKABLE: [&str; 9] = [
     "provider_diagnostic",
     "tool_call",
     "reasoning",
     "vl_caption",
+    "review_assignment",
     "skill",
     "injected:background",
     "injected:peer",
@@ -1889,6 +1891,7 @@ impl Host {
         self.asks.refuse_all();
         let mut m = self.moment.write().expect("moment poisoned");
         m.members.clear();
+        m.member_cwd = None;
         m.team_return = None;
         m.team_cursor = None;
         // The keyboard went with the panel: the new session's team is not up
@@ -2476,6 +2479,9 @@ impl Host {
         // here because this is where facts land, and consecutive repeats are
         // dropped the way every shell drops them.
         if let SessionEvent::UserMessage { text, .. } = fact {
+            if crate::content::review_assignment_title(text).is_some() {
+                return;
+            }
             // Recall the WORDS, not the picture. For a text-only model the runtime
             // folds a VL recognition into the message so the model can read it;
             // that is not what the person typed, and an up-arrow must not drop a

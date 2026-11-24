@@ -209,7 +209,7 @@ pub fn key(m: &mut Moment, press: KeyPress) -> Step {
 fn accept(m: &mut Moment, s: &Search) {
     if let Some(i) = s.at() {
         m.input = m.history[i].clone();
-        m.hint_history_clear();
+        m.disarm_quit();
     }
     m.caret = m.input.len();
 }
@@ -412,6 +412,7 @@ mod tests {
         assert_eq!(key(&mut m, KeyPress::plain(Key::Enter)), Step::Took);
         assert_eq!(m.search, None, "the search is closed");
         assert_eq!(m.input, "cargo nextest run -p atomcode-tui", "the lit one");
+        assert!(m.notice.is_none());
         assert_eq!(m.caret, m.input.len());
         // The next Enter is nobody's but the composer's.
         assert_eq!(key(&mut m, KeyPress::plain(Key::Enter)), Step::Left);

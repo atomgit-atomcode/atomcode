@@ -183,6 +183,7 @@ impl Feed {
             description: Box::new(atomcode_kernel::agent::AgentDescription {
                 session: session.to_string(),
                 parent: header.parent.clone(),
+                working_dir: header.cwd,
                 member: header
                     .member
                     .as_ref()

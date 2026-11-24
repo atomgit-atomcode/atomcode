@@ -925,6 +925,7 @@ impl Agent {
                 session: self.session_id().to_string(),
                 parent: self.parent.clone(),
                 member: None,
+                working_dir: self.cwd().map(|dir| dir.display().to_string()),
                 label: None,
                 model: model.as_ref().map(|m| m.model_name().to_string()),
                 context_window: model.as_ref().map(|m| m.context_window()),

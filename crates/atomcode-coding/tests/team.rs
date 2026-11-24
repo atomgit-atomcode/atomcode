@@ -1,4 +1,4 @@
-//! A team: members that stay, report to the lead, and only to the lead.
+//! A team: members that stay, report to the lead and hand off work when authorized.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -425,7 +425,7 @@ async fn headless_team_wait_returns_member_report_without_status_polling() {
 }
 
 #[tokio::test]
-async fn a_member_can_only_address_the_lead() {
+async fn a_member_cannot_address_a_teammate_without_a_grant() {
     let dir = scratch("only-lead");
     let app = start(tree(
         &dir,
@@ -441,6 +441,7 @@ async fn a_member_can_only_address_the_lead() {
         .unwrap();
     let names = scout.ctx().service::<ToolsSvc>().unwrap().names();
     assert!(names.contains(&"tell_parent".to_string()), "{names:?}");
+    assert!(names.contains(&"tell_sibling".to_string()), "{names:?}");
     assert!(
         !names.contains(&"team".to_string()),
         "a member cannot delegate: {names:?}"
@@ -453,6 +454,252 @@ async fn a_member_can_only_address_the_lead() {
         !names.contains(&"write_file".to_string()),
         "an explorer reads: {names:?}"
     );
+}
+
+#[tokio::test]
+async fn authorized_team_peer_messages_leave_notes_or_wake_only_the_recipient() {
+    let dir = scratch("peer-handoff");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "lead must stay idle" }"#,
+        r#"{ text = "first" }, { text = "second" }, { text = "handoff handled" }, { text = "replacement" }, { text = "outside" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let spawn = |name: &str| {
+        serde_json::json!({"action": "delegate", "name": name, "role": "explorer", "task": "inspect"}).to_string()
+    };
+    for name in ["source", "target"] {
+        let created = as_lead(&app, &lead, &spawn(name)).await;
+        assert!(!created.is_error, "{}", created.content);
+        let member = agents
+            .by_session(&format!("{}/{name}", lead.session_id()))
+            .unwrap();
+        settled(&member, 1).await;
+    }
+    let source = agents
+        .by_session(&format!("{}/source", lead.session_id()))
+        .unwrap();
+    let target = agents
+        .by_session(&format!("{}/target", lead.session_id()))
+        .unwrap();
+    // Under test the lead has no pump; clear the reports of the initial assignments.
+    let _ = lead.inbox().withdraw_messages();
+    let send = |member: Arc<Agent>, args: &'static str| async move {
+        let tool = member
+            .ctx()
+            .service::<ToolsSvc>()
+            .unwrap()
+            .get("tell_sibling")
+            .unwrap();
+        atomcode_harness::agent::as_agent(member.ctx().clone(), async move {
+            tool.execute(
+                args,
+                &ToolContext {
+                    working_dir: std::env::current_dir().unwrap(),
+                    cancel: Default::default(),
+                    progress: ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await
+        })
+        .await
+    };
+    const GRANT: &str = r#"{"action":"allow_peer","name":"source","to":"target"}"#;
+    const NOTE: &str = r#"{"to":"target","text":"read next turn"}"#;
+    assert!(send(source.clone(), NOTE).await.is_error);
+    assert!(!as_lead(&app, &lead, GRANT).await.is_error);
+    assert!(
+        send(target.clone(), r#"{"to":"source","text":"reverse"}"#)
+            .await
+            .is_error
+    );
+    assert!(!send(source.clone(), NOTE).await.is_error);
+    assert!(!target.inbox().has_waking_input());
+    assert_eq!(turns_ended(&target), 1);
+    assert!(
+        !send(
+            source.clone(),
+            r#"{"to":"target","text":"take the handoff","wake":true}"#
+        )
+        .await
+        .is_error
+    );
+    settled(&target, 2).await;
+    assert_eq!(
+        peers(&target)
+            .iter()
+            .filter(|(from, text)| from == source.session_id()
+                && (text.contains("read next turn") || text.contains("take the handoff")))
+            .count(),
+        2
+    );
+    assert!(!lead.inbox().has_waking_input());
+    assert_eq!(turns_ended(&lead), 0);
+
+    assert!(
+        !as_lead(
+            &app,
+            &lead,
+            r#"{"action":"revoke_peer","name":"source","to":"target"}"#
+        )
+        .await
+        .is_error
+    );
+    assert!(send(source.clone(), NOTE).await.is_error);
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+    assert!(
+        !status.content.contains("peer targets"),
+        "{}",
+        status.content
+    );
+    assert!(!as_lead(&app, &lead, GRANT).await.is_error);
+    assert!(
+        !as_lead(&app, &lead, r#"{"action":"stop","name":"target"}"#)
+            .await
+            .is_error
+    );
+    assert!(send(source.clone(), NOTE).await.is_error);
+    assert!(!as_lead(&app, &lead, &spawn("target")).await.is_error);
+    assert!(send(source, NOTE).await.is_error);
+
+    let ctx = app.context();
+    let other_lead = agents
+        .create(
+            &ctx,
+            atomcode_harness::agent::CreateAgent::root(&ctx).id("other-team"),
+        )
+        .await
+        .unwrap();
+    assert!(!as_lead(&app, &other_lead, &spawn("outside")).await.is_error);
+    assert!(agents.by_session("other-team/outside").is_some());
+    assert!(
+        as_lead(
+            &app,
+            &lead,
+            r#"{"action":"allow_peer","name":"target","to":"outside"}"#
+        )
+        .await
+        .is_error
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_first_turn_can_handoff_without_a_lead_request() {
+    fn requests(agent: &Agent) -> usize {
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    SessionEvent::ReplyCheckpoint {
+                        provider_call: true,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    for direct in [false, true] {
+        let dir = scratch(if direct {
+            "first-handoff"
+        } else {
+            "relayed-handoff"
+        });
+        let relay = r#"{ calls = [{ name = "team", args = { action = "tell", name = "target", text = "handoff evidence" } }] }, { text = "received" }"#;
+        let sender = if direct {
+            r#"{ calls = [{ name = "tell_sibling", args = { to = "target", text = "handoff evidence", wake = true } }] }"#
+        } else {
+            r#"{ calls = [{ name = "tell_parent", args = { text = "handoff evidence" } }] }"#
+        };
+        let app = start(tree(
+            &dir,
+            if direct { r#"{ text = "received" }"# } else { relay },
+            &format!(r#"{{ text = "ready" }}, {sender}, {{ text = "source finished" }}, {{ text = "target handled" }}"#),
+        )).await;
+        let lead = create_agent(&app).await.unwrap();
+        let agents = app.context().service::<AgentsSvc>().unwrap();
+        let source_session = format!("{}/source", lead.session_id());
+        let target_session = format!("{}/target", lead.session_id());
+
+        let args = r#"{"action":"delegate","name":"source","role":"explorer","task":"find evidence","to":"target"}"#;
+        let premature = as_lead(&app, &lead, args).await;
+        assert!(premature.is_error, "{}", premature.content);
+        assert!(agents.by_session(&source_session).is_none());
+
+        let result = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"target","role":"explorer","task":"get ready"}"#,
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let target = agents.by_session(&target_session).unwrap();
+        settled(&target, 1).await;
+        let _ = lead.inbox().withdraw_messages();
+
+        let created = as_lead(
+            &app,
+            &lead,
+            if direct {
+                args
+            } else {
+                r#"{"action":"delegate","name":"source","role":"explorer","task":"find evidence"}"#
+            },
+        )
+        .await;
+        assert!(!created.is_error, "{}", created.content);
+        let source = agents.by_session(&source_session).unwrap();
+        settled(&source, 1).await;
+        if direct {
+            let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+            assert!(
+                status
+                    .content
+                    .lines()
+                    .any(|l| l.starts_with("source ") && l.contains("peer targets [target]")),
+                "{}",
+                status.content
+            );
+            assert!(notes(&source)
+                .iter()
+                .any(|(_, text)| text.contains("`source` to `target` are allowed")));
+            settled(&target, 2).await;
+            assert_eq!(requests(&lead), 0, "handoff arrived before the lead ran");
+        } else {
+            drive(&app, &lead).await.unwrap();
+            settled(&target, 2).await;
+            assert!(
+                requests(&lead) >= 2,
+                "relay requires the lead's tool call and reply"
+            );
+        }
+        let expected_sender = if direct {
+            &source_session
+        } else {
+            lead.session_id()
+        };
+        assert!(peers(&target)
+            .iter()
+            .any(|(from, text)| from == expected_sender && text == "handoff evidence"));
+        if direct {
+            // The initial task still reports completion through the existing path.
+            drive(&app, &lead).await.unwrap();
+            assert_eq!(requests(&lead), 1);
+        }
+        assert_eq!(requests(&source) + requests(&target), 4);
+        println!(
+            "{}: lead requests {}, team requests {}",
+            if direct { "direct" } else { "relayed" },
+            requests(&lead),
+            requests(&lead) + 4
+        );
+    }
 }
 
 // ---- roles are data ------------------------------------------------------
@@ -740,6 +987,11 @@ async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
         scribe.cwd(),
         Some(&worktree),
         "the member's world is its checkout"
+    );
+    assert_eq!(
+        scribe.describe().working_dir,
+        Some(worktree.display().to_string()),
+        "the member's frontend description reports its checkout"
     );
     assert!(worktree.join("note.txt").exists(), "it wrote there");
     assert!(!dir.join("note.txt").exists(), "and not in the lead's tree");
@@ -2634,33 +2886,56 @@ async fn a_stopping_member_keeps_its_name_until_its_agent_is_removed() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_stop_timeout_keeps_the_member_owned_and_does_not_commit_stopped() {
     let dir = scratch("stop-timeout");
-    let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
+    let app = start(tree(
+        &dir,
+        r#"{ text = "ok" }"#,
+        r#"{ text = "looked" }, { text = "sender ready" }, { text = "receiver ready" }"#,
+    ))
+    .await;
     let lead = create_agent(&app).await.unwrap();
-    assert!(
-        !as_lead(
-            &app,
-            &lead,
-            r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#
-        )
-        .await
-        .is_error
-    );
     let agents = app.context().service::<AgentsSvc>().unwrap();
+    for name in ["scout", "y_sender", "z_receiver"] {
+        let args = serde_json::json!({
+            "action": "delegate", "name": name, "role": "explorer", "task": "look around"
+        });
+        let created = as_lead(&app, &lead, &args.to_string()).await;
+        assert!(!created.is_error, "{}", created.content);
+        let member = agents
+            .by_session(&format!("{}/{name}", lead.session_id()))
+            .unwrap();
+        settled(&member, 1).await;
+    }
+    let grant = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"allow_peer","name":"y_sender","to":"z_receiver"}"#,
+    )
+    .await;
+    assert!(!grant.is_error, "{}", grant.content);
     let member = agents
         .by_session(&format!("{}/scout", lead.session_id()))
         .unwrap();
-    until_idle(&member).await;
     member.begin_turn();
-    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
-    assert!(stopped.is_error, "{}", stopped.content);
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
+    assert!(
+        stopped.is_error && stopped.content.contains("scout"),
+        "{}",
+        stopped.content
+    );
     assert!(agents.get(member.id()).is_some());
     assert!(!member
         .session()
         .events()
         .iter()
         .any(|event| matches!(event.event, SessionEvent::Stopped { .. })));
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+    assert!(
+        !status.is_error && status.content.contains("peer targets [z_receiver]"),
+        "{}",
+        status.content
+    );
     member.end_turn();
-    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
     assert!(!stopped.is_error, "{}", stopped.content);
 }
 

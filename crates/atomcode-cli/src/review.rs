@@ -102,7 +102,7 @@ pub struct ReviewArgs {
     task_file: Option<String>,
     /// Max seconds to wait for each stream event before failing the run (liveness guard
     /// against a stalled provider). Raise it for slow providers / very large contexts.
-    #[arg(long, default_value_t = 180)]
+    #[arg(long, default_value_t = 300)]
     stream_timeout: u64,
     /// Hard cap on LLM rounds (tool-call iterations) for this review — the round safety
     /// fuse. Omit ⇒ UNLIMITED. On a large repo a small diff can otherwise send the model

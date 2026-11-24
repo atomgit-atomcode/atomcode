@@ -372,6 +372,14 @@ impl AgentClient {
             .and_then(|v| v.described.clone())
     }
 
+    fn member_cwd(&self) -> Option<String> {
+        let views = self.view.lock().expect("client poisoned");
+        if views.on_screen == views.root {
+            return None;
+        }
+        views.screen()?.described.as_ref()?.working_dir.clone()
+    }
+
     /// The selection id host control accepted, so the providers list can mark
     /// the row the session is on while the two accounts running the same model
     /// are still indistinguishable by the wire name alone.
@@ -1089,24 +1097,20 @@ fn same_mention_after_edit(previous: &str, current: &str) -> bool {
     longer.get(edit_start + edit_len..) == Some(&shorter[edit_start..])
 }
 
-/// What follows a leading `$` or `¥` while a skill is being named.
+/// What follows a leading skill marker while a skill is being named.
 ///
 /// Only the first character has this meaning. Once whitespace appears the
 /// skill has been named and the rest is its task, so the discovery menu closes.
 fn skill_prefix(input: &str) -> Option<&str> {
-    let rest = input
-        .strip_prefix('$')
-        .or_else(|| input.strip_prefix('¥'))?;
+    let rest = atomcode_capabilities::skills::strip_skill_marker(input)?;
     (!rest.chars().any(char::is_whitespace)).then_some(rest)
 }
 
 /// Turn the composer spelling into the existing `/skills` gateway command.
-/// Preserve secondary $/¥ references: the shared gateway validates them all
+/// Preserve secondary marked references: the shared gateway validates them all
 /// before queuing, rather than silently treating an unknown name as task text.
 fn skill_command(input: &str, known: impl FnOnce(&str) -> bool) -> Option<String> {
-    let rest = input
-        .strip_prefix('$')
-        .or_else(|| input.strip_prefix('¥'))?;
+    let rest = atomcode_capabilities::skills::strip_skill_marker(input)?;
     let rest = rest.trim();
     let name = rest.split_whitespace().next()?;
     known(name).then(|| format!("/skills {rest}"))
@@ -1302,15 +1306,12 @@ async fn answer_prompts(
     }
 }
 
-/// The least time between two questions about the allowance — per asker.
+/// The least time between two questions about the allowance.
 ///
-/// The figure only moves when a turn spends something, and the question costs a
-/// round trip on the account — so it is asked after a turn, on the idle beat
-/// while a badge is actually on the row (`tick_beat`), and then held off for
-/// this long. The turn-end ask and the idle-beat re-ask keep separate stamps
-/// (`check_allowance` / `reask_allowance_on_idle`): an idle beat must not
-/// consume the slot a turn's own refresh needs. The number is the one
-/// `atomcode-tuix` settled on.
+/// The question costs a round trip on the account, so it is asked after a
+/// turn — a successful model turn can be the first sign of an early reset,
+/// which allows one immediate recheck — and held off for this long. The
+/// number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
@@ -1916,19 +1917,10 @@ pub struct Tui {
     /// is not known until then.
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
-    /// When a turn-end ask last went out. The figure only moves when a turn
-    /// spends something, so the turn-end ask is the authoritative one: it
-    /// also moves the idle slot ([`Self::allowance_idle_checked`]), so a
-    /// turn-end ask suppresses the idle beat for one [`ALLOWANCE_EVERY`]
-    /// window. The suppression is one-way by design — an idle ask never
-    /// moves this slot, because a turn ending right after one has actually
-    /// changed the figure and must still ask.
-    allowance_checked: Mutex<Option<std::time::Instant>>,
-    /// The idle beat's own throttle stamp, kept apart from the turn-end one
-    /// ([`Self::allowance_checked`]): the two asks must not contend for a
-    /// single [`ALLOWANCE_EVERY`] slot.
-    allowance_idle_checked: Mutex<Option<std::time::Instant>>,
-    /// Invalidates quota requests issued before the active model was replaced.
+    /// When the allowance was last asked about and whether it was a forced
+    /// refresh after a successful turn with a full quota badge.
+    allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
+    /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
@@ -2233,10 +2225,12 @@ impl UserInterface for Tui {
         let native_mouse_notice = (!self.surface.mouse()).then(|| {
             t(if crate::tmux_mouse::disabled() {
                 Msg::MouseDisabledByTmux
-            } else if crate::caps::mouse_reported() {
-                Msg::MouseHandedBackAtStart
-            } else {
+            } else if !crate::caps::mouse_reported() {
                 Msg::MouseUnreportedAtStart
+            } else if single_arrow_scroll_enabled() {
+                Msg::MouseHandedBackArrowScrollAtStart
+            } else {
+                Msg::MouseHandedBackAtStart
             })
             .into_owned()
         });
@@ -3108,7 +3102,16 @@ impl UserInterface for Tui {
                 }
                 Wake::PullBgQuestion => self.pour_bg_question(),
                 Wake::Tick => {
-                    stale = self.tick_beat();
+                    {
+                        let mut m = self.host.moment.write().expect("moment poisoned");
+                        if m.scrollbar_until
+                            .is_some_and(|t| t <= tokio::time::Instant::now())
+                        {
+                            m.scrollbar_until = None;
+                        }
+                        m.tick = m.tick.wrapping_add(1);
+                    }
+                    stale = true;
                 }
                 // A drag held still at the conversation's edge: one more row.
                 Wake::EdgeScroll => {
@@ -3157,9 +3160,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::ArrowBurst { up, n }) => {
                     // A lone ↓ the composer and the conversation have no use
                     // for steps into the team panel, as a pressed one does.
+                    let browser = crate::browser_terminal::detected();
+                    let alternate_scroll = crate::ansi::alternate_scroll_enabled();
                     if !up
                         && n == 1
-                        && !crate::ansi::alternate_scroll_enabled()
+                        && !browser
+                        && !alternate_scroll
                         && self.down_reaches_team()
                         && self.host.focus_team()
                     {
@@ -3180,11 +3186,11 @@ impl UserInterface for Tui {
                     if arrows_scroll(
                         self.surface.mouse(),
                         crate::caps::mouse_reported(),
-                        crate::ansi::alternate_scroll_enabled(),
+                        alternate_scroll || browser,
                         self.arrows_reach_the_composer()
-                            && !(n == 1 && self.caret_moves_within_draft(up)),
+                            && (browser || !(n == 1 && self.caret_moves_within_draft(up))),
                     ) {
-                        let step = if crate::ansi::alternate_scroll_enabled() {
+                        let step = if alternate_scroll {
                             CONVERSATION_WHEEL_LINES
                         } else {
                             1
@@ -6928,76 +6934,40 @@ impl Tui {
         });
     }
 
-    /// One idle beat: per-frame housekeeping, plus — only while the allowance
-    /// badge is actually on the row — a throttled re-ask of the figure, so a
-    /// mid-window refresh on the account reaches the row without waiting for
-    /// a turn to end. The visibility judgment is `row_showing`'s, made under
-    /// the moment's write lock and acted on outside it.
-    fn tick_beat(&self) -> bool {
-        let reask = {
-            let mut m = self.host.moment.write().expect("moment poisoned");
-            if m.scrollbar_until
-                .is_some_and(|t| t <= tokio::time::Instant::now())
-            {
-                m.scrollbar_until = None;
-            }
-            m.tick = m.tick.wrapping_add(1);
-            crate::modules::status::row_showing(m.allowance.as_ref(), m.now)
-        };
-        if reask {
-            self.reask_allowance_on_idle();
-        }
-        true
-    }
-
-    fn check_allowance(&self) {
-        self.ask_allowance(&self.allowance_checked);
-        // The turn-end ask is the authoritative one — the figure just changed —
-        // so the idle slot moves with it: the idle beat cannot fire a
-        // duplicate within the same window.
-        *self
-            .allowance_idle_checked
-            .lock()
-            .expect("allowance poisoned") = Some(std::time::Instant::now());
-    }
-
-    /// The idle beat's re-ask, throttled on its OWN stamp: an idle beat must
-    /// not eat the turn-end slot — a turn ending right after one would have
-    /// its refresh swallowed, and that is the moment the figure actually
-    /// changed.
-    fn reask_allowance_on_idle(&self) {
-        self.ask_allowance(&self.allowance_idle_checked);
-    }
-
-    fn ask_allowance(&self, slot: &Mutex<Option<std::time::Instant>>) {
-        let now = std::time::Instant::now();
-        {
-            let mut last = slot.lock().expect("allowance poisoned");
-            if last.is_some_and(|at| now.duration_since(at) < ALLOWANCE_EVERY) {
-                return;
-            }
-            // Stamped before the answer comes back, not after: two turns
-            // finishing inside the interval must not both send a question
-            // while the first is still in flight.
-            *last = Some(now);
-        }
+    fn check_allowance(&self, model_completed: bool) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return;
         };
         let Some(control) = self.client.control() else {
             return;
         };
+        let recheck_full_window = model_completed
+            && self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .allowance
+                .as_ref()
+                .is_some_and(|window| window.percent >= 100);
+        let generation = {
+            let now = tokio::time::Instant::now();
+            let mut last = self.allowance_checked.lock().expect("allowance poisoned");
+            if last.is_some_and(|(at, rechecked)| {
+                now.duration_since(at) < ALLOWANCE_EVERY && (!recheck_full_window || rechecked)
+            }) {
+                return;
+            }
+            // A successful model turn can be the first sign of an early reset.
+            // Allow one immediate recheck, even if the old lookup is in flight.
+            *last = Some((now, recheck_full_window));
+            self.allowance_generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let session = self.client.session();
         let host = self.host.clone();
         let nudged = self.allowance_nudged.clone();
         let client = self.client.clone();
         let allowance_generation = self.allowance_generation.clone();
-        // Bumping here, not just at session switch: the two throttle slots
-        // can each have a question in flight (an idle beat asking, then a
-        // turn ending past its slot's window), and the replies may arrive out
-        // of order — the newer question must retire the older one's answer,
-        // or the stale figures overwrite the fresh ones.
-        let generation = allowance_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
@@ -7372,8 +7342,10 @@ impl Tui {
             _ if self.members.is_working(session) => Some(crate::moment::Activity::Working),
             _ => None,
         };
+        let member_cwd = self.client.member_cwd();
         let mut m = self.host.moment.write().expect("moment poisoned");
         m.viewing = session.to_string();
+        m.member_cwd = member_cwd;
         if let Some(activity) = activity {
             m.activity = activity;
         }
@@ -7986,6 +7958,7 @@ impl Tui {
                 // model: it is the agent's, and the row draws it beside the
                 // model the way tuix does (`glm-5 [high]`).
                 let effort = described.as_ref().and_then(|d| d.reasoning_effort);
+                let member_cwd = self.client.member_cwd();
                 let changed = {
                     let mut moment = self.host.moment.write().expect("moment poisoned");
                     // An agent describing itself is what a `/login` or `/provider`
@@ -7998,7 +7971,8 @@ impl Tui {
                     }
                     let changed = moment.ctx_window != window
                         || moment.model != model
-                        || moment.effort != effort;
+                        || moment.effort != effort
+                        || moment.member_cwd != member_cwd;
                     let cleared_allowance = refresh_allowance && moment.allowance.take().is_some();
                     if refresh_allowance {
                         self.allowance_generation.fetch_add(1, Ordering::SeqCst);
@@ -8006,12 +7980,13 @@ impl Tui {
                     moment.ctx_window = window;
                     moment.model = model;
                     moment.effort = effort;
+                    moment.member_cwd = member_cwd;
                     changed || cleared_allowance
                 };
                 if refresh_allowance {
                     *self.allowance_checked.lock().expect("allowance poisoned") = None;
                     self.allowance_nudged.store(false, Ordering::SeqCst);
-                    self.check_allowance();
+                    self.check_allowance(false);
                 }
                 // The providers rows too, and only now that the moment is free:
                 // `refresh_providers` writes the same lock this branch held, and
@@ -8318,6 +8293,13 @@ impl Tui {
                 );
                 // Followed from the start, for what the panel says of it.
                 self.client.watch_member(&description.session);
+                self.client.describe(&description);
+                let member_cwd = self.client.member_cwd();
+                self.host
+                    .moment
+                    .write()
+                    .expect("moment poisoned")
+                    .member_cwd = member_cwd;
                 true
             }
             AgentEvent::AgentRemoved { session } => {
@@ -8461,7 +8443,13 @@ impl Tui {
                 }
                 // A turn just spent some of the allowance, so this is the
                 // moment the figure changed. Rate-limited inside.
-                self.check_allowance();
+                self.check_allowance(matches!(
+                    event,
+                    AgentEvent::TurnComplete {
+                        reason: atomcode_kernel::event::StopReason::Stopped,
+                        ..
+                    }
+                ));
                 // A summary the turn outlived would leave 正在压缩 up on an idle
                 // screen. An interrupted one arrives as a said line rather than
                 // as `Compacted`/`CompactionFailed`, so the turn's own end is
@@ -9106,9 +9094,8 @@ impl Tui {
                     }
                 }
                 // `$name [task]` is the compact spelling of `/skills name
-                // [task]`. `¥` is accepted only as a keyboard/input alias; a
-                // menu pick has already normalised it to `$`, while a fully
-                // typed `¥name` reaches the same gateway here. The marker must
+                // [task]`. A menu pick normalises either yen sign to `$`, and
+                // a fully typed shortcut reaches the same gateway. The marker must
                 // be the first character (see `skill_prefix`), so currency and
                 // shell variables in ordinary prose remain ordinary prose.
                 let described = self.client.described();
@@ -9907,6 +9894,8 @@ impl Tui {
                 self.surface.set_mouse(on);
                 let text = if on {
                     t(Msg::MouseTaken).into_owned()
+                } else if single_arrow_scroll_enabled() {
+                    t(Msg::MouseHandedBackArrowScroll).into_owned()
                 } else {
                     t(Msg::MouseHandedBack).into_owned()
                 };
@@ -11134,9 +11123,8 @@ impl Tui {
         self.refresh_menu();
     }
 
-    /// Replace either leading skill-picker spelling with the canonical `$name`
-    /// form and leave room for the task. Selection never preserves `¥`: it is
-    /// an input alias for keyboards that produce it, not a second wire syntax.
+    /// Replace the leading skill-picker spelling with the canonical `$name`
+    /// form and leave room for the task.
     fn complete_skill(&self, picked: &str) {
         let name = picked.trim_start_matches('$');
         let text = format!("${name} ");
@@ -12261,13 +12249,10 @@ fn recall_back(m: &mut crate::moment::Moment) {
         Some(0) => return, // already at the oldest; going further is nowhere
         Some(i) => i - 1,
     };
-    let entering = m.history_at.is_none();
     m.history_at = Some(at);
     m.input = m.history[at].clone();
     m.caret = 0;
-    if entering {
-        m.hint_history_clear();
-    }
+    m.disarm_quit();
 }
 
 /// Forward one entry, and out the far side to the draft that was set aside.
@@ -12364,21 +12349,23 @@ fn sanitize_paste(text: &str) -> String {
     crate::text::for_buffer(text)
 }
 
+fn single_arrow_scroll_enabled() -> bool {
+    crate::ansi::alternate_scroll_enabled() || crate::browser_terminal::detected()
+}
+
 /// Whether a run of ↑/↓ that reached the composer scrolls the conversation
 /// rather than walking the input history.
 ///
-/// With the mouse handed back, the wheel can arrive as arrow keys. Ordinarily
-/// that is useful only on a terminal that reports a mouse; HarmonyOS is the
-/// exception: DECSET 1007 turns its wheel into a multi-arrow burst, while a
-/// lone Up/Down remains an input-history key. Fn+Up/Down arrives as
-/// PageUp/PageDown and always pages the conversation.
+/// With the mouse handed back, a terminal can send wheel motion as arrows.
+/// Browser terminals and HiShell can send a single arrow for a wheel event.
+/// PageUp/PageDown always page the conversation.
 fn arrows_scroll(
     mouse_held: bool,
     mouse_reported: bool,
-    alternate_scroll: bool,
+    single_arrow_scroll: bool,
     would_scroll: bool,
 ) -> bool {
-    !mouse_held && (mouse_reported || alternate_scroll) && would_scroll
+    !mouse_held && (mouse_reported || single_arrow_scroll) && would_scroll
 }
 
 fn input_wake(input: Input, approval: Option<ApprovalInput>) -> Wake {
@@ -12444,7 +12431,7 @@ async fn pump_terminal_input<S>(
         events,
         wake.clone(),
         handed_back,
-        crate::ansi::alternate_scroll_enabled(),
+        single_arrow_scroll_enabled(),
         presented_approval,
     )
     .await;
@@ -12481,7 +12468,7 @@ async fn pump_input<S>(
     events: S,
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
-    alternate_scroll: bool,
+    single_arrow_scroll: bool,
     presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
@@ -12562,11 +12549,9 @@ async fn pump_input<S>(
                     _ => break,
                 }
             }
-            // HiShell also sends isolated wheel arrows. In its explicitly
-            // enabled alternate-scroll mode they must never recall input
-            // history; Ctrl+P/Ctrl+N remain unambiguous history keys. Other
-            // terminals preserve the usual single-arrow keyboard behavior.
-            let sent = if n == 1 && !alternate_scroll {
+            // Browser terminals and HiShell can send isolated wheel arrows.
+            // Ctrl+P/Ctrl+N remain unambiguous history keys in those terminals.
+            let sent = if n == 1 && !single_arrow_scroll {
                 forward(event, approval)
             } else {
                 wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
@@ -12663,7 +12648,6 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
-            allowance_idle_checked: Mutex::new(None),
             allowance_generation: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
@@ -13068,6 +13052,8 @@ mod history_tests {
         let mut m = said(&["first", "second", "third"], "");
         recall_back(&mut m);
         assert_eq!(m.input, "third");
+        assert_eq!(m.history_at, Some(2));
+        assert!(m.notice.is_none());
         recall_back(&mut m);
         assert_eq!(m.input, "second");
         recall_back(&mut m);
@@ -14902,7 +14888,7 @@ mod paste_burst_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn harmony_isolated_wheel_arrows_never_become_history_keys() {
+    async fn isolated_wheel_arrows_never_become_history_keys_in_browser_or_hishell() {
         assert_eq!(
             pumped_with_scroll(
                 vec![(0, arrow(true)), (35, arrow(false)), (35, arrow(true))],
@@ -18431,7 +18417,11 @@ mod skills_menu_tests {
     #[test]
     fn a_leading_dollar_or_yen_opens_the_same_fuzzy_skill_menu() {
         let (host, tui) = screen();
-        for typed in ["$od", "¥od"] {
+        type_line(&host, "￥");
+        tui.refresh_menu();
+        assert!(host.menu_open());
+
+        for typed in ["$od", "¥od", "￥od"] {
             type_line(&host, typed);
             tui.refresh_menu();
             assert_eq!(
@@ -18441,7 +18431,14 @@ mod skills_menu_tests {
             );
         }
 
-        for typed in ["use $od", "use ¥od", "$code task", "¥code task"] {
+        for typed in [
+            "use $od",
+            "use ¥od",
+            "use ￥od",
+            "$code task",
+            "¥code task",
+            "￥code task",
+        ] {
             type_line(&host, typed);
             tui.refresh_menu();
             assert!(
@@ -18454,14 +18451,16 @@ mod skills_menu_tests {
     #[test]
     fn taking_a_yen_skill_match_normalises_it_to_dollar() {
         let (host, tui) = screen();
-        type_line(&host, "¥od");
-        tui.refresh_menu();
-        assert!(!tui.take_command("$code", &tui.client));
-        let m = host.moment.read().expect("moment poisoned");
-        assert_eq!(m.input, "$code ");
-        assert_eq!(m.caret, m.input.len());
-        drop(m);
-        assert!(!host.menu_open(), "the following words are the skill task");
+        for typed in ["¥od", "￥od"] {
+            type_line(&host, typed);
+            tui.refresh_menu();
+            assert!(!tui.take_command("$code", &tui.client));
+            let m = host.moment.read().expect("moment poisoned");
+            assert_eq!(m.input, "$code ");
+            assert_eq!(m.caret, m.input.len());
+            drop(m);
+            assert!(!host.menu_open(), "the following words are the skill task");
+        }
     }
 
     #[test]
@@ -18485,6 +18484,10 @@ mod skills_menu_tests {
         assert_eq!(
             skill_command("¥code ¥review task", known),
             Some("/skills code ¥review task".into())
+        );
+        assert_eq!(
+            skill_command("￥code ￥review task", known),
+            Some("/skills code ￥review task".into())
         );
         assert_eq!(
             skill_command("$code $unknown task", known),
@@ -19701,6 +19704,74 @@ mod allowance_switch_tests {
             windows,
         }
     }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_successful_turn_rechecks_spent_quota_before_the_throttle_expires() {
+        use atomcode_kernel::event::StopReason;
+
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let spent = atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: true,
+            resets_at: "14:17".into(),
+            resets_in_seconds: 12_360,
+            window_seconds: 18_000,
+            used_percent: Some(100),
+            calls_used: None,
+            call_limit: None,
+        };
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.allowance =
+                crate::moment::Allowance::nearest(std::slice::from_ref(&spent), moment.now);
+        }
+        tui.on_event(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(1),
+            reason: StopReason::RateLimited,
+        });
+        let old = pending.recv().await.unwrap();
+        let success = |turn| AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(turn),
+            reason: StopReason::Stopped,
+        };
+        tui.on_event(success(2));
+        tokio::task::yield_now().await;
+        let refreshed = pending
+            .try_recv()
+            .expect("a successful turn checks immediately");
+        tui.on_event(success(3));
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "the forced refresh is coalesced"
+        );
+
+        refreshed
+            .send(reply(vec![atomcode_host_api::UsageWindow {
+                exhausted: false,
+                used_percent: Some(0),
+                ..spent.clone()
+            }]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        old.send(reply(vec![spent])).unwrap();
+        tokio::task::yield_now().await;
+        let allowance = host.moment.read().unwrap().allowance.clone().unwrap();
+        assert_eq!(
+            allowance.percent, 0,
+            "the old 100% reply cannot restore the badge"
+        );
+        assert!(!tui.allowance_nudged.load(Ordering::SeqCst));
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn model_switch_clears_cached_quota_and_discards_the_old_pending_answer() {
         let (host, tui) = assemble(Headless::new(100, 24));
@@ -19724,7 +19795,7 @@ mod allowance_switch_tests {
             let mut m = host.moment.write().unwrap();
             m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
         }
-        tui.check_allowance();
+        tui.check_allowance(false);
         let old = pending.recv().await.unwrap();
         tui.on_event(AgentEvent::Described {
             description: Box::new(AgentDescription {
@@ -19743,249 +19814,6 @@ mod allowance_switch_tests {
         assert!(
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn an_allowance_refreshed_mid_window_updates_the_row() {
-        let (host, tui) = assemble(Headless::new(100, 24));
-        let app = App::new(PluginRegistry::new(), ConfigTree::default());
-        *tui.ctx.lock().unwrap() = Some(app.context());
-        tui.client.follow("lead");
-        let (commands, _received) = mpsc::unbounded_channel();
-        let (requests, mut pending) = mpsc::unbounded_channel();
-        tui.client.connect(commands, Arc::new(Meter { requests }));
-        let spent = vec![atomcode_host_api::UsageWindow {
-            label: "5h".into(),
-            exhausted: false,
-            resets_at: "23:24".into(),
-            resets_in_seconds: 8_000,
-            window_seconds: 18_000,
-            used_percent: Some(99),
-            calls_used: None,
-            call_limit: None,
-        }];
-        {
-            let mut m = host.moment.write().unwrap();
-            m.allowance = crate::moment::Allowance::nearest(&spent, m.now);
-        }
-        // Through the idle beat — the contract this PR adds is "Tick re-asks a
-        // visible badge", so the test must drive that path, not the bare ask.
-        *tui.allowance_idle_checked.lock().unwrap() = None;
-        tui.tick_beat();
-        let ask = pending.recv().await.unwrap();
-        // The account was refreshed underneath the window: the row must
-        // follow the new figure instead of keeping the stale one up.
-        let refreshed = vec![atomcode_host_api::UsageWindow {
-            label: "5h".into(),
-            exhausted: false,
-            resets_at: "23:24".into(),
-            resets_in_seconds: 8_000,
-            window_seconds: 18_000,
-            used_percent: Some(10),
-            calls_used: None,
-            call_limit: None,
-        }];
-        ask.send(reply(refreshed)).unwrap();
-        tokio::task::yield_now().await;
-        let now = host
-            .moment
-            .read()
-            .unwrap()
-            .allowance
-            .clone()
-            .expect("the badge stays after a refresh");
-        assert_eq!(now.percent, 10, "the row follows a mid-window refresh");
-        // A refresh that KEEPS the figure near spent must keep the badge on
-        // the row — the visible-badge path, not only the disappear path.
-        // The second ask rides the turn-end slot: the idle one is spent.
-        let still_visible = vec![atomcode_host_api::UsageWindow {
-            label: "5h".into(),
-            exhausted: false,
-            resets_at: "23:24".into(),
-            resets_in_seconds: 8_000,
-            window_seconds: 18_000,
-            used_percent: Some(85),
-            calls_used: None,
-            call_limit: None,
-        }];
-        tui.check_allowance();
-        let ask = pending.recv().await.unwrap();
-        ask.send(reply(still_visible)).unwrap();
-        tokio::task::yield_now().await;
-        let now = host
-            .moment
-            .read()
-            .unwrap()
-            .allowance
-            .clone()
-            .expect("a near-spent refresh keeps the badge");
-        assert_eq!(
-            now.percent, 85,
-            "the row follows a refresh that stays visible"
-        );
-        assert!(crate::modules::status::row_showing(
-            Some(&now),
-            host.moment.read().unwrap().now
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_idle_beat_reasks_only_a_visible_badge() {
-        let (host, tui) = assemble(Headless::new(100, 24));
-        let app = App::new(PluginRegistry::new(), ConfigTree::default());
-        *tui.ctx.lock().unwrap() = Some(app.context());
-        tui.client.follow("lead");
-        let (commands, _received) = mpsc::unbounded_channel();
-        let (requests, mut pending) = mpsc::unbounded_channel();
-        tui.client.connect(commands, Arc::new(Meter { requests }));
-        let now = host.moment.read().unwrap().now;
-        // A badge on the row: the idle beat asks.
-        {
-            let mut m = host.moment.write().unwrap();
-            m.allowance = Some(crate::moment::Allowance {
-                label: "5h".into(),
-                percent: 99,
-                resets_at: String::new(),
-                resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
-            });
-        }
-        *tui.allowance_idle_checked.lock().unwrap() = None;
-        tui.tick_beat();
-        pending.recv().await.unwrap().send(reply(vec![])).unwrap();
-        tokio::task::yield_now().await;
-        // The window has already turned over: the row shows nothing, and the
-        // beat must not keep asking about a badge that is no longer on it.
-        {
-            let mut m = host.moment.write().unwrap();
-            m.allowance = Some(crate::moment::Allowance {
-                label: "5h".into(),
-                percent: 99,
-                resets_at: String::new(),
-                resets_by: Some(crate::moment::Timestamp::millis(
-                    now.as_millis().saturating_sub(1),
-                )),
-            });
-        }
-        *tui.allowance_idle_checked.lock().unwrap() = None;
-        tui.tick_beat();
-        tokio::task::yield_now().await;
-        assert!(
-            pending.try_recv().is_err(),
-            "an expired badge is not re-asked"
-        );
-        // A quiet row (figure below the threshold): nothing asked either.
-        {
-            let mut m = host.moment.write().unwrap();
-            m.allowance = Some(crate::moment::Allowance {
-                label: "5h".into(),
-                percent: 10,
-                resets_at: String::new(),
-                resets_by: None,
-            });
-        }
-        *tui.allowance_idle_checked.lock().unwrap() = None;
-        tui.tick_beat();
-        tokio::task::yield_now().await;
-        assert!(pending.try_recv().is_err(), "a quiet row is not re-asked");
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_turn_end_ask_holds_the_idle_beat_down_for_one_window() {
-        // 回合结束的问询盖了两个槽：窗口之内，空闲拍不得再问——
-        // turn-end → idle 的那向压制是双槽契约的正文。
-        let (host, tui) = assemble(Headless::new(100, 24));
-        let app = App::new(PluginRegistry::new(), ConfigTree::default());
-        *tui.ctx.lock().unwrap() = Some(app.context());
-        tui.client.follow("lead");
-        let (commands, _received) = mpsc::unbounded_channel();
-        let (requests, mut pending) = mpsc::unbounded_channel();
-        tui.client.connect(commands, Arc::new(Meter { requests }));
-        let now = host.moment.read().unwrap().now;
-        {
-            let mut m = host.moment.write().unwrap();
-            m.allowance = Some(crate::moment::Allowance {
-                label: "5h".into(),
-                percent: 99,
-                resets_at: String::new(),
-                resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
-            });
-        }
-        tui.check_allowance();
-        pending
-            .recv()
-            .await
-            .unwrap()
-            .send(reply(vec![atomcode_host_api::UsageWindow {
-                label: "5h".into(),
-                exhausted: false,
-                resets_at: String::new(),
-                resets_in_seconds: 100,
-                window_seconds: 18_000,
-                used_percent: Some(10),
-                calls_used: None,
-                call_limit: None,
-            }]))
-            .unwrap();
-        tokio::task::yield_now().await;
-        // 窗口之内，空闲拍被顶住：不再发第二笔。
-        tui.tick_beat();
-        tokio::task::yield_now().await;
-        assert!(
-            pending.try_recv().is_err(),
-            "the idle beat is suppressed for one window after a turn-end ask"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_late_answer_from_the_older_question_never_overwrites_fresh_figures() {
-        // 双槽都可能有一笔在飞（空闲拍先问、回合后结束）：后发问询递增
-        // 代数，先发的落地必须被当作过期丢弃——旧数字不得覆盖新数字。
-        let (host, tui) = assemble(Headless::new(100, 24));
-        let app = App::new(PluginRegistry::new(), ConfigTree::default());
-        *tui.ctx.lock().unwrap() = Some(app.context());
-        tui.client.follow("lead");
-        let (commands, _received) = mpsc::unbounded_channel();
-        let (requests, mut pending) = mpsc::unbounded_channel();
-        tui.client.connect(commands, Arc::new(Meter { requests }));
-        let now = host.moment.read().unwrap().now;
-        {
-            let mut m = host.moment.write().unwrap();
-            m.allowance = Some(crate::moment::Allowance {
-                label: "5h".into(),
-                percent: 99,
-                resets_at: String::new(),
-                resets_by: Some(crate::moment::Timestamp::millis(now.as_millis() + 60_000)),
-            });
-        }
-        // 空闲拍先问：第一笔在飞，不答。
-        *tui.allowance_idle_checked.lock().unwrap() = None;
-        tui.tick_beat();
-        let first = pending.recv().await.unwrap();
-        // 回合后结束：turn-end 问询后发，第二笔。
-        tui.check_allowance();
-        let second = pending.recv().await.unwrap();
-        // 第二笔先落地（exhausted 行），第一笔后落地（安静行）。
-        second
-            .send(reply(vec![atomcode_host_api::UsageWindow {
-                label: "5h".into(),
-                exhausted: true,
-                resets_at: String::new(),
-                resets_in_seconds: 100,
-                window_seconds: 18_000,
-                used_percent: Some(99),
-                calls_used: None,
-                call_limit: None,
-            }]))
-            .unwrap();
-        tokio::task::yield_now().await;
-        let after_second = host.moment.read().unwrap().allowance.clone();
-        first.send(reply(vec![])).unwrap();
-        tokio::task::yield_now().await;
-        let after_first = host.moment.read().unwrap().allowance.clone();
-        assert_eq!(
-            after_second, after_first,
-            "the older question's late answer is retired, not rendered"
         );
     }
 }
@@ -20415,6 +20243,52 @@ mod display_history_tests {
         );
         assert_eq!(views.sessions["lead"].history_request, None);
     }
+    #[test]
+    fn the_status_directory_follows_the_member_on_screen() {
+        let (host, tui) = assemble(crate::surface::Headless::new(100, 24));
+        tui.client.follow("lead");
+        host.set_session_dir("/main");
+        for (session, working_dir) in [
+            ("lead/dev", Some("/worktrees/dev")),
+            ("lead/reviewer", None),
+        ] {
+            tui.on_event(AgentEvent::AgentAdded {
+                description: Box::new(AgentDescription {
+                    session: session.into(),
+                    parent: Some("lead".into()),
+                    working_dir: working_dir.map(str::to_owned),
+                    ..Default::default()
+                }),
+            });
+        }
+        assert!(tui.look_at("lead/dev"));
+        assert_eq!(
+            host.moment.read().unwrap().member_cwd.as_deref(),
+            Some("/worktrees/dev")
+        );
+        assert!(tui.look_at("lead/reviewer"));
+        assert!(host.moment.read().unwrap().member_cwd.is_none());
+
+        // A late description from the first member cannot change the second.
+        tui.on_event(AgentEvent::Described {
+            description: Box::new(AgentDescription {
+                session: "lead/dev".into(),
+                working_dir: Some("/worktrees/dev-moved".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(host.moment.read().unwrap().member_cwd.is_none());
+        assert!(tui.look_at("lead/dev"));
+        assert_eq!(
+            host.moment.read().unwrap().member_cwd.as_deref(),
+            Some("/worktrees/dev-moved")
+        );
+        assert!(tui.look_at("lead"));
+        let moment = host.moment.read().unwrap();
+        assert!(moment.member_cwd.is_none());
+        assert_eq!(moment.cwd, "/main");
+    }
+
     #[test]
     fn a_leads_old_page_does_not_prepend_into_a_member_now_on_screen() {
         let (host, tui) = assemble(crate::surface::Headless::new(80, 24));

@@ -94,7 +94,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── 当下 ──
-        Msg::MomentHistoryClear => "已填入历史消息 · Ctrl+C 清空输入 · Esc 停止任务".into(),
         Msg::UpgradeProgressDownloading => "正在下载更新".into(),
         Msg::UpgradeProgressEta { seconds } => format!("剩余约 {seconds} 秒").into(),
         Msg::UpgradeProgressEtaUnknown => "剩余时间 —".into(),
@@ -523,8 +522,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 到当前行首 / 行尾
     Ctrl+U / Ctrl+K                 删除到当前行首 / 行尾
     Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
-    Up / Down                       在输入里移动游标，到头翻历史（HiShell：到头滚动对话）
-    Ctrl+P / Ctrl+N                 上一条 / 下一条输入历史（HiShell 请使用这组快捷键）
+    Up / Down                       移动游标，到头翻历史；网页终端交还鼠标时滚动对话（HiShell 到头滚动）
+    Ctrl+P / Ctrl+N                 上一条 / 下一条输入历史（网页终端和 HiShell 中，方向键滚动时请用这组键翻历史）
     点击输入框                      定位游标
     Ctrl+R                          搜索这个项目里以前打过的东西；继续打字缩小范围，再按往更老翻，Enter 接受，Esc 还回草稿
 
@@ -1031,11 +1030,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolImage { ordinal } => format!("图片 {ordinal} · 点击打开").into(),
         Msg::ImageGone => "这张图已经找不到了".into(),
         Msg::ImageCorrupt => "图片数据损坏".into(),
+        Msg::MouseHandedBackArrowScroll => "鼠标已交还终端 · ↑/↓ 滚动对话 · Ctrl+P/N 翻历史 · Ctrl+G 收回".into(),
         Msg::MouseTaken => "鼠标已收回 · ctrl+g 交还终端".into(),
         Msg::RawTop => "── atomcode · 本会话全文 ──".into(),
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ↑↓/ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · 保留原生鼠标 · 在 tmux 启用鼠标并重启后可用应用滚动".into(),
+        Msg::MouseHandedBackArrowScrollAtStart => "↑/↓ 滚动对话 · Ctrl+P / Ctrl+N 翻历史 · Ctrl+R 搜索\n终端保留鼠标，可直接拖选 · Ctrl+G 收回".into(),
         Msg::MouseUnreportedAtStart => "输入历史：Ctrl+P 上一条 · Ctrl+N 下一条 · Ctrl+R 搜索\n/keys 查看全部快捷键 · 终端保留鼠标，可直接拖选".into(),
         Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮翻页 · Ctrl+P/N 翻输入历史".into(),
         Msg::MouseHandedBackAtStart => "鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into(),

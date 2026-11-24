@@ -3,6 +3,41 @@ use atomcode_kernel::stream::StreamEvent;
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// A positive-integer-seconds duration read from env var `var`: `None` when unset,
+/// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
+/// rather than silently disabling the timeout).
+fn env_duration_secs(var: &str) -> Option<Duration> {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+}
+
+/// The default content-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set
+/// to a valid positive integer, else 300s. Reasoning and tool argument progress
+/// reset this budget; a slow stream must not be mistaken for a dead connection.
+///
+/// One source for every agent the product runs: the conversation, and the
+/// `code_review` child reviewer, which assembles its own config and used to carry
+/// a private 120s that cut long-reasoning models off well before the main loop would.
+pub fn default_stream_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
+}
+
+/// The default first-token (prefill / TTFB) timeout. An explicit
+/// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
+/// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
+/// defaults to 600s but is NEVER shorter than `stream_timeout`: prefill on a slow
+/// local model legitimately exceeds inter-token latency, so a first-token budget
+/// below the inter-token one inverts the intent. In particular a user who raised
+/// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
+/// up with a SHORTER prefill window than inter-token — hence the `.max()`.
+pub fn default_first_token_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+        .unwrap_or_else(|| default_stream_timeout().max(Duration::from_secs(600)))
+}
+
 /// A first-content deadline followed by an idle deadline. Metadata never resets it.
 pub struct StreamWatchdog {
     first: Option<Duration>,

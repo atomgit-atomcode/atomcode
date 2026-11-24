@@ -47,6 +47,9 @@ pub struct AgentDescription {
     /// Set for a team member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberIdentity>,
+    /// The agent's own working directory, when it overrides the inherited one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     /// A few words a person reads to know which agent this is, when its
     /// session id says nothing — a subagent's is minted. Set by whatever
     /// created it (the delegation's own short description). Additive on the

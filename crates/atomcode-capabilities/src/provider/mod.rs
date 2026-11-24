@@ -365,7 +365,7 @@ mod wire_dump_tests {
 }
 
 mod watchdog;
-pub use watchdog::StreamWatchdog;
+pub use watchdog::{default_first_token_timeout, default_stream_timeout, StreamWatchdog};
 
 /// Apply last, replacing built-in headers. Mark every value sensitive so HTTP
 /// diagnostics cannot print credentials, even for an unfamiliar header name.

@@ -190,8 +190,8 @@ impl Default for ReviewToolConfig {
         Self {
             model: String::new(),
             context_window: 128_000,
-            stream_timeout: Duration::from_secs(120),
-            first_token_timeout: Duration::from_secs(120),
+            stream_timeout: atomcode_capabilities::provider::default_stream_timeout(),
+            first_token_timeout: atomcode_capabilities::provider::default_first_token_timeout(),
             request_timeout: Duration::from_secs(300),
             max_commits_without_confirmation: 20,
             max_files_without_confirmation: 40,
@@ -213,7 +213,8 @@ impl Default for ReviewToolConfig {
 #[async_trait]
 pub trait ReviewDelegate: Send + Sync + std::fmt::Debug {
     /// Whether this runtime is currently a host-owned, one-review reporting task.
-    /// False after a person takes it over, and for ordinary conversations.
+    /// False for ordinary conversations and subsequent turns after a person
+    /// takes over an assignment.
     fn report_only(&self) -> bool {
         false
     }
@@ -617,7 +618,7 @@ impl Tool for ReviewTool {
         // preflight so oversized scopes are always confirmed in the visible
         // conversation before either execution path starts.
         if !a.inline_command {
-            if let Some(delegate) = &self.delegate {
+            if let Some(delegate) = self.delegate.as_ref().filter(|d| !d.report_only()) {
                 let task = delegated_task(args, a.instructions.as_deref());
                 if let Some(Ok(started)) = delegate
                     .delegate(&ctx.working_dir, task, scope.host_word(), manifest.files)

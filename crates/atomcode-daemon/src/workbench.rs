@@ -35,6 +35,17 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         )
         .route("/workbench/git", get(editing::git_status))
         .route("/workbench/diff", get(editing::git_diff))
+        .route("/workbench/git/stage", post(editing::git_stage))
+        .route("/workbench/git/unstage", post(editing::git_unstage))
+        .route("/workbench/git/discard", post(editing::git_discard))
+        .route("/workbench/git/commit", post(editing::git_commit))
+        .route("/workbench/git/branches", get(editing::git_branches))
+        .route("/workbench/git/branch", post(editing::git_switch))
+        .route("/workbench/git/log", get(editing::git_log))
+        .route(
+            "/workbench/git/commit-diff",
+            get(editing::git_commit_detail),
+        )
         .route("/workbench/terminals", post(create_terminal))
         .route(
             "/workbench/terminals/:id",
