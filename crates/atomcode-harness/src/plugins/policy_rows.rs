@@ -110,14 +110,16 @@ impl Plugin for TodoPlugin {
             "Use `todowrite` to plan multi-step work: add one todo per concrete step before you \
              start, and mark each completed as soon as it is done. For detailed user guidance, \
              first use `todo_sources` to identify its original message sequences, then attach \
-             `source_seqs` to the initial plan. Otherwise call todowrite FIRST when a task has \
-             multiple requests, phases, files, dependencies, ambiguity, or needs investigation \
-             followed by changes, and make the initial list cover the WHOLE request — \
+             `source_seqs` to the initial plan. Otherwise call todowrite FIRST when a task is \
+             genuinely multi-step — several distinct requests or phases that will take many \
+             rounds, or an investigation whose outcome decides the changes — and make the \
+             initial list cover the WHOLE request — \
              investigation, design, implementation, verification — not only the next action. \
              Each item names a concrete outcome a later turn can execute without re-planning \
              (`add retry to fetch_user`, not `fix networking`; never `task 1` or `step 2`). Then \
-             keep it current ONE item at a time rather than resending the list: \
-             `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` when you \
+             keep it current ONE item at a time rather than resending the list, sending each \
+             update in the same round as the work it describes (never a round that only \
+             updates the list): `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` when you \
              start #N, and `completed` the moment it is actually verified — never on intent, and \
              never batch-completing several at the end. Keep exactly one item in_progress. \
              The list is there to show where the work actually stands, so keep it true: if the \
@@ -126,8 +128,10 @@ impl Plugin for TodoPlugin {
              and still wanted — finish it, or say plainly which are open and why (blocked, \
              needing a decision, ambiguous, or no longer wanted). If the \
              user pivots to unrelated multi-step work, call it with the new full list to REPLACE \
-             the old one instead of carrying stale items forward. Not for a single quick edit, a \
-             one-off command, or a purely informational reply.",
+             the old one instead of carrying stale items forward. Not for work you can finish in \
+             a few rounds — a single quick edit, the same change across a few files, a rename, \
+             one bug fix with its check, a one-off command, or a purely informational reply: \
+             just do it.",
         );
         Ok(())
     }

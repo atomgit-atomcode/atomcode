@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Stream deadlines live beside the watchdog that enforces them, so the
+// `code_review` child reviewer reads the same defaults as the conversation.
+use atomcode_capabilities::provider::{default_first_token_timeout, default_stream_timeout};
 use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
@@ -1150,34 +1153,6 @@ impl TierProvider {
     }
 }
 
-/// A positive-integer-seconds duration read from env var `var`: `None` when unset,
-/// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
-/// rather than silently disabling the timeout).
-fn env_duration_secs(var: &str) -> Option<Duration> {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .map(Duration::from_secs)
-}
-/// The default content-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set
-/// to a valid positive integer, else 300s. Reasoning and tool argument progress
-/// reset this budget; a slow stream must not be mistaken for a dead connection.
-fn default_stream_timeout() -> Duration {
-    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
-}
-/// The default first-token (prefill / TTFB) timeout. An explicit
-/// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
-/// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
-/// defaults to 600s but is NEVER shorter than `stream_timeout`: prefill on a slow
-/// local model legitimately exceeds inter-token latency, so a first-token budget
-/// below the inter-token one inverts the intent. In particular a user who raised
-/// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
-/// up with a SHORTER prefill window than inter-token — hence the `.max()`.
-fn default_first_token_timeout() -> Duration {
-    env_duration_secs("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
-        .unwrap_or_else(|| default_stream_timeout().max(Duration::from_secs(600)))
-}
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
 /// and other controllers within the same rolling window.
@@ -1406,6 +1381,34 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
+    /// The mounted `code_review` row builds its reviewer from
+    /// `ReviewToolConfig::default()`, not from this config. Its stream deadlines
+    /// used to be a private 120s, so a long-reasoning model the conversation
+    /// waited on for 300s was cut off the moment it was asked to review.
+    #[test]
+    fn code_review_reviewer_inherits_conversation_stream_deadlines() {
+        let conversation =
+            super::CodingAgentConfig::new("", "", "model", "/work", super::product_dirs_from_env());
+        let reviewer = atomcode_review::ReviewToolConfig::default();
+        assert_eq!(reviewer.stream_timeout, conversation.stream_timeout);
+        assert_eq!(
+            reviewer.first_token_timeout,
+            conversation.first_token_timeout
+        );
+        let standalone = atomcode_review::ReviewAgentConfig::new(
+            "",
+            "",
+            "model",
+            "/work",
+            super::product_dirs_from_env(),
+        );
+        assert_eq!(standalone.stream_timeout, conversation.stream_timeout);
+        assert_eq!(
+            standalone.first_token_timeout,
+            conversation.first_token_timeout
+        );
+    }
+
     #[test]
     fn auto_review_environment_policy_is_independent() {
         for configured in [true, false] {

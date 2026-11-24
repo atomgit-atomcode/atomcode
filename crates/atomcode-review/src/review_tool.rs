@@ -190,8 +190,8 @@ impl Default for ReviewToolConfig {
         Self {
             model: String::new(),
             context_window: 128_000,
-            stream_timeout: Duration::from_secs(120),
-            first_token_timeout: Duration::from_secs(120),
+            stream_timeout: atomcode_capabilities::provider::default_stream_timeout(),
+            first_token_timeout: atomcode_capabilities::provider::default_first_token_timeout(),
             request_timeout: Duration::from_secs(300),
             max_commits_without_confirmation: 20,
             max_files_without_confirmation: 40,
