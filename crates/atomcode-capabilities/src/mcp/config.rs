@@ -495,6 +495,17 @@ pub fn config_path_for_source(
     }
 }
 
+fn write_mcp_config(path: &Path, content: String) -> Result<()> {
+    // User MCP configs can include inline credentials. Project configs
+    // intentionally share the project's permissions.
+    #[cfg(windows)]
+    if path.file_name().is_some_and(|name| name == "mcp.json") {
+        return crate::fs::atomic_write(path, content.as_bytes(), 0o600);
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 /// Turn one configured server off or back on, in the file that defines it.
 ///
 /// Turning off writes `disabled: true`. Turning on **removes** the key rather than writing
@@ -514,7 +525,7 @@ pub fn set_mcp_server_disabled_in_json_file(
     }
     let text = read_config_text(path)?;
     let out = with_server_disabled(&text, server_key, disabled, &path.display())?;
-    std::fs::write(path, out)
+    write_mcp_config(path, out)
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
 
     Ok(())
@@ -810,7 +821,7 @@ pub fn merge_stdio_mcp_server_into_json_file(
         &path.display(),
     )?;
     create_parent(path)?;
-    std::fs::write(path, out)
+    write_mcp_config(path, out)
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
 
     Ok(())
@@ -900,7 +911,7 @@ pub fn merge_http_oauth_mcp_server_into_json_file(
         &path.display(),
     )?;
     create_parent(path)?;
-    std::fs::write(path, out)
+    write_mcp_config(path, out)
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
     Ok(())
 }
@@ -1067,7 +1078,7 @@ fn write_auto_approved_tool(target: &Path, server: &str, tool: &str) -> Result<(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(target, out)?;
+    write_mcp_config(target, out)?;
     Ok(())
 }
 

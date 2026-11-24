@@ -8641,6 +8641,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     if let Some(ref token) = token_file_token {
         match daemon_token_file::write(daemon_token_port, std::process::id(), token) {
             Ok(p) => tracing::info!("daemon token file written: {}", p.display()),
+            #[cfg(windows)]
+            Err(e) => {
+                let path = daemon_token_file::token_file_path(daemon_token_port);
+                telemetry.shutdown(Duration::from_millis(500)).await;
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Failed to publish the private daemon token at {}. IDE clients require this file. Check the directory permissions and use a filesystem that supports Windows ACLs",
+                    path.display()
+                )));
+            }
+            #[cfg(not(windows))]
             Err(e) => tracing::warn!("failed to write daemon token file: {e}"),
         }
     }

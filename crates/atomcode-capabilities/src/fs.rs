@@ -3,8 +3,6 @@
 //! Ported from `atomcode-core`'s `fs_atomic` for the `plugin` feature (trust store).
 
 use anyhow::{Context, Result};
-#[cfg(not(windows))]
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
@@ -12,14 +10,23 @@ use std::path::Path;
 /// directory** (avoids EXDEV on iCloud/Dropbox symlinks), fsyncs the file
 /// before persist, then fsyncs the parent directory for POSIX durability.
 ///
-/// `mode` is the Unix file mode (`0o644` normal, `0o600` secrets). Ignored on Windows.
+/// `mode` is the Unix file mode (`0o644` normal, `0o600` secrets). On Windows
+/// an owner-only mode requests a protected DACL.
 pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().context("atomic_write: path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("atomic_write: create_dir_all({})", parent.display()))?;
 
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("atomic_write: NamedTempFile::new_in({})", parent.display()))?;
+    #[cfg(windows)]
+    let tmp = if mode & 0o077 == 0 {
+        atomcode_config::windows_private_file::tempfile_in(parent)
+    } else {
+        tempfile::NamedTempFile::new_in(parent)
+    };
+    #[cfg(not(windows))]
+    let tmp = tempfile::NamedTempFile::new_in(parent);
+    let mut tmp =
+        tmp.with_context(|| format!("atomic_write: NamedTempFile::new_in({})", parent.display()))?;
     tmp.write_all(content)
         .with_context(|| format!("atomic_write: write({})", tmp.path().display()))?;
     tmp.as_file_mut()
@@ -32,7 +39,7 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("atomic_write: chmod({:o})", mode))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = mode;
     }
@@ -40,23 +47,10 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     tmp.persist(path)
         .map_err(|e| anyhow::anyhow!("atomic_write: persist({}): {}", path.display(), e.error))?;
 
-    #[cfg(not(windows))]
-    let dir = File::open(parent)
-        .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?;
-    #[cfg(windows)]
-    let dir = {
-        use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
-            .open(parent)
-            .with_context(|| format!("atomic_write: open parent dir {}", parent.display()))?
-    };
     #[cfg(unix)]
-    dir.sync_all()
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
         .with_context(|| format!("atomic_write: fsync parent {}", parent.display()))?;
-    #[cfg(windows)]
-    let _ = dir;
 
     Ok(())
 }

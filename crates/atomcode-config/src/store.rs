@@ -399,8 +399,12 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("Failed to create temporary config in {}", parent.display()))?;
+    #[cfg(windows)]
+    let temp = crate::windows_private_file::tempfile_in(parent);
+    #[cfg(not(windows))]
+    let temp = tempfile::NamedTempFile::new_in(parent);
+    let mut temp =
+        temp.with_context(|| format!("Failed to create temporary config in {}", parent.display()))?;
     temp.write_all(bytes)
         .with_context(|| format!("Failed to write temporary config for {}", path.display()))?;
     temp.as_file()
