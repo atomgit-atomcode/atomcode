@@ -1375,6 +1375,13 @@ struct RepeatFuse {
     /// `None`: every round counts, however long it ran.
     poll_after: Option<std::time::Duration>,
     state: Mutex<RepeatState>,
+    malformed: Mutex<HashMap<String, MalformedRound>>,
+}
+
+struct MalformedRound {
+    turn: u64,
+    step: u32,
+    repeated: bool,
 }
 
 #[derive(Default)]
@@ -1433,7 +1440,37 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
         };
 
         let started = tokio::time::Instant::now();
-        let results = next.run(batch).await;
+        let mut results = next.run(batch).await;
+        if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
+            let mut malformed = self.malformed.lock().expect("repeat fuse poisoned");
+            // A mixed batch can still make progress. Count only fully rejected
+            // rounds, so a fresh id or a changing garbage suffix buys no retry.
+            if results.len() == batch.calls.len()
+                && results.iter().all(|result| {
+                    result.is_error && result.content == crate::exec::MALFORMED_TOOL_NAME
+                })
+            {
+                let repeated = malformed.get(session.id()).is_some_and(|previous| {
+                    previous.turn == batch.turn && previous.step.checked_add(1) == Some(batch.step)
+                });
+                malformed.insert(
+                    session.id().to_owned(),
+                    MalformedRound {
+                        turn: batch.turn,
+                        step: batch.step,
+                        repeated,
+                    },
+                );
+                if repeated {
+                    for result in &mut results {
+                        result.content = "Stopped after the model returned malformed tool names again. These calls were not executed.".into();
+                    }
+                    return results;
+                }
+            } else {
+                malformed.remove(session.id());
+            }
+        }
 
         // It waited: a watch, not a loop. Not counted, and not nudged — the
         // same call next round starts the count afresh.
@@ -1476,6 +1513,12 @@ impl RepeatFuse {
         // included, so the nudge is normally said by then. Should a turn end
         // without it, the nudge goes with the turn rather than into the next.
         let ends_turn = matches!(committed.event, SessionEvent::TurnEnd { .. });
+        if ends_turn {
+            self.malformed
+                .lock()
+                .expect("repeat fuse poisoned")
+                .remove(&committed.session);
+        }
         if !ends_turn && !matches!(committed.event, SessionEvent::StepEnd { .. }) {
             return;
         }
@@ -1508,7 +1551,16 @@ impl RepeatFuse {
 
 #[async_trait]
 impl Listener<TurnStopping> for RepeatFuse {
-    async fn call(&self, _progress: &TurnProgress) -> Option<StopReason> {
+    async fn call(&self, progress: &TurnProgress) -> Option<StopReason> {
+        if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
+            let mut malformed = self.malformed.lock().expect("repeat fuse poisoned");
+            if malformed.get(session.id()).is_some_and(|round| {
+                round.turn == progress.turn && round.step == progress.rounds && round.repeated
+            }) {
+                malformed.remove(session.id());
+                return Some(StopReason::ToolLoopDetected);
+            }
+        }
         let mut state = self.state.lock().expect("repeat fuse poisoned");
         if state.rounds >= self.stop_at {
             *state = RepeatState::default();
@@ -1574,6 +1626,7 @@ impl Plugin for RepeatFusePlugin {
             poll_after: (poll_after_secs > 0)
                 .then(|| std::time::Duration::from_secs(poll_after_secs)),
             state: Mutex::new(RepeatState::default()),
+            malformed: Mutex::new(HashMap::new()),
         });
         let _ = ctx.on_waterfall::<ToolsExecuteBatch>(fuse.clone(), false);
         let _ = ctx.on_serial::<TurnStopping>(fuse.clone());
