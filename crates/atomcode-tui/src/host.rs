@@ -2157,7 +2157,10 @@ impl Host {
             .expect("presentation poisoned")
             .set_undone(turns.clone(), rewound);
         if changed {
-            self.moment.write().expect("moment poisoned").undone = turns;
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.undone = turns;
+            // Both a model prediction and a todo suggestion refer to the old history.
+            m.suggestion = None;
         }
         changed
     }

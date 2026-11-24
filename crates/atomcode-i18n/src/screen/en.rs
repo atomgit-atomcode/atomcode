@@ -1683,6 +1683,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "Appended instructions: unknown".into(),
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerContinueTodo { title } => format!("Continue with {title}").into(),
         Msg::ComposerPlaceholder => "Ask AtomCode to do Anything".into(),
         Msg::WaitsForTheTurn { command } => format!(
             "A reply is in progress: /{command} has to wait for this turn to end; Esc stops the turn now"

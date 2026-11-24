@@ -7465,6 +7465,48 @@ impl Tui {
         false
     }
 
+    /// Offer an open item on a live completion while the model suggestion is pending.
+    fn offer_current_todo(&self) -> bool {
+        use atomcode_capabilities::tools::todo::TodoStatus;
+
+        {
+            let m = self.host.moment.read().expect("moment poisoned");
+            if m.suggestion.is_some()
+                || !m.input.is_empty()
+                || m.secret.is_some()
+                || m.autonomy.is_some()
+            {
+                return false;
+            }
+        }
+
+        let (session, items) = {
+            let views = self.client.view.lock().expect("client poisoned");
+            let Some(screen) = views.screen() else {
+                return false;
+            };
+            if !screen.outstanding.is_empty() {
+                return false;
+            }
+            (
+                views.on_screen.clone(),
+                crate::modules::todo::plan_items(&screen.events),
+            )
+        };
+        let next = items
+            .iter()
+            .find(|item| item.status == TodoStatus::InProgress)
+            .or_else(|| items.iter().find(|item| item.status == TodoStatus::Pending));
+        if let Some(next) = next {
+            let title = crate::text::one_line(&next.content);
+            if !title.is_empty() {
+                let text = t(Msg::ComposerContinueTodo { title: &title });
+                return took_suggestion(&self.host.moment, &session, &text);
+            }
+        }
+        false
+    }
+
     /// Ask for a `※ recap:` under the turn that just ended, when it is one a
     /// person needs help coming back to — see [`wants_recap`]. In the
     /// background: the side call takes seconds, and the screen paints on. What
@@ -8391,8 +8433,9 @@ impl Tui {
                 // At `TurnComplete` only: a cancelled turn ends `Cancelled` and
                 // then `TurnComplete`, and a line resent at the first would be
                 // wiped off the panel by the second.
+                let mut suggestion_changed = false;
                 if matches!(event, AgentEvent::TurnComplete { .. }) {
-                    {
+                    let was_open = {
                         let mut m = self.host.moment.write().expect("moment poisoned");
                         if matches!(
                             event,
@@ -8409,12 +8452,13 @@ impl Tui {
                                 m.draft.clear();
                             }
                         }
-                        m.turn_open = false;
+                        let was_open = std::mem::take(&mut m.turn_open);
                         m.cancellation_pending = false;
                         if let Some(retract) = m.retract.as_mut() {
                             retract.ended = true;
                         }
-                    }
+                        was_open
+                    };
                     self.settle_withdrawn();
                     self.try_retract();
                     if matches!(
@@ -8424,6 +8468,7 @@ impl Tui {
                             ..
                         }
                     ) {
+                        suggestion_changed = was_open && self.offer_current_todo();
                         self.maybe_recap();
                     } else {
                         // Ended some other way: no recap, and its start must not
@@ -8477,6 +8522,7 @@ impl Tui {
                 } else {
                     Activity::Idle
                 }) | outcome_changed
+                    | suggestion_changed
                     | matches!(
                         event,
                         AgentEvent::TurnComplete {
@@ -13270,6 +13316,92 @@ mod suggestion_tests {
             viewing: session.into(),
             ..Moment::default()
         })
+    }
+
+    #[test]
+    fn a_live_completion_offers_the_open_todo_without_waiting_for_the_model() {
+        use atomcode_kernel::event::{AgentEvent, StopReason};
+        use atomcode_kernel::session::{Committed, SessionEvent};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        tui.client.follow("lead");
+        host.moment.write().unwrap().viewing = "lead".into();
+        let end = |turn| AgentEvent::TurnComplete {
+            reason: StopReason::Stopped,
+            turn: Some(turn),
+            provider_failure: None,
+        };
+
+        for (turn, status) in [(1, "pending"), (2, "completed")] {
+            let seq = (turn - 1) * 4;
+            let call_id = format!("todo-{turn}");
+            let facts = [
+                SessionEvent::AssistantMessage {
+                    turn,
+                    round: 0,
+                    text: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: call_id.clone(),
+                        name: "todowrite".into(),
+                        arguments: format!(
+                            r#"{{"todos":[{{"content":"add tests","status":"{status}"}}]}}"#
+                        ),
+                    }],
+                    reasoning_blocks: Vec::new(),
+                    meta: None,
+                },
+                SessionEvent::ToolResultLogged {
+                    turn,
+                    round: 0,
+                    call_id,
+                    content: "ok".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+                SessionEvent::TurnEnd {
+                    turn,
+                    stop: StopReason::Stopped,
+                    error: None,
+                },
+            ];
+            for (index, event) in facts.into_iter().enumerate() {
+                tui.on_event(AgentEvent::Fact(Box::new(Committed {
+                    session: "lead".into(),
+                    seq: seq + index as u64 + 1,
+                    at: 0,
+                    event,
+                })));
+            }
+
+            // Applying persisted facts alone must not display a suggestion.
+            assert!(host.moment.read().unwrap().suggestion.is_none());
+            host.moment.write().unwrap().turn_open = true;
+            tui.on_event(end(turn));
+
+            if turn == 1 {
+                let expected = super::t(super::Msg::ComposerContinueTodo { title: "add tests" });
+                assert_eq!(
+                    host.moment.read().unwrap().suggestion.as_deref(),
+                    Some(expected.as_ref())
+                );
+                assert!(took_suggestion(&host.moment, "lead", "Run the tests"));
+                assert_eq!(
+                    host.moment.read().unwrap().suggestion.as_deref(),
+                    Some("Run the tests")
+                );
+                tui.on_event(AgentEvent::Fact(Box::new(Committed {
+                    session: "lead".into(),
+                    seq: seq + 4,
+                    at: 0,
+                    event: SessionEvent::Interrupted { turn, undone: true },
+                })));
+                assert!(host.moment.read().unwrap().suggestion.is_none());
+            } else {
+                assert!(host.moment.read().unwrap().suggestion.is_none());
+            }
+        }
     }
 
     /// 一句猜出来的话,只在它还适用的时候留着。
