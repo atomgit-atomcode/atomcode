@@ -3115,6 +3115,21 @@ found`，唯一带语音的只有百度输入法（`com.baidu.input_oppo`），�
 `a_stale_recording_is_swept_and_a_fresh_one_is_kept`、`only_a_real_wav_recording_is_accepted`
 （改用可注入根目录的版本）等，语音单测 9/9。
 
+**修复后的真机复验（PLT140 / Android 16，2026-11-24）**
+
+- **录音→转写→清理**整条链路：点麦克风 → 弹「这台设备没有语音识别器」（正文标明当前引擎
+  `mock · whisper-1`，底栏 `[去插件页] [录音并转写]`）→ 录音时按钮进入 `btn-voice active`
+  态、对话框关闭 → 再点一次结束 → 文案「语音转写测试：你好世界」回到输入框。
+- **录音确实被清掉了**：转写后 `files/atomcode/voice/` 只剩 `.` 与 `..`，文件已不在。这是
+  修复前最实在的一处——原先 daemon 不删、页面不删、`discard()` 还是死代码，原始麦克风音频
+  会无限期留在设备上。
+- **路径收敛双向可验**：把同一个真 WAV 分别放在 `files/atomcode/outside.wav` 与
+  `files/atomcode/voice/inside.wav`，前者被拒
+  （`the recording is outside /data/data/com.atomcode.app/files/atomcode/voice`），后者
+  正常转写（200）。修复前两者都会被接受并上传给模型供应商。
+- **没有崩溃**：录音期间停止再停止，进程存活、pump 线程正常退出——修复前
+  `release()` 与 `read()` 的竞态会抛 `IllegalStateException` 并杀掉进程。
+
 顺带记一条环境事实：共享 `target/` 会因两个分支先后构建而串味——另一分支的
 `atomcode-i18n` 产物被覆盖后，本分支的 `atomcode-tui` 会报
 `TranscriptInitAcknowledgement` 不存在（源文件里它是有的）。`touch` 一下
