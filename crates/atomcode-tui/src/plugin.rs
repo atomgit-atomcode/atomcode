@@ -1916,10 +1916,10 @@ pub struct Tui {
     /// is not known until then.
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
-    /// When the allowance was last asked about, so it is not asked again for
-    /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
-    allowance_checked: Mutex<Option<std::time::Instant>>,
-    /// Invalidates quota requests issued before the active model was replaced.
+    /// When the allowance was last asked about and whether it was a forced
+    /// refresh after a successful turn with a full quota badge.
+    allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
+    /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
@@ -6938,30 +6938,40 @@ impl Tui {
         });
     }
 
-    fn check_allowance(&self) {
-        let now = std::time::Instant::now();
-        {
-            let mut last = self.allowance_checked.lock().expect("allowance poisoned");
-            if last.is_some_and(|at| now.duration_since(at) < ALLOWANCE_EVERY) {
-                return;
-            }
-            // Stamped before the answer comes back, not after: two turns
-            // finishing inside the interval must not both send a question
-            // while the first is still in flight.
-            *last = Some(now);
-        }
+    fn check_allowance(&self, model_completed: bool) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return;
         };
         let Some(control) = self.client.control() else {
             return;
         };
+        let recheck_full_window = model_completed
+            && self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .allowance
+                .as_ref()
+                .is_some_and(|window| window.percent >= 100);
+        let generation = {
+            let now = tokio::time::Instant::now();
+            let mut last = self.allowance_checked.lock().expect("allowance poisoned");
+            if last.is_some_and(|(at, rechecked)| {
+                now.duration_since(at) < ALLOWANCE_EVERY && (!recheck_full_window || rechecked)
+            }) {
+                return;
+            }
+            // A successful model turn can be the first sign of an early reset.
+            // Allow one immediate recheck, even if the old lookup is in flight.
+            *last = Some((now, recheck_full_window));
+            self.allowance_generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let session = self.client.session();
         let host = self.host.clone();
         let nudged = self.allowance_nudged.clone();
         let client = self.client.clone();
         let allowance_generation = self.allowance_generation.clone();
-        let generation = allowance_generation.load(Ordering::SeqCst);
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
@@ -7980,7 +7990,7 @@ impl Tui {
                 if refresh_allowance {
                     *self.allowance_checked.lock().expect("allowance poisoned") = None;
                     self.allowance_nudged.store(false, Ordering::SeqCst);
-                    self.check_allowance();
+                    self.check_allowance(false);
                 }
                 // The providers rows too, and only now that the moment is free:
                 // `refresh_providers` writes the same lock this branch held, and
@@ -8437,7 +8447,13 @@ impl Tui {
                 }
                 // A turn just spent some of the allowance, so this is the
                 // moment the figure changed. Rate-limited inside.
-                self.check_allowance();
+                self.check_allowance(matches!(
+                    event,
+                    AgentEvent::TurnComplete {
+                        reason: atomcode_kernel::event::StopReason::Stopped,
+                        ..
+                    }
+                ));
                 // A summary the turn outlived would leave 正在压缩 up on an idle
                 // screen. An interrupted one arrives as a said line rather than
                 // as `Compacted`/`CompactionFailed`, so the turn's own end is
@@ -19692,6 +19708,74 @@ mod allowance_switch_tests {
             windows,
         }
     }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_successful_turn_rechecks_spent_quota_before_the_throttle_expires() {
+        use atomcode_kernel::event::StopReason;
+
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let spent = atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: true,
+            resets_at: "14:17".into(),
+            resets_in_seconds: 12_360,
+            window_seconds: 18_000,
+            used_percent: Some(100),
+            calls_used: None,
+            call_limit: None,
+        };
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.allowance =
+                crate::moment::Allowance::nearest(std::slice::from_ref(&spent), moment.now);
+        }
+        tui.on_event(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(1),
+            reason: StopReason::RateLimited,
+        });
+        let old = pending.recv().await.unwrap();
+        let success = |turn| AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(turn),
+            reason: StopReason::Stopped,
+        };
+        tui.on_event(success(2));
+        tokio::task::yield_now().await;
+        let refreshed = pending
+            .try_recv()
+            .expect("a successful turn checks immediately");
+        tui.on_event(success(3));
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "the forced refresh is coalesced"
+        );
+
+        refreshed
+            .send(reply(vec![atomcode_host_api::UsageWindow {
+                exhausted: false,
+                used_percent: Some(0),
+                ..spent.clone()
+            }]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        old.send(reply(vec![spent])).unwrap();
+        tokio::task::yield_now().await;
+        let allowance = host.moment.read().unwrap().allowance.clone().unwrap();
+        assert_eq!(
+            allowance.percent, 0,
+            "the old 100% reply cannot restore the badge"
+        );
+        assert!(!tui.allowance_nudged.load(Ordering::SeqCst));
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn model_switch_clears_cached_quota_and_discards_the_old_pending_answer() {
         let (host, tui) = assemble(Headless::new(100, 24));
@@ -19715,7 +19799,7 @@ mod allowance_switch_tests {
             let mut m = host.moment.write().unwrap();
             m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
         }
-        tui.check_allowance();
+        tui.check_allowance(false);
         let old = pending.recv().await.unwrap();
         tui.on_event(AgentEvent::Described {
             description: Box::new(AgentDescription {
