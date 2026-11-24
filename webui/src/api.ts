@@ -193,6 +193,17 @@ export async function cancelDetachedChat(
   await stopChat(requestId);
 }
 
+// Bound each event, including buffered partial events. Allow room for JSON
+// envelopes and inline content such as images in live snapshots.
+const SSE_EVENT_LIMIT_BYTES = 32 * 1024 * 1024;
+
+export class SseEventTooLargeError extends Error {
+  constructor() {
+    super('Server-sent event exceeds 32 MiB');
+    this.name = 'SseEventTooLargeError';
+  }
+}
+
 /** Parse the daemon's single-data-line SSE blocks, keeping partial chunks. */
 async function readEventStream<T>(
   response: Response,
@@ -203,13 +214,27 @@ async function readEventStream<T>(
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let bytes = 0;
+  // Hold a final LF until the next byte tells us whether it is part of the
+  // event or the delimiter, including when the two LFs arrive in different chunks.
+  let pendingLf = false;
+  const lf = Uint8Array.of(10);
+  const append = (piece: Uint8Array) => {
+    bytes += piece.length;
+    if (bytes > SSE_EVENT_LIMIT_BYTES) throw new SseEventTooLargeError();
+    buffer += decoder.decode(piece, { stream: true });
+  };
   const dispatch = (block: string) => {
-    const line = block.split('\n').find(line => line.startsWith('data:'));
-    const json = line?.slice('data:'.length).trim();
+    const json = /(?:^|\n)data:([^\n]*)/.exec(block)?.[1].trim();
     if (!json) return;
     let event: T;
     try { event = JSON.parse(json) as T; } catch { return; }
     onEvent(event);
+  };
+  const dispatchBuffered = () => {
+    dispatch(buffer + decoder.decode());
+    buffer = '';
+    bytes = 0;
   };
   try {
     for (;;) {
@@ -221,14 +246,40 @@ async function readEventStream<T>(
       });
       if (done) break;
       options.onActivity?.();
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split('\n\n');
-      buffer = parts.pop() ?? '';
-      for (const part of parts) dispatch(part);
+      if (value.length === 0) continue;
+      let start = 0;
+      if (pendingLf) {
+        pendingLf = false;
+        if (value[0] === 10) {
+          dispatchBuffered();
+          start = 1;
+        } else {
+          append(lf);
+        }
+      }
+      let newline = value.indexOf(10, start);
+      while (newline !== -1) {
+        if (newline === value.length - 1) {
+          append(value.subarray(start, newline));
+          pendingLf = true;
+          start = value.length;
+          break;
+        }
+        if (value[newline + 1] === 10) {
+          append(value.subarray(start, newline));
+          dispatchBuffered();
+          start = newline + 2;
+          newline = value.indexOf(10, start);
+        } else {
+          newline = value.indexOf(10, newline + 1);
+        }
+      }
+      append(value.subarray(start));
     }
     // /chat accepts a final block without a separator. /live dispatches only
     // complete blocks before reconnecting; keep that existing distinction.
-    if (options.flushTrailing && buffer.trim()) dispatch(buffer);
+    if (pendingLf) append(lf);
+    if (options.flushTrailing) dispatchBuffered();
   } finally {
     try { await reader.cancel(); } catch { /* fetch already aborted */ }
     reader.releaseLock();
@@ -263,9 +314,11 @@ export async function streamChat(
       } catch { /* legacy /chat dispatch isolation */ }
     }, { flushTrailing: true, signal });
   } catch (error) {
-    // An authoritative terminal has already settled the turn. A late
-    // transport failure cannot put the chat back into detached recovery.
-    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError)) throw error;
+    // An authoritative terminal has already settled the turn. A later
+    // transport or framing error cannot put the chat back into recovery.
+    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError || error instanceof SseEventTooLargeError)) {
+      throw error;
+    }
   }
 
   if (signal?.aborted) {

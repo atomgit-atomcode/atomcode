@@ -189,11 +189,7 @@ fn refold(state: &mut State) {
 /// (`refold`), and printing it is how a person still gets to read it; the same
 /// as `atomcode-tuix`'s `/todo`.
 pub(crate) fn plan_text(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
-    let mut plan = Plan::default();
-    for logged in events {
-        plan.absorb(&logged.event);
-    }
-    let items = plan.fold(&atomcode_kernel::session::undone_turns(events));
+    let items = plan_items(events);
     if items.is_empty() {
         return t(Msg::TodoNoPlan).into_owned();
     }
@@ -212,6 +208,15 @@ pub(crate) fn plan_text(events: &[atomcode_kernel::session::LoggedEvent]) -> Str
         ));
     }
     out
+}
+
+/// The current plan, projected from the visible turns of this session.
+pub(crate) fn plan_items(events: &[atomcode_kernel::session::LoggedEvent]) -> Vec<TodoItem> {
+    let mut plan = Plan::default();
+    for logged in events {
+        plan.absorb(&logged.event);
+    }
+    plan.fold(&atomcode_kernel::session::undone_turns(events))
 }
 
 /// The calls, folded into a list, leaving out the turns that were taken back.

@@ -56,7 +56,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { SseEventTooLargeError, streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -1581,7 +1581,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // events. Backoff caps the retry rate; after a run of failures (daemon
     // genuinely gone) we fall back to non-sync so the user isn't stuck.
     let attempt = 0;
-    const scheduleReconnect = (startedAt: number) => {
+    const scheduleReconnect = (startedAt: number, error?: unknown) => {
       // Superseded by a newer stream (session switch / manual toggle / watchdog)
       // — that one owns reconnection now.
       if (controller.signal.aborted) return;
@@ -1593,7 +1593,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // first byte would pin backoff at 1s forever.
       if (Date.now() - startedAt >= 30000) attempt = 0;
       attempt += 1;
-      if (attempt > 6) {
+      // A snapshot beyond the event limit can replay on every reconnect.
+      if (error instanceof SseEventTooLargeError || attempt > 6) {
         stopLiveStream();
         liveLifecycleRef.current = createLiveLifecycleState();
         restorePendingSteers();
@@ -1602,8 +1603,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         setQueued([]);
         setLivePending(null);
         setUserInputReq(null);
-        setHistoryHint(t('sync.reconnectFailed'));
-        pushNoticeToLastAssistant(t('sync.reconnectFailed'));
+        const message = t('sync.reconnectFailed');
+        setHistoryHint(message);
+        pushNoticeToLastAssistant(error instanceof SseEventTooLargeError ? message + ' ' + error.message : message);
         return;
       }
       const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
@@ -1630,7 +1632,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         },
       )
         .then(() => scheduleReconnect(startedAt)) // clean server close → reconnect
-        .catch(() => scheduleReconnect(startedAt)); // error → reconnect
+        .catch(error => scheduleReconnect(startedAt, error)); // error → reconnect
     };
     run();
   }

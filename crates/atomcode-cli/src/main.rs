@@ -5347,10 +5347,8 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
         let bt = std::backtrace::Backtrace::force_capture().to_string();
         let scrubbed_loc =
             atomcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
-        let scrubbed_msg = atomcode_telemetry::scrub::truncate_head(
-            &atomcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
-            atomcode_telemetry::scrub::HEAD_MAX,
-        );
+        let scrubbed_msg =
+            atomcode_telemetry::scrub::message_head(&msg, home.as_deref(), cwd.as_deref());
         let frames =
             atomcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
         telemetry.track(atomcode_telemetry::Event::Panic {

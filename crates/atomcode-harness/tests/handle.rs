@@ -567,6 +567,77 @@ async fn allow_always_stops_it_being_asked_twice() {
 
 // ---- lifecycle ----------------------------------------------------------
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn malformed_tool_names_get_one_retry_despite_changing_suffixes() {
+    let dir = scratch("malformed-tool-name");
+    std::fs::write(dir.join("input.txt"), "CORRECTED_CALL_RAN").unwrap();
+    let script = replay(
+        r#"{ calls = [ { name = "todowriteough11z35b</argValue>", args = {} } ] },
+           { calls = [ { name = "todowriteough11z36b</argValue>", args = {} } ] },
+           { calls = [ { name = "read_file</argValue>", args = {} } ] },
+           { calls = [ { name = "read_file", args = { file_path = "input.txt" } },
+                       { name = "todowriteough11z37b</argValue>", args = {} } ] },
+           { text = "Corrected." }"#,
+    );
+    let app = start(tree(&dir, &script, &[])).await;
+    let mut handle = handle_of(&app);
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "Update the list".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let events = drain_turn(&mut handle).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete {
+                reason: StopReason::ToolLoopDetected,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult { result, .. } if result.is_error => {
+                Some(result.content.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("Retry using an exact name"));
+    assert!(errors[1].contains("malformed tool names again"));
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "Continue".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let next = drain_turn(&mut handle).await;
+    assert!(
+        next.iter().any(|event| matches!(event,
+            AgentEvent::ToolResult { result }
+                if !result.is_error && result.content.contains("CORRECTED_CALL_RAN")
+        )),
+        "{next:?}"
+    );
+    assert!(
+        matches!(
+            next.last(),
+            Some(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+                ..
+            })
+        ),
+        "{next:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
     let dir = scratch("cancel");
