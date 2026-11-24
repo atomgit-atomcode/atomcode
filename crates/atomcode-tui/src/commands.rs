@@ -4495,6 +4495,7 @@ mod tests {
             body.contains("HiShell"),
             "HiShell's history-key exception must be discoverable in /keys"
         );
+        assert!(body.contains("browser terminals") || body.contains("网页终端"));
         // 旧散文形态的行内分隔（` · `）不再出现：现在是逐行两列。
         assert!(
             !body.contains(" · "),

@@ -2224,10 +2224,12 @@ impl UserInterface for Tui {
         let native_mouse_notice = (!self.surface.mouse()).then(|| {
             t(if crate::tmux_mouse::disabled() {
                 Msg::MouseDisabledByTmux
-            } else if crate::caps::mouse_reported() {
-                Msg::MouseHandedBackAtStart
-            } else {
+            } else if !crate::caps::mouse_reported() {
                 Msg::MouseUnreportedAtStart
+            } else if single_arrow_scroll_enabled() {
+                Msg::MouseHandedBackArrowScrollAtStart
+            } else {
+                Msg::MouseHandedBackAtStart
             })
             .into_owned()
         });
@@ -3157,9 +3159,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::ArrowBurst { up, n }) => {
                     // A lone ↓ the composer and the conversation have no use
                     // for steps into the team panel, as a pressed one does.
+                    let browser = crate::browser_terminal::detected();
+                    let alternate_scroll = crate::ansi::alternate_scroll_enabled();
                     if !up
                         && n == 1
-                        && !crate::ansi::alternate_scroll_enabled()
+                        && !browser
+                        && !alternate_scroll
                         && self.down_reaches_team()
                         && self.host.focus_team()
                     {
@@ -3180,11 +3185,11 @@ impl UserInterface for Tui {
                     if arrows_scroll(
                         self.surface.mouse(),
                         crate::caps::mouse_reported(),
-                        crate::ansi::alternate_scroll_enabled(),
+                        alternate_scroll || browser,
                         self.arrows_reach_the_composer()
-                            && !(n == 1 && self.caret_moves_within_draft(up)),
+                            && (browser || !(n == 1 && self.caret_moves_within_draft(up))),
                     ) {
-                        let step = if crate::ansi::alternate_scroll_enabled() {
+                        let step = if alternate_scroll {
                             CONVERSATION_WHEEL_LINES
                         } else {
                             1
@@ -9877,6 +9882,8 @@ impl Tui {
                 self.surface.set_mouse(on);
                 let text = if on {
                     t(Msg::MouseTaken).into_owned()
+                } else if single_arrow_scroll_enabled() {
+                    t(Msg::MouseHandedBackArrowScroll).into_owned()
                 } else {
                     t(Msg::MouseHandedBack).into_owned()
                 };
@@ -12230,13 +12237,10 @@ fn recall_back(m: &mut crate::moment::Moment) {
         Some(0) => return, // already at the oldest; going further is nowhere
         Some(i) => i - 1,
     };
-    let entering = m.history_at.is_none();
     m.history_at = Some(at);
     m.input = m.history[at].clone();
     m.caret = 0;
-    if entering {
-        m.hint_history_clear();
-    }
+    m.disarm_quit();
 }
 
 /// Forward one entry, and out the far side to the draft that was set aside.
@@ -12333,21 +12337,23 @@ fn sanitize_paste(text: &str) -> String {
     crate::text::for_buffer(text)
 }
 
+fn single_arrow_scroll_enabled() -> bool {
+    crate::ansi::alternate_scroll_enabled() || crate::browser_terminal::detected()
+}
+
 /// Whether a run of ↑/↓ that reached the composer scrolls the conversation
 /// rather than walking the input history.
 ///
-/// With the mouse handed back, the wheel can arrive as arrow keys. Ordinarily
-/// that is useful only on a terminal that reports a mouse; HarmonyOS is the
-/// exception: DECSET 1007 turns its wheel into a multi-arrow burst, while a
-/// lone Up/Down remains an input-history key. Fn+Up/Down arrives as
-/// PageUp/PageDown and always pages the conversation.
+/// With the mouse handed back, a terminal can send wheel motion as arrows.
+/// Browser terminals and HiShell can send a single arrow for a wheel event.
+/// PageUp/PageDown always page the conversation.
 fn arrows_scroll(
     mouse_held: bool,
     mouse_reported: bool,
-    alternate_scroll: bool,
+    single_arrow_scroll: bool,
     would_scroll: bool,
 ) -> bool {
-    !mouse_held && (mouse_reported || alternate_scroll) && would_scroll
+    !mouse_held && (mouse_reported || single_arrow_scroll) && would_scroll
 }
 
 fn input_wake(input: Input, approval: Option<ApprovalInput>) -> Wake {
@@ -12413,7 +12419,7 @@ async fn pump_terminal_input<S>(
         events,
         wake.clone(),
         handed_back,
-        crate::ansi::alternate_scroll_enabled(),
+        single_arrow_scroll_enabled(),
         presented_approval,
     )
     .await;
@@ -12450,7 +12456,7 @@ async fn pump_input<S>(
     events: S,
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool,
-    alternate_scroll: bool,
+    single_arrow_scroll: bool,
     presented_approval: impl Fn() -> Option<ApprovalInput>,
 ) where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
@@ -12531,11 +12537,9 @@ async fn pump_input<S>(
                     _ => break,
                 }
             }
-            // HiShell also sends isolated wheel arrows. In its explicitly
-            // enabled alternate-scroll mode they must never recall input
-            // history; Ctrl+P/Ctrl+N remain unambiguous history keys. Other
-            // terminals preserve the usual single-arrow keyboard behavior.
-            let sent = if n == 1 && !alternate_scroll {
+            // Browser terminals and HiShell can send isolated wheel arrows.
+            // Ctrl+P/Ctrl+N remain unambiguous history keys in those terminals.
+            let sent = if n == 1 && !single_arrow_scroll {
                 forward(event, approval)
             } else {
                 wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
@@ -13036,6 +13040,8 @@ mod history_tests {
         let mut m = said(&["first", "second", "third"], "");
         recall_back(&mut m);
         assert_eq!(m.input, "third");
+        assert_eq!(m.history_at, Some(2));
+        assert!(m.notice.is_none());
         recall_back(&mut m);
         assert_eq!(m.input, "second");
         recall_back(&mut m);
@@ -14870,7 +14876,7 @@ mod paste_burst_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn harmony_isolated_wheel_arrows_never_become_history_keys() {
+    async fn isolated_wheel_arrows_never_become_history_keys_in_browser_or_hishell() {
         assert_eq!(
             pumped_with_scroll(
                 vec![(0, arrow(true)), (35, arrow(false)), (35, arrow(true))],

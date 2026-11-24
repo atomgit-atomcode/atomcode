@@ -1482,12 +1482,6 @@ impl Moment {
         self.draft.clear();
     }
 
-    pub fn hint_history_clear(&mut self) {
-        self.disarm_quit();
-        self.notice =
-            Some(Notice::for_ms(t(Msg::MomentHistoryClear), false, self.now, NOTICE_MS).below());
-    }
-
     /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
     /// that quits, `false` when it is the first that arms.
     ///

@@ -111,7 +111,6 @@ pub enum Msg<'a> {
     },
     UpgradeProgressEtaUnknown,
     MomentQuitAgain,
-    MomentHistoryClear,
     MomentEofAgain,
 
     // ── overlays (`overlay.rs`) ──
@@ -1656,6 +1655,7 @@ pub enum Msg<'a> {
     /// Most important first — how to take the mouse back — because the tip
     /// row is one right-aligned row that cuts what does not fit at the end.
     MouseHandedBack,
+    MouseHandedBackArrowScroll,
     /// Printed above the conversation `/raw` puts on the terminal's own screen.
     RawTop,
     /// …and under it: what this screen is for and the way back.
@@ -1663,6 +1663,7 @@ pub enum Msg<'a> {
     /// Said once at start when `[ui] mouse = false` hands the pointer to the
     /// terminal from the first frame.
     MouseHandedBackAtStart,
+    MouseHandedBackArrowScrollAtStart,
     /// The terminal reports no mouse (HarmonyOS): what works instead, at start.
     MouseUnreportedAtStart,
     MouseDisabledByTmux,
