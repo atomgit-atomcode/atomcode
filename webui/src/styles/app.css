@@ -4595,3 +4595,114 @@ body {
   padding: 8px 12px; border: 1px solid var(--app-border-subtle); border-radius: var(--corner-radius-small);
   background: var(--app-input-background); color: var(--app-primary-foreground); font: inherit;
 }
+
+/* Team navigation belongs to the session title; the transcript is an independent reader. */
+.workbench-toggle ~ .session-header:has(.team-switcher) { padding-right: 100px; }
+.session-header:has(.team-switcher) .session-title-btn { min-width: 0; }
+.team-switcher { position: relative; flex: 0 0 auto; }
+.team-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+  font: inherit;
+  font-size: .8125rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.team-trigger:hover, .team-row:hover, .team-row[aria-current] {
+  background: var(--app-ghost-button-hover-background);
+}
+.team-roster {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: clamp(138px, 28vw, 248px);
+  max-height: min(55vh, 360px);
+  max-height: min(55dvh, 360px);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+  box-shadow: 0 8px 24px #0002;
+}
+.team-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  text-align: left;
+  cursor: pointer;
+}
+.team-member-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-member-status, .team-entry-label, .team-transcript-note {
+  color: var(--app-secondary-foreground);
+  font-size: .75rem;
+}
+.team-row .team-member-status { flex: 0 0 auto; }
+.session-body:has(.team-transcript) { flex-direction: row; }
+.team-panel-seat { flex: 0 0 min(400px, 36%); min-width: 0; }
+.team-panel-seat:empty { display: none; }
+.session-body:has(.workbench) .team-panel-seat {
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: min(400px, 46%);
+  z-index: 25;
+}
+.team-transcript {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--app-border-subtle);
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+  overflow: hidden;
+}
+.team-transcript-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--app-border-subtle);
+}
+.team-transcript-header h2 { margin: 0 0 3px; font-size: 1rem; overflow-wrap: anywhere; }
+.team-transcript-body { min-height: 0; overflow: auto; padding: 4px 16px 16px; }
+.team-transcript-entry { margin-top: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--app-border-subtle); }
+.team-entry-text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; font-size: .875rem; }
+.team-transcript-entry.is-tool { color: var(--app-secondary-foreground); font-size: .8125rem; }
+.team-transcript-entry summary { cursor: pointer; }
+@media (max-width: 850px) {
+  .workbench-toggle ~ .session-header:has(.team-switcher) { padding-right: 152px; }
+}
+@media (max-width: 640px) {
+  .session-header:has(.team-switcher) .session-title-btn { padding-inline: 4px; }
+  .team-roster { left: auto; right: 0; }
+  .team-panel-seat, .session-body:has(.workbench) .team-panel-seat {
+    position: fixed;
+    inset: auto 0 0;
+    width: auto;
+    height: min(72vh, 600px);
+    height: min(72dvh, 600px);
+    z-index: 75;
+  }
+  .team-transcript {
+    border: 1px solid var(--app-border-subtle);
+    border-radius: 16px 16px 0 0;
+    box-shadow: 0 -12px 36px #0003;
+  }
+  .team-transcript-body { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+}

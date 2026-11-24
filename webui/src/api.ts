@@ -373,6 +373,34 @@ export interface SessionMeta {
 
 export type SessionActivity = 'open' | 'running' | 'waiting';
 
+export interface TeamMember {
+  id: string;
+  name: string;
+  role: string;
+  activity: SessionActivity | null;
+}
+
+export interface TeamTranscript {
+  entries: { seq: number; kind: 'user' | 'peer' | 'assistant' | 'tool' | 'tool_result' | 'tool_error'; text: string }[];
+  truncated: boolean;
+}
+
+function teamPath(project: string, lead: string) {
+  return `/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(lead)}/team`;
+}
+
+export async function getTeamMembers(project: string, lead: string, signal: AbortSignal): Promise<TeamMember[]> {
+  const resp = await apiFetch(teamPath(project, lead), { headers: authHeaders(), signal, cache: 'no-store' });
+  if (resp.status === 404) return [];
+  return readJson(resp);
+}
+
+export async function getTeamTranscript(project: string, lead: string, member: string, signal: AbortSignal): Promise<TeamTranscript> {
+  const resp = await apiFetch(`${teamPath(project, lead)}/${encodeURIComponent(member)}`, { headers: authHeaders(), signal, cache: 'no-store' });
+  return readJson(resp);
+}
+
+
 export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
 }

@@ -46,6 +46,7 @@ mod mention_search;
 pub mod native_live;
 mod project_preferences;
 mod runtime_host;
+mod team_view;
 mod transcript_view;
 mod workbench;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
@@ -8345,6 +8346,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/projects/:hash/sessions/:id/todo-sources",
             get(get_todo_sources),
+        )
+        .route("/projects/:hash/sessions/:id/team", get(team_view::list))
+        .route(
+            "/projects/:hash/sessions/:id/team/:member",
+            get(team_view::detail),
         )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))

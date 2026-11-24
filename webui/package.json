@@ -17,6 +17,7 @@
     "test:workspace-actions": "node scripts/workspace-actions-e2e.mjs",
     "test:session-fork": "node scripts/session-fork-e2e.mjs",
     "test:session-browse": "node scripts/session-browse-e2e.mjs",
+    "test:team-members": "node scripts/team-members-e2e.mjs",
     "test:message-images": "node scripts/message-images-e2e.mjs",
     "test:grouped-history": "node scripts/grouped-history-e2e.mjs",
     "test:turn-process": "node scripts/turn-process-e2e.mjs",
