@@ -579,9 +579,10 @@ pub struct Moment {
     pub quiet_since: Option<Timestamp>,
     /// UI clock reading when the latest provider retry was announced.
     pub provider_retry_started: Option<Timestamp>,
-    /// Where the agent is working. Not derivable from the log, which is
-    /// exactly what this struct is for.
+    /// The lead session's working directory.
     pub cwd: String,
+    /// The directory shown in the status bar for a member with its own checkout.
+    pub member_cwd: Option<String>,
     /// The model the screen agent runs on, from its description — known before
     /// the first turn (which is when the folded status `model` is still empty).
     /// The footer prefers the folded model when it has one and falls back to

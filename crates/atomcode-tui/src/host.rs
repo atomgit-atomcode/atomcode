@@ -1889,6 +1889,7 @@ impl Host {
         self.asks.refuse_all();
         let mut m = self.moment.write().expect("moment poisoned");
         m.members.clear();
+        m.member_cwd = None;
         m.team_return = None;
         m.team_cursor = None;
         // The keyboard went with the panel: the new session's team is not up

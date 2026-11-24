@@ -988,6 +988,11 @@ async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
         Some(&worktree),
         "the member's world is its checkout"
     );
+    assert_eq!(
+        scribe.describe().working_dir,
+        Some(worktree.display().to_string()),
+        "the member's frontend description reports its checkout"
+    );
     assert!(worktree.join("note.txt").exists(), "it wrote there");
     assert!(!dir.join("note.txt").exists(), "and not in the lead's tree");
     let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;

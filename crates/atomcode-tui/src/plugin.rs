@@ -372,6 +372,14 @@ impl AgentClient {
             .and_then(|v| v.described.clone())
     }
 
+    fn member_cwd(&self) -> Option<String> {
+        let views = self.view.lock().expect("client poisoned");
+        if views.on_screen == views.root {
+            return None;
+        }
+        views.screen()?.described.as_ref()?.working_dir.clone()
+    }
+
     /// The selection id host control accepted, so the providers list can mark
     /// the row the session is on while the two accounts running the same model
     /// are still indistinguishable by the wire name alone.
@@ -7323,8 +7331,10 @@ impl Tui {
             _ if self.members.is_working(session) => Some(crate::moment::Activity::Working),
             _ => None,
         };
+        let member_cwd = self.client.member_cwd();
         let mut m = self.host.moment.write().expect("moment poisoned");
         m.viewing = session.to_string();
+        m.member_cwd = member_cwd;
         if let Some(activity) = activity {
             m.activity = activity;
         }
@@ -7937,6 +7947,7 @@ impl Tui {
                 // model: it is the agent's, and the row draws it beside the
                 // model the way tuix does (`glm-5 [high]`).
                 let effort = described.as_ref().and_then(|d| d.reasoning_effort);
+                let member_cwd = self.client.member_cwd();
                 let changed = {
                     let mut moment = self.host.moment.write().expect("moment poisoned");
                     // An agent describing itself is what a `/login` or `/provider`
@@ -7949,7 +7960,8 @@ impl Tui {
                     }
                     let changed = moment.ctx_window != window
                         || moment.model != model
-                        || moment.effort != effort;
+                        || moment.effort != effort
+                        || moment.member_cwd != member_cwd;
                     let cleared_allowance = refresh_allowance && moment.allowance.take().is_some();
                     if refresh_allowance {
                         self.allowance_generation.fetch_add(1, Ordering::SeqCst);
@@ -7957,6 +7969,7 @@ impl Tui {
                     moment.ctx_window = window;
                     moment.model = model;
                     moment.effort = effort;
+                    moment.member_cwd = member_cwd;
                     changed || cleared_allowance
                 };
                 if refresh_allowance {
@@ -8269,6 +8282,13 @@ impl Tui {
                 );
                 // Followed from the start, for what the panel says of it.
                 self.client.watch_member(&description.session);
+                self.client.describe(&description);
+                let member_cwd = self.client.member_cwd();
+                self.host
+                    .moment
+                    .write()
+                    .expect("moment poisoned")
+                    .member_cwd = member_cwd;
                 true
             }
             AgentEvent::AgentRemoved { session } => {
@@ -20137,6 +20157,52 @@ mod display_history_tests {
         );
         assert_eq!(views.sessions["lead"].history_request, None);
     }
+    #[test]
+    fn the_status_directory_follows_the_member_on_screen() {
+        let (host, tui) = assemble(crate::surface::Headless::new(100, 24));
+        tui.client.follow("lead");
+        host.set_session_dir("/main");
+        for (session, working_dir) in [
+            ("lead/dev", Some("/worktrees/dev")),
+            ("lead/reviewer", None),
+        ] {
+            tui.on_event(AgentEvent::AgentAdded {
+                description: Box::new(AgentDescription {
+                    session: session.into(),
+                    parent: Some("lead".into()),
+                    working_dir: working_dir.map(str::to_owned),
+                    ..Default::default()
+                }),
+            });
+        }
+        assert!(tui.look_at("lead/dev"));
+        assert_eq!(
+            host.moment.read().unwrap().member_cwd.as_deref(),
+            Some("/worktrees/dev")
+        );
+        assert!(tui.look_at("lead/reviewer"));
+        assert!(host.moment.read().unwrap().member_cwd.is_none());
+
+        // A late description from the first member cannot change the second.
+        tui.on_event(AgentEvent::Described {
+            description: Box::new(AgentDescription {
+                session: "lead/dev".into(),
+                working_dir: Some("/worktrees/dev-moved".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(host.moment.read().unwrap().member_cwd.is_none());
+        assert!(tui.look_at("lead/dev"));
+        assert_eq!(
+            host.moment.read().unwrap().member_cwd.as_deref(),
+            Some("/worktrees/dev-moved")
+        );
+        assert!(tui.look_at("lead"));
+        let moment = host.moment.read().unwrap();
+        assert!(moment.member_cwd.is_none());
+        assert_eq!(moment.cwd, "/main");
+    }
+
     #[test]
     fn a_leads_old_page_does_not_prepend_into_a_member_now_on_screen() {
         let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
