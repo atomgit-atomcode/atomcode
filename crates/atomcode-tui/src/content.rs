@@ -2791,6 +2791,28 @@ pub struct InjectedBlock {
     pub result: bool,
 }
 
+/// Recognize the host's review assignment envelope, including stored reviews.
+/// The model still receives the original text from the session log.
+pub fn review_assignment_title(text: &str) -> Option<&str> {
+    let marker = "=== ASSIGNED READ-ONLY REVIEW ===\n";
+    let assignment = if text.starts_with("=== ORIGINATING REQUEST (CONTEXT ONLY) === ") {
+        text.split_once("\n\n=== ASSIGNED READ-ONLY REVIEW ===\n")?
+            .1
+    } else {
+        text.strip_prefix(marker)?
+    };
+    let (title, rest) = assignment.split_once('\n')?;
+    if !title.starts_with("代码审查 · ")
+        || !rest.starts_with("Review the requested changes: call the `code_review` tool with ")
+        || !rest.ends_with(
+            "The originating conversation owns all follow-up work, including work requested above.",
+        )
+    {
+        return None;
+    }
+    Some(title)
+}
+
 impl Content for InjectedBlock {
     fn kind(&self) -> &'static str {
         self.kind
@@ -2822,10 +2844,16 @@ impl Content for InjectedBlock {
             line.push(Span::styled(width::take_width(&hint, room), tail_ink()));
             return line;
         }
-        Line::styled(
+        let mut line = Line::styled(
             width::take_width(&format!("[{}]", self.origin), w as usize),
             muted(),
-        )
+        );
+        if self.kind == "review_assignment" {
+            let hint = format!("  {}", pt(PMsg::LidExpandHint));
+            let room = (w as usize).saturating_sub(line.width());
+            line.push(Span::styled(width::take_width(&hint, room), tail_ink()));
+        }
+        line
     }
 }
 

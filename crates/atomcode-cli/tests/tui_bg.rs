@@ -153,7 +153,11 @@ impl LlmProvider for Model {
         // person's "审查下代码改动" makes it.
         if !tools.is_empty()
             && last.is_some_and(|m| {
-                m.role == Role::User && matches!(m.text.as_str(), "review it" | "review it slow")
+                m.role == Role::User
+                    && matches!(
+                        m.text.as_str(),
+                        "review it" | "review it slow" | "review it before foreground"
+                    )
             })
         {
             return Ok(Box::pin(futures::stream::iter(vec![
@@ -164,6 +168,30 @@ impl LlmProvider for Model {
                 }),
                 StreamEvent::Done { truncated: false },
             ])));
+        }
+        if !tools.is_empty()
+            && last.is_some_and(|m| {
+                m.role == Role::User
+                    && m.text.starts_with(
+                        "=== ORIGINATING REQUEST (CONTEXT ONLY) === review it before foreground\n",
+                    )
+            })
+        {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let mut gate = self.gate.clone();
+            let _ = gate.wait_for(|open| *open).await;
+            return Ok(Box::pin(futures::stream::iter(
+                ["assigned-review", "repeat-review"]
+                    .map(|id| {
+                        StreamEvent::ToolCall(ToolCall {
+                            id: id.into(),
+                            name: "code_review".into(),
+                            arguments: "{}".into(),
+                        })
+                    })
+                    .into_iter()
+                    .chain([StreamEvent::Done { truncated: false }]),
+            )));
         }
         let text = if slow {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -2192,6 +2220,51 @@ async fn an_unopened_running_review_is_hidden_but_its_disk_record_remains_recove
         &review
     ));
     until_listed(&rig, &review, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn opening_a_review_keeps_its_assignment_folded_and_runs_it_once() {
+    use atomcode_kernel::session::SessionEvent;
+
+    let rig = Rig::new().await;
+    changed_repo(rig.project.path());
+    let parent = rig.client.root();
+    rig.term.type_line("review it before foreground");
+    rig.until("assignment reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) != 0
+    })
+    .await;
+    let assignment = rig.background().await[0].session.clone();
+    rig.term.type_line("/bg 1");
+    rig.until("review in foreground", |rig| {
+        rig.client.root() == assignment
+    })
+    .await;
+    rig.until_screen("代码审查 · 工作区改动").await;
+    assert!(!rig.term.text().contains("ASSIGNED READ-ONLY REVIEW"));
+
+    rig.release();
+    rig.until_screen("no issues found").await;
+    rig.until("review turn finished", |rig| {
+        rig.client
+            .events()
+            .iter()
+            .any(|entry| matches!(entry.event, SessionEvent::TurnEnd { .. }))
+    })
+    .await;
+    let events = rig.client.events();
+    assert!(events.iter().any(|entry| matches!(
+        &entry.event,
+        SessionEvent::ToolResultLogged { call_id, is_error: true, content, .. }
+            if call_id == "repeat-review" && content.contains("runs code_review once")
+    )));
+    assert!(rig
+        .background()
+        .await
+        .iter()
+        .all(|slot| slot.session == parent));
+    rig.quit().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
