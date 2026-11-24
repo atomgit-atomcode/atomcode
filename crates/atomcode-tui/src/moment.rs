@@ -820,10 +820,12 @@ pub struct Moment {
     ///
     /// Polled rather than pushed, and that is forced: an allowance moves on the
     /// account's clock, not on anything this session does, so there is nothing
-    /// to subscribe to. The check fires after a turn ends, held to no more
-    /// often than [`crate::plugin::ALLOWANCE_EVERY`] — a question asked on the
-    /// account costs a round trip, and the answer only matters at the rate a
-    /// person can spend it.
+    /// to subscribe to. The check fires after a turn ends, and on the idle
+    /// beat while a badge is actually on the row, held to no more often than
+    /// [`crate::plugin::ALLOWANCE_EVERY`] — a question asked on the account
+    /// costs a round trip. The only exceptions to that throttle: the chat
+    /// clearing the quota, and the immediate recheck the row's 100% badge
+    /// allows.
     ///
     /// Kept whatever the figure is, so the decision about *when it is worth
     /// saying* stays in the drawing, where it can be judged without a network

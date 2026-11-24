@@ -1923,9 +1923,10 @@ pub struct Tui {
     allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
     /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,
-    /// The newest ask that came back empty or failed: a reply from the ask
+    /// The newest ask that failed to produce an answer: a reply from the ask
     /// just before it is still the freshest data the page has seen, so it is
-    /// allowed to land instead of being retired with the rest.
+    /// allowed to land instead of being retired with the rest. (An empty
+    /// window is a successful answer — it clears the badge — not a failure.)
     failed_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
@@ -3116,6 +3117,7 @@ impl UserInterface for Tui {
                         }
                         m.tick = m.tick.wrapping_add(1);
                     }
+                    self.idle_beat();
                     stale = true;
                 }
                 // A drag held still at the conversation's edge: one more row.
@@ -6939,6 +6941,22 @@ impl Tui {
         });
     }
 
+    /// The idle beat: the account may have refreshed mid-window while nobody
+    /// was looking. Re-ask — still throttled by [`ALLOWANCE_EVERY`] — only
+    /// while the badge is actually on the row, the SAME visibility the draw
+    /// uses: a figure nobody sees costs a round trip for nothing.
+    fn idle_beat(&self) {
+        let badge_on_row = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            m.allowance
+                .as_ref()
+                .is_some_and(|left| crate::modules::status::allowance_badge(left, m.now).is_some())
+        };
+        if badge_on_row {
+            self.check_allowance(false);
+        }
+    }
+
     fn check_allowance(&self, model_completed: bool) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return;
@@ -6994,10 +7012,14 @@ impl Tui {
                 }) => windows,
                 // A host that will not say leaves the row as it was. Blanking
                 // it on a failed question would read as "you are back to zero"
-                // — but the failure is remembered: a reply the ask before this
-                // one is still the freshest figure in hand and may land.
+                // — but the failure is remembered while it is still the
+                // newest ask: a reply from the ask just before it is then the
+                // freshest figure in hand and may land. A superseded ask's
+                // late failure must not clobber the newer ask's record.
                 _ => {
-                    failed_generation.store(generation, Ordering::SeqCst);
+                    if generation == allowance_generation.load(Ordering::SeqCst) {
+                        failed_generation.store(generation, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
@@ -19918,6 +19940,52 @@ mod allowance_switch_tests {
             "the old 100% reply cannot restore the badge"
         );
         assert!(!tui.allowance_nudged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_idle_beat_reasks_a_visible_badge_and_stays_throttled() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        // The badge is on the row: the idle beat re-asks.
+        tui.idle_beat();
+        let answer = pending.recv().await.unwrap();
+        answer.send(reply(windows.clone())).unwrap();
+        tokio::task::yield_now().await;
+        // The throttle holds: a second idle beat right after does not ask.
+        tui.idle_beat();
+        assert!(
+            pending.try_recv().is_err(),
+            "the idle re-ask must be held to ALLOWANCE_EVERY"
+        );
+        // An empty moment (no badge) does not ask either.
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = None;
+        }
+        tui.idle_beat();
+        assert!(
+            pending.try_recv().is_err(),
+            "a row without a badge must not be asked about"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

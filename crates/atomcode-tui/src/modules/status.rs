@@ -657,7 +657,7 @@ const ALLOWANCE_SPENT: u8 = 95;
 /// was left when the host answered. Past it the window has turned over and the
 /// figure is about a window that no longer exists, so the row says nothing
 /// rather than "90%" of an allowance that is back to full.
-fn allowance_badge(
+pub(crate) fn allowance_badge(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
 ) -> Option<String> {
