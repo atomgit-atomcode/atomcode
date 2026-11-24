@@ -163,6 +163,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
   private _focusedPanelId?: string;
+  private _chatInputHadFocusOnBlur = false;
+  private _chatInputBlurAt = 0;
+  private _windowBlurredAt = 0;
+  private _chatInputFocusWebview?: vscode.Webview;
+  private _windowStateWatcher?: vscode.Disposable;
+  private _focusRestoreTimer?: ReturnType<typeof setTimeout>;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _pendingMessages = new Map<string, PendingPanelMessage[]>();
   private _loginId?: string;
@@ -200,6 +206,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ) {
         this._broadcastChromeFont();
       }
+    });
+    // Windows Alt+Tab: when the VS Code window regains focus, the webview does
+    // not get focus back (the lone Alt even activates the menu bar). If the
+    // chat input held focus before the window lost it, hand focus back.
+    this._windowStateWatcher = vscode.window.onDidChangeWindowState((state) => {
+      if (!state.focused) {
+        this._windowBlurredAt = Date.now();
+        return;
+      }
+      if (process.platform !== 'win32') return;
+      if (!this._chatInputHadFocusOnBlur) return;
+      // Only restore when the webview's blur report coincides with the OS
+      // window losing focus. A report long before it means focus moved
+      // elsewhere inside the app, and restoring would steal focus back.
+      const fresh = Math.abs(this._chatInputBlurAt - this._windowBlurredAt) <= 2000;
+      this._chatInputHadFocusOnBlur = false;
+      if (!fresh) return;
+      const target = this._chatInputFocusWebview;
+      // Let the workbench finish window activation (and dismiss any Alt-activated menu) first.
+      this._focusRestoreTimer = setTimeout(() => {
+        if (target) target.postMessage({ type: 'focusInput' });
+        else this.focusInput();
+      }, 100);
     });
   }
 
@@ -258,6 +287,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._atomCodeConfigWatcher?.dispose();
     this._atomCodeAuthWatcher?.dispose();
     if (this._setupRefreshTimer) clearTimeout(this._setupRefreshTimer);
+    this._windowStateWatcher?.dispose();
+    if (this._focusRestoreTimer) clearTimeout(this._focusRestoreTimer);
   }
 
   private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
@@ -353,6 +384,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._webviewPanels.delete(webview);
     this._sessionBindingPromises.delete(webview);
     this._panelHistoryLoads.delete(panel);
+    if (this._chatInputFocusWebview === webview) {
+      this._chatInputFocusWebview = undefined;
+    }
     if (!disposedSid) return;
 
     const rt = this._sessionRuntimes.get(disposedSid);
@@ -784,6 +818,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           );
           break;
         }
+        case 'chatInputFocusState':
+          this._chatInputHadFocusOnBlur = Boolean(msg.focused);
+          this._chatInputBlurAt = Date.now();
+          this._chatInputFocusWebview = webview;
+          break;
         case 'getSkills':
           try {
             const skills = await this._client.listSkills();

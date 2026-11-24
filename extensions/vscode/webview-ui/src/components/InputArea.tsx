@@ -118,7 +118,21 @@ export function InputArea() {
       }
     }
     window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
+    // Report whether this textarea held focus when the webview loses or gains
+    // document focus, so the extension host can restore focus when the VS Code
+    // window regains it (Alt+Tab back on Windows leaves the webview unfocused).
+    // Reporting on focus too keeps a stale "input had focus" state from
+    // surviving in-app focus moves.
+    const reportFocusState = () => {
+      postMessage({ type: 'chatInputFocusState', focused: document.activeElement === textareaRef.current });
+    };
+    window.addEventListener('blur', reportFocusState);
+    window.addEventListener('focus', reportFocusState);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      window.removeEventListener('blur', reportFocusState);
+      window.removeEventListener('focus', reportFocusState);
+    };
   }, []);
 
   useEffect(() => {
@@ -150,6 +164,34 @@ export function InputArea() {
       window.removeEventListener('resize', updateInputInset);
       document.removeEventListener('atomcode-font-size', updateFontSize);
       sessionBody.style.removeProperty('--input-inset');
+    };
+  }, []);
+
+  // Windows: switching back with Alt+Tab lands a lone Alt keydown/keyup in the
+  // webview, which activates the workbench menu bar and steals focus. Swallow
+  // the lone Alt key (AltGr reports Ctrl+Alt, so it is excluded). Windows-only:
+  // on macOS a bare Option keydown participates in accent input.
+  useEffect(() => {
+    const isWindows = navigator.userAgent.includes('Windows');
+    if (!isWindows) return;
+    const swallowAlt = (e: KeyboardEvent) => {
+      if (e.key !== 'Alt' || e.ctrlKey || e.shiftKey || e.metaKey) return;
+      e.preventDefault();
+      if (e.type === 'keyup') {
+        // Only hand focus back when nothing meaningful holds it (focus fell to
+        // the document level) or the textarea itself — don't steal it from the
+        // file picker or other inputs inside the webview.
+        const active = document.activeElement;
+        if (active === document.body || active === textareaRef.current) {
+          textareaRef.current?.focus();
+        }
+      }
+    };
+    window.addEventListener('keydown', swallowAlt);
+    window.addEventListener('keyup', swallowAlt);
+    return () => {
+      window.removeEventListener('keydown', swallowAlt);
+      window.removeEventListener('keyup', swallowAlt);
     };
   }, []);
 
