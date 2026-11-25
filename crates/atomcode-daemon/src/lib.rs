@@ -2024,29 +2024,41 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// cross-site sends) carry the protection.
 async fn serve_webui_index(
     State(state): State<AppState>,
-    uri: axum::http::Uri,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
+    let uri = req.uri().clone();
     if state.enforce_token {
+        let source = auth_token::request_source(&req);
+        let now = std::time::Instant::now();
         if let Some(query) = uri.query() {
             if let Some(token) = first_query_value(query, "token") {
-                if !token.is_empty() && state.webui_tokens.is_valid(&token) {
-                    let rest = strip_query_key(query, "token");
-                    let location = if rest.is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("/?{rest}")
-                    };
-                    let cookie = format!(
-                        "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        state.webui_cookie_name, token
-                    );
-                    return axum::response::Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header(header::LOCATION, location)
-                        .header(header::SET_COOKIE, cookie)
-                        .body(axum::body::Body::empty())
-                        .map(IntoResponse::into_response)
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                if !token.is_empty() {
+                    if state.webui_tokens.is_valid(&token) {
+                        state.webui_tokens.note_auth_success(&source);
+                        let rest = strip_query_key(query, "token");
+                        let location = if rest.is_empty() {
+                            "/".to_string()
+                        } else {
+                            format!("/?{rest}")
+                        };
+                        let cookie = format!(
+                            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+                            state.webui_cookie_name, token
+                        );
+                        return axum::response::Response::builder()
+                            .status(StatusCode::FOUND)
+                            .header(header::LOCATION, location)
+                            .header(header::SET_COOKIE, cookie)
+                            .body(axum::body::Body::empty())
+                            .map(IntoResponse::into_response)
+                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
+                        return auth_token::too_many_requests(wait);
+                    }
+                    if let Some(wait) = state.webui_tokens.note_auth_failure(&source, now) {
+                        return auth_token::too_many_requests(wait);
+                    }
                 }
             }
         }
@@ -6642,17 +6654,20 @@ async fn serve_http(
             },
         ));
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal(shutdown).await;
-            // The host, HTTP /shutdown, and OS signals converge on the same fact.
-            // Streaming bodies must see it too, otherwise graceful shutdown can
-            // wait forever for an old EventSource connection.
-            if let Some(owner) = owner {
-                owner.send_replace(true);
-            }
-        })
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal(shutdown).await;
+        // The host, HTTP /shutdown, and OS signals converge on the same fact.
+        // Streaming bodies must see it too, otherwise graceful shutdown can
+        // wait forever for an old EventSource connection.
+        if let Some(owner) = owner {
+            owner.send_replace(true);
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -10022,6 +10037,126 @@ mod tests {
             webui_cookie_name: auth_token::webui_cookie_name(13456),
             cue_providers: api_cue::CueProviders::default(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn webui_index_handoff_shares_the_auth_failure_budget() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/", get(serve_webui_index))
+            .with_state(state);
+
+        let send = |token: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("/?token={token}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                (response.status(), retry_after)
+            }
+        };
+
+        // The valid handoff sets the cookie and clears the failure budget.
+        assert_eq!(send("good-token").await.0, StatusCode::FOUND);
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_ne!(send("wrong-token").await.0, StatusCode::TOO_MANY_REQUESTS);
+        }
+        let (status, retry_after) = send("wrong-token").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "Retry-After must be seconds in 1..=30, got {retry_after:?}"
+        );
+        let (status, retry_after) = send("wrong-token").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "blocked handoffs must carry Retry-After, got {retry_after:?}"
+        );
+        assert_eq!(
+            send("good-token").await.0,
+            StatusCode::FOUND,
+            "the recovery handoff must still work during a block"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn require_webui_token_returns_429_after_repeated_failures() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/ping", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+
+        let send = |token: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder().method("GET").uri("/ping");
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("Bearer {token}"));
+                }
+                let response = app
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                (response.status(), retry_after)
+            }
+        };
+
+        // Missing credentials are not guesses and must not consume the budget.
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT + 2 {
+            assert_eq!(send(None).await.0, StatusCode::UNAUTHORIZED);
+        }
+
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_eq!(send(Some("wrong-token")).await.0, StatusCode::UNAUTHORIZED);
+        }
+        let (status, retry_after) = send(Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "Retry-After must be seconds in 1..=30, got {retry_after:?}"
+        );
+        let (status, retry_after) = send(Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "blocked retries must carry Retry-After, got {retry_after:?}"
+        );
+        assert_eq!(
+            send(Some("good-token")).await.0,
+            StatusCode::OK,
+            "a valid token must still work during a block; the block only stops guesses"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
