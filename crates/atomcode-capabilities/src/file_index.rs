@@ -224,8 +224,9 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
     // Keep the best FILTER_RESULT_LIMIT rows in a max-heap keyed by the popup
     // order. The root is the worst kept row, so a later match only replaces it
     // when it ranks better. This avoids cloning every match and sorting the
-    // whole set on each keystroke.
-    let mut best: BinaryHeap<RankedEntry> = BinaryHeap::with_capacity(FILTER_RESULT_LIMIT);
+    // whole set on each keystroke. The heap allocates on the first match, so an
+    // empty index or a filter with no matches allocates nothing.
+    let mut best: BinaryHeap<RankedEntry> = BinaryHeap::new();
     for (index, entry) in entries.iter().enumerate() {
         if !entry.rel_path.starts_with(scope_dir) || entry.rel_path == scope_dir {
             continue;
@@ -244,6 +245,11 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
             }
         }
         if best.len() < FILTER_RESULT_LIMIT {
+            if best.capacity() == 0 {
+                // First match: size the buffer once. Zero-match calls keep
+                // `BinaryHeap::new`'s empty allocation.
+                best.reserve_exact(FILTER_RESULT_LIMIT);
+            }
             best.push(RankedEntry {
                 entry: entry.clone(),
                 index,
