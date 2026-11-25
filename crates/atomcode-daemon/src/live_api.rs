@@ -436,6 +436,69 @@ async fn await_chat_user_input_response(
     }
 }
 
+/// Startup advisories each `/chat` session has already been shown.
+///
+/// Every `/chat` request builds its own temporary `CodingRuntime`, and each
+/// runtime re-derives the same startup advisories (instruction-file states such
+/// as a `claude.md` shadowed by `AGENTS.md`, skill notices, resume notes) and
+/// re-emits them as leading `ControllerWarning` events. Left alone the WebUI
+/// repeats them on every input. The daemon is the session-level owner here, so
+/// it keeps a per-session set of already-shown texts: identical advisories are
+/// dropped, and a genuinely changed one (the file on disk changed) has a
+/// different text and still goes through.
+pub(crate) struct StartupAdvisories {
+    inner: std::sync::Mutex<AdvisoryIndex>,
+}
+
+struct AdvisoryIndex {
+    order: std::collections::VecDeque<String>,
+    seen: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+/// Bound the registry: one entry per chat session, warnings are few per
+/// session, and a long-lived daemon should not accumulate every session id.
+const STARTUP_ADVISORY_SESSIONS: usize = 512;
+
+impl Default for StartupAdvisories {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(AdvisoryIndex {
+                order: Default::default(),
+                seen: Default::default(),
+            }),
+        }
+    }
+}
+
+impl StartupAdvisories {
+    /// Record `message` as shown for `session`; returns `true` when the session
+    /// already saw the exact same advisory text (a duplicate to drop).
+    fn already_shown(&self, session: &str, message: &str) -> bool {
+        let Ok(mut index) = self.inner.lock() else {
+            // A poisoned lock never hides an advisory — show it.
+            return false;
+        };
+        if !index.seen.contains_key(session) {
+            index.seen.insert(session.to_string(), Default::default());
+            index.order.push_back(session.to_string());
+            while index.order.len() > STARTUP_ADVISORY_SESSIONS {
+                if let Some(evicted) = index.order.pop_front() {
+                    index.seen.remove(&evicted);
+                }
+            }
+        }
+        match index.seen.get_mut(session) {
+            Some(shown) => !shown.insert(message.to_string()),
+            None => false,
+        }
+    }
+}
+
+fn chat_startup_advisories() -> &'static StartupAdvisories {
+    static LEDGER: std::sync::OnceLock<StartupAdvisories> = std::sync::OnceLock::new();
+    LEDGER.get_or_init(StartupAdvisories::default)
+}
+
 /// Drive a native runtime over `conv` and forward its native events to the shared
 /// `/chat` consumer. `perm_rx` carries interactive approval decisions from `/chat/permission`
 /// (`None` = apply [`fallback_approval_decision`] for the selected mode). The kernel
@@ -530,6 +593,12 @@ pub(crate) async fn run_chat_turn_v2(
     }
 
     let mut cancelled = false;
+    // The runtime's event task sends every startup warning before any other
+    // event (its first act, no awaits between sends), so leading
+    // `ControllerWarning`s in this stream are exactly the startup advisories.
+    // Once anything else arrives the turn is underway and later
+    // `ControllerWarning`s are turn-time facts that always forward.
+    let mut startup_advisories_open = true;
     let final_messages = loop {
         let ev = tokio::select! {
             _ = cancel.cancelled(), if !cancelled => {
@@ -546,9 +615,23 @@ pub(crate) async fn run_chat_turn_v2(
             );
             break None;
         };
+        if !matches!(ev, CodingRuntimeEvent::ControllerWarning(_)) {
+            startup_advisories_open = false;
+        }
         match ev {
             event @ CodingRuntimeEvent::Agent(_) => {
                 let _ = runtime_event_tx.send(event);
+            }
+            CodingRuntimeEvent::ControllerWarning(message) => {
+                // Only the per-turn startup advisories dedupe: the session
+                // already showed this exact text on an earlier input. A
+                // changed advisory text still shows.
+                if startup_advisories_open
+                    && chat_startup_advisories().already_shown(&session_id, &message)
+                {
+                    continue;
+                }
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(message));
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
                 let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload.clone())
