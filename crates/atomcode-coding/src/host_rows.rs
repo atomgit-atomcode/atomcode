@@ -571,6 +571,10 @@ impl Waterfall<AgentRequest> for Bridge {
         } else {
             Vec::new()
         };
+        // Both are whole conversations, and the rest of this function waits on
+        // the provider's whole stream: held, every mounted hook would keep two
+        // more copies alive for it. `logged` stays — the bridges share it.
+        drop((proposed, handed));
         let at = req.messages.len();
         req.messages.extend(tail.iter().cloned());
         let mut timing =

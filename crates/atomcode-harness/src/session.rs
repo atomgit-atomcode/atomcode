@@ -379,14 +379,14 @@ impl SessionLog {
 
     /// Events after `cursor`, for an incremental consumer (persistence, a UI
     /// that already rendered a prefix).
+    ///
+    /// Facts are kept in sequence order, so the tail is found by bisection:
+    /// every commit advances the projections through here, and a scan of the
+    /// whole log per fact grows with the session.
     pub fn since(&self, cursor: SeqNo) -> Vec<LoggedEvent> {
-        self.events
-            .read()
-            .expect("session log poisoned")
-            .iter()
-            .filter(|e| e.seq > cursor)
-            .cloned()
-            .collect()
+        let events = self.events.read().expect("session log poisoned");
+        let start = events.partition_point(|e| e.seq <= cursor);
+        events[start..].to_vec()
     }
 
     pub fn len(&self) -> usize {
