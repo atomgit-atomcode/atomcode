@@ -359,7 +359,15 @@ fn contains_case_insensitive(haystack: &str, needle_lower: &str, scratch: &mut S
             return haystack.contains(needle_lower);
         }
         scratch.clear();
-        scratch.extend(haystack.chars().flat_map(char::to_lowercase));
+        if haystack.contains('Σ') {
+            // `str::to_lowercase` applies the Unicode Final_Sigma rule
+            // (Σ → ς at a word end); `char::to_lowercase` always yields σ.
+            // Delegate the contextual fold to std. Only paths with an
+            // uppercase sigma pay this extra temporary allocation.
+            scratch.push_str(&haystack.to_lowercase());
+        } else {
+            scratch.extend(haystack.chars().flat_map(char::to_lowercase));
+        }
         return scratch.contains(needle_lower);
     }
     let haystack = haystack.as_bytes();
@@ -1363,7 +1371,13 @@ mod tests {
             // 'İ' lowercases to 'i' plus a combining dot.
             ("İstanbul.md", "i\u{307}stanbul"),
             ("ẞ.md", "ß"),
+            // Σ before `.` then a cased letter is not word-final: σ.
             ("ΣΟΦΟΣ.md", "σοφοσ"),
+            // Σ at a word end folds to ς, like `str::to_lowercase`.
+            ("docs/ΣΟΦΟΣ", "σοφος"),
+            ("AΣ", "ας"),
+            // `_` is case-ignorable, so the following Α makes Σ word-final.
+            ("ΑΣ_Α", "ας_α"),
             ("目录/文件.rs", "文件"),
             ("already/ärger.md", "ärger"),
             ("docs/Ärger.md", "rger"),
@@ -1385,6 +1399,30 @@ mod tests {
         assert!(is_lowercase_invariant("already/ärger.md"));
         assert!(!is_lowercase_invariant("docs/Ärger.md"));
         assert!(!is_lowercase_invariant("İstanbul.md"));
+    }
+
+    #[test]
+    fn filter_matches_final_sigma_like_str_lowercase() {
+        let entries = vec![
+            Entry {
+                rel_path: "docs/ΣΟΦΟΣ/".into(),
+                is_dir: true,
+                depth: 2,
+            },
+            Entry {
+                rel_path: "AΣ".into(),
+                is_dir: false,
+                depth: 1,
+            },
+        ];
+
+        // The uppercase filter folds to a trailing ς. The matched path must
+        // fold the same way, or this becomes a false negative.
+        for (filter, expected) in [("ΣΟΦΟΣ", "docs/ΣΟΦΟΣ/"), ("AΣ", "AΣ")] {
+            let result = filter_entries(&entries, "", filter);
+            assert_eq!(result.len(), 1, "filter={filter:?}");
+            assert_eq!(result[0].rel_path, expected);
+        }
     }
 
     // ---- FileIndex.walk (real tempdir) ----
