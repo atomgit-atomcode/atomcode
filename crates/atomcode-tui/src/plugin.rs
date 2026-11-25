@@ -1923,10 +1923,12 @@ pub struct Tui {
     allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
     /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,
-    /// The newest ask that failed to produce an answer: a reply from the ask
-    /// just before it is still the freshest data the page has seen, so it is
-    /// allowed to land instead of being retired with the rest. (An empty
-    /// window is a successful answer — it clears the badge — not a failure.)
+    /// The oldest ask in the current run of failed asks: every ask after the
+    /// last one that answered has failed, so a reply from before the run is
+    /// still the freshest data the page has seen and is allowed to land
+    /// instead of being retired with the rest. A landing reply or a model
+    /// switch ends the run. (An empty window is a successful answer — it
+    /// clears the badge — not a failure.)
     failed_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
@@ -7013,12 +7015,16 @@ impl Tui {
                 // A host that will not say leaves the row as it was. Blanking
                 // it on a failed question would read as "you are back to zero"
                 // — but the failure is remembered while it is still the
-                // newest ask: a reply from the ask just before it is then the
-                // freshest figure in hand and may land. A superseded ask's
-                // late failure must not clobber the newer ask's record.
+                // newest ask: the run of failed asks grows at its oldest end,
+                // so the reply from just before the run is the freshest
+                // figure in hand and may land. A superseded ask's late
+                // failure must not clobber the run's record.
                 _ => {
                     if generation == allowance_generation.load(Ordering::SeqCst) {
-                        failed_generation.store(generation, Ordering::SeqCst);
+                        let previous = failed_generation.load(Ordering::SeqCst);
+                        if previous == 0 || previous > generation {
+                            failed_generation.store(generation, Ordering::SeqCst);
+                        }
                     }
                     return;
                 }
@@ -7034,12 +7040,13 @@ impl Tui {
             let (changed, warning) = {
                 let mut m = host.moment.write().expect("moment poisoned");
                 let current = allowance_generation.load(Ordering::SeqCst);
-                let retired = generation != current
-                    && !(generation + 1 == current
-                        && failed_generation.load(Ordering::SeqCst) == current);
+                let failed = failed_generation.load(Ordering::SeqCst);
+                let retired = generation != current && !(failed != 0 && generation < failed);
                 if retired {
                     return;
                 }
+                // Fresh data in hand: the run of failed asks it outlived is over.
+                failed_generation.store(0, Ordering::SeqCst);
                 let warning = crate::moment::Allowance::exhausted(&windows)
                     .filter(|_| !nudged.swap(true, Ordering::SeqCst))
                     .map(|spent| {
@@ -8055,6 +8062,7 @@ impl Tui {
                     let cleared_allowance = refresh_allowance && moment.allowance.take().is_some();
                     if refresh_allowance {
                         self.allowance_generation.fetch_add(1, Ordering::SeqCst);
+                        self.failed_generation.store(0, Ordering::SeqCst);
                     }
                     moment.ctx_window = window;
                     moment.model = model;
@@ -19976,7 +19984,16 @@ mod allowance_switch_tests {
             pending.try_recv().is_err(),
             "the idle re-ask must be held to ALLOWANCE_EVERY"
         );
-        // An empty moment (no badge) does not ask either.
+        // The throttle expires: the same visible badge asks again — proof
+        // the clock has left the throttle window.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.idle_beat();
+        let later = pending.recv().await.unwrap();
+        later.send(reply(windows.clone())).unwrap();
+        tokio::task::yield_now().await;
+        // An empty moment (no badge) does not ask even with the throttle
+        // expired, so the gate really is the badge and not the throttle.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
         {
             let mut m = host.moment.write().unwrap();
             m.allowance = None;
@@ -19985,6 +20002,60 @@ mod allowance_switch_tests {
         assert!(
             pending.try_recv().is_err(),
             "a row without a badge must not be asked about"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reply_from_before_a_run_of_failed_asks_still_lands() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(100),
+            calls_used: None,
+            call_limit: None,
+        }];
+        let refused = || HostReply::Usage {
+            windows: vec![],
+            unavailable: Some("host refused".into()),
+            plan: None,
+            stats: None,
+            stats_unavailable: None,
+        };
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        // The first ask is in flight.
+        tui.check_allowance(false);
+        let first = pending.recv().await.unwrap();
+        // A full badge allows one immediate recheck: it fails.
+        tui.check_allowance(true);
+        pending.recv().await.unwrap().send(refused()).unwrap();
+        tokio::task::yield_now().await;
+        // ... and so does the next one, fired after the throttle window.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.check_allowance(false);
+        pending.recv().await.unwrap().send(refused()).unwrap();
+        tokio::task::yield_now().await;
+        // The reply from the first ask is the freshest figure in hand: it
+        // lands instead of being retired with the failed run that followed.
+        first.send(reply(windows.clone())).unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let m = host.moment.read().unwrap();
+        assert!(
+            m.allowance.as_ref().is_some_and(|left| left.percent == 100),
+            "the freshest reply must outlive the failed asks after it"
         );
     }
 
