@@ -47,12 +47,15 @@ pub struct PathConfineMiddleware {
     /// Repo-relative paths (normalized, no `./` prefix). Empty `None` ⇒ root-only
     /// confinement (legacy). `Some(set)` ⇒ also require path ∈ set or ancestor of set.
     allow: Option<HashSet<PathBuf>>,
-    /// Extra read-only roots OUTSIDE the repo that the review tools may read, e.g.
-    /// the `--skill-dir` packages. A skill's `SKILL.md` is only an index; its
-    /// `references/` rules live in the skill package, which by construction sits
-    /// outside the reviewed repo. Without this, `use_skill` returns the index and
-    /// every `read_file` of the referenced rules is denied — the skill looks used
-    /// but its rules never reach the model. Canonicalized at construction.
+    /// Extra read-only roots the review tools may read, e.g. the `--skill-dir`
+    /// packages. A skill's `SKILL.md` is only an index; its `references/` rules
+    /// live in the skill package, which may sit outside the reviewed repo. Without
+    /// this, `use_skill` returns the index and every `read_file` of the referenced
+    /// rules is denied — the skill looks used but its rules never reach the model.
+    ///
+    /// Checked BEFORE the repo/allowlist logic: a skill package may also live
+    /// INSIDE the repo (`.claude/skills`, `./skills`) and would otherwise be
+    /// blocked by the review-scope allowlist. Canonicalized at construction.
     read_roots: Vec<PathBuf>,
 }
 
@@ -74,14 +77,16 @@ impl PathConfineMiddleware {
         }
     }
 
-    /// Allow reading files under these roots even though they sit outside the repo.
-    /// Used for `--skill-dir`: a skill package's `references/` must be readable or
-    /// `use_skill` only delivers the `SKILL.md` index and the detailed rules never
-    /// load. Roots are canonicalized; nonexistent ones are skipped (atomcodex already
-    /// canonicalizes `--skill-dir`, this is defense in depth).
+    /// Allow reading files under these roots regardless of whether they sit inside
+    /// or outside the repo. Used for `--skill-dir`: a skill package's `references/`
+    /// must be readable or `use_skill` only delivers the `SKILL.md` index and the
+    /// detailed rules never load.
     ///
-    /// The allowlist (`with_allowlist`) still applies only inside the repo: these
-    /// roots are read-only resources, not review targets.
+    /// Only directories that actually look like skill packages are accepted (own
+    /// `SKILL.md`, or a direct child directory with `SKILL.md`). A misconfigured
+    /// `--skill-dir ~` / `/tmp` must not turn a whole subtree into a readable root.
+    /// The review allowlist still governs every other repo path: these roots are
+    /// read-only resources, not review targets.
     pub fn with_read_roots(mut self, roots: &[PathBuf]) -> Self {
         let mut list: Vec<PathBuf> = Vec::with_capacity(roots.len());
         for r in roots {
@@ -89,12 +94,24 @@ impl PathConfineMiddleware {
                 continue;
             };
             let n = normalize_lexical(&c);
+            if !is_skill_root(&n) {
+                eprintln!(
+                    "[confine] ignoring read root without SKILL.md: {}",
+                    n.display()
+                );
+                continue;
+            }
             if !list.contains(&n) {
                 list.push(n);
             }
         }
         self.read_roots = list;
         self
+    }
+
+    /// 构造后的只读根（测试断言接线用）。
+    pub(crate) fn read_roots(&self) -> &[PathBuf] {
+        &self.read_roots
     }
 
     /// Restrict tools to the given repo-relative reviewable paths (changed files
@@ -204,8 +221,16 @@ fn check_one(
         root.join(p)
     };
     let normalized = normalize_lexical(&joined);
+    // Skill roots win regardless of where the package sits: outside the repo
+    // (server-side cache) or inside it (`.claude/skills`, `./skills`). The review
+    // allowlist governs review targets, not skill resources.
+    if !read_roots.is_empty() && path_in_read_root(read_roots, &joined) {
+        return Ok(());
+    }
     if !normalized.starts_with(root) {
-        return check_read_root(read_roots, &joined, raw);
+        return Err(format!(
+            "path '{raw}' is outside the review repository; review tools may only access files within the repo"
+        ));
     }
     if let Some(existing) = existing_prefix(&joined) {
         if let (Ok(canon_root), Ok(canon_existing)) =
@@ -258,31 +283,33 @@ fn path_in_review_scope(rel: &Path, allowed: &HashSet<PathBuf>) -> bool {
     false
 }
 
-/// Paths outside the repo are accepted only when they resolve under an explicitly
-/// declared read-only root (the `--skill-dir` packages). Judgment uses the
-/// canonicalized existing prefix, so a symlink planted inside a skill directory
-/// cannot escape it. The review-scope allowlist does NOT apply here: skill packages
-/// are read-only resources, not review targets.
-fn check_read_root(read_roots: &[PathBuf], joined: &Path, raw: &str) -> Result<(), String> {
-    let denied = || {
-        format!(
-            "path '{raw}' is outside the review repository; review tools may only access files within the repo"
-        )
-    };
-    if read_roots.is_empty() {
-        return Err(denied());
-    }
+/// Whether `joined` resolves under an explicitly declared read-only root (skill
+/// package). Judgment uses the canonicalized existing prefix, so a symlink planted
+/// inside a skill directory cannot escape it.
+fn path_in_read_root(read_roots: &[PathBuf], joined: &Path) -> bool {
     let Some(existing) = existing_prefix(joined) else {
-        return Err(denied());
+        return false;
     };
     let Ok(canon) = std::fs::canonicalize(existing) else {
-        return Err(denied());
+        return false;
     };
-    if read_roots.iter().any(|r| canon.starts_with(r)) {
-        Ok(())
-    } else {
-        Err(denied())
+    read_roots.iter().any(|r| canon.starts_with(r))
+}
+
+/// Directory shape check for `--skill-dir` roots: the directory itself contains
+/// `SKILL.md` (single skill package), or one of its direct children does (parent
+/// directory holding multiple skill packages). Anything else — `~`, `/tmp`, a
+/// repo root without skills — must not be widened into a readable subtree.
+fn is_skill_root(dir: &Path) -> bool {
+    if dir.join("SKILL.md").is_file() {
+        return true;
     }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_type().map(|t| t.is_dir()).unwrap_or(false) && e.path().join("SKILL.md").is_file()
+    })
 }
 
 /// Longest existing prefix of `p`, used to catch symlink escapes without requiring
@@ -550,11 +577,12 @@ mod tests {
         let skill = tmp.path().join("skills").join("demo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
         std::fs::write(skill.join("references/rules-api.md"), "rule").unwrap();
         let root = std::fs::canonicalize(&repo).unwrap();
         let skill_root = std::fs::canonicalize(&skill).unwrap();
         let target = skill_root.join("references/rules-api.md");
-        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+        let args = serde_json::json!({"file_path": target.to_string_lossy()}).to_string();
         let a = allow(&["docs/a.md"]);
 
         assert!(
@@ -568,6 +596,47 @@ mod tests {
             .is_ok(),
             "skill references outside the repo must be readable"
         );
+    }
+
+    /// `--skill-dir` can also point INSIDE the repo (`.claude/skills`, `./skills`).
+    /// Those files are not in the review allowlist, so the read-root exemption must
+    /// be evaluated before the repo/allowlist logic or the same silent degradation
+    /// returns for in-repo skill packages.
+    #[test]
+    fn read_roots_allow_skill_files_inside_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = repo.join(".claude/skills/demo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+        std::fs::write(skill.join("references/rules.md"), "rule").unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+        let skill_root = std::fs::canonicalize(&skill).unwrap();
+        let a = allow(&["docs/a.md"]);
+        let target = skill_root.join("references/rules.md");
+        let args = serde_json::json!({"file_path": target.to_string_lossy()}).to_string();
+
+        assert!(
+            check_arguments(
+                &root,
+                Some(&a),
+                std::slice::from_ref(&skill_root),
+                "read_file",
+                &args,
+            )
+            .is_ok(),
+            "in-repo skill references must be readable"
+        );
+        // Other repo files are still governed by the review allowlist.
+        assert!(check_arguments(
+            &root,
+            Some(&a),
+            std::slice::from_ref(&skill_root),
+            "read_file",
+            r#"{"file_path":"src/other.rs"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -626,7 +695,7 @@ mod tests {
         let root = std::fs::canonicalize(&repo).unwrap();
         let skill_root = std::fs::canonicalize(&skill).unwrap();
         let target = skill_root.join("link/secret.txt");
-        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+        let args = serde_json::json!({"file_path": target.to_string_lossy()}).to_string();
         assert!(check_arguments(
             &root,
             None,
@@ -642,5 +711,29 @@ mod tests {
         let mw = PathConfineMiddleware::new(root())
             .with_read_roots(&[PathBuf::from("/nonexistent/skill-dir")]);
         assert!(mw.read_roots.is_empty());
+    }
+
+    /// A misconfigured wide `--skill-dir` (`~`, `/tmp`, a repo root with no skills)
+    /// must not widen the read sandbox to an arbitrary subtree.
+    #[test]
+    fn with_read_roots_skips_dirs_without_skill_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("wide");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "x").unwrap();
+        let mw = PathConfineMiddleware::new(root()).with_read_roots(&[dir]);
+        assert!(mw.read_roots().is_empty());
+    }
+
+    /// `--skill-dir` may be the parent of several skill packages.
+    #[test]
+    fn with_read_roots_accepts_skill_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("skills");
+        let skill = parent.join("demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+        let mw = PathConfineMiddleware::new(root()).with_read_roots(&[parent.clone()]);
+        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&parent).unwrap()]);
     }
 }

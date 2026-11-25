@@ -171,15 +171,7 @@ pub(crate) fn build_review_agent_inner(
         // a model `grep /` / read outside the repo is blocked before it runs; when
         // `review_paths` is set, also block reads of files not in the review scope
         // (e.g. notes.md dropped by ignore but still on disk). Review-agent only.
-        //
-        // Skill packages (`--skill-dir`) live outside the repo by construction; their
-        // `references/` rules must stay readable or `use_skill` only delivers an index
-        // whose detailed rules can never load (skills silently degrade to no-ops).
-        .middleware(Arc::new(
-            crate::confine::PathConfineMiddleware::new(cfg.working_dir.clone())
-                .with_allowlist(&cfg.review_paths)
-                .with_read_roots(&cfg.skill_dirs),
-        ))
+        .middleware(Arc::new(review_confine(cfg)))
         .stream_timeout(cfg.stream_timeout)
         .first_token_timeout(cfg.effective_first_token_timeout())
         .request_timeout(cfg.request_timeout);
@@ -289,6 +281,18 @@ fn mount_review_tools(
         return reg.mount(&names);
     }
     mounted
+}
+
+/// Path confinement for the review agent: repo root + review-scope allowlist, plus
+/// the `--skill-dir` packages as read roots. Skill packages may sit outside the repo
+/// (server-side cache) or inside it (`.claude/skills`); their `references/` rules must
+/// stay readable or `use_skill` only delivers an index whose detailed rules can never
+/// load (skills silently degrade to no-ops). Extracted so the wiring is testable —
+/// dropping `.with_read_roots` must fail a test, not silently regress production.
+fn review_confine(cfg: &ReviewAgentConfig) -> crate::confine::PathConfineMiddleware {
+    crate::confine::PathConfineMiddleware::new(cfg.working_dir.clone())
+        .with_allowlist(&cfg.review_paths)
+        .with_read_roots(&cfg.skill_dirs)
 }
 
 /// Final system prompt: full override wins (else the built-in reviewer persona), then the
@@ -799,5 +803,27 @@ mod persona_compose_tests {
     fn blank_append_leaves_no_residue() {
         let c = cfg().with_persona_append("   \n  ");
         assert_eq!(compose_persona(&c), review_persona("m1"));
+    }
+
+    /// The ONLY wiring point that makes skill `references/` readable. Losing it
+    /// would silently restore "skill invoked, rules never loaded"; confine's own
+    /// unit tests bypass this function, so assert the wiring here.
+    #[test]
+    fn skill_dirs_are_wired_into_confine_read_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = repo.join(".claude/skills/demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+        let mut c = ReviewAgentConfig::new(
+            "k",
+            "https://x.test",
+            "m1",
+            &repo,
+            atomcode_capabilities::ProductDirs::new(repo.join(".ours-home"), ".ours"),
+        );
+        c.skill_dirs = vec![skill.clone()];
+        let mw = review_confine(&c);
+        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&skill).unwrap()]);
     }
 }
