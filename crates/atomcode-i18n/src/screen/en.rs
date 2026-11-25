@@ -1699,7 +1699,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CompactAfterTurn => "Will compact once this turn ends".into(),
-        Msg::ModelNextTurn { model } => format!("Current turn continues with {model}; the selected model applies next turn.").into(),
+        Msg::ModelNextTurn { model } => format!("{model} finishes this turn; new model applies next turn (Esc to switch now)").into(),
         Msg::RuntimeBusy => "Busy (a reply, a compaction or a rebuild is under way); try again shortly".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()
