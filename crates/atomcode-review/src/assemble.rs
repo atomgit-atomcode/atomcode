@@ -171,9 +171,14 @@ pub(crate) fn build_review_agent_inner(
         // a model `grep /` / read outside the repo is blocked before it runs; when
         // `review_paths` is set, also block reads of files not in the review scope
         // (e.g. notes.md dropped by ignore but still on disk). Review-agent only.
+        //
+        // Skill packages (`--skill-dir`) live outside the repo by construction; their
+        // `references/` rules must stay readable or `use_skill` only delivers an index
+        // whose detailed rules can never load (skills silently degrade to no-ops).
         .middleware(Arc::new(
             crate::confine::PathConfineMiddleware::new(cfg.working_dir.clone())
-                .with_allowlist(&cfg.review_paths),
+                .with_allowlist(&cfg.review_paths)
+                .with_read_roots(&cfg.skill_dirs),
         ))
         .stream_timeout(cfg.stream_timeout)
         .first_token_timeout(cfg.effective_first_token_timeout())

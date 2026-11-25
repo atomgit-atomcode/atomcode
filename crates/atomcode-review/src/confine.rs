@@ -47,6 +47,13 @@ pub struct PathConfineMiddleware {
     /// Repo-relative paths (normalized, no `./` prefix). Empty `None` ⇒ root-only
     /// confinement (legacy). `Some(set)` ⇒ also require path ∈ set or ancestor of set.
     allow: Option<HashSet<PathBuf>>,
+    /// Extra read-only roots OUTSIDE the repo that the review tools may read, e.g.
+    /// the `--skill-dir` packages. A skill's `SKILL.md` is only an index; its
+    /// `references/` rules live in the skill package, which by construction sits
+    /// outside the reviewed repo. Without this, `use_skill` returns the index and
+    /// every `read_file` of the referenced rules is denied — the skill looks used
+    /// but its rules never reach the model. Canonicalized at construction.
+    read_roots: Vec<PathBuf>,
 }
 
 impl PathConfineMiddleware {
@@ -63,7 +70,31 @@ impl PathConfineMiddleware {
         Self {
             root: normalize_lexical(&root),
             allow: None,
+            read_roots: Vec::new(),
         }
+    }
+
+    /// Allow reading files under these roots even though they sit outside the repo.
+    /// Used for `--skill-dir`: a skill package's `references/` must be readable or
+    /// `use_skill` only delivers the `SKILL.md` index and the detailed rules never
+    /// load. Roots are canonicalized; nonexistent ones are skipped (atomcodex already
+    /// canonicalizes `--skill-dir`, this is defense in depth).
+    ///
+    /// The allowlist (`with_allowlist`) still applies only inside the repo: these
+    /// roots are read-only resources, not review targets.
+    pub fn with_read_roots(mut self, roots: &[PathBuf]) -> Self {
+        let mut list: Vec<PathBuf> = Vec::with_capacity(roots.len());
+        for r in roots {
+            let Ok(c) = std::fs::canonicalize(r) else {
+                continue;
+            };
+            let n = normalize_lexical(&c);
+            if !list.contains(&n) {
+                list.push(n);
+            }
+        }
+        self.read_roots = list;
+        self
     }
 
     /// Restrict tools to the given repo-relative reviewable paths (changed files
@@ -102,7 +133,13 @@ impl ToolMiddleware for PathConfineMiddleware {
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        match check_arguments(&self.root, self.allow.as_ref(), &call.name, &call.arguments) {
+        match check_arguments(
+            &self.root,
+            self.allow.as_ref(),
+            &self.read_roots,
+            &call.name,
+            &call.arguments,
+        ) {
             Ok(()) => BeforeOutcome::Proceed,
             Err(reason) => BeforeOutcome::deny(reason),
         }
@@ -110,10 +147,13 @@ impl ToolMiddleware for PathConfineMiddleware {
 }
 
 /// Reject if any path field escapes `root`, or (when `allow` is set) falls outside
-/// the reviewable set. Unparseable args pass through — the tool will reject them.
+/// the reviewable set. Paths outside `root` are accepted only when they fall under
+/// one of `read_roots` (skill packages). Unparseable args pass through — the tool
+/// will reject them.
 fn check_arguments(
     root: &Path,
     allow: Option<&HashSet<PathBuf>>,
+    read_roots: &[PathBuf],
     tool_name: &str,
     args: &str,
 ) -> Result<(), String> {
@@ -127,13 +167,13 @@ fn check_arguments(
         match v.get(key) {
             Some(serde_json::Value::String(s)) => {
                 saw_path = true;
-                check_one(root, allow, s)?;
+                check_one(root, allow, read_roots, s)?;
             }
             Some(serde_json::Value::Array(items)) => {
                 for it in items {
                     if let Some(s) = it.as_str() {
                         saw_path = true;
-                        check_one(root, allow, s)?;
+                        check_one(root, allow, read_roots, s)?;
                     }
                 }
             }
@@ -151,7 +191,12 @@ fn check_arguments(
     Ok(())
 }
 
-fn check_one(root: &Path, allow: Option<&HashSet<PathBuf>>, raw: &str) -> Result<(), String> {
+fn check_one(
+    root: &Path,
+    allow: Option<&HashSet<PathBuf>>,
+    read_roots: &[PathBuf],
+    raw: &str,
+) -> Result<(), String> {
     let p = Path::new(raw);
     let joined = if p.is_absolute() {
         p.to_path_buf()
@@ -160,9 +205,7 @@ fn check_one(root: &Path, allow: Option<&HashSet<PathBuf>>, raw: &str) -> Result
     };
     let normalized = normalize_lexical(&joined);
     if !normalized.starts_with(root) {
-        return Err(format!(
-            "path '{raw}' is outside the review repository; review tools may only access files within the repo"
-        ));
+        return check_read_root(read_roots, &joined, raw);
     }
     if let Some(existing) = existing_prefix(&joined) {
         if let (Ok(canon_root), Ok(canon_existing)) =
@@ -215,6 +258,33 @@ fn path_in_review_scope(rel: &Path, allowed: &HashSet<PathBuf>) -> bool {
     false
 }
 
+/// Paths outside the repo are accepted only when they resolve under an explicitly
+/// declared read-only root (the `--skill-dir` packages). Judgment uses the
+/// canonicalized existing prefix, so a symlink planted inside a skill directory
+/// cannot escape it. The review-scope allowlist does NOT apply here: skill packages
+/// are read-only resources, not review targets.
+fn check_read_root(read_roots: &[PathBuf], joined: &Path, raw: &str) -> Result<(), String> {
+    let denied = || {
+        format!(
+            "path '{raw}' is outside the review repository; review tools may only access files within the repo"
+        )
+    };
+    if read_roots.is_empty() {
+        return Err(denied());
+    }
+    let Some(existing) = existing_prefix(joined) else {
+        return Err(denied());
+    };
+    let Ok(canon) = std::fs::canonicalize(existing) else {
+        return Err(denied());
+    };
+    if read_roots.iter().any(|r| canon.starts_with(r)) {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
 /// Longest existing prefix of `p`, used to catch symlink escapes without requiring
 /// the final path (or glob tail) to exist.
 fn existing_prefix(p: &Path) -> Option<&Path> {
@@ -257,12 +327,26 @@ mod tests {
     #[test]
     fn rejects_grep_root() {
         // The actual production failure: `grep /` scanned the whole container → OOM.
-        assert!(check_arguments(&root(), None, "grep", r#"{"pattern":"foo","path":"/"}"#).is_err());
+        assert!(check_arguments(
+            &root(),
+            None,
+            &[],
+            "grep",
+            r#"{"pattern":"foo","path":"/"}"#
+        )
+        .is_err());
     }
 
     #[test]
     fn allows_relative_inside_repo() {
-        assert!(check_arguments(&root(), None, "read_file", r#"{"file_path":"src/a.rs"}"#).is_ok());
+        assert!(check_arguments(
+            &root(),
+            None,
+            &[],
+            "read_file",
+            r#"{"file_path":"src/a.rs"}"#
+        )
+        .is_ok());
     }
 
     #[test]
@@ -270,6 +354,7 @@ mod tests {
         assert!(check_arguments(
             &root(),
             None,
+            &[],
             "read_file",
             r#"{"file_path":"/work/repo/src/a.rs"}"#
         )
@@ -281,6 +366,7 @@ mod tests {
         assert!(check_arguments(
             &root(),
             None,
+            &[],
             "read_file",
             r#"{"file_path":"../../etc/passwd"}"#
         )
@@ -289,9 +375,14 @@ mod tests {
 
     #[test]
     fn rejects_absolute_outside_repo() {
-        assert!(
-            check_arguments(&root(), None, "read_file", r#"{"file_path":"/etc/passwd"}"#).is_err()
-        );
+        assert!(check_arguments(
+            &root(),
+            None,
+            &[],
+            "read_file",
+            r#"{"file_path":"/etc/passwd"}"#
+        )
+        .is_err());
     }
 
     #[cfg(unix)]
@@ -309,6 +400,7 @@ mod tests {
         assert!(check_arguments(
             &root,
             None,
+            &[],
             "read_file",
             r#"{"file_path":"link/secret.txt"}"#
         )
@@ -319,26 +411,35 @@ mod tests {
     fn pattern_with_slash_not_treated_as_path() {
         // grep with no `path` field: a regex pattern containing '/' must NOT be
         // mistaken for a path argument. Without allowlist this still passes.
-        assert!(check_arguments(&root(), None, "grep", r#"{"pattern":"a/b/c"}"#).is_ok());
+        assert!(check_arguments(&root(), None, &[], "grep", r#"{"pattern":"a/b/c"}"#).is_ok());
     }
 
     #[test]
     fn array_paths_any_escape_blocks() {
         // ast_grep `paths`: one inside, one escaping → blocked; all inside → ok.
-        assert!(check_arguments(&root(), None, "ast_grep", r#"{"paths":["src","/etc"]}"#).is_err());
-        assert!(check_arguments(&root(), None, "ast_grep", r#"{"paths":["src","lib"]}"#).is_ok());
+        assert!(check_arguments(
+            &root(),
+            None,
+            &[],
+            "ast_grep",
+            r#"{"paths":["src","/etc"]}"#
+        )
+        .is_err());
+        assert!(
+            check_arguments(&root(), None, &[], "ast_grep", r#"{"paths":["src","lib"]}"#).is_ok()
+        );
     }
 
     #[test]
     fn missing_path_field_passes_without_allowlist() {
         // grep default path "." (field absent) → tool resolves to working_dir, safe
         // when we only confine to repo root.
-        assert!(check_arguments(&root(), None, "grep", r#"{"pattern":"foo"}"#).is_ok());
+        assert!(check_arguments(&root(), None, &[], "grep", r#"{"pattern":"foo"}"#).is_ok());
     }
 
     #[test]
     fn unparseable_args_pass_through() {
-        assert!(check_arguments(&root(), None, "read_file", "not json").is_ok());
+        assert!(check_arguments(&root(), None, &[], "read_file", "not json").is_ok());
     }
 
     #[test]
@@ -347,6 +448,7 @@ mod tests {
         assert!(check_arguments(
             &root(),
             Some(&a),
+            &[],
             "read_file",
             r#"{"file_path":"pkg/conanfile.py"}"#
         )
@@ -354,6 +456,7 @@ mod tests {
         assert!(check_arguments(
             &root(),
             Some(&a),
+            &[],
             "read_file",
             r#"{"file_path":"/work/repo/pkg/patches/a.patch"}"#
         )
@@ -363,7 +466,14 @@ mod tests {
     #[test]
     fn allowlist_allows_ancestor_dir() {
         let a = allow(&["pkg/conanfile.py"]);
-        assert!(check_arguments(&root(), Some(&a), "list_directory", r#"{"path":"pkg"}"#).is_ok());
+        assert!(check_arguments(
+            &root(),
+            Some(&a),
+            &[],
+            "list_directory",
+            r#"{"path":"pkg"}"#
+        )
+        .is_ok());
     }
 
     #[test]
@@ -373,6 +483,7 @@ mod tests {
         let err = check_arguments(
             &root(),
             Some(&a),
+            &[],
             "read_file",
             r#"{"file_path":"pkg/notes.md"}"#,
         );
@@ -390,6 +501,7 @@ mod tests {
         assert!(check_arguments(
             &root(),
             Some(&a),
+            &[],
             "read_file",
             r#"{"file_path":"other/main.go"}"#
         )
@@ -399,16 +511,21 @@ mod tests {
     #[test]
     fn allowlist_requires_path_on_scoped_tools() {
         let a = allow(&["pkg/a.go"]);
-        assert!(check_arguments(&root(), Some(&a), "grep", r#"{"pattern":"foo"}"#).is_err());
-        assert!(check_arguments(&root(), Some(&a), "list_directory", r#"{}"#).is_err());
+        assert!(check_arguments(&root(), Some(&a), &[], "grep", r#"{"pattern":"foo"}"#).is_err());
+        assert!(check_arguments(&root(), Some(&a), &[], "list_directory", r#"{}"#).is_err());
     }
 
     #[test]
     fn allowlist_rejects_repo_root_dot() {
         let a = allow(&["pkg/a.go"]);
-        assert!(
-            check_arguments(&root(), Some(&a), "grep", r#"{"pattern":"x","path":"."}"#).is_err()
-        );
+        assert!(check_arguments(
+            &root(),
+            Some(&a),
+            &[],
+            "grep",
+            r#"{"pattern":"x","path":"."}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -420,5 +537,110 @@ mod tests {
         ]);
         assert!(mw.allow.as_ref().unwrap().contains(Path::new("pkg/a.go")));
         assert_eq!(mw.allow.as_ref().unwrap().len(), 1);
+    }
+
+    /// A skill package lives OUTSIDE the reviewed repo (`--skill-dir`). Its
+    /// `SKILL.md` is only an index: the detailed rules sit in `references/`, so
+    /// `read_file` on the skill dir must be allowed or `use_skill` delivers an
+    /// index whose rules can never be loaded.
+    #[test]
+    fn read_roots_allow_skill_files_outside_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = tmp.path().join("skills").join("demo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(skill.join("references/rules-api.md"), "rule").unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+        let skill_root = std::fs::canonicalize(&skill).unwrap();
+        let target = skill_root.join("references/rules-api.md");
+        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+        let a = allow(&["docs/a.md"]);
+
+        assert!(
+            check_arguments(
+                &root,
+                Some(&a),
+                std::slice::from_ref(&skill_root),
+                "read_file",
+                &args,
+            )
+            .is_ok(),
+            "skill references outside the repo must be readable"
+        );
+    }
+
+    #[test]
+    fn read_roots_do_not_open_other_outside_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = tmp.path().join("skills").join("demo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+        let skill_root = std::fs::canonicalize(&skill).unwrap();
+        assert!(check_arguments(
+            &root,
+            None,
+            std::slice::from_ref(&skill_root),
+            "read_file",
+            r#"{"file_path":"/etc/passwd"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn read_roots_do_not_bypass_repo_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = tmp.path().join("skills").join("demo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+        let skill_root = std::fs::canonicalize(&skill).unwrap();
+        let a = allow(&["docs/a.md"]);
+        // Skill roots only widen access OUTSIDE the repo; the review-scope
+        // allowlist still governs repo-internal reads.
+        assert!(check_arguments(
+            &root,
+            Some(&a),
+            std::slice::from_ref(&skill_root),
+            "read_file",
+            r#"{"file_path":"src/other.rs"}"#
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_roots_reject_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = tmp.path().join("skills").join("demo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, skill.join("link")).unwrap();
+        let root = std::fs::canonicalize(&repo).unwrap();
+        let skill_root = std::fs::canonicalize(&skill).unwrap();
+        let target = skill_root.join("link/secret.txt");
+        let args = format!(r#"{{"file_path":"{}"}}"#, target.display());
+        assert!(check_arguments(
+            &root,
+            None,
+            std::slice::from_ref(&skill_root),
+            "read_file",
+            &args,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn with_read_roots_skips_nonexistent_dirs() {
+        let mw = PathConfineMiddleware::new(root())
+            .with_read_roots(&[PathBuf::from("/nonexistent/skill-dir")]);
+        assert!(mw.read_roots.is_empty());
     }
 }
