@@ -1136,10 +1136,23 @@ mod tests {
             })
             .cloned()
             .collect();
-        matched.sort_by(|a, b| cmp_entries(a, b, scope_depth));
-        matched.truncate(FILTER_RESULT_LIMIT);
+        // Keep the pre-P11 sort key inline and independent of `cmp_entries`.
+        // If the production key regresses, this reference must disagree.
+        matched.sort_by(|a, b| {
+            let a_direct = a.depth == scope_depth + 1;
+            let b_direct = b.depth == scope_depth + 1;
+            b_direct
+                .cmp(&a_direct)
+                .then_with(|| b.is_dir.cmp(&a.is_dir))
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        matched.truncate(EXPECTED_POPUP_ROWS);
         matched
     }
+
+    /// The popup contract, kept independent of the production constant so a
+    /// limit regression cannot pass both sides of the comparison.
+    const EXPECTED_POPUP_ROWS: usize = 30;
 
     /// More than 30 matches per case exercises the eviction path.
     fn many_entries() -> Vec<Entry> {
@@ -1200,7 +1213,7 @@ mod tests {
     fn filter_keeps_at_most_thirty_best_matches() {
         let entries = many_entries();
         let result = filter_entries(&entries, "src/", "file");
-        assert_eq!(result.len(), FILTER_RESULT_LIMIT);
+        assert_eq!(result.len(), EXPECTED_POPUP_ROWS);
         assert_eq!(result.first().unwrap().rel_path, "src/File000.rs");
         assert_eq!(result.last().unwrap().rel_path, "src/File029.rs");
     }
@@ -1277,7 +1290,7 @@ mod tests {
                 filter_entries_reference(&entries, scope_dir, filter),
                 "scope_dir={scope_dir:?} filter={filter:?}"
             );
-            assert_eq!(bounded.len(), FILTER_RESULT_LIMIT);
+            assert_eq!(bounded.len(), EXPECTED_POPUP_ROWS);
         }
     }
 
