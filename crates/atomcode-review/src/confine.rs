@@ -82,28 +82,25 @@ impl PathConfineMiddleware {
     /// must be readable or `use_skill` only delivers the `SKILL.md` index and the
     /// detailed rules never load.
     ///
-    /// Only directories that actually look like skill packages are accepted (own
-    /// `SKILL.md`, or a direct child directory with `SKILL.md`). A misconfigured
-    /// `--skill-dir ~` / `/tmp` must not turn a whole subtree into a readable root.
-    /// The review allowlist still governs every other repo path: these roots are
-    /// read-only resources, not review targets.
+    /// Each root is resolved to the actual skill package(s) it names:
+    /// - the dir itself has `SKILL.md` → that dir;
+    /// - otherwise its direct child dirs with `SKILL.md` → those dirs (a parent
+    ///   directory holding several skills; the parent itself is NOT opened, so a
+    ///   parent that happens to contain the reviewed repo cannot bypass the
+    ///   review-scope allowlist);
+    /// - otherwise flat `*.md` skill files (the `SkillRegistry` single-file
+    ///   layout) → that dir;
+    /// - anything else (`~`, `/tmp`) is skipped with a hint.
+    ///
+    /// The review allowlist still governs every non-skill repo path: these roots
+    /// are read-only resources, not review targets.
     pub fn with_read_roots(mut self, roots: &[PathBuf]) -> Self {
         let mut list: Vec<PathBuf> = Vec::with_capacity(roots.len());
         for r in roots {
             let Ok(c) = std::fs::canonicalize(r) else {
                 continue;
             };
-            let n = normalize_lexical(&c);
-            if !is_skill_root(&n) {
-                eprintln!(
-                    "[confine] ignoring read root without SKILL.md: {}",
-                    n.display()
-                );
-                continue;
-            }
-            if !list.contains(&n) {
-                list.push(n);
-            }
+            collect_read_roots(&normalize_lexical(&c), &mut list);
         }
         self.read_roots = list;
         self
@@ -296,20 +293,57 @@ fn path_in_read_root(read_roots: &[PathBuf], joined: &Path) -> bool {
     read_roots.iter().any(|r| canon.starts_with(r))
 }
 
-/// Directory shape check for `--skill-dir` roots: the directory itself contains
-/// `SKILL.md` (single skill package), or one of its direct children does (parent
-/// directory holding multiple skill packages). Anything else — `~`, `/tmp`, a
-/// repo root without skills — must not be widened into a readable subtree.
-fn is_skill_root(dir: &Path) -> bool {
+/// Resolve one `--skill-dir` into the actual read-only roots. See
+/// [`PathConfineMiddleware::with_read_roots`] for the accepted layouts. A parent
+/// directory holding multiple skills contributes its skill CHILD dirs, never itself.
+fn collect_read_roots(dir: &Path, out: &mut Vec<PathBuf>) {
     if dir.join("SKILL.md").is_file() {
-        return true;
+        push_unique(out, dir.to_path_buf());
+        return;
     }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+        return;
     };
-    entries.flatten().any(|e| {
-        e.file_type().map(|t| t.is_dir()).unwrap_or(false) && e.path().join("SKILL.md").is_file()
-    })
+    let mut found_child = false;
+    let mut has_flat_md = false;
+    for e in entries.flatten() {
+        let child = e.path();
+        if child.is_dir() && child.join("SKILL.md").is_file() {
+            // canonicalize follows a symlinked skill dir to its real target.
+            if let Ok(c) = std::fs::canonicalize(&child) {
+                push_unique(out, normalize_lexical(&c));
+            }
+            found_child = true;
+            continue;
+        }
+        if e.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && child
+                .extension()
+                .map(|x| x.eq_ignore_ascii_case("md"))
+                .unwrap_or(false)
+        {
+            has_flat_md = true;
+        }
+    }
+    if found_child {
+        return;
+    }
+    if has_flat_md {
+        // Single-file skill layout (`<name>.md`), same contract as SkillRegistry.
+        push_unique(out, dir.to_path_buf());
+        return;
+    }
+    eprintln!(
+        "[confine] ignoring read root without SKILL.md or skill files: {}",
+        dir.display()
+    );
+}
+
+fn push_unique(list: &mut Vec<PathBuf>, p: PathBuf) {
+    if !list.contains(&p) {
+        list.push(p);
+    }
 }
 
 /// Longest existing prefix of `p`, used to catch symlink escapes without requiring
@@ -713,27 +747,53 @@ mod tests {
         assert!(mw.read_roots.is_empty());
     }
 
-    /// A misconfigured wide `--skill-dir` (`~`, `/tmp`, a repo root with no skills)
-    /// must not widen the read sandbox to an arbitrary subtree.
+    /// A misconfigured wide `--skill-dir` (`~`, `/tmp`, a repo root with no skills
+    /// and no markdown) must not widen the read sandbox to an arbitrary subtree.
     #[test]
-    fn with_read_roots_skips_dirs_without_skill_md() {
+    fn with_read_roots_skips_dirs_without_skill_content() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("wide");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("notes.md"), "x").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
         let mw = PathConfineMiddleware::new(root()).with_read_roots(&[dir]);
         assert!(mw.read_roots().is_empty());
     }
 
-    /// `--skill-dir` may be the parent of several skill packages.
+    /// `--skill-dir` may be the parent of several skill packages: each CHILD skill
+    /// dir becomes a read root, but the parent itself does not (it may contain the
+    /// reviewed repo, and opening it would bypass the review-scope allowlist).
     #[test]
-    fn with_read_roots_accepts_skill_parent_dir() {
+    fn with_read_roots_parent_dir_opens_only_skill_children() {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("skills");
         let skill = parent.join("demo");
+        let nested_repo = parent.join("repo");
+        let other_repo = tmp.path().join("other-repo");
         std::fs::create_dir_all(&skill).unwrap();
+        std::fs::create_dir_all(&nested_repo).unwrap();
+        std::fs::create_dir_all(&other_repo).unwrap();
         std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+        std::fs::write(nested_repo.join("secret.txt"), "secret").unwrap();
         let mw = PathConfineMiddleware::new(root()).with_read_roots(&[parent.clone()]);
-        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&parent).unwrap()]);
+        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&skill).unwrap()]);
+
+        // A sibling repo under the same parent is NOT readable through the skill
+        // root: only the skill child dir was opened, not the parent subtree.
+        let root = std::fs::canonicalize(&other_repo).unwrap();
+        let target = std::fs::canonicalize(nested_repo.join("secret.txt")).unwrap();
+        let args = serde_json::json!({"file_path": target.to_string_lossy()}).to_string();
+        assert!(check_arguments(&root, None, mw.read_roots(), "read_file", &args).is_err());
+    }
+
+    /// Single-file skill layout: `<name>.md` directly in the `--skill-dir` (same
+    /// contract as `SkillRegistry`), so the dir itself is the skill package.
+    #[test]
+    fn with_read_roots_accepts_flat_markdown_skill_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("flat-skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("demo.md"), "# demo skill").unwrap();
+        let mw = PathConfineMiddleware::new(root()).with_read_roots(&[dir.clone()]);
+        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&dir).unwrap()]);
     }
 }

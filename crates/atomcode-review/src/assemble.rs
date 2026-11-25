@@ -683,6 +683,28 @@ mod tests {
         // Only indexable sources counted: a.rs, b.go, c.py, sub/f.ts = 4 (md/lock excluded).
         assert_eq!(count_indexed_sources(root), 4);
     }
+
+    /// The ONLY wiring point that makes skill `references/` readable. Losing it
+    /// would silently restore "skill invoked, rules never loaded"; confine's own
+    /// unit tests bypass this function, so assert the wiring here.
+    #[test]
+    fn skill_dirs_are_wired_into_confine_read_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let skill = repo.join(".claude/skills/demo");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+        let mut c = ReviewAgentConfig::new(
+            "k",
+            "https://x.test",
+            "m1",
+            &repo,
+            atomcode_capabilities::ProductDirs::new(repo.join(".ours-home"), ".ours"),
+        );
+        c.skill_dirs = vec![skill.clone()];
+        let mw = review_confine(&c);
+        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&skill).unwrap()]);
+    }
 }
 
 #[cfg(test)]
@@ -803,27 +825,5 @@ mod persona_compose_tests {
     fn blank_append_leaves_no_residue() {
         let c = cfg().with_persona_append("   \n  ");
         assert_eq!(compose_persona(&c), review_persona("m1"));
-    }
-
-    /// The ONLY wiring point that makes skill `references/` readable. Losing it
-    /// would silently restore "skill invoked, rules never loaded"; confine's own
-    /// unit tests bypass this function, so assert the wiring here.
-    #[test]
-    fn skill_dirs_are_wired_into_confine_read_roots() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        let skill = repo.join(".claude/skills/demo");
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
-        let mut c = ReviewAgentConfig::new(
-            "k",
-            "https://x.test",
-            "m1",
-            &repo,
-            atomcode_capabilities::ProductDirs::new(repo.join(".ours-home"), ".ours"),
-        );
-        c.skill_dirs = vec![skill.clone()];
-        let mw = review_confine(&c);
-        assert_eq!(mw.read_roots(), &[std::fs::canonicalize(&skill).unwrap()]);
     }
 }
