@@ -1617,6 +1617,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 .into()
         }
         Msg::CmdAboutProxy => "outbound proxy: follow the system, pin the current one, or none".into(),
+        Msg::GcAbout => "preview cleanup of old session history".into(),
+        Msg::GcUsage => "Use /gc to preview or /gc --apply to run the previewed cleanup.".into(),
+        Msg::GcBusy => "Session cleanup is already running.".into(),
+        Msg::GcPreviewFirst => "Run /gc to preview the cleanup first.".into(),
+        Msg::GcApplyHint => "Run /gc --apply to permanently delete these sessions and their attachments.".into(),
+        Msg::GcLowSpace { free } => format!("The session disk has {free} free. Run /gc to preview cleanup.").into(),
+        Msg::GcFailed { error } => format!("Session cleanup failed ({error}).").into(),
+        Msg::GcPreview { used, count, estimated, skipped } => format!("Session history size {used}. Eligible old sessions: {count}. Estimated reclaimable file size: {estimated}. Skipped during inspection: {skipped}. Migration backups and separate Code Rewind stores are kept.").into(),
+        Msg::GcApplied { deleted, skipped, failed, removed } => format!("Deleted {deleted} old sessions, skipped {skipped}, and could not finish {failed}. Removed {removed} of session files.").into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),
         Msg::ProxyFollowSystemAbout => {

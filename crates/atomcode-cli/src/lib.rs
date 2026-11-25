@@ -38,6 +38,7 @@ pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
 pub mod tui_command_meter;
+mod tui_gc;
 pub mod tui_git_auth;
 pub mod tui_grape;
 pub mod tui_login;
@@ -315,6 +316,7 @@ pub mod tui_front {
             crate::tui_opening::row_layer(),
             crate::tui_shell::row_layer(),
             crate::tui_upgrade::row_layer(),
+            crate::tui_gc::row_layer(),
             crate::tui_changelog::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
@@ -324,11 +326,21 @@ pub mod tui_front {
         ];
         let hint_root = working_dir.clone();
         let hint_dirs = dirs.clone();
-        let capabilities = tokio::task::spawn_blocking(move || {
-            crate::project_setup::startup_hint(&hint_root, &hint_dirs)
+        let sessions_root =
+            atomcode_capabilities::session::SessionManager::sessions_root(dirs.user());
+        let notice_root = sessions_root.clone();
+        let (capabilities, low_space) = tokio::task::spawn_blocking(move || {
+            (
+                crate::project_setup::startup_hint(&hint_root, &hint_dirs),
+                crate::tui_gc::low_space_notice(&notice_root),
+            )
         })
         .await
-        .unwrap_or(None);
+        .unwrap_or_default();
+        let opening_notice = match (opening_notice, low_space) {
+            (Some(notice), Some(low_space)) => Some(format!("{notice}\n{low_space}")),
+            (notice, low_space) => notice.or(low_space),
+        };
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
             Arc::new(crate::tui_providers::ProvidersRow),
@@ -358,6 +370,7 @@ pub mod tui_front {
                 capabilities,
             }),
             Arc::new(crate::tui_upgrade::UpgradeRow),
+            Arc::new(crate::tui_gc::GcRow { sessions_root }),
             Arc::new(crate::tui_changelog::ChangelogRow {
                 seen: atomcode_config::changelog::seen_path(
                     &atomcode_config::config::Config::config_dir(),

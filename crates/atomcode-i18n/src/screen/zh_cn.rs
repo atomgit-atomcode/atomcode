@@ -1530,6 +1530,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "增删用 `atomcode schedule add` / `remove`；到点执行的是操作系统的调度器。".into()
         }
         Msg::CmdAboutProxy => "出站代理：跟随系统、固定当前代理，或不走代理".into(),
+        Msg::GcAbout => "预览旧会话清理".into(),
+        Msg::GcUsage => "输入 /gc 预览，或输入 /gc --apply 执行已预览的清理。".into(),
+        Msg::GcBusy => "会话清理正在进行。".into(),
+        Msg::GcPreviewFirst => "请先输入 /gc 预览清理范围。".into(),
+        Msg::GcApplyHint => "输入 /gc --apply 将永久删除这些会话及其附件。".into(),
+        Msg::GcLowSpace { free } => format!("会话目录所在磁盘仅剩 {free}。输入 /gc 预览清理范围。").into(),
+        Msg::GcFailed { error } => format!("会话清理失败（{error}）。").into(),
+        Msg::GcPreview { used, count, estimated, skipped } => format!("会话目录文件大小 {used}。{count} 个旧会话符合清理条件，预计可清理 {estimated}，检查时跳过 {skipped} 个。迁移备份和独立的代码回退仓库会保留。").into(),
+        Msg::GcApplied { deleted, skipped, failed, removed } => format!("已删除 {deleted} 个旧会话，跳过 {skipped} 个，{failed} 个未能完成。移除了 {removed} 的会话文件。").into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("出站代理（现在：{current}）").into(),
         Msg::ProxyFollowSystemAbout => "跟随环境和系统代理；模型请求在本地代理关闭时自动直连，恢复后重新使用（默认）".into(),
