@@ -9970,21 +9970,41 @@ mod tests {
                 )
                 .await
                 .unwrap()
-                .status()
             }
         };
 
         // The valid handoff sets the cookie and clears the failure budget.
-        assert_eq!(send("good-token").await, StatusCode::FOUND);
+        assert_eq!(send("good-token").await.status(), StatusCode::FOUND);
         for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
-            assert_ne!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+            assert_ne!(send("wrong-token").await.status(), StatusCode::TOO_MANY_REQUESTS);
         }
-        assert_eq!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+        let blocked = send("wrong-token").await;
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        retry_after_seconds(&blocked);
         assert_eq!(
-            send("good-token").await,
+            send("good-token").await.status(),
             StatusCode::FOUND,
             "the recovery handoff must still work during a block"
         );
+    }
+
+    /// Reads the `Retry-After` seconds, requiring the header to be present and
+    /// within the contract range (1..=30) the 429 path promises.
+    fn retry_after_seconds(response: &axum::response::Response) -> u64 {
+        let value = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("429 must carry Retry-After");
+        let seconds = value
+            .to_str()
+            .expect("Retry-After must be valid UTF-8")
+            .parse::<u64>()
+            .expect("Retry-After must be an integer number of seconds");
+        assert!(
+            (1..=30).contains(&seconds),
+            "Retry-After must be within 1..=30, got {seconds}"
+        );
+        seconds
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -10013,21 +10033,68 @@ mod tests {
                 app.oneshot(request.body(axum::body::Body::empty()).unwrap())
                     .await
                     .unwrap()
-                    .status()
             }
         };
 
         for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
-            assert_eq!(send(Some("wrong-token")).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(send(Some("wrong-token")).await.status(), StatusCode::UNAUTHORIZED);
         }
+        let blocked = send(Some("wrong-token")).await;
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        retry_after_seconds(&blocked);
+
+        // A guess during the block also returns 429 with a bounded Retry-After.
+        let during_block = send(Some("wrong-token")).await;
+        assert_eq!(during_block.status(), StatusCode::TOO_MANY_REQUESTS);
+        retry_after_seconds(&during_block);
+
         assert_eq!(
-            send(Some("wrong-token")).await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(
-            send(Some("good-token")).await,
+            send(Some("good-token")).await.status(),
             StatusCode::OK,
             "a valid token must still work during a block; the block only stops guesses"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn missing_credentials_never_consume_the_failure_budget() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/ping", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+
+        let send = |token: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder().method("GET").uri("/ping");
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("Bearer {token}"));
+                }
+                app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        // More than the limit of credential-less requests stays 401 and must not
+        // trip the block (a broken client cannot lock itself out).
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT + 5 {
+            assert_eq!(send(None).await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(send(Some("good-token")).await, StatusCode::OK);
+        assert_eq!(
+            send(Some("wrong-token")).await,
+            StatusCode::UNAUTHORIZED,
+            "no failure budget was consumed by the credential-less requests"
         );
     }
 
