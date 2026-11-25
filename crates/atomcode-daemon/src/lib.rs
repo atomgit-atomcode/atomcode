@@ -2004,29 +2004,41 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// cross-site sends) carry the protection.
 async fn serve_webui_index(
     State(state): State<AppState>,
-    uri: axum::http::Uri,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
+    let uri = req.uri().clone();
     if state.enforce_token {
+        let source = auth_token::request_source(&req);
+        let now = std::time::Instant::now();
+        if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
+            return auth_token::too_many_requests(wait);
+        }
         if let Some(query) = uri.query() {
             if let Some(token) = first_query_value(query, "token") {
-                if !token.is_empty() && state.webui_tokens.is_valid(&token) {
-                    let rest = strip_query_key(query, "token");
-                    let location = if rest.is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("/?{rest}")
-                    };
-                    let cookie = format!(
-                        "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        state.webui_cookie_name, token
-                    );
-                    return axum::response::Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header(header::LOCATION, location)
-                        .header(header::SET_COOKIE, cookie)
-                        .body(axum::body::Body::empty())
-                        .map(IntoResponse::into_response)
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                if !token.is_empty() {
+                    if state.webui_tokens.is_valid(&token) {
+                        state.webui_tokens.note_auth_success(&source);
+                        let rest = strip_query_key(query, "token");
+                        let location = if rest.is_empty() {
+                            "/".to_string()
+                        } else {
+                            format!("/?{rest}")
+                        };
+                        let cookie = format!(
+                            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+                            state.webui_cookie_name, token
+                        );
+                        return axum::response::Response::builder()
+                            .status(StatusCode::FOUND)
+                            .header(header::LOCATION, location)
+                            .header(header::SET_COOKIE, cookie)
+                            .body(axum::body::Body::empty())
+                            .map(IntoResponse::into_response)
+                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    if let Some(wait) = state.webui_tokens.note_auth_failure(&source, now) {
+                        return auth_token::too_many_requests(wait);
+                    }
                 }
             }
         }
@@ -6605,17 +6617,20 @@ async fn serve_http(
             },
         ));
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal(shutdown).await;
-            // The host, HTTP /shutdown, and OS signals converge on the same fact.
-            // Streaming bodies must see it too, otherwise graceful shutdown can
-            // wait forever for an old EventSource connection.
-            if let Some(owner) = owner {
-                owner.send_replace(true);
-            }
-        })
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal(shutdown).await;
+        // The host, HTTP /shutdown, and OS signals converge on the same fact.
+        // Streaming bodies must see it too, otherwise graceful shutdown can
+        // wait forever for an old EventSource connection.
+        if let Some(owner) = owner {
+            owner.send_replace(true);
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -9930,6 +9945,85 @@ mod tests {
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn webui_index_handoff_shares_the_auth_failure_budget() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/", get(serve_webui_index))
+            .with_state(state);
+
+        let send = |token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/?token={token}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        // The valid handoff sets the cookie and clears the failure budget.
+        assert_eq!(send("good-token").await, StatusCode::FOUND);
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_ne!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn require_webui_token_returns_429_after_repeated_failures() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/ping", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+
+        let send = |token: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder().method("GET").uri("/ping");
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("Bearer {token}"));
+                }
+                app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_eq!(send(Some("wrong-token")).await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            send(Some("wrong-token")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            send(Some("good-token")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the block must also reject a valid token until it expires"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
