@@ -8,7 +8,7 @@
 // See spec: docs/superpowers/specs/2026-05-06-at-mention-design.md
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -58,6 +58,12 @@ const MAX_INDEX_ENTRIES: usize = 50_000;
 /// nothing. The popup only shows 30 rows and substring-searches, so a few
 /// thousand skill/command entries per dir is already far more than useful.
 const ALLOWLIST_DIR_MAX_ENTRIES: usize = 2_000;
+
+/// How many rows the `@` popup renders.
+///
+/// `filter_entries` keeps a bounded top-N set while scanning, so a broad
+/// filter on a large index cannot clone or sort every match.
+const FILTER_RESULT_LIMIT: usize = 30;
 
 // ---------------------------------------------------------------------------
 // Token detection
@@ -215,37 +221,103 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
         scope_dir.matches('/').count()
     };
 
-    let mut matched: Vec<Entry> = entries
-        .iter()
-        .filter(|e| e.rel_path.starts_with(scope_dir))
-        .filter(|e| e.rel_path != scope_dir)
-        .filter(|e| {
-            if filter_lower.is_empty() {
-                // Empty filter = pure drill-down view: only direct
-                // children of `scope_dir`. Cross-level matching kicks
-                // in only once the user starts typing a filter.
-                return e.depth == scope_depth + 1;
+    // Keep the best FILTER_RESULT_LIMIT rows in a max-heap keyed by the popup
+    // order. The root is the worst kept row, so a later match only replaces it
+    // when it ranks better. This avoids cloning every match and sorting the
+    // whole set on each keystroke.
+    let mut best: BinaryHeap<RankedEntry> = BinaryHeap::with_capacity(FILTER_RESULT_LIMIT + 1);
+    for entry in entries {
+        if !entry.rel_path.starts_with(scope_dir) || entry.rel_path == scope_dir {
+            continue;
+        }
+        if filter_lower.is_empty() {
+            // Empty filter = pure drill-down view: only direct children of
+            // `scope_dir`. Cross-level matching kicks in only once the user
+            // starts typing a filter.
+            if entry.depth != scope_depth + 1 {
+                continue;
             }
-            let after_scope = &e.rel_path[scope_dir.len()..];
-            after_scope.to_lowercase().contains(&filter_lower)
-        })
-        .cloned()
-        .collect();
+        } else {
+            let after_scope = &entry.rel_path[scope_dir.len()..];
+            if !contains_case_insensitive(after_scope, &filter_lower) {
+                continue;
+            }
+        }
+        if best.len() < FILTER_RESULT_LIMIT {
+            best.push(RankedEntry {
+                entry: entry.clone(),
+                scope_depth,
+            });
+        } else if best.peek().is_some_and(|worst| {
+            rank_entries(entry, &worst.entry, scope_depth) == std::cmp::Ordering::Less
+        }) {
+            best.pop();
+            best.push(RankedEntry {
+                entry: entry.clone(),
+                scope_depth,
+            });
+        }
+    }
 
-    matched.sort_by(|a, b| {
-        // Direct children of scope_dir first.
-        let a_direct = a.depth == scope_depth + 1;
-        let b_direct = b.depth == scope_depth + 1;
-        b_direct
-            .cmp(&a_direct)
-            // Then dirs before files within same level.
-            .then_with(|| b.is_dir.cmp(&a.is_dir))
-            // Then alpha.
-            .then_with(|| a.rel_path.cmp(&b.rel_path))
-    });
-
-    matched.truncate(30);
+    let mut matched: Vec<Entry> = best.into_iter().map(|ranked| ranked.entry).collect();
+    matched.sort_by(|a, b| rank_entries(a, b, scope_depth));
     matched
+}
+
+/// The popup order: direct children of the scope first, then directories
+/// before files, then byte-order path.
+fn rank_entries(a: &Entry, b: &Entry, scope_depth: usize) -> std::cmp::Ordering {
+    let a_direct = a.depth == scope_depth + 1;
+    let b_direct = b.depth == scope_depth + 1;
+    b_direct
+        .cmp(&a_direct)
+        .then_with(|| b.is_dir.cmp(&a.is_dir))
+        .then_with(|| a.rel_path.cmp(&b.rel_path))
+}
+
+/// Heap element for the bounded top-N scan. `Ord` is [`rank_entries`], so a
+/// [`BinaryHeap`] keeps the worst kept row at its root.
+struct RankedEntry {
+    entry: Entry,
+    scope_depth: usize,
+}
+
+impl PartialEq for RankedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for RankedEntry {}
+
+impl PartialOrd for RankedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        rank_entries(&self.entry, &other.entry, self.scope_depth)
+    }
+}
+
+/// Case-insensitive substring test for the filter.
+///
+/// The popup runs this once per candidate on every keystroke, so the common
+/// ASCII case must not allocate. Non-ASCII input keeps the exact
+/// `to_lowercase` semantics; only those paths take the allocating fallback.
+fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        return haystack
+            .as_bytes()
+            .windows(needle_lower.len())
+            .any(|window| window.eq_ignore_ascii_case(needle_lower.as_bytes()));
+    }
+    haystack.to_lowercase().contains(needle_lower)
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1069,117 @@ mod tests {
         // Direct children of crates/ (depth 2) should come before deeper.
         let first = &result[0];
         assert_eq!(first.depth, 2, "first should be depth-2: {:?}", first);
+    }
+
+    /// Pre-P11 implementation: collect every match, sort all of them, then
+    /// truncate. The bounded selection must produce exactly this output.
+    fn filter_entries_full_sort(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<Entry> {
+        let filter_lower = filter.to_lowercase();
+        let scope_depth = if scope_dir.is_empty() {
+            0
+        } else {
+            scope_dir.matches('/').count()
+        };
+        let mut matched: Vec<Entry> = entries
+            .iter()
+            .filter(|e| e.rel_path.starts_with(scope_dir))
+            .filter(|e| e.rel_path != scope_dir)
+            .filter(|e| {
+                if filter_lower.is_empty() {
+                    return e.depth == scope_depth + 1;
+                }
+                e.rel_path[scope_dir.len()..]
+                    .to_lowercase()
+                    .contains(&filter_lower)
+            })
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| {
+            let a_direct = a.depth == scope_depth + 1;
+            let b_direct = b.depth == scope_depth + 1;
+            b_direct
+                .cmp(&a_direct)
+                .then_with(|| b.is_dir.cmp(&a.is_dir))
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        matched.truncate(30);
+        matched
+    }
+
+    /// More than 30 matches per case exercises the eviction path.
+    fn many_entries() -> Vec<Entry> {
+        let mut entries = vec![
+            Entry {
+                rel_path: "README.md".into(),
+                is_dir: false,
+                depth: 1,
+            },
+            Entry {
+                rel_path: "src/".into(),
+                is_dir: true,
+                depth: 1,
+            },
+        ];
+        for i in 0..120 {
+            entries.push(Entry {
+                rel_path: format!("src/File{i:03}.rs"),
+                is_dir: false,
+                depth: 2,
+            });
+            entries.push(Entry {
+                rel_path: format!("src/Mod{i:03}/"),
+                is_dir: true,
+                depth: 2,
+            });
+            entries.push(Entry {
+                rel_path: format!("src/Mod{i:03}/Inner{i:03}.RS"),
+                is_dir: false,
+                depth: 3,
+            });
+        }
+        entries
+    }
+
+    #[test]
+    fn bounded_selection_matches_the_full_sort() {
+        let entries = many_entries();
+        for (scope_dir, filter) in [
+            ("", ""),
+            ("src/", ""),
+            ("src/", "file"),
+            ("src/", "FILE"),
+            ("src/", "mod0"),
+            ("src/", "inner"),
+            ("", "src/"),
+            ("", "RS"),
+        ] {
+            assert_eq!(
+                filter_entries(&entries, scope_dir, filter),
+                filter_entries_full_sort(&entries, scope_dir, filter),
+                "scope_dir={scope_dir:?} filter={filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_keeps_at_most_thirty_best_matches() {
+        let entries = many_entries();
+        let result = filter_entries(&entries, "src/", "file");
+        assert_eq!(result.len(), 30);
+        assert_eq!(result.first().unwrap().rel_path, "src/File000.rs");
+        assert_eq!(result.last().unwrap().rel_path, "src/File029.rs");
+    }
+
+    #[test]
+    fn filter_matches_non_ascii_case_insensitively() {
+        let entries = vec![Entry {
+            rel_path: "docs/Ärger.md".into(),
+            is_dir: false,
+            depth: 2,
+        }];
+        assert_eq!(filter_entries(&entries, "", "ärger").len(), 1);
+        assert_eq!(filter_entries(&entries, "", "ÄRGER").len(), 1);
+        assert!(filter_entries(&entries, "", "arg").is_empty());
     }
 
     // ---- FileIndex.walk (real tempdir) ----
