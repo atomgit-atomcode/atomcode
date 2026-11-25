@@ -65,6 +65,11 @@ const ALLOWLIST_DIR_MAX_ENTRIES: usize = 2_000;
 /// filter on a large index cannot clone or sort every match.
 const FILTER_RESULT_LIMIT: usize = 30;
 
+/// Keep the allocation-free window scan for the first few typed characters.
+/// Longer needles use the standard substring search to avoid rescanning long
+/// partial matches in paths with repeated characters.
+const ASCII_WINDOW_NEEDLE_LIMIT: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Token detection
 // ---------------------------------------------------------------------------
@@ -215,8 +220,7 @@ pub fn split_token(token: &str) -> (String, String) {
 /// Sorted direct-children-first, dirs-before-files, then alphabetical. Capped at 30.
 pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<Entry> {
     let filter_lower = filter.to_lowercase();
-    // Reused by the Unicode fallback, so one keystroke allocates at most once
-    // instead of once per non-ASCII candidate.
+    // Reuse the same buffer across candidates that need to be lowercased.
     let mut lower_scratch = String::new();
     let scope_depth = if scope_dir.is_empty() {
         0
@@ -227,9 +231,9 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
     // Keep the best FILTER_RESULT_LIMIT rows in a max-heap keyed by the popup
     // order. The root is the worst kept row, so a later match only replaces it
     // when it ranks better. This avoids cloning every match and sorting the
-    // whole set on each keystroke. The heap allocates on the first match, so an
-    // empty index or a filter with no matches allocates nothing.
-    let mut best: BinaryHeap<RankedEntry> = BinaryHeap::new();
+    // whole set on each keystroke. Borrow the candidates and clone only the
+    // returned entries. The heap allocates on the first match.
+    let mut best: BinaryHeap<RankedEntry<'_>> = BinaryHeap::new();
     for (index, entry) in entries.iter().enumerate() {
         if !entry.rel_path.starts_with(scope_dir) || entry.rel_path == scope_dir {
             continue;
@@ -247,33 +251,29 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
                 continue;
             }
         }
+        let candidate = RankedEntry {
+            entry,
+            index,
+            scope_depth,
+        };
         if best.len() < FILTER_RESULT_LIMIT {
             if best.capacity() == 0 {
                 // First match: size the buffer once. Zero-match calls keep
                 // `BinaryHeap::new`'s empty allocation.
                 best.reserve_exact(FILTER_RESULT_LIMIT);
             }
-            best.push(RankedEntry {
-                entry: entry.clone(),
-                index,
-                scope_depth,
-            });
-        } else if best.peek().is_some_and(|worst| {
-            rank_entries(entry, index, &worst.entry, worst.index, scope_depth)
-                == std::cmp::Ordering::Less
-        }) {
-            best.pop();
-            best.push(RankedEntry {
-                entry: entry.clone(),
-                index,
-                scope_depth,
-            });
+            best.push(candidate);
+        } else if let Some(mut worst) = best.peek_mut() {
+            if candidate < *worst {
+                *worst = candidate;
+            }
         }
     }
 
-    let mut matched: Vec<RankedEntry> = best.into_iter().collect();
-    matched.sort_by(RankedEntry::cmp);
-    matched.into_iter().map(|ranked| ranked.entry).collect()
+    best.into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.entry.clone())
+        .collect()
 }
 
 /// The popup order: direct children of the scope first, then directories
@@ -304,36 +304,36 @@ fn rank_entries(
 
 /// Heap element for the bounded top-N scan. `Ord` is [`rank_entries`], so a
 /// [`BinaryHeap`] keeps the worst kept row at its root.
-struct RankedEntry {
-    entry: Entry,
+struct RankedEntry<'a> {
+    entry: &'a Entry,
     index: usize,
     scope_depth: usize,
 }
 
-impl PartialEq for RankedEntry {
+impl PartialEq for RankedEntry<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 
-impl Eq for RankedEntry {}
+impl Eq for RankedEntry<'_> {}
 
-impl PartialOrd for RankedEntry {
+impl PartialOrd for RankedEntry<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for RankedEntry {
+impl Ord for RankedEntry<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // The scope is part of the order so a cross-scope comparison stays
         // antisymmetric. Within one `filter_entries` call every element has
         // the same scope, so this key is equal and does not change results.
         self.scope_depth.cmp(&other.scope_depth).then_with(|| {
             rank_entries(
-                &self.entry,
+                self.entry,
                 self.index,
-                &other.entry,
+                other.entry,
                 other.index,
                 self.scope_depth,
             )
@@ -343,13 +343,10 @@ impl Ord for RankedEntry {
 
 /// Case-insensitive substring test for the filter.
 ///
-/// The popup runs this once per candidate on every keystroke, so the common
-/// ASCII case must not allocate. Any non-ASCII byte falls back to Unicode case
-/// folding, which must stay exactly equal to `haystack.to_lowercase()`. A path
-/// that folding leaves unchanged (CJK, digits, already-lowercase text) is
-/// compared directly. Otherwise `scratch` holds the folded path, so a keystroke
-/// allocates at most once instead of once per candidate. The ASCII path compares
-/// bytes, so multi-byte sequences are never split.
+/// Match exactly as `haystack.to_lowercase().contains(needle_lower)` would.
+/// Short ASCII queries compare bytes directly. Longer ASCII queries reuse
+/// `scratch` and use the standard substring search. Unicode paths whose
+/// lowercase form is unchanged can be searched directly.
 fn contains_case_insensitive(haystack: &str, needle_lower: &str, scratch: &mut String) -> bool {
     if needle_lower.is_empty() {
         return true;
@@ -360,6 +357,20 @@ fn contains_case_insensitive(haystack: &str, needle_lower: &str, scratch: &mut S
             // needle cannot match. This also keeps a non-ASCII filter over a
             // large ASCII index from folding every candidate.
             return false;
+        }
+        if needle_lower.len() > ASCII_WINDOW_NEEDLE_LIMIT {
+            // Reject obvious misses before copying and lowering the path.
+            let last = needle_lower.as_bytes()[needle_lower.len() - 1];
+            let upper = last.to_ascii_uppercase();
+            if !haystack.contains(char::from(last))
+                && (last == upper || !haystack.contains(char::from(upper)))
+            {
+                return false;
+            }
+            scratch.clear();
+            scratch.push_str(haystack);
+            scratch.make_ascii_lowercase();
+            return scratch.contains(needle_lower);
         }
         let haystack = haystack.as_bytes();
         let needle = needle_lower.as_bytes();
@@ -1283,7 +1294,7 @@ mod tests {
         // Without the scope key both directions rank Less: `shallow` treats
         // its own depth as direct, and `deep` treats its own depth as direct.
         let shallow = RankedEntry {
-            entry: Entry {
+            entry: &Entry {
                 rel_path: "shallow".into(),
                 is_dir: false,
                 depth: 1,
@@ -1292,7 +1303,7 @@ mod tests {
             scope_depth: 0,
         };
         let deep = RankedEntry {
-            entry: Entry {
+            entry: &Entry {
                 rel_path: "deep".into(),
                 is_dir: false,
                 depth: 2,
@@ -1367,6 +1378,30 @@ mod tests {
         // ASCII filter over a non-ASCII path also uses the fallback.
         assert_eq!(matching("RGER"), ["docs/Ärger.md"]);
         assert!(matching("arg").is_empty());
+    }
+
+    #[test]
+    fn ascii_filter_matches_to_lowercase_across_search_paths() {
+        let repeated = format!("src/generated/{}.rs", "Aa".repeat(90));
+        let mut scratch = String::new();
+        for haystack in [repeated.as_str(), "src/AAAAAAAAB.rs", "README.md", ""] {
+            for needle in [
+                "",
+                "a",
+                "aaab",
+                "aaaab",
+                "aaaaaaaab",
+                "aaaabaaaa",
+                "readme",
+                "工具",
+            ] {
+                assert_eq!(
+                    contains_case_insensitive(haystack, needle, &mut scratch),
+                    haystack.to_lowercase().contains(needle),
+                    "haystack={haystack:?} needle={needle:?}"
+                );
+            }
+        }
     }
 
     #[test]
