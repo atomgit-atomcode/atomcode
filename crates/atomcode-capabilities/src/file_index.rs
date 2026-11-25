@@ -215,6 +215,9 @@ pub fn split_token(token: &str) -> (String, String) {
 /// Sorted direct-children-first, dirs-before-files, then alphabetical. Capped at 30.
 pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<Entry> {
     let filter_lower = filter.to_lowercase();
+    // Reused by the Unicode fallback, so one keystroke allocates at most once
+    // instead of once per non-ASCII candidate.
+    let mut lower_scratch = String::new();
     let scope_depth = if scope_dir.is_empty() {
         0
     } else {
@@ -240,7 +243,7 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
             }
         } else {
             let after_scope = &entry.rel_path[scope_dir.len()..];
-            if !contains_case_insensitive(after_scope, &filter_lower) {
+            if !contains_case_insensitive(after_scope, &filter_lower, &mut lower_scratch) {
                 continue;
             }
         }
@@ -341,15 +344,23 @@ impl Ord for RankedEntry {
 /// Case-insensitive substring test for the filter.
 ///
 /// The popup runs this once per candidate on every keystroke, so the common
-/// ASCII case must not allocate. Any non-ASCII byte falls back to
-/// `to_lowercase`, which preserves Unicode case folding exactly. The ASCII
-/// path compares bytes, so multi-byte sequences are never split.
-fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+/// ASCII case must not allocate. Any non-ASCII byte falls back to Unicode case
+/// folding, which must stay exactly equal to `haystack.to_lowercase()`. A path
+/// that folding leaves unchanged (CJK, digits, already-lowercase text) is
+/// compared directly. Otherwise `scratch` holds the folded path, so a keystroke
+/// allocates at most once instead of once per candidate. The ASCII path compares
+/// bytes, so multi-byte sequences are never split.
+fn contains_case_insensitive(haystack: &str, needle_lower: &str, scratch: &mut String) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
     if !(haystack.is_ascii() && needle_lower.is_ascii()) {
-        return haystack.to_lowercase().contains(needle_lower);
+        if is_lowercase_invariant(haystack) {
+            return haystack.contains(needle_lower);
+        }
+        scratch.clear();
+        scratch.extend(haystack.chars().flat_map(char::to_lowercase));
+        return scratch.contains(needle_lower);
     }
     let haystack = haystack.as_bytes();
     let needle = needle_lower.as_bytes();
@@ -358,6 +369,19 @@ fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
     };
     haystack.windows(needle.len()).any(|window| {
         window[0].eq_ignore_ascii_case(&first) && window[1..].eq_ignore_ascii_case(rest)
+    })
+}
+
+/// Whether Unicode lowercasing leaves `text` byte-for-byte unchanged.
+///
+/// This is the no-allocation condition for the fallback: when it holds,
+/// `text.contains(needle)` equals `text.to_lowercase().contains(needle)` for an
+/// already-lowercased needle. Multi-character lowercase expansions (`İ` → `i`
+/// plus a combining dot) count as a change, so those still take `scratch`.
+fn is_lowercase_invariant(text: &str) -> bool {
+    text.chars().all(|c| {
+        let mut lower = c.to_lowercase();
+        lower.next() == Some(c) && lower.next().is_none()
     })
 }
 
@@ -1329,6 +1353,38 @@ mod tests {
         // ASCII filter over a non-ASCII path also uses the fallback.
         assert_eq!(matching("RGER"), ["docs/Ärger.md"]);
         assert!(matching("arg").is_empty());
+    }
+
+    #[test]
+    fn unicode_fallback_matches_to_lowercase() {
+        let cases = [
+            ("docs/Ärger.md", "ärger"),
+            ("docs/ÄRGER.MD", "ärger"),
+            // 'İ' lowercases to 'i' plus a combining dot.
+            ("İstanbul.md", "i\u{307}stanbul"),
+            ("ẞ.md", "ß"),
+            ("ΣΟΦΟΣ.md", "σοφοσ"),
+            ("目录/文件.rs", "文件"),
+            ("already/ärger.md", "ärger"),
+            ("docs/Ärger.md", "rger"),
+        ];
+        // One scratch buffer is shared across every candidate.
+        let mut scratch = String::new();
+        for (haystack, needle) in cases {
+            assert_eq!(
+                contains_case_insensitive(haystack, needle, &mut scratch),
+                haystack.to_lowercase().contains(needle),
+                "haystack={haystack:?} needle={needle:?}"
+            );
+        }
+        // Reuse must not leak the previous candidate into the next match.
+        assert!(contains_case_insensitive("Ärger.md", "ärger", &mut scratch));
+        assert!(!contains_case_insensitive("ärger.md", "xyz", &mut scratch));
+
+        assert!(is_lowercase_invariant("目录/文件.rs"));
+        assert!(is_lowercase_invariant("already/ärger.md"));
+        assert!(!is_lowercase_invariant("docs/Ärger.md"));
+        assert!(!is_lowercase_invariant("İstanbul.md"));
     }
 
     // ---- FileIndex.walk (real tempdir) ----
