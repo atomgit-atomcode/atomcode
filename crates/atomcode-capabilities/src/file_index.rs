@@ -317,13 +317,18 @@ impl PartialOrd for RankedEntry {
 
 impl Ord for RankedEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        rank_entries(
-            &self.entry,
-            self.index,
-            &other.entry,
-            other.index,
-            self.scope_depth,
-        )
+        // The scope is part of the order so a cross-scope comparison stays
+        // antisymmetric. Within one `filter_entries` call every element has
+        // the same scope, so this key is equal and does not change results.
+        self.scope_depth.cmp(&other.scope_depth).then_with(|| {
+            rank_entries(
+                &self.entry,
+                self.index,
+                &other.entry,
+                other.index,
+                self.scope_depth,
+            )
+        })
     }
 }
 
@@ -1214,6 +1219,33 @@ mod tests {
             rank_entries(&duplicate, 1, &entry, 0, 0),
             std::cmp::Ordering::Greater
         );
+    }
+
+    #[test]
+    fn ranked_entry_ord_is_antisymmetric_across_scope_depths() {
+        // Without the scope key both directions rank Less: `shallow` treats
+        // its own depth as direct, and `deep` treats its own depth as direct.
+        let shallow = RankedEntry {
+            entry: Entry {
+                rel_path: "shallow".into(),
+                is_dir: false,
+                depth: 1,
+            },
+            index: 0,
+            scope_depth: 0,
+        };
+        let deep = RankedEntry {
+            entry: Entry {
+                rel_path: "deep".into(),
+                is_dir: false,
+                depth: 2,
+            },
+            index: 1,
+            scope_depth: 1,
+        };
+
+        assert_eq!(shallow.cmp(&deep), std::cmp::Ordering::Less);
+        assert_eq!(shallow.cmp(&deep), deep.cmp(&shallow).reverse());
     }
 
     #[test]
