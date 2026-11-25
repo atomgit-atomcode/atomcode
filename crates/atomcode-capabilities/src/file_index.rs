@@ -354,30 +354,36 @@ fn contains_case_insensitive(haystack: &str, needle_lower: &str, scratch: &mut S
     if needle_lower.is_empty() {
         return true;
     }
-    if !(haystack.is_ascii() && needle_lower.is_ascii()) {
-        if is_lowercase_invariant(haystack) {
-            return haystack.contains(needle_lower);
+    if haystack.is_ascii() {
+        if !needle_lower.is_ascii() {
+            // Lowercasing an ASCII haystack stays ASCII, so a non-ASCII
+            // needle cannot match. This also keeps a non-ASCII filter over a
+            // large ASCII index from folding every candidate.
+            return false;
         }
-        scratch.clear();
-        if haystack.contains('Σ') {
-            // `str::to_lowercase` applies the Unicode Final_Sigma rule
-            // (Σ → ς at a word end); `char::to_lowercase` always yields σ.
-            // Delegate the contextual fold to std. Only paths with an
-            // uppercase sigma pay this extra temporary allocation.
-            scratch.push_str(&haystack.to_lowercase());
-        } else {
-            scratch.extend(haystack.chars().flat_map(char::to_lowercase));
-        }
-        return scratch.contains(needle_lower);
+        let haystack = haystack.as_bytes();
+        let needle = needle_lower.as_bytes();
+        let Some((&first, rest)) = needle.split_first() else {
+            return true;
+        };
+        return haystack.windows(needle.len()).any(|window| {
+            window[0].eq_ignore_ascii_case(&first) && window[1..].eq_ignore_ascii_case(rest)
+        });
     }
-    let haystack = haystack.as_bytes();
-    let needle = needle_lower.as_bytes();
-    let Some((&first, rest)) = needle.split_first() else {
-        return true;
-    };
-    haystack.windows(needle.len()).any(|window| {
-        window[0].eq_ignore_ascii_case(&first) && window[1..].eq_ignore_ascii_case(rest)
-    })
+    if is_lowercase_invariant(haystack) {
+        return haystack.contains(needle_lower);
+    }
+    scratch.clear();
+    if haystack.contains('Σ') {
+        // `str::to_lowercase` applies the Unicode Final_Sigma rule
+        // (Σ → ς at a word end); `char::to_lowercase` always yields σ.
+        // Delegate the contextual fold to std. Only paths with an
+        // uppercase sigma pay this extra temporary allocation.
+        scratch.push_str(&haystack.to_lowercase());
+    } else {
+        scratch.extend(haystack.chars().flat_map(char::to_lowercase));
+    }
+    scratch.contains(needle_lower)
 }
 
 /// Whether Unicode lowercasing leaves `text` byte-for-byte unchanged.
@@ -1373,14 +1379,18 @@ mod tests {
             ("ẞ.md", "ß"),
             // Σ before `.` then a cased letter is not word-final: σ.
             ("ΣΟΦΟΣ.md", "σοφοσ"),
+            ("ΑΣ.Α", "ασ.α"),
             // Σ at a word end folds to ς, like `str::to_lowercase`.
             ("docs/ΣΟΦΟΣ", "σοφος"),
             ("AΣ", "ας"),
-            // `_` is case-ignorable, so the following Α makes Σ word-final.
+            // `_` is ExtendNumLet, not Case_Ignorable, so it is not cased.
+            // Σ after the last cased letter is word-final: ς.
             ("ΑΣ_Α", "ας_α"),
             ("目录/文件.rs", "文件"),
             ("already/ärger.md", "ärger"),
             ("docs/Ärger.md", "rger"),
+            // ASCII haystack, non-ASCII needle: no match, no folding.
+            ("docs/README.md", "文件"),
         ];
         // One scratch buffer is shared across every candidate.
         let mut scratch = String::new();
