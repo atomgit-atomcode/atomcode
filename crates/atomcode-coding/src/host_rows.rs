@@ -252,8 +252,10 @@ impl Plugin for SessionNativePlugin {
 pub struct HostHooks {
     hooks: RwLock<BTreeMap<String, Arc<dyn LifecycleHooks>>>,
     /// The log's projection with its stats, for the request being made — see
-    /// [`HostHooks::logged_view`].
-    logged_view: Mutex<Option<(LoggedViewKey, Arc<Vec<Message>>)>>,
+    /// [`HostHooks::logged_view`]. Weak: the bridges of the request in flight
+    /// hold it, and it goes with them instead of sitting beside the log as one
+    /// more copy of the whole conversation between requests.
+    logged_view: Mutex<Option<(LoggedViewKey, std::sync::Weak<Vec<Message>>)>>,
 }
 
 /// Which request a [`HostHooks::logged_view`] was made for: the session, how
@@ -296,12 +298,12 @@ impl HostHooks {
         let key = (log.id().to_string(), log.last_seq(), turn, round);
         let mut cached = self.logged_view.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, view)) = cached.as_ref() {
-            if *at == key {
-                return view.clone();
+            if let Some(view) = view.upgrade().filter(|_| *at == key) {
+                return view;
             }
         }
-        let view = Arc::new(derive_messages_with_meta(&log.events()));
-        *cached = Some((key, view.clone()));
+        let view = Arc::new(log.read_events(derive_messages_with_meta));
+        *cached = Some((key, Arc::downgrade(&view)));
         view
     }
 
@@ -3698,6 +3700,34 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    /// One projection for every bridge of a request, and none left over once
+    /// the request lets go of it: between requests the log is the only copy.
+    #[test]
+    fn the_logged_view_is_shared_by_a_request_and_released_after_it() {
+        use super::{HostHooks, SessionEvent, SessionLog};
+        use std::sync::Arc;
+        let hooks = HostHooks::new();
+        let log = SessionLog::new("view");
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "看看".into(),
+            images: vec![],
+        });
+
+        let outer = hooks.logged_view(&log, 1, 1);
+        let inner = hooks.logged_view(&log, 1, 1);
+        assert!(Arc::ptr_eq(&outer, &inner), "the bridges share one view");
+        drop((outer, inner));
+        let (_, kept) = hooks.logged_view.lock().unwrap().clone().unwrap();
+        assert!(
+            kept.upgrade().is_none(),
+            "nothing holds it after the request"
+        );
+
+        let next = hooks.logged_view(&log, 1, 2);
+        assert_eq!(next.len(), 1, "a later request projects the log again");
+    }
+
     #[test]
     fn the_stub_budget_is_described_as_clamped() {
         let row = super::CodingCompaction {
