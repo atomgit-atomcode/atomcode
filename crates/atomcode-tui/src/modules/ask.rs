@@ -289,12 +289,13 @@ fn question_rows(
                 role: Role::Accent,
             });
             // Keep room for the answers, their blank, the legend and the panel's
-            // foot, so a long command (a heredoc) WRAPS into what is left rather
-            // than shoving the options off the panel. Whatever fits is the full
-            // command; past the budget a single `…` says the rest is there — the
-            // exact bytes still execute, this is what the reader is shown of
-            // them.
-            let keep = slots.len() + 4;
+            // foot — `slots.len() + 3`, one row each, counted once — so a long
+            // command (a heredoc) WRAPS into what is left rather than shoving
+            // the options off the panel. Reserving the foot twice leaves the
+            // command one row short while the legend and the foot stay up:
+            // chrome paid for with the words under review — see
+            // `a_short_panel_keeps_the_whole_command_above_its_foot`.
+            let keep = slots.len() + 3;
             let budget = h.saturating_sub(rows.len().saturating_add(keep)).max(1);
             let mut used = 0usize;
             let mut clipped = false;
@@ -1072,6 +1073,42 @@ mod tests {
         assert!(
             shortest.iter().any(|r| r.contains("yes")) && shortest.iter().any(|r| r.contains("no")),
             "both answers are still up: {shortest:#?}"
+        );
+    }
+
+    /// A short panel does not buy its foot with the command being approved.
+    ///
+    /// The foot is chrome and the command is the thing a person is being asked
+    /// about. On a 60×11 rect a three-line command, its three options, the
+    /// legend and the foot all fit once the edge goes, so the budget in
+    /// `question_rows` must reserve the foot exactly once — reserving it twice
+    /// (`slots + 4`) clips the command to two lines and a `…` while the legend
+    /// and the foot keep their rows: chrome paid for with the words under
+    /// review. See the salvage order in [`fit`].
+    #[test]
+    fn a_short_panel_keeps_the_whole_command_above_its_foot() {
+        let command = "echo one\necho two\necho three";
+        let args = serde_json::json!({ "command": command }).to_string();
+        let lines = drawn(&asking(approval(None, "bash", &args, Some("")), 0), 60, 11);
+        let body = lines.join("\n");
+        assert_eq!(lines.len(), 11, "{lines:#?}");
+        for line in command.lines() {
+            assert!(
+                body.contains(line),
+                "`{line}` is on screen, the command is not clipped: {lines:#?}"
+            );
+        }
+        assert!(
+            !body.contains('…'),
+            "nothing of the command was traded for chrome: {lines:#?}"
+        );
+        // And the fix this PR is about still holds: the legend has its own row
+        // and the row under it is blank, so the status line below stays apart.
+        assert!(body.contains("选择"), "the legend is still up: {lines:#?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(""),
+            "the foot still separates the legend from the status line: {lines:#?}"
         );
     }
 
