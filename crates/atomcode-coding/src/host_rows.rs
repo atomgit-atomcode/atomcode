@@ -257,8 +257,10 @@ pub struct HostHooks {
 }
 
 /// Which request a [`HostHooks::logged_view`] was made for: the session, how
-/// far its log had got, and the turn and round asking.
-type LoggedViewKey = (String, usize, u64, u32);
+/// far its log had got (its last sequence number — a length can come back to
+/// an earlier value once a round's chunks leave the log), and the turn and
+/// round asking.
+type LoggedViewKey = (String, u64, u64, u32);
 
 impl HostHooks {
     pub fn new() -> Arc<Self> {
@@ -291,7 +293,7 @@ impl HostHooks {
     /// some path the key does not see costs nothing worse than the stats:
     /// [`with_logged_meta`] only lends them to messages that line up.
     fn logged_view(&self, log: &SessionLog, turn: u64, round: u32) -> Arc<Vec<Message>> {
-        let key = (log.id().to_string(), log.len(), turn, round);
+        let key = (log.id().to_string(), log.last_seq(), turn, round);
         let mut cached = self.logged_view.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, view)) = cached.as_ref() {
             if *at == key {

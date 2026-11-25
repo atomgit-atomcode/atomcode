@@ -2050,4 +2050,56 @@ mod content_deadline_tests {
             _ => panic!("expected partial reply"),
         }
     }
+
+    /// A round's chunks leave memory once its message is in, yet a later round
+    /// cut off mid-stream still has every chunk it needs to become the
+    /// `PartialReply` a cancel commits — that is decided before `TurnEnd`.
+    #[test]
+    fn a_cancel_after_settled_rounds_still_finds_its_partial_reply() {
+        let log = SessionLog::new("settled-then-cancelled");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        for word in ["读", "文件"] {
+            log.append(SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: word.into(),
+                reasoning: false,
+            });
+        }
+        log.append(SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "读文件".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            reasoning_blocks: vec![],
+            meta: None,
+        });
+        for word in ["改到", "一半"] {
+            log.append(SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 2,
+                delta: word.into(),
+                reasoning: false,
+            });
+        }
+
+        assert!(
+            log.events()
+                .iter()
+                .all(|e| !matches!(e.event, SessionEvent::AssistantChunk { round: 1, .. })),
+            "the settled round keeps no chunks"
+        );
+        match partial_reply(&log.events(), 1).unwrap() {
+            SessionEvent::PartialReply { text, .. } => assert_eq!(text, "改到一半"),
+            other => panic!("expected partial reply, got {other:?}"),
+        }
+
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Cancelled,
+            error: None,
+        });
+        assert!(log.events().iter().all(|e| !e.event.is_transient()));
+    }
 }

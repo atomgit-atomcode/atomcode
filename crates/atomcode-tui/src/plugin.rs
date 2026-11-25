@@ -1001,6 +1001,9 @@ impl AgentClient {
             at: committed.at,
             event: committed.event.clone(),
         });
+        // Same rule as the agent's own log: what is drawn from here later is
+        // what a resumed session draws, without the settled rounds' chunks.
+        atomcode_kernel::session::settle_transients(&mut view.events);
         on_screen
     }
 
@@ -20378,6 +20381,56 @@ mod display_history_tests {
             101
         );
         assert_eq!(views.sessions["lead"].history_request, None);
+    }
+    /// The view kept for redrawing a session holds what a resumed one would:
+    /// a round's deltas go once its message arrives, those still streaming stay.
+    #[test]
+    fn the_kept_view_drops_a_rounds_chunks_once_its_message_is_in() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow("lead");
+        let mut seq = 0;
+        let mut keep = |event: SessionEvent| {
+            seq += 1;
+            tui.client.keep(&Committed {
+                session: "lead".into(),
+                seq,
+                at: seq,
+                event,
+            });
+        };
+        let chunk = |round| SessionEvent::AssistantChunk {
+            turn: 1,
+            round,
+            delta: "字".into(),
+            reasoning: false,
+        };
+        keep(SessionEvent::TurnStart { turn: 1 });
+        for _ in 0..500 {
+            keep(chunk(1));
+        }
+        keep(SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "字".repeat(500),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            reasoning_blocks: vec![],
+            meta: None,
+        });
+        keep(chunk(2));
+
+        let kinds: Vec<_> = tui
+            .client
+            .events()
+            .into_iter()
+            .map(|e| match e.event {
+                SessionEvent::TurnStart { .. } => "start",
+                SessionEvent::AssistantMessage { .. } => "message",
+                SessionEvent::AssistantChunk { round: 2, .. } => "streaming",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["start", "message", "streaming"]);
     }
     #[test]
     fn the_status_directory_follows_the_member_on_screen() {

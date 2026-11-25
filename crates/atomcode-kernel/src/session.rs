@@ -740,6 +740,50 @@ pub struct LoggedEvent {
     pub event: SessionEvent,
 }
 
+/// Drop the transient facts the newest fact of an in-memory log makes
+/// redundant. Call it after each append.
+///
+/// Chunks exist for a live view of a round that is still streaming, and to
+/// rebuild what an interrupted round said (`PartialReply`). Once the round has
+/// its `AssistantMessage`, or the turn its `TurnEnd`, neither needs them — and a
+/// log that keeps every delta of a long session holds hundreds of megabytes the
+/// session file never had. What remains is the shape a resumed log has: the
+/// file never stored them. Durable facts and their order are untouched, so a
+/// sequence-number cursor stays valid; a cursor counting positions does not.
+///
+/// Only the tail after the turn's `TurnStart` is scanned: a settled turn's
+/// chunks never come before it.
+pub fn settle_transients(events: &mut Vec<LoggedEvent>) {
+    let (turn, round) = match events.last().map(|logged| &logged.event) {
+        Some(SessionEvent::AssistantMessage { turn, round, .. }) => (*turn, Some(*round)),
+        Some(SessionEvent::TurnEnd { turn, .. }) => (*turn, None),
+        _ => return,
+    };
+    let start = events
+        .iter()
+        .rposition(
+            |logged| matches!(logged.event, SessionEvent::TurnStart { turn: t } if t == turn),
+        )
+        .unwrap_or(0);
+    let redundant = |event: &SessionEvent| match event {
+        SessionEvent::AssistantChunk {
+            turn: t, round: r, ..
+        }
+        | SessionEvent::ReasoningDiscarded { turn: t, round: r } => {
+            *t == turn && round.is_none_or(|round| *r == round)
+        }
+        _ => false,
+    };
+    if !events[start..]
+        .iter()
+        .any(|logged| redundant(&logged.event))
+    {
+        return;
+    }
+    let tail: Vec<LoggedEvent> = events.drain(start..).collect();
+    events.extend(tail.into_iter().filter(|logged| !redundant(&logged.event)));
+}
+
 /// A committed fact, broadcast with the session it belongs to.
 ///
 /// The id is not decoration. One process runs more than one log — a delegated
