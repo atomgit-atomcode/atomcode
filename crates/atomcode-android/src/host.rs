@@ -250,41 +250,47 @@ impl AgentServer {
         // written here (see [`crate::shims`]). On a desktop build there is no
         // bundle and this is a no-op.
         if let Some(native_lib_dir) = &options.native_lib_dir {
-            match crate::shims::install(native_lib_dir, &options.data_dir, &options.helper_lib_dirs)
-            {
-                Some(installed) => {
-                    match &installed.git_version {
-                        Ok(version) => tracing::info!(
-                            git = %version,
-                            bin = %installed.bin_dir.display(),
-                            "bundled git is available"
-                        ),
-                        Err(error) => tracing::warn!(
+            let installed =
+                crate::shims::install(native_lib_dir, &options.data_dir, &options.helper_lib_dirs);
+            match &installed.git_version {
+                Ok(version) => tracing::info!(
+                    git = %version,
+                    bin = %installed.bin_dir.display(),
+                    "bundled git is available"
+                ),
+                Err(error) => {
+                    // Two different problems, and the fix differs: one is a
+                    // build that never packaged git, the other is a git that is
+                    // packaged but cannot run here.
+                    if native_lib_dir.join(crate::shims::GIT_LIB).is_file() {
+                        tracing::warn!(
                             %error,
                             bin = %installed.bin_dir.display(),
                             "the bundled git is installed but cannot run: git-dependent features \
                              (agent `bash` git, session rewind) will fail"
-                        ),
-                    }
-                    // The helper APK is optional; say which of its tools are on
-                    // PATH so a missing `make` is explained rather than mysterious.
-                    if installed.helper_tools.is_empty() {
-                        tracing::info!(
-                            "helper APK tools are unavailable (install com.atomcode.tools to get \
-                             make and a C compiler)"
                         );
                     } else {
-                        tracing::info!(
-                            tools = %installed.helper_tools.join(","),
-                            "helper APK tools are available"
+                        tracing::warn!(
+                            %error,
+                            lib = %native_lib_dir.display(),
+                            "no bundled git in the APK: build it with scripts/build-android-git.sh; \
+                             git-dependent features will fail"
                         );
                     }
                 }
-                None => tracing::warn!(
-                    lib = %native_lib_dir.display(),
-                    "no bundled git in the APK: build it with scripts/build-android-git.sh; \
-                     git-dependent features will fail"
-                ),
+            }
+            // The helper APK is optional; say which of its tools are on
+            // PATH so a missing `make` is explained rather than mysterious.
+            if installed.helper_tools.is_empty() {
+                tracing::info!(
+                    "helper APK tools are unavailable (install com.atomcode.tools to get \
+                     make and a C compiler)"
+                );
+            } else {
+                tracing::info!(
+                    tools = %installed.helper_tools.join(","),
+                    "helper APK tools are available"
+                );
             }
         }
 

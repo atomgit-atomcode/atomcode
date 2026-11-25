@@ -50,6 +50,9 @@ pub struct InstalledTools {
     pub lib_dir: PathBuf,
     /// `git --version` through the `PATH` entry, or why it could not run — the
     /// one line that tells a person whether the bundle actually works here.
+    ///
+    /// A build that ships no bundled git reports why here; the rest of the
+    /// wiring (provider tools, CA bundle, `HOME`) still happened.
     pub git_version: Result<String, String>,
     /// The extra command-line tools this build ships, and whether each one
     /// actually runs here. A phone has no package manager, so a tool that is
@@ -334,27 +337,92 @@ fn write_links(lib_dir: &Path, bin_dir: &Path) -> std::io::Result<()> {
             continue;
         }
         let link = bin_dir.join(name);
+        let target = target_for(name, lib_dir);
+        // A name this build cannot resolve must NOT resolve. The link an
+        // earlier install left behind goes away rather than pointing at a
+        // library directory the platform has since deleted — a dangling link
+        // fails at `exec` with "No such file or directory" and takes the tool
+        // with it.
+        if !target.is_file() {
+            let _ = std::fs::remove_file(&link);
+            continue;
+        }
         // A stale link from an older layout is removed first; `symlink` would
         // otherwise fail with EEXIST.
         let _ = std::fs::remove_file(&link);
-        symlink(&target_for(name, lib_dir), &link)?;
+        symlink(&target, &link)?;
     }
     for (name, lib) in EXTRA_TOOLS {
-        // A build may ship only some of them; a missing library is simply not
-        // linked, so the name stays unresolved (and the tool is reported as
-        // unavailable rather than failing at exec time).
+        // A build may ship only some of them. A missing library means the name
+        // must NOT resolve — so the link an earlier install left behind goes
+        // away, rather than pointing at whatever that install's library
+        // directory was. (That directory is deleted when the platform updates
+        // the APK, so the link would dangle: `exec` reports "No such file or
+        // directory" and the tool is silently unusable.)
         if claimed_by_package(bin_dir, name) {
             continue;
         }
+        let link = bin_dir.join(name);
         let target = lib_dir.join(lib);
         if !target.is_file() {
+            let _ = std::fs::remove_file(&link);
             continue;
         }
-        let link = bin_dir.join(name);
         let _ = std::fs::remove_file(&link);
         symlink(&target, &link)?;
     }
     Ok(())
+}
+
+/// Remove the links in `bin_dir` whose target no longer exists.
+///
+/// A link is written pointing into an APK's `nativeLibraryDir`, and the
+/// platform gives every app update a fresh directory (`/data/app/~~<hash>==/`)
+/// and deletes the old one. A link written by the previous install is then
+/// dangling: `exec` fails with "No such file or directory" and the tool it
+/// named is simply gone — with no error anywhere that says so.
+///
+/// The names this host owns are the ones it writes, so they are the ones
+/// checked. A link a runtime package owns (see [`claimed_by_package`]) is
+/// left alone: it points into that package's own directory, which the
+/// platform keeps for as long as the package is installed.
+///
+/// A link whose target is merely unreadable (a permission the app does not
+/// have) still counts as present: it is not dangling, and removing it would
+/// take away a link that still works.
+fn remove_dangling_links(bin_dir: &Path) {
+    for name in PROGRAMS
+        .iter()
+        .copied()
+        .chain(EXTRA_TOOLS.iter().map(|(name, _)| *name))
+        .chain(HELPER_TOOLS.iter().map(|(name, _)| *name))
+        .chain(PROVIDER_TOOLS.iter().map(|(name, _)| *name))
+    {
+        let link = bin_dir.join(name);
+        // A package that took this name over owns it now.
+        if claimed_by_package(bin_dir, name) {
+            continue;
+        }
+        // `symlink_metadata` reads the link itself; `exists` would follow it
+        // and report "missing" for a dangling link — which is exactly the case
+        // being looked for.
+        let Ok(metadata) = std::fs::symlink_metadata(&link) else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        // `metadata` follows the link, so it answers "does the target still
+        // exist". Only `NotFound` means the target is gone: any other error
+        // (a permission the app does not have) means the link is fine and
+        // removing it would take away a working tool.
+        match std::fs::metadata(&link) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        let _ = std::fs::remove_file(&link);
+    }
 }
 
 #[cfg(unix)]
@@ -367,30 +435,44 @@ fn symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
-/// Wire the bundled git into this process.
+/// Wire the bundled tools into this process.
 ///
 /// `data_dir` holds the `PATH` directory, the default gitconfig and the CA
 /// bundle. `HOME` becomes `data_dir` when it is unset: a phone has no `/home`,
 /// and an unset `HOME` would send git's config lookups to `/`.
 ///
-/// Returns `None` on a build without the bundled git (the desktop case), in
-/// which case the environment is left untouched.
+/// None of this depends on the build shipping a bundled git. A build without
+/// one still needs the provider tools on `PATH`, the CA bundle for TLS, `HOME`
+/// for the credential store and `LD_LIBRARY_PATH` for the provider binaries'
+/// own libraries — so none of it is gated on it. What the bundled git decides
+/// is only whether `git` itself resolves.
 pub fn install(
     native_lib_dir: &Path,
     data_dir: &Path,
     provider_lib_dirs: &[PathBuf],
-) -> Option<InstalledTools> {
-    if !native_lib_dir.join(GIT_LIB).is_file() {
-        return None;
-    }
-
+) -> InstalledTools {
     let bin_dir = data_dir.join("bin");
+
+    // Links written by an earlier install can point at a directory the
+    // platform has since deleted — see [`remove_dangling_links`]. They go
+    // before anything is written.
+    remove_dangling_links(&bin_dir);
+
+    // This build's own tools. A tool this APK does not ship gets no link, and
+    // the one an earlier version left behind is removed — see [`write_links`].
     if let Err(error) = write_links(native_lib_dir, &bin_dir) {
-        tracing::warn!(%error, dir = %bin_dir.display(), "could not link the bundled git");
-        return None;
+        tracing::warn!(%error, dir = %bin_dir.display(), "could not link the bundled tools");
     }
 
+    // The provider tools (make, bash, clang, …) come from other APKs; they do
+    // not depend on this one shipping git.
+    let helper_tools = link_helper_tools(provider_lib_dirs, data_dir);
+
+    // `PATH` carries the bin directory even when nothing was linked into it:
+    // the provider tools live there, and they are what a build without a
+    // bundled git still has.
     prepend_path(&bin_dir);
+
     std::env::set_var("GIT_EXEC_PATH", native_lib_dir);
     // `git init`/`clone` copy the template dir (hooks, description) into the new
     // repository. Git's compiled-in path points at an install prefix we did not
@@ -423,9 +505,6 @@ pub fn install(
 
     let git_version = probe_version(&bin_dir);
     let extra_tools = probe_extra_tools(&bin_dir);
-    // The helper APK's binaries are linked last: it is optional, and its absence
-    // is normal rather than an error.
-    let helper_tools = link_helper_tools(provider_lib_dirs, data_dir);
     // Provider binaries share their directory with their runtime libraries
     // (libLLVM, libicu, libc++_shared …), but the loader only searches the
     // executable's RUNPATH — which these binaries set to the Termux prefix on a
@@ -575,13 +654,13 @@ pub fn install(
         );
         std::env::set_var("LD_LIBRARY_PATH", lib_dirs.join(":"));
     }
-    Some(InstalledTools {
+    InstalledTools {
         bin_dir,
         lib_dir: native_lib_dir.to_path_buf(),
         git_version,
         extra_tools,
         helper_tools,
-    })
+    }
 }
 
 /// Probe each bundled extra tool through the `PATH` entry, so the report says
@@ -766,13 +845,51 @@ fn ca_env_vars(bundle: &Path) -> Vec<(&'static str, PathBuf)> {
 mod tests {
     use super::*;
 
+    /// `install` writes process-global environment variables (`PATH`, `HOME`,
+    /// `LD_LIBRARY_PATH`, …), so two tests calling it at once would read each
+    /// other's values. This serializes them.
+    ///
+    /// Only the unix tests call `install` (the provider tools are linked
+    /// through symlinks), so on Windows this would be dead code.
+    #[cfg(unix)]
+    fn install_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // A build without a bundled git still wires the rest: the provider tools
+    // need to be on `PATH`, TLS needs the CA bundle, and `HOME` needs to point
+    // at the product tree. None of that depends on this APK shipping git.
+    //
+    // The provider tool is linked through a symlink, so this is a unix test.
+    #[cfg(unix)]
     #[test]
-    fn a_build_without_the_bundle_changes_nothing() {
+    fn a_build_without_the_bundle_still_wires_the_provider_tools() {
+        let _guard = install_lock();
         let work = tempfile::tempdir().unwrap();
         let lib = work.path().join("lib");
+        let tools = work.path().join("tools");
         std::fs::create_dir_all(&lib).unwrap();
-        assert!(install(&lib, work.path(), &[]).is_none());
-        assert!(!work.path().join("bin").exists());
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("libmake.so"), b"binary").unwrap();
+
+        let installed = install(&lib, work.path(), &[tools]);
+
+        // The provider tool is on `PATH` even though this build ships no git.
+        assert!(
+            installed.helper_tools.contains(&"make".to_string()),
+            "{:?}",
+            installed.helper_tools
+        );
+        assert!(
+            installed.bin_dir.join("make").exists(),
+            "the provider tool must be linked into the bin directory"
+        );
+        // `git` is not there, and the failure says so rather than pretending.
+        assert!(installed.git_version.is_err());
+        // `HOME` is set regardless of the bundled git — the credential store
+        // resolves `~/.git-credentials` from it.
+        assert_eq!(std::env::var("HOME").ok().as_deref(), work.path().to_str());
     }
 
     // A package that took a host name over must keep it across a restart: the
@@ -787,12 +904,13 @@ mod tests {
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(lib.join(PYTHON3_LIB), b"stub").unwrap();
+        std::fs::write(lib.join(GIT_LIB), b"binary").unwrap();
         // The daemon records the takeover beside `bin/`.
         let overrides = work.path().join(".bin-overrides");
         std::fs::create_dir_all(&overrides).unwrap();
         std::fs::write(overrides.join("python3"), "libpython3.so").unwrap();
         // The package's own link is already in place.
-        symlink("pluginhost", &bin.join("python3")).unwrap();
+        symlink(Path::new("pluginhost"), &bin.join("python3")).unwrap();
 
         write_links(&lib, &bin).unwrap();
 
@@ -812,6 +930,10 @@ mod tests {
         let lib = work.path().join("lib");
         let bin = work.path().join("bin");
         std::fs::create_dir_all(&lib).unwrap();
+        // A name is linked only when the library it points at is there, so the
+        // libraries are created before the links are written.
+        std::fs::write(lib.join(GIT_LIB), b"binary").unwrap();
+        std::fs::write(lib.join(GIT_REMOTE_HTTPS_LIB), b"binary").unwrap();
         write_links(&lib, &bin).unwrap();
         for name in PROGRAMS {
             let link = bin.join(name);
@@ -1057,6 +1179,120 @@ mod tests {
                 .map(|(_, value)| value.clone())
                 .unwrap_or_else(|| panic!("{wanted} must be set for the bundled clients"));
             assert_eq!(value, bundle, "{wanted} must point at the CA bundle");
+        }
+    }
+
+    // The platform gives every app update a fresh `/data/app/~~<hash>==/`
+    // directory and deletes the old one. A link written by the previous install
+    // is then dangling, and `exec` fails with "No such file or directory" —
+    // the tool is simply gone, with nothing saying so.
+    //
+    // This is the shape that was found on a device: the APK that stopped
+    // shipping git left twelve links pointing at the deleted install
+    // directory, and `git`, `curl`, `jq`, `rg`, `python3` and `pluginhost`
+    // were all unusable.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_whose_target_is_gone_is_removed() {
+        let work = tempfile::tempdir().unwrap();
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // The previous install's library directory, which the platform deleted.
+        let gone = work.path().join("old-install/lib");
+        let target = gone.join(GIT_LIB);
+        symlink(&target, &bin.join("git")).unwrap();
+        symlink(&gone.join(CURL_LIB), &bin.join("curl")).unwrap();
+        assert!(
+            !bin.join("git").exists(),
+            "the fixture must be a dangling link to start with"
+        );
+
+        remove_dangling_links(&bin);
+
+        assert!(
+            !bin.join("git").exists() && bin.join("git").symlink_metadata().is_err(),
+            "a link to a deleted directory must be removed"
+        );
+        assert!(
+            bin.join("curl").symlink_metadata().is_err(),
+            "a link to a deleted directory must be removed"
+        );
+    }
+
+    // The other half of the contract: a link that still resolves must survive.
+    // Removing it would take away a working tool to fix a broken one.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_whose_target_still_exists_is_kept() {
+        let work = tempfile::tempdir().unwrap();
+        let lib = work.path().join("lib");
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(lib.join(GIT_LIB), b"binary").unwrap();
+        symlink(&lib.join(GIT_LIB), &bin.join("git")).unwrap();
+
+        remove_dangling_links(&bin);
+
+        assert_eq!(
+            std::fs::read_link(bin.join("git")).unwrap(),
+            lib.join(GIT_LIB),
+            "a working link must not be touched"
+        );
+    }
+
+    // A name a runtime package took over points into that package's own
+    // directory. The host does not own it and must not remove it, dangling or
+    // not — the package is what decides.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_a_package_claimed_is_not_removed_even_when_dangling() {
+        let work = tempfile::tempdir().unwrap();
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let overrides = work.path().join(".bin-overrides");
+        std::fs::create_dir_all(&overrides).unwrap();
+        std::fs::write(overrides.join("python3"), "libpython3.so").unwrap();
+        symlink(
+            &work.path().join("gone/libpython3.so"),
+            &bin.join("python3"),
+        )
+        .unwrap();
+
+        remove_dangling_links(&bin);
+
+        assert!(
+            bin.join("python3").symlink_metadata().is_ok(),
+            "a package's own link is not the host's to remove"
+        );
+    }
+
+    // The end-to-end shape of the bug: an install whose APK no longer ships
+    // git must not leave the previous install's links behind.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_without_the_bundled_git_clears_the_previous_install_s_links() {
+        let _guard = install_lock();
+        let work = tempfile::tempdir().unwrap();
+        let data = work.path().join("data");
+        let bin = data.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // What the previous install left behind: links into a directory the
+        // platform has since deleted.
+        let gone = work.path().join("old-install/lib");
+        symlink(&gone.join(GIT_LIB), &bin.join("git")).unwrap();
+        symlink(&gone.join(CURL_LIB), &bin.join("curl")).unwrap();
+        symlink(&gone.join(PLUGINHOST_LIB), &bin.join("pluginhost")).unwrap();
+
+        // This build ships no git at all.
+        let lib = work.path().join("new-install/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        install(&lib, &data, &[]);
+        for name in ["git", "curl", "pluginhost"] {
+            assert!(
+                bin.join(name).symlink_metadata().is_err(),
+                "{name} still points at the deleted install directory"
+            );
         }
     }
 }
