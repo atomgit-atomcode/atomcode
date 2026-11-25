@@ -225,8 +225,8 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
     // order. The root is the worst kept row, so a later match only replaces it
     // when it ranks better. This avoids cloning every match and sorting the
     // whole set on each keystroke.
-    let mut best: BinaryHeap<RankedEntry> = BinaryHeap::with_capacity(FILTER_RESULT_LIMIT + 1);
-    for entry in entries {
+    let mut best: BinaryHeap<RankedEntry> = BinaryHeap::with_capacity(FILTER_RESULT_LIMIT);
+    for (index, entry) in entries.iter().enumerate() {
         if !entry.rel_path.starts_with(scope_dir) || entry.rel_path == scope_dir {
             continue;
         }
@@ -246,27 +246,30 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
         if best.len() < FILTER_RESULT_LIMIT {
             best.push(RankedEntry {
                 entry: entry.clone(),
+                index,
                 scope_depth,
             });
         } else if best.peek().is_some_and(|worst| {
-            rank_entries(entry, &worst.entry, scope_depth) == std::cmp::Ordering::Less
+            rank_entries(entry, index, &worst.entry, worst.index, scope_depth)
+                == std::cmp::Ordering::Less
         }) {
             best.pop();
             best.push(RankedEntry {
                 entry: entry.clone(),
+                index,
                 scope_depth,
             });
         }
     }
 
-    let mut matched: Vec<Entry> = best.into_iter().map(|ranked| ranked.entry).collect();
-    matched.sort_by(|a, b| rank_entries(a, b, scope_depth));
-    matched
+    let mut matched: Vec<RankedEntry> = best.into_iter().collect();
+    matched.sort_by(RankedEntry::cmp);
+    matched.into_iter().map(|ranked| ranked.entry).collect()
 }
 
 /// The popup order: direct children of the scope first, then directories
 /// before files, then byte-order path.
-fn rank_entries(a: &Entry, b: &Entry, scope_depth: usize) -> std::cmp::Ordering {
+fn cmp_entries(a: &Entry, b: &Entry, scope_depth: usize) -> std::cmp::Ordering {
     let a_direct = a.depth == scope_depth + 1;
     let b_direct = b.depth == scope_depth + 1;
     b_direct
@@ -275,10 +278,26 @@ fn rank_entries(a: &Entry, b: &Entry, scope_depth: usize) -> std::cmp::Ordering 
         .then_with(|| a.rel_path.cmp(&b.rel_path))
 }
 
+/// Total order used by the bounded selection and the final sort.
+///
+/// The original index is the last key. `FileIndex::walk` deduplicates paths,
+/// but `from_entries` accepts caller-provided duplicates. The index makes ties
+/// deterministic and equal to a stable full sort followed by truncation.
+fn rank_entries(
+    a: &Entry,
+    a_index: usize,
+    b: &Entry,
+    b_index: usize,
+    scope_depth: usize,
+) -> std::cmp::Ordering {
+    cmp_entries(a, b, scope_depth).then_with(|| a_index.cmp(&b_index))
+}
+
 /// Heap element for the bounded top-N scan. `Ord` is [`rank_entries`], so a
 /// [`BinaryHeap`] keeps the worst kept row at its root.
 struct RankedEntry {
     entry: Entry,
+    index: usize,
     scope_depth: usize,
 }
 
@@ -298,26 +317,37 @@ impl PartialOrd for RankedEntry {
 
 impl Ord for RankedEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        rank_entries(&self.entry, &other.entry, self.scope_depth)
+        rank_entries(
+            &self.entry,
+            self.index,
+            &other.entry,
+            other.index,
+            self.scope_depth,
+        )
     }
 }
 
 /// Case-insensitive substring test for the filter.
 ///
 /// The popup runs this once per candidate on every keystroke, so the common
-/// ASCII case must not allocate. Non-ASCII input keeps the exact
-/// `to_lowercase` semantics; only those paths take the allocating fallback.
+/// ASCII case must not allocate. Any non-ASCII byte falls back to
+/// `to_lowercase`, which preserves Unicode case folding exactly. The ASCII
+/// path compares bytes, so multi-byte sequences are never split.
 fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        return haystack
-            .as_bytes()
-            .windows(needle_lower.len())
-            .any(|window| window.eq_ignore_ascii_case(needle_lower.as_bytes()));
+    if !(haystack.is_ascii() && needle_lower.is_ascii()) {
+        return haystack.to_lowercase().contains(needle_lower);
     }
-    haystack.to_lowercase().contains(needle_lower)
+    let haystack = haystack.as_bytes();
+    let needle = needle_lower.as_bytes();
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    haystack.windows(needle.len()).any(|window| {
+        window[0].eq_ignore_ascii_case(&first) && window[1..].eq_ignore_ascii_case(rest)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,9 +1101,10 @@ mod tests {
         assert_eq!(first.depth, 2, "first should be depth-2: {:?}", first);
     }
 
-    /// Pre-P11 implementation: collect every match, sort all of them, then
-    /// truncate. The bounded selection must produce exactly this output.
-    fn filter_entries_full_sort(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<Entry> {
+    /// Pre-P11 implementation: collect every match, stable-sort all of them,
+    /// then truncate. The stable sort keeps equal ranks in input order, which
+    /// is the same tie-break as the bounded selection's index key.
+    fn filter_entries_reference(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<Entry> {
         let filter_lower = filter.to_lowercase();
         let scope_depth = if scope_dir.is_empty() {
             0
@@ -1094,15 +1125,8 @@ mod tests {
             })
             .cloned()
             .collect();
-        matched.sort_by(|a, b| {
-            let a_direct = a.depth == scope_depth + 1;
-            let b_direct = b.depth == scope_depth + 1;
-            b_direct
-                .cmp(&a_direct)
-                .then_with(|| b.is_dir.cmp(&a.is_dir))
-                .then_with(|| a.rel_path.cmp(&b.rel_path))
-        });
-        matched.truncate(30);
+        matched.sort_by(|a, b| cmp_entries(a, b, scope_depth));
+        matched.truncate(FILTER_RESULT_LIMIT);
         matched
     }
 
@@ -1155,7 +1179,7 @@ mod tests {
         ] {
             assert_eq!(
                 filter_entries(&entries, scope_dir, filter),
-                filter_entries_full_sort(&entries, scope_dir, filter),
+                filter_entries_reference(&entries, scope_dir, filter),
                 "scope_dir={scope_dir:?} filter={filter:?}"
             );
         }
@@ -1165,21 +1189,95 @@ mod tests {
     fn filter_keeps_at_most_thirty_best_matches() {
         let entries = many_entries();
         let result = filter_entries(&entries, "src/", "file");
-        assert_eq!(result.len(), 30);
+        assert_eq!(result.len(), FILTER_RESULT_LIMIT);
         assert_eq!(result.first().unwrap().rel_path, "src/File000.rs");
         assert_eq!(result.last().unwrap().rel_path, "src/File029.rs");
     }
 
     #[test]
-    fn filter_matches_non_ascii_case_insensitively() {
-        let entries = vec![Entry {
-            rel_path: "docs/Ärger.md".into(),
+    fn rank_breaks_ties_by_input_index() {
+        let entry = Entry {
+            rel_path: "dup/same.rs".into(),
             is_dir: false,
             depth: 2,
-        }];
-        assert_eq!(filter_entries(&entries, "", "ärger").len(), 1);
-        assert_eq!(filter_entries(&entries, "", "ÄRGER").len(), 1);
-        assert!(filter_entries(&entries, "", "arg").is_empty());
+        };
+        let duplicate = entry.clone();
+        assert_eq!(
+            cmp_entries(&entry, &duplicate, 0),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            rank_entries(&entry, 0, &duplicate, 1, 0),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            rank_entries(&duplicate, 1, &entry, 0, 0),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn bounded_selection_matches_the_full_sort_with_duplicate_paths() {
+        let mut entries = Vec::new();
+        for _ in 0..40 {
+            entries.push(Entry {
+                rel_path: "dup/same.rs".into(),
+                is_dir: false,
+                depth: 2,
+            });
+        }
+        entries.push(Entry {
+            rel_path: "dup/other.rs".into(),
+            is_dir: false,
+            depth: 2,
+        });
+
+        for (scope_dir, filter) in [("", "dup"), ("dup/", "")] {
+            let bounded = filter_entries(&entries, scope_dir, filter);
+            assert_eq!(
+                bounded,
+                filter_entries_reference(&entries, scope_dir, filter),
+                "scope_dir={scope_dir:?} filter={filter:?}"
+            );
+            assert_eq!(bounded.len(), FILTER_RESULT_LIMIT);
+        }
+    }
+
+    #[test]
+    fn filter_matches_non_ascii_case_insensitively() {
+        // Non-ASCII paths and filters take the `to_lowercase` fallback, so
+        // Unicode case folding stays exactly as it was before the ASCII fast
+        // path. `Ä`, `Δ` and `П` are not ASCII letters.
+        let entries = vec![
+            Entry {
+                rel_path: "docs/Ärger.md".into(),
+                is_dir: false,
+                depth: 2,
+            },
+            Entry {
+                rel_path: "docs/Δelta.md".into(),
+                is_dir: false,
+                depth: 2,
+            },
+            Entry {
+                rel_path: "docs/Привет.md".into(),
+                is_dir: false,
+                depth: 2,
+            },
+        ];
+        let matching = |filter: &str| -> Vec<String> {
+            filter_entries(&entries, "", filter)
+                .into_iter()
+                .map(|entry| entry.rel_path)
+                .collect()
+        };
+
+        assert_eq!(matching("ärger"), ["docs/Ärger.md"]);
+        assert_eq!(matching("δ"), ["docs/Δelta.md"]);
+        assert_eq!(matching("ПРИВЕТ"), ["docs/Привет.md"]);
+        // ASCII filter over a non-ASCII path also uses the fallback.
+        assert_eq!(matching("RGER"), ["docs/Ärger.md"]);
+        assert!(matching("arg").is_empty());
     }
 
     // ---- FileIndex.walk (real tempdir) ----
