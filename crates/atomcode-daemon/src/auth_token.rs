@@ -130,11 +130,21 @@ impl WebuiTokenStore {
                 None => now.saturating_duration_since(window.window_start) < AUTH_FAILURE_WINDOW,
             });
             if failures.len() >= AUTH_TRACKED_SOURCES_MAX {
-                if let Some(oldest) = failures
+                // Keep active blocks: evicting one would let that source guess
+                // again. Prefer the oldest source that is not blocked; if every
+                // tracked source is blocked, fall back to the oldest so the map
+                // stays bounded.
+                let victim = failures
                     .iter()
+                    .filter(|(_, window)| window.blocked_until.is_none_or(|until| now >= until))
                     .min_by_key(|(_, window)| window.window_start)
-                    .map(|(source, _)| source.clone())
-                {
+                    .or_else(|| {
+                        failures
+                            .iter()
+                            .min_by_key(|(_, window)| window.window_start)
+                    })
+                    .map(|(source, _)| source.clone());
+                if let Some(oldest) = victim {
                     failures.remove(&oldest);
                 }
             }
@@ -247,9 +257,6 @@ pub async fn require_webui_token(
     // built without it (tests, embedded hosts) share one bucket.
     let source = request_source(&req);
     let now = Instant::now();
-    if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
-        return Err(too_many_requests(wait));
-    }
     // Accept the token from either the `Authorization: Bearer` header
     // (programmatic clients, legacy URL-token front-ends) OR the HttpOnly
     // `atomcode_webui` cookie set by the `/?token=` handoff. Header wins
@@ -272,10 +279,17 @@ pub async fn require_webui_token(
         }
         // Only a presented token consumes the failure budget. A missing
         // credential is not a guess, so a broken client cannot lock itself out.
-        Some(_) => match state.webui_tokens.note_auth_failure(&source, now) {
-            Some(wait) => Err(too_many_requests(wait)),
-            None => Err(StatusCode::UNAUTHORIZED.into_response()),
-        },
+        // A valid token is checked before the block, so recovery is always
+        // possible; the block only rejects further guesses.
+        Some(_) => {
+            if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
+                return Err(too_many_requests(wait));
+            }
+            match state.webui_tokens.note_auth_failure(&source, now) {
+                Some(wait) => Err(too_many_requests(wait)),
+                None => Err(StatusCode::UNAUTHORIZED.into_response()),
+            }
+        }
         None => Err(StatusCode::UNAUTHORIZED.into_response()),
     }
 }
@@ -360,6 +374,62 @@ mod token_store_tests {
         );
         assert!(store.auth_retry_after("10.0.0.1", now).is_some());
         assert_eq!(store.auth_retry_after("10.0.0.2", now), None);
+    }
+
+    #[test]
+    fn expired_sources_are_pruned_before_eviction() {
+        let store = WebuiTokenStore::new();
+        let start = Instant::now();
+        for index in 0..AUTH_TRACKED_SOURCES_MAX {
+            store.note_auth_failure(&format!("expired-{index}"), start);
+        }
+        assert_eq!(
+            store.failures.lock().unwrap().len(),
+            AUTH_TRACKED_SOURCES_MAX
+        );
+
+        let later = start + AUTH_FAILURE_WINDOW + Duration::from_millis(1);
+        store.note_auth_failure("fresh", later);
+        let failures = store.failures.lock().unwrap();
+        assert_eq!(
+            failures.len(),
+            1,
+            "expired windows are dropped, not evicted"
+        );
+        assert!(failures.contains_key("fresh"));
+    }
+
+    #[test]
+    fn eviction_keeps_an_active_block_and_bounds_the_map() {
+        let store = WebuiTokenStore::new();
+        let start = Instant::now();
+        for _ in 0..AUTH_FAILURE_LIMIT - 1 {
+            store.note_auth_failure("blocked", start);
+        }
+        assert!(store.note_auth_failure("blocked", start).is_some());
+        for index in 1..AUTH_TRACKED_SOURCES_MAX {
+            store.note_auth_failure(
+                &format!("source-{index}"),
+                start + Duration::from_micros(index as u64),
+            );
+        }
+        assert_eq!(
+            store.failures.lock().unwrap().len(),
+            AUTH_TRACKED_SOURCES_MAX
+        );
+
+        store.note_auth_failure("new-source", start + Duration::from_secs(1));
+        let failures = store.failures.lock().unwrap();
+        assert_eq!(failures.len(), AUTH_TRACKED_SOURCES_MAX);
+        assert!(
+            failures.contains_key("blocked"),
+            "an active block must not be evicted"
+        );
+        assert!(failures.contains_key("new-source"));
+        assert!(
+            !failures.contains_key("source-1"),
+            "the oldest non-blocked source is evicted"
+        );
     }
 
     #[test]

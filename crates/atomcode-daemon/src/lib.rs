@@ -2010,9 +2010,6 @@ async fn serve_webui_index(
     if state.enforce_token {
         let source = auth_token::request_source(&req);
         let now = std::time::Instant::now();
-        if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
-            return auth_token::too_many_requests(wait);
-        }
         if let Some(query) = uri.query() {
             if let Some(token) = first_query_value(query, "token") {
                 if !token.is_empty() {
@@ -2035,6 +2032,9 @@ async fn serve_webui_index(
                             .body(axum::body::Body::empty())
                             .map(IntoResponse::into_response)
                             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
+                        return auth_token::too_many_requests(wait);
                     }
                     if let Some(wait) = state.webui_tokens.note_auth_failure(&source, now) {
                         return auth_token::too_many_requests(wait);
@@ -9980,6 +9980,11 @@ mod tests {
             assert_ne!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
         }
         assert_eq!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            send("good-token").await,
+            StatusCode::FOUND,
+            "the recovery handoff must still work during a block"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -10021,8 +10026,8 @@ mod tests {
         );
         assert_eq!(
             send(Some("good-token")).await,
-            StatusCode::TOO_MANY_REQUESTS,
-            "the block must also reject a valid token until it expires"
+            StatusCode::OK,
+            "a valid token must still work during a block; the block only stops guesses"
         );
     }
 
