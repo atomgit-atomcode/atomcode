@@ -185,6 +185,9 @@ impl WebuiTokenStore {
 }
 
 /// 常量时间字节比较。长度不同一定返回 false；比较次数只取决于较长的一方。
+///
+/// `black_box` 是编译器屏障：阻止 LLVM 把「xor 累积判零」折叠成会提前返回的
+/// `memcmp`/`bcmp`，否则会重新打开 CWE-208 时序侧信道。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
     let longest = a.len().max(b.len());
@@ -193,7 +196,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         let right = b.get(index).copied().unwrap_or(0);
         diff |= (left ^ right) as usize;
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 /// 从 `Authorization` 头解析 Bearer token（大小写不敏感前缀）。
