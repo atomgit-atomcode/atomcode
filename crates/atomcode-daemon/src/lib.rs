@@ -9962,26 +9962,43 @@ mod tests {
         let send = |token: &'static str| {
             let app = app.clone();
             async move {
-                app.oneshot(
-                    axum::http::Request::builder()
-                        .uri(format!("/?token={token}"))
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status()
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("/?token={token}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                (response.status(), retry_after)
             }
         };
 
         // The valid handoff sets the cookie and clears the failure budget.
-        assert_eq!(send("good-token").await, StatusCode::FOUND);
+        assert_eq!(send("good-token").await.0, StatusCode::FOUND);
         for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
-            assert_ne!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+            assert_ne!(send("wrong-token").await.0, StatusCode::TOO_MANY_REQUESTS);
         }
-        assert_eq!(send("wrong-token").await, StatusCode::TOO_MANY_REQUESTS);
+        let (status, retry_after) = send("wrong-token").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "Retry-After must be seconds in 1..=30, got {retry_after:?}"
+        );
+        let (status, retry_after) = send("wrong-token").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "blocked handoffs must carry Retry-After, got {retry_after:?}"
+        );
         assert_eq!(
-            send("good-token").await,
+            send("good-token").await.0,
             StatusCode::FOUND,
             "the recovery handoff must still work during a block"
         );
@@ -10010,22 +10027,41 @@ mod tests {
                 if let Some(token) = token {
                     request = request.header("authorization", format!("Bearer {token}"));
                 }
-                app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+                let response = app
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
                     .await
-                    .unwrap()
-                    .status()
+                    .unwrap();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                (response.status(), retry_after)
             }
         };
 
-        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
-            assert_eq!(send(Some("wrong-token")).await, StatusCode::UNAUTHORIZED);
+        // Missing credentials are not guesses and must not consume the budget.
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT + 2 {
+            assert_eq!(send(None).await.0, StatusCode::UNAUTHORIZED);
         }
-        assert_eq!(
-            send(Some("wrong-token")).await,
-            StatusCode::TOO_MANY_REQUESTS
+
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_eq!(send(Some("wrong-token")).await.0, StatusCode::UNAUTHORIZED);
+        }
+        let (status, retry_after) = send(Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "Retry-After must be seconds in 1..=30, got {retry_after:?}"
+        );
+        let (status, retry_after) = send(Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "blocked retries must carry Retry-After, got {retry_after:?}"
         );
         assert_eq!(
-            send(Some("good-token")).await,
+            send(Some("good-token")).await.0,
             StatusCode::OK,
             "a valid token must still work during a block; the block only stops guesses"
         );

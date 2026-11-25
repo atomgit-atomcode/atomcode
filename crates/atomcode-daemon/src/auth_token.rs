@@ -191,9 +191,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     for index in 0..longest {
         let left = a.get(index).copied().unwrap_or(0);
         let right = b.get(index).copied().unwrap_or(0);
-        diff |= (left ^ right) as usize;
+        // `black_box` keeps LLVM from recognizing the xor accumulation as
+        // `memcmp` / `bcmp`, which return early and reopen CWE-208.
+        diff |= std::hint::black_box((left ^ right) as usize);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 /// 从 `Authorization` 头解析 Bearer token（大小写不敏感前缀）。
