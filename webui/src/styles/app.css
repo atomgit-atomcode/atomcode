@@ -295,6 +295,17 @@ body {
 
 .timeline-message:first-child { padding-top: 0; }
 
+.turn-recap {
+  max-width: 100%;
+  margin-top: 0.5rem;
+  color: var(--app-secondary-foreground);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.turn-recap-label { font-weight: 600; }
+
 /* === User Message (right-aligned chat bubble) === */
 .user-message-wrapper {
   position: relative;

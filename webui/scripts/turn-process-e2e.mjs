@@ -32,7 +32,7 @@ const server=createServer(async(req,res)=>{
   if(path==='/models')return json([{name:'fixture',model:'fixture',provider:'fixture',effort_levels:[]}]);
   if(path.endsWith('/transcript'))return json({session_id:id,turns:[]});
   if(path==='/live/mode')return json({mode:'build'});
-  if(path==='/live/session')return json({success:true,session_id:id});
+  if(path==='/live/switch_session')return json({ok:true,session_id:id});
   if(path==='/sessions'||path==='/projects/fixture/sessions')return json([meta]);
   if(path==='/chat/active'||path==='/projects'||path==='/skills'||path.startsWith('/workbench/'))return json([]);
   try{

@@ -923,6 +923,11 @@ impl SessionManager {
         Ok(self.read_event_log(id, false)?.1)
     }
 
+    /// Read the log with a caller-specific byte ceiling, including growth while reading.
+    pub fn load_events_bounded(&self, id: &str, limit: usize) -> SessionResult<Vec<LoggedEvent>> {
+        Ok(self.read_event_log_bounded(id, false, limit)?.1)
+    }
+
     /// A short display label from the first prompt recorded for an unnamed
     /// session, including a turn that never finished. Reads only a log prefix.
     pub fn first_prompt_preview(&self, id: &str) -> SessionResult<Option<String>> {

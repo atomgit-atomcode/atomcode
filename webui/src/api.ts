@@ -1201,6 +1201,7 @@ export interface ApprovalModeResponse {
 }
 
 export interface TurnStats {
+  turn_id?: number;
   duration_ms: number;
   rounds: number;
   tool_calls: number;
@@ -1781,6 +1782,15 @@ export async function getLivePersona(sessionId: string): Promise<{persona: Perso
 }
 
 export interface FollowUpView { prompt: string | null; current_task: boolean; new_session?: unknown; execution_id?: string | null }
+export async function getTurnRecap(sessionId: string, turnId: number): Promise<string | null> {
+  const response = await apiFetch('/chat/recap', {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, turn_id: turnId }),
+  });
+  return (await readJson<{ text: string | null }>(response)).text;
+}
+
 export async function followUp(sessionId: string, args: string): Promise<FollowUpView> {
   const response = await apiFetch('/live/followup', {
     method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},

@@ -31,6 +31,7 @@ mod api_config;
 mod api_cue;
 mod api_provider;
 mod api_provider_accounts;
+mod api_recap;
 mod api_schedule;
 pub mod approval_mode;
 mod commands;
@@ -4514,6 +4515,8 @@ pub enum ChatEvent {
 
 #[derive(Debug, Serialize)]
 pub struct TurnStatsWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<u64>,
     duration_ms: u64,
     rounds: usize,
     tool_calls: usize,
@@ -4525,6 +4528,7 @@ pub struct TurnStatsWire {
 impl From<atomcode_coding::RuntimeTurnStats> for TurnStatsWire {
     fn from(stats: atomcode_coding::RuntimeTurnStats) -> Self {
         Self {
+            turn_id: None,
             duration_ms: stats.duration.as_millis().min(u128::from(u64::MAX)) as u64,
             rounds: stats.turn_count,
             tool_calls: stats.tool_call_count,
@@ -5379,7 +5383,10 @@ impl ChatRuntimeProjector {
                 message: format!("compact failed: {error}"),
             }],
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
-                reason, stats, ..
+                turn_id,
+                reason,
+                stats,
+                ..
             }) => {
                 if self.terminal_seen {
                     return Vec::new();
@@ -5390,7 +5397,10 @@ impl ChatRuntimeProjector {
                     self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
                 }
                 self.tool_call_count = self.tool_call_count.max(stats.tool_call_count);
-                let stats = TurnStatsWire::from(stats);
+                let stats = TurnStatsWire {
+                    turn_id: Some(turn_id),
+                    ..stats.into()
+                };
 
                 let mut events = Vec::new();
                 if let Some(event) = self.finish() {
@@ -8363,6 +8373,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Chat API
         .merge(chat_message_routes())
         .route("/chat/stop", post(stop_chat))
+        .route(
+            "/chat/recap",
+            post(api_recap::recap).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
         .route("/chat/user-input", post(chat_user_input))
