@@ -190,6 +190,16 @@ enum Row {
     /// The key legend. Its words are not in the row because they are a property
     /// of the page, not of the row — see [`legend`].
     Legend,
+    /// The panel's own foot: the blank that keeps the legend off the status line
+    /// drawn directly below it.
+    ///
+    /// The panel ends where the composer would, and the status line hugs the row
+    /// under it. Without a row of its own the legend reads as one more segment of
+    /// that line — the same defect the [`Row::Edge`] at the top answers. Chrome,
+    /// so it is shed with the legend before a word of what is being asked goes
+    /// (see [`fit`]); named apart from [`Row::Blank`] because it sits at the very
+    /// end and the tail's salvage order has to know that.
+    Foot,
     /// A batch's page tabs.
     Tabs,
     /// The line between the answers and the way out of answering.
@@ -232,7 +242,7 @@ fn layout(sheet: &Sheet, w: usize, h: usize) -> Vec<Row> {
         Some(asked) => question_rows(sheet, asked, w, body, h, &mut rows),
         None => review_rows(sheet, &mut rows),
     }
-    rows.extend([Row::Blank, Row::Legend]);
+    rows.extend([Row::Blank, Row::Legend, Row::Foot]);
     fit(rows, h)
 }
 
@@ -278,11 +288,13 @@ fn question_rows(
                 text: about.tool.clone(),
                 role: Role::Accent,
             });
-            // Keep room for the answers, their blank, and the legend, so a long
-            // command (a heredoc) WRAPS into what is left rather than shoving the
-            // options off the panel. Whatever fits is the full command; past the
-            // budget a single `…` says the rest is there — the exact bytes still
-            // execute, this is what the reader is shown of them.
+            // Keep room for the answers, their blank, the legend and the panel's
+            // foot — `slots.len() + 3`, one row each, counted once — so a long
+            // command (a heredoc) WRAPS into what is left rather than shoving
+            // the options off the panel. Reserving the foot twice leaves the
+            // command one row short while the legend and the foot stay up:
+            // chrome paid for with the words under review — see
+            // `a_short_panel_keeps_the_whole_command_above_its_foot`.
             let keep = slots.len() + 3;
             let budget = h.saturating_sub(rows.len().saturating_add(keep)).max(1);
             let mut used = 0usize;
@@ -361,12 +373,15 @@ fn review_rows(sheet: &Sheet, rows: &mut Vec<Row>) {
 /// Cut the layout down to the height it was given, least important row first.
 ///
 /// The order is deliberate: the margin above the question goes, then the legend
-/// and its blank, then what the answers mean, then the question's OWN lines (the
-/// text between the header and the answers) from the bottom up — and only as a
-/// last resort the answers. The answers are the one thing the panel is for; a
-/// short terminal that cannot hold a long command AND its options drops command
-/// lines, never an option a person still has to pick from. `geometry` fits the
-/// same way, so a click still lands on the row it lit.
+/// and its blank, then the panel's own foot, then what the answers mean, then the
+/// question's OWN lines (the text between the header and the answers) from the
+/// bottom up — and only as a last resort the answers. The answers are the one
+/// thing the panel is for; a short terminal that cannot hold a long command AND
+/// its options drops command lines, never an option a person still has to pick
+/// from. `geometry` fits the same way, so a click still lands on the row it lit.
+/// The foot outlives the legend on purpose: losing the key hints is a smaller
+/// loss than pressing them onto the status line, and the answers keep their
+/// separating row until no row is left to spend on it.
 fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     if rows.len() <= h {
         return rows;
@@ -384,10 +399,22 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
             rows.remove(i);
         }
     }
-    if rows.len() > h && rows.last() == Some(&Row::Legend) {
-        rows.pop();
-        if rows.last() == Some(&Row::Blank) {
-            rows.pop();
+    // Then the panel's own tail: the legend, and the foot under it. Both are
+    // chrome, and the order between them is the point — the legend goes first,
+    // so a short rect drops the key hints rather than pressing them onto the
+    // status line, and the foot is the last row spent, because while one row can
+    // still go to it the answers stay clear of the line below. The blank the
+    // legend was pushed with goes with it: once the legend is gone there is
+    // nothing left for it to separate.
+    for row in [Row::Legend, Row::Foot] {
+        if rows.len() <= h {
+            break;
+        }
+        if let Some(i) = rows.iter().rposition(|r| *r == row) {
+            rows.remove(i);
+            if row == Row::Legend && i > 0 && rows[i - 1] == Row::Blank {
+                rows.remove(i - 1);
+            }
         }
     }
     while rows.len() > h {
@@ -425,7 +452,7 @@ fn draw(sheet: &Sheet, row: Row, caps: Caps, w: usize, arrows_used_for_scrolling
         Row::Edge => {
             Line::styled(caps.g(Glyph::Horizontal).repeat(w), theme::fg(Role::Muted)).truncate(w)
         }
-        Row::Blank | Row::Margin => Line::empty(),
+        Row::Blank | Row::Margin | Row::Foot => Line::empty(),
         Row::Legend => Line::styled(
             format!(
                 "  {}",
@@ -1004,6 +1031,84 @@ mod tests {
                 .position(|r| matches!(r, Row::Prompt(_)))
                 .map(|p| p + 2),
             "{rows:?}"
+        );
+    }
+
+    /// The panel ends on a row of its own, so the legend is not the last word
+    /// against the status line the host hugs under it: the keys are read on their
+    /// own row, and the row under them is blank.
+    ///
+    /// The order the tail spends its chrome in is the other half of this: a rect
+    /// too short for the whole panel loses the legend before the foot, because
+    /// the foot is what keeps the answers — the one thing the panel is for — off
+    /// the line below.
+    #[test]
+    fn the_legend_is_never_the_last_word_against_the_status_line() {
+        let moment = asking(Q::plain("Keep going?", &["yes", "no"]), 0);
+        // The edge, the prompt, its gap, two answers, the gap under them, the
+        // legend, and the foot.
+        let full = framed(&moment, 60);
+        assert_eq!(full.len(), 8, "{full:#?}");
+        assert_eq!(full.last().map(String::as_str), Some(""), "{full:#?}");
+        assert!(
+            full[full.len() - 2].contains("选择"),
+            "the legend sits above the foot: {full:#?}"
+        );
+
+        // Everything but the legend's own two rows: the keys go, the separation
+        // from the status line stays.
+        let tight = drawn(&moment, 60, 6);
+        assert!(
+            !tight.join("\n").contains("选择"),
+            "the legend went: {tight:#?}"
+        );
+        assert_eq!(
+            tight.last().map(String::as_str),
+            Some(""),
+            "the foot is the last row spent: {tight:#?}"
+        );
+
+        // And when not even that row is left, the answers are what survives.
+        let shortest = drawn(&moment, 60, 4);
+        assert!(
+            shortest.iter().any(|r| r.contains("yes")) && shortest.iter().any(|r| r.contains("no")),
+            "both answers are still up: {shortest:#?}"
+        );
+    }
+
+    /// A short panel does not buy its foot with the command being approved.
+    ///
+    /// The foot is chrome and the command is the thing a person is being asked
+    /// about. On a 60×11 rect a three-line command, its three options, the
+    /// legend and the foot all fit once the edge goes, so the budget in
+    /// `question_rows` must reserve the foot exactly once — reserving it twice
+    /// (`slots + 4`) clips the command to two lines and a `…` while the legend
+    /// and the foot keep their rows: chrome paid for with the words under
+    /// review. See the salvage order in [`fit`].
+    #[test]
+    fn a_short_panel_keeps_the_whole_command_above_its_foot() {
+        let command = "echo one\necho two\necho three";
+        let args = serde_json::json!({ "command": command }).to_string();
+        let lines = drawn(&asking(approval(None, "bash", &args, Some("")), 0), 60, 11);
+        let body = lines.join("\n");
+        assert_eq!(lines.len(), 11, "{lines:#?}");
+        for line in command.lines() {
+            assert!(
+                body.contains(line),
+                "`{line}` is on screen, the command is not clipped: {lines:#?}"
+            );
+        }
+        assert!(
+            !body.contains('…'),
+            "nothing of the command was traded for chrome: {lines:#?}"
+        );
+        // And the fix this PR is about still holds: the legend has its own row
+        // and the row under it is blank, so the status line below stays apart.
+        assert!(body.contains("选择"), "the legend is still up: {lines:#?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(""),
+            "the foot still separates the legend from the status line: {lines:#?}"
         );
     }
 
