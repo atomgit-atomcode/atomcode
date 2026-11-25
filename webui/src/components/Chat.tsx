@@ -9,7 +9,7 @@ import { LiveGoalBar } from './LiveGoalBar';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
-import { ApiCallError, importPatchFile, taskSpecs } from '../api';
+import { ApiCallError, getTurnRecap, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
 import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
@@ -147,6 +147,8 @@ import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifac
 interface Message {
   retryDiagnostics?: string[];
   turnStop?: string;
+  recapKey?: string;
+  recap?: string;
   sourceSeq?: number;
   specPinned?: boolean;
   contextSummary?: boolean;
@@ -560,6 +562,42 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   // 只有当前 tab 实际提交过回合，或从 /live 观察到 running=true，终态才有
   // 通知资格。初始/重连时重放的 idle state 不能伪装成一次新完成事件。
   const notificationTurnActiveRef = useRef(false);
+  const recapTurn = useRef({ away: false, autonomous: false });
+  const recapAutonomy = useRef({ goal: false, loop: false });
+
+  function observeTurnStart(autonomous = false) {
+    notificationTurnActiveRef.current = true;
+    turnStartedAtRef.current = Date.now();
+    recapTurn.current = { away: document.hidden, autonomous };
+  }
+
+  function finishAssistantTurn(
+    session: string | null,
+    stopReason: string | undefined,
+    stats: TurnStats | undefined,
+    autonomous = false,
+  ) {
+    const ts = Date.now();
+    const elapsed = stats?.duration_ms ?? ts - (turnStartedAtRef.current ?? ts);
+    const turnId = stats?.turn_id;
+    const recapKey = session && turnId && stopReason === 'stopped' && !autonomous
+      && !recapTurn.current.autonomous && notificationTurnActiveRef.current
+      // The last placeholder can belong to a steer that is about to become
+      // the next turn. Wait for a terminal with an unambiguous assistant row.
+      && (!syncRef.current || pendingSteersRef.current.length === 0)
+      && (elapsed >= 120_000 || recapTurn.current.away || document.hidden)
+      ? `${session}/${turnId}` : undefined;
+    stampLastAssistantCompletion(ts, stopReason, session, recapKey);
+    if (!recapKey || !session || !turnId) return;
+    const generation = sessionGenerationRef.current;
+    void getTurnRecap(session, turnId).then(text => {
+      if (!text || activeIdRef.current !== session || generation !== sessionGenerationRef.current) return;
+      setMessages(current => current.map(message =>
+        message.recapKey === recapKey ? { ...message, recap: text } : message));
+    }).catch(() => {
+      // An unavailable auxiliary result leaves the completed turn usable.
+    });
+  }
   function finishTurnNotification(info: {
     stopReason?: string;
     sessionId?: string;
@@ -1361,8 +1399,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     });
     scrollRestorationRef.current = restore;
     const visibility = () => {
-      if (document.visibilityState === 'hidden') restore.suspend();
-      else restore.resume();
+      if (document.hidden) {
+        if (notificationTurnActiveRef.current) recapTurn.current.away = true;
+        restore.suspend();
+      } else restore.resume();
     };
     const pagehide = () => restore.suspend();
     const pageshow = () => restore.resume();
@@ -1819,17 +1859,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
     if (e.type === 'loop_changed') {
+      recapAutonomy.current.loop = e.active;
       setLoopSampledAt(Date.now());
       setLoopProgress(e.active ? e : null);
       return;
     }
     if (e.type === 'goal_changed') {
+      recapAutonomy.current.goal = e.active;
       setGoalSampledAt(Date.now());
       setGoalProgress(e);
       return;
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      recapAutonomy.current = { goal: !!e.goal?.active, loop: !!e.loop_progress?.active };
       promptHistoryRef.current.reset();
       promptHistoryRevision.current++;
       liveSessionObservationRef.current++;
@@ -1994,6 +2037,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
       if (!alreadyViewing) {
+        recapAutonomy.current = { goal: false, loop: false };
+        notificationTurnActiveRef.current = false;
+        turnStartedAtRef.current = null;
         sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
         todoTitlesRef.current.clear();
@@ -2068,8 +2114,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
 
       case 'state': {
         if (e.running && !notificationTurnActiveRef.current) {
-          notificationTurnActiveRef.current = true;
-          turnStartedAtRef.current = Date.now();
+          observeTurnStart(recapAutonomy.current.goal || recapAutonomy.current.loop);
         }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'state',
@@ -2092,7 +2137,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
-          stampLastAssistantCompletion(Date.now(), e.stop_reason);
+          finishAssistantTurn(liveSessionIdRef.current, e.stop_reason, e.stats,
+            recapAutonomy.current.goal || recapAutonomy.current.loop);
           finishTodoTurn();
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
@@ -2276,7 +2322,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   /** Stamp the assistant when the turn actually finishes. The optimistic
    *  placeholder intentionally has no clock, keeping reply completion distinct
    *  from the user's submission time. */
-  function stampLastAssistantCompletion(ts = Date.now(), stopReason?: string, scope = activeIdRef.current) {
+  function stampLastAssistantCompletion(ts = Date.now(), stopReason?: string, scope = activeIdRef.current, recapKey?: string) {
     const viewport = scrollRef.current;
     const readingProcess = processReadIntent.current && viewport
       && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > BOTTOM_SLACK;
@@ -2291,6 +2337,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         if (prev[index].role !== 'assistant') continue;
         const next = prev.slice();
         next[index] = { ...next[index], ts: next[index].ts ?? ts, turnStop: stopReason ?? next[index].turnStop, parts: settlePendingToolParts(next[index].parts) };
+        if (recapKey) next[index].recapKey = recapKey;
         return next;
       }
       return prev;
@@ -2886,7 +2933,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       case 'done': {
         setCompacting(false);
         // Every terminal keeps successful todo changes and drops unresolved previews.
-        stampLastAssistantCompletion(Date.now(), event.stop_reason, event.session_id);
+        finishAssistantTurn(event.session_id, event.stop_reason, event.stats);
         finishTodoTurn();
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -3107,8 +3154,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       setBusy(true);
       // 回合起点只记录一次（steer 不重置）：供终态通知计算 durationMs。
       if (!steering) {
-        notificationTurnActiveRef.current = true;
-        turnStartedAtRef.current = Date.now();
+        observeTurnStart(recapAutonomy.current.goal || recapAutonomy.current.loop);
       }
       const now = Date.now();
       const pendingSteer: PendingLiveSteer = {
@@ -3205,8 +3251,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // ── Normal path ──
     setBusy(true);
     // 回合起点只记录一次：供终态通知计算 durationMs。
-    notificationTurnActiveRef.current = true;
-    turnStartedAtRef.current = Date.now();
+    observeTurnStart();
     // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
     // done 事件中 onSessionId 会再刷一次确保更新。
     setTimeout(() => onLiveTurnDone?.(), 200);
@@ -5238,7 +5283,8 @@ function AssistantMessageView({
   const groups = pollGroups ?? groupEmptyPolls(search.trim() ? [] : [msg]);
   const onlyHiddenPolls = msg.parts.every(part => part.kind === 'tool'
     ? groups.hidden.has(part.tool.id) : part.kind === 'text' && !part.text.trim());
-  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length) return null;
+  const recap = isLastInTurn && !streaming ? msg.recap : undefined;
+  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length && !recap) return null;
 
   return (
     <div class={cls} ref={searchRef}>
@@ -5284,6 +5330,11 @@ function AssistantMessageView({
           {/* One timestamp per user turn: intermediate assistant/tool rounds share
               the turn's persisted timestamp but must not repeat it in the timeline. */}
           {showTimestamp && <div class="msg-time">{timeLabel}</div>}
+        </div>
+      )}
+      {recap && (
+        <div class="turn-recap" role="status">
+          <span class="turn-recap-label">{t('chat.turnRecap')}</span>{' · '}{recap}
         </div>
       )}
     </div>

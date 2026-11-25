@@ -186,12 +186,14 @@ struct Live {
     projection: Mutex<LogProjection>,
 }
 
-/// An offset in one live log. A replacement App can rebuild the same
-/// session id with an equal or longer history, so length alone is insufficient.
+/// The last fact read from one live log. A replacement App can rebuild the same
+/// session id with an equal or longer history, so the sequence number alone is
+/// insufficient. A sequence number, not a position: a settled round's chunks
+/// leave the log, which moves every later fact's index.
 #[derive(Default)]
 struct LogCursor {
     log: Weak<SessionLog>,
-    seen: usize,
+    seen: u64,
 }
 
 impl LogCursor {
@@ -201,15 +203,16 @@ impl LogCursor {
         read: impl FnOnce(bool, &[LoggedEvent]) -> R,
     ) -> R {
         log.read_events(|events| {
-            let reset = self.log.as_ptr() != Arc::as_ptr(log) || self.seen > events.len();
+            let last = events.last().map_or(0, |logged| logged.seq);
+            let reset = self.log.as_ptr() != Arc::as_ptr(log) || self.seen > last;
             let start = if reset {
                 self.log = Arc::downgrade(log);
                 0
             } else {
-                self.seen
+                events.partition_point(|logged| logged.seq <= self.seen)
             };
             let result = read(reset, &events[start..]);
-            self.seen = events.len();
+            self.seen = last;
             result
         })
     }
@@ -2172,6 +2175,51 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chunks leaving the log between two reads move later facts to lower
+    /// positions; the cursor still hands over each new fact exactly once.
+    #[test]
+    fn the_log_cursor_misses_nothing_when_settled_chunks_leave() {
+        let log = Arc::new(SessionLog::new("bg-cursor"));
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        for _ in 0..5 {
+            log.append(SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "字".into(),
+                reasoning: false,
+            });
+        }
+        let mut cursor = LogCursor::default();
+        let first = cursor.read_new(&log, |reset, events| (reset, events.len()));
+        assert_eq!(first, (true, 6));
+
+        log.append(SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "答".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            reasoning_blocks: vec![],
+            meta: None,
+        });
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "再看看".into(),
+            images: vec![],
+        });
+        let next = cursor.read_new(&log, |reset, events| {
+            (
+                reset,
+                events.iter().map(|e| e.event.clone()).collect::<Vec<_>>(),
+            )
+        });
+        assert!(!next.0, "the same log is not a reset");
+        assert_eq!(next.1.len(), 2, "{:?}", next.1);
+        assert!(matches!(next.1[0], SessionEvent::AssistantMessage { .. }));
+        assert!(matches!(next.1[1], SessionEvent::UserMessage { .. }));
+        assert!(cursor.read_new(&log, |_, events| events.is_empty()));
+    }
 
     #[test]
     fn delegated_review_keeps_context_without_assigning_follow_up_work() {

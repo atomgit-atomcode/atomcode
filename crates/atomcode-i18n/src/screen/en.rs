@@ -1617,6 +1617,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 .into()
         }
         Msg::CmdAboutProxy => "outbound proxy: follow the system, pin the current one, or none".into(),
+        Msg::GcAbout => "preview cleanup of old session history".into(),
+        Msg::GcUsage => "Use /gc to preview or /gc --apply to run the previewed cleanup.".into(),
+        Msg::GcBusy => "Session cleanup is already running.".into(),
+        Msg::GcPreviewFirst => "Run /gc to preview the cleanup first.".into(),
+        Msg::GcApplyHint => "Run /gc --apply to permanently delete these sessions and their attachments.".into(),
+        Msg::GcLowSpace { free } => format!("The session disk has {free} free. Run /gc to preview cleanup.").into(),
+        Msg::GcFailed { error } => format!("Session cleanup failed ({error}).").into(),
+        Msg::GcPreview { used, count, estimated, skipped } => format!("Session history size {used}. Eligible old sessions: {count}. Estimated reclaimable file size: {estimated}. Skipped during inspection: {skipped}. Migration backups and separate Code Rewind stores are kept.").into(),
+        Msg::GcApplied { deleted, skipped, failed, removed } => format!("Deleted {deleted} old sessions, skipped {skipped}, and could not finish {failed}. Removed {removed} of session files.").into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),
         Msg::ProxyFollowSystemAbout => {
@@ -1690,7 +1699,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CompactAfterTurn => "Will compact once this turn ends".into(),
-        Msg::ModelNextTurn { model } => format!("Current turn continues with {model}; the selected model applies next turn.").into(),
+        Msg::ModelNextTurn { model } => format!("{model} finishes this turn; new model applies next turn (Esc to switch now)").into(),
         Msg::RuntimeBusy => "Busy (a reply, a compaction or a rebuild is under way); try again shortly".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()

@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createBrowseRefresh, sessionSelectionDisposition } from './lib/sessionBrowse';
 import { Chat } from './components/Chat';
+import { TeamMembers } from './components/TeamMembers';
 import { Workbench, hasUnsavedWorkbenchDrafts, persistWorkbenchState } from './components/Workbench';
 import { Sidebar } from './components/Sidebar';
 import { Automation } from './components/Automation';
@@ -120,6 +121,7 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sessionListVersion, setSessionListVersion] = useState(0);
+  const [teamPanelHost, setTeamPanelHost] = useState<HTMLDivElement | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   // 表头会话菜单改用 fixed 定位，避免被祖先 overflow/层叠裁剪；记录锚点坐标。
   const [headerMenuPos, setHeaderMenuPos] = useState<{ top: number; left: number } | null>(null);
@@ -715,6 +717,9 @@ export function App() {
                 />
               </svg>
             </button>
+            {activeSession.id === sessionId && activeSession.project_hash && (
+              <TeamMembers key={`${activeSession.project_hash}/${activeSession.id}`} project={activeSession.project_hash} lead={activeSession.id} panelHost={teamPanelHost} />
+            )}
             {headerMenuOpen && headerMenuPos && (
               <div
                 class="item-menu"
@@ -803,6 +808,7 @@ export function App() {
             gitRequest={historyRequest?.view === 'diff' ? historyRequest : undefined}
             fileRequest={historyRequest?.view === 'content' ? historyRequest : undefined}
             onClose={() => { setHistoryWorkbench(null); restoreViewerFocus(); }} />}
+          <div ref={setTeamPanelHost} class="team-panel-seat" />
           </FileViewerContext.Provider>
         </div>
       </div>

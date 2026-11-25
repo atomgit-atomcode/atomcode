@@ -37,7 +37,10 @@ pub fn write(port: u16, pid: u32, token: &str) -> std::io::Result<PathBuf> {
         f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(body.as_bytes())?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    atomcode_capabilities::fs::atomic_write(&path, body.as_bytes(), 0o600)
+        .map_err(std::io::Error::other)?;
+    #[cfg(not(any(unix, windows)))]
     std::fs::write(&path, body)?;
     Ok(path)
 }
@@ -79,6 +82,12 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        assert_eq!(write(19999, 4243, "tok-new").unwrap(), path);
+        let replaced: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(replaced["pid"], 4243);
+        assert_eq!(replaced["token"], "tok-new");
 
         remove(19999);
         assert!(!path.exists());

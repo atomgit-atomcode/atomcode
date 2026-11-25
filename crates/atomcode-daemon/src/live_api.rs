@@ -1232,14 +1232,20 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(completion)) => {
                 self.tools.clear();
                 match completion {
-                    atomcode_coding::TurnCompletion::Completed { reason, stats, .. } => {
-                        LiveWireEvent::State {
-                            running: false,
-                            stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
-                            message: None,
-                            stats: Some(stats.into()),
-                        }
-                    }
+                    atomcode_coding::TurnCompletion::Completed {
+                        turn_id,
+                        reason,
+                        stats,
+                        ..
+                    } => LiveWireEvent::State {
+                        running: false,
+                        stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
+                        message: None,
+                        stats: Some(crate::TurnStatsWire {
+                            turn_id: Some(turn_id),
+                            ..stats.into()
+                        }),
+                    },
                     atomcode_coding::TurnCompletion::SnapshotUnavailable {
                         error, stats, ..
                     } => LiveWireEvent::State {

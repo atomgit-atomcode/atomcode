@@ -86,6 +86,7 @@ pub mod native_log;
 mod next_prompt_suggestion;
 mod rate_limit;
 mod recap;
+pub use recap::CommittedRecap;
 mod skill_first;
 pub mod subagent_tiers;
 mod todo;

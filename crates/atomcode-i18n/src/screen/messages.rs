@@ -2396,6 +2396,29 @@ pub enum Msg<'a> {
     ScheduleOff,
     ScheduleEditInTheCli,
     CmdAboutProxy,
+    GcAbout,
+    GcUsage,
+    GcBusy,
+    GcPreviewFirst,
+    GcApplyHint,
+    GcLowSpace {
+        free: &'a str,
+    },
+    GcFailed {
+        error: &'a str,
+    },
+    GcPreview {
+        used: &'a str,
+        count: usize,
+        estimated: &'a str,
+        skipped: usize,
+    },
+    GcApplied {
+        deleted: usize,
+        skipped: usize,
+        failed: usize,
+        removed: &'a str,
+    },
     ProxyTakes,
     ProxyPickerTitle {
         current: &'a str,

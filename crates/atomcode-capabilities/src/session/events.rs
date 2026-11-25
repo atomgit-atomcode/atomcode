@@ -911,16 +911,41 @@ impl SessionManager {
 
     /// The header an event session was created with.
     pub fn read_event_header(&self, id: &str) -> SessionResult<SessionHeader> {
-        let (header, _) = self.read_event_log(id, true)?;
-        header.ok_or_else(|| SessionStoreError::Corrupt {
+        let path = self.events_path(id)?;
+        let file = open_read_file(&path)?;
+        let mut reader = BufReader::new(file.take(MAX_JSONL_LINE_BYTES as u64 + 1));
+        let mut bytes = Vec::new();
+        reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| io_at(&path, error))?;
+        if bytes.len() > MAX_JSONL_LINE_BYTES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "session event header",
+                limit: MAX_JSONL_LINE_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        let missing = || SessionStoreError::Corrupt {
             kind: "session events",
             message: format!("{id}: no header"),
-        })
+        };
+        if bytes.last() != Some(&b'\n') {
+            return Err(missing());
+        }
+        let record: Line = super::manager::deserialize(&bytes, "session event header")?;
+        let header = record.header.ok_or_else(missing)?;
+        validate_header_version(&header)?;
+        Ok(header)
     }
 
     /// Every stored fact of an event session, in file order.
     pub fn load_events(&self, id: &str) -> SessionResult<Vec<LoggedEvent>> {
-        Ok(self.read_event_log(id, false)?.1)
+        self.load_events_bounded(id, MAX_JSONL_BYTES)
+    }
+
+    /// Read the log with a caller-specific byte ceiling, including growth while reading.
+    pub fn load_events_bounded(&self, id: &str, limit: usize) -> SessionResult<Vec<LoggedEvent>> {
+        Ok(self.read_event_log_bounded(id, limit)?.1)
     }
 
     /// A short display label from the first prompt recorded for an unnamed
@@ -995,9 +1020,7 @@ impl SessionManager {
         id: &str,
         limit: usize,
     ) -> SessionResult<SessionSnapshot> {
-        Ok(snapshot_of(
-            &self.read_event_log_bounded(id, false, limit)?.1,
-        ))
+        Ok(snapshot_of(&self.read_event_log_bounded(id, limit)?.1))
     }
 
     /// Read-only reference projection. Scan with the store's line/file guards,
@@ -1161,18 +1184,9 @@ impl SessionManager {
         Ok((meta, messages, clipped, captured_through_seq))
     }
 
-    fn read_event_log(
-        &self,
-        id: &str,
-        header_only: bool,
-    ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
-        self.read_event_log_bounded(id, header_only, MAX_JSONL_BYTES)
-    }
-
     pub(super) fn read_event_log_bounded(
         &self,
         id: &str,
-        header_only: bool,
         limit: usize,
     ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
         let path = self.events_path(id)?;
@@ -1202,17 +1216,8 @@ impl SessionManager {
                     message: format!("{}:{}: {error}", path.display(), index + 1),
                 })?;
             if let Some(found) = line.header {
-                if found.version > SESSION_FORMAT_VERSION {
-                    return Err(SessionStoreError::FutureSchema {
-                        kind: "session events",
-                        found: found.version,
-                        supported: SESSION_FORMAT_VERSION,
-                    });
-                }
+                validate_header_version(&found)?;
                 header = Some(found);
-                if header_only {
-                    break;
-                }
                 continue;
             }
             match (line.seq, line.event) {
@@ -1842,6 +1847,17 @@ const SIDECARS: [(&str, &str); 4] = [
     ("rewind.txn.json", "rewind.txn"),
     ("todos.json", "todos"),
 ];
+
+fn validate_header_version(header: &SessionHeader) -> SessionResult<()> {
+    if header.version > SESSION_FORMAT_VERSION {
+        return Err(SessionStoreError::FutureSchema {
+            kind: "session events",
+            found: header.version,
+            supported: SESSION_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
 
 /// Every file a snapshot-format session keeps that a build from before the
 /// event format reads.

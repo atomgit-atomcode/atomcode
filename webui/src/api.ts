@@ -373,6 +373,34 @@ export interface SessionMeta {
 
 export type SessionActivity = 'open' | 'running' | 'waiting';
 
+export interface TeamMember {
+  id: string;
+  name: string;
+  role: string;
+  activity: SessionActivity | null;
+}
+
+export interface TeamTranscript {
+  entries: { seq: number; kind: 'user' | 'peer' | 'assistant' | 'tool' | 'tool_result' | 'tool_error'; text: string }[];
+  truncated: boolean;
+}
+
+function teamPath(project: string, lead: string) {
+  return `/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(lead)}/team`;
+}
+
+export async function getTeamMembers(project: string, lead: string, signal: AbortSignal): Promise<TeamMember[]> {
+  const resp = await apiFetch(teamPath(project, lead), { headers: authHeaders(), signal, cache: 'no-store' });
+  if (resp.status === 404) return [];
+  return readJson(resp);
+}
+
+export async function getTeamTranscript(project: string, lead: string, member: string, signal: AbortSignal): Promise<TeamTranscript> {
+  const resp = await apiFetch(`${teamPath(project, lead)}/${encodeURIComponent(member)}`, { headers: authHeaders(), signal, cache: 'no-store' });
+  return readJson(resp);
+}
+
+
 export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
 }
@@ -1173,6 +1201,7 @@ export interface ApprovalModeResponse {
 }
 
 export interface TurnStats {
+  turn_id?: number;
   duration_ms: number;
   rounds: number;
   tool_calls: number;
@@ -1753,6 +1782,15 @@ export async function getLivePersona(sessionId: string): Promise<{persona: Perso
 }
 
 export interface FollowUpView { prompt: string | null; current_task: boolean; new_session?: unknown; execution_id?: string | null }
+export async function getTurnRecap(sessionId: string, turnId: number): Promise<string | null> {
+  const response = await apiFetch('/chat/recap', {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, turn_id: turnId }),
+  });
+  return (await readJson<{ text: string | null }>(response)).text;
+}
+
 export async function followUp(sessionId: string, args: string): Promise<FollowUpView> {
   const response = await apiFetch('/live/followup', {
     method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
