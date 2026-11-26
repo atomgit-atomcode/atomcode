@@ -244,7 +244,7 @@ pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[atomcode: output truncated
 /// shrinks below the original.
 const PREVIEW_HEAD: usize = 32 * 1024;
 const PREVIEW_TAIL: usize = 12 * 1024;
-const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Override the spill threshold. Data-dense scenarios (financial reports,
 /// whole-market scans) truncate constantly at the 50 KB default; this lets an
