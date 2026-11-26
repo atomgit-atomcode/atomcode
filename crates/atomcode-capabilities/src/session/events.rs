@@ -2477,15 +2477,20 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
     use super::transcript::{ToolRecord, UsageRecord, RECORD_VERSION};
 
     let undone = atomcode_kernel::session::undone_turns(events);
-    let results: std::collections::HashMap<&str, (&str, bool)> = events
+    let results: std::collections::HashMap<_, _> = events
         .iter()
         .filter_map(|logged| match &logged.event {
             SessionEvent::ToolResultLogged {
+                turn,
+                round,
                 call_id,
                 content,
                 is_error,
                 ..
-            } => Some((call_id.as_str(), (content.as_str(), *is_error))),
+            } => Some((
+                (*turn, *round, call_id.as_str()),
+                (content.as_str(), *is_error),
+            )),
             _ => None,
         })
         .collect();
@@ -2516,6 +2521,8 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
                 }
             }
             SessionEvent::AssistantMessage {
+                turn,
+                round,
                 text,
                 reasoning,
                 tool_calls,
@@ -2529,7 +2536,7 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
                 record.reasoning.push_str(reasoning);
                 for call in tool_calls {
                     let (result, is_error) = results
-                        .get(call.id.as_str())
+                        .get(&(*turn, *round, call.id.as_str()))
                         .map(|(content, is_error)| (content.to_string(), *is_error))
                         .unwrap_or_default();
                     record.tools.push(ToolRecord {
@@ -3611,6 +3618,162 @@ mod tests {
             day.iter().map(|t| t.user.as_str()).collect::<Vec<_>>(),
             vec!["remember kiwi", "and then?"]
         );
+    }
+
+    #[tokio::test]
+    async fn recall_expands_the_original_review_after_two_compactions_and_reopen() {
+        use atomcode_kernel::tool::{Tool, ToolCall, ToolContext};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "review-session");
+        let other = created(&manager, "other-session");
+        let reply = format!("{}\nC4: escape_html 单趟化", "界".repeat(3_000));
+        let review = "P5: MAX_CHAIN_DEPTH 提升\nP7: json write_char";
+        let facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: reply.clone(),
+                reasoning: "private reasoning".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "review".into(),
+                        name: "code_review".into(),
+                        arguments: "private arguments".into(),
+                    },
+                    ToolCall {
+                        id: "bash".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+            SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: "review".into(),
+                content: review.into(),
+                is_error: false,
+                images: vec![],
+            },
+            SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: "bash".into(),
+                content: "unrelated tool output".into(),
+                is_error: false,
+                images: vec![],
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+            SessionEvent::Compacted {
+                turn: 2,
+                through: 5,
+                summary: "Reviewed code.".into(),
+                from: 0,
+            },
+            SessionEvent::Compacted {
+                turn: 3,
+                through: 6,
+                summary: "Worked on code.".into(),
+                from: 0,
+            },
+            SessionEvent::TurnStart { turn: 4 },
+            SessionEvent::AssistantMessage {
+                turn: 4,
+                round: 1,
+                text: "unfinished review".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+        ];
+        let facts: Vec<_> = facts
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| logged(index as u64 + 1, 1000, event))
+            .collect();
+        manager.append_events(&lease, &facts).unwrap();
+        manager.append_events(&other, &facts).unwrap();
+        drop(lease);
+        drop(other);
+
+        let reopened = SessionManager::with_root(manager.root());
+        let recall =
+            crate::session::RecallTool::new(reopened.root()).with_current_session("review-session");
+        assert!(recall.self_bounds_output());
+        let context = ToolContext {
+            working_dir: reopened.root().into(),
+            cancel: Default::default(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let hit = recall
+            .execute(
+                r#"{"current_session":true,"query":"MAX_CHAIN_DEPTH"}"#,
+                &context,
+            )
+            .await;
+        assert!(!hit.is_error, "{}", hit.content);
+        assert_eq!(hit.content.matches("read_turn 1").count(), 1);
+        assert!(!hit.content.contains("other-s"));
+        assert!(!hit.content.contains("P7:"));
+
+        let page = recall.execute(r#"{"read_turn":1}"#, &context).await;
+        assert!(!page.is_error, "{}", page.content);
+        let first: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+        let offset = first["next_offset"].as_u64().unwrap();
+        let next = recall
+            .execute(&format!(r#"{{"read_turn":1,"offset":{offset}}}"#), &context)
+            .await;
+        assert!(!next.is_error, "{}", next.content);
+        let next: serde_json::Value = serde_json::from_str(&next.content).unwrap();
+        assert!(next["next_offset"].is_null());
+        let recovered = format!(
+            "{}{}",
+            first["text"].as_str().unwrap(),
+            next["text"].as_str().unwrap()
+        );
+        assert_eq!(recovered, format!("{reply}\n\n[code_review]\n{review}"));
+        assert_eq!(next["undone"], false);
+        assert!(
+            recall
+                .execute(r#"{"read_turn":4}"#, &context)
+                .await
+                .is_error
+        );
+        assert!(
+            recall
+                .execute(r#"{"read_turn":1,"session":"other-session"}"#, &context)
+                .await
+                .is_error
+        );
+
+        let lease = reopened.acquire_lease("review-session").unwrap();
+        reopened
+            .append_events(
+                &lease,
+                &[logged(
+                    10,
+                    1001,
+                    SessionEvent::Rewound {
+                        turn: 4,
+                        to: 0,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        let withdrawn = recall.execute(r#"{"read_turn":1}"#, &context).await;
+        let withdrawn: serde_json::Value = serde_json::from_str(&withdrawn.content).unwrap();
+        assert_eq!(withdrawn["undone"], true);
     }
 
     /// A session a newer build last wrote is listed and marked, and opening it is
