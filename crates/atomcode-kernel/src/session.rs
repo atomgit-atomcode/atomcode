@@ -1430,6 +1430,23 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                     }
                 };
                 message.synthetic = true;
+                // A team member's first request is its lead's delegation. Kept
+                // under a summary it is history, exactly as a person's first
+                // request is, and says so: unframed, the member reads the task
+                // it already worked on as a fresh instruction.
+                if matches!(origin, InjectionOrigin::Peer { .. })
+                    && folded.iter().any(|(from, _)| *from > 0 && seq <= *from)
+                {
+                    message.internal_origin =
+                        Some(crate::message::COMPACTION_RETAINED_ORIGIN.into());
+                    if !with_meta {
+                        message.internal_origin =
+                            Some(crate::message::COMPACTION_RETAINED_MODEL_ORIGIN.into());
+                        message
+                            .text
+                            .insert_str(0, crate::message::COMPACTION_RETAINED_FRAMING);
+                    }
+                }
                 let source = match origin {
                     InjectionOrigin::CompactionSummary => Provenance::Summary(seq),
                     _ => Provenance::Derived(seq),

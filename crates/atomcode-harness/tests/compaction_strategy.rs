@@ -911,6 +911,25 @@ async fn a_member_spoken_to_only_by_its_lead_still_compacts() {
     );
     assert!(!seen.iter().any(|t| t.contains("the lead's follow-up")));
     assert!(seen.iter().any(|t| t.contains("the lead's latest message")));
+    // Kept under a summary, the delegation is history like a person's first
+    // request, and is framed as such: unframed, a member reads its original
+    // task as a fresh instruction and starts it over.
+    let sent = w.seen();
+    assert!(
+        sent[1]
+            .text
+            .starts_with(atomcode_kernel::message::COMPACTION_RETAINED_FRAMING),
+        "{:?}",
+        sent[1].text
+    );
+    let latest = sent.last().unwrap();
+    assert!(
+        !latest
+            .text
+            .contains(atomcode_kernel::message::COMPACTION_RETAINED_FRAMING),
+        "the lead's latest message is a live instruction: {:?}",
+        latest.text
+    );
 }
 
 /// The person may speak to a member directly, long after its lead delegated.
