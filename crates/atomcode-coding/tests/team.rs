@@ -3478,3 +3478,38 @@ done"#).unwrap();
     assert_eq!(record["content"], "contract from docs");
     assert_eq!(record["is_error"], false);
 }
+
+/// What one agent read is not what another knows: a lead that read a file
+/// does not let a member that never opened it replace it.
+#[tokio::test]
+async fn a_member_cannot_overwrite_a_file_only_its_lead_read() {
+    let dir = scratch("member-write-guard");
+    std::fs::write(dir.join("notes.md"), "earlier work\n").unwrap();
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\ntools: read_file, write_file\n---\nYou write notes.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "", calls = [ { name = "read_file", args = { file_path = "notes.md" } } ] }, { text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "scribe", scope = ["notes.md"], task = "write the notes" } } ] }, { text = "delegated" }"#,
+        r#"{ text = "", calls = [ { name = "write_file", args = { file_path = "notes.md", content = "replaced\n" } } ] }, { text = "tried" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scribe = agents
+        .by_session(&format!("{}/scribe", lead.session_id()))
+        .expect("the member exists");
+    until_idle(&scribe).await;
+    let refused = scribe.session().events().into_iter().any(|e| {
+        matches!(e.event, SessionEvent::ToolResultLogged { is_error: true, ref content, .. }
+            if content.contains("has not read it"))
+    });
+    assert!(refused, "the member's own log decides");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "earlier work\n"
+    );
+}

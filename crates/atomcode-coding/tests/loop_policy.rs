@@ -1567,3 +1567,82 @@ async fn one_agents_repeats_never_stop_another_agents_turn() {
         assert_eq!(outcome.text, "second done", "guard {guard}");
     }
 }
+
+/// `write_file` replaces a whole file. Over one this conversation has never
+/// read, edited or written, it is refused and nothing changes; read it once
+/// and the same write goes through. A file that does not exist yet is created
+/// as before.
+#[tokio::test]
+async fn overwriting_a_file_this_conversation_never_read_is_refused() {
+    let dir = scratch("write-guard");
+    std::fs::write(dir.join("notes.md"), "## 1. kept\nearlier work\n").unwrap();
+    let script = r###"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "", calls = [ { name = "write_file", args = { file_path = "notes.md", content = "## 1. new\n" } } ] },
+  { text = "", calls = [ { name = "write_file", args = { file_path = "fresh.md", content = "fresh\n" } } ] },
+  { text = "", calls = [ { name = "read_file", args = { file_path = "notes.md" } } ] },
+  { text = "", calls = [ { name = "write_file", args = { file_path = "notes.md", content = "## 1. new\n" } } ] },
+  { text = "done" },
+] }
+"###;
+    let rows = "[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
+    let app = start(tree(&dir, script, &[rows])).await;
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.text, "done");
+
+    let results: Vec<(bool, String)> = app
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::ToolResultLogged {
+                is_error, content, ..
+            } => Some((is_error, content)),
+            _ => None,
+        })
+        .collect();
+    assert!(results[0].0, "{:?}", results[0]);
+    assert!(
+        results[0].1.contains("has not read it") && results[0].1.contains("read_file"),
+        "the refusal says what to do: {}",
+        results[0].1
+    );
+    assert!(!results[1].0, "a new file is created: {:?}", results[1]);
+    assert!(
+        !results[3].0,
+        "after a read the write goes through: {:?}",
+        results[3]
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "## 1. new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("fresh.md")).unwrap(),
+        "fresh\n"
+    );
+}
+
+/// A refused write is not a read: retrying it unchanged is refused again,
+/// rather than getting through on the strength of its own first attempt.
+#[tokio::test]
+async fn retrying_a_refused_overwrite_is_refused_again() {
+    let dir = scratch("write-guard-retry");
+    std::fs::write(dir.join("notes.md"), "earlier work\n").unwrap();
+    let write = r#"{ text = "", calls = [ { name = "write_file", args = { file_path = "notes.md", content = "x\n" } } ] }"#;
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [{write}, {write}, {{ text = \"done\" }}] }}"
+    );
+    let rows = "[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
+    let app = start(tree(&dir, &script, &[rows])).await;
+    run_turn(&app, "go").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "earlier work\n"
+    );
+}

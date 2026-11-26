@@ -36,6 +36,7 @@ pub mod ui_jsonrpc;
 pub mod ui_web;
 pub mod world;
 pub mod world_tools;
+pub mod write_guard;
 
 use std::sync::Arc;
 
@@ -122,6 +123,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(reasoning_effort::ReasoningEffortPlugin))
         .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
         .register(Arc::new(loop_policy::RepeatFusePlugin))
+        .register(Arc::new(write_guard::WriteGuardPlugin))
         .register(Arc::new(policy_rows::TodoPlugin))
         .register(Arc::new(policy_rows::PermissionsPlugin))
         .register(Arc::new(skill_permissions::SkillPermissionsPlugin))
