@@ -772,8 +772,10 @@ impl Tool for TellParent {
     }
     fn description(&self) -> &str {
         "Send a message to the lead agent that delegated to you: a progress note, a question, \
-         or your final report. The lead is the only agent you can address. A progress note \
-         does not end your task: keep working after it."
+         or your final report. The lead is the only agent you can address, and `text` is all \
+         it receives: your other replies never reach it, so put everything it needs — \
+         results, findings, content to deliver — in `text`. A progress note does not end \
+         your task: keep working after it."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -1146,8 +1148,15 @@ impl TeamTool {
             .as_ref()
             .map(|(to, _)| format!(" It can hand off directly to `{to}` from its first turn."))
             .unwrap_or_default();
+        // Said now, while the lead can still pick another role: a read-only
+        // member handed writing finds out only after reading the whole task.
+        let read_only = if role.permission == Permission::Explore {
+            " — read-only: it cannot create or edit files"
+        } else {
+            ""
+        };
         let report = format!(
-            "delegated to `{name}` ({}{}){}.{direct_handoff} It will report through `tell_parent`. {follow_up}",
+            "delegated to `{name}` ({}{}{read_only}){}.{direct_handoff} It will report through `tell_parent`. {follow_up}",
             role.id,
             match &named {
                 Some(model) => format!(" on {model}"),
@@ -1361,7 +1370,8 @@ impl TeamTool {
                 "{}\n\nYou are `{name}`, a {} on a team. The lead delegated this to you. Use \
                  `tell_parent` for questions and progress (`kind: \"progress\"`, then keep working: \
                  a progress note does not end your task), and call it with a compact report \
-                 when you are done. The lead does not see your full activity. If required work is \
+                 when you are done. The lead does not see your full activity: only what you pass \
+                 to `tell_parent` reaches it, never your other replies. If required work is \
                  outside your write scope, blocked, or left undone, report non-sensitive affected paths, \
                  reason and remaining work with `tell_parent`; do not silently skip it or assume \
                  another member will handle it. Your scope is a permission boundary, not proof \
@@ -1412,6 +1422,16 @@ impl TeamTool {
             .any(|name| query::is_query_name(name))
         {
             prompts.contribute("team-query-evidence", 0, "Include the Team evidence reference in your report so the lead can inspect the original query and result.".to_owned());
+        }
+        if role.permission == Permission::Explore {
+            prompts.contribute(
+                "team-read-only",
+                0,
+                "You cannot create or edit files. If your task asks you to write anything, \
+                 tell the lead at once with `tell_parent` (`kind: \"blocked\"`) before doing \
+                 the rest, rather than after."
+                    .to_owned(),
+            );
         }
         let member_id = format!("{lead_session}/{name}");
         let member_session = member_id.clone();

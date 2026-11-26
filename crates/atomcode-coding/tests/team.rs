@@ -329,6 +329,38 @@ async fn a_member_that_stops_after_a_progress_note_is_reported_on() {
     );
 }
 
+/// A lead that hands writing to a read-only role learns it when it delegates,
+/// not from the member's report after the whole task has been read through.
+#[tokio::test]
+async fn delegating_to_a_read_only_role_says_it_cannot_write() {
+    let dir = scratch("read-only");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "nothing to report" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let delegated = lead
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|e| match e.event {
+            SessionEvent::ToolResultLogged { content, .. }
+                if content.starts_with("delegated to `scout`") =>
+            {
+                Some(content)
+            }
+            _ => None,
+        })
+        .expect("the delegation's result");
+    assert!(
+        delegated.contains("read-only") && delegated.contains("cannot create or edit files"),
+        "{delegated}"
+    );
+}
+
 #[tokio::test]
 async fn status_tell_and_stop_are_the_leads_to_call() {
     let dir = scratch("lifecycle");
