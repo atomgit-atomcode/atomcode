@@ -126,16 +126,17 @@ fn parsed(text: &str) -> Result<(Vec<SessionReference>, Vec<std::ops::Range<usiz
 }
 
 /// Human-readable failure for the one oversize case a person can actually fix:
-/// the referenced session's dialogue snapshot exceeds the attachment budget.
-/// Say what is over, by how much, and the way back — run a compaction there so
-/// the projection shrinks below the budget, then reference it again.
+/// the referenced session's committed event log exceeds the attachment budget.
+/// Say what is over, by how much, and the honest way back — compaction does not
+/// remove committed events, so the log will not shrink; fetch the turns you
+/// need instead of referencing the session wholesale.
 fn projection_too_large_message(id: &str, limit: usize, actual: usize) -> String {
     let over = actual.saturating_sub(limit);
     format!(
-        "Cannot reference session {id}: its reference projection (the snapshot of its \
-         dialogue) is {actual} bytes, over the {limit}-byte attachment budget by {over}. \
-         Run a compaction in that session (e.g. `/compact`) so the projection shrinks \
-         below the budget, then reference it again."
+        "Cannot reference session {id}: its committed event log (tool results included) \
+         is {actual} bytes, over the {limit}-byte attachment budget by {over}. Compaction \
+         does not remove committed events, so the log will not shrink — fetch the turns \
+         you need instead of referencing the session."
     )
 }
 
@@ -357,10 +358,10 @@ mod tests {
     fn projection_too_large_message_says_what_over_by_how_much_and_the_way_back() {
         assert_eq!(
             projection_too_large_message("fe2558bb", 8_388_608, 8_388_630),
-            "Cannot reference session fe2558bb: its reference projection (the snapshot of \
-             its dialogue) is 8388630 bytes, over the 8388608-byte attachment budget by 22. \
-             Run a compaction in that session (e.g. `/compact`) so the projection shrinks \
-             below the budget, then reference it again."
+            "Cannot reference session fe2558bb: its committed event log (tool results \
+             included) is 8388630 bytes, over the 8388608-byte attachment budget by 22. \
+             Compaction does not remove committed events, so the log will not shrink — \
+             fetch the turns you need instead of referencing the session."
         );
     }
 
