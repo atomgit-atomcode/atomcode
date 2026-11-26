@@ -171,7 +171,8 @@ struct Live {
     control: Arc<RuntimeControl>,
     commands: mpsc::UnboundedSender<AgentCommand>,
     /// 这个会话的日志投影:面板的聚合、回合状态与缓存游标都在这里。泵每收到一个
-    /// 事件就喂它,`describe` 只读字段。`Arc` 是因为泵与 [`Live`] 都要用。
+    /// 事件就喂它(事实只从日志折入,见 [`LogProjection::absorb`]),`describe` 只读
+    /// 字段。`Arc` 是因为泵与 [`Live`] 都要用。
     projection: Arc<Mutex<LogProjection>>,
     /// 放到后台的时刻,unix 毫秒。
     since: u64,
@@ -243,7 +244,8 @@ struct LogProjection {
 ///
 /// 两条来源汇进同一个 [`LogProjection::absorb`],面板聚合与回合状态就不会有两套
 /// 推导 -- 这也让 `attach` 的全量 seed 与之后的增量无论先后都得出同一份结果
-/// (issue #1821 #12)。
+/// (issue #1821 #12)。事实只认 `Logged` 这一种形状:运行时事件里也有 `Fact`,说的
+/// 是同一件事,它不参与计数(理由见 [`LogProjection::absorb`])。
 enum Observed<'a> {
     Logged(&'a LoggedEvent),
     Live(&'a AgentEvent),
@@ -255,8 +257,9 @@ enum Observed<'a> {
 /// (挂着的请求、错误);两边都只写这里,描述只读这里。
 #[derive(Default)]
 struct LogSummary {
-    /// 折进来的事实条数。`resume_locked` drain 出的 `Fact` 也算 —— 首屏的
-    /// `len` 与日志对不上就会让后续缓存一直错位。
+    /// 折进来的日志事实条数。只有日志那一路(seed 与 `update`)推进它 —— 通道上
+    /// 的 `Fact` 不算(见 [`LogProjection::absorb`])。它等于日志长度,就是「同一条
+    /// 事实只折一次」的判据(`a_fact_on_the_channel_is_folded_once_with_its_log_record`)。
     len: u64,
     title: Option<String>,
     first_user: Option<String>,
@@ -807,10 +810,16 @@ fn one_line(text: &str) -> Option<String> {
 /// `running_at`:还在跑时的此刻(unix 毫秒)。那时用时量到此刻,而不是最后一条事实 ——
 /// 模型安静地想一分钟,面板上的用时不该停在一分钟前。
 impl LogSummary {
-    /// 折进一条已提交的事实,返回面板那一行会不会因此变。
+    /// 折进日志里的一条事实:计一条,再按它改字段。seed 与增量都走这里,所以两条
+    /// 路径不可能各说一套(issue #1821 #12)。
+    fn absorb_logged(&mut self, logged: &LoggedEvent) -> bool {
+        self.len += 1;
+        self.absorb_event(logged.at, &logged.event)
+    }
+
+    /// 一条已提交的事实对面板那一行的影响,返回它会不会因此变。
     ///
-    /// 这是日志侧唯一的推导入口:全量 seed、增量更新、`resume_locked` drain 出的
-    /// `Fact` 都走这里,所以两条路径不可能各说一套(issue #1821 #12)。
+    /// 事实的计数在 [`Self::absorb_logged`]:这里只管它改哪个字段。
     fn absorb_event(&mut self, at: u64, event: &SessionEvent) -> bool {
         self.first_at.get_or_insert(at);
         self.last_at = at;
@@ -923,18 +932,19 @@ impl LogSummary {
 impl LogProjection {
     /// 折进一条观察。返回面板要不要重画。
     ///
-    /// `Logged` 与 `Fact` 是日志事实(seed、增量、drain 都算 `len`);其余运行时
-    /// 事件只更新回合状态。两条来源共用 [`LogSummary`],没有第二套推导。
+    /// `Logged` 是日志事实的唯一来源(seed、增量都算 `len`);其余运行时事件只更新
+    /// 回合状态。两条来源共用 [`LogSummary`],没有第二套推导。
+    ///
+    /// 通道上的 `AgentEvent::Fact` **不**在这里折:它说的是日志刚多了哪一条,而
+    /// pump 与 `describe` 面对的是同一个前端、同一份日志。屏幕一订阅
+    /// (`Subscribe { from: 0 }`),feed 就把整段历史与新提交的事实逐条推过来,
+    /// `update` 又按 cursor 从日志折同一批 —— 两边都折,首屏重放与回到后台之后
+    /// 面板的步数/工具/token 就会翻倍。事实引起的面板变化由下一次 `update` 带出来
+    /// (面板每秒都在读),所以这里也不必替它要一次重画。
     fn absorb(&mut self, observed: Observed<'_>) -> bool {
         match observed {
-            Observed::Logged(logged) => {
-                self.summary.len += 1;
-                self.summary.absorb_event(logged.at, &logged.event)
-            }
-            Observed::Live(AgentEvent::Fact(committed)) => {
-                self.summary.len += 1;
-                self.summary.absorb_event(committed.at, &committed.event)
-            }
+            Observed::Logged(logged) => self.summary.absorb_logged(logged),
+            Observed::Live(AgentEvent::Fact(_)) => false,
             Observed::Live(event) => self.summary.saw(event),
         }
     }
@@ -961,13 +971,14 @@ impl LogProjection {
             *self = Self::default();
             return;
         };
-        self.cursor.read_new(&log, |reset, events| {
+        // 借出两个字段:`read_new` 握着 `cursor`,折事实的那半边只能碰 `summary`。
+        let Self { cursor, summary } = self;
+        cursor.read_new(&log, |reset, events| {
             if reset {
-                self.summary = LogSummary::default();
+                *summary = LogSummary::default();
             }
             for logged in events {
-                self.summary.len += 1;
-                self.summary.absorb_event(logged.at, &logged.event);
+                summary.absorb_logged(logged);
             }
         });
     }
@@ -1958,10 +1969,8 @@ impl Background {
         while let Ok(event) = pumps.events.try_recv() {
             // Preserve a request that appeared during preparation: subscribing
             // to the committed foreground must still bring that question back.
-            // Its fact is already in the seed; only the live half is folded here.
-            if matches!(event, AgentEvent::Fact(_)) {
-                continue;
-            }
+            // Facts that arrived meanwhile change nothing: the seed above already
+            // folded them, and the projection takes facts only from the log.
             pumps
                 .projection
                 .lock()
@@ -3092,6 +3101,88 @@ mod tests {
         assert_eq!(seeded.summary.stats(None), incremental.summary.stats(None));
         // 第二个回合开始后,第一个回合的结局不再代表现在。
         assert_eq!(seeded.summary.ended, None);
+    }
+
+    /// #12: 同一条事实在通道上(`Fact`)与日志里各来一次,只能折一次。
+    ///
+    /// pump 与 `describe` 面对的是同一个前端、同一份日志:屏幕一订阅
+    /// (`Subscribe { from: 0 }`),feed 就把整段历史逐条推成 `Fact`,新提交的事实
+    /// 也从这里过来;回到后台后 `update` 又按 cursor 从日志折一遍。两边都折,面板的
+    /// 步数/工具/token 就会把每条事实记两遍。渠道喂养与全量 seed 必须等值。
+    #[test]
+    fn a_fact_on_the_channel_is_folded_once_with_its_log_record() {
+        let events = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "  first words  \nsecond".into(),
+                images: vec![],
+            },
+            SessionEvent::StepEnd {
+                turn: 1,
+                step: 1,
+                tool_calls: 3,
+            },
+            SessionEvent::Usage {
+                turn: 1,
+                round: 1,
+                usage: atomcode_kernel::stream::TokenUsage {
+                    prompt: 100,
+                    completion: 7,
+                    cached: 20,
+                },
+            },
+            SessionEvent::PartialReply {
+                turn: 1,
+                round: 1,
+                text: "\n  the last word  ".into(),
+                reasoning: String::new(),
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        ];
+
+        let full = Arc::new(SessionLog::new("fact-once"));
+        for event in &events {
+            full.append(event.clone());
+        }
+        let mut seeded = LogProjection::default();
+        seeded.seed(&full);
+
+        // 混合喂养:每条事实先在通道上到一次(订阅重放或新提交),再由日志增量折
+        // 一次 —— 这正是会话在前台被订阅期间发生的事。
+        let mixed_log = Arc::new(SessionLog::new("fact-once"));
+        let mut mixed = LogProjection::default();
+        for event in &events {
+            let (seq, at) = mixed_log.record(event.clone());
+            let fact = AgentEvent::Fact(Box::new(atomcode_kernel::session::Committed {
+                session: "fact-once".into(),
+                seq,
+                at,
+                event: event.clone(),
+            }));
+            assert!(
+                !mixed.absorb(Observed::Live(&fact)),
+                "a fact on the channel says nothing the log does not: {seq}"
+            );
+            mixed.update(Some(mixed_log.clone()));
+        }
+
+        assert_eq!(seeded.summary.len, events.len() as u64);
+        assert_eq!(
+            mixed.summary.len, seeded.summary.len,
+            "a fact is folded once, from the log"
+        );
+        assert_eq!(mixed.summary.stats(None), seeded.summary.stats(None));
+        assert_eq!(mixed.summary.first_user, seeded.summary.first_user);
+        assert_eq!(mixed.summary.last_said, seeded.summary.last_said);
+        assert_eq!(
+            format!("{:?}", mixed.summary.ended),
+            format!("{:?}", seeded.summary.ended)
+        );
     }
 
     /// #23: `(stopped, phase, ended, pending)` 的每种组合都有明确答案。
