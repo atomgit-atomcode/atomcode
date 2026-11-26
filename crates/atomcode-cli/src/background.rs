@@ -280,7 +280,8 @@ struct LogSummary {
     /// 上一个回合怎么结束的。日志的 `TurnEnd` 与运行时的 `TurnComplete` 说的是
     /// 同一件事,两边都写同一个字段。
     ended: Option<BackgroundState>,
-    /// 最近一次出的错,给面板那一行。`TurnStart` 清掉。
+    /// 最近一次出的错,给面板那一行。运行时的新回合(`TurnStarted`)清掉 ——
+    /// 日志里的 `TurnStart` 说的是过去,不清现在这一行。
     error: Option<String>,
 }
 
@@ -427,8 +428,8 @@ pub struct Background {
     me: Weak<Background>,
     /// 已经排上队、等发起它的那段对话收下的结果,键是 sender 的会话 id。
     ///
-    /// 事件到达时([`Self::settle_arrivals`])与 10 秒一次的兜底扫描
-    /// ([`Self::sweep_settling`])都只看它:命中一条就标 [`Mark::Home`] 并摘除,
+    /// 事件到达时与 10 秒一次的兜底扫描([`Self::settle_waiting`])都只看它:命中
+    /// 一条就标 [`Mark::Home`] 并摘除,
     /// 不再有每条投递一个 10 分钟的全量轮询(issue #1821 #14 / #9)。
     settling: Mutex<HashMap<String, SettleEntry>>,
     /// The sessions stopped because the screen went away, in slot order — what
@@ -521,7 +522,7 @@ pub fn connect(
         });
     }
     // 注可能只落 home 的日志、不产生事件。低频借一次 seq 兜底;平时
-    // `settle_arrivals` 在事件到达时就关掉了。
+    // `settle_waiting` 在事件到达时就关掉了。
     {
         let weak = Arc::downgrade(&background);
         tokio::spawn(async move {
@@ -532,7 +533,7 @@ pub fn connect(
                 let Some(background) = weak.upgrade() else {
                     break;
                 };
-                background.sweep_settling();
+                background.settle_waiting();
             }
         });
     }
@@ -842,13 +843,22 @@ impl LogSummary {
         self.last_at = at;
         match event {
             SessionEvent::TurnStart { .. } => {
-                // 新回合开始:上一个回合的结局与错误不再代表现在。
+                // 新回合开始:上一个回合的结局不再代表现在。`error` 不在这里清:
+                // 这条事实可能早于它被折进来的那一秒 —— 面板关着时日志只积不折,
+                // 一条还没折的旧 `TurnStart` 会清掉运行时刚刚报上来的 `Error`,而
+                // 那条 `Error` 恰恰是「现在这一回合失败了」。清 `error` 只在运行
+                // 时那一侧(`saw(TurnStarted)`)做,那里说的才是现在。
                 self.ended = None;
-                self.error = None;
                 true
             }
             SessionEvent::TurnEnd { stop, error, .. } => {
-                self.pending = None;
+                // `pending` 不在这里清:它不是日志里的事实,日志这一侧从不产生它。
+                // 而这条 `TurnEnd` 可能已经旧了 —— 面板没开时日志只积不折,新的
+                // `AgentEvent::Request` 先到(`pending` 已置位),第一次 `describe`
+                // 折上一回合的 `TurnEnd` 就会把刚到的请求清掉:面板从 `Waiting`
+                // 掉回 `Running`,`question()` 永久 `NotFound`,`answer()` 回
+                // `Stale`。回合结束该由运行时的 `saw(TurnComplete)` 说 —— 与
+                // `ended` 同一条路径(issue #1821 #24)。
                 self.ended = Some(ended_state(stop));
                 if error.is_some() {
                     self.error = error.clone();
@@ -899,7 +909,8 @@ impl LogSummary {
     }
 
     /// 折进一条运行时事件。`pending` 只在这里记(它不是日志里的事实);
-    /// `ended` / `error` 与日志的 `TurnEnd` / `TurnStart` 写同一个字段。
+    /// `ended` / `error` 与日志的 `TurnEnd` 写同一个字段 —— 但**清** error 只在这里
+    /// 的 `TurnStarted`,日志那条路说的是过去。
     fn saw(&mut self, event: &AgentEvent) -> bool {
         match event {
             AgentEvent::TurnStarted { .. } => {
@@ -919,7 +930,7 @@ impl LogSummary {
             AgentEvent::Error { message, .. } => {
                 // 这一行确实会变:phase 已经落 `Failed`,没有 `TurnComplete` 的收尾
                 // 路径(重配回滚失败、恢复持久化失败、fail-close)不会再有第二条事件
-                // 来说它,不在这里要重画,面板要等下一条无关 announce 才播。
+                // 来说它 —— 所以这里要一次重画,否则面板要等下一条无关 announce 才播。
                 self.error = Some(message.clone());
                 true
             }
@@ -1207,7 +1218,7 @@ impl Background {
                 | AgentEvent::ContextAdded { .. }
                 | AgentEvent::Fact(_)
         ) {
-            self.settle_arrivals();
+            self.settle_waiting();
         }
         // 替别的会话干活的那个,干完了把结果投回去 —— 内容落在发起它的那段对话里。
         // 这是"结果回来了"在那段对话里的形状。**只投内容**:要不要接着逐条核实,是那段
@@ -1373,22 +1384,12 @@ impl Background {
         }
     }
 
-    /// 事件到达时把注册表里等待的那几条检查一遍。
-    fn settle_arrivals(&self) {
-        let senders: Vec<String> = {
-            let settling = self.settling.lock().expect("settling poisoned");
-            if settling.is_empty() {
-                return;
-            }
-            settling.keys().cloned().collect()
-        };
-        for sender in senders {
-            self.settle_sender(&sender);
-        }
-    }
-
-    /// 兜底:每 10 秒借一次 home 日志的 seq,没有新事实就不多看一眼。
-    fn sweep_settling(&self) {
+    /// 把注册表里等待的那几条检查一遍。
+    ///
+    /// 两个触发点共用这一个函数体:home 的一条事件到了([`Self::arrived`]),或 10 秒
+    /// 一次的兜底扫描。检查本身只看 `seen_seq` 之后的新事实,所以多问几次不贵 ——
+    /// 而少问一次就可能漏掉只落日志、不产生事件的注(issue #1821 #14)。
+    fn settle_waiting(&self) {
         let senders: Vec<String> = {
             let settling = self.settling.lock().expect("settling poisoned");
             if settling.is_empty() {
@@ -2989,6 +2990,42 @@ mod tests {
         assert_eq!(summary.ended, Some(BackgroundState::Failed));
     }
 
+    /// 同一类的另一条:日志里一条还没折进来的 `TurnStart` 不能清掉运行时刚报上来的
+    /// 错 —— 面板关着时它比那条 `Error` 旧,清掉之后那一行要等下一条无关 announce
+    /// 才播,而这条 `Error` 正是「现在这一回合失败了」(issue #1821 #24)。
+    #[test]
+    fn a_late_turn_start_does_not_drop_the_error_the_runtime_just_reported() {
+        let log = stamped_log("late-turn-start");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Stopped,
+            error: None,
+        });
+        log.append(SessionEvent::TurnStart { turn: 2 });
+
+        let mut projection = LogProjection::default();
+        // 还没折进来的那条 `TurnStart` 说的是过去;运行时先说了现在。
+        projection.absorb(Observed::Live(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        }));
+        projection.update(Some(log.clone()));
+
+        assert_eq!(
+            projection.summary.error.as_deref(),
+            Some("provider died"),
+            "a turn start folded late describes the past, not the runtime's now"
+        );
+        // 日志那一半照旧折进来。
+        assert_eq!(projection.summary.len, 3);
+        assert_eq!(projection.summary.ended, None);
+    }
+
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。
     #[test]
     fn a_question_is_forgotten_when_its_turn_ends() {
@@ -3005,6 +3042,48 @@ mod tests {
             reason: StopReason::Stopped,
         });
         assert!(summary.pending.is_none());
+    }
+
+    /// 审查 Required:面板没开的时候日志只积不折,上一回合的 `TurnEnd` 要等到第一次
+    /// `describe` 才折进来。它只能改日志那一半 —— `pending` 只来自运行时事件,在这里
+    /// 清掉就等于把刚到的请求吃了:面板从 `Waiting` 掉回 `Running`,`question()`
+    /// 永久 `NotFound`、`answer()` 回 `Stale`,提问那一侧还挂在 `rx` 上(issue #1821 #24)。
+    #[test]
+    fn a_late_turn_end_does_not_drop_the_request_that_arrived_first() {
+        let log = stamped_log("late-turn-end");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "上一回合说过话".into(),
+            images: vec![],
+        });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Stopped,
+            error: None,
+        });
+
+        let mut projection = LogProjection::default();
+        // 投影一次都没读过这份日志:上一回合的 `TurnEnd` 还积着。新的回合已经问上
+        // 了,请求先到。
+        projection.absorb(Observed::Live(&AgentEvent::Request {
+            id: 7,
+            kind: "approval".into(),
+            payload: serde_json::Value::Null,
+        }));
+        // 第一次 describe:把积着的那条 `TurnEnd` 折进来。
+        projection.update(Some(log.clone()));
+
+        assert!(
+            matches!(
+                &projection.summary.pending,
+                Some(AgentEvent::Request { id: 7, .. })
+            ),
+            "a turn end folded late cannot drop the request the runtime just took"
+        );
+        // 日志那一半照旧折对了。
+        assert_eq!(projection.summary.len, 3);
+        assert_eq!(projection.summary.ended, Some(BackgroundState::Done));
     }
 
     #[test]
