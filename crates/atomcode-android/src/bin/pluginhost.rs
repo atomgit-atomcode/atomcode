@@ -98,6 +98,15 @@ struct Manifest {
     /// caller to set an environment variable.
     #[serde(default)]
     preload: Vec<String>,
+    /// The SHA-256 of every library this package loads, keyed by the library's
+    /// path relative to the package root.
+    ///
+    /// The bundle's own digest was checked once, when it was installed. These
+    /// tie the *file on disk* to that check, so the gap between the two — where
+    /// a library inside the package directory can be replaced — closes: a
+    /// library whose hash does not match is not loaded at all.
+    #[serde(default)]
+    digests: std::collections::BTreeMap<String, String>,
 }
 
 #[cfg(unix)]
@@ -270,6 +279,71 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
     any.then_some(out)
 }
 
+/// Check a library against the digest the manifest publishes for it.
+///
+/// The bundle's own digest was verified once, at install time. This is the
+/// second half of that check: it ties the *file on disk* to the claim, so the
+/// window between "the bundle was verified" and "the library is loaded" does
+/// not become a way in. A library that was swapped after the install hashes
+/// differently and is refused.
+///
+/// A library with no published digest is refused too. The manifest is written
+/// by whoever published the package, and a package that loads code without
+/// saying what that code is cannot be checked at all — so the loader treats the
+/// absence of a digest as "not verified", not as "nothing to check".
+#[cfg(unix)]
+fn verify_digest(library: &Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(library)
+        .map_err(|error| format!("cannot read {}: {error}", library.display()))?;
+    let actual = {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let expected = expected.trim().to_ascii_lowercase();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} does not match its published digest (expected {expected}, got {actual})",
+            library.display()
+        ))
+    }
+}
+
+/// Check every library a package loads, before any of them is loaded.
+///
+/// The entry library and the preloaded ones alike: `preload` is how CPython's
+/// interpreter reaches the process's global scope, so it is code execution
+/// exactly as much as the entry is.
+#[cfg(unix)]
+fn verify_manifest_digests(dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let mut libraries: Vec<&str> = Vec::new();
+    if !manifest.entry.is_empty() {
+        libraries.push(&manifest.entry);
+    }
+    libraries.extend(manifest.preload.iter().map(String::as_str));
+
+    for library in libraries {
+        let Some(expected) = manifest.digests.get(library) else {
+            return Err(format!(
+                "package {:?} loads {library:?} but publishes no digest for it",
+                manifest.name
+            ));
+        };
+        // The path is checked the same way the loader resolves it, so a
+        // manifest cannot point the digest at a file outside the package.
+        let Some(relative) = safe_relative(Path::new(library)) else {
+            return Err(format!(
+                "library must be a relative path inside the package: {library}"
+            ));
+        };
+        verify_digest(&dir.join(relative), expected)?;
+    }
+    Ok(())
+}
+
 /// Re-run ourselves with `LD_PRELOAD` when the package asks for globally
 /// preloaded libraries.
 ///
@@ -294,6 +368,14 @@ fn reexec_with_preload(command: &str) {
     };
     if manifest.preload.is_empty() {
         return;
+    }
+    // Checked **here**, before the re-exec: the preloaded libraries are loaded
+    // by the dynamic linker at process start-up, so the child would already
+    // have them mapped in before `load` got a chance to look. A package whose
+    // libraries do not match their published digests is refused before it can
+    // put anything into the process.
+    if verify_manifest_digests(&dir, &manifest).is_err() {
+        return; // `load` will report the real problem
     }
     let mut paths: Vec<String> = Vec::with_capacity(manifest.preload.len());
     for relative in &manifest.preload {
@@ -341,6 +423,12 @@ fn load(command: &str) -> Result<Loaded, String> {
         return Err(format!("invalid command name: {command:?}"));
     }
     let (name, dir, manifest) = resolve(command)?;
+
+    // Before anything is loaded: every library this package will load must
+    // hash to the digest its manifest publishes. The bundle's own digest was
+    // checked once, at install time — this closes the gap between that check
+    // and this one.
+    verify_manifest_digests(&dir, &manifest)?;
 
     let library = dir.join(&manifest.entry);
     if !library.is_file() {
@@ -465,4 +553,103 @@ fn main() {
     let plugin: PluginMain = unsafe { std::mem::transmute(entry) };
     let code = unsafe { plugin(pointers.len() as c_int, pointers.as_ptr()) };
     std::process::exit(code);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A manifest whose `entry` and `preload` point at libraries that exist.
+    fn manifest_with(digests: std::collections::BTreeMap<String, String>) -> Manifest {
+        Manifest {
+            name: "demo".into(),
+            version: "1.0".into(),
+            entry: "lib/demo.so".into(),
+            symbol: "plugin_main".into(),
+            aliases: Vec::new(),
+            preload: vec!["lib/libpython.so".into()],
+            digests,
+        }
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn package_with(libraries: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in libraries {
+            let target = dir.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, body).unwrap();
+        }
+        dir
+    }
+
+    /// The digest is checked against the file on disk, so a library that was
+    /// swapped after the install does not match and is refused.
+    #[test]
+    fn a_library_that_matches_its_digest_is_accepted() {
+        let dir = package_with(&[("lib/demo.so", b"\x7fELF"), ("lib/libpython.so", b"\x7fPY")]);
+        let mut digests = std::collections::BTreeMap::new();
+        digests.insert("lib/demo.so".into(), sha256_of(b"\x7fELF"));
+        digests.insert("lib/libpython.so".into(), sha256_of(b"\x7fPY"));
+        let manifest = manifest_with(digests);
+
+        verify_manifest_digests(dir.path(), &manifest).expect("the digests match");
+    }
+
+    /// The whole point: a library replaced after the install hashes differently
+    /// and is refused before it is loaded.
+    #[test]
+    fn a_library_that_was_swapped_is_refused() {
+        let dir = package_with(&[("lib/demo.so", b"\x7fELF"), ("lib/libpython.so", b"\x7fPY")]);
+        let mut digests = std::collections::BTreeMap::new();
+        digests.insert("lib/demo.so".into(), sha256_of(b"the original"));
+        digests.insert("lib/libpython.so".into(), sha256_of(b"\x7fPY"));
+        let manifest = manifest_with(digests);
+
+        let error = verify_manifest_digests(dir.path(), &manifest)
+            .expect_err("a swapped library is refused");
+        assert!(error.contains("does not match"), "{error}");
+    }
+
+    /// A preloaded library is code execution exactly as much as the entry one
+    /// is, so it is checked too — and a missing digest for it refuses the load.
+    #[test]
+    fn a_preloaded_library_without_a_digest_is_refused() {
+        let dir = package_with(&[("lib/demo.so", b"\x7fELF"), ("lib/libpython.so", b"\x7fPY")]);
+        let mut digests = std::collections::BTreeMap::new();
+        digests.insert("lib/demo.so".into(), sha256_of(b"\x7fELF"));
+        let manifest = manifest_with(digests);
+
+        let error =
+            verify_manifest_digests(dir.path(), &manifest).expect_err("the preload has no digest");
+        assert!(error.contains("publishes no digest"), "{error}");
+    }
+
+    /// A digest may not point at a file outside the package: the path is
+    /// resolved the same way the loader resolves it.
+    #[test]
+    fn a_digest_path_that_escapes_the_package_is_refused() {
+        let dir = package_with(&[("lib/demo.so", b"\x7fELF")]);
+        // The **entry** itself points outside the package, and the digest is
+        // published for it — so the path check is what refuses it, not the
+        // missing digest.
+        let mut manifest = manifest_with(std::collections::BTreeMap::new());
+        manifest.entry = "../outside.so".into();
+        manifest.preload.clear();
+        manifest
+            .digests
+            .insert("../outside.so".into(), sha256_of(b"whatever"));
+
+        let error = verify_manifest_digests(dir.path(), &manifest).expect_err("refuses the escape");
+        assert!(
+            error.contains("relative path inside the package"),
+            "{error}"
+        );
+    }
 }

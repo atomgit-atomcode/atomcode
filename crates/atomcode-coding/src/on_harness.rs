@@ -420,6 +420,22 @@ struct FsWorldPatch<'a> {
     also_readable: Vec<&'a std::path::Path>,
 }
 
+/// The config shape the `fs-saf` row reads.
+///
+/// It is deliberately **not** [`FsWorldPatch`]: that is the fenced shape, and a
+/// row that reads two fields cannot be handed four. Naming the shape here is
+/// what makes the mismatch visible at the point where it happens — the swap
+/// that hands this row a config written for another one.
+#[derive(serde::Serialize)]
+struct SafWorldPatch<'a> {
+    /// The path the world reports as its root. Synthetic: SAF has no paths.
+    root: Option<&'a str>,
+    /// Refuse every mutation. The granted tree is read-only unless something
+    /// says otherwise.
+    #[serde(skip_serializing_if = "is_false")]
+    read_only: bool,
+}
+
 /// For `skip_serializing_if`, which hands the field over by reference.
 fn is_false(value: &bool) -> bool {
     !*value
@@ -937,6 +953,28 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     if atomcode_capabilities::saf::installed_backend().is_some() {
         tracing::debug!("SAF: swapping the `fs` row to `fs-saf`");
         out = out.swap("fs", "fs-saf");
+        // `swap` keeps the row's config, and the config the `fs` row was
+        // patched with is in the **fenced** shape (`FsWorldPatch`) — the
+        // `fs-saf` row knows only `root` and `read_only`. Left alone, the fence
+        // fields would be dropped in silence, and in the headless case the
+        // `root` would still be the real working directory: the SAF world's
+        // root would become the app's private directory instead of `/saf`, and
+        // the daemon's `/fs/*` routes (which work on real paths) and the file
+        // tools (which work on the granted tree) would be looking at two
+        // different namespaces.
+        //
+        // So the shape is made explicit here: the SAF world is the granted
+        // tree, and whether it is read-only is the fence's own question, asked
+        // of the row rather than inherited from a shape it cannot read.
+        out = out
+            .patch(
+                "fs",
+                SafWorldPatch {
+                    root: Some(atomcode_capabilities::saf::SAF_ROOT),
+                    read_only: false,
+                },
+            )
+            .map_err(|e| e.to_string())?;
     } else {
         tracing::debug!("SAF: no backend installed, keeping the local world");
     }

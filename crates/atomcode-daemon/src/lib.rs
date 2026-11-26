@@ -1378,6 +1378,29 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([header::CONTENT_TYPE])
 }
 
+/// Tell the browser not to send this URL to anyone else.
+///
+/// The webui is reached through a `?token=` query string, and the page's own
+/// sub-resource requests would otherwise carry the full URL — token included —
+/// in their `Referer` header. The token is the full control of `/config`
+/// (provider API keys), `/fs/*`, `/chat` and `/packages/install`, so it must
+/// not travel to a third origin.
+///
+/// The handoff itself already strips the query string (see
+/// [`serve_webui_index`]) and hands the token over in a `HttpOnly; SameSite=Strict`
+/// cookie; this is the belt to its braces, for the paths that do not go through
+/// the handoff.
+async fn no_referrer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert("Referrer-Policy", "no-referrer".parse().unwrap());
+    response
+}
+
 /// Middleware that updates `last_activity` timestamp on every request except
 /// GET /health and POST /shutdown (these should not prevent idle timeout).
 async fn activity_tracker_middleware(
@@ -7986,12 +8009,18 @@ async fn fs_search(
     // `@` picker was simply empty in that build. Search the granted tree over the
     // `FileSystem` seam instead. A real directory still takes the real path.
     if !dir.is_dir() {
-        if let Some(matches) = saf_search(&dir, &q.q).await {
-            return Json(serde_json::json!({
+        if let Some((matches, refusal)) = saf_search(&dir, &q.q).await {
+            let mut body = serde_json::json!({
                 "path": dir.to_string_lossy(),
                 "matches": matches,
-            }))
-            .into_response();
+            });
+            if let Some(message) = refusal {
+                // The scope left the granted tree. Saying so is the point: an
+                // empty list would read as "nothing matched" and send the
+                // person looking in the wrong place.
+                body["error"] = serde_json::Value::String(message);
+            }
+            return Json(body).into_response();
         }
     }
     let search_dir = dir.clone();
@@ -8012,7 +8041,14 @@ async fn fs_search(
 /// Same token grammar and same result shape as [`search_at_mention`], so the
 /// webui picker does not learn a second protocol: `scope` narrows the start
 /// directory, `filter` matches names.
-async fn saf_search(dir: &std::path::Path, token: &str) -> Option<Vec<serde_json::Value>> {
+///
+/// The second element of the pair is a message when the search was **refused**
+/// rather than empty: a scope that leaves the granted tree is an error, and the
+/// caller should say so instead of showing an empty picker.
+async fn saf_search(
+    dir: &std::path::Path,
+    token: &str,
+) -> Option<(Vec<serde_json::Value>, Option<String>)> {
     let root = atomcode_capabilities::saf::installed_root()?;
     let backend = atomcode_capabilities::saf::installed_backend()?;
     // A path outside the granted tree is not ours to search.
@@ -8021,13 +8057,17 @@ async fn saf_search(dir: &std::path::Path, token: &str) -> Option<Vec<serde_json
     let scope = relative.join(&scope);
     let scope = scope.to_string_lossy().replace('\\', "/");
     let world = atomcode_capabilities::saf::SafFs::read_only(root, backend);
-    let matches = atomcode_capabilities::saf::search_names(&world, &scope, &filter).await;
-    Some(
+    let matches = match atomcode_capabilities::saf::search_names(&world, &scope, &filter).await {
+        Ok(matches) => matches,
+        Err(error) => return Some((Vec::new(), Some(error.message))),
+    };
+    Some((
         matches
             .into_iter()
             .map(|(path, is_dir)| serde_json::json!({ "path": path, "is_dir": is_dir }))
             .collect(),
-    )
+        None,
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -8721,7 +8761,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .with_state(state)
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))
-        .layer(cors_layer());
+        .layer(cors_layer())
+        .layer(axum::middleware::from_fn(no_referrer));
 
     // Spawn idle timeout watchdog task
     spawn_idle_timeout_task(

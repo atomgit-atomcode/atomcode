@@ -18,6 +18,7 @@ import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.util.Log
 import java.io.File
+import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONObject
 import android.view.ViewGroup
@@ -51,6 +52,21 @@ class MainActivity : ComponentActivity() {
     private lateinit var web: WebView
     private lateinit var status: TextView
     private var loadedUrl: String? = null
+    /**
+     * The origin the webui is served from: `127.0.0.1:<daemon port>`.
+     *
+     * This is the boundary for everything the page can do. The JavaScript bridge
+     * reaches the microphone, the file picker, the package installer and the
+     * workspace — so it must only exist on the page the app itself loaded, and
+     * only for as long as that page is the one on screen.
+     *
+     * The port is part of it on purpose. The daemon binds a random port, so
+     * "127.0.0.1:anything" is not the same page: any other process on the device
+     * can bind a loopback port and serve whatever it likes. A host-only check
+     * would let a link the model emits navigate that page *inside the WebView*,
+     * where the bridge would still be reachable.
+     */
+    private var trustedOrigin: String? = null
     private var bound = false
     /** Where the camera app writes the picture it was asked to take, if any. */
     private var pendingCaptureFile: File? = null
@@ -207,22 +223,39 @@ class MainActivity : ComponentActivity() {
             // and treats a `null` return as "the browser blocked the pop-up".
             // A WebView cannot open a tab, so the page is handed to the system
             // browser instead — see `installExternalLinkBridge`.
-            addJavascriptInterface(HostBridge(), "AtomCodeHost")
+            addJavascriptInterface(HostBridge(), BRIDGE_NAME)
             webViewClient = object : WebViewClient() {
-                // Every in-app navigation stays on the loopback origin. A link
+                // Every in-app navigation stays on the daemon's origin. A link
                 // the model emits, and the OAuth sign-in page, both leave it —
                 // those go to the system browser, which is where a sign-in
                 // belongs anyway (the page then polls the daemon, so no callback
                 // into this app is needed).
+                //
+                // The comparison is on the whole origin, port included. A host
+                // check alone would let `http://127.0.0.1:<other port>` — a page
+                // any local process can serve — load inside this WebView, where
+                // the bridge is still installed.
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                    val host = request.url.host ?: return true
-                    if (host == "127.0.0.1" || host == "localhost") return false
+                    if (isTrusted(request.url)) return false
                     openInBrowser(request.url.toString())
                     return true
                 }
 
+                override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    // The bridge is installed for the webui's origin only. If
+                    // something else is being loaded here, it must not be able to
+                    // reach the microphone, the file picker or the installer.
+                    if (isTrusted(Uri.parse(url))) {
+                        view.addJavascriptInterface(HostBridge(), BRIDGE_NAME)
+                    } else {
+                        view.removeJavascriptInterface(BRIDGE_NAME)
+                    }
+                }
+
                 override fun onPageFinished(view: WebView, url: String) {
                     super.onPageFinished(view, url)
+                    if (!isTrusted(Uri.parse(url))) return
                     installExternalLinkBridge(view)
                 }
             }
@@ -382,9 +415,28 @@ class MainActivity : ComponentActivity() {
             val target = File(dir, "${System.currentTimeMillis()}-${shareName(uri)}")
             try {
                 val input = contentResolver.openInputStream(uri) ?: continue
-                input.use { source -> target.outputStream().use { source.copyTo(it) } }
+                // The activity is exported and accepts a share from any app, so
+                // the stream is untrusted input: without a cap, one share could
+                // fill the device's storage. The limit is counted while copying,
+                // not from the header — a provider may lie about the length.
+                val copied = input.use { source ->
+                    target.outputStream().use { sink ->
+                        val buffer = ByteArray(64 * 1024)
+                        var total = 0L
+                        while (true) {
+                            val read = source.read(buffer)
+                            if (read <= 0) break
+                            total += read
+                            if (total > MAX_SHARE_BYTES) {
+                                throw IOException("the shared file is over the $MAX_SHARE_BYTES byte limit")
+                            }
+                            sink.write(buffer, 0, read)
+                        }
+                        total
+                    }
+                }
                 pendingShares.add(target.absolutePath)
-                Log.i(TAG, "accepted a shared file: ${target.name}")
+                Log.i(TAG, "accepted a shared file: ${target.name} ($copied bytes)")
             } catch (failure: Exception) {
                 Log.w(TAG, "could not copy a shared file", failure)
                 target.delete()
@@ -810,6 +862,15 @@ class MainActivity : ComponentActivity() {
                 Log.w(TAG, "not an absolute file path: $path")
                 return false
             }
+            // The page names the path, so the range is checked here rather than
+            // left to `FileProvider`: the page could otherwise hand any readable
+            // file on the device to a third app with read access. The
+            // `FileProvider` declaration is the second line of defence, not the
+            // only one.
+            if (!isVouchable(file)) {
+                Log.w(TAG, "outside the paths this app vouches for: $path")
+                return false
+            }
             val uri = try {
                 FileProvider.getUriForFile(this@MainActivity, "$packageName.files", file)
             } catch (refused: IllegalArgumentException) {
@@ -985,9 +1046,61 @@ class MainActivity : ComponentActivity() {
         view.evaluateJavascript(script, null)
     }
 
+    /**
+     * Whether `url` is the daemon's own page — the only one that may hold the
+     * JavaScript bridge.
+     *
+     * The comparison is on scheme, host **and port**. The daemon binds a random
+     * loopback port, so `http://127.0.0.1:<other port>` is a different page
+     * served by a different process: any app on the device can bind one and
+     * answer with whatever it likes. A host-only check would treat that page as
+     * ours, and a link the model emits could navigate into it — inside the
+     * WebView, where the bridge would still be installed.
+     */
+    private fun isTrusted(url: Uri): Boolean {
+        val trusted = trustedOrigin ?: return false
+        return url.scheme == "http" &&
+            (url.host == "127.0.0.1" || url.host == "localhost") &&
+            originOf(url) == trusted
+    }
+
+    /** `scheme://host:port`, the part that decides "same page". */
+    private fun originOf(url: Uri): String {
+        val host = url.host ?: return ""
+        // The default port of `http` is 80; the daemon never uses it, but a URL
+        // that spells it out is still the same origin as one that does not.
+        val port = if (url.port == -1) 80 else url.port
+        return "${url.scheme}://$host:$port"
+    }
+
+    /**
+     * Whether this app vouches for handing `file` to another app.
+     *
+     * The page names the path, so the range is decided here: the product
+     * directory (this app's own tree) and the shared workspace
+     * (`/storage/emulated/0/AtomCode`) are the two directories the agent works
+     * in. Anything else on the device — another app's directory, the DCIM
+     * folder, a file a photo app left behind — is not this app's to hand out.
+     *
+     * The comparison is on the **canonical** path, so a path that walks out of
+     * the tree with `..` and comes back is judged by where it lands, not by how
+     * it was spelled.
+     */
+    private fun isVouchable(file: File): Boolean {
+        val canonical = try {
+            file.canonicalFile
+        } catch (missing: IOException) {
+            return false
+        }
+        val roots = listOf(
+            File(filesDir, "atomcode").canonicalFile,
+            File(Environment.getExternalStorageDirectory(), SHARED_DIR).canonicalFile,
+        )
+        return roots.any { root -> canonical.path == root.path || canonical.path.startsWith(root.path + File.separator) }
+    }
+
     /** Hand an external URL to whichever app handles it (browser, usually). */
-    private fun openInBrowser(url: String) {
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    private fun openInBrowser(url: String) {        if (!url.startsWith("http://") && !url.startsWith("https://")) {
             Log.w(TAG, "refusing to open non-http URL: $url")
             return
         }
@@ -1119,6 +1232,9 @@ class MainActivity : ComponentActivity() {
 
     private fun load(url: String) {
         agentUrl = url
+        // The origin the bridge is allowed to exist on. Taken from the daemon URL
+        // the host handed us — not from whatever the page navigates to later.
+        trustedOrigin = originOf(Uri.parse(url))
         val session = pendingOpenSession
         pendingOpenSession = null
         val target = if (session != null) withSession(url, session) else url
@@ -1368,6 +1484,14 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "AtomCode"
+        /**
+         * The name the page sees the host bridge under.
+         *
+         * Also the name the bridge is *removed* under when the WebView navigates
+         * off the daemon's origin — the two must be the same string, so it lives
+         * in one place.
+         */
+        private const val BRIDGE_NAME = "AtomCodeHost"
         /** 共享存储下 agent 的工作目录；外部 daemon 把 ATOMACODE_HOME 指到这里。 */
         private const val SHARED_DIR = "AtomCode"
         private const val FILE_CHOOSER_REQUEST = 0x51
@@ -1379,6 +1503,14 @@ class MainActivity : ComponentActivity() {
         private const val SHARES_DIR = "shares"
         /** Shared files nobody collected are cleaned up from the cache. */
         private const val STALE_SHARE_MS = 60 * 60_000L
+        /**
+         * The largest file a share may contribute.
+         *
+         * The activity is exported and takes a share from any app, so the bytes
+         * are untrusted. 64 MB is comfortably above a photo or a log and far
+         * below what would matter for filling a phone's storage.
+         */
+        private const val MAX_SHARE_BYTES = 64L * 1024 * 1024
         /** Runtime notification prompt (Android 13+). */
         private const val NOTIFICATION_REQUEST = 0x52
         /**

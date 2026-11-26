@@ -292,7 +292,11 @@ class AgentService : Service() {
             helperLibDirs.ifEmpty { null },
         )
         urlOrError = if (url != null) {
-            Log.i(TAG, "agent server listening at $url")
+            // The URL carries the auth token, so it must not be logged. The
+            // port is enough to say "it is up" and is not a credential: that
+            // token is the full control of `/config` (provider API keys),
+            // `/fs/*`, `/chat` and `/packages/install`.
+            Log.i(TAG, "agent server listening on port ${NativeAgent.nativePort()}")
             startStatusPolling(url)
             url to null
         } else {

@@ -49,6 +49,10 @@ async-trait = "0.1"
 # the daemon side already depends on these, so nothing new enters the lock.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The loader verifies a package's library against the digest the manifest
+# publishes, before it is `dlopen`ed into the host process. `sha2` is already
+# in the lock through `atomcode-daemon`, so this adds no new package.
+sha2 = "0.10"
 atomcode-config = { path = "../atomcode-config" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 # For one thing only: reporting whether the gateway signer is available, so a

@@ -296,3 +296,21 @@ pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativeLastError(
         None => std::ptr::null_mut(),
     }
 }
+
+/// The port the agent server listens on, or `0` when it is not running.
+///
+/// The webui URL carries the auth token, so it must not be logged — and this
+/// is what the log line says instead: the port is enough to tell "it is up" from
+/// "it is not", and nothing else is needed. `AgentService` logs this one.
+#[no_mangle]
+pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativePort(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> j16 {
+    let Ok(slot) = SERVER.lock() else {
+        return 0;
+    };
+    slot.as_ref()
+        .map(|server| server.port() as j16)
+        .unwrap_or(0)
+}

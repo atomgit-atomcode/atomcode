@@ -56,6 +56,15 @@ object NativeAgent {
     external fun nativeLastError(): String?
 
     /**
+     * The port the agent server listens on, or 0 when it is not running.
+     *
+     * The webui URL carries the auth token, so it must not be logged — and this
+     * is what the log line says instead: the port is enough to tell "it is up"
+     * from "it is not", and it is not a credential.
+     */
+    external fun nativePort(): Int
+
+    /**
      * Hand the folder granted through the picker to the Rust SAF world.
      *
      * Must be called before the runtime mounts that world — the `fs-saf` row

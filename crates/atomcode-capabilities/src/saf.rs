@@ -131,6 +131,13 @@ pub fn installed_root() -> Option<PathBuf> {
 const SEARCH_MAX_DEPTH: usize = 8;
 const SEARCH_MAX_MATCHES: usize = 200;
 
+/// The path the SAF world reports as its root.
+///
+/// Synthetic: SAF has no paths, so this is a name the world prints, the gates
+/// compare against, and the model reads. It is the same for every grant — the
+/// tree behind it is the one the person picked.
+pub const SAF_ROOT: &str = "/saf";
+
 /// Directory names the name search never descends into.
 fn is_noise_dir(name: &str) -> bool {
     matches!(
@@ -149,14 +156,19 @@ fn is_noise_dir(name: &str) -> bool {
 /// Why not reuse `file_index`: it walks a real directory and reads `.gitignore`,
 /// while SAF hands out `content://` documents with neither. The bounds exist for
 /// the same reason the file picker has them — a grant can be a whole SD card.
-pub async fn search_names(fs: &dyn FileSystem, scope: &str, filter: &str) -> Vec<(String, bool)> {
+///
+/// The scope is checked **here**, at the boundary, and a scope that leaves the
+/// tree is an error rather than an empty result: it used to be caught further
+/// down, where the refusal was swallowed into "no matches", so the caller could
+/// not tell "nothing matched" from "you asked for somewhere else".
+pub async fn search_names(
+    fs: &dyn FileSystem,
+    scope: &str,
+    filter: &str,
+) -> Result<Vec<(String, bool)>, FsError> {
     let needle = filter.trim().to_lowercase();
     let root = fs.root();
-    let start = if scope.trim().is_empty() {
-        root.clone()
-    } else {
-        root.join(scope)
-    };
+    let start = scope_within_root(&root, scope)?;
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
         std::collections::VecDeque::from([(start, 0usize)]);
@@ -195,7 +207,38 @@ pub async fn search_names(fs: &dyn FileSystem, scope: &str, filter: &str) -> Vec
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// The directory a search starts from, checked against the root.
+///
+/// The scope comes from the `@`-mention token, so it is whatever the caller
+/// typed: `../../../../data/data/…` must not start a walk outside the granted
+/// tree. Folding is lexical, which is exact for this world — SAF documents have
+/// no links to follow (see the module docs), so there is no second path that
+/// could differ from the one folded here.
+fn scope_within_root(root: &Path, scope: &str) -> Result<PathBuf, FsError> {
+    let scope = scope.trim();
+    if scope.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let mut depth = 0usize;
+    for component in Path::new(scope).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err(FsError::denied(format!("{scope} is outside this folder")));
+                }
+                depth -= 1;
+            }
+            Component::Normal(_) => depth += 1,
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(FsError::denied(format!("{scope} is outside this folder")));
+            }
+        }
+    }
+    Ok(root.join(scope))
 }
 
 /// A [`FileSystem`] whose root is a folder the person granted through the picker.
@@ -677,6 +720,39 @@ mod tests {
         assert!(fs.canonicalize(Path::new("../../etc")).await.is_err());
     }
 
+    /// The **write** side is refused too.
+    ///
+    /// The escape check used to be asserted only on reads, even though
+    /// `write_bytes` and `create_dir_all` share the same `relative()` call — a
+    /// shared path is not an asserted one, and a change to the write path could
+    /// have gone unnoticed. A write that lands outside the granted tree is the
+    /// one that matters: it puts a file where the person never granted
+    /// anything.
+    #[tokio::test]
+    async fn a_write_that_leaves_the_tree_is_denied() {
+        let fs = world(Memory::new());
+        for path in [
+            "../escaped.txt",
+            "../../data/data/com.other.app/x",
+            "/sdcard/other/x",
+        ] {
+            let error = fs.write_bytes(Path::new(path), b"x").await.unwrap_err();
+            assert_eq!(error.kind, FsErrorKind::Denied, "{path} must be refused");
+        }
+    }
+
+    /// Creating a directory is a mutation too, and it is the one that can
+    /// leave a whole tree behind.
+    #[tokio::test]
+    async fn a_directory_that_leaves_the_tree_is_denied() {
+        let fs = world(Memory::new());
+        let error = fs
+            .create_dir_all(Path::new("../escaped"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, FsErrorKind::Denied);
+    }
+
     #[tokio::test]
     async fn listing_is_sorted_by_name_whatever_the_provider_returns() {
         let fs = world(
@@ -737,7 +813,7 @@ mod tests {
                 .with_file("README.md", b"x"),
         );
 
-        let found = search_names(&fs, "", "apply").await;
+        let found = search_names(&fs, "", "apply").await.expect("searches");
         let paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
         assert!(
             paths.contains(&"src/main/java/cn/ApplyStockController.java"),
@@ -752,7 +828,7 @@ mod tests {
 
         // An empty filter is "what is here" — the immediate children, the same
         // thing typing `@` with nothing after it asks for.
-        let top = search_names(&fs, "", "").await;
+        let top = search_names(&fs, "", "").await.expect("searches");
         let tops: Vec<&str> = top.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(tops, vec!["README.md", "src", "target"]);
     }
@@ -766,8 +842,29 @@ mod tests {
                 .with_file("src/apply.rs", b"x")
                 .with_file("docs/apply.md", b"x"),
         );
-        let found = search_names(&fs, "src", "apply").await;
+        let found = search_names(&fs, "src", "apply").await.expect("searches");
         let paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(paths, vec!["src/apply.rs"]);
+    }
+
+    /// A scope that leaves the granted tree is refused **at the boundary**.
+    ///
+    /// It used to be caught further down, where the refusal was swallowed into
+    /// "no matches" — so the caller could not tell "nothing matched" from "you
+    /// asked for somewhere else", and a scope pointing at another app's data
+    /// looked like an empty folder.
+    #[tokio::test]
+    async fn a_scope_that_leaves_the_tree_is_refused_rather_than_returning_nothing() {
+        let fs = world(Memory::new().with_file("src/apply.rs", b"x"));
+
+        for scope in ["../..", "../../data/data/com.other.app", "/etc"] {
+            let error = search_names(&fs, scope, "apply")
+                .await
+                .expect_err("a scope that leaves the tree is refused");
+            assert!(
+                error.message.contains("outside this folder"),
+                "{scope}: {error:?}"
+            );
+        }
     }
 }

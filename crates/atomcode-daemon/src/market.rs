@@ -819,10 +819,21 @@ pub(crate) async fn market_helper_download(Query(query): Query<HelperQuery>) -> 
     // The repository published a hash; a mismatch means the file is not the one
     // the index describes, and installing it would be installing something
     // nobody reviewed.
-    if !helper.sha256.is_empty() {
-        if let Err(error) = verify_sha256(&bytes, &helper.sha256) {
-            return Json(serde_json::json!({ "success": false, "error": error })).into_response();
+    //
+    // An **empty** hash is refused rather than treated as "nothing to check":
+    // the index is supposed to carry a digest for every artifact, and one that
+    // does not is a broken index, not an artifact that happens to be trusted.
+    // The APK lands in `files/atomcode/helper/`, and the page can then ask the
+    // system installer to install it — so an unverified APK must not get that
+    // far.
+    let expected = match required_helper_digest(&helper) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return Json(serde_json::json!({ "success": false, "error": error })).into_response()
         }
+    };
+    if let Err(error) = verify_sha256(&bytes, expected) {
+        return Json(serde_json::json!({ "success": false, "error": error })).into_response();
     }
 
     let path = match write_helper_apk(&helper.name, &bytes) {
@@ -887,6 +898,24 @@ fn write_helper_apk(name: &str, bytes: &[u8]) -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
+/// The digest a helper artifact must carry, or why it has none.
+///
+/// An **empty** digest is an error, not an absence of one: the index is
+/// supposed to publish a digest for every artifact, and one that does not is a
+/// broken index. Treating it as "nothing to check" let an unverified APK
+/// through to `files/atomcode/helper/`, where the page can then ask the
+/// system installer to install it.
+fn required_helper_digest(helper: &MarketHelper) -> Result<&str, String> {
+    let digest = helper.sha256.trim();
+    if digest.is_empty() {
+        return Err(format!(
+            "the market publishes no sha256 for {}",
+            helper.name
+        ));
+    }
+    Ok(digest)
+}
+
 fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let expected = expected.trim().to_ascii_lowercase();
@@ -929,6 +958,60 @@ pub(crate) async fn set_market_base(Json(body): Json<MarketBaseBody>) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A helper artifact with **no** digest is refused.
+    ///
+    /// It used to be treated as "nothing to check", so an unverified APK landed
+    /// in `files/atomcode/helper/` — where the page can ask the system
+    /// installer to install it. The index is supposed to publish a digest for
+    /// every artifact; one that does not is a broken index.
+    #[test]
+    fn a_helper_without_a_digest_is_refused() {
+        let helper = MarketHelper {
+            name: "zig".into(),
+            package: "com.atomcode.tools.zig".into(),
+            title: String::new(),
+            summary: String::new(),
+            version: "1.0".into(),
+            size_bytes: 0,
+            sha256: String::new(),
+            artifact: Artifact::default(),
+        };
+        let error = required_helper_digest(&helper).expect_err("an empty digest is refused");
+        assert!(error.contains("publishes no sha256"), "{error}");
+    }
+
+    /// A digest that is only whitespace is the same as none.
+    #[test]
+    fn a_helper_with_a_blank_digest_is_refused() {
+        let helper = MarketHelper {
+            name: "zig".into(),
+            package: String::new(),
+            title: String::new(),
+            summary: String::new(),
+            version: "1.0".into(),
+            size_bytes: 0,
+            sha256: "   \n ".into(),
+            artifact: Artifact::default(),
+        };
+        assert!(required_helper_digest(&helper).is_err());
+    }
+
+    /// A published digest is taken as it is — trimmed, but not otherwise.
+    #[test]
+    fn a_published_digest_is_accepted() {
+        let helper = MarketHelper {
+            name: "zig".into(),
+            package: String::new(),
+            title: String::new(),
+            summary: String::new(),
+            version: "1.0".into(),
+            size_bytes: 0,
+            sha256: "  abc123  ".into(),
+            artifact: Artifact::default(),
+        };
+        assert_eq!(required_helper_digest(&helper).ok(), Some("abc123"));
+    }
 
     // A fresh install that ships a known market gets it written once. Without this
     // the panel opened on "market not configured" and the phones that can only get

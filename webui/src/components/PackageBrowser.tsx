@@ -440,6 +440,14 @@ export function PackageBrowser({ onClose }: PackageBrowserProps) {
       setError(t('pkg.sourceRequired'));
       return;
     }
+    // A package is dlopen'd into the host process, so the bundle is verified
+    // before it is unpacked. Asking here rather than letting the daemon refuse
+    // it turns "a button that fails" into "a field that must be filled in".
+    const digest = sha256.trim();
+    if (!digest) {
+      setError(t('pkg.sha256Required'));
+      return;
+    }
     if (busy) return;
     const controller = new AbortController();
     setAbort(controller);
@@ -453,7 +461,7 @@ export function PackageBrowser({ onClose }: PackageBrowserProps) {
       const request = {
         url: isUrl ? trimmed : undefined,
         path: isUrl ? undefined : trimmed,
-        sha256: sha256.trim() || undefined,
+        sha256: digest,
       };
       let sawEvent = false;
       let record: PackageRecord;

@@ -102,6 +102,47 @@ pub struct Manifest {
     /// to bring its own engine, and a local one keeps the audio on the device.
     #[serde(default)]
     pub transcribe: bool,
+    /// Libraries loaded **globally** before the entry point, relative to the
+    /// package root.
+    ///
+    /// The daemon does not load them, but it must know about them: they are
+    /// code that ends up in the host process exactly as much as the entry
+    /// library is, so their digests are recorded and checked like the entry's.
+    ///
+    /// CPython needs this and cannot express it any other way: its extension
+    /// modules link against `libpython` and expect its symbols in the process's
+    /// global scope.
+    ///
+    /// Not serialized when empty, so a published manifest keeps the shape it
+    /// had before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload: Vec<String>,
+    /// The SHA-256 of every library this package loads, keyed by the library's
+    /// path relative to the package root.
+    ///
+    /// A package is not inert data: `pluginhost` loads these libraries into the
+    /// **host process**, so installing one is handing that bundle the ability to
+    /// run inside the agent. The bundle's own digest is checked once, at install
+    /// time; these tie the *files that will be loaded* to that check.
+    ///
+    /// Without them there is a window between the two: the bundle is verified,
+    /// unpacked, and then a library inside the package directory can be replaced
+    /// before anything loads it — and `pluginhost` would load the replacement
+    /// without looking again. The loader refuses a library whose digest does not
+    /// match, so a swapped file is dead code rather than a running backdoor.
+    ///
+    /// Both the entry library and the preloaded ones are listed: `preload` is
+    /// how CPython's interpreter gets into the process's global scope, so it is
+    /// code execution exactly as much as the entry is.
+    ///
+    /// A library with no entry here is not loaded. A data-only package (no
+    /// `entry`) needs none.
+    ///
+    /// Not serialized when empty: the published manifest keeps the shape it had
+    /// before this field existed. The digests are written into the **installed**
+    /// manifest instead, where the loader reads them from.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub digests: std::collections::BTreeMap<String, String>,
 }
 
 fn default_symbol() -> String {
@@ -262,19 +303,40 @@ pub(crate) async fn list_packages() -> impl IntoResponse {
     }
 }
 
+/// The digest an install request must carry.
+///
+/// A package is `dlopen`ed into the host process by `pluginhost`, so installing
+/// one is handing that bundle the ability to run inside the agent. The catalog
+/// publishes a digest for every artifact; without it there is nothing tying the
+/// downloaded bytes to the entry that advertised them, and the request accepts
+/// both a URL and a local path — either could be anything.
+fn required_digest(req: &InstallRequest) -> Result<&str, String> {
+    req.sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| {
+            "a bundle needs its sha256: a package is dlopen'd into the host process, \
+             so an unverified bundle is unverified code"
+                .to_string()
+        })
+}
+
 /// POST /packages/install
 pub(crate) async fn install_package(
     State(_state): State<AppState>,
     Json(req): Json<InstallRequest>,
 ) -> impl IntoResponse {
+    let expected = match required_digest(&req) {
+        Ok(expected) => expected,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
+    };
     let bytes = match read_bundle(&req).await {
         Ok(bytes) => bytes,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error).into_response(),
     };
-    if let Some(expected) = req.sha256.as_deref() {
-        if let Err(error) = verify_sha256(&bytes, expected) {
-            return json_error(StatusCode::BAD_REQUEST, error).into_response();
-        }
+    if let Err(error) = verify_sha256(&bytes, expected) {
+        return json_error(StatusCode::BAD_REQUEST, error).into_response();
     }
     match install_bytes(&bytes) {
         Ok(record) => {
@@ -830,12 +892,18 @@ pub fn install_bytes_with(
         .map_err(|error| format!("cannot create staging dir: {error}"))?;
 
     let unpacked = unpack_tar_gz(bundle, &staging, on_stage).and_then(|()| {
-        let manifest = read_manifest(&staging)?;
+        let mut manifest = read_manifest(&staging)?;
         validate_manifest(&manifest)?;
         // A data-only package declares no entry, so there is no file to check.
         if !manifest.entry.is_empty() {
             validate_entry(&staging, &manifest.entry)?;
         }
+        // The bundle's digest was verified before it was unpacked; this ties each
+        // library the package will load to the digest the publisher declared for
+        // it, and works out the ones the publisher did not declare. The result
+        // is written into the installed manifest, so the loader can check the
+        // same thing again later.
+        resolve_library_digests(&staging, &mut manifest)?;
         // Check the command names before anything is moved into place: a
         // package whose alias is already taken must not install at all.
         check_aliases(&manifest)?;
@@ -863,6 +931,14 @@ pub fn install_bytes_with(
     };
 
     let destination = root.join(&manifest.name);
+    // The manifest on disk carries the digests worked out above, so the loader
+    // reads them from the installed package rather than trusting the directory.
+    // It is written before the rename, so the tree that lands at `destination`
+    // already has it.
+    if let Err(error) = write_manifest(&staging, &manifest) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
     // Replace-in-place, but keep ONE generation: see `rollback`. An upgrade
     // that turns out to be broken must be undoable without finding the old
     // bundle again.
@@ -1365,6 +1441,7 @@ async fn run_streaming(
     req: InstallRequest,
     tx: &UnboundedSender<WireProgress>,
 ) -> Result<PackageRecord, String> {
+    let expected = required_digest(&req)?;
     let bundle = if let Some(path) = req.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         let path = path.to_string();
         let tx = tx.clone();
@@ -1379,9 +1456,7 @@ async fn run_streaming(
     };
 
     let _ = tx.send(WireProgress::stage("verify"));
-    if let Some(expected) = req.sha256.as_deref() {
-        verify_sha256(&bundle, expected)?;
-    }
+    verify_sha256(&bundle, expected)?;
 
     let stage_tx = tx.clone();
     tokio::task::spawn_blocking(move || {
@@ -1551,6 +1626,18 @@ fn read_manifest(dir: &Path) -> Result<Manifest, String> {
     serde_json::from_str(&body).map_err(|error| format!("package.json is invalid: {error}"))
 }
 
+/// Write the manifest back into an installed package.
+///
+/// The installed manifest is not the published one: it carries the digests
+/// worked out at install time, so the loader can check the libraries it is
+/// about to load against the tree they were verified in.
+fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let path = dir.join("package.json");
+    let body = serde_json::to_string_pretty(manifest)
+        .map_err(|error| format!("cannot serialize package.json: {error}"))?;
+    std::fs::write(&path, body).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
 pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     if !is_package_name(&manifest.name) {
         return Err(format!(
@@ -1612,7 +1699,55 @@ pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             return Err(format!("requires lists {required:?} twice"));
         }
     }
+    // A digest the publisher declared must be well-formed and must name a
+    // library this package actually loads. A digest for a library that is not
+    // loaded says the publisher expected something to run that will not run.
+    for (path, digest) in &manifest.digests {
+        if !is_hex_digest(digest) {
+            return Err(format!(
+                "digest for {path:?} must be 64 lowercase hex characters, got {digest:?}"
+            ));
+        }
+        match classify(Path::new(path)) {
+            Relative::Inside(_) => {}
+            Relative::RootDir | Relative::Escape => {
+                return Err(format!(
+                    "digest path must be relative to the package: {path:?}"
+                ))
+            }
+        }
+        if !loaded_libraries(manifest)
+            .iter()
+            .any(|library| library == path)
+        {
+            return Err(format!(
+                "package {:?} publishes a digest for {path:?}, which it does not load",
+                manifest.name
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The libraries a package loads into the host process: the entry one, and the
+/// ones preloaded into the global scope before it.
+///
+/// Empty when the package is data-only — there is nothing to load then.
+fn loaded_libraries(manifest: &Manifest) -> Vec<String> {
+    let mut out = Vec::new();
+    if !manifest.entry.is_empty() {
+        out.push(manifest.entry.clone());
+    }
+    out.extend(manifest.preload.iter().cloned());
+    out
+}
+
+/// A SHA-256 digest as lowercase hex: 64 characters, no prefix, no separators.
+fn is_hex_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Every command name a package answers to: its own name plus its aliases,
@@ -1646,6 +1781,58 @@ fn validate_entry(dir: &Path, entry: &str) -> Result<(), String> {
         return Err(format!("entry does not exist in the bundle: {entry}"));
     }
     Ok(())
+}
+
+/// Check the libraries a package loads against the digests it publishes, and
+/// work out the digests for the ones it does not publish.
+///
+/// The bundle's own digest was verified before it was unpacked. This ties each
+/// *file* to that claim: a declared digest that does not match the file is a
+/// lie and the install is refused; a library with no declared digest is
+/// measured here, and the result is what gets written into the installed
+/// manifest.
+///
+/// That is what closes the gap the loader would otherwise have: the loader
+/// checks the installed manifest, so a library swapped after the install is
+/// dead code rather than a running backdoor. And it does not require the
+/// publisher to republish anything — a package published before this field
+/// existed still installs, and still ends up with digests on disk.
+fn resolve_library_digests(dir: &Path, manifest: &mut Manifest) -> Result<(), String> {
+    for library in loaded_libraries(manifest) {
+        let relative = match classify(Path::new(&library)) {
+            Relative::Inside(relative) => relative,
+            Relative::RootDir | Relative::Escape => {
+                return Err(format!(
+                    "library must be a relative path inside the package: {library}"
+                ))
+            }
+        };
+        let target = dir.join(&relative);
+        let bytes =
+            std::fs::read(&target).map_err(|error| format!("cannot read {library}: {error}"))?;
+        let actual = sha256_hex(&bytes);
+        match manifest.digests.get(&library) {
+            Some(expected) => {
+                if !expected.eq_ignore_ascii_case(&actual) {
+                    return Err(format!(
+                        "{library}: digest mismatch (expected {expected}, got {actual})"
+                    ));
+                }
+            }
+            None => {
+                manifest.digests.insert(library.clone(), actual);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The lowercase hex SHA-256 of these bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// A package id is also a directory name, so it may not contain separators.
@@ -2107,6 +2294,43 @@ mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
+    /// A bundle without a digest is refused.
+    ///
+    /// A package is not inert data: `pluginhost` dlopens its `entry` into the
+    /// **host process**, so installing one is giving that bundle the ability to
+    /// run inside the agent. Without a digest there is nothing tying the bytes
+    /// to the catalog that advertised them, and the route takes both a URL and
+    /// a local path — either could be anything.
+    #[test]
+    fn a_bundle_without_a_digest_is_refused() {
+        let request = InstallRequest {
+            url: None,
+            path: Some("/tmp/whatever.tar.gz".to_string()),
+            sha256: None,
+        };
+        let error = required_digest(&request).expect_err("a missing digest must be refused");
+        assert!(error.contains("sha256"), "{error}");
+
+        // Present but blank is the same as missing.
+        let blank = InstallRequest {
+            url: None,
+            path: Some("/tmp/whatever.tar.gz".to_string()),
+            sha256: Some("   ".to_string()),
+        };
+        assert!(required_digest(&blank).is_err());
+    }
+
+    /// A digest that is present is used as it is.
+    #[test]
+    fn a_bundle_with_a_digest_keeps_it() {
+        let request = InstallRequest {
+            url: None,
+            path: Some("/tmp/whatever.tar.gz".to_string()),
+            sha256: Some("  abc123  ".to_string()),
+        };
+        assert_eq!(required_digest(&request).as_deref(), Ok("abc123"));
+    }
+
     /// The seam voice input uses for a local engine: a package declares
     /// `"transcribe": true` and becomes the thing audio is handed to.
     ///
@@ -2407,6 +2631,8 @@ mod tests {
             links: std::collections::BTreeMap::new(),
             requires,
             transcribe: false,
+            preload: Vec::new(),
+            digests: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2750,6 +2976,93 @@ mod tests {
 
     const MANIFEST: &str =
         r#"{"name":"demo","version":"1.0","description":"d","entry":"lib/demo.so"}"#;
+
+    /// The digests of the libraries a package loads end up in the **installed**
+    /// manifest, so the loader can check the file it is about to load.
+    ///
+    /// The publisher does not have to declare them: they are worked out at
+    /// install time, which means a package published before the field existed
+    /// still installs and still ends up protected.
+    #[test]
+    fn the_installed_manifest_carries_the_digest_of_every_library_it_loads() {
+        with_temp_root(|| {
+            let bundle = bundle_with(MANIFEST, &[("lib/demo.so", b"\x7fELF")]);
+            install_bytes(&bundle).expect("installs");
+
+            let installed =
+                read_manifest(&packages_root().join("demo")).expect("installed manifest");
+            let digest = installed
+                .digests
+                .get("lib/demo.so")
+                .expect("the entry library has a digest");
+            assert_eq!(digest.len(), 64, "a sha256 is 64 hex characters");
+            assert_eq!(digest, &sha256_hex(b"\x7fELF"), "and it is the file's own");
+        });
+    }
+
+    /// A publisher that declares a digest is held to it: a mismatch means the
+    /// file is not the one the catalog described.
+    #[test]
+    fn a_declared_digest_that_does_not_match_the_file_refuses_the_install() {
+        with_temp_root(|| {
+            let manifest = r#"{"name":"demo","version":"1.0","entry":"lib/demo.so",
+                "digests":{"lib/demo.so":"0000000000000000000000000000000000000000000000000000000000000000"}}"#;
+            let bundle = bundle_with(manifest, &[("lib/demo.so", b"\x7fELF")]);
+            let error = install_bytes(&bundle).expect_err("a mismatch refuses the install");
+            assert!(error.contains("digest mismatch"), "{error}");
+        });
+    }
+
+    /// A digest for a library the package never loads is a mistake worth
+    /// reporting: it says the publisher expected something to run that will
+    /// not run.
+    #[test]
+    fn a_digest_for_a_library_that_is_not_loaded_is_refused() {
+        let manifest = manifest_with_requires(vec![]);
+        let mut manifest = manifest;
+        manifest.digests.insert(
+            "lib/not-loaded.so".into(),
+            "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        );
+        let error = validate_manifest(&manifest).expect_err("refuses the extra digest");
+        assert!(error.contains("does not load"), "{error}");
+    }
+
+    /// A malformed digest is refused rather than ignored — a digest that is
+    /// not a digest cannot be compared with anything.
+    #[test]
+    fn a_malformed_digest_is_refused() {
+        let mut manifest = manifest_with_requires(vec![]);
+        manifest
+            .digests
+            .insert("lib/demo.so".into(), "not-a-digest".into());
+        let error = validate_manifest(&manifest).expect_err("refuses the malformed digest");
+        assert!(error.contains("64 lowercase hex"), "{error}");
+    }
+
+    /// The preloaded libraries are code execution exactly as much as the entry
+    /// one is — CPython's interpreter reaches the process's global scope
+    /// through them — so they are measured and recorded too.
+    #[test]
+    fn the_preloaded_libraries_are_measured_too() {
+        with_temp_root(|| {
+            let manifest = r#"{"name":"demo","version":"1.0","entry":"lib/demo.so",
+                "preload":["lib/libpython.so"]}"#;
+            let bundle = bundle_with(
+                manifest,
+                &[("lib/demo.so", b"\x7fELF"), ("lib/libpython.so", b"\x7fPY")],
+            );
+            install_bytes(&bundle).expect("installs");
+
+            let installed =
+                read_manifest(&packages_root().join("demo")).expect("installed manifest");
+            assert_eq!(
+                installed.digests.get("lib/libpython.so"),
+                Some(&sha256_hex(b"\x7fPY")),
+                "a preloaded library is measured like the entry one"
+            );
+        });
+    }
 
     #[test]
     fn a_bundle_installs_lists_and_removes() {
