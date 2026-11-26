@@ -49,6 +49,7 @@ use crate::el::El;
 use crate::frame::{Line, Style};
 use crate::module::{Height, View};
 use crate::moment::{Activity, Moment, Viewport};
+use crate::text::compact_duration;
 use crate::theme::{self, Role};
 use crate::width;
 
@@ -477,7 +478,12 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
     if let Some(since) = moment.compacting_since {
         let ms = goal_elapsed(moment)
             .unwrap_or_else(|| moment.now.as_millis().saturating_sub(since.as_millis()));
-        out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
+        out.push(
+            t(Msg::LiveElapsed {
+                took: &compact_duration(ms),
+            })
+            .into_owned(),
+        );
         if goal_elapsed(moment).is_some() {
             append_usage(&mut out, state, moment);
         }
@@ -487,20 +493,35 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
     // turn's is. There is no turn to read figures off, so this is the whole group.
     if state.turn.is_none() {
         if let Some(ms) = goal_elapsed(moment) {
-            out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
+            out.push(
+                t(Msg::LiveElapsed {
+                    took: &compact_duration(ms),
+                })
+                .into_owned(),
+            );
             append_usage(&mut out, state, moment);
             return out;
         }
         if moment.recognizing_image {
             if let Some(since) = moment.recognizing_since {
                 let ms = moment.now.as_millis().saturating_sub(since.as_millis());
-                out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
+                out.push(
+                    t(Msg::LiveElapsed {
+                        took: &compact_duration(ms),
+                    })
+                    .into_owned(),
+                );
             }
         }
         return out;
     }
     if let Some(ms) = elapsed(state, moment) {
-        out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
+        out.push(
+            t(Msg::LiveElapsed {
+                took: &compact_duration(ms),
+            })
+            .into_owned(),
+        );
     }
     append_usage(&mut out, state, moment);
     out
@@ -547,24 +568,6 @@ fn elapsed(state: &State, moment: &Moment) -> Option<u64> {
     }
     let started = moment.turn_started?;
     Some(moment.now.as_millis().saturating_sub(started.as_millis()))
-}
-
-/// A duration as a person says it: seconds, then minutes and seconds, then hours
-/// and minutes.
-///
-/// Never milliseconds and never a float: this is read at a glance by someone
-/// deciding whether to interrupt, and `13400ms` is a number to work out rather
-/// than an answer.
-fn short(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}m{:02}s", secs % 60);
-    }
-    format!("{}h{:02}m", mins / 60, mins % 60)
 }
 
 /// The words carry the state's colour; the figures stay quiet.
@@ -1067,11 +1070,11 @@ mod tests {
 
     #[test]
     fn a_duration_is_said_the_way_a_person_says_it() {
-        assert_eq!(short(0), "0s");
-        assert_eq!(short(13_400), "13s", "seconds, not milliseconds");
-        assert_eq!(short(59_999), "59s");
-        assert_eq!(short(65_000), "1m05s");
-        assert_eq!(short(3_723_000), "1h02m");
+        assert_eq!(compact_duration(0), "0s");
+        assert_eq!(compact_duration(13_400), "13s", "seconds, not milliseconds");
+        assert_eq!(compact_duration(59_999), "59s");
+        assert_eq!(compact_duration(65_000), "1m05s");
+        assert_eq!(compact_duration(3_723_000), "1h02m");
     }
 
     #[test]
