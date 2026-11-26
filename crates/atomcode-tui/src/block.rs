@@ -218,6 +218,15 @@ pub trait Content: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The raw text a live block is growing, before display trimming.
+    ///
+    /// The live cache trims outer blank lines itself and extends that trim by
+    /// the appended suffix, so it needs the untrimmed text. Defaults to
+    /// [`Self::growing_text`] for content whose growing text needs no trim.
+    fn growing_raw(&self) -> Option<&str> {
+        self.growing_text()
+    }
+
     /// Append to this block's text without rebuilding it.
     ///
     /// The default refuses. A content that only ever grows (a streamed answer
@@ -337,10 +346,14 @@ struct CachedRender {
     /// answer". **No palette** — colour is not decided here (see [`ShapeCaps`]),
     /// so a theme change does not walk into this branch.
     key: (u16, ShapeCaps),
-    /// The source the lines were rendered from, whole. The prefix check against
-    /// it is what makes reuse safe: text that was extended is text the kept
-    /// lines still describe, and text that was edited is not.
-    source: String,
+    /// Identity of the content this render describes. A replaced content (an
+    /// `amend`) is a different allocation, so the cache rebuilds.
+    identity: usize,
+    /// The raw growing text as of the last render. The next render appends only
+    /// the new suffix; it never copies the whole reply.
+    raw: String,
+    /// The display view within `raw`: outer blank lines trimmed.
+    trim: GrowingTrim,
     /// The rows this render produced, shared with whoever is drawing them.
     ///
     /// A handle rather than a copy: a frame wants a screenful of a block that
@@ -350,10 +363,84 @@ struct CachedRender {
     /// this is the only handle left — which it is once the frame that took the
     /// last one has been painted and dropped — and copies when it is not.
     lines: Arc<Vec<Line>>,
-    /// Byte offset in `source`, and line count in `lines`, up to which nothing
-    /// can change. See [`crate::markdown::render_settled`].
+    /// Byte offset in the display view, and line count in `lines`, up to which
+    /// nothing can change. See [`crate::markdown::render_settled`].
     settled: usize,
     settled_lines: usize,
+}
+
+/// The display view of a growing text: outer blank lines trimmed.
+///
+/// The live cache keeps this in step with the text as it is appended. A frame
+/// then reads the new suffix instead of rescanning the whole reply. It mirrors
+/// [`crate::content::ModelSaid`]'s `display_text`, which the settled render
+/// uses.
+#[derive(Clone, Copy, Debug, Default)]
+struct GrowingTrim {
+    /// Length of the text this state describes.
+    len: usize,
+    /// Start of the first non-blank line, once one has arrived.
+    start: Option<usize>,
+    /// End of the last non-blank line, excluding its line ending.
+    end: usize,
+    /// Start of the line the text currently ends in.
+    line_start: usize,
+    /// Whether the current last line's content so far is non-blank.
+    last_line_nonblank: bool,
+    /// Whether the text currently ends with `\n`.
+    ends_with_newline: bool,
+}
+
+impl GrowingTrim {
+    /// Extend the view by `delta`, which the caller has already appended to the
+    /// text this state describes.
+    fn extend(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let old_len = self.len;
+        let mut offset = 0usize;
+        let mut first = true;
+        for raw_line in delta.split_inclusive('\n') {
+            let seg_start = old_len + offset;
+            offset += raw_line.len();
+            let has_newline = raw_line.ends_with('\n');
+            let content = raw_line.trim_end_matches(['\r', '\n']);
+            let continues = first && !self.ends_with_newline;
+            let line_nonblank = if continues {
+                self.last_line_nonblank || !raw_line.trim().is_empty()
+            } else {
+                !raw_line.trim().is_empty()
+            };
+            let line_start = if continues {
+                self.line_start
+            } else {
+                seg_start
+            };
+            if line_nonblank {
+                self.start.get_or_insert(line_start);
+                self.end = seg_start + content.len();
+            }
+            if has_newline {
+                self.line_start = seg_start + raw_line.len();
+                self.last_line_nonblank = false;
+            } else {
+                self.line_start = line_start;
+                self.last_line_nonblank = line_nonblank;
+            }
+            self.ends_with_newline = has_newline;
+            first = false;
+        }
+        self.len = old_len + delta.len();
+    }
+
+    /// The display view within the text: outer blank lines trimmed.
+    fn range(&self) -> std::ops::Range<usize> {
+        match self.start {
+            Some(start) => start..self.end.max(start),
+            None => 0..0,
+        }
+    }
 }
 
 /// A settled block, and how many rows it was last measured to draw.
@@ -416,47 +503,94 @@ impl Slot {
     pub fn rows_at(&self, ctx: &RenderCtx) -> (usize, Option<Arc<Vec<Line>>>) {
         match self {
             Slot::Live(b, cache) => {
-                let Some(text) = b.content.growing_text() else {
+                let Some(text) = b.content.growing_raw() else {
                     let lines = b.content.lines(ctx);
                     return (lines.len(), Some(Arc::new(lines)));
                 };
                 let width = ctx.width;
+                let identity = Arc::as_ptr(&b.content) as *const () as usize;
                 let mut cached = cache.0.write().expect("live cache poisoned");
                 let base = Style::new();
-                let rendered = match cached.take() {
-                    // Reuse what is settled only when the same width rendered it
-                    // and the text is an extension of what did. Anything else — a
-                    // resize, an edit, a different block — renders the whole
-                    // thing.
-                    Some(mut c) if c.key == (width, ctx.caps) && text.starts_with(&c.source) => {
-                        #[cfg(test)]
-                        LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
-                        // Everything before the last settled boundary is fixed;
-                        // render from there, which is the part still in flux.
-                        let lines = Arc::make_mut(&mut c.lines);
-                        lines.truncate(c.settled_lines);
-                        #[allow(
-                            clippy::string_slice,
-                            reason = "`c.settled` is a byte offset this render produced at a line boundary — the byte after a `\\n` — and `text` extends `c.source` byte for byte (the `starts_with` above), so the same offset is a char boundary in `text` too"
-                        )]
-                        let tail = crate::markdown::render_settled(&text[c.settled..], width, base);
-                        lines.extend(tail.lines);
-                        c.settled += tail.settled;
-                        c.settled_lines += tail.settled_lines;
-                        // Kept, not replaced: the same buffer, so a growing
-                        // answer does not re-allocate its own source every frame.
-                        c.source.clear();
-                        c.source.push_str(text);
-                        c
+                let mut resumed = None;
+                if let Some(mut c) = cached.take() {
+                    if c.key == (width, ctx.caps) && text.len() >= c.raw.len() {
+                        // The same allocation can only have grown. A different
+                        // allocation (an `amend`) still reuses the cache when
+                        // the new text extends what it described; that check
+                        // reads the prefix, so it runs only for an `amend`,
+                        // never for a streamed delta.
+                        let extends =
+                            c.identity == identity || text.as_bytes().starts_with(c.raw.as_bytes());
+                        if extends {
+                            #[cfg(test)]
+                            LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
+                            c.identity = identity;
+                            let delta = &text[c.raw.len()..];
+                            c.raw.push_str(delta);
+                            let had_start = c.trim.start;
+                            c.trim.extend(delta);
+                            if c.trim.start != had_start {
+                                // Leading blank lines were trimmed for the first
+                                // time; the rendered offsets describe the old view.
+                                c.lines = Arc::new(Vec::new());
+                                c.settled = 0;
+                                c.settled_lines = 0;
+                            }
+                            let range = c.trim.range();
+                            if range.is_empty() {
+                                // Nothing visible yet: an empty block draws no
+                                // rows, and `render_settled("")` would draw one.
+                                c.lines = Arc::new(Vec::new());
+                                c.settled = 0;
+                                c.settled_lines = 0;
+                            } else {
+                                let shown = &c.raw[range.start..range.end];
+                                if c.settled > shown.len() {
+                                    // `growing_raw` promises growth; if it broke
+                                    // that promise, discard the offsets.
+                                    c.lines = Arc::new(Vec::new());
+                                    c.settled = 0;
+                                    c.settled_lines = 0;
+                                }
+                                #[allow(
+                                    clippy::string_slice,
+                                    reason = "`c.settled` is a byte offset this render produced at a line boundary — the byte after a `\\n` — and `shown` extends what it described, so the same offset is a char boundary"
+                                )]
+                                let tail = crate::markdown::render_settled(
+                                    &shown[c.settled..],
+                                    width,
+                                    base,
+                                );
+                                let lines = Arc::make_mut(&mut c.lines);
+                                lines.truncate(c.settled_lines);
+                                lines.extend(tail.lines);
+                                c.settled += tail.settled;
+                                c.settled_lines += tail.settled_lines;
+                            }
+                            resumed = Some(c);
+                        }
                     }
-                    _ => {
-                        let r = crate::markdown::render_settled(text, width, base);
+                }
+                let rendered = match resumed {
+                    Some(c) => c,
+                    None => {
+                        let mut trim = GrowingTrim::default();
+                        trim.extend(text);
+                        let range = trim.range();
+                        let (lines, settled, settled_lines) = if range.is_empty() {
+                            (Vec::new(), 0, 0)
+                        } else {
+                            let r = crate::markdown::render_settled(&text[range], width, base);
+                            (r.lines, r.settled, r.settled_lines)
+                        };
                         CachedRender {
                             key: (width, ctx.caps),
-                            source: text.to_string(),
-                            lines: Arc::new(r.lines),
-                            settled: r.settled,
-                            settled_lines: r.settled_lines,
+                            identity,
+                            raw: text.to_string(),
+                            trim,
+                            lines: Arc::new(lines),
+                            settled,
+                            settled_lines,
                         }
                     }
                 };
@@ -1255,6 +1389,38 @@ mod tests {
     }
 
     #[test]
+    fn an_appended_delta_resumes_without_rebuilding_the_raw_text() {
+        let _alone = live_alone();
+        let mut s = Stream::new();
+        let id = s
+            .writer("model")
+            .open(Coord::new(1, 1), grew("first line\n"));
+        let first = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30))
+            .1
+            .expect("a first render");
+        let home = Arc::as_ptr(&first) as usize;
+        drop(first);
+
+        LIVE_RESUMES.store(0, At::Relaxed);
+        assert!(s.writer("model").append(id, "second line\n"));
+        let second = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30))
+            .1
+            .expect("a second render");
+        assert_eq!(resumes(), 1, "the append resumed from the cache");
+        assert_eq!(
+            Arc::as_ptr(&second) as usize,
+            home,
+            "the rows were extended in place"
+        );
+    }
+
+    #[test]
     fn a_resize_starts_the_render_over() {
         let _alone = live_alone();
         let mut s = Stream::new();
@@ -1280,5 +1446,41 @@ mod tests {
             *lines.unwrap(),
             crate::markdown::render("a line long enough to wrap differently", 12, Style::new())
         );
+    }
+}
+
+#[cfg(test)]
+mod growing_trim_tests {
+    use super::GrowingTrim;
+    use crate::content::ModelSaid;
+
+    fn check(pieces: &[&str]) {
+        let text: String = pieces.concat();
+        let mut trim = GrowingTrim::default();
+        for piece in pieces {
+            trim.extend(piece);
+        }
+        let range = trim.range();
+        let got = &text[range];
+        let said = ModelSaid(text.clone());
+        let want = said.display_text();
+        assert_eq!(got, want, "pieces={pieces:?} text={text:?}");
+    }
+
+    #[test]
+    fn matches_display_text_when_trimmed_in_pieces() {
+        for pieces in [
+            vec![""],
+            vec!["abc"],
+            vec!["\n \r\nabc\n\n \t\n"],
+            vec!["abc", "def"],
+            vec!["abc\n", "def"],
+            vec!["\n\n", "abc"],
+            vec!["abc\r", "def\n\n"],
+            vec!["line1\n", "\n", "  \n", "line2\n"],
+            vec!["   ", "  x", "\n\n  "],
+        ] {
+            check(&pieces);
+        }
     }
 }

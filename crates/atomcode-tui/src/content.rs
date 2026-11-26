@@ -1151,7 +1151,7 @@ pub struct ModelSaid(pub String);
 
 impl ModelSaid {
     /// Remove only outer blank lines, preserving indentation and Markdown spaces.
-    fn display_text(&self) -> &str {
+    pub(crate) fn display_text(&self) -> &str {
         let mut offset = 0;
         let mut start = None;
         let mut end = 0;
@@ -1187,6 +1187,9 @@ impl Content for ModelSaid {
         } else {
             crate::markdown::render(text, w, Style::new())
         }
+    }
+    fn growing_raw(&self) -> Option<&str> {
+        (!self.0.is_empty()).then_some(&self.0)
     }
     fn growing_text(&self) -> Option<&str> {
         let text = self.display_text();
