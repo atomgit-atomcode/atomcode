@@ -4501,6 +4501,13 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Internal until the response polls it. Emits the existing warning wire shape.
+    #[serde(skip)]
+    StartupAdvisory {
+        project_bucket: String,
+        session_id: String,
+        message: String,
+    },
     /// Routine automatic retry diagnostics; clients keep these out of live status.
     #[serde(rename = "provider_retry")]
     ProviderRetry { message: String },
@@ -5779,7 +5786,7 @@ async fn chat_stream(
     let active_conns = state.active_connections.clone();
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let stream = UnboundedReceiverStream::new(rx).map(|event| {
+    let stream = chat_response_events(rx, live_api::chat_startup_advisories()).map(|event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
@@ -5801,6 +5808,28 @@ async fn chat_stream(
                 .text("ping"),
         )
         .into_response()
+}
+
+fn chat_response_events(
+    receiver: mpsc::UnboundedReceiver<ChatEvent>,
+    advisories: &live_api::StartupAdvisories,
+) -> impl futures::Stream<Item = ChatEvent> + '_ {
+    UnboundedReceiverStream::new(receiver).filter_map(move |event| {
+        futures::future::ready(match event {
+            ChatEvent::StartupAdvisory {
+                project_bucket,
+                session_id,
+                message,
+            } => {
+                if advisories.already_shown((project_bucket, session_id), &message) {
+                    None
+                } else {
+                    Some(ChatEvent::Warning { message })
+                }
+            }
+            event => Some(event),
+        })
+    })
 }
 
 /// Await the inner chat task, translating its outcome into SSE events and
@@ -6048,7 +6077,7 @@ async fn process_chat_request(
         interactive_permission && approval_mode_requires_responder(approval_mode);
     // Native runtime observations stay native until this daemon driver projects
     // them to the HTTP ChatEvent wire model.
-    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel::<CodingRuntimeEvent>();
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
 
     // Check if session was stopped before we started the turn loop.
     // If so, save the current conversation (session messages + user message)
@@ -6172,7 +6201,22 @@ async fn process_chat_request(
         summary_count: summary_baseline,
         ..Default::default()
     };
+    let project_bucket = NativeSessionManager::project_hash(
+        &working_dir,
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
     while let Some(event) = runtime_event_rx.recv().await {
+        let event = match event {
+            live_api::ChatTurnEvent::Runtime(event) => event,
+            live_api::ChatTurnEvent::StartupAdvisory(message) => {
+                let _ = event_tx.send(ChatEvent::StartupAdvisory {
+                    project_bucket: project_bucket.clone(),
+                    session_id: perm_session_key.clone(),
+                    message,
+                });
+                continue;
+            }
+        };
         for chat_event in projector.project_runtime(event, &perm_session_key) {
             if matches!(chat_event, ChatEvent::Done { .. }) {
                 terminal_sent.store(true, std::sync::atomic::Ordering::Release);
@@ -11783,7 +11827,7 @@ mod tests {
             session_id: &str,
             request_id: &str,
             message: &str,
-        ) -> Vec<String> {
+        ) -> mpsc::UnboundedReceiver<ChatEvent> {
             let (main_url, _main_request, main_task) = spawn_openai_sse("turn done").await;
             let mut config = Config::with_default_provider("main");
             config
@@ -11793,7 +11837,7 @@ mod tests {
                 .save(&Config::default_path())
                 .expect("save chat test config");
 
-            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
             let active_chats = ActiveChatRegistry::default();
             let admission = active_chats.admit(None, Some(request_id)).await.unwrap();
             let operation_id = admission.operation_id.clone();
@@ -11826,20 +11870,29 @@ mod tests {
                 .await
                 .expect("provider task finishes");
 
-            let mut warnings = Vec::new();
-            while let Some(event) = event_rx.recv().await {
-                if let ChatEvent::Warning { message } = event {
-                    warnings.push(message);
-                }
-            }
-            warnings
+            event_rx
+        }
+
+        async fn warnings(
+            receiver: mpsc::UnboundedReceiver<ChatEvent>,
+            advisories: &live_api::StartupAdvisories,
+        ) -> Vec<String> {
+            chat_response_events(receiver, advisories)
+                .filter_map(|event| {
+                    futures::future::ready(match event {
+                        ChatEvent::Warning { message } => Some(message),
+                        _ => None,
+                    })
+                })
+                .collect()
+                .await
         }
 
         let home = ScopedChatHome::new();
         let dir = home._dir.path().join("project");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "agents rules").unwrap();
-        std::fs::write(dir.join("claude.md"), "claude rules").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "claude rules").unwrap();
         let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
         // Seed a native session so every turn continues the SAME session id.
@@ -11868,30 +11921,73 @@ mod tests {
                 .unwrap();
         }
 
-        // 第 1 条输入：claude.md 遮蔽提示出现一次。
-        let first = run_turn(&home, &dir, id, "chat-advisory-turn-1", "one").await;
+        let advisories = live_api::StartupAdvisories::default();
+        // An unpolled response can be dropped before its queued warning reaches SSE.
+        drop(run_turn(&home, &dir, id, "chat-advisory-abandoned", "abandoned").await);
+
+        // The first consumed response still shows the startup advisory.
+        let first = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-1", "one").await,
+            &advisories,
+        )
+        .await;
         assert_eq!(
-            first.iter().filter(|w| w.contains("claude.md")).count(),
+            first.iter().filter(|w| w.contains("CLAUDE.md")).count(),
             1,
             "first turn must show the claude.md advisory once: {first:?}"
         );
 
         // 第 2 条输入：同一会话，同样的提示不再重复。
-        let second = run_turn(&home, &dir, id, "chat-advisory-turn-2", "two").await;
+        let second = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-2", "two").await,
+            &advisories,
+        )
+        .await;
         assert!(
-            !second.iter().any(|w| w.contains("claude.md")),
+            !second.iter().any(|w| w.contains("CLAUDE.md")),
             "second turn must not repeat the claude.md advisory: {second:?}"
         );
 
         // 指令文件状态真的变化：AGENTS.md 变空产生新提示，必须再次展示。
         std::fs::write(dir.join("AGENTS.md"), "").unwrap();
-        let third = run_turn(&home, &dir, id, "chat-advisory-turn-3", "three").await;
+        let third = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-3", "three").await,
+            &advisories,
+        )
+        .await;
         assert!(
             third
                 .iter()
                 .any(|w| w.contains("AGENTS.md") && w.contains("empty")),
             "a changed instruction state must surface its new advisory: {third:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_startup_advisories_are_scoped_to_the_project_and_ignore_live_warnings() {
+        let advisories = live_api::StartupAdvisories::default();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for project_bucket in ["project-a", "project-a", "project-b"] {
+            sender
+                .send(ChatEvent::StartupAdvisory {
+                    project_bucket: project_bucket.into(),
+                    session_id: "same-session-id".into(),
+                    message: "same warning".into(),
+                })
+                .unwrap();
+        }
+        sender
+            .send(ChatEvent::Warning {
+                message: "same warning".into(),
+            })
+            .unwrap();
+        drop(sender);
+
+        let events: Vec<_> = chat_response_events(receiver, &advisories).collect().await;
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| {
+            matches!(event, ChatEvent::Warning { message } if message == "same warning")
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

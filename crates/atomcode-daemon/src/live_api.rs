@@ -407,10 +407,10 @@ pub(crate) fn live_runtime_config(
 }
 
 fn send_chat_runtime_error(
-    events: &mpsc::UnboundedSender<CodingRuntimeEvent>,
+    events: &mpsc::UnboundedSender<ChatTurnEvent>,
     message: impl Into<String>,
 ) {
-    let _ = events.send(CodingRuntimeEvent::Agent(
+    let _ = events.send(ChatTurnEvent::Runtime(CodingRuntimeEvent::Agent(
         atomcode_kernel::event::AgentEvent::Error {
             message: message.into(),
             http_status: None,
@@ -419,7 +419,7 @@ fn send_chat_runtime_error(
             retry_after_secs: None,
             ends_turn: false,
         },
-    ));
+    )));
 }
 
 async fn await_chat_user_input_response(
@@ -436,23 +436,23 @@ async fn await_chat_user_input_response(
     }
 }
 
-/// Startup advisories each `/chat` session has already been shown.
+/// Startup advisories consumed by a `/chat` response.
 ///
 /// Every `/chat` request builds its own temporary `CodingRuntime`, and each
 /// runtime re-derives the same startup advisories (instruction-file states such
 /// as a `claude.md` shadowed by `AGENTS.md`, skill notices, resume notes) and
 /// re-emits them as leading `ControllerWarning` events. Left alone the WebUI
-/// repeats them on every input. The daemon is the session-level owner here, so
-/// it keeps a per-session set of already-shown texts: identical advisories are
-/// dropped, and a genuinely changed one (the file on disk changed) has a
-/// different text and still goes through.
+/// repeats them on every input. The SSE stream records the texts as it
+/// consumes them, so dropping an unpolled response leaves its warnings eligible.
 pub(crate) struct StartupAdvisories {
     inner: std::sync::Mutex<AdvisoryIndex>,
 }
 
+type AdvisorySession = (String, String);
+
 struct AdvisoryIndex {
-    order: std::collections::VecDeque<String>,
-    seen: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    order: std::collections::VecDeque<AdvisorySession>,
+    seen: std::collections::HashMap<AdvisorySession, std::collections::HashSet<String>>,
 }
 
 /// Bound the registry: one entry per chat session, warnings are few per
@@ -473,30 +473,35 @@ impl Default for StartupAdvisories {
 impl StartupAdvisories {
     /// Record `message` as shown for `session`; returns `true` when the session
     /// already saw the exact same advisory text (a duplicate to drop).
-    fn already_shown(&self, session: &str, message: &str) -> bool {
+    pub(super) fn already_shown(&self, session: AdvisorySession, message: &str) -> bool {
         let Ok(mut index) = self.inner.lock() else {
             // A poisoned lock never hides an advisory — show it.
             return false;
         };
-        if !index.seen.contains_key(session) {
-            index.seen.insert(session.to_string(), Default::default());
-            index.order.push_back(session.to_string());
+        if !index.seen.contains_key(&session) {
+            index.seen.insert(session.clone(), Default::default());
+            index.order.push_back(session.clone());
             while index.order.len() > STARTUP_ADVISORY_SESSIONS {
                 if let Some(evicted) = index.order.pop_front() {
                     index.seen.remove(&evicted);
                 }
             }
         }
-        match index.seen.get_mut(session) {
+        match index.seen.get_mut(&session) {
             Some(shown) => !shown.insert(message.to_string()),
             None => false,
         }
     }
 }
 
-fn chat_startup_advisories() -> &'static StartupAdvisories {
+pub(super) fn chat_startup_advisories() -> &'static StartupAdvisories {
     static LEDGER: std::sync::OnceLock<StartupAdvisories> = std::sync::OnceLock::new();
     LEDGER.get_or_init(StartupAdvisories::default)
+}
+
+pub(crate) enum ChatTurnEvent {
+    Runtime(CodingRuntimeEvent),
+    StartupAdvisory(String),
 }
 
 /// Drive a native runtime over `conv` and forward its native events to the shared
@@ -506,7 +511,7 @@ fn chat_startup_advisories() -> &'static StartupAdvisories {
 pub(crate) async fn run_chat_turn_v2(
     session_id: String,
     conv: Arc<Mutex<Vec<KernelMessage>>>,
-    runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
+    runtime_event_tx: mpsc::UnboundedSender<ChatTurnEvent>,
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<crate::permission_bridge::ChatPermission>>,
@@ -516,6 +521,10 @@ pub(crate) async fn run_chat_turn_v2(
 ) {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use atomcode_coding::{CodingRuntime, TurnCompletion};
+
+    let emit = |event| {
+        let _ = runtime_event_tx.send(ChatTurnEvent::Runtime(event));
+    };
 
     // Split the just-submitted user input from the persisted prefix before runtime
     // startup. The buffer already holds kernel messages (cold summaries inline as
@@ -619,19 +628,8 @@ pub(crate) async fn run_chat_turn_v2(
             startup_advisories_open = false;
         }
         match ev {
-            event @ CodingRuntimeEvent::Agent(_) => {
-                let _ = runtime_event_tx.send(event);
-            }
-            CodingRuntimeEvent::ControllerWarning(message) => {
-                // Only the per-turn startup advisories dedupe: the session
-                // already showed this exact text on an earlier input. A
-                // changed advisory text still shows.
-                if startup_advisories_open
-                    && chat_startup_advisories().already_shown(&session_id, &message)
-                {
-                    continue;
-                }
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(message));
+            CodingRuntimeEvent::ControllerWarning(message) if startup_advisories_open => {
+                let _ = runtime_event_tx.send(ChatTurnEvent::StartupAdvisory(message));
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
                 let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload.clone())
@@ -644,7 +642,7 @@ pub(crate) async fn run_chat_turn_v2(
                 // the route as soon as it sees the projected permission event.
                 let expected_approval_id = permission_routes.approval_id(&session_id, &approval.call_id);
                 let interactive = perm_rx.is_some();
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                emit(CodingRuntimeEvent::Request(request.clone()));
                 let mut answer = match &mut perm_rx {
                     None => fallback_approval_decision(approval_mode).into(),
                     Some(rx) => tokio::select! {
@@ -700,7 +698,7 @@ pub(crate) async fn run_chat_turn_v2(
                     == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND =>
             {
                 let Some(responders) = &user_input_responders else {
-                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                    emit(CodingRuntimeEvent::Request(request.clone()));
                     let _ = handle.respond(request.id, serde_json::Value::Null).await;
                     continue;
                 };
@@ -708,7 +706,7 @@ pub(crate) async fn run_chat_turn_v2(
                 responders.register(session_id.clone(), request.id, tx);
                 // Register before publishing the SSE event so a very fast browser answer
                 // cannot race the response route and be rejected as stale.
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                emit(CodingRuntimeEvent::Request(request.clone()));
                 let answer = await_chat_user_input_response(rx, coding_cfg.request_timeout);
                 tokio::pin!(answer);
                 let value = tokio::select! {
@@ -723,7 +721,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = handle.respond(request.id, value).await;
             }
             CodingRuntimeEvent::Request(request) => {
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                emit(CodingRuntimeEvent::Request(request.clone()));
                 let _ = handle.respond(request.id, serde_json::Value::Null).await;
             }
             CodingRuntimeEvent::TurnFinished(completion @ TurnCompletion::Completed { .. }) => {
@@ -731,7 +729,7 @@ pub(crate) async fn run_chat_turn_v2(
                     TurnCompletion::Completed { snapshot, .. } => snapshot.clone(),
                     TurnCompletion::SnapshotUnavailable { .. } => unreachable!(),
                 };
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(completion));
+                emit(CodingRuntimeEvent::TurnFinished(completion));
                 break Some(AuthoritativeTerminal {
                     snapshot: snapshot.as_ref().clone(),
                 });
@@ -739,7 +737,7 @@ pub(crate) async fn run_chat_turn_v2(
             event @ CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
                 ..
             }) => {
-                let _ = runtime_event_tx.send(event);
+                emit(event);
                 break None;
             }
             event @ CodingRuntimeEvent::CompactionStarted { .. }
@@ -757,7 +755,7 @@ pub(crate) async fn run_chat_turn_v2(
                     let mut buffer = conv.lock().await;
                     *buffer = snapshot.messages;
                 }
-                let _ = runtime_event_tx.send(event);
+                emit(event);
             }
             CodingRuntimeEvent::SessionNameSuggested { name } => {
                 if let Err(error) = crate::legacy_convert::apply_ai_catalog_name_in_project(
@@ -765,7 +763,7 @@ pub(crate) async fn run_chat_turn_v2(
                     &naming_session_id,
                     &name,
                 ) {
-                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                    emit(CodingRuntimeEvent::ControllerWarning(format!(
                         "session naming failed: {error}"
                     )));
                 }
@@ -778,7 +776,7 @@ pub(crate) async fn run_chat_turn_v2(
                 break None;
             }
             event => {
-                let _ = runtime_event_tx.send(event);
+                emit(event);
             }
         }
     };
