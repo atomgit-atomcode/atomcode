@@ -480,6 +480,14 @@ mod tests {
         assert!(context.contains(nested));
         assert!(!context.contains("internal-secret"));
         assert!(context.contains("answer"));
+        // The working-tree state travels with every excerpt: it is what makes
+        // a referenced session recognizably "the one from that workspace" at
+        // a glance, without any automatic injection.
+        assert!(context.contains("working_dir"), "{context}");
+        assert!(
+            context.contains("/project"),
+            "the session's workspace path must appear in the excerpt: {context}"
+        );
         assert_eq!(
             before,
             std::fs::read(manager.events_path(&reference.id).unwrap()).unwrap()
