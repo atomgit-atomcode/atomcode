@@ -458,8 +458,29 @@ section{position:relative;padding:150px var(--pad) 0}
 .end h2 code{color:var(--ph);font-weight:500}
 .end p{margin:18px auto 30px;max-width:520px}
 .end .btns{display:flex;flex-wrap:wrap;justify-content:center;gap:10px}
-.wm{position:relative;margin-top:90px;font:700 clamp(44px,15vw,280px)/.9 var(--mono);letter-spacing:-.07em;white-space:nowrap;user-select:none;
-  background:radial-gradient(360px circle at var(--mx,50%) var(--my,40%),#f2ffcf,var(--ph) 18%,var(--ph2) 34%,#161a15 62%);-webkit-background-clip:text;background-clip:text;color:transparent;-webkit-mask:linear-gradient(#000 55%,transparent);mask:linear-gradient(#000 55%,transparent)}
+/* 荧光地平线字标：常亮的流光字 + 扫描线 + 终端光标 + 网格地面倒影 */
+.wm-wrap{position:relative;margin:90px calc(-1 * var(--pad)) 0;padding:0 var(--pad);isolation:isolate;user-select:none;-webkit-user-select:none}
+.wm-glow{position:absolute;left:var(--gx,50%);top:42%;width:min(1100px,90%);height:80%;transform:translate(-50%,-50%);z-index:-1;pointer-events:none;
+  background:radial-gradient(ellipse at 50% 50%,rgba(198,242,78,.32),rgba(63,174,95,.16) 38%,rgba(31,111,139,.1) 58%,transparent 72%);filter:blur(46px);transition:left .9s var(--ease);animation:wmBreath 7s ease-in-out infinite}
+@keyframes wmBreath{50%{opacity:.7;transform:translate(-50%,-50%) scale(1.06,.94)}}
+.wm{position:relative;display:inline-flex;align-items:flex-end;font:700 clamp(44px,15vw,280px)/.9 var(--mono);letter-spacing:-.07em;white-space:nowrap}
+.wm-t{position:relative;
+  background:linear-gradient(100deg,var(--ph2) 0%,var(--ph) 18%,#f6ffd8 27%,var(--ph) 36%,#8fd94a 52%,var(--ph2) 68%,#2f9a7a 82%,var(--ph2) 100%);background-size:240% 100%;
+  -webkit-background-clip:text;background-clip:text;color:transparent;animation:wmFlow 12s linear infinite;filter:drop-shadow(0 0 30px rgba(198,242,78,.35))}
+@keyframes wmFlow{to{background-position:-240% 0}}
+/* 鼠标白热高光：同一段文字叠一层，只在光斑处显形 */
+.wm-t::after{content:attr(data-t);position:absolute;inset:0;background:radial-gradient(260px circle at var(--mx,-999px) var(--my,-999px),#fff,rgba(246,255,216,.6) 30%,transparent 62%);-webkit-background-clip:text;background-clip:text;color:transparent}
+/* 终端扫描线 */
+.wm::after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(5,6,5,.32) 0 1px,transparent 1px 4px)}
+.wm-car{flex:none;width:.13em;height:.68em;margin:0 0 .1em .07em;background:var(--ph);box-shadow:0 0 30px var(--ph),0 0 90px rgba(198,242,78,.5);animation:wmBlink 1.1s steps(1) infinite}
+@keyframes wmBlink{60%{opacity:.12}}
+/* 倒影 + 地面 */
+.wm-ref{display:block;margin-top:-.04em;height:.55em;overflow:hidden;font:700 clamp(44px,15vw,280px)/.9 var(--mono);letter-spacing:-.07em;white-space:nowrap;transform:scaleY(-1);opacity:.2;pointer-events:none;
+  -webkit-mask:linear-gradient(to top,#000,transparent 85%);mask:linear-gradient(to top,#000,transparent 85%)}
+.wm-ref span{display:block;margin-top:-.35em;background:linear-gradient(100deg,var(--ph3),var(--ph2) 30%,var(--ph) 45%,var(--ph2) 70%,var(--ph3));-webkit-background-clip:text;background-clip:text;color:transparent;filter:blur(1.5px)}
+.wm-floor{position:absolute;left:0;right:0;bottom:0;height:42%;z-index:-1;pointer-events:none;
+  background-image:linear-gradient(rgba(198,242,78,.2) 1px,transparent 1px),linear-gradient(90deg,rgba(198,242,78,.2) 1px,transparent 1px);background-size:56px 56px;
+  transform:perspective(420px) rotateX(62deg);transform-origin:50% 100%;-webkit-mask:radial-gradient(ellipse at 50% 100%,#000 10%,transparent 70%);mask:radial-gradient(ellipse at 50% 100%,#000 10%,transparent 70%);opacity:.55}
 footer{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px;padding:26px var(--pad) calc(34px + env(safe-area-inset-bottom));border-top:1px solid var(--line);font:12px var(--mono);color:var(--fg3)}
 footer nav{display:flex;flex-wrap:wrap;gap:6px 18px}
 footer nav a:hover{color:var(--ph)}
@@ -825,7 +846,12 @@ footer nav a:hover{color:var(--ph)}
     <a class="btn btn-p" href="https://ai.atomgit.com/serverless-api" data-mag data-cur="big" data-i="cta.b1">领取免费额度 →</a>
     <a class="btn btn-g" href="docs/zh/index.html" data-doc="index" data-mag data-i="cta.b2">阅读文档</a>
   </div>
-  <div class="wm" id="wm" aria-hidden="true">AtomCode</div>
+  <div class="wm-wrap" id="wmWrap" aria-hidden="true">
+    <div class="wm-glow"></div>
+    <div class="wm"><span class="wm-t" id="wm" data-t="AtomCode">AtomCode</span><i class="wm-car"></i></div>
+    <div class="wm-ref"><span>AtomCode</span></div>
+    <div class="wm-floor"></div>
+  </div>
 </section>
 </main>
 <footer>
@@ -1422,8 +1448,15 @@ if(fine&&!reduce){
   document.documentElement.addEventListener('pointerleave',()=>c.classList.remove('show'));
   (function f(){cx+=(mx-cx)*.2;cy+=(my-cy)*.2;c.style.transform=`translate3d(${cx.toFixed(1)}px,${cy.toFixed(1)}px,0)`;requestAnimationFrame(f)})();
 }
-const wm=$('#wm');
-track($('#end'),e=>{const r=wm.getBoundingClientRect();wm.style.setProperty('--mx',(e.clientX-r.left)+'px');wm.style.setProperty('--my',(e.clientY-r.top)+'px')});
+const wm=$('#wm'),wmWrap=$('#wmWrap');
+watch(wmWrap);
+// 鼠标：字上加白热高光，背后光晕向鼠标方向偏移
+track($('#end'),e=>{const r=wm.getBoundingClientRect(),wr=wmWrap.getBoundingClientRect();
+  wm.style.setProperty('--mx',(e.clientX-r.left)+'px');wm.style.setProperty('--my',(e.clientY-r.top)+'px');
+  wmWrap.style.setProperty('--gx',clamp((e.clientX-wr.left)/wr.width*100,25,75).toFixed(1)+'%')});
+$('#end').addEventListener('pointerleave',()=>{wm.style.setProperty('--mx','-999px');wmWrap.style.removeProperty('--gx')});
+// 首次进入视口时像终端输出一样解码打出
+if(!reduce){const wmIO=new IntersectionObserver(es=>{if(es[0].isIntersecting){wmIO.disconnect();scramble(wm,'AtomCode',1100)}},{threshold:.4});wmIO.observe(wmWrap)}
 
 /* ==================== 启动 ==================== */
 layoutOrb();applyLang();buildCovers();tuiNext();
