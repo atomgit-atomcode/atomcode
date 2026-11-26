@@ -419,7 +419,17 @@ impl GrowingTrim {
             };
             if line_nonblank {
                 self.start.get_or_insert(line_start);
-                self.end = seg_start + content.len();
+                // A delta that adds only line-ending characters to a line that
+                // was already non-blank does not move its content end. The
+                // combined line's trailing `\r`/`\n` are trimmed, including a
+                // `\r` the previous delta left at the end. This keeps the
+                // incremental view equal to `display_text` when a delta
+                // boundary splits a CRLF.
+                self.end = if content.is_empty() {
+                    self.end
+                } else {
+                    seg_start + content.len()
+                };
             }
             if has_newline {
                 self.line_start = seg_start + raw_line.len();
@@ -1479,6 +1489,13 @@ mod growing_trim_tests {
             vec!["abc\r", "def\n\n"],
             vec!["line1\n", "\n", "  \n", "line2\n"],
             vec!["   ", "  x", "\n\n  "],
+            // A delta boundary that splits a CRLF: the incremental trim must
+            // match `display_text`, which trims the whole combined line.
+            vec!["ab\r", "\n"],
+            vec!["a\r\r", "\n"],
+            vec!["ab\r", "\r\n"],
+            vec!["ab\r", "xyz\n"],
+            vec!["ab\r", "\nxyz"],
         ] {
             check(&pieces);
         }
