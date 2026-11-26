@@ -287,6 +287,48 @@ async fn a_member_that_finishes_silently_is_reported_on() {
     );
 }
 
+/// A progress note is not a report on the task: a member that sends one and
+/// then ends its turn is idle with the work unfinished, and a lead told only
+/// "next I will read the following file" would wait for it forever.
+#[tokio::test]
+async fn a_member_that_stops_after_a_progress_note_is_reported_on() {
+    let dir = scratch("progress");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "", calls = [ { name = "tell_parent", args = { kind = "progress", text = "done 10 of 41; next I read mod.rs" } } ] }, { text = "Progress reported to the lead." }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    // The note and the turn's end are two messages; the second may land after
+    // a lead turn has already claimed the first.
+    let mut heard = Vec::new();
+    for _ in 0..100 {
+        heard = heard_by(&app, &lead).await;
+        if heard.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let texts: Vec<&str> = heard.iter().map(|(_, text)| text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("next I read mod.rs")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("[scout finished turn 1") && t.contains("progress")),
+        "the lead hears that the member stopped after only a progress note: {texts:?}"
+    );
+}
+
 #[tokio::test]
 async fn status_tell_and_stop_are_the_leads_to_call() {
     let dir = scratch("lifecycle");

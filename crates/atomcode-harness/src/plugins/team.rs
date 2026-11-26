@@ -595,6 +595,9 @@ fn tools_for(role: &Role) -> Vec<String> {
 #[derive(Default)]
 struct ReportReceipt {
     sent: bool,
+    /// The last thing told was only progress: the turn ending after it is the
+    /// member going idle with the task unreported, which the lead must hear.
+    progress: bool,
     note_key: Option<String>,
 }
 
@@ -769,13 +772,19 @@ impl Tool for TellParent {
     }
     fn description(&self) -> &str {
         "Send a message to the lead agent that delegated to you: a progress note, a question, \
-         or your final report. The lead is the only agent you can address."
+         or your final report. The lead is the only agent you can address. A progress note \
+         does not end your task: keep working after it."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": "What to tell the lead" }
+                "text": { "type": "string", "description": "What to tell the lead" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["progress", "done", "blocked"],
+                    "description": "`progress` for a note on the way, after which you keep working; `done` for your final report (the default); `blocked` when you cannot go on without the lead."
+                }
             },
             "required": ["text"]
         })
@@ -787,9 +796,11 @@ impl Tool for TellParent {
         #[derive(Deserialize)]
         struct Args {
             text: String,
+            #[serde(default)]
+            kind: Option<String>,
         }
-        let text = match serde_json::from_str::<Args>(args) {
-            Ok(a) => a.text,
+        let (text, progress) = match serde_json::from_str::<Args>(args) {
+            Ok(a) => (a.text, a.kind.as_deref() == Some("progress")),
             Err(e) => return fail(format!("invalid arguments: {e}")),
         };
         let Some(lead) = self.agents.get(self.lead) else {
@@ -797,10 +808,15 @@ impl Tool for TellParent {
         };
         let member = self.agents.get(self.me);
         let note = member.as_ref().and_then(|m| report_note(m, &lead));
-        let mut report = format!("[{}] {text}", self.name);
+        let mut report = if progress {
+            format!("[{}] (progress) {text}", self.name)
+        } else {
+            format!("[{}] {text}", self.name)
+        };
         {
             let mut receipt = self.told.lock().expect("told poisoned");
             receipt.sent = true;
+            receipt.progress = progress;
             if let Some(note) = note.filter(|n| Some(&n.key) != receipt.note_key.as_ref()) {
                 append_report_note(&mut report, Some(&note));
                 receipt.note_key = Some(note.key);
@@ -1343,7 +1359,8 @@ impl TeamTool {
             0,
             format!(
                 "{}\n\nYou are `{name}`, a {} on a team. The lead delegated this to you. Use \
-                 `tell_parent` for questions and progress, and call it with a compact report \
+                 `tell_parent` for questions and progress (`kind: \"progress\"`, then keep working: \
+                 a progress note does not end your task), and call it with a compact report \
                  when you are done. The lead does not see your full activity. If required work is \
                  outside your write scope, blocked, or left undone, report non-sensitive affected paths, \
                  reason and remaining work with `tell_parent`; do not silently skip it or assume \
@@ -2357,6 +2374,7 @@ impl Plugin for TeamPlugin {
             };
             let note = report_note(&member, &lead);
             if told.sent
+                && !told.progress
                 && !budget_stop
                 && note
                     .as_ref()
@@ -2370,6 +2388,12 @@ impl Plugin for TeamPlugin {
                 .unwrap_or_else(|| "(nothing)".into());
             let mut report = if budget_stop {
                 format!("[{name} reached its provider request budget in turn {turn}]\n{said}")
+            } else if told.progress {
+                format!(
+                    "[{name} finished turn {turn}: {stop:?} after a progress note, without a \
+                     final report — it is idle and its task is not reported done; tell it to \
+                     continue, or stop it]\n{said}"
+                )
             } else {
                 format!("[{name} finished turn {turn}: {stop:?}]\n{said}")
             };
