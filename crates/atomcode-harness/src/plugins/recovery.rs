@@ -288,8 +288,7 @@ impl OverflowLadder {
                 self.request_sizes(req)
             ));
         };
-        let window = self
-            .ctx
+        let window = crate::agent::scoped(&self.ctx)
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
@@ -373,7 +372,7 @@ impl OverflowLadder {
     }
 
     fn request_sizes(&self, req: &ModelRequest) -> String {
-        let provider = self.ctx.service::<crate::seams::LlmSvc>();
+        let provider = crate::agent::scoped(&self.ctx).service::<crate::seams::LlmSvc>();
         let model = provider
             .as_ref()
             .map(|p| p.model_name())
@@ -402,7 +401,7 @@ impl OverflowLadder {
     }
 
     fn sized(&self, messages: &[Message]) -> Sized {
-        let provider = self.ctx.service::<LlmSvc>();
+        let provider = crate::agent::scoped(&self.ctx).service::<LlmSvc>();
         let estimated = estimate(messages, provider.as_deref());
         let Some(provider) = provider else {
             return Sized::Estimated(estimated);
@@ -462,7 +461,7 @@ impl OverflowLadder {
         };
         let (Some(session), Some(provider), Some(through)) = (
             crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
-            self.ctx.service::<LlmSvc>(),
+            crate::agent::scoped(&self.ctx).service::<LlmSvc>(),
             through,
         ) else {
             return;
@@ -495,8 +494,7 @@ impl Waterfall<AgentRequest> for OverflowLadder {
         // fails, or worse, comes back empty. Only once something has been
         // answered — a first prompt too large on its own is nothing a
         // compaction can shrink.
-        let window = self
-            .ctx
+        let window = crate::agent::scoped(&self.ctx)
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);

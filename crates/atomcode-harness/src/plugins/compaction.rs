@@ -412,6 +412,14 @@ pub async fn attempt_with_sent_prompt(
     let events = log.events();
     let sent = provider.and_then(|provider| log.sent_prompt(provider));
     let Some(view) = StrategyView::of(&events, sent) else {
+        // Nothing in the log reads as a request to keep at the head, so no
+        // strategy can be shown the conversation. Said, because it looks
+        // exactly like a conversation with nothing to compact.
+        tracing::warn!(
+            session_id = log.id(),
+            events = events.len(),
+            "compaction skipped: no request to keep at the head of the conversation"
+        );
         return CompactionAttempt::default();
     };
     let plan = strategy.plan(&view.kernel_view(ask)).await;

@@ -1032,8 +1032,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
         // Context pressure is measured from what the provider last reported,
         // not estimated from the text: the provider is the authority on its own
         // tokenizer.
-        let window = self
-            .ctx
+        let window = crate::agent::scoped(&self.ctx)
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
@@ -1079,6 +1078,19 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             );
         }
         let result = compaction.compact_attempt(&session, &ask).await;
+        if result.decision.is_none() && result.diagnostic.is_none() {
+            // Past the trigger with nothing done is the state a session that
+            // can never be compacted sits in until it overflows; once per
+            // stage and turn (the gate), so a long turn says it once.
+            tracing::info!(
+                session_id = session.id(),
+                turn = session.current_turn(),
+                used_tokens = used,
+                context_window = window,
+                slow,
+                "context past the compaction trigger; nothing to compact"
+            );
+        }
         if result.decision.is_none() {
             if let Some(reason) = result.diagnostic {
                 let bytes = session.derive_messages().iter().map(|m| m.text.len()).sum();
