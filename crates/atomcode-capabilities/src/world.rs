@@ -592,15 +592,63 @@ pub struct Collected {
     pub exit: Exit,
 }
 
+/// The retained bytes of one process stream. A gap is kept out of the bytes
+/// so the shell can decode both sides before adding the display marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapturedOutput {
+    Whole(Vec<u8>),
+    Truncated {
+        head: Vec<u8>,
+        tail: Vec<u8>,
+        omitted: u64,
+    },
+}
+
+impl CapturedOutput {
+    fn into_whole(self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Whole(bytes) => Ok(bytes),
+            Self::Truncated { .. } => Err("uncapped process output was truncated".into()),
+        }
+    }
+
+    fn decode_with(self, decode: impl Fn(&[u8]) -> String) -> String {
+        match self {
+            Self::Whole(bytes) => decode(&bytes),
+            Self::Truncated {
+                head,
+                tail,
+                omitted,
+            } => with_capture_gap(decode(&head), decode(&tail), omitted),
+        }
+    }
+}
+
+pub(crate) fn with_capture_gap(mut head: String, tail: String, omitted: u64) -> String {
+    use std::fmt::Write;
+    let _ = write!(
+        head,
+        "\n[atomcode: captured output truncated - {omitted} bytes omitted]\n"
+    );
+    head.push_str(&tail);
+    head
+}
+
+/// Process exit status and the retained portions of both streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CappedCollected {
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
+    pub exit: Exit,
+}
+
 /// A byte stream that keeps at most `cap` bytes: the head and the tail.
 ///
 /// A command that prints without end (`yes`, `cat /dev/urandom`) must not grow
 /// this process without bound. The caller chooses `cap`; the head gets the
 /// larger share — the opening (a diff header, a log's first lines) is usually
 /// the more useful half — and the tail keeps the most recent bytes (the error,
-/// the status). [`CappedBytes::finish`] marks the dropped middle with an ASCII
-/// marker, and aligns the seam to a UTF-8 boundary only when the retained bytes
-/// really are UTF-8.
+/// the status). [`CappedBytes::finish`] reports the dropped bytes separately.
 ///
 /// A small delta merges into the back chunk, so a world that yields one byte at
 /// a time costs one entry per [`TAIL_CHUNK_BYTES`], not one per byte.
@@ -682,7 +730,7 @@ impl CappedBytes {
         }
     }
 
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub(crate) fn finish(self) -> CapturedOutput {
         let total = self.total;
         let tail_bytes = self.tail_bytes;
         let mut tail = Vec::with_capacity(tail_bytes);
@@ -695,53 +743,18 @@ impl CappedBytes {
         if excess > 0 {
             tail.drain(..excess);
         }
-        let kept = self.head.len() + tail.len();
-        if total <= kept as u64 {
-            // Nothing was dropped, so there is no seam to align.
-            let mut out = self.head;
-            out.extend(tail);
-            return out;
-        }
-        // Do not leave half a character either side of the marker. This is
-        // best-effort and UTF-8-specific: `world.decode` may decode the same
-        // bytes as UTF-16 or an OEM/GBK code page, where a UTF-8 continuation
-        // byte is a legal lead or trail byte. Only a head that was cut
-        // mid-character proves the seam is UTF-8. A head that is valid UTF-8
-        // (including pure ASCII) ended at a boundary: a tail starting with
-        // 0x80..=0xBF then belongs to another encoding, or to a character whose
-        // lead byte is in the dropped middle. A UTF-16 head is valid UTF-8 too
-        // (its NULs are), but no sequence is incomplete, so it is left alone.
-        //
-        // Trade-off: a UTF-8 flood whose head ends at a character boundary can
-        // still start its tail mid-character, leaving one replacement character
-        // after the marker. Aligning that would also eat a GBK/OEM byte that
-        // starts the tail with the same value.
         let mut head = self.head;
-        let head_incomplete = match std::str::from_utf8(&head) {
-            Ok(_) => false,
-            Err(error) => {
-                if error.error_len().is_none() {
-                    head.truncate(error.valid_up_to());
-                    true
-                } else {
-                    false
-                }
-            }
-        };
-        if head_incomplete {
-            let leading_continuation = tail
-                .iter()
-                .take(3)
-                .take_while(|byte| **byte & 0xC0 == 0x80)
-                .count();
-            tail.drain(..leading_continuation);
-        }
         let omitted = total.saturating_sub((head.len() + tail.len()) as u64);
-        let marker = format!("\n[atomcode: captured output truncated - {omitted} bytes omitted]\n");
-        let mut out = head;
-        out.extend_from_slice(marker.as_bytes());
-        out.extend(tail);
-        out
+        if omitted == 0 {
+            head.extend(tail);
+            CapturedOutput::Whole(head)
+        } else {
+            CapturedOutput::Truncated {
+                head,
+                tail,
+                omitted,
+            }
+        }
     }
 }
 
@@ -766,9 +779,9 @@ impl Retained {
         }
     }
 
-    fn finish(self) -> Vec<u8> {
+    fn finish(self) -> CapturedOutput {
         match self {
-            Retained::Whole(out) => out,
+            Retained::Whole(out) => CapturedOutput::Whole(out),
             Retained::Capped(out) => out.finish(),
         }
     }
@@ -858,20 +871,26 @@ pub trait Process: Send + Sync {
         &self,
         limit: Option<std::time::Duration>,
     ) -> Result<Option<Collected>, String> {
-        self.collect_within_capped(limit, None).await
+        let Some(output) = self.collect_within_capped(limit, None).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Collected {
+            stdout: output.stdout.into_whole()?,
+            stderr: output.stderr.into_whole()?,
+            exit: output.exit,
+        }))
     }
 
     /// [`collect_within`](Self::collect_within) that retains at most `cap` bytes
     /// of each stream.
     ///
-    /// The retained bytes are the head and the tail, and a marker replaces the
-    /// dropped middle. `None` keeps everything, the contract
-    /// [`collect_within`](Self::collect_within) has always had.
+    /// The head and tail stay separate when bytes are dropped. `None` keeps
+    /// everything, as in [`collect_within`](Self::collect_within).
     async fn collect_within_capped(
         &self,
         limit: Option<std::time::Duration>,
         cap: Option<usize>,
-    ) -> Result<Option<Collected>, String> {
+    ) -> Result<Option<CappedCollected>, String> {
         let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
         let running_out = || async move {
             match deadline {
@@ -912,7 +931,7 @@ pub trait Process: Send + Sync {
                 _ = running_out() => return Ok(None),
             }
         };
-        Ok(Some(Collected {
+        Ok(Some(CappedCollected {
             stdout: stdout.finish(),
             stderr: stderr.finish(),
             exit,
@@ -1010,6 +1029,12 @@ pub trait Shell: Send + Sync {
     /// need: UTF-8.
     fn decode(&self, bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Decode captured output and render any gap as text. Shells that detect
+    /// encoding from a stream header can reuse that encoding for the tail.
+    fn decode_capture(&self, output: CapturedOutput) -> String {
+        output.decode_with(|bytes| self.decode(bytes))
     }
 } // ---- the local world -----------------------------------------------------
 
@@ -2600,18 +2625,25 @@ mod bounded_line_tests {
 mod capped_output_tests {
     use super::*;
 
+    fn display(output: CapturedOutput) -> String {
+        output.decode_with(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
     #[test]
     fn capped_bytes_keeps_the_head_and_tail_and_marks_the_middle() {
         let mut bytes = CappedBytes::new(100);
         bytes.push(&[b'a'; 60]);
         bytes.push(&[b'b'; 60]);
-        let out = bytes.finish();
-        let text = String::from_utf8_lossy(&out);
-        assert!(out.starts_with(&[b'a'; 60]), "head is kept");
-        assert!(out.ends_with(&[b'b'; 25]), "tail is kept");
-        assert!(text.contains("output truncated"), "{text}");
-        assert!(text.contains("20 bytes omitted"), "{text}");
-        assert!(out.len() < 200, "{}", out.len());
+        let output = bytes.finish();
+        assert_eq!(
+            output,
+            CapturedOutput::Truncated {
+                head: [vec![b'a'; 60], vec![b'b'; 15]].concat(),
+                tail: vec![b'b'; 25],
+                omitted: 20,
+            }
+        );
+        assert!(display(output).contains("20 bytes omitted"));
     }
 
     #[test]
@@ -2619,129 +2651,73 @@ mod capped_output_tests {
         let mut bytes = CappedBytes::new(100);
         bytes.push(b"hello");
         bytes.push(b" world");
-        assert_eq!(bytes.finish(), b"hello world");
+        assert_eq!(
+            bytes.finish(),
+            CapturedOutput::Whole(b"hello world".to_vec())
+        );
     }
 
     #[test]
     fn capped_bytes_bounds_a_single_huge_chunk() {
         let mut bytes = CappedBytes::new(100);
         bytes.push(&[b'x'; 1_000_000]);
-        let out = bytes.finish();
-        assert!(out.len() < 200, "{}", out.len());
-        assert!(String::from_utf8_lossy(&out).contains("output truncated"));
+        assert_eq!(
+            bytes.finish(),
+            CapturedOutput::Truncated {
+                head: vec![b'x'; 75],
+                tail: vec![b'x'; 25],
+                omitted: 999_900,
+            }
+        );
     }
 
     #[test]
-    fn capped_bytes_merges_tiny_chunks() {
-        let mut bytes = CappedBytes::new(1024); // head 768, tail 256
-        for _ in 0..10_000 {
-            bytes.push(b"x");
+    fn capped_bytes_merges_tiny_chunks_and_keeps_the_newest() {
+        let mut bytes = CappedBytes::new(1024);
+        for n in 0..10_000 {
+            bytes.push(&[(n % 256) as u8]);
         }
-        assert!(
-            bytes.tail.len() <= 2,
-            "one-byte pushes created {} tail entries",
-            bytes.tail.len()
-        );
-        let out = bytes.finish();
-        assert!(out.ends_with(&[b'x'; 10]));
-    }
-
-    #[test]
-    fn capped_bytes_keeps_the_last_tail_bytes_across_chunks() {
-        let mut bytes = CappedBytes::new(20); // head 15, tail 5
-        bytes.push(&[b'a'; 10]);
-        bytes.push(&[b'b'; 10]);
-        bytes.push(&[b'c'; 10]);
-        let out = bytes.finish();
-        assert!(out.starts_with(&[b'a'; 10]), "head kept");
-        assert!(out.ends_with(&[b'c'; 5]), "tail is the newest bytes");
-        assert!(
-            String::from_utf8_lossy(&out).contains("10 bytes omitted"),
-            "{}",
-            String::from_utf8_lossy(&out)
+        assert!(bytes.tail.len() <= 2, "{:?}", bytes.tail.len());
+        let CapturedOutput::Truncated { tail, .. } = bytes.finish() else {
+            panic!("expected capped output");
+        };
+        assert_eq!(
+            tail,
+            (9744..10_000).map(|n| (n % 256) as u8).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn capped_bytes_does_not_split_a_multibyte_character_at_the_seam() {
-        // 300 bytes of 3-byte characters. cap 10 gives head 8 and tail 2: the
-        // head cut falls inside the third character and the tail is its
-        // trailing continuation bytes. Both sides must be aligned.
-        let text = "中".repeat(100);
-        let mut bytes = CappedBytes::new(10);
-        bytes.push(text.as_bytes());
-        let out = bytes.finish();
-        let shown = String::from_utf8_lossy(&out);
-        assert!(
-            !shown.contains('\u{FFFD}'),
-            "seam split a character: {shown:?}"
-        );
-        assert!(shown.contains("output truncated"), "{shown:?}");
-        assert!(shown.starts_with("中中"), "{shown:?}");
-    }
-
-    #[test]
-    fn capped_bytes_does_not_align_a_non_utf8_tail() {
-        // The head is invalid UTF-8 (GBK-like). The tail starts with 0x81, a
-        // legal GBK lead byte that also looks like a UTF-8 continuation byte.
-        // It must not be dropped.
-        let mut bytes = CappedBytes::new(100); // head 75, tail 25
-        bytes.push(&[0xFF; 75]);
-        bytes.push(&[0x40]);
+    fn capped_bytes_preserves_raw_bytes_at_both_sides_of_the_gap() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'A'; 74]);
+        bytes.push(&[0xE4, 0xB8, 0xAD]);
         bytes.push(&[0x81]);
-        bytes.push(&[0x41; 24]);
-        let out = bytes.finish();
-        assert_eq!(out[out.len() - 25], 0x81, "the GBK lead byte was dropped");
-        assert!(out.ends_with(&[0x41; 24]));
-    }
-
-    #[test]
-    fn capped_bytes_does_not_align_a_utf16_tail() {
-        // ASCII UTF-16LE: the head is valid UTF-8 (NULs) and no sequence is
-        // incomplete, so the mid-character rule leaves the tail alone.
-        let mut bytes = CappedBytes::new(100); // head 75, tail 25
-        bytes.push(&"A\0".repeat(38).into_bytes()); // 76 bytes; head takes 75
-        bytes.push(&[0x40]);
-        bytes.push(&[0x81]);
-        bytes.push(&[0x41; 24]);
-        let out = bytes.finish();
-        assert_eq!(out[out.len() - 25], 0x81, "UTF-16 parity was shifted");
-        assert!(out.ends_with(&[0x41; 24]));
+        bytes.push(&[b'B'; 24]);
+        let CapturedOutput::Truncated {
+            head,
+            tail,
+            omitted,
+        } = bytes.finish()
+        else {
+            panic!("expected capped output");
+        };
+        assert_eq!(head.last(), Some(&0xE4));
+        assert_eq!(tail.first(), Some(&0x81));
+        assert_eq!(omitted, 2);
     }
 
     #[test]
     #[cfg(feature = "tools")]
-    fn the_capture_marker_is_ascii_and_distinct_from_the_artifact_marker() {
+    fn the_capture_marker_is_distinct_from_the_artifact_marker() {
         let mut bytes = CappedBytes::new(100);
         bytes.push(&[b'x'; 1_000]);
-        let out = bytes.finish();
-        assert!(
-            out.is_ascii(),
-            "the marker must stay ASCII for OEM decoders"
-        );
-        let text = String::from_utf8_lossy(&out);
+        let text = display(bytes.finish());
         assert!(
             text.contains("[atomcode: captured output truncated"),
             "{text}"
         );
-        assert!(
-            !text.contains(crate::tools::output_artifact::ARTIFACT_TRUNCATION_MARKER_PREFIX),
-            "the capture marker must not look like an artifact preview: {text}"
-        );
-    }
-
-    #[test]
-    fn capped_bytes_does_not_align_a_gbk_tail_behind_an_ascii_head() {
-        // A pure-ASCII head is valid UTF-8, but that does not make a GBK tail
-        // UTF-8. Only a head cut mid-character makes the seam UTF-8.
-        let mut bytes = CappedBytes::new(100); // head 75, tail 25
-        bytes.push(&[b'A'; 75]);
-        bytes.push(&[0x40]);
-        bytes.push(&[0x81]);
-        bytes.push(&[0x41; 24]);
-        let out = bytes.finish();
-        assert_eq!(out[out.len() - 25], 0x81, "the GBK lead byte was dropped");
-        assert!(out.ends_with(&[0x41; 24]));
+        assert!(!text.contains(crate::tools::output_artifact::ARTIFACT_TRUNCATION_MARKER_PREFIX));
     }
 
     struct Flood {
@@ -2777,9 +2753,21 @@ mod capped_output_tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(collected.stdout.len() < 1_100, "{}", collected.stdout.len());
-        assert!(collected.stderr.len() < 1_100, "{}", collected.stderr.len());
-        assert!(String::from_utf8_lossy(&collected.stdout).contains("output truncated"));
-        assert!(String::from_utf8_lossy(&collected.stderr).contains("output truncated"));
+        assert_eq!(
+            collected.stdout,
+            CapturedOutput::Truncated {
+                head: vec![b'a'; 750],
+                tail: vec![b'a'; 250],
+                omitted: 9_000,
+            }
+        );
+        assert_eq!(
+            collected.stderr,
+            CapturedOutput::Truncated {
+                head: vec![b'e'; 750],
+                tail: vec![b'e'; 250],
+                omitted: 9_000,
+            }
+        );
     }
 }

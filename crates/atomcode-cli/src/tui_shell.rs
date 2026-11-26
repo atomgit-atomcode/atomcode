@@ -55,6 +55,50 @@ impl Plugin for ShellRow {
 
 /// What `run_shell` puts before every stderr chunk it hands the callback.
 const STDERR: &str = "[stderr] ";
+const MAX_PENDING_LINE_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+struct PendingLine {
+    text: String,
+    truncated: bool,
+}
+
+impl PendingLine {
+    fn push(&mut self, chunk: &str, prefix: &str, emit: &dyn Fn(String)) {
+        for piece in chunk.split_inclusive('\n') {
+            let complete = piece.ends_with('\n');
+            let body = piece.strip_suffix('\n').unwrap_or(piece);
+            if !self.truncated {
+                let remaining = MAX_PENDING_LINE_BYTES - self.text.len();
+                let end = body.floor_char_boundary(remaining);
+                self.text
+                    .push_str(body.get(..end).expect("valid UTF-8 boundary"));
+                self.truncated = end < body.len();
+            }
+            if complete {
+                self.emit(prefix, true, emit);
+            }
+        }
+    }
+
+    fn emit(&mut self, prefix: &str, complete: bool, emit: &dyn Fn(String)) {
+        if complete || self.truncated || !self.text.is_empty() {
+            let body = if complete && !self.truncated {
+                self.text.trim_end_matches('\r')
+            } else {
+                &self.text
+            };
+            let marker = if self.truncated {
+                " [atomcode: line truncated]"
+            } else {
+                ""
+            };
+            emit(format!("{prefix}{body}{marker}"));
+        }
+        self.text.clear();
+        self.truncated = false;
+    }
+}
 
 struct Here {
     working_dir: std::path::PathBuf,
@@ -90,13 +134,7 @@ impl Shell for Here {
         // 劈成两截。stdout 和 stderr **各攒各的**:`run_shell` 把两路的块交给同
         // 一个回调(stderr 的块前面带 `[stderr] `),攒在一处的话,stdout 半行没
         // 换行时来一块 stderr 就会被粘成一行。`[stderr] ` 也按行加,而不是按块。
-        let pending = std::sync::Mutex::new((String::new(), String::new()));
-        let emit = |buf: &mut String, prefix: &str| {
-            while let Some(nl) = buf.find('\n') {
-                let whole: String = buf.drain(..=nl).collect();
-                line(format!("{prefix}{}", whole.trim_end_matches(['\n', '\r'])));
-            }
-        };
+        let pending = std::sync::Mutex::new((PendingLine::default(), PendingLine::default()));
         let outcome = run_shell(
             &atomcode_capabilities::world::LocalShell,
             command,
@@ -106,25 +144,15 @@ impl Shell for Here {
                 let mut held = pending.lock().expect("pending poisoned");
                 let (out, err) = &mut *held;
                 match chunk.strip_prefix(STDERR) {
-                    Some(rest) => {
-                        err.push_str(rest);
-                        emit(err, STDERR);
-                    }
-                    None => {
-                        out.push_str(chunk);
-                        emit(out, "");
-                    }
+                    Some(rest) => err.push(rest, STDERR, line),
+                    None => out.push(chunk, "", line),
                 }
             },
         )
         .await;
-        let (out, err) = std::mem::take(&mut *pending.lock().expect("pending poisoned"));
-        if !out.is_empty() {
-            line(out);
-        }
-        if !err.is_empty() {
-            line(format!("{STDERR}{err}"));
-        }
+        let (mut out, mut err) = pending.into_inner().expect("pending poisoned");
+        out.emit("", false, line);
+        err.emit(STDERR, false, line);
         // stdout 和 stderr 合起来，按它们本来的顺序读不出来——所以 stderr 排在
         // 后面并原样保留。人敲 `!` 多半正是想看报错。
         let mut output = outcome.stdout;
@@ -153,6 +181,22 @@ impl Shell for Here {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_partial_line_is_bounded_and_the_next_line_still_arrives() {
+        let mut pending = PendingLine::default();
+        let lines = std::cell::RefCell::new(Vec::new());
+        let emit = |line| lines.borrow_mut().push(line);
+        let chunk = "中".repeat(MAX_PENDING_LINE_BYTES / 3);
+        pending.push(&chunk, STDERR, &emit);
+        pending.push("中", STDERR, &emit);
+        assert!(pending.text.len() <= MAX_PENDING_LINE_BYTES);
+        pending.push("\r\nnext\r\n", STDERR, &emit);
+        let lines = lines.into_inner();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("[atomcode: line truncated]"));
+        assert_eq!(lines[1], "[stderr] next");
+    }
 
     /// A `!` runs where the session works when the screen knows it — after a
     /// `/cd`, not where this row was set up — and where it was set up otherwise.

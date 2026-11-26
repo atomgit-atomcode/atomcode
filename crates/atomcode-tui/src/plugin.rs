@@ -6271,7 +6271,7 @@ impl Tui {
             // 复制一次就是几千次复制。行先攒着,由一个 50ms 的钟去画 —— 而不是
             // 等下一行来了才画:一阵几行、然后安静下来的命令(`npm run dev` 的
             // 开场白),靠「来行才画」的话,那阵的后几行要等命令结束才出现。
-            let shown = std::sync::Mutex::new((Vec::<String>::new(), false));
+            let shown = std::sync::Mutex::new((crate::shell::ShellLines::default(), false));
             let flush = || {
                 let mut held = shown.lock().expect("shown poisoned");
                 if !held.1 {
@@ -6279,7 +6279,7 @@ impl Tui {
                 }
                 held.1 = false;
                 let content = Arc::new(ShellOutput {
-                    lines: held.0.clone(),
+                    lines: held.0.snapshot(),
                     ..ShellOutput::default()
                 });
                 drop(held);
@@ -6311,12 +6311,15 @@ impl Tui {
                     _ = tick.tick() => flush(),
                 }
             };
-            let mut lines = std::mem::take(&mut shown.lock().expect("shown poisoned").0);
+            let mut shown = std::mem::take(&mut shown.lock().expect("shown poisoned").0);
             // 什么都没流出来、却有输出:命令根本没起来(找不到 shell、目录不对),
             // 那句原因只在 `ran.output` 里。不画它的话,人只看到一个「退出码 —」。
-            if lines.is_empty() && !ran.output.trim().is_empty() {
-                lines = ran.output.trim_end().lines().map(str::to_string).collect();
+            if shown.is_empty() && !ran.output.trim().is_empty() {
+                for line in ran.output.trim_end().lines() {
+                    shown.push(line.to_string());
+                }
             }
+            let mut lines = shown.snapshot();
             if ran.failed() && !ran_in.is_empty() {
                 lines.push(t(Msg::ShellWorkingDir { dir: &ran_in }).into_owned());
             }

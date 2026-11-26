@@ -423,18 +423,16 @@ impl Tool for BashTool {
                 Some(MAX_CAPTURED_BYTES),
             ) => match res {
                 Ok(Some(collected)) => {
+                    let stdout = self.world.decode_capture(collected.stdout);
+                    let stderr = self.world.decode_capture(collected.stderr);
                     if let Some(observer) = self.observer.as_ref().filter(|observer| observer.interested(ctx)) {
                         observer.completed(ctx, &ShellExecutionReceipt {
                             command: a.command.clone(), exit_code: collected.exit.code,
-                            stdout: self.world.decode(&collected.stdout),
-                            stderr: self.world.decode(&collected.stderr),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
                         });
                     }
-                    let mut result = format_output(
-                        &self.world.decode(&collected.stdout),
-                        &self.world.decode(&collected.stderr),
-                        collected.exit.code,
-                    );
+                    let mut result = format_output(&stdout, &stderr, collected.exit.code);
                     if let (Some(lines), Some(preview)) = (preview_lines, &output_preview) {
                         let status = collected.exit.code.map(|code| format!("[exit code {code}]"))
                             .unwrap_or_else(|| "[process terminated by signal]".into());
@@ -1311,10 +1309,92 @@ pub(crate) fn decode_output(bytes: &[u8]) -> String {
     decode_oem(bytes, console_codepage())
 }
 
+pub(super) fn decode_captured_output(output: crate::world::CapturedOutput) -> String {
+    use crate::world::{with_capture_gap, CapturedOutput};
+
+    let (head, tail, omitted) = match output {
+        CapturedOutput::Whole(bytes) => return decode_output(&bytes),
+        CapturedOutput::Truncated {
+            head,
+            tail,
+            omitted,
+        } => (head, tail, omitted),
+    };
+
+    // Both offsets are in the original stream. Probe only its head, which
+    // carries any BOM, and use the same byte order for the tail.
+    let even_end = head.len() & !1;
+    let utf16_head = |end| {
+        let bytes = &head[..end];
+        let (little_endian, decoded) = decode_utf16_with_order(bytes)?;
+        let last = bytes.chunks_exact(2).last()?;
+        // A truncated high surrogate is part of the gap, not visible text.
+        if (0xD800..=0xDBFF).contains(&utf16_unit(last, little_endian)) {
+            return None;
+        }
+        Some((end, little_endian, decoded))
+    };
+    if let Some((end, little_endian, decoded_head)) =
+        utf16_head(even_end).or_else(|| even_end.checked_sub(2).and_then(utf16_head))
+    {
+        let mut start = usize::from((head.len() as u64 + omitted) % 2 != 0).min(tail.len());
+        let mut units = tail[start..].chunks_exact(2);
+        if units
+            .next()
+            .is_some_and(|pair| (0xDC00..=0xDFFF).contains(&utf16_unit(pair, little_endian)))
+        {
+            start += 2;
+        }
+        let decoded_tail: String = char::decode_utf16(
+            tail[start..]
+                .chunks_exact(2)
+                .map(|pair| utf16_unit(pair, little_endian)),
+        )
+        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+        return with_capture_gap(
+            decoded_head,
+            decoded_tail,
+            omitted + (head.len() - end + start) as u64,
+        );
+    }
+
+    let utf8_end = match std::str::from_utf8(&head) {
+        Ok(text) if !text.is_ascii() => Some(head.len()),
+        Err(error) if error.error_len().is_none() => Some(error.valid_up_to()),
+        _ => None,
+    };
+    if let Some(end) = utf8_end {
+        let start = tail
+            .iter()
+            .take(3)
+            .take_while(|byte| **byte & 0xC0 == 0x80)
+            .count();
+        return with_capture_gap(
+            String::from_utf8_lossy(&head[..end]).into_owned(),
+            String::from_utf8_lossy(&tail[start..]).into_owned(),
+            omitted + (head.len() - end + start) as u64,
+        );
+    }
+    with_capture_gap(decode_output(&head), decode_output(&tail), omitted)
+}
+
+fn utf16_unit(pair: &[u8], little_endian: bool) -> u16 {
+    if little_endian {
+        u16::from_le_bytes([pair[0], pair[1]])
+    } else {
+        u16::from_be_bytes([pair[0], pair[1]])
+    }
+}
+
 /// Recognize redirected UTF-16 output by BOM or by the byte-position NUL bias of
 /// console diagnostics.  The no-BOM heuristic also requires valid UTF-16 and a
 /// printable decoded result, so ordinary binary/legacy output is not reinterpreted.
 fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
+    decode_utf16_with_order(bytes).map(|(_, text)| text)
+}
+
+fn decode_utf16_with_order(bytes: &[u8]) -> Option<(bool, String)> {
     let (little_endian, body, bom) = if bytes.starts_with(&[0xFF, 0xFE]) {
         (true, &bytes[2..], true)
     } else if bytes.starts_with(&[0xFE, 0xFF]) {
@@ -1346,26 +1426,23 @@ fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
     if body.len() % 2 != 0 {
         return None;
     }
-    let units = body.chunks_exact(2).map(|pair| {
-        if little_endian {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
-        }
-    });
+    let units = body
+        .chunks_exact(2)
+        .map(|pair| utf16_unit(pair, little_endian));
     if bom {
-        return Some(
+        return Some((
+            little_endian,
             char::decode_utf16(units)
-                .map(|item| item.unwrap_or('\u{FFFD}'))
+                .map(|item| item.unwrap_or(char::REPLACEMENT_CHARACTER))
                 .collect(),
-        );
+        ));
     }
     let decoded: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
     let control_count = decoded
         .chars()
         .filter(|character| character.is_control() && !character.is_whitespace())
         .count();
-    (control_count <= decoded.chars().count() / 20).then_some(decoded)
+    (control_count <= decoded.chars().count() / 20).then_some((little_endian, decoded))
 }
 
 /// Decode `bytes` with a Windows OEM/ANSI codepage number. Pure and platform-independent
@@ -1473,13 +1550,24 @@ fn decode_stream_chunk(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> Option
         Err(_) => {}
     }
 
+    // Legacy bytes without a line ending still have to leave the live
+    // decoder. A chunk boundary can be lossy in the preview; the final
+    // capture keeps its own bytes and is decoded separately.
+    const MAX_STREAM_DECODE_BYTES: usize = 16 * 1024;
     let emit_len = if eof {
         pending.len()
     } else {
         pending
             .iter()
             .rposition(|byte| matches!(byte, b'\n' | b'\r'))
-            .map_or(0, |index| index + 1)
+            .map(|index| index + 1)
+            .unwrap_or_else(|| {
+                if pending.len() >= MAX_STREAM_DECODE_BYTES {
+                    pending.len()
+                } else {
+                    0
+                }
+            })
     };
     if emit_len == 0 {
         return None;
@@ -3280,6 +3368,10 @@ impl crate::world::Shell for LocalShell {
         decode_output(bytes)
     }
 
+    fn decode_capture(&self, output: crate::world::CapturedOutput) -> String {
+        decode_captured_output(output)
+    }
+
     async fn spawn(
         &self,
         command: &str,
@@ -3672,10 +3764,8 @@ pub async fn run_shell(
         chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
     }
 
-    let stdout = stdout_buf.finish();
-    let stderr = stderr_buf.finish();
-    let stdout_str = world.decode(&stdout);
-    let stderr_str = world.decode(&stderr);
+    let stdout_str = world.decode_capture(stdout_buf.finish());
+    let stderr_str = world.decode_capture(stderr_buf.finish());
     let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
     let exit = match result {
@@ -4034,6 +4124,62 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    #[test]
+    fn capped_utf16_keeps_the_text_and_reports_the_gap() {
+        let text = format!("HEAD\n{}TAIL\n", "line🙂".repeat(100));
+        for little_endian in [false, true] {
+            for bom in [false, true] {
+                let encode = |unit: u16| {
+                    if little_endian {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    }
+                };
+                let mut bytes = Vec::new();
+                if bom {
+                    bytes.extend(encode(0xFEFF));
+                }
+                bytes.extend(text.encode_utf16().flat_map(encode));
+                for cap in 45..60 {
+                    let mut capture = crate::world::CappedBytes::new(cap);
+                    for chunk in bytes.chunks(7) {
+                        capture.push(chunk);
+                    }
+                    let shown = decode_captured_output(capture.finish());
+                    assert!(shown.starts_with("HEAD\n"), "{shown:?}");
+                    assert!(shown.ends_with("TAIL\n"), "{shown:?}");
+                    assert!(
+                        shown.contains("[atomcode: captured output truncated"),
+                        "{shown:?}"
+                    );
+                    assert!(!shown.contains(char::REPLACEMENT_CHARACTER), "{shown:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capped_utf8_does_not_decode_a_cut_tail_as_legacy_text() {
+        let text = "中".repeat(100) + "\n";
+        let mut capture = crate::world::CappedBytes::new(12);
+        capture.push(text.as_bytes());
+        let shown = decode_captured_output(capture.finish());
+        assert_eq!(
+            shown,
+            "中中中\n[atomcode: captured output truncated - 291 bytes omitted]\n\n"
+        );
+    }
+
+    #[test]
+    fn live_legacy_output_without_newlines_drains_the_decoder_buffer() {
+        let mut pending = Vec::new();
+        let block = [0xD6, 0xD0].repeat(4096);
+        assert!(decode_stream_chunk(&mut pending, &block, false).is_none());
+        assert!(decode_stream_chunk(&mut pending, &block, false).is_some());
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn grant_normalization_matches_join_with_comments_quotes_and_unicode() {
