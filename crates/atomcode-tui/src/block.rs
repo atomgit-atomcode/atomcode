@@ -323,13 +323,19 @@ pub enum Slot {
 
 /// A live block's last render, so the next frame renders only what is new.
 ///
-/// A live block is re-rendered every frame — it can have changed — and a
-/// streaming answer only ever grows, so re-parsing all of it to add a word is
-/// what makes a frame cost the length of the answer. Everything before the last
-/// settled line boundary is fixed, so it is kept and only the tail is rendered
-/// again. This dies with the block it describes, like [`Settled`]'s row count.
+/// A live block renders every frame. An append keeps the settled line boundary.
+/// The cache reuses those rows and renders only the new tail.
+/// An amend checks the prefix before it reuses the rows.
+/// This cache ends with its block, like [`Settled`]'s row count.
 #[derive(Debug, Default)]
-pub struct LiveCache(RwLock<Option<CachedRender>>);
+pub struct LiveCache(RwLock<LiveCacheState>);
+
+#[derive(Debug, Default)]
+struct LiveCacheState {
+    render: Option<CachedRender>,
+    /// An `amend` can replace the text. Check its prefix before reusing rows.
+    amended: bool,
+}
 
 /// How many times a live re-render resumed from the cache. Test-only: whether a
 /// frame rendered one line or the whole answer cannot be seen in its output,
@@ -346,11 +352,8 @@ struct CachedRender {
     /// answer". **No palette** — colour is not decided here (see [`ShapeCaps`]),
     /// so a theme change does not walk into this branch.
     key: (u16, ShapeCaps),
-    /// Identity of the content this render describes. A replaced content (an
-    /// `amend`) is a different allocation, so the cache rebuilds.
-    identity: usize,
-    /// The raw growing text as of the last render. The next render appends only
-    /// the new suffix; it never copies the whole reply.
+    /// The raw text from the last render. A valid extension appends its suffix.
+    /// An edit rebuilds the cache.
     raw: String,
     /// The display view within `raw`: outer blank lines trimmed.
     trim: GrowingTrim,
@@ -518,23 +521,18 @@ impl Slot {
                     return (lines.len(), Some(Arc::new(lines)));
                 };
                 let width = ctx.width;
-                let identity = Arc::as_ptr(&b.content) as *const () as usize;
                 let mut cached = cache.0.write().expect("live cache poisoned");
                 let base = Style::new();
                 let mut resumed = None;
-                if let Some(mut c) = cached.take() {
+                if let Some(mut c) = cached.render.take() {
                     if c.key == (width, ctx.caps) && text.len() >= c.raw.len() {
-                        // The same allocation can only have grown. A different
-                        // allocation (an `amend`) still reuses the cache when
-                        // the new text extends what it described; that check
-                        // reads the prefix, so it runs only for an `amend`,
-                        // never for a streamed delta.
+                        // An append keeps the prefix. An amend can replace it,
+                        // even when an allocator reuses the old address.
                         let extends =
-                            c.identity == identity || text.as_bytes().starts_with(c.raw.as_bytes());
+                            !cached.amended || text.as_bytes().starts_with(c.raw.as_bytes());
                         if extends {
                             #[cfg(test)]
                             LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
-                            c.identity = identity;
                             let delta = &text[c.raw.len()..];
                             c.raw.push_str(delta);
                             let had_start = c.trim.start;
@@ -595,7 +593,6 @@ impl Slot {
                         };
                         CachedRender {
                             key: (width, ctx.caps),
-                            identity,
                             raw: text.to_string(),
                             trim,
                             lines: Arc::new(lines),
@@ -605,7 +602,8 @@ impl Slot {
                     }
                 };
                 let lines = Arc::clone(&rendered.lines);
-                *cached = Some(rendered);
+                cached.render = Some(rendered);
+                cached.amended = false;
                 let n = lines.len();
                 (n, Some(lines))
             }
@@ -875,9 +873,10 @@ impl StreamWriter<'_> {
     /// producer. `false` if it has settled, does not exist, or is someone
     /// else's — never a panic, and never a silent write to a frozen block.
     pub fn amend(&mut self, id: BlockId, content: Arc<dyn Content>) -> bool {
-        let Some(Slot::Live(block, _)) = self.stream.live_at(id, self.producer) else {
+        let Some(Slot::Live(block, cache)) = self.stream.live_at(id, self.producer) else {
             return false;
         };
+        cache.0.write().expect("live cache poisoned").amended = true;
         block.content = content;
         true
     }
@@ -1349,6 +1348,28 @@ mod tests {
             *lines.unwrap(),
             crate::markdown::render("a completely different answer", 30, Style::new())
         );
+    }
+
+    #[test]
+    fn two_amends_without_a_render_recheck_the_cached_prefix() {
+        let _alone = live_alone();
+        let ctx = RenderCtx::bare(30);
+        for (first, last) in [("first answer\n", "another answer\n"), ("é\n", "αβ\n")] {
+            let mut stream = Stream::new();
+            let id = stream.writer("model").open(Coord::new(1, 1), grew(first));
+            stream.get(id).unwrap().rows_at(&ctx);
+
+            stream.writer("model").amend(id, grew("intermediate\n"));
+            stream.writer("model").amend(id, grew(last));
+
+            LIVE_RESUMES.store(0, At::Relaxed);
+            let (_, lines) = stream.get(id).unwrap().rows_at(&ctx);
+            assert_eq!(resumes(), 0, "a replacement cannot reuse old rows");
+            assert_eq!(
+                *lines.unwrap(),
+                crate::markdown::render(last.trim_end(), 30, Style::new())
+            );
+        }
     }
 
     #[test]
