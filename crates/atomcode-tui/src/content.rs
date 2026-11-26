@@ -1151,7 +1151,7 @@ pub struct ModelSaid(pub String);
 
 impl ModelSaid {
     /// Remove only outer blank lines, preserving indentation and Markdown spaces.
-    fn display_text(&self) -> &str {
+    pub(crate) fn display_text(&self) -> &str {
         let mut offset = 0;
         let mut start = None;
         let mut end = 0;
@@ -1188,9 +1188,16 @@ impl Content for ModelSaid {
             crate::markdown::render(text, w, Style::new())
         }
     }
+    fn growing_raw(&self) -> Option<&str> {
+        (!self.0.is_empty()).then_some(&self.0)
+    }
     fn growing_text(&self) -> Option<&str> {
         let text = self.display_text();
         (!text.is_empty()).then_some(text)
+    }
+    fn append(&mut self, delta: &str) -> bool {
+        self.0.push_str(delta);
+        true
     }
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
@@ -1215,6 +1222,10 @@ impl Content for ModelThought {
     }
     fn content_hash(&self) -> ContentHash {
         hash_of(&["reasoning", &self.0])
+    }
+    fn append(&mut self, delta: &str) -> bool {
+        self.0.push_str(delta);
+        true
     }
     /// Open, the lid stays on top: `⎿ thought, N lines  点击收起`, then the
     /// thought. The lid is how the thought was opened and it is still the thing
