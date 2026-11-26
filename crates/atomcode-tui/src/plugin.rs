@@ -1312,10 +1312,13 @@ async fn answer_prompts(
 /// The least time between two questions about the allowance.
 ///
 /// The question costs a round trip on the account, so it is asked after a
-/// turn — and only then: the one immediate recheck a turn can trigger fires
-/// while the row already shows a badge that has hit 100% (the first sign of
-/// an early reset), not for a fresh or unrendered figure. Questions are held
-/// off for this long. The number is the one `atomcode-tuix` settled on.
+/// turn — or, on an idle heartbeat, while the row actually shows a badge at
+/// or past the near threshold (the idle re-ask that lets a mid-window
+/// refresh reach the row). The one immediate recheck a turn can trigger
+/// fires while the row already shows a badge that has hit 100% (the first
+/// sign of an early reset), not for a fresh or unrendered figure. Questions
+/// are held off for this long. The number is the one `atomcode-tuix` settled
+/// on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
@@ -1922,7 +1925,9 @@ pub struct Tui {
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// When the allowance was last asked about and whether it was a forced
-    /// refresh after a successful turn with a full quota badge.
+    /// refresh after a successful turn with a full quota badge. The idle
+    /// heartbeat's re-ask (while a badge is on the row) goes through the
+    /// same throttle, so this timestamp covers both askers.
     allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
     /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,

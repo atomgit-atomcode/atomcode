@@ -1088,6 +1088,27 @@ mod tests {
             "a countdown is still something to say about when"
         );
 
+        // The boundary: the instant the window turns over the figure is about
+        // a window that no longer exists, so the row says nothing — exactly
+        // `resets_by == now`, not just past it.
+        let boundary = crate::moment::Allowance {
+            label: "5 小时".into(),
+            percent: 90,
+            resets_at: String::new(),
+            resets_by: Some(crate::moment::Timestamp::millis(3_600_000)),
+        };
+        let at_the_instant = crate::moment::Timestamp::millis(3_600_000);
+        assert_eq!(
+            allowance_badge(&boundary, at_the_instant),
+            None,
+            "resets_by == now is a window already gone"
+        );
+        let one_milli_left = crate::moment::Timestamp::millis(3_599_999);
+        assert!(
+            allowance_badge(&boundary, one_milli_left).is_some(),
+            "one milli before the boundary the badge is still on the row"
+        );
+
         // Spent is still said — it is the one figure that changes what happens
         // next. The colour is the row's business; the words are the same.
         assert_eq!(
