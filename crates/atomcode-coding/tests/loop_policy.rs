@@ -1524,3 +1524,46 @@ async fn a_second_session_still_gets_its_own_attempt() {
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
+
+/// Each agent's repeats are its own. Two agents on one tree — a lead and its
+/// members, or a parent and a `task` child — share both guards, and a count or
+/// a trip that is not keyed by session lets one agent's calls stop another's
+/// turn.
+#[tokio::test]
+async fn one_agents_repeats_never_stop_another_agents_turn() {
+    for guard in ["tool-loop-guard", "repeat-fuse"] {
+        let dir = scratch("per-agent-guard");
+        std::fs::write(dir.join("a.txt"), "same content every time").unwrap();
+        let call = r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+        let script = format!(
+            "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [{call}, {call}, {{ text = \"first done\" }}, {call}, {call}, {{ text = \"second done\" }}] }}"
+        );
+        let (other, limits) = if guard == "tool-loop-guard" {
+            ("repeat-fuse", "warn_after = 2, stop_after = 3")
+        } else {
+            (
+                "tool-loop-guard",
+                "nudge_at = 2, stop_at = 3, poll_after_secs = 0",
+            )
+        };
+        let rows = format!(
+            "[[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = 20 }}\n\n\
+             [[remove]]\nid = \"{other}\"\n\n\
+             [[patch]]\nid = \"{guard}\"\nconfig = {{ {limits} }}"
+        );
+        let app = start(tree(&dir, &script, &[&rows])).await;
+        let first = atomcode_harness::create_agent(&app).await.unwrap();
+        let second = atomcode_harness::create_agent(&app).await.unwrap();
+        first.send("go");
+        let outcome = atomcode_harness::drive(&app, &first).await.unwrap();
+        assert_ne!(outcome.stop, StopReason::ToolLoopDetected, "guard {guard}");
+        second.send("go");
+        let outcome = atomcode_harness::drive(&app, &second).await.unwrap();
+        assert_ne!(
+            outcome.stop,
+            StopReason::ToolLoopDetected,
+            "guard {guard}: the second agent repeated twice, under the limit of three"
+        );
+        assert_eq!(outcome.text, "second done", "guard {guard}");
+    }
+}
