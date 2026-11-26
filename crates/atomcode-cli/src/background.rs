@@ -449,6 +449,9 @@ struct SettleEntry {
     /// 收下了 —— 同一段对话第二次委派时,第一次的旧注入事实不能把它提前标成
     /// [`Mark::Home`](issue #1821 #1)。
     baseline_seq: u64,
+    /// 上一次检查时 home 日志的末 seq。事件到达时先比这一条:日志没有新事实,就
+    /// 不必从 `baseline_seq` 反向扫一遍(issue #1821 #13)。
+    seen_seq: u64,
     /// 到这个时刻(unix 毫秒)还没收下就放弃:结果没投进,会话仍该可恢复。
     deadline: u64,
 }
@@ -810,6 +813,20 @@ fn one_line(text: &str) -> Option<String> {
 /// `running_at`:还在跑时的此刻(unix 毫秒)。那时用时量到此刻,而不是最后一条事实 ——
 /// 模型安静地想一分钟,面板上的用时不该停在一分钟前。
 impl LogSummary {
+    /// 复位日志派生的一半,只把只来自运行时事件的字段搬回来。
+    ///
+    /// `pending`/`error` 不是日志里的事实:提问(与它的回答)只在提问那一刻发一次,
+    /// 重订阅不会再补发,日志里也没有对应记录。清掉就再也补不回来 —— 提问侧还挂在
+    /// `rx` 上,面板却从 `Waiting` 掉回 `Running`,`question()`/`answer()` 再也取不回
+    /// 那个请求。日志那一半由随后的 seed/增量重建(issue #1821 #12)。
+    fn reset_log_derived(&mut self) {
+        let pending = self.pending.take();
+        let error = self.error.take();
+        *self = Self::default();
+        self.pending = pending;
+        self.error = error;
+    }
+
     /// 折进日志里的一条事实:计一条,再按它改字段。seed 与增量都走这里,所以两条
     /// 路径不可能各说一套(issue #1821 #12)。
     fn absorb_logged(&mut self, logged: &LoggedEvent) -> bool {
@@ -900,8 +917,11 @@ impl LogSummary {
                 true
             }
             AgentEvent::Error { message, .. } => {
+                // 这一行确实会变:phase 已经落 `Failed`,没有 `TurnComplete` 的收尾
+                // 路径(重配回滚失败、恢复持久化失败、fail-close)不会再有第二条事件
+                // 来说它,不在这里要重画,面板要等下一条无关 announce 才播。
                 self.error = Some(message.clone());
-                false
+                true
             }
             _ => false,
         }
@@ -951,7 +971,8 @@ impl LogProjection {
 
     /// 从一份已有的日志建投影:与之后的增量走同一个 [`Self::absorb`]。
     fn seed(&mut self, log: &Arc<SessionLog>) {
-        self.summary = LogSummary::default();
+        // 日志这一半整份重建,只在运行时事件里的字段不跟着走。
+        self.summary.reset_log_derived();
         let last = log.read_events(|events| {
             for logged in events {
                 self.absorb(Observed::Logged(logged));
@@ -968,14 +989,19 @@ impl LogProjection {
     /// 一个 `absorb`,所以 seed 与增量等值。
     fn update(&mut self, log: Option<Arc<SessionLog>>) {
         let Some(log) = log else {
-            *self = Self::default();
+            // 日志暂时读不到(App 正在重建、`Feed` 还没找到这个会话):不复位,也不折
+            // 事实。`pending`/`error` 不在日志里,清掉就再也补不回来(提问侧还挂在
+            // `rx` 上,面板却从 `Waiting` 掉回 `Running`);`cursor` 留着,日志回到同一份
+            // `Arc` 时按 `seen` 续读,重建期间新增的事实一条不落,已折过的字段也不会
+            // 因为「只折新增」而永久空着(issue #1821 #12)。
             return;
         };
         // 借出两个字段:`read_new` 握着 `cursor`,折事实的那半边只能碰 `summary`。
         let Self { cursor, summary } = self;
         cursor.read_new(&log, |reset, events| {
             if reset {
-                *summary = LogSummary::default();
+                // 换了日志(或 seq 倒退):日志那一半从头重建,只把不在日志里的字段搬回来。
+                summary.reset_log_derived();
             }
             for logged in events {
                 summary.absorb_logged(logged);
@@ -1257,18 +1283,32 @@ impl Background {
         let Some(home) = handle else { return };
         // 投递前 home 日志的末 seq:只有它之后的事实才算这一次收下了。同一段对话
         // 第二次委派时,第一次的旧注入事实不能把它提前标成 `Mark::Home`(#1)。
-        let baseline_seq = session_log(&home).map_or(0, |log| log.last_seq());
-        if matches!(*mark.lock().expect("mark poisoned"), Mark::Pending(_)) {
-            let mut settling = self.settling.lock().expect("settling poisoned");
-            settling.insert(
-                sender.clone(),
-                SettleEntry {
-                    mark: mark.clone(),
-                    home: home.clone(),
-                    baseline_seq,
-                    deadline: now_ms().saturating_add(SETTLE_BUDGET_MS),
-                },
-            );
+        //
+        // 日志此刻读不到(App 正在重建、`Feed` 还没找到这个会话)就**不登记**:下界
+        // 退化成 0 会把整份 home 日志放进匹配范围,上一次委派留下的旧注入事实会被
+        // 算作这次「收下了」,会话随即被隐藏。宁可在退出/恢复里多留一条,也不把没
+        // 确认收下的结果标成 `Mark::Home`。
+        match session_log(&home).map(|log| log.last_seq()) {
+            Some(baseline_seq) => {
+                if matches!(*mark.lock().expect("mark poisoned"), Mark::Pending(_)) {
+                    let mut settling = self.settling.lock().expect("settling poisoned");
+                    settling.insert(
+                        sender.clone(),
+                        SettleEntry {
+                            mark: mark.clone(),
+                            home: home.clone(),
+                            baseline_seq,
+                            seen_seq: baseline_seq,
+                            deadline: now_ms().saturating_add(SETTLE_BUDGET_MS),
+                        },
+                    );
+                }
+            }
+            None => tracing::debug!(
+                origin = %origin,
+                from = %sender,
+                "home log unreadable at delivery: not watching for a settle"
+            ),
         }
         let handle = home.runtime().clone();
         let me = self.me.clone();
@@ -1364,7 +1404,7 @@ impl Background {
     /// 一条投递现在收下了没有。收下 → 标 [`Mark::Home`] 并摘除;home 没了或预算
     /// 耗尽 → 摘除,结果仍可恢复。
     fn settle_sender(&self, sender: &str) {
-        let (mark, home, baseline_seq) = {
+        let (mark, home, baseline_seq, seen_seq) = {
             let mut settling = self.settling.lock().expect("settling poisoned");
             let Some(entry) = settling.get(sender) else {
                 return;
@@ -1373,19 +1413,41 @@ impl Background {
                 settling.remove(sender);
                 return;
             }
-            (entry.mark.clone(), entry.home.clone(), entry.baseline_seq)
+            (
+                entry.mark.clone(),
+                entry.home.clone(),
+                entry.baseline_seq,
+                entry.seen_seq,
+            )
         };
-        let received = session_log(&home).is_some_and(|log| {
-            log.read_events(|events| holds_note_from(events, sender, baseline_seq))
-        });
-        if received {
+        let Some(log) = session_log(&home) else {
+            // A retired home cannot add another fact: stop watching, leave the result
+            // recoverable rather than marking an undelivered one as received.
+            if home.runtime().is_stopped() || home.front_end().app().is_none() {
+                self.remove_settle(sender);
+            }
+            return;
+        };
+        let last = log.last_seq();
+        // 日志没有新事实就不必反向扫:事件到达时每条登记项只是比一次 seq,与等待的
+        // 条数和日志长度都无关(issue #1821 #13)。
+        if last > seen_seq
+            && log.read_events(|events| holds_note_from(events, sender, baseline_seq))
+        {
             came_home_now(&mark, sender);
             self.remove_settle(sender);
             return;
         }
-        // A retired home cannot add another fact: stop watching, leave the result
-        // recoverable rather than marking an undelivered one as received.
-        if home.runtime().is_stopped() || home.front_end().app().is_none() {
+        if let Some(entry) = self
+            .settling
+            .lock()
+            .expect("settling poisoned")
+            .get_mut(sender)
+        {
+            entry.seen_seq = entry.seen_seq.max(last);
+        }
+        // 退役的 home 不会再添事实:停止观察,结果仍可恢复。
+        if home.runtime().is_stopped() {
             self.remove_settle(sender);
         }
     }
@@ -2497,6 +2559,15 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
 mod tests {
     use super::*;
 
+    /// 一份把时间钉住的日志:`append` 与 `record` 盖出的 `at` 都不变,断言 `stats` 的
+    /// `elapsed_ms` 才不是看运气(两条日志各记一遍同一批事实时,真实时钟会差几毫秒)。
+    fn stamped_log(id: &str) -> Arc<SessionLog> {
+        Arc::new(SessionLog::with_clock(
+            atomcode_kernel::session::SessionHeader::new(id),
+            Arc::new(atomcode_kernel::clock::FixedWallClock(1_700_000_000_000)),
+        ))
+    }
+
     /// Chunks leaving the log between two reads move later facts to lower
     /// positions; the cursor still hands over each new fact exactly once.
     #[test]
@@ -3064,14 +3135,14 @@ mod tests {
             usage(50, 0),
         ];
 
-        let full = Arc::new(SessionLog::new("seed-equal"));
+        let full = stamped_log("seed-equal");
         for event in &events {
             full.append(event.clone());
         }
         let mut seeded = LogProjection::default();
         seeded.seed(&full);
 
-        let incremental_log = Arc::new(SessionLog::new("seed-equal"));
+        let incremental_log = stamped_log("seed-equal");
         let mut incremental = LogProjection::default();
         for event in &events {
             incremental_log.append(event.clone());
@@ -3145,7 +3216,7 @@ mod tests {
             },
         ];
 
-        let full = Arc::new(SessionLog::new("fact-once"));
+        let full = stamped_log("fact-once");
         for event in &events {
             full.append(event.clone());
         }
@@ -3154,7 +3225,7 @@ mod tests {
 
         // 混合喂养:每条事实先在通道上到一次(订阅重放或新提交),再由日志增量折
         // 一次 —— 这正是会话在前台被订阅期间发生的事。
-        let mixed_log = Arc::new(SessionLog::new("fact-once"));
+        let mixed_log = stamped_log("fact-once");
         let mut mixed = LogProjection::default();
         for event in &events {
             let (seq, at) = mixed_log.record(event.clone());
@@ -3183,6 +3254,148 @@ mod tests {
             format!("{:?}", mixed.summary.ended),
             format!("{:?}", seeded.summary.ended)
         );
+    }
+
+    /// 日志暂时读不到(App 正在重建、`Feed` 还没找到这个会话)时,`update(None)` 不能把
+    /// 只来自运行时事件的字段一起清掉:提问不在日志里,重订阅也不会再补发。日志回来
+    /// 时按 `seen` 续读 —— 重建期间新增的事实一条不落,已折过的字段也不会空着。
+    #[test]
+    fn an_unreadable_log_keeps_the_request_only_the_runtime_knows() {
+        let log = stamped_log("keeps-pending");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "  first words  ".into(),
+            images: vec![],
+        });
+        log.append(SessionEvent::StepEnd {
+            turn: 1,
+            step: 1,
+            tool_calls: 3,
+        });
+        let mut projection = LogProjection::default();
+        projection.update(Some(log.clone()));
+        projection.absorb(Observed::Live(&AgentEvent::Request {
+            id: 7,
+            kind: "approval".into(),
+            payload: serde_json::Value::Null,
+        }));
+
+        // App 正在重建:日志读不到。
+        projection.update(None);
+        assert!(
+            matches!(
+                &projection.summary.pending,
+                Some(AgentEvent::Request { id: 7, .. })
+            ),
+            "a request that never reaches the log must survive an unreadable log"
+        );
+        assert_eq!(
+            projection.summary.first_user.as_deref(),
+            Some("first words"),
+            "the log half is still the last thing the log said"
+        );
+
+        // 重建期间日志又长了一条:回来时把它折进来,已折过的不重复。
+        log.append(SessionEvent::StepEnd {
+            turn: 1,
+            step: 2,
+            tool_calls: 2,
+        });
+        projection.update(Some(log.clone()));
+        let mut seeded = LogProjection::default();
+        seeded.seed(&log);
+        assert_eq!(projection.summary.len, seeded.summary.len);
+        assert_eq!(
+            projection.summary.stats(None),
+            seeded.summary.stats(None),
+            "the facts that arrived while the log was unreadable are folded once, not lost"
+        );
+        assert!(projection.summary.has_user_message);
+        assert!(projection.summary.pending.is_some());
+    }
+
+    /// 换了日志(重建后的 App 拿来另一份,`read_new` 判 reset)时,日志那一半从头重建,
+    /// 只来自运行时事件的 `pending`/`error` 仍要在 —— 它们同样补不回来。
+    #[test]
+    fn a_reset_log_rebuilds_the_log_half_and_keeps_the_runtime_half() {
+        let old = stamped_log("reset");
+        old.append(SessionEvent::TurnStart { turn: 1 });
+        old.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "old words".into(),
+            images: vec![],
+        });
+        old.append(SessionEvent::StepEnd {
+            turn: 1,
+            step: 1,
+            tool_calls: 3,
+        });
+        let mut projection = LogProjection::default();
+        projection.update(Some(old.clone()));
+        projection.absorb(Observed::Live(&AgentEvent::Request {
+            id: 9,
+            kind: "question".into(),
+            payload: serde_json::Value::Null,
+        }));
+        projection.absorb(Observed::Live(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        }));
+        assert_eq!(projection.summary.steps, 1);
+
+        let rebuilt = stamped_log("reset");
+        rebuilt.append(SessionEvent::UserMessage {
+            turn: 2,
+            text: "rebuilt words".into(),
+            images: vec![],
+        });
+        rebuilt.append(SessionEvent::StepEnd {
+            turn: 2,
+            step: 1,
+            tool_calls: 1,
+        });
+        projection.update(Some(rebuilt.clone()));
+
+        assert!(
+            matches!(
+                &projection.summary.pending,
+                Some(AgentEvent::Request { id: 9, .. })
+            ),
+            "a reset rebuilds the log half, not the request"
+        );
+        assert_eq!(projection.summary.error.as_deref(), Some("provider died"));
+        assert_eq!(
+            projection.summary.first_user.as_deref(),
+            Some("rebuilt words"),
+            "the log half comes from the log that is there now"
+        );
+        assert_eq!(projection.summary.len, 2);
+        assert_eq!((projection.summary.steps, projection.summary.tools), (1, 1));
+        let mut seeded = LogProjection::default();
+        seeded.seed(&rebuilt);
+        assert_eq!(projection.summary.stats(None), seeded.summary.stats(None));
+        assert!(projection.summary.has_user_message);
+    }
+
+    /// 审查 Low:`saw(AgentEvent::Error)` 改写了面板那一行,就要说「会变」——
+    /// 没有 `TurnComplete` 的收尾路径不会再有第二条事件来播它。
+    #[test]
+    fn an_error_asks_for_the_panel_line_to_be_repainted() {
+        let mut summary = LogSummary::default();
+        assert!(summary.saw(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: Some(500),
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: true,
+        }));
+        assert_eq!(summary.error.as_deref(), Some("provider died"));
     }
 
     /// #23: `(stopped, phase, ended, pending)` 的每种组合都有明确答案。
