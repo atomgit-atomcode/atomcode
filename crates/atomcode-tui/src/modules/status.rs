@@ -657,15 +657,24 @@ const ALLOWANCE_SPENT: u8 = 95;
 /// was left when the host answered. Past it the window has turned over and the
 /// figure is about a window that no longer exists, so the row says nothing
 /// rather than "90%" of an allowance that is back to full.
+/// Whether the badge is on the row right now — the cheap form of
+/// [`allowance_badge`], for callers that only need the visibility judgment
+/// and would otherwise build a string every heartbeat just to ask.
+pub(crate) fn badge_visible(
+    left: &crate::moment::Allowance,
+    now: crate::moment::Timestamp,
+) -> bool {
+    left.percent >= ALLOWANCE_NEAR && !left.resets_by.is_some_and(|by| by <= now)
+}
+
 pub(crate) fn allowance_badge(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
 ) -> Option<String> {
-    if left.percent < ALLOWANCE_NEAR {
+    if !badge_visible(left, now) {
         return None;
     }
     let remaining = match left.resets_by {
-        Some(by) if by <= now => return None,
         Some(by) => (by.as_millis() - now.as_millis()).div_ceil(1000),
         None => 0,
     };
