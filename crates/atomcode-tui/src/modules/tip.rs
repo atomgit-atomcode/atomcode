@@ -102,7 +102,16 @@ fn goal_duration(
     if goal.paused.is_none() {
         ms = ms.saturating_add(moment.now.as_millis().saturating_sub(since.as_millis()));
     }
-    Some(crate::text::compact_duration(ms))
+    let secs = ms / 1_000;
+    if secs < 3_600 {
+        return Some(crate::text::compact_duration(ms));
+    }
+    Some(format!(
+        "{}h {:02}m {:02}s",
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60
+    ))
 }
 
 impl View for Tip {
@@ -192,7 +201,7 @@ impl View for Tip {
                             Some(duration) => format!("Goal paused · {duration} · /goal report"),
                             None => paused_bare.to_owned(),
                         },
-                        Some(paused_bare.to_owned()),
+                        Some(paused_bare),
                         Role::Warning,
                     )
                 } else if goal.recovering {
@@ -238,7 +247,7 @@ impl View for Tip {
                             Some(duration) => format!("Goal continuing · {duration}"),
                             None => "Goal continuing".to_owned(),
                         },
-                        Some("Goal continuing".to_owned()),
+                        Some("Goal continuing"),
                         Role::Accent,
                     )
                 } else {
@@ -247,7 +256,7 @@ impl View for Tip {
                             Some(duration) => format!("Goal active · {duration}"),
                             None => "Goal active".to_owned(),
                         },
-                        Some("Goal active".to_owned()),
+                        Some("Goal active"),
                         Role::Accent,
                     )
                 };
@@ -262,13 +271,10 @@ impl View for Tip {
                 // at 27–34 columns a paused goal keeps `/goal report` instead of
                 // losing it to the clock. Only a row too narrow for the bare
                 // badge falls back to the short form.
-                let bare_width = bare.as_ref().map_or_else(
-                    || crate::width::str_width(&label),
-                    |bare| crate::width::str_width(bare),
-                );
+                let bare = bare.filter(|bare| crate::width::str_width(bare) <= available);
                 if crate::width::str_width(&label) > available {
-                    if let Some(bare) = bare.as_ref() {
-                        label = bare.clone();
+                    if let Some(bare) = bare {
+                        label = bare.to_owned();
                     }
                 }
                 if crate::width::str_width(&label) > available {
@@ -289,12 +295,20 @@ impl View for Tip {
                 }
                 // A quiet, wide row can keep goal state on the left and the
                 // restart reminder on the right. Narrow rows preserve the goal.
-                // The reminder is budgeted against the badge without its clock,
-                // so a running goal's ticking cannot take it off the row.
+                // Fit both labels before composing the tip. Use the badge
+                // without its clock when only that version fits beside the
+                // reminder, so truncation cannot cut into the goal status.
                 if quiet {
-                    if let Some(hint) = restart
-                        .filter(|hint| crate::width::str_width(hint) + bare_width + 1 <= available)
-                    {
+                    if let Some(hint) = restart.filter(|hint| {
+                        crate::width::str_width(hint)
+                            + crate::width::str_width(bare.unwrap_or(&label))
+                            + 1
+                            <= available
+                    }) {
+                        let room = available - crate::width::str_width(hint) - 1;
+                        if crate::width::str_width(&label) > room {
+                            label = bare.unwrap_or(&label).to_owned();
+                        }
                         text = if text.is_empty() {
                             label
                         } else {
@@ -585,11 +599,27 @@ mod tests {
         goal.paused = None;
         goal.elapsed_secs = 62;
         m.autonomy = Some(goal.clone());
-        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (goal.clone(), m.now));
         m.now = Timestamp::millis(22_000);
         assert!(draw_at(&m, 100, 1)[0]
             .plain()
             .contains("Goal active · 1m03s"));
+
+        goal.elapsed_secs = 3_599;
+        m.autonomy = Some(goal.clone());
+        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 59m59s"));
+        m.now = Timestamp::millis(23_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1h 00m 00s"));
+        m.now = Timestamp::millis(24_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1h 00m 01s"));
     }
 
     #[test]
@@ -677,12 +707,31 @@ mod tests {
             restart_hint: Some("restart to apply".into()),
             ..Moment::default()
         };
-        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (goal.clone(), m.now));
         // 29..=35 columns: the bare badge plus the reminder still fit.
         let line = draw_at(&m, 30, 1)[0].plain();
         assert!(line.ends_with("restart to apply"), "{line:?}");
         assert!(line.contains("Goal active"), "{line:?}");
+        assert!(!line.contains('·'), "{line:?}");
         assert!(crate::width::str_width(&line) <= 30, "{line:?}");
+
+        let mut goal = goal;
+        goal.paused = Some("pause".into());
+        m.autonomy = Some(goal.clone());
+        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        let narrow = draw_at(&m, 47, 1)[0].plain();
+        assert!(
+            narrow.starts_with("Goal paused · /goal report"),
+            "{narrow:?}"
+        );
+        assert!(narrow.ends_with("restart to apply"), "{narrow:?}");
+        let wide = draw_at(&m, 70, 1)[0].plain();
+        assert!(
+            wide.starts_with("Goal paused · 1m01s · /goal report"),
+            "{wide:?}"
+        );
+        assert!(wide.ends_with("restart to apply"), "{wide:?}");
     }
 
     #[test]
