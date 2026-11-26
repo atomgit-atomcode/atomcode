@@ -2351,11 +2351,6 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb_logged(&self, logged: &LoggedEvent) {
-        self.absorb_logged_with_members(logged, 0);
-    }
-
-    /// Live-only context, captured before immutable transcript blocks are emitted.
-    pub fn absorb_logged_with_members(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         {
             let mut m = self.moment.write().expect("moment poisoned");
@@ -2433,7 +2428,7 @@ impl Host {
         // result landing on that lid can still change how many rows the lid
         // draws, since it carries the result (`summary_lines`).
         self.pinned(true, || {
-            self.fold(logged, members_working);
+            self.fold(logged);
         });
     }
 
@@ -2442,7 +2437,7 @@ impl Host {
     ///
     /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
     /// "measure, change, measure again", and the change is this.
-    fn fold(&self, logged: &LoggedEvent, members_working: usize) {
+    fn fold(&self, logged: &LoggedEvent) {
         let fact = &logged.event;
         // What this fold appended, as the blocks themselves: a fact may open
         // several at once (one per tool call in a message), and each of them is a
@@ -2454,10 +2449,7 @@ impl Host {
             let before = stream.len();
             let dir = self.session_dir.read().expect("dir poisoned").clone();
             for p in self.modules.producers() {
-                let mut w = stream
-                    .writer(p.id())
-                    .in_dir(dir.clone())
-                    .with_members_working(members_working);
+                let mut w = stream.writer(p.id()).in_dir(dir.clone());
                 p.absorb(logged, &mut w);
             }
             for slot in &stream.slots()[before..] {
@@ -14168,22 +14160,38 @@ mod tests {
     }
 
     #[test]
-    fn live_turn_end_captures_member_work_without_rewriting_history() {
+    fn a_clean_turn_ends_normally_while_the_live_line_waits_for_members() {
         use crate::block::RenderCtx;
         use crate::i18n::{t, Msg};
+        use crate::modules::live;
         let h = host();
-        h.absorb(&SessionEvent::TurnStart { turn: 1 });
-        let end = LoggedEvent {
-            seq: 2,
-            at: 0,
-            event: SessionEvent::TurnEnd {
-                turn: 1,
-                stop: atomcode_harness::seams::StopReason::Stopped,
-                error: None,
-            },
+        h.modules
+            .add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        {
+            let mut moment = h.moment.write().unwrap();
+            moment.lead = "lead".into();
+            moment.viewing = "lead".into();
+            moment.model = "test-model".into();
+            moment.members = vec![crate::moment::MemberNow {
+                activity: crate::moment::Activity::Working,
+                session: "lead/member".into(),
+                ..Default::default()
+            }];
+        }
+        let finish = |h: &Host| {
+            h.absorb(&SessionEvent::TurnStart { turn: 1 });
+            h.absorb_logged(&LoggedEvent {
+                seq: 2,
+                at: 0,
+                event: SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: atomcode_harness::seams::StopReason::Stopped,
+                    error: None,
+                },
+            });
         };
-        h.absorb_logged_with_members(&end, 2);
-        let endings = |h: &Host| -> Vec<String> {
+        let endings = |h: &Host| {
             h.stream
                 .read()
                 .unwrap()
@@ -14191,35 +14199,29 @@ mod tests {
                 .iter()
                 .filter(|slot| slot.block().kind() == "turn_end")
                 .flat_map(|slot| slot.block().content.lines(&RenderCtx::bare(160)))
-                .map(|line| line.plain())
-                .collect()
+                .collect::<Vec<_>>()
         };
-        let captured = endings(&h);
-        let expected = t(Msg::StopWithMembersRunning { n: 2 }).into_owned();
-        assert!(
-            captured.iter().any(|line| line.contains(&expected)),
-            "{captured:?}"
-        );
-        h.moment.write().unwrap().members.clear();
-        assert_eq!(endings(&h), captured, "settled history retains its meaning");
+        finish(&h);
         let replay = host();
-        replay.absorb(&SessionEvent::TurnStart { turn: 1 });
-        replay.absorb_logged(&end);
-        assert!(!endings(&replay).iter().any(|line| line.contains(&expected)));
-        let failed = host();
-        failed.absorb(&SessionEvent::TurnStart { turn: 1 });
-        failed.absorb_logged_with_members(
-            &LoggedEvent {
-                event: SessionEvent::TurnEnd {
-                    turn: 1,
-                    stop: atomcode_harness::seams::StopReason::ProviderError,
-                    error: Some("failure".into()),
-                },
-                ..end
-            },
-            2,
+        finish(&replay);
+        let ending = endings(&h);
+        assert_eq!(
+            ending,
+            endings(&replay),
+            "same text and style as an ordinary turn"
         );
-        assert!(!endings(&failed).iter().any(|line| line.contains(&expected)));
+        assert!(ending.iter().any(|line| line.plain().contains("✻ Done")));
+
+        let frame = h.compose((160, 24));
+        let waiting = t(Msg::LiveWaitingForMember { n: 1 });
+        let shows_waiting = |line: &Line| line.plain().contains(waiting.as_ref());
+        assert!(frame.part("live").unwrap().lines.iter().any(shows_waiting));
+        assert!(!frame
+            .part("status")
+            .unwrap()
+            .lines
+            .iter()
+            .any(shows_waiting));
     }
 
     #[test]

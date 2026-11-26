@@ -1234,7 +1234,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopAt { at } => format!("stopped {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-        Msg::StopWithMembersRunning { n } => format!("Turn ended · {n} sub-agents still working").into(),
         Msg::LiveWaitingForMember { n } => format!("Waiting for {n} sub-agents").into(),
         Msg::LiveStopping => "stopping".into(),
         Msg::LiveRecognizingImage => "recognizing image".into(),

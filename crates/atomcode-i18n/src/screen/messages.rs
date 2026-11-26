@@ -1848,9 +1848,6 @@ pub enum Msg<'a> {
     },
 
     // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-    StopWithMembersRunning {
-        n: usize,
-    },
     LiveWaitingForMember {
         n: usize,
     },

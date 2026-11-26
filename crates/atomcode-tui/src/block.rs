@@ -777,7 +777,6 @@ impl Stream {
             stream: self,
             producer,
             dir: None,
-            members_working: 0,
         }
     }
 }
@@ -794,20 +793,9 @@ pub struct StreamWriter<'a> {
     /// The directory the session works in, as the host answered it — `None`
     /// until it has (see [`StreamWriter::dir`]).
     dir: Option<Arc<str>>,
-    members_working: usize,
 }
 
 impl StreamWriter<'_> {
-    /// Live member count supplied by the host; replay defaults to zero.
-    pub fn with_members_working(mut self, n: usize) -> Self {
-        self.members_working = n;
-        self
-    }
-
-    pub fn members_working(&self) -> usize {
-        self.members_working
-    }
-
     /// The same writer, for a session the host says works in `dir`.
     pub fn in_dir(mut self, dir: Option<Arc<str>>) -> Self {
         self.dir = dir;
