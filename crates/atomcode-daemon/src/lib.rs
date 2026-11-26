@@ -433,6 +433,12 @@ pub struct SessionsByWorkingDirQuery {
 /// Request to create a new session
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Isolation: only effective when `working_dir` is absent — a new UUID is
+    /// generated and used as both the session id and the directory name under
+    /// the current project dir (`{project_dir}/{uuid}`, created if missing).
+    /// When `working_dir` is given, it is used as-is and this flag has no effect.
+    #[serde(default)]
+    pub isolated_workspace: bool,
     /// Optional working directory (uses current project dir if not provided)
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
@@ -3467,33 +3473,47 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // Determine working directory
-    let working_dir = match req.working_dir {
+    let (id, working_dir) = match req.working_dir {
         Some(dir) => {
             let mut proj = state.project.write().await;
             update_project_state(&mut proj, &dir);
-            dir
+            // An explicit working_dir is used as-is; isolated_workspace has no
+            // effect in this branch.
+            (uuid::Uuid::new_v4().to_string(), dir)
         }
         None => {
             // Use current project's working directory
             let project = state.project.read().await;
-            project.working_dir.clone()
+            if req.isolated_workspace {
+                // Isolated workspace without an explicit dir: the generated UUID
+                // is both the session id and the directory name under the
+                // current project dir ({project_dir}/{uuid}, created below if
+                // missing).
+                let id = uuid::Uuid::new_v4().to_string();
+                let dir = project.working_dir.join(&id);
+                (id, dir)
+            } else {
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    project.working_dir.clone(),
+                )
+            }
         }
     };
 
     // Ensure working directory exists
     if !working_dir.exists() {
-        // Create atomchat directory in user's home if default
-        let home = atomcode_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let atomchat_dir = home.join("atomchat");
-        if atomchat_dir.exists() || std::fs::create_dir_all(&atomchat_dir).is_ok() {
-            // Use atomchat directory as working dir
-        } else {
-            let msg = format!("Working directory does not exist: {:?}", working_dir);
-            return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
+        if let Err(error) = std::fs::create_dir_all(&working_dir) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(format!(
+                    "Failed to create working directory {working_dir:?}: {error}"
+                )),
+            )
+                .into_response();
         }
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
     let manager = atomcode_capabilities::session::SessionManager::for_project(
         &working_dir,
         &atomcode_coding::config::product_dirs_from_env(),
