@@ -238,6 +238,8 @@ impl LogCursor {
 struct LogProjection {
     cursor: LogCursor,
     summary: LogSummary,
+    /// 正在整份重建(`seed`)。只有这时日志侧 `TurnEnd` 的 `error` 才写成面板的错。
+    rebuilding: bool,
 }
 
 /// 一次要喂给投影的事实:日志里的一条,或运行时说出的一条。
@@ -830,15 +832,19 @@ impl LogSummary {
 
     /// 折进日志里的一条事实:计一条,再按它改字段。seed 与增量都走这里,所以两条
     /// 路径不可能各说一套(issue #1821 #12)。
-    fn absorb_logged(&mut self, logged: &LoggedEvent) -> bool {
+    ///
+    /// `rebuild`:这一批是不是 `seed` 的整份重建。日志侧的 `error` 只在这时写 ——
+    /// 增量折进来的一条 `TurnEnd` 可能早于运行时刚报的 `Error`(面板没开时日志只积
+    /// 不折),它说的不是「现在」。
+    fn absorb_logged(&mut self, logged: &LoggedEvent, rebuild: bool) -> bool {
         self.len += 1;
-        self.absorb_event(logged.at, &logged.event)
+        self.absorb_event(logged.at, &logged.event, rebuild)
     }
 
     /// 一条已提交的事实对面板那一行的影响,返回它会不会因此变。
     ///
     /// 事实的计数在 [`Self::absorb_logged`]:这里只管它改哪个字段。
-    fn absorb_event(&mut self, at: u64, event: &SessionEvent) -> bool {
+    fn absorb_event(&mut self, at: u64, event: &SessionEvent, rebuild: bool) -> bool {
         self.first_at.get_or_insert(at);
         self.last_at = at;
         match event {
@@ -860,7 +866,11 @@ impl LogSummary {
                 // `Stale`。回合结束该由运行时的 `saw(TurnComplete)` 说 —— 与
                 // `ended` 同一条路径(issue #1821 #24)。
                 self.ended = Some(ended_state(stop));
-                if error.is_some() {
+                if error.is_some() && rebuild {
+                    // 日志侧的 `error` 只在整份重建时写。增量折进来的这条 `TurnEnd`
+                    // 可能已经旧了 —— 面板关着时日志只积不折,运行时刚报的 `Error`
+                    // 先到,一次增量读上一回合的 `TurnEnd` 就把新错盖掉,那一行要等
+                    // 下一条无关 announce 才播,而新 `Error` 才是「现在这一回合失败了」。
                     self.error = error.clone();
                 }
                 true
@@ -974,7 +984,7 @@ impl LogProjection {
     /// (面板每秒都在读),所以这里也不必替它要一次重画。
     fn absorb(&mut self, observed: Observed<'_>) -> bool {
         match observed {
-            Observed::Logged(logged) => self.summary.absorb_logged(logged),
+            Observed::Logged(logged) => self.summary.absorb_logged(logged, self.rebuilding),
             Observed::Live(AgentEvent::Fact(_)) => false,
             Observed::Live(event) => self.summary.saw(event),
         }
@@ -984,12 +994,15 @@ impl LogProjection {
     fn seed(&mut self, log: &Arc<SessionLog>) {
         // 日志这一半整份重建,只在运行时事件里的字段不跟着走。
         self.summary.reset_log_derived();
+        // 整份重建:日志侧 `error` 在这里说这份日志最后的失败。
+        self.rebuilding = true;
         let last = log.read_events(|events| {
             for logged in events {
                 self.absorb(Observed::Logged(logged));
             }
             events.last().map_or(0, |logged| logged.seq)
         });
+        self.rebuilding = false;
         self.cursor = LogCursor {
             log: Arc::downgrade(log),
             seen: last,
@@ -1008,14 +1021,19 @@ impl LogProjection {
             return;
         };
         // 借出两个字段:`read_new` 握着 `cursor`,折事实的那半边只能碰 `summary`。
-        let Self { cursor, summary } = self;
+        let Self {
+            cursor, summary, ..
+        } = self;
         cursor.read_new(&log, |reset, events| {
             if reset {
                 // 换了日志(或 seq 倒退):日志那一半从头重建,只把不在日志里的字段搬回来。
                 summary.reset_log_derived();
             }
             for logged in events {
-                summary.absorb_logged(logged);
+                // `update` 折的是「日志里已有/新增的事实」,即便 `reset` 是整份重建,
+                // 这批事实也可能早于运行时刚报的 `Error`。日志侧的 `error` 只在
+                // `seed`(attach 时)写,这里一律不写。
+                summary.absorb_logged(logged, false);
             }
         });
     }
@@ -2794,6 +2812,7 @@ mod tests {
                 stop: StopReason::Stopped,
                 error: None,
             },
+            true,
         );
         assert_eq!(seeded.ended, Some(BackgroundState::Done));
     }
@@ -2801,7 +2820,7 @@ mod tests {
     fn stats_of(log: &[LoggedEvent], running_at: Option<u64>) -> Option<BackgroundStats> {
         let mut summary = LogSummary::default();
         for logged in log {
-            summary.absorb_event(logged.at, &logged.event);
+            summary.absorb_event(logged.at, &logged.event, false);
         }
         summary.stats(running_at)
     }
@@ -3024,6 +3043,50 @@ mod tests {
         // 日志那一半照旧折进来。
         assert_eq!(projection.summary.len, 3);
         assert_eq!(projection.summary.ended, None);
+    }
+
+    /// 同一类的另一条:日志里一条还没折进来的 `TurnEnd { error: Some }` 也不能盖掉
+    /// 运行时刚报上来的错 —— 面板关着时日志只积不折,这条 `TurnEnd` 说的是上一回合
+    /// 的旧错,运行时那条 `Error` 才是「现在这一回合失败了」(issue #1821 #24)。
+    /// 日志侧的 `error` 只该在整份重建(seed)时写。
+    #[test]
+    fn a_late_turn_end_does_not_drop_the_error_the_runtime_just_reported() {
+        let log = stamped_log("late-turn-end-error");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::ProviderError,
+            error: Some("old failure from the previous turn".into()),
+        });
+
+        let mut projection = LogProjection::default();
+        // 这条 `TurnEnd` 还没折进来,说的是过去;运行时先说了现在。
+        projection.absorb(Observed::Live(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        }));
+        projection.update(Some(log.clone()));
+
+        assert_eq!(
+            projection.summary.error.as_deref(),
+            Some("provider died"),
+            "a turn end folded late carries the previous turn's error, not the runtime's now"
+        );
+        // 日志那一半照旧折进来,旧回合的结局仍然分组。
+        assert_eq!(projection.summary.len, 2);
+        assert_eq!(projection.summary.ended, Some(BackgroundState::Failed));
+
+        // 整份重建时,日志侧 `error` 才代表这份日志最后的失败。
+        let mut seeded = LogProjection::default();
+        seeded.seed(&log);
+        assert_eq!(
+            seeded.summary.error.as_deref(),
+            Some("old failure from the previous turn")
+        );
     }
 
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。
