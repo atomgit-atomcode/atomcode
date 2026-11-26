@@ -1694,39 +1694,6 @@ impl Drop for McpReadFlight {
     }
 }
 
-/// Consecutive streamed deltas for the session on screen, not yet folded.
-///
-/// The transcript producer rebuilds its block content on every fact it folds
-/// (`ModelSaid(acc.clone())`), so folding each provider delta clones the whole
-/// reply: O(reply) copy per delta, O(reply²) over one answer. Appending a delta
-/// is all the producer does, and appending is order-preserving, so consecutive
-/// deltas of one `(session, turn, round, channel)` merge here and fold once —
-/// before the next fact or before the next frame, whichever comes first.
-struct PendingChunks {
-    session: String,
-    seq: SeqNo,
-    at: u64,
-    turn: u64,
-    round: u32,
-    reasoning: bool,
-    delta: String,
-}
-
-impl PendingChunks {
-    fn accepts(&self, committed: &Committed, turn: u64, round: u32, reasoning: bool) -> bool {
-        self.session == committed.session
-            && self.turn == turn
-            && self.round == round
-            && self.reasoning == reasoning
-    }
-
-    fn push(&mut self, committed: &Committed, delta: &str) {
-        self.delta.push_str(delta);
-        self.seq = committed.seq;
-        self.at = committed.at;
-    }
-}
-
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
     mcp_read: Mutex<Option<McpReadJob>>,
@@ -1789,9 +1756,6 @@ pub struct Tui {
     turn_began: Mutex<Option<std::time::Instant>>,
     away_this_turn: std::sync::atomic::AtomicBool,
     last_reply: Mutex<String>,
-    /// Consecutive streamed deltas waiting to be folded as one. See
-    /// [`PendingChunks`].
-    pending_chunks: Mutex<Option<PendingChunks>>,
     recaps: Arc<std::sync::atomic::AtomicU64>,
     /// The side call a recap is waiting on, aborted when it stops being wanted
     /// so a dropped recap is not one still paid for.
@@ -2450,10 +2414,6 @@ impl UserInterface for Tui {
                 }
             }
             if stale && !client.replaying() && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
-                // Fold the streamed run before the frame that shows it. With
-                // another fact in flight the fold happens there; with the
-                // stream quiet, this is the only place left.
-                self.flush_pending_chunks();
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
@@ -2726,7 +2686,6 @@ impl UserInterface for Tui {
                         self.away_this_turn.store(false, Ordering::SeqCst);
                         self.last_reply.lock().expect("reply poisoned").clear();
                         self.members.clear();
-                        self.discard_pending_chunks();
                         self.host.switch_session();
                         // `/cd` is a new session somewhere else: the status row,
                         // the welcome and the shell rows follow it there — asked
@@ -4472,9 +4431,6 @@ impl Tui {
             for event in page.events {
                 self.on_event(AgentEvent::Fact(Box::new(event)));
             }
-            // A page ends on its last fact; a streamed delta buffered there
-            // must fold before `high` jumps past it, or `keep` will reject it.
-            self.flush_pending_chunks();
             {
                 let mut views = self.client.view.lock().expect("client poisoned");
                 let view = views.sessions.get_mut(session).expect("checked session");
@@ -6904,10 +6860,6 @@ impl Tui {
     /// the screen emptied and drawn again from what is known of it, the input
     /// and the stream now its. `false` when it was already there.
     fn look_at(&self, session: &str) -> bool {
-        // The buffered deltas are in neither the host stream (about to be
-        // reset) nor the client history (only folded facts reach it). Fold
-        // them before the view changes, so coming back replays them.
-        self.flush_pending_chunks();
         let Some(known) = self.client.look_at(session) else {
             return false;
         };
@@ -7383,91 +7335,6 @@ impl Tui {
     /// does not: a streamed delta is in the transcript already, and this event
     /// is the same news in another shape, so a frame for it would recompose the
     /// picture that is already on the screen.
-    /// Merge one streamed delta into the pending run, or start a new run.
-    ///
-    /// A change of session, turn, round or channel folds the previous run
-    /// first. The producer appends, so merging is safe only within one run: a
-    /// run that spans a different channel is a different block.
-    fn buffer_chunk(&self, committed: &Committed) {
-        let atomcode_kernel::session::SessionEvent::AssistantChunk {
-            turn,
-            round,
-            delta,
-            reasoning,
-        } = &committed.event
-        else {
-            return;
-        };
-        let evicted = {
-            let mut pending = self.pending_chunks.lock().expect("pending chunks poisoned");
-            match pending.as_mut() {
-                Some(run) if run.accepts(committed, *turn, *round, *reasoning) => {
-                    run.push(committed, delta);
-                    None
-                }
-                _ => {
-                    let evicted = pending.take();
-                    *pending = Some(PendingChunks {
-                        session: committed.session.clone(),
-                        seq: committed.seq,
-                        at: committed.at,
-                        turn: *turn,
-                        round: *round,
-                        reasoning: *reasoning,
-                        delta: delta.clone(),
-                    });
-                    evicted
-                }
-            }
-        };
-        if let Some(evicted) = evicted {
-            self.fold_chunks(evicted);
-        }
-    }
-
-    /// Fold one merged run through the same road a single delta took.
-    fn fold_chunks(&self, run: PendingChunks) -> bool {
-        let committed = Committed {
-            session: run.session,
-            seq: run.seq,
-            at: run.at,
-            event: atomcode_kernel::session::SessionEvent::AssistantChunk {
-                turn: run.turn,
-                round: run.round,
-                delta: run.delta,
-                reasoning: run.reasoning,
-            },
-        };
-        if !self.client.keep(&committed) {
-            return false;
-        }
-        self.host.absorb_logged_with_members(&committed.logged(), 0);
-        true
-    }
-
-    /// Fold whatever a streaming run left pending. `true` when it drew
-    /// something. Called before the next non-stream event (so a message that
-    /// settles a block sees the deltas it settles) and before a frame.
-    fn flush_pending_chunks(&self) -> bool {
-        match self
-            .pending_chunks
-            .lock()
-            .expect("pending chunks poisoned")
-            .take()
-        {
-            Some(run) => self.fold_chunks(run),
-            None => false,
-        }
-    }
-
-    /// Drop a run whose block is about to disappear with its stream.
-    fn discard_pending_chunks(&self) {
-        self.pending_chunks
-            .lock()
-            .expect("pending chunks poisoned")
-            .take();
-    }
-
     fn on_event(&self, event: AgentEvent) -> bool {
         // Before anything else, and whoever is on screen: the arms below drop
         // the lead's turn events while a member is looked at.
@@ -7477,29 +7344,13 @@ impl Tui {
             }
             _ => false,
         };
-        // A streamed delta is merged, not folded; every other event must fold
-        // the run it interrupts first, so the block keeps the log's order (an
-        // `AssistantMessage` settles the text the deltas before it built).
-        let buffered = matches!(
-            &event,
-            AgentEvent::Fact(committed)
-                if matches!(
-                    committed.event,
-                    atomcode_kernel::session::SessionEvent::AssistantChunk { .. }
-                )
-        );
-        let flushed = if buffered {
-            false
-        } else {
-            self.flush_pending_chunks()
-        };
         let settled = self.settle_asks(&event);
         let changed = self.on_event_drawn(event);
         if replay_ended {
             self.host.moment.write().expect("moment poisoned").scroll =
                 crate::moment::ScrollPos::BOTTOM;
         }
-        changed || settled || replay_ended || flushed
+        changed || settled || replay_ended
     }
 
     fn on_event_drawn(&self, event: AgentEvent) -> bool {
@@ -7507,15 +7358,6 @@ impl Tui {
         match event {
             // Content: a fact of the session on screen, folded once.
             AgentEvent::Fact(committed) => {
-                // A streamed delta is merged and folded once, before the next
-                // fact or frame — see [`PendingChunks`].
-                if matches!(
-                    &committed.event,
-                    atomcode_kernel::session::SessionEvent::AssistantChunk { .. }
-                ) {
-                    self.buffer_chunk(&committed);
-                    return true;
-                }
                 // A member's reply says how big its context has grown, which is
                 // what the team panel shows of it.
                 if let atomcode_kernel::session::SessionEvent::AssistantMessage {
@@ -12309,7 +12151,6 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             turn_began: Mutex::new(None),
             away_this_turn: std::sync::atomic::AtomicBool::new(false),
             last_reply: Mutex::new(String::new()),
-            pending_chunks: Mutex::new(None),
             recaps: Arc::default(),
             recap_task: Mutex::new(None),
             focused: std::sync::atomic::AtomicBool::new(true),
@@ -19136,169 +18977,5 @@ mod tool_image_tests {
             crate::terminal_image::MASCOT_WAIT_PNG
         );
         assert!(host.moment.read().unwrap().attachments.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod stream_coalescing_tests {
-    use super::*;
-    use crate::surface::Headless;
-
-    fn screen() -> (Arc<Host>, Tui) {
-        let (host, tui) = assemble(Headless::new(80, 24));
-        host.modules
-            .add_producer(crate::modules::transcript::Transcript::new())
-            .unwrap();
-        tui.client.follow_switched("lead");
-        (host, tui)
-    }
-
-    fn chunk(seq: SeqNo, delta: &str, reasoning: bool) -> AgentEvent {
-        AgentEvent::Fact(Box::new(Committed {
-            session: "lead".into(),
-            seq,
-            at: seq,
-            event: atomcode_kernel::session::SessionEvent::AssistantChunk {
-                turn: 1,
-                round: 0,
-                delta: delta.into(),
-                reasoning,
-            },
-        }))
-    }
-
-    fn growing(host: &Arc<Host>) -> Option<String> {
-        let stream = host.stream.read().expect("stream poisoned");
-        stream
-            .slots()
-            .iter()
-            .find_map(|slot| slot.block().content.growing_text().map(str::to_string))
-    }
-
-    #[test]
-    fn consecutive_deltas_are_folded_once_in_order() {
-        let (host, tui) = screen();
-        assert!(tui.on_event(chunk(1, "hel", false)));
-        assert!(tui.on_event(chunk(2, "lo", false)));
-        assert_eq!(growing(&host), None, "nothing folds while the run is open");
-        assert!(tui.flush_pending_chunks());
-        assert_eq!(growing(&host).as_deref(), Some("hello"));
-        assert_eq!(
-            host.stream.read().expect("stream poisoned").slots().len(),
-            1
-        );
-    }
-
-    #[test]
-    fn a_settling_fact_folds_the_run_first() {
-        let (host, tui) = screen();
-        tui.on_event(chunk(1, "hel", false));
-        tui.on_event(chunk(2, "lo", false));
-        tui.on_event(AgentEvent::Fact(Box::new(Committed {
-            session: "lead".into(),
-            seq: 3,
-            at: 3,
-            event: atomcode_kernel::session::SessionEvent::AssistantMessage {
-                turn: 1,
-                round: 0,
-                text: "hello".into(),
-                reasoning: String::new(),
-                tool_calls: Vec::new(),
-                reasoning_blocks: Vec::new(),
-                meta: None,
-            },
-        })));
-        let stream = host.stream.read().expect("stream poisoned");
-        assert_eq!(
-            stream.slots().len(),
-            1,
-            "the run and its message are one block"
-        );
-        assert!(!stream.slots()[0].is_live(), "the message settled it");
-        assert_eq!(
-            stream.slots()[0]
-                .block()
-                .content
-                .reading_text(&crate::block::RenderCtx::bare(80)),
-            "hello"
-        );
-    }
-
-    #[test]
-    fn a_channel_change_folds_the_previous_run_first() {
-        let (host, tui) = screen();
-        tui.on_event(chunk(1, "deep", false));
-        tui.on_event(chunk(2, " thought", true));
-        assert_eq!(
-            growing(&host).as_deref(),
-            Some("deep"),
-            "the reasoning run folds the text run it interrupted"
-        );
-        tui.flush_pending_chunks();
-        let kinds: Vec<_> = host
-            .stream
-            .read()
-            .expect("stream poisoned")
-            .slots()
-            .iter()
-            .map(|slot| slot.block().kind())
-            .collect();
-        assert_eq!(kinds, ["assistant", "reasoning"]);
-    }
-
-    #[test]
-    fn switching_views_keeps_the_unfolded_tail_for_replay() {
-        let (host, tui) = screen();
-        tui.on_event(chunk(1, "hel", false));
-        tui.on_event(chunk(2, "lo", false));
-
-        // Leave the lead before any frame folded the run.
-        assert!(tui.look_at("member"));
-
-        // The tail is in the lead's history, or coming back loses it.
-        let lead = tui
-            .client
-            .view
-            .lock()
-            .expect("client poisoned")
-            .sessions
-            .get("lead")
-            .expect("lead view")
-            .events
-            .clone();
-        assert!(
-            lead.iter().any(|e| matches!(
-                &e.event,
-                atomcode_kernel::session::SessionEvent::AssistantChunk { delta, .. }
-                    if delta == "hello"
-            )),
-            "the unfolded tail must reach the client history: {lead:?}"
-        );
-
-        // Coming back replays it into a fresh stream.
-        assert!(tui.look_at("lead"));
-        assert_eq!(growing(&host).as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn a_slow_stream_appends_without_rebuilding_the_block() {
-        let (host, tui) = screen();
-        tui.on_event(chunk(1, "hel", false));
-        tui.flush_pending_chunks();
-        let first = {
-            let stream = host.stream.read().expect("stream poisoned");
-            Arc::as_ptr(&stream.slots()[0].block().content)
-        };
-
-        tui.on_event(chunk(2, "lo", false));
-        tui.flush_pending_chunks();
-
-        let same = {
-            let stream = host.stream.read().expect("stream poisoned");
-            assert_eq!(stream.slots().len(), 1);
-            std::ptr::eq(first, Arc::as_ptr(&stream.slots()[0].block().content))
-        };
-        assert!(same, "the delta must append in place, not replace the Arc");
-        assert_eq!(growing(&host).as_deref(), Some("hello"));
     }
 }
